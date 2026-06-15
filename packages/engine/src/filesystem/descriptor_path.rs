@@ -8,6 +8,9 @@ pub(crate) trait DirectoryPathRecord {
     type Key: Clone + Debug + Ord;
 
     fn parent_key(&self, key: &Self::Key) -> Option<Self::Key>;
+    fn parent_keys(&self, key: &Self::Key) -> Vec<Self::Key> {
+        self.parent_key(key).into_iter().collect()
+    }
     fn name(&self) -> &str;
 }
 
@@ -44,17 +47,24 @@ where
         visiting.remove(directory_id);
         return Ok(None);
     };
-    let path = match row.parent_key(directory_id) {
-        Some(parent_key) => {
-            let Some(parent_path) =
+    let parent_keys = row.parent_keys(directory_id);
+    let path = if parent_keys.is_empty() {
+        compose_directory_path(None, row.name())?
+    } else {
+        let mut resolved_parent_path = None;
+        for parent_key in parent_keys {
+            if let Some(parent_path) =
                 derive_directory_path_for(&parent_key, records, paths, visiting)?
-            else {
-                visiting.remove(directory_id);
-                return Ok(None);
-            };
-            compose_directory_path(Some(&parent_path), row.name())?
+            {
+                resolved_parent_path = Some(parent_path);
+                break;
+            }
         }
-        None => compose_directory_path(None, row.name())?,
+        let Some(parent_path) = resolved_parent_path else {
+            visiting.remove(directory_id);
+            return Ok(None);
+        };
+        compose_directory_path(Some(&parent_path), row.name())?
     };
     visiting.remove(directory_id);
     paths.insert(directory_id.clone(), path.clone());

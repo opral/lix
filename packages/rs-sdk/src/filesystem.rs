@@ -884,9 +884,8 @@ fn materialization_local_path(root: &Path, path: &str) -> Option<PathBuf> {
 }
 
 fn path_contains_unmanaged_entry(root: &Path, local_path: &Path) -> Result<bool, LixError> {
-    let relative = match local_path.strip_prefix(root) {
-        Ok(relative) => relative,
-        Err(_) => return Ok(true),
+    let Ok(relative) = local_path.strip_prefix(root) else {
+        return Ok(true);
     };
     let mut current = root.to_path_buf();
     for component in relative.components() {

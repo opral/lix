@@ -3676,7 +3676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_directory_rejects_path_assignment() {
+    async fn execute_sql_update_directory_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_directory_row("dir-docs", "branch-a", None, "docs")],
@@ -3690,25 +3690,29 @@ mod tests {
             schema_definitions: vec![],
         };
 
-        let error = execute_write_sql(
+        let result = execute_write_sql(
             &mut ctx,
             "UPDATE lix_directory SET path = '/renamed/' WHERE id = 'dir-docs'",
             &[],
         )
         .await
-        .expect_err("path should remain read-only");
+        .expect("path update should stage descriptor rewrite");
 
-        assert!(
-            error.message.contains("not writable")
-                || error.message.contains("read-only column 'path'"),
-            "unexpected error: {error:?}"
-        );
-        assert!(
-            staged_writes
-                .lock()
-                .expect("staged writes lock")
-                .deltas
-                .is_empty()
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
+        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"id\":\"dir-docs\",\"name\":\"renamed\",\"parent_id\":null}")
         );
     }
 

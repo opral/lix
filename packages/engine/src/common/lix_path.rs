@@ -87,16 +87,6 @@ impl LixPath {
             .into_iter()
             .flat_map(|segments| segments.strip_suffix('/').unwrap_or(segments).split('/'))
     }
-
-    pub(crate) fn to_file_path(&self) -> String {
-        assert!(!self.segments.is_empty() && !self.segments.ends_with('/'));
-        format!("/{}", self.segments)
-    }
-
-    pub(crate) fn to_directory_path(&self) -> String {
-        assert!(self.segments.is_empty() || self.segments.ends_with('/'));
-        format!("/{}", self.segments)
-    }
 }
 
 fn validate_segment(segment: &str) -> PathResult<()> {

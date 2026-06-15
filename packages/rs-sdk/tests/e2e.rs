@@ -813,7 +813,7 @@ async fn filesystem_materialization_skips_special_file_collisions() {
 
     let tempdir = tempfile::tempdir().unwrap();
     let socket_path = tempdir.path().join("socket");
-    let _listener = UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
     lix.write_file("/socket", b"lix".to_vec(), FsWriteOptions::default())
@@ -831,7 +831,7 @@ async fn filesystem_materialization_skips_special_file_collisions() {
             .is_socket()
     );
 
-    drop(_listener);
+    drop(listener);
     std::fs::remove_file(tempdir.path().join("socket")).unwrap();
     wait_for_disk_file(&tempdir.path().join("socket"), Some(b"lix"));
     lix.close().await.unwrap();

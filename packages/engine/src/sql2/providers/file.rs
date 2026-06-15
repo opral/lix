@@ -82,7 +82,7 @@ use crate::filesystem::{
     blob_ref_row, blob_ref_tombstone_row, derive_directory_paths,
     directory_path_resolvers_from_live_state, file_descriptor_row, file_descriptor_write_row,
     filesystem_storage_scope_key, plan_file_delete, plan_file_descriptor_write,
-    plan_parsed_file_path_update, plan_parsed_file_path_write,
+    plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -1180,6 +1180,16 @@ struct FileDescriptorRecord {
     live: MaterializedLiveStateRow,
 }
 
+impl FileDescriptorRecord {
+    fn directory_parent_keys(&self, directory_id: &str) -> Vec<FilesystemDescriptorKey> {
+        let mut keys = vec![self.key.in_same_scope(directory_id)];
+        if self.key.is_untracked() {
+            keys.push(self.key.in_tracked_scope(directory_id));
+        }
+        keys
+    }
+}
+
 #[derive(Clone)]
 struct PluginRenderContext {
     live_state: Arc<dyn LiveStateReader>,
@@ -1215,6 +1225,17 @@ impl DirectoryPathRecord for DirectoryDescriptorRecord {
         self.parent_id
             .as_deref()
             .map(|parent_id| key.in_same_scope(parent_id))
+    }
+
+    fn parent_keys(&self, key: &Self::Key) -> Vec<Self::Key> {
+        let Some(parent_id) = self.parent_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut keys = vec![key.in_same_scope(parent_id)];
+        if key.is_untracked() {
+            keys.push(key.in_tracked_scope(parent_id));
+        }
+        keys
     }
 
     fn name(&self) -> &str {
@@ -1594,11 +1615,8 @@ fn lix_file_path_update_stage_from_batch(
             None
         };
 
-        let resolver = path_resolvers
-            .entry(file_path_resolver_key(&context))
-            .or_default();
-        let plan = plan_parsed_file_path_update(
-            resolver,
+        let plan = plan_parsed_file_path_update_with_resolvers(
+            path_resolvers,
             id.clone(),
             parsed_path,
             context.clone(),
@@ -1750,9 +1768,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     "INSERT into lix_file with path requires directory path resolver".to_string(),
                 ));
             };
-            let resolver = path_resolvers
-                .entry(file_path_resolver_key(&context))
-                .or_insert_with(DirectoryPathResolver::default);
             let Some(generate_directory_id) = generate_directory_id.as_deref_mut() else {
                 return Err(DataFusionError::Execution(
                     "INSERT into lix_file with path requires directory id generator".to_string(),
@@ -1764,8 +1779,8 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     .map(plugin_storage_archive_file_id)
                     .unwrap_or_else(|| generate_directory_id())
             });
-            let mut plan = plan_parsed_file_path_write(
-                resolver,
+            let mut plan = plan_parsed_file_path_write_with_resolvers(
+                path_resolvers,
                 parsed_path,
                 Some(file_id.clone()),
                 data,
@@ -2154,8 +2169,15 @@ async fn lix_file_record_batch(
     for (_, file) in file_rows {
         let directory_path = match file.directory_id.as_ref() {
             Some(directory_id) => {
-                let key = file.key.in_same_scope(directory_id);
-                let Some(path) = directory_paths.get(&key).cloned() else {
+                let parent_key = file
+                    .directory_parent_keys(directory_id)
+                    .into_iter()
+                    .find(|key| directory_paths.contains_key(key));
+                let Some(path) = parent_key
+                    .as_ref()
+                    .and_then(|key| directory_paths.get(key))
+                    .cloned()
+                else {
                     return Err(LixError::new(
                         LixError::CODE_FOREIGN_KEY,
                         format!(
@@ -2402,16 +2424,7 @@ fn lix_file_live_state_projection(projected_schema: Option<&Schema>) -> LiveStat
     let Some(schema) = projected_schema else {
         return LiveStateProjection::default();
     };
-    let mut columns = Vec::new();
-    let needs_snapshot = schema.fields().iter().any(|field| {
-        matches!(
-            field.name().as_str(),
-            "path" | "directory_id" | "name" | "data"
-        )
-    });
-    if needs_snapshot {
-        columns.push("snapshot_content".to_string());
-    }
+    let mut columns = vec!["snapshot_content".to_string()];
     if schema
         .fields()
         .iter()

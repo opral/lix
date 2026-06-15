@@ -39,6 +39,7 @@ use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::plugin::{is_plugin_storage_path, reject_normal_plugin_storage_mutation};
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,
@@ -56,9 +57,11 @@ use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
 
 use crate::filesystem::{
     DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
-    FilesystemDeletePlan, FilesystemRowContext, VisibleFilesystem, derive_directory_paths,
+    FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, VisibleFilesystem,
+    create_directory_path_with_leaf_id_with_resolvers, derive_directory_paths,
     directory_descriptor_write_row, directory_path_resolvers_from_live_state,
-    filesystem_storage_scope_key, plan_recursive_directory_delete,
+    filesystem_storage_scope_key, plan_parsed_directory_path_update_with_resolvers,
+    plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{
@@ -370,6 +373,7 @@ impl TableProvider for LixDirectoryProvider {
             write_ctx,
             Arc::clone(&self.schema),
             self.branch_binding.clone(),
+            self.functions.clone(),
             request,
             physical_assignments,
             physical_filters,
@@ -596,7 +600,9 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
                 .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_directory_record_batch(&table_schema, rows)
                 .map_err(lix_error_to_datafusion_error)?;
-            let matched_batch = filter_lix_directory_batch(source_batch, &filters)?;
+            let matched_batch = filter_lix_directory_batch(source_batch.clone(), &filters)?;
+            reject_lix_directory_delete_plugin_storage_paths(&matched_batch, &source_batch)
+                .map_err(lix_error_to_datafusion_error)?;
             let branch_ids =
                 directory_branch_ids_from_batch(&matched_batch, branch_binding.active_branch_id())?;
             let mut visible_filesystems = BTreeMap::new();
@@ -644,6 +650,7 @@ struct LixDirectoryUpdateExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
     branch_binding: BranchBinding,
+    functions: FunctionProviderHandle,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -662,6 +669,7 @@ impl LixDirectoryUpdateExec {
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
         branch_binding: BranchBinding,
+        functions: FunctionProviderHandle,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -677,6 +685,7 @@ impl LixDirectoryUpdateExec {
             write_ctx,
             table_schema,
             branch_binding,
+            functions,
             request,
             assignments,
             filters,
@@ -744,6 +753,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
         let branch_binding = self.branch_binding.clone();
+        let functions = self.functions.clone();
         let request = self.request.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
@@ -769,6 +779,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
                 &assignments,
                 branch_binding.active_branch_id(),
                 &mut path_resolvers,
+                &mut || functions.call_uuid_v7().to_string(),
             )?;
             let count = u64::try_from(write_rows.len()).map_err(|_| {
                 DataFusionError::Execution("lix_directory UPDATE row count overflow".into())
@@ -933,16 +944,28 @@ struct DirectoryDescriptorRecord {
     id: String,
     parent_id: Option<String>,
     name: String,
+    key: FilesystemDescriptorKey,
     live: MaterializedLiveStateRow,
 }
 
 impl DirectoryPathRecord for DirectoryDescriptorRecord {
-    type Key = (String, String);
+    type Key = FilesystemDescriptorKey;
 
     fn parent_key(&self, key: &Self::Key) -> Option<Self::Key> {
         self.parent_id
-            .as_ref()
-            .map(|parent_id| (key.0.clone(), parent_id.clone()))
+            .as_deref()
+            .map(|parent_id| key.in_same_scope(parent_id))
+    }
+
+    fn parent_keys(&self, key: &Self::Key) -> Vec<Self::Key> {
+        let Some(parent_id) = self.parent_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut keys = vec![key.in_same_scope(parent_id)];
+        if key.is_untracked() {
+            keys.push(key.in_tracked_scope(parent_id));
+        }
+        keys
     }
 
     fn name(&self) -> &str {
@@ -987,8 +1010,12 @@ fn lix_directory_update_write_rows_from_batch(
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
     branch_binding: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<Vec<TransactionWriteRow>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
+    let updates_path = assignments
+        .iter()
+        .any(|(column_name, _)| column_name == "path");
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
         let id = optional_string_value(batch, row_index, "id")?;
@@ -998,6 +1025,27 @@ fn lix_directory_update_write_rows_from_batch(
             row_index,
             branch_binding,
         )?;
+        if updates_path {
+            let directory_id = id.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "UPDATE lix_directory path requires existing directory id".to_string(),
+                )
+            })?;
+            let path = update_required_string_value(batch, &assignment_values, row_index, "path")?;
+            let parsed = crate::common::LixPath::try_from_directory_path(&path)
+                .map_err(lix_error_to_datafusion_error)?;
+            rows.extend(
+                plan_parsed_directory_path_update_with_resolvers(
+                    path_resolvers,
+                    parsed,
+                    directory_id,
+                    context,
+                    generate_directory_id,
+                )
+                .map_err(lix_error_to_datafusion_error)?,
+            );
+            continue;
+        }
         let parent_id =
             update_optional_string_value(batch, &assignment_values, row_index, "parent_id")?;
         let name = update_required_string_value(batch, &assignment_values, row_index, "name")?;
@@ -1058,6 +1106,42 @@ fn lix_directory_recursive_delete_rows_from_batch(
         );
     }
     Ok((rows, count))
+}
+
+fn reject_lix_directory_delete_plugin_storage_paths(
+    matched_batch: &RecordBatch,
+    all_directories_batch: &RecordBatch,
+) -> std::result::Result<(), LixError> {
+    let mut all_directory_paths = Vec::new();
+    for row_index in 0..all_directories_batch.num_rows() {
+        if let Some(path) = optional_string_value(all_directories_batch, row_index, "path")
+            .map_err(|error| LixError::unknown(error.to_string()))?
+        {
+            all_directory_paths.push(path);
+        }
+    }
+
+    for row_index in 0..matched_batch.num_rows() {
+        let Some(path) = optional_string_value(matched_batch, row_index, "path")
+            .map_err(|error| LixError::unknown(error.to_string()))?
+        else {
+            continue;
+        };
+        reject_normal_plugin_storage_mutation(&path, "DELETE FROM lix_directory")?;
+        if all_directory_paths.iter().any(|candidate| {
+            path_is_inside_directory(candidate, &path) && is_plugin_storage_path(candidate)
+        }) {
+            reject_normal_plugin_storage_mutation(
+                "/.lix_system/plugins/",
+                "DELETE FROM lix_directory recursive directory delete",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn path_is_inside_directory(path: &str, directory_path: &str) -> bool {
+    directory_path == "/" || path.starts_with(directory_path)
 }
 
 fn append_deduped_delete_plan(
@@ -1161,25 +1245,26 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                         .to_string(),
                 ));
             };
-            let resolver = path_resolvers
-                .entry(directory_path_resolver_key(&context))
-                .or_insert_with(DirectoryPathResolver::default);
             let Some(generate_directory_id) = generate_directory_id.as_deref_mut() else {
                 return Err(DataFusionError::Execution(
                     "INSERT into lix_directory with path requires directory id generator"
                         .to_string(),
                 ));
             };
-            let directory_id = id.unwrap_or_else(|| generate_directory_id());
-            let mut planned_rows = resolver
-                .create_directory_path_with_leaf_id(
-                    &path,
-                    Some(directory_id.clone()),
-                    context,
-                    generate_directory_id,
-                )
-                .map_err(|error| map_lix_directory_insert_error(error, surface_name, &directory_id))
+            let explicit_directory_id = id.clone();
+            let parsed = crate::common::LixPath::try_from_directory_path(&path)
                 .map_err(lix_error_to_datafusion_error)?;
+            let plan = create_directory_path_with_leaf_id_with_resolvers(
+                path_resolvers,
+                parsed,
+                explicit_directory_id,
+                context,
+                generate_directory_id,
+            )
+            .map_err(|error| map_lix_directory_insert_error(error, surface_name, id.as_deref()))
+            .map_err(lix_error_to_datafusion_error)?;
+            let directory_id = plan.directory_id;
+            let mut planned_rows = plan.rows;
             attach_lix_directory_insert_origin(&mut planned_rows, surface_name, &directory_id);
             rows.extend(planned_rows);
             continue;
@@ -1195,7 +1280,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                 resolver
                     .reserve_directory(parent_id.clone(), name.clone(), directory_id.clone())
                     .map_err(|error| {
-                        map_lix_directory_insert_error(error, surface_name, directory_id)
+                        map_lix_directory_insert_error(error, surface_name, Some(directory_id))
                     })
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -1217,8 +1302,11 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 fn map_lix_directory_insert_error(
     error: LixError,
     surface_name: &str,
-    directory_id: &str,
+    directory_id: Option<&str>,
 ) -> LixError {
+    let Some(directory_id) = directory_id else {
+        return error;
+    };
     let directory_id_conflict =
         format!("unique constraint violation on lix_directory.id for value {directory_id:?}");
     if error.code == LixError::CODE_UNIQUE && error.message == directory_id_conflict {
@@ -1346,19 +1434,18 @@ fn lix_directory_record_batch(
                     format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
                 )
             })?;
+        let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
         directory_rows.push(DirectoryDescriptorRecord {
             id: snapshot.id,
             parent_id: snapshot.parent_id,
             name: snapshot.name,
+            key,
             live: row,
         });
     }
 
-    let directory_paths = derive_directory_paths(
-        directory_rows
-            .iter()
-            .map(|row| ((row.live.branch_id.clone(), row.id.clone()), row)),
-    )?;
+    let directory_paths =
+        derive_directory_paths(directory_rows.iter().map(|row| (row.key.clone(), row)))?;
     let mut ids = Vec::new();
     let mut paths = Vec::new();
     let mut parent_ids = Vec::new();
@@ -1377,11 +1464,7 @@ fn lix_directory_record_batch(
 
     for directory in directory_rows {
         ids.push(Some(directory.id.clone()));
-        paths.push(
-            directory_paths
-                .get(&(directory.live.branch_id.clone(), directory.id.clone()))
-                .cloned(),
-        );
+        paths.push(directory_paths.get(&directory.key).cloned());
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
         entity_pks.push(Some(directory.live.entity_pk.as_json_array_text()?));
@@ -1479,14 +1562,7 @@ fn lix_directory_live_state_projection(projected_schema: Option<&Schema>) -> Liv
     let Some(schema) = projected_schema else {
         return LiveStateProjection::default();
     };
-    let mut columns = Vec::new();
-    let needs_snapshot = schema
-        .fields()
-        .iter()
-        .any(|field| matches!(field.name().as_str(), "parent_id" | "name"));
-    if needs_snapshot {
-        columns.push("snapshot_content".to_string());
-    }
+    let mut columns = vec!["snapshot_content".to_string()];
     if schema
         .fields()
         .iter()
@@ -1501,6 +1577,9 @@ fn validate_lix_directory_update_assignments(
     schema: &SchemaRef,
     assignments: &[(String, Expr)],
 ) -> Result<()> {
+    let updates_path = assignments
+        .iter()
+        .any(|(column_name, _)| column_name == "path");
     for (column_name, _) in assignments {
         schema.field_with_name(column_name).map_err(|_| {
             DataFusionError::Plan(format!(
@@ -1509,11 +1588,17 @@ fn validate_lix_directory_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "parent_id" | "name" | "lixcol_metadata"
+            "path" | "parent_id" | "name" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_directory cannot stage read-only column '{column_name}'"
             )));
+        }
+        if updates_path && matches!(column_name.as_str(), "parent_id" | "name") {
+            return Err(DataFusionError::Execution(
+                "UPDATE lix_directory cannot mix path with parent_id or name assignments"
+                    .to_string(),
+            ));
         }
     }
     Ok(())
@@ -1810,7 +1895,9 @@ mod tests {
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
-    use crate::filesystem::{VisibleFilesystem, directory_path_resolvers_from_state_rows};
+    use crate::filesystem::{
+        FilesystemDescriptorKey, VisibleFilesystem, directory_path_resolvers_from_state_rows,
+    };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -2026,38 +2113,36 @@ mod tests {
 
     #[test]
     fn derives_nested_directory_paths() {
+        let root_live = live_row(
+            "dir-docs",
+            "branch-a",
+            "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+        );
+        let child_live = live_row(
+            "dir-guides",
+            "branch-a",
+            "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
+        );
         let root = DirectoryDescriptorRecord {
             id: "dir-docs".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            live: live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
-            ),
+            key: FilesystemDescriptorKey::from_live_row(&root_live, "dir-docs"),
+            live: root_live,
         };
         let child = DirectoryDescriptorRecord {
             id: "dir-guides".to_string(),
             parent_id: Some("dir-docs".to_string()),
             name: "guides".to_string(),
-            live: live_row(
-                "dir-guides",
-                "branch-a",
-                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
-            ),
+            key: FilesystemDescriptorKey::from_live_row(&child_live, "dir-guides"),
+            live: child_live,
         };
+        let child_key = child.key.clone();
         let records = [root, child];
-        let paths = derive_directory_paths(
-            records
-                .iter()
-                .map(|row| ((row.live.branch_id.clone(), row.id.clone()), row)),
-        )
-        .expect("path derivation should succeed");
+        let paths = derive_directory_paths(records.iter().map(|row| (row.key.clone(), row)))
+            .expect("path derivation should succeed");
 
-        assert_eq!(
-            paths.get(&("branch-a".to_string(), "dir-guides".to_string())),
-            Some(&"/docs/guides/".to_string())
-        );
+        assert_eq!(paths.get(&child_key), Some(&"/docs/guides/".to_string()));
     }
 
     #[test]

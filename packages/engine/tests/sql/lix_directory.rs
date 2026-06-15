@@ -976,3 +976,204 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_directory_tracked_path_insert_promotes_untracked_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-docs', '/docs/', true)",
+                &[],
+            )
+            .await
+            .expect("untracked directory insert should succeed");
+        session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .await
+            .expect("tracked directory insert should promote same path id");
+
+        let result = session
+            .execute(
+                "SELECT id, path, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("dir-docs".to_string()),
+                Value::Text("/docs/".to_string()),
+                Value::Boolean(false),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_untracked_path_insert_reuses_tracked_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("tracked parent insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-draft', '/docs/draft/', true)",
+                &[],
+            )
+            .await
+            .expect("untracked child insert should reuse tracked parent");
+
+        let result = session
+            .execute(
+                "SELECT id, path, parent_id, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE id IN ('dir-docs', 'dir-draft') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("dir-docs".to_string()),
+                    Value::Text("/docs/".to_string()),
+                    Value::Null,
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("dir-draft".to_string()),
+                    Value::Text("/docs/draft/".to_string()),
+                    Value::Text("dir-docs".to_string()),
+                    Value::Boolean(true),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_path_insert_rejects_untracked_duplicate_with_different_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-docs-shadow', '/docs/', true)",
+                &[],
+            )
+            .await
+            .expect_err("untracked duplicate with a different id should fail");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
+    lix_directory_path_update_promotes_untracked_parents,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-parent', '/archive/', true)",
+                &[],
+            )
+            .await
+            .expect("untracked parent insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+
+        session
+            .execute(
+                "UPDATE lix_directory SET path = '/archive/docs/' WHERE id = 'dir-docs'",
+                &[],
+            )
+            .await
+            .expect("directory path update should promote missing tracked parent");
+
+        let result = session
+            .execute(
+                "SELECT id, path, parent_id, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE id IN ('dir-parent', 'dir-docs') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("dir-docs".to_string()),
+                    Value::Text("/archive/docs/".to_string()),
+                    Value::Text("dir-parent".to_string()),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("dir-parent".to_string()),
+                    Value::Text("/archive/".to_string()),
+                    Value::Null,
+                    Value::Boolean(false),
+                ],
+            ],
+        );
+    }
+);

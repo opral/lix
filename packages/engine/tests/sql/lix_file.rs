@@ -1984,3 +1984,139 @@ simulation_test!(
         assert_rows_eq(result, vec![vec![Value::Text("/shared/a.txt".to_string())]]);
     }
 );
+
+simulation_test!(
+    lix_file_tracked_path_insert_promotes_untracked_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-scratch', '/scratch/', true)",
+                &[],
+            )
+            .await
+            .expect("untracked parent insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-readme', '/scratch/readme.md', lix_text_encode('hello'))",
+                &[],
+            )
+            .await
+            .expect("tracked file insert should promote untracked parent");
+
+        let directories = session
+            .execute(
+                "SELECT id, path, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE path = '/scratch/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            directories,
+            vec![vec![
+                Value::Text("dir-scratch".to_string()),
+                Value::Text("/scratch/".to_string()),
+                Value::Boolean(false),
+            ]],
+        );
+
+        let files = session
+            .execute(
+                "SELECT id, path, directory_id, data \
+                 FROM lix_file \
+                 WHERE id = 'file-readme'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            files,
+            vec![vec![
+                Value::Text("file-readme".to_string()),
+                Value::Text("/scratch/readme.md".to_string()),
+                Value::Text("dir-scratch".to_string()),
+                Value::Blob(b"hello".to_vec()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_untracked_path_insert_reuses_tracked_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("tracked parent insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
+                 VALUES ('file-draft', '/docs/draft.md', lix_text_encode('draft'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked file insert should reuse tracked parent");
+
+        let directories = session
+            .execute(
+                "SELECT id, path, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            directories,
+            vec![vec![
+                Value::Text("dir-docs".to_string()),
+                Value::Text("/docs/".to_string()),
+                Value::Boolean(false),
+            ]],
+        );
+
+        let files = session
+            .execute(
+                "SELECT id, path, directory_id, lixcol_untracked \
+                 FROM lix_file \
+                 WHERE id = 'file-draft'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            files,
+            vec![vec![
+                Value::Text("file-draft".to_string()),
+                Value::Text("/docs/draft.md".to_string()),
+                Value::Text("dir-docs".to_string()),
+                Value::Boolean(true),
+            ]],
+        );
+    }
+);

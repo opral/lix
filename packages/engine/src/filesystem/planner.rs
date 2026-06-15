@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -37,6 +40,12 @@ pub(crate) struct FilesystemWritePlan {
 pub(crate) struct FilesystemDeletePlan {
     pub(crate) rows: Vec<TransactionWriteRow>,
     pub(crate) count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct DirectoryPathCreatePlan {
+    pub(crate) rows: Vec<TransactionWriteRow>,
+    pub(crate) directory_id: String,
 }
 
 /// Common state-row lane fields shared by filesystem descriptor/blob rows.
@@ -105,8 +114,18 @@ impl FilesystemDescriptorKey {
         }
     }
 
-    pub(crate) fn descriptor_id(&self) -> &str {
-        &self.descriptor_id
+    pub(crate) fn in_tracked_scope(&self, descriptor_id: &str) -> Self {
+        Self {
+            branch_id: self.branch_id.clone(),
+            global: self.global,
+            untracked: false,
+            file_id: self.file_id.clone(),
+            descriptor_id: descriptor_id.to_string(),
+        }
+    }
+
+    pub(crate) fn is_untracked(&self) -> bool {
+        self.untracked
     }
 }
 
@@ -229,6 +248,7 @@ enum FilesystemNamespaceEntry {
 pub(crate) struct DirectoryPathResolver {
     directories_by_id: BTreeMap<String, DirectoryDescriptorSeed>,
     entries_by_parent_and_name: BTreeMap<(Option<String>, String), FilesystemNamespaceEntry>,
+    promoted_directory_ids: BTreeSet<String>,
 }
 
 impl DirectoryPathResolver {
@@ -355,7 +375,8 @@ impl DirectoryPathResolver {
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
         let parsed = LixPath::try_from_directory_path(directory_path)?;
-        self.plan_directory_segments(
+        self.plan_directory_segments_with_fallback(
+            None,
             parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>(),
             None,
             context,
@@ -364,57 +385,9 @@ impl DirectoryPathResolver {
         )
     }
 
-    pub(crate) fn create_directory_path_with_leaf_id(
+    fn plan_directory_segments_with_fallback(
         &mut self,
-        directory_path: &str,
-        leaf_id: Option<String>,
-        context: FilesystemRowContext,
-        generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        let parsed = LixPath::try_from_directory_path(directory_path)?;
-        self.create_parsed_directory_path_with_leaf_id(
-            parsed,
-            leaf_id,
-            context,
-            generate_directory_id,
-        )
-    }
-
-    pub(crate) fn create_parsed_directory_path_with_leaf_id(
-        &mut self,
-        parsed: LixPath,
-        leaf_id: Option<String>,
-        context: FilesystemRowContext,
-        generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
-        let duplicate_directory_path = directory_path_from_segments(&segments);
-        self.plan_directory_segments(
-            segments,
-            leaf_id,
-            context,
-            generate_directory_id,
-            Some(duplicate_directory_path.as_str()),
-        )
-    }
-
-    fn ensure_directory_segments(
-        &mut self,
-        segments: &[String],
-        context: FilesystemRowContext,
-        generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        self.plan_directory_segments(
-            segments.to_vec(),
-            None,
-            context,
-            generate_directory_id,
-            None,
-        )
-    }
-
-    fn plan_directory_segments(
-        &mut self,
+        fallback: Option<&Self>,
         segments: Vec<String>,
         leaf_id: Option<String>,
         context: FilesystemRowContext,
@@ -434,20 +407,79 @@ impl DirectoryPathResolver {
         for (index, name) in segments.into_iter().enumerate() {
             let is_leaf = index == leaf_index;
             let key = (parent_id.clone(), name.clone());
-            match self.entries_by_parent_and_name.get(&key) {
+            let fallback_entry = fallback
+                .and_then(|resolver| resolver.entries_by_parent_and_name.get(&key))
+                .cloned();
+            match self.entries_by_parent_and_name.get(&key).cloned() {
                 Some(FilesystemNamespaceEntry::Directory(existing_id)) => {
                     if is_leaf && let Some(directory_path) = duplicate_directory_path {
                         return Err(duplicate_directory_path_error(directory_path));
+                    }
+                    if let Some(fallback_entry) = fallback_entry.as_ref() {
+                        Self::reject_cross_scope_directory_conflict(
+                            key.0.as_deref(),
+                            &key.1,
+                            &existing_id,
+                            fallback_entry,
+                        )?;
+                        if !context.untracked
+                            && let FilesystemNamespaceEntry::Directory(fallback_id) = fallback_entry
+                            && fallback_id == &existing_id
+                        {
+                            self.stage_promoted_directory_once(&existing_id, &context, &mut rows)?;
+                        }
                     }
                     parent_id = Some(existing_id.clone());
                     continue;
                 }
                 Some(existing @ FilesystemNamespaceEntry::File(_)) => {
                     return Err(filesystem_namespace_conflict_error(
-                        &key.0, &key.1, existing,
+                        &key.0, &key.1, &existing,
                     ));
                 }
                 None => {}
+            }
+
+            if let Some(fallback_entry) = fallback_entry {
+                match fallback_entry {
+                    FilesystemNamespaceEntry::Directory(existing_id) => {
+                        if is_leaf
+                            && let Some(leaf_id) = leaf_id.as_ref()
+                            && leaf_id != &existing_id
+                        {
+                            return Err(directory_id_conflict_error(&existing_id));
+                        }
+                        let fallback_resolver =
+                            fallback.expect("fallback entry came from resolver");
+                        let seed = fallback_resolver
+                            .directories_by_id
+                            .get(&existing_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    "LIX_ERROR_UNKNOWN",
+                                    format!(
+                                        "directory namespace entry references missing directory descriptor {existing_id:?}"
+                                    ),
+                                )
+                            })?;
+                        self.reserve_directory(
+                            seed.parent_id.clone(),
+                            seed.name.clone(),
+                            seed.id.clone(),
+                        )?;
+                        if !context.untracked {
+                            self.stage_promoted_directory_seed_once(seed, &context, &mut rows);
+                        }
+                        parent_id = Some(existing_id);
+                        continue;
+                    }
+                    existing @ FilesystemNamespaceEntry::File(_) => {
+                        return Err(filesystem_namespace_conflict_error(
+                            &key.0, &key.1, &existing,
+                        ));
+                    }
+                }
             }
 
             let id = if is_leaf {
@@ -472,6 +504,64 @@ impl DirectoryPathResolver {
         }
 
         Ok(rows)
+    }
+
+    fn reject_cross_scope_directory_conflict(
+        parent_id: Option<&str>,
+        entry_name: &str,
+        existing_id: &str,
+        fallback_entry: &FilesystemNamespaceEntry,
+    ) -> Result<(), LixError> {
+        match fallback_entry {
+            FilesystemNamespaceEntry::Directory(fallback_id) if fallback_id == existing_id => {
+                Ok(())
+            }
+            existing => {
+                let parent_id = parent_id.map(str::to_string);
+                Err(filesystem_namespace_conflict_error(
+                    &parent_id, entry_name, existing,
+                ))
+            }
+        }
+    }
+
+    fn stage_promoted_directory_once(
+        &mut self,
+        directory_id: &str,
+        context: &FilesystemRowContext,
+        rows: &mut Vec<TransactionWriteRow>,
+    ) -> Result<(), LixError> {
+        let seed = self.directories_by_id.get(directory_id).cloned().ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "directory namespace entry references missing directory descriptor {directory_id:?}"
+                ),
+            )
+        })?;
+        self.stage_promoted_directory_seed_once(seed, context, rows);
+        Ok(())
+    }
+
+    fn stage_promoted_directory_seed_once(
+        &mut self,
+        seed: DirectoryDescriptorSeed,
+        context: &FilesystemRowContext,
+        rows: &mut Vec<TransactionWriteRow>,
+    ) {
+        if !self.promoted_directory_ids.insert(seed.id.clone()) {
+            return;
+        }
+        rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
+            id: seed.id,
+            parent_id: seed.parent_id,
+            name: seed.name,
+            context: FilesystemRowContext {
+                file_id: None,
+                untracked: false,
+                ..context.clone()
+            },
+        }));
     }
 
     fn validate_directory_parent_graph(&self) -> Result<(), LixError> {
@@ -756,8 +846,30 @@ pub(crate) fn blob_ref_tombstone_row(
     )
 }
 
-pub(crate) fn plan_parsed_file_path_write(
+pub(crate) fn plan_parsed_file_path_write_with_resolvers(
+    resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    parsed: LixPath,
+    id: Option<String>,
+    data: Option<Vec<u8>>,
+    context: FilesystemRowContext,
+    generate_directory_id: &mut dyn FnMut() -> String,
+) -> Result<FilesystemWritePlan, LixError> {
+    let fallback = fallback_path_resolver(resolvers, &context);
+    let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
+    plan_parsed_file_path_write_with_fallback(
+        resolver,
+        fallback.as_ref(),
+        parsed,
+        id,
+        data,
+        context,
+        generate_directory_id,
+    )
+}
+
+fn plan_parsed_file_path_write_with_fallback(
     resolver: &mut DirectoryPathResolver,
+    fallback: Option<&DirectoryPathResolver>,
     parsed: LixPath,
     id: Option<String>,
     data: Option<Vec<u8>>,
@@ -777,10 +889,13 @@ pub(crate) fn plan_parsed_file_path_write(
     let directory_id = if directory_segments.is_empty() {
         None
     } else {
-        rows.extend(resolver.ensure_directory_segments(
-            directory_segments,
+        rows.extend(resolver.plan_directory_segments_with_fallback(
+            fallback,
+            directory_segments.to_vec(),
+            None,
             context.clone(),
             generate_directory_id,
+            None,
         )?);
         resolver
             .directory_id_from_segments(directory_segments)
@@ -877,8 +992,28 @@ pub(crate) fn plan_file_descriptor_write(
     })
 }
 
-pub(crate) fn plan_parsed_file_path_update(
+pub(crate) fn plan_parsed_file_path_update_with_resolvers(
+    resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    existing_file_id: String,
+    parsed: LixPath,
+    context: FilesystemRowContext,
+    generate_directory_id: &mut dyn FnMut() -> String,
+) -> Result<FilesystemWritePlan, LixError> {
+    let fallback = fallback_path_resolver(resolvers, &context);
+    let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
+    plan_parsed_file_path_update_with_fallback(
+        resolver,
+        fallback.as_ref(),
+        existing_file_id,
+        parsed,
+        context,
+        generate_directory_id,
+    )
+}
+
+fn plan_parsed_file_path_update_with_fallback(
     resolver: &mut DirectoryPathResolver,
+    fallback: Option<&DirectoryPathResolver>,
     existing_file_id: String,
     parsed: LixPath,
     context: FilesystemRowContext,
@@ -895,10 +1030,13 @@ pub(crate) fn plan_parsed_file_path_update(
     let directory_id = if directory_segments.is_empty() {
         None
     } else {
-        rows.extend(resolver.ensure_directory_segments(
-            directory_segments,
+        rows.extend(resolver.plan_directory_segments_with_fallback(
+            fallback,
+            directory_segments.to_vec(),
+            None,
             context.clone(),
             generate_directory_id,
+            None,
         )?);
         resolver
             .directory_id_from_segments(directory_segments)
@@ -924,6 +1062,105 @@ pub(crate) fn plan_parsed_file_path_update(
         file_data: Vec::new(),
         count: 1,
     })
+}
+
+pub(crate) fn create_directory_path_with_leaf_id_with_resolvers(
+    resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    parsed: LixPath,
+    leaf_id: Option<String>,
+    context: FilesystemRowContext,
+    generate_directory_id: &mut dyn FnMut() -> String,
+) -> Result<DirectoryPathCreatePlan, LixError> {
+    let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
+    let duplicate_directory_path = directory_path_from_segments(&segments);
+    let fallback = fallback_path_resolver(resolvers, &context);
+    let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
+    let rows = resolver.plan_directory_segments_with_fallback(
+        fallback.as_ref(),
+        segments.clone(),
+        leaf_id,
+        context,
+        generate_directory_id,
+        Some(duplicate_directory_path.as_str()),
+    )?;
+    let directory_id = resolver
+        .directory_id_from_segments(&segments)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("directory path {duplicate_directory_path:?} did not resolve after create"),
+            )
+        })?
+        .to_string();
+    Ok(DirectoryPathCreatePlan { rows, directory_id })
+}
+
+pub(crate) fn plan_parsed_directory_path_update_with_resolvers(
+    resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    parsed: LixPath,
+    directory_id: String,
+    context: FilesystemRowContext,
+    generate_directory_id: &mut dyn FnMut() -> String,
+) -> Result<Vec<TransactionWriteRow>, LixError> {
+    let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Err(duplicate_directory_path_error("/"));
+    }
+    let leaf_name = segments
+        .last()
+        .expect("parsed directory path should have a leaf segment")
+        .clone();
+    let parent_segments = &segments[..segments.len() - 1];
+    let fallback = fallback_path_resolver(resolvers, &context);
+    let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
+    let mut rows = resolver.plan_directory_segments_with_fallback(
+        fallback.as_ref(),
+        parent_segments.to_vec(),
+        None,
+        context.clone(),
+        generate_directory_id,
+        None,
+    )?;
+    let parent_id = if parent_segments.is_empty() {
+        None
+    } else {
+        resolver
+            .directory_id_from_segments(parent_segments)
+            .map(ToOwned::to_owned)
+    };
+    resolver.update_directory(parent_id.clone(), leaf_name.clone(), directory_id.clone())?;
+    rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
+        id: directory_id,
+        parent_id,
+        name: leaf_name,
+        context: FilesystemRowContext {
+            file_id: None,
+            ..context
+        },
+    }));
+    Ok(rows)
+}
+
+fn fallback_path_resolver(
+    resolvers: &BTreeMap<String, DirectoryPathResolver>,
+    context: &FilesystemRowContext,
+) -> Option<DirectoryPathResolver> {
+    let fallback_key = filesystem_storage_scope_key(
+        &context.branch_id,
+        context.global,
+        !context.untracked,
+        context.file_id.as_deref(),
+    );
+    resolvers.get(&fallback_key).cloned()
+}
+
+fn path_resolver_key(context: &FilesystemRowContext) -> String {
+    filesystem_storage_scope_key(
+        &context.branch_id,
+        context.global,
+        context.untracked,
+        context.file_id.as_deref(),
+    )
 }
 
 fn file_directory_segments(segments: &[String]) -> &[String] {
@@ -1222,7 +1459,7 @@ mod tests {
         FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
         FilesystemRowContext, blob_ref_row, directory_descriptor_row,
         directory_descriptor_write_row, file_descriptor_row, file_descriptor_write_row,
-        plan_file_descriptor_write, plan_parsed_file_path_update, plan_parsed_file_path_write,
+        plan_file_descriptor_write,
     };
     use crate::common::LixPath;
     use crate::filesystem::VisibleFilesystem;
@@ -1235,6 +1472,78 @@ mod tests {
 
     fn parsed_file_path(path: &str) -> LixPath {
         LixPath::try_from_file_path(path).expect("test file path should parse")
+    }
+
+    fn with_resolver_map<T>(
+        resolver: &mut DirectoryPathResolver,
+        key: String,
+        run: impl FnOnce(&mut BTreeMap<String, DirectoryPathResolver>) -> Result<T, crate::LixError>,
+    ) -> Result<T, crate::LixError> {
+        let mut resolvers = BTreeMap::from([(key.clone(), std::mem::take(resolver))]);
+        let result = run(&mut resolvers);
+        *resolver = resolvers.remove(&key).unwrap_or_default();
+        result
+    }
+
+    fn create_directory_path_with_leaf_id(
+        resolver: &mut DirectoryPathResolver,
+        directory_path: &str,
+        leaf_id: Option<String>,
+        context: FilesystemRowContext,
+        generate_directory_id: &mut dyn FnMut() -> String,
+    ) -> Result<Vec<crate::transaction::types::TransactionWriteRow>, crate::LixError> {
+        let parsed = LixPath::try_from_directory_path(directory_path)?;
+        let key = super::path_resolver_key(&context);
+        with_resolver_map(resolver, key, |resolvers| {
+            super::create_directory_path_with_leaf_id_with_resolvers(
+                resolvers,
+                parsed,
+                leaf_id,
+                context,
+                generate_directory_id,
+            )
+            .map(|plan| plan.rows)
+        })
+    }
+
+    fn plan_parsed_file_path_write(
+        resolver: &mut DirectoryPathResolver,
+        parsed: LixPath,
+        id: Option<String>,
+        data: Option<Vec<u8>>,
+        context: FilesystemRowContext,
+        generate_directory_id: &mut dyn FnMut() -> String,
+    ) -> Result<super::FilesystemWritePlan, crate::LixError> {
+        let key = super::path_resolver_key(&context);
+        with_resolver_map(resolver, key, |resolvers| {
+            super::plan_parsed_file_path_write_with_resolvers(
+                resolvers,
+                parsed,
+                id,
+                data,
+                context,
+                generate_directory_id,
+            )
+        })
+    }
+
+    fn plan_parsed_file_path_update(
+        resolver: &mut DirectoryPathResolver,
+        existing_file_id: String,
+        parsed: LixPath,
+        context: FilesystemRowContext,
+        generate_directory_id: &mut dyn FnMut() -> String,
+    ) -> Result<super::FilesystemWritePlan, crate::LixError> {
+        let key = super::path_resolver_key(&context);
+        with_resolver_map(resolver, key, |resolvers| {
+            super::plan_parsed_file_path_update_with_resolvers(
+                resolvers,
+                existing_file_id,
+                parsed,
+                context,
+                generate_directory_id,
+            )
+        })
     }
 
     #[test]
@@ -1313,14 +1622,14 @@ mod tests {
             .expect("root directory ensure should be a no-op");
         assert!(rows.is_empty());
 
-        let error = resolver
-            .create_directory_path_with_leaf_id(
-                "/",
-                Some("dir-root".to_string()),
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&["should-not-be-used"]),
-            )
-            .expect_err("explicit root directory create should be rejected");
+        let error = create_directory_path_with_leaf_id(
+            &mut resolver,
+            "/",
+            Some("dir-root".to_string()),
+            FilesystemRowContext::active_branch("branch-a"),
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect_err("explicit root directory create should be rejected");
         assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
     }
 
@@ -1385,14 +1694,14 @@ mod tests {
         let mut resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
 
-        let rows = resolver
-            .create_directory_path_with_leaf_id(
-                "/docs/nested/",
-                Some("dir-nested".to_string()),
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&["dir-generated-docs"]),
-            )
-            .expect("directory path should plan");
+        let rows = create_directory_path_with_leaf_id(
+            &mut resolver,
+            "/docs/nested/",
+            Some("dir-nested".to_string()),
+            FilesystemRowContext::active_branch("branch-a"),
+            &mut test_id_generator(&["dir-generated-docs"]),
+        )
+        .expect("directory path should plan");
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -1652,23 +1961,23 @@ mod tests {
         let mut resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
 
-        resolver
-            .create_directory_path_with_leaf_id(
-                "/docs/",
-                Some("dir-docs".to_string()),
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&[]),
-            )
-            .expect("first explicit directory create should plan");
+        create_directory_path_with_leaf_id(
+            &mut resolver,
+            "/docs/",
+            Some("dir-docs".to_string()),
+            FilesystemRowContext::active_branch("branch-a"),
+            &mut test_id_generator(&[]),
+        )
+        .expect("first explicit directory create should plan");
 
-        let error = resolver
-            .create_directory_path_with_leaf_id(
-                "/docs/",
-                Some("dir-docs-again".to_string()),
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&[]),
-            )
-            .expect_err("duplicate explicit directory create should be rejected");
+        let error = create_directory_path_with_leaf_id(
+            &mut resolver,
+            "/docs/",
+            Some("dir-docs-again".to_string()),
+            FilesystemRowContext::active_branch("branch-a"),
+            &mut test_id_generator(&[]),
+        )
+        .expect_err("duplicate explicit directory create should be rejected");
         assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
     }
 

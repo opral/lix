@@ -1,32 +1,8 @@
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::binary_cas::BlobDataReader;
-use crate::common::LixPath;
-use crate::filesystem::{
-    BlobRefRowInput, DirectoryDeleteInput, DirectoryPathResolver, FileDeleteInput,
-    FileDescriptorRowInput, FilesystemDeletePlan, FilesystemDirEntryKind, FilesystemEntry,
-    FilesystemIndex, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
-    directory_path_resolvers_from_state_rows, file_descriptor_row, filesystem_conflict_error,
-    filesystem_schema_keys, filesystem_storage_scope_key, load_filesystem_index,
-    plan_directory_delete, plan_file_delete, plan_parsed_file_path_write,
-    plan_recursive_directory_delete, wrong_kind_error,
-};
-use crate::live_state::{
-    LiveStateFileScanRequest, LiveStateFilter, LiveStateReader, LiveStateScanRequest,
-    MaterializedLiveStateRow,
-};
-use crate::plugin::{
-    InstalledPlugin, is_plugin_storage_path, load_installed_plugins_from_filesystem,
-    plugin_key_from_archive_path, plugin_state_live_state_projection,
-    plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
-    render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
-};
-use crate::sql2::SqlWriteExecutionContext;
-use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
-use crate::transaction::types::{
-    TransactionFileData, TransactionJson, TransactionWrite, TransactionWriteMode,
-};
+use crate::Value;
+use crate::storage::StorageBackend;
 
 use super::context::SessionContext;
 
@@ -92,476 +68,326 @@ where
         data: Vec<u8>,
         options: FsWriteOptions,
     ) -> Result<(), LixError> {
-        let parsed_path = LixPath::try_from_file_path(path)?;
-        let path = path.to_string();
-        self.session.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                let branch_id = transaction.active_branch_id().to_string();
-                let rows = scan_filesystem_rows(transaction, &branch_id).await?;
-                let filesystem = FilesystemIndex::from_live_rows(rows.clone())?;
-                let metadata = transaction_metadata(options.metadata, "fs.write_file metadata")?;
+        let path_value = Value::Text(path.to_string());
+        let lane_value = Value::Boolean(options.untracked);
+        let existing = self
+            .session
+            .execute(
+                "SELECT id, lixcol_untracked FROM lix_file WHERE path = $1",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        let metadata_value = json_metadata_value(options.metadata);
+        for row in existing.rows() {
+            let existing_untracked: bool = row.get("lixcol_untracked")?;
+            if existing_untracked != options.untracked {
+                return Err(filesystem_conflict_error(format!(
+                    "fs.write_file cannot write {} path {path:?} over existing {} file",
+                    lane_name(options.untracked),
+                    lane_name(existing_untracked)
+                )));
+            }
+        }
 
-                if let Some(existing) = filesystem.entry(&path) {
-                    match existing {
-                        FilesystemEntry::Directory(_) => {
-                            Err(wrong_kind_error(&path, "file", "directory"))
-                        }
-                        FilesystemEntry::File(file)
-                            if file.scope.untracked != options.untracked =>
-                        {
-                            Err(filesystem_conflict_error(format!(
-                                "fs.write_file cannot write {} path {path:?} over existing {} file",
-                                lane_name(options.untracked),
-                                lane_name(file.scope.untracked)
-                            )))
-                        }
-                        FilesystemEntry::File(file) => {
-                            let mut rows = Vec::new();
-                            let context = file.context_with_metadata(metadata);
-                            let mut file_data = Vec::new();
-                            if data.is_empty() {
-                                if file.blob_hash.is_some() {
-                                    rows.push(blob_ref_tombstone_row(
-                                        file.id.clone(),
-                                        context.clone(),
-                                    ));
-                                }
-                            } else {
-                                rows.push(blob_ref_row(BlobRefRowInput {
-                                    file_id: file.id.clone(),
-                                    data: data.clone(),
-                                    context: FilesystemRowContext {
-                                        file_id: None,
-                                        metadata: None,
-                                        ..context.clone()
-                                    },
-                                })?);
-                            }
-                            file_data.push(TransactionFileData {
-                                file_id: file.id.clone(),
-                                path: Some(path.clone()),
-                                filename: Some(file.name.clone()),
-                                branch_id: context.branch_id.clone(),
-                                global: context.global,
-                                untracked: context.untracked,
-                                data,
-                            });
-                            if context.metadata.is_some() {
-                                rows.push(file_descriptor_row(FileDescriptorRowInput {
-                                    id: file.id.clone(),
-                                    directory_id: file.directory_id.clone(),
-                                    name: file.name.clone(),
-                                    context: context.clone(),
-                                }));
-                            }
-                            if rows.is_empty() && file_data.is_empty() {
-                                return Ok(());
-                            }
-                            transaction
-                                .stage_write(TransactionWrite::RowsWithFileData {
-                                    mode: TransactionWriteMode::Replace,
-                                    rows,
-                                    file_data,
-                                    count: 1,
-                                })
-                                .await?;
-                            Ok(())
-                        }
-                    }
-                } else {
-                    if options.untracked {
-                        filesystem.reject_tracked_path_collision(&path, "fs.write_file")?;
-                    }
-                    let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
-                    let context = FilesystemRowContext {
-                        branch_id: branch_id.clone(),
-                        global: false,
-                        untracked: options.untracked,
-                        file_id: None,
-                        metadata,
-                    };
-                    let key =
-                        filesystem_storage_scope_key(&branch_id, false, options.untracked, None);
-                    let resolver = resolvers
-                        .entry(key)
-                        .or_insert_with(DirectoryPathResolver::default);
-                    let file_id =
-                        plugin_key_from_archive_path(&path).map(|key| plugin_storage_archive_file_id(&key));
-                    let plan = plan_parsed_file_path_write(
-                        resolver,
-                        parsed_path,
-                        file_id,
-                        Some(data),
-                        context,
-                        &mut || transaction.functions().call_uuid_v7().to_string(),
-                    )?;
-                    transaction
-                        .stage_write(TransactionWrite::RowsWithFileData {
-                            mode: TransactionWriteMode::Replace,
-                            rows: plan.rows,
-                            file_data: plan.file_data,
-                            count: plan.count,
-                        })
-                        .await?;
-                    Ok(())
-                }
-            })
-        })
-        .await
+        if existing.is_empty() {
+            self.session
+                .execute(
+                    "INSERT INTO lix_file (path, data, lixcol_metadata, lixcol_untracked) \
+                     VALUES ($1, $2, $3, $4)",
+                    &[path_value, Value::Blob(data), metadata_value, lane_value],
+                )
+                .await?;
+        } else {
+            self.session
+                .execute(
+                    "UPDATE lix_file \
+                     SET data = $2, lixcol_metadata = $3 \
+                     WHERE path = $1 AND lixcol_untracked = $4",
+                    &[path_value, Value::Blob(data), metadata_value, lane_value],
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
-        let path = LixPath::try_from_file_path(path)?.to_file_path();
-        let _operation_guard = self.session.begin_session_operation()?;
-        let read = SharedStorageRead::new(
-            self.session
-                .storage
-                .begin_read(StorageReadOptions::default())?,
-        );
-        let active_branch_id = self.session.active_branch_id_from_reader(&read).await?;
-        let live_state = self.session.live_state.reader(&read);
-        let filesystem_rows = live_state
-            .scan_rows(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: filesystem_schema_keys(),
-                    branch_ids: vec![active_branch_id.clone()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
+        let path_value = Value::Text(path.to_string());
+        let file_result = self
+            .session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                std::slice::from_ref(&path_value),
+            )
             .await?;
-        let index = FilesystemIndex::from_live_rows(filesystem_rows)?;
-        let blob_reader = self.session.binary_cas.reader(read.clone());
-        if let Some(bytes) = read_plugin_file_bytes(
-            &self.session,
-            &path,
-            &active_branch_id,
-            &index,
-            &live_state,
-            &blob_reader,
-        )
-        .await?
-        {
-            return Ok(Some(bytes));
+        if let Some(row) = file_result.rows().first() {
+            return Ok(Some(row.get("data")?));
         }
-        index.read_file_bytes(&path, &blob_reader).await
+
+        let directory_result = self
+            .session
+            .execute(
+                "SELECT id FROM lix_directory \
+                 WHERE path = $1 OR path = concat($1, '/') \
+                 LIMIT 1",
+                &[path_value],
+            )
+            .await?;
+        if !directory_result.is_empty() {
+            return Err(wrong_kind_error(path, "file", "directory"));
+        }
+        Ok(None)
     }
 
     pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
-        let parsed_path = LixPath::try_from_directory_path(path)?;
-        let path = path.to_string();
-        self.session.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                if path == "/" {
-                    return Ok(());
-                }
-                let branch_id = transaction.active_branch_id().to_string();
-                let rows = scan_filesystem_rows(transaction, &branch_id).await?;
-                let filesystem = FilesystemIndex::from_live_rows(rows.clone())?;
-                if let Some(existing) = filesystem.entry(&path) {
-                    return match existing {
-                        FilesystemEntry::Directory(directory)
-                            if directory.scope.untracked == options.untracked =>
-                        {
-                            Ok(())
-                        }
-                        FilesystemEntry::Directory(directory) => Err(filesystem_conflict_error(format!(
-                            "fs.mkdir cannot write {} path {path:?} over existing {} directory",
-                            lane_name(options.untracked),
-                            lane_name(directory.scope.untracked)
-                        ))),
-                        FilesystemEntry::File(_) => Err(wrong_kind_error(&path, "directory", "file")),
-                    };
-                }
-                if options.untracked {
-                    filesystem.reject_tracked_path_collision(&path, "fs.mkdir")?;
-                }
-                let metadata = transaction_metadata(options.metadata, "fs.mkdir metadata")?;
-                let context = FilesystemRowContext {
-                    branch_id: branch_id.clone(),
-                    global: false,
-                    untracked: options.untracked,
-                    file_id: None,
-                    metadata,
-                };
-                let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
-                let key = filesystem_storage_scope_key(&branch_id, false, options.untracked, None);
-                let resolver = resolvers
-                    .entry(key)
-                    .or_insert_with(DirectoryPathResolver::default);
-                let rows = resolver.create_parsed_directory_path_with_leaf_id(
-                    parsed_path,
-                    None,
-                    context,
-                    &mut || transaction.functions().call_uuid_v7().to_string(),
-                )?;
-                if !rows.is_empty() {
-                    transaction
-                        .stage_write(TransactionWrite::Rows {
-                            mode: TransactionWriteMode::Replace,
-                            rows,
-                        })
-                        .await?;
-                }
-                Ok(())
-            })
-        })
-        .await
+        let path_value = Value::Text(path.to_string());
+        let root_result = self
+            .session
+            .execute(
+                "SELECT 1 AS is_root WHERE $1 = '/'",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        if !root_result.is_empty() {
+            return Ok(());
+        }
+
+        let existing = self
+            .session
+            .execute(
+                "SELECT id, lixcol_untracked FROM lix_directory WHERE path = $1",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        for row in existing.rows() {
+            let existing_untracked: bool = row.get("lixcol_untracked")?;
+            if existing_untracked != options.untracked {
+                return Err(filesystem_conflict_error(format!(
+                    "fs.mkdir cannot write {} path {path:?} over existing {} directory",
+                    lane_name(options.untracked),
+                    lane_name(existing_untracked)
+                )));
+            }
+        }
+        if !existing.is_empty() {
+            return Ok(());
+        }
+
+        self.session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_metadata, lixcol_untracked) \
+                 VALUES ($1, $2, $3)",
+                &[
+                    path_value,
+                    json_metadata_value(options.metadata),
+                    Value::Boolean(options.untracked),
+                ],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
-        let path = LixPath::try_from_directory_path(path)?.to_directory_path();
-        let _operation_guard = self.session.begin_session_operation()?;
-        let read = SharedStorageRead::new(
-            self.session
-                .storage
-                .begin_read(StorageReadOptions::default())?,
-        );
-        let active_branch_id = self.session.active_branch_id_from_reader(&read).await?;
-        let live_state = self.session.live_state.reader(&read);
-        let index = load_filesystem_index(&live_state, &active_branch_id).await?;
-        index.readdir(&path).map(|entries| {
-            entries.map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|entry| FsDirEntry {
-                        name: entry.name,
-                        path: entry.path,
-                        kind: match entry.kind {
-                            FilesystemDirEntryKind::File => FsDirEntryKind::File,
-                            FilesystemDirEntryKind::Directory => FsDirEntryKind::Directory,
-                        },
-                    })
-                    .collect()
-            })
-        })
+        let path_value = Value::Text(path.to_string());
+        let root_result = self
+            .session
+            .execute(
+                "SELECT 1 AS is_root WHERE $1 = '/'",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        let parent_id = if root_result.is_empty() {
+            let directory_result = self
+                .session
+                .execute(
+                    "SELECT id FROM lix_directory WHERE path = $1 LIMIT 1",
+                    std::slice::from_ref(&path_value),
+                )
+                .await?;
+            if let Some(row) = directory_result.rows().first() {
+                Some(row.get::<String>("id")?)
+            } else {
+                let file_result = self
+                    .session
+                    .execute(
+                        "SELECT id FROM lix_file \
+                         WHERE path = $1 OR concat(path, '/') = $1 \
+                         LIMIT 1",
+                        &[path_value],
+                    )
+                    .await?;
+                if !file_result.is_empty() {
+                    return Err(wrong_kind_error(path, "directory", "file"));
+                }
+                return Ok(None);
+            }
+        } else {
+            None
+        };
+
+        let entries = match parent_id {
+            Some(parent_id) => {
+                self.session
+                    .execute(
+                        "SELECT name, path, 'directory' AS kind, 0 AS kind_order \
+                         FROM lix_directory \
+                         WHERE parent_id = $1 \
+                         UNION ALL \
+                         SELECT name, path, 'file' AS kind, 1 AS kind_order \
+                         FROM lix_file \
+                         WHERE directory_id = $1 \
+                         ORDER BY name, kind_order",
+                        &[Value::Text(parent_id)],
+                    )
+                    .await?
+            }
+            None => {
+                self.session
+                    .execute(
+                        "SELECT name, path, 'directory' AS kind, 0 AS kind_order \
+                         FROM lix_directory \
+                         WHERE parent_id IS NULL \
+                         UNION ALL \
+                         SELECT name, path, 'file' AS kind, 1 AS kind_order \
+                         FROM lix_file \
+                         WHERE directory_id IS NULL \
+                         ORDER BY name, kind_order",
+                        &[],
+                    )
+                    .await?
+            }
+        };
+        Ok(Some(fs_entries_from_rows(&entries)?))
     }
 
     pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
-        let rm_path = parse_rm_path(path)?;
-        if matches!(rm_path, RmPath::Directory(ref path) if path == "/") {
+        let path_value = Value::Text(path.to_string());
+        let root_result = self
+            .session
+            .execute(
+                "SELECT 1 AS is_root WHERE $1 = '/'",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        if !root_result.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 "fs.rm cannot remove the root directory",
             ));
         }
-        self.session.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                let branch_id = transaction.active_branch_id().to_string();
-                let rows = scan_filesystem_rows(transaction, &branch_id).await?;
-                let filesystem = FilesystemIndex::from_live_rows(rows)?;
-                let Some((path, entry)) = resolve_rm_entry(&filesystem, &rm_path)? else {
-                    return Ok(());
-                };
-                reject_plugin_storage_rm(&path, entry, &filesystem, options.recursive)?;
-                let metadata = transaction_metadata(options.metadata, "fs.rm metadata")?;
-                let plan = match entry {
-                    FilesystemEntry::File(file) => {
-                        let mut context = file.context();
-                        context.metadata = metadata;
-                        plan_file_delete(FileDeleteInput {
-                            file_id: file.id.clone(),
-                            has_blob_ref: file.blob_hash.is_some(),
-                            context,
-                        })
-                    }
-                    FilesystemEntry::Directory(directory) => {
-                        let has_children = filesystem.has_children(directory);
-                        if has_children && !options.recursive {
-                            return Err(LixError::new(
-                                LixError::CODE_CONSTRAINT_VIOLATION,
-                                format!("fs.rm cannot remove non-empty directory {path:?} without recursive=true"),
-                            ));
-                        }
-                        let mut context = directory.context();
-                        context.metadata = metadata;
-                        if options.recursive {
-                            plan_recursive_directory_delete(&directory.id, &filesystem.visible_filesystem(), context)
-                        } else {
-                            plan_directory_delete(DirectoryDeleteInput {
-                                directory_id: directory.id.clone(),
-                                context,
-                            })
-                        }
-                    }
-                };
-                stage_delete_plan(transaction, plan).await
-            })
-        })
-        .await
-    }
-}
 
-fn reject_plugin_storage_rm(
-    removed_path: &str,
-    entry: &FilesystemEntry,
-    filesystem: &FilesystemIndex,
-    recursive: bool,
-) -> Result<(), LixError> {
-    reject_normal_plugin_storage_mutation(removed_path, "fs.rm")?;
-    if !recursive || !matches!(entry, FilesystemEntry::Directory(_)) {
-        return Ok(());
-    }
-    if filesystem.file_entries().any(|(candidate_path, _)| {
-        is_plugin_storage_path(candidate_path)
-            && path_is_inside_directory(candidate_path, removed_path)
-    }) {
-        return reject_normal_plugin_storage_mutation(
-            "/.lix_system/plugins/",
-            "fs.rm recursive directory delete",
-        );
-    }
-    Ok(())
-}
-
-fn path_is_inside_directory(path: &str, directory_path: &str) -> bool {
-    directory_path == "/" || path.starts_with(directory_path)
-}
-
-pub(crate) async fn scan_filesystem_rows<B>(
-    transaction: &mut crate::transaction::Transaction<B>,
-    branch_id: &str,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError>
-where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    transaction
-        .scan_live_state(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: filesystem_schema_keys(),
-                branch_ids: vec![branch_id.to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await
-}
-
-async fn scan_plugin_state_rows_from_reader(
-    live_state: &dyn LiveStateReader,
-    branch_id: &str,
-    file_id: &str,
-    plugin: &InstalledPlugin,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let rows = live_state
-        .scan_file_rows(&LiveStateFileScanRequest {
-            branch_ids: vec![branch_id.to_string()],
-            file_id: file_id.to_string(),
-            schema_keys: plugin.schema_keys.clone(),
-            projection: plugin_state_live_state_projection(),
-            ..Default::default()
-        })
-        .await?;
-    Ok(retain_plugin_state_rows(plugin, rows))
-}
-
-async fn read_plugin_file_bytes(
-    host: &impl crate::plugin::PluginComponentHost,
-    path: &str,
-    branch_id: &str,
-    index: &FilesystemIndex,
-    live_state: &dyn LiveStateReader,
-    blob_reader: &dyn BlobDataReader,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let Some(FilesystemEntry::File(file)) = index.entry(path) else {
-        return Ok(None);
-    };
-    if file.blob_hash.is_some() {
-        return Ok(None);
-    }
-
-    let installed_plugins = load_installed_plugins_from_filesystem(index, blob_reader).await?;
-    let Some(plugin) = select_plugin_for_path(&installed_plugins, path) else {
-        return Ok(None);
-    };
-
-    let active_state =
-        scan_plugin_state_rows_from_reader(live_state, branch_id, &file.id, plugin).await?;
-    render_materialized_plugin_file(host, plugin, &active_state).await
-}
-
-async fn stage_delete_plan<B>(
-    transaction: &mut crate::transaction::Transaction<B>,
-    plan: FilesystemDeletePlan,
-) -> Result<(), LixError>
-where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    if plan.rows.is_empty() {
-        return Ok(());
-    }
-    transaction
-        .stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows: plan.rows,
-        })
-        .await?;
-    Ok(())
-}
-
-fn transaction_metadata(
-    value: Option<JsonValue>,
-    context: &str,
-) -> Result<Option<TransactionJson>, LixError> {
-    value
-        .map(|value| TransactionJson::from_value(value, context))
-        .transpose()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RmPath {
-    Directory(String),
-    FileOrDirectory(String),
-}
-
-fn parse_rm_path(path: &str) -> Result<RmPath, LixError> {
-    if let Ok(directory_path) =
-        LixPath::try_from_directory_path(path).map(|path| path.to_directory_path())
-    {
-        return Ok(RmPath::Directory(directory_path));
-    }
-
-    Ok(RmPath::FileOrDirectory(
-        LixPath::try_from_file_path(path)?.to_file_path(),
-    ))
-}
-
-fn resolve_rm_entry<'a>(
-    filesystem: &'a FilesystemIndex,
-    path: &RmPath,
-) -> Result<Option<(String, &'a FilesystemEntry)>, LixError> {
-    match path {
-        RmPath::Directory(directory_path) => {
-            if let Some(entry @ FilesystemEntry::Directory(_)) = filesystem.entry(directory_path) {
-                return Ok(Some((directory_path.clone(), entry)));
-            }
-            if let Some(file_path) = directory_path.strip_suffix('/')
-                && matches!(filesystem.entry(file_path), Some(FilesystemEntry::File(_)))
-            {
-                return Err(wrong_kind_error(file_path, "directory", "file"));
-            }
-            Ok(None)
+        let file_result = self
+            .session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = $1 LIMIT 1",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        if let Some(row) = file_result.rows().first() {
+            let file_id: String = row.get("id")?;
+            self.session
+                .execute(
+                    "DELETE FROM lix_file WHERE id = $1",
+                    &[Value::Text(file_id)],
+                )
+                .await?;
+            return Ok(());
         }
-        RmPath::FileOrDirectory(file_path) => {
-            if let Some(entry @ FilesystemEntry::File(_)) = filesystem.entry(file_path) {
-                return Ok(Some((file_path.clone(), entry)));
+
+        let directory_result = self
+            .session
+            .execute(
+                "SELECT id, path FROM lix_directory \
+                 WHERE path = $1 OR path = concat($1, '/') \
+                 LIMIT 1",
+                std::slice::from_ref(&path_value),
+            )
+            .await?;
+        let Some(directory_row) = directory_result.rows().first() else {
+            let file_as_directory = self
+                .session
+                .execute(
+                    "SELECT id FROM lix_file WHERE concat(path, '/') = $1 LIMIT 1",
+                    &[path_value],
+                )
+                .await?;
+            if !file_as_directory.is_empty() {
+                return Err(wrong_kind_error(path, "directory", "file"));
             }
-            let directory_path = LixPath::try_from_file_path(file_path)
-                .expect("file path should parse before converting to a directory path")
-                .to_file_path()
-                + "/";
-            if let Some(entry @ FilesystemEntry::Directory(_)) = filesystem.entry(&directory_path) {
-                return Ok(Some((directory_path, entry)));
+            return Ok(());
+        };
+        let directory_id: String = directory_row.get("id")?;
+        let directory_path: String = directory_row.get("path")?;
+
+        if !options.recursive {
+            let child_result = self
+                .session
+                .execute(
+                    "SELECT name FROM lix_directory WHERE parent_id = $1 \
+                     UNION ALL \
+                     SELECT name FROM lix_file WHERE directory_id = $1 \
+                     LIMIT 1",
+                    &[Value::Text(directory_id.clone())],
+                )
+                .await?;
+            if !child_result.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!(
+                        "fs.rm cannot remove non-empty directory {directory_path:?} without recursive=true"
+                    ),
+                ));
             }
-            Ok(None)
         }
+
+        self.session
+            .execute(
+                "DELETE FROM lix_directory WHERE id = $1",
+                &[Value::Text(directory_id)],
+            )
+            .await?;
+        Ok(())
     }
 }
 
 fn lane_name(untracked: bool) -> &'static str {
     if untracked { "untracked" } else { "tracked" }
+}
+
+fn json_metadata_value(value: Option<JsonValue>) -> Value {
+    value.map(Value::Json).unwrap_or(Value::Null)
+}
+
+fn fs_entries_from_rows(result: &crate::ExecuteResult) -> Result<Vec<FsDirEntry>, LixError> {
+    result
+        .rows()
+        .iter()
+        .map(|row| {
+            let kind = match row.get::<String>("kind")?.as_str() {
+                "directory" => FsDirEntryKind::Directory,
+                "file" => FsDirEntryKind::File,
+                other => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("fs.readdir SQL returned unknown entry kind {other:?}"),
+                    ));
+                }
+            };
+            Ok(FsDirEntry {
+                name: row.get("name")?,
+                path: row.get("path")?,
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn wrong_kind_error(path: &str, expected: &str, actual: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!("fs path {path:?} expected {expected}, found {actual}"),
+    )
+}
+
+fn filesystem_conflict_error(message: String) -> LixError {
+    LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message)
 }

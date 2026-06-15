@@ -95,6 +95,62 @@ simulation_test!(
 );
 
 simulation_test!(
+    metadata_narrow_filesystem_projections_keep_descriptor_rows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let file_metadata = json!({"source": "file-narrow"});
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, lixcol_metadata) \
+                 VALUES ('metadata-narrow-file', '/metadata-narrow-file.txt', $1)",
+                &[Value::Json(file_metadata.clone())],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let file_result = session
+            .execute(
+                "SELECT id, lixcol_metadata \
+                 FROM lix_file \
+                 WHERE id = 'metadata-narrow-file'",
+                &[],
+            )
+            .await
+            .expect("narrow file metadata read should succeed");
+        assert_metadata_value(file_result, "lixcol_metadata", &file_metadata);
+
+        let directory_metadata = json!({"source": "directory-narrow"});
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_metadata) \
+                 VALUES ('metadata-narrow-dir', '/metadata-narrow-dir/', $1)",
+                &[Value::Json(directory_metadata.clone())],
+            )
+            .await
+            .expect("directory insert should succeed");
+
+        let directory_result = session
+            .execute(
+                "SELECT path, lixcol_metadata \
+                 FROM lix_directory \
+                 WHERE id = 'metadata-narrow-dir'",
+                &[],
+            )
+            .await
+            .expect("narrow directory metadata read should succeed");
+        assert_metadata_value(directory_result, "lixcol_metadata", &directory_metadata);
+    }
+);
+
+simulation_test!(
     metadata_rejects_invalid_json_on_typed_entity_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;
