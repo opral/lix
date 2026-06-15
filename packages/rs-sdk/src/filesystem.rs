@@ -399,7 +399,7 @@ where
         self.apply_local_snapshot_to_lix(&local, previous.as_ref())
             .await?;
         let lix = self.collect_lix_snapshot().await?;
-        let materialized = self.materialize_snapshot(&lix)?;
+        let materialized = self.materialize_snapshot_after_disk_sync(&lix, &local)?;
         self.remember_materialized(materialized);
         Ok(())
     }
@@ -538,6 +538,22 @@ where
     }
 
     fn materialize_snapshot(&self, target: &Snapshot) -> Result<Snapshot, LixError> {
+        self.materialize_snapshot_with_base(target, None)
+    }
+
+    fn materialize_snapshot_after_disk_sync(
+        &self,
+        target: &Snapshot,
+        base: &Snapshot,
+    ) -> Result<Snapshot, LixError> {
+        self.materialize_snapshot_with_base(target, Some(base))
+    }
+
+    fn materialize_snapshot_with_base(
+        &self,
+        target: &Snapshot,
+        base: Option<&Snapshot>,
+    ) -> Result<Snapshot, LixError> {
         ensure_filesystem_root_directory(&self.root)?;
         let local = collect_local_snapshot(&self.root)?;
         let previous = self.last_materialized();
@@ -549,6 +565,12 @@ where
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.files.contains_key(*path))
         }) {
+            if base.is_some_and(|snapshot| {
+                !snapshot.files.contains_key(path)
+                    || snapshot.files.get(path) != local.files.get(path)
+            }) {
+                continue;
+            }
             remove_materialized_file(&self.root, path)?;
         }
 
@@ -561,6 +583,12 @@ where
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.directories.contains(*path))
             })
+            .filter(|path| {
+                base.is_none_or(|snapshot| {
+                    snapshot.directories.contains(*path)
+                        && local.directories.contains(*path) == snapshot.directories.contains(*path)
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         sort_directories_deepest_first(&mut directories_to_remove);
@@ -572,6 +600,12 @@ where
             .directories
             .iter()
             .filter(|path| path.as_str() != "/" && !is_filesystem_metadata_path(path))
+            .filter(|path| base.is_none_or(|snapshot| !snapshot.directories.contains(*path)))
+            .filter(|path| {
+                base.is_none_or(|snapshot| {
+                    local.directories.contains(*path) == snapshot.directories.contains(*path)
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
@@ -584,6 +618,12 @@ where
             .iter()
             .filter(|(path, _)| !is_filesystem_metadata_path(path))
         {
+            if base.is_some_and(|snapshot| snapshot.files.get(path) == Some(data)) {
+                continue;
+            }
+            if base.is_some_and(|snapshot| snapshot.files.get(path) != local.files.get(path)) {
+                continue;
+            }
             if local.files.get(path) != Some(data) {
                 write_materialized_file(&self.root, path, data)?;
             }
@@ -1208,6 +1248,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 0);
+
+        state.close().await.unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn disk_sync_materialization_preserves_file_changed_after_import() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_engine(backend, None)
+            .await
+            .unwrap();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap();
+        let state = FilesystemState {
+            session: engine.open_workspace_session().await.unwrap(),
+            root,
+            sync_lock: tokio::sync::Mutex::new(()),
+            last_materialized: Mutex::new(None),
+        };
+
+        state.sync_disk_to_lix(false).await.unwrap();
+        let disk_path = tempdir.path().join("disk.txt");
+        std::fs::write(&disk_path, b"disk").unwrap();
+        let local = collect_local_snapshot(&state.root).unwrap();
+        let previous = state.last_materialized();
+        state
+            .apply_local_snapshot_to_lix(&local, previous.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .session
+                .fs()
+                .read_file("/disk.txt")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"disk".as_slice())
+        );
+        std::fs::write(&disk_path, b"changed").unwrap();
+
+        let target = state.collect_lix_snapshot().await.unwrap();
+        let materialized = state
+            .materialize_snapshot_after_disk_sync(&target, &local)
+            .unwrap();
+        state.remember_materialized(materialized);
+        assert_eq!(std::fs::read(&disk_path).unwrap(), b"changed");
+
+        state.sync_disk_to_lix(true).await.unwrap();
+        assert_eq!(
+            state
+                .session
+                .fs()
+                .read_file("/disk.txt")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"changed".as_slice())
+        );
 
         state.close().await.unwrap();
     }
