@@ -10,7 +10,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDir = join(__dirname, "..");
 const repoRoot = join(packageDir, "..", "..");
 const profile = "release";
-const targetDir = join(repoRoot, "target", "wasm32-wasip2", profile);
+const targetTriple = "wasm32-wasip2";
 const outDir = join(packageDir, "dist", "bundled-plugins");
 
 function run(cmd, args, opts = {}) {
@@ -24,6 +24,44 @@ function run(cmd, args, opts = {}) {
 	});
 }
 
+function output(cmd, args, opts = {}) {
+	return new Promise((resolve, reject) => {
+		let stdout = "";
+		const child = spawn(cmd, args, {
+			stdio: ["ignore", "pipe", "inherit"],
+			...opts,
+		});
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk;
+		});
+		child.on("error", reject);
+		child.on("exit", (code) => {
+			if (code === 0) resolve(stdout);
+			else reject(new Error(`${cmd} exited with code ${code ?? 1}`));
+		});
+	});
+}
+
+async function cargoTargetDir() {
+	const metadata = JSON.parse(
+		await output("cargo", [
+			"metadata",
+			"--manifest-path",
+			join(repoRoot, "Cargo.toml"),
+			"--format-version",
+			"1",
+			"--no-deps",
+		]),
+	);
+	if (typeof metadata.target_directory !== "string") {
+		throw new Error("cargo metadata did not include target_directory");
+	}
+	return metadata.target_directory;
+}
+
+const cargoTargetRoot = await cargoTargetDir();
+const targetDir = join(cargoTargetRoot, targetTriple, profile);
 const cargoArgs = [
 	"build",
 	"--manifest-path",
@@ -33,7 +71,9 @@ const cargoArgs = [
 	"-p",
 	"plugin_md_v2",
 	"--target",
-	"wasm32-wasip2",
+	targetTriple,
+	"--target-dir",
+	cargoTargetRoot,
 ];
 cargoArgs.push("--profile", profile);
 await run("cargo", cargoArgs);
@@ -84,6 +124,9 @@ async function findWasm(crateName) {
 	const direct = join(targetDir, `${crateName}.wasm`);
 	if (existsSync(direct)) {
 		return direct;
+	}
+	if (!existsSync(targetDir)) {
+		throw new Error(`Cargo target directory does not exist: ${targetDir}`);
 	}
 	const matches = await findFiles(targetDir, `${crateName}.wasm`);
 	if (matches.length === 0) {
