@@ -17,7 +17,7 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 use crate::sqlite_backend::SqliteBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
-const HOST_METADATA_GITIGNORE: &[u8] = b"*\n!.gitignore\n";
+const HOST_METADATA_GITIGNORE: &[u8] = b"*\n";
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
