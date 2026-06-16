@@ -4,6 +4,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::backend::{BackendError, Key, KeyRange, SpaceId};
 
+pub(crate) const MUTATION_REVISION_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0007_0001), "observe.mutation_revision");
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageSpace {
     pub id: SpaceId,

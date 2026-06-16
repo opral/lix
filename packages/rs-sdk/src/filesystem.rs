@@ -92,7 +92,13 @@ struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MaterializedSnapshot {
     disk: Snapshot,
-    lix: Snapshot,
+    lix_revision: LixRevision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LixRevision {
+    active_branch_id: String,
+    active_branch_commit_id: String,
 }
 
 enum FilesystemEvent {
@@ -393,7 +399,8 @@ where
         let _guard = self.sync_lock.lock().await;
         let lix = self.collect_lix_snapshot().await?;
         let disk = self.materialize_snapshot(&lix)?;
-        self.remember_materialized(disk, lix);
+        let lix_revision = self.collect_lix_revision().await?;
+        self.remember_materialized(disk, lix_revision);
         Ok(())
     }
 
@@ -401,8 +408,8 @@ where
         let _guard = self.sync_lock.lock().await;
         let local = collect_local_snapshot(&self.root)?;
         if skip_if_last_materialized && self.is_last_materialized_disk(&local) {
-            let lix = self.collect_lix_snapshot().await?;
-            if self.is_last_materialized(&local, &lix) {
+            let lix_revision = self.collect_lix_revision().await?;
+            if self.is_last_materialized(&local, &lix_revision) {
                 return Ok(());
             }
         }
@@ -411,7 +418,8 @@ where
             .await?;
         let lix = self.collect_lix_snapshot().await?;
         let materialized = self.materialize_snapshot_after_disk_sync(&lix, &local)?;
-        self.remember_materialized(materialized, lix);
+        let lix_revision = self.collect_lix_revision().await?;
+        self.remember_materialized(materialized, lix_revision);
         Ok(())
     }
 
@@ -444,6 +452,32 @@ where
             snapshot.files.insert(path, data);
         }
         Ok(snapshot)
+    }
+
+    async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
+        let active_branch_id = self.session.active_branch_id().await?;
+        let rows = self
+            .session
+            .execute(
+                "SELECT lix_active_branch_commit_id() AS active_branch_commit_id",
+                &[],
+            )
+            .await?;
+        let active_branch_commit_id = rows
+            .rows()
+            .first()
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "lix_active_branch_commit_id() returned no rows",
+                )
+            })?
+            .get::<String>("active_branch_commit_id")?;
+
+        Ok(LixRevision {
+            active_branch_id,
+            active_branch_commit_id,
+        })
     }
 
     async fn apply_local_snapshot_to_lix(
@@ -647,12 +681,12 @@ where
         Ok(remembered)
     }
 
-    fn remember_materialized(&self, disk: Snapshot, lix: Snapshot) {
+    fn remember_materialized(&self, disk: Snapshot, lix_revision: LixRevision) {
         *self
             .last_materialized
             .lock()
             .expect("filesystem materialized snapshot lock should not poison") =
-            Some(MaterializedSnapshot { disk, lix });
+            Some(MaterializedSnapshot { disk, lix_revision });
     }
 
     fn last_materialized_disk(&self) -> Option<Snapshot> {
@@ -671,12 +705,14 @@ where
             .is_some_and(|materialized| &materialized.disk == snapshot)
     }
 
-    fn is_last_materialized(&self, disk: &Snapshot, lix: &Snapshot) -> bool {
+    fn is_last_materialized(&self, disk: &Snapshot, lix_revision: &LixRevision) -> bool {
         self.last_materialized
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
-            .is_some_and(|materialized| &materialized.disk == disk && &materialized.lix == lix)
+            .is_some_and(|materialized| {
+                &materialized.disk == disk && &materialized.lix_revision == lix_revision
+            })
     }
 }
 
@@ -690,7 +726,7 @@ where
         return;
     };
     loop {
-        match event_rx.recv_timeout(Duration::from_secs(1)) {
+        match event_rx.recv() {
             Ok(FilesystemEvent::DiskChanged) => {
                 if drain_filesystem_events(&runtime, &state, &event_rx, true) {
                     return;
@@ -702,12 +738,9 @@ where
                     return;
                 }
             }
-            Ok(FilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(FilesystemEvent::Shutdown) | Err(_) => {
                 let _ = runtime.block_on(state.close());
                 return;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = runtime.block_on(state.sync_disk_to_lix(true));
             }
         }
     }
@@ -1368,9 +1401,9 @@ mod tests {
         state.sync_disk_to_lix(false).await.unwrap();
 
         let local = collect_local_snapshot(&state.root).unwrap();
-        let lix = state.collect_lix_snapshot().await.unwrap();
+        let lix_revision = state.collect_lix_revision().await.unwrap();
         assert!(
-            state.is_last_materialized(&local, &lix),
+            state.is_last_materialized(&local, &lix_revision),
             "an unchanged filesystem should be recognized as already materialized"
         );
 
@@ -1432,6 +1465,51 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn disk_sync_does_not_skip_lix_side_file_data_change() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_engine(backend, None)
+            .await
+            .unwrap();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap();
+        let state = FilesystemState {
+            session: engine.open_workspace_session().await.unwrap(),
+            root,
+            sync_lock: tokio::sync::Mutex::new(()),
+            last_materialized: Mutex::new(None),
+        };
+
+        state.sync_disk_to_lix(false).await.unwrap();
+        state
+            .session
+            .fs()
+            .write_file("/sql.txt", b"first".to_vec(), FsWriteOptions::default())
+            .await
+            .unwrap();
+        state.sync_from_lix().await.unwrap();
+        assert_eq!(
+            std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+            b"first"
+        );
+
+        state
+            .session
+            .fs()
+            .write_file("/sql.txt", b"second".to_vec(), FsWriteOptions::default())
+            .await
+            .unwrap();
+        state.sync_disk_to_lix(true).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+            b"second"
+        );
+
+        state.close().await.unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn disk_sync_materialization_preserves_file_changed_after_import() {
         let tempdir = tempfile::tempdir().unwrap();
         let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
@@ -1472,7 +1550,8 @@ mod tests {
         let materialized = state
             .materialize_snapshot_after_disk_sync(&target, &local)
             .unwrap();
-        state.remember_materialized(materialized, target);
+        let target_revision = state.collect_lix_revision().await.unwrap();
+        state.remember_materialized(materialized, target_revision);
         assert_eq!(std::fs::read(&disk_path).unwrap(), b"changed");
 
         state.sync_disk_to_lix(true).await.unwrap();

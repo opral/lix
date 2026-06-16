@@ -62,6 +62,9 @@ where
             self.closed = true;
             return Ok(None);
         }
+        self.session
+            .observe_invalidation
+            .ensure_external_watcher(self.session.storage.clone())?;
 
         if self.last_rows.is_none() {
             let Some((mutation_sequence, rows)) = self.evaluate_stable_snapshot().await? else {
@@ -81,7 +84,7 @@ where
                 return Ok(None);
             }
 
-            if self.receiver.changed().await.is_err() {
+            if !self.wait_for_invalidation().await? {
                 self.closed = true;
                 return Ok(None);
             }
@@ -112,6 +115,10 @@ where
 
     pub fn close(&mut self) {
         self.closed = true;
+    }
+
+    async fn wait_for_invalidation(&mut self) -> Result<bool, LixError> {
+        Ok(self.receiver.changed().await.is_ok())
     }
 
     async fn evaluate_stable_snapshot(&mut self) -> Result<Option<(u64, ExecuteResult)>, LixError> {

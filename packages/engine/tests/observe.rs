@@ -2,12 +2,13 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lix_engine::{
-    Backend, BackendError, Engine, InMemoryBackend, InMemoryRead, InMemoryWrite, ObserveEvent,
-    ReadOptions, SessionContext, Value, WriteOptions,
+    Backend, BackendError, BackendRead, Engine, GetOptions, InMemoryBackend, InMemoryRead,
+    InMemoryWrite, Key, KeyRange, ObserveEvent, PointVisitor, ReadOptions, ScanOptions, ScanResult,
+    ScanVisitor, SessionContext, SpaceId, Value, WriteOptions,
 };
 use serde_json::json;
 use support::simulation_test::engine::{SimSession, Simulation};
@@ -553,6 +554,12 @@ struct CountingReadBackend {
     read_count: Arc<AtomicUsize>,
 }
 
+struct CountingRead {
+    inner: InMemoryRead,
+    read_count: Arc<AtomicUsize>,
+    counted: AtomicBool,
+}
+
 impl CountingReadBackend {
     fn new() -> Self {
         Self {
@@ -572,7 +579,7 @@ impl CountingReadBackend {
 
 impl Backend for CountingReadBackend {
     type Read<'a>
-        = InMemoryRead
+        = CountingRead
     where
         Self: 'a;
 
@@ -582,12 +589,53 @@ impl Backend for CountingReadBackend {
         Self: 'a;
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        self.read_count.fetch_add(1, Ordering::SeqCst);
-        self.inner.begin_read(opts)
+        Ok(CountingRead {
+            inner: self.inner.begin_read(opts)?,
+            read_count: Arc::clone(&self.read_count),
+            counted: AtomicBool::new(false),
+        })
     }
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.inner.begin_write(opts)
+    }
+}
+
+impl BackendRead for CountingRead {
+    fn visit_keys<V>(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        self.count_user_read(space);
+        self.inner.visit_keys(space, keys, opts, visitor)
+    }
+
+    fn scan<V>(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        self.count_user_read(space);
+        self.inner.scan(space, range, opts, visitor)
+    }
+}
+
+impl CountingRead {
+    fn count_user_read(&self, space: SpaceId) {
+        if space != SpaceId(0x0007_0001) && !self.counted.swap(true, Ordering::SeqCst) {
+            self.read_count.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 

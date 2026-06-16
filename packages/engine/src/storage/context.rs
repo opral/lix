@@ -1,13 +1,20 @@
 use std::ops::Bound;
 
+use bytes::Bytes;
+
 use crate::backend::{
-    Backend, BackendError, BackendWrite, CommitResult, InMemoryBackend, KeyRange, Prefix,
-    ReadOptions, WriteOptions,
+    Backend, BackendError, BackendWrite, CommitResult, CoreProjection, GetOptions, InMemoryBackend,
+    Key, KeyRange, Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, StoredValue,
+    WriteOptions, get_many,
 };
 use crate::storage::{
     StorageRead, StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError,
     StorageWriteSetStats,
 };
+
+use super::spaces::MUTATION_REVISION_SPACE;
+
+const MUTATION_REVISION_KEY: &[u8] = b"global";
 
 #[derive(Clone, Debug)]
 pub struct StorageContext<B = InMemoryBackend> {
@@ -84,10 +91,38 @@ where
                 return Err(error);
             }
         };
+        if stats.staged_puts > 0 || stats.staged_deletes > 0 {
+            if let Err(error) = stage_mutation_revision(&mut write) {
+                let _ = write.rollback();
+                return Err(StorageWriteSetError::Backend(error));
+            }
+        }
         Ok(PreparedStorageCommit {
             write: Some(write),
             stats: Some(stats),
         })
+    }
+
+    pub(crate) fn load_mutation_revision(&self) -> Result<Option<Bytes>, BackendError> {
+        let read = self.backend.begin_read(ReadOptions::default())?;
+        let values = get_many(
+            &read,
+            MUTATION_REVISION_SPACE.id,
+            &[mutation_revision_key()],
+            GetOptions {
+                projection: CoreProjection::FullValue,
+                ..GetOptions::default()
+            },
+        )?;
+        Ok(values
+            .values
+            .into_iter()
+            .next()
+            .flatten()
+            .and_then(|value| match value {
+                ProjectedValue::FullValue(bytes) => Some(bytes),
+                ProjectedValue::KeyOnly => None,
+            }))
     }
 
     pub fn delete_range(
@@ -127,6 +162,27 @@ where
             opts,
         )
     }
+}
+
+fn mutation_revision_key() -> Key {
+    Key(Bytes::from_static(MUTATION_REVISION_KEY))
+}
+
+fn stage_mutation_revision<W>(write: &mut W) -> Result<(), BackendError>
+where
+    W: BackendWrite,
+{
+    write.put_many(
+        MUTATION_REVISION_SPACE.id,
+        PutBatch {
+            entries: vec![PutEntry {
+                key: mutation_revision_key(),
+                value: StoredValue {
+                    bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+                },
+            }],
+        },
+    )
 }
 
 impl<'a, B> PreparedStorageCommit<'a, B>
@@ -348,8 +404,10 @@ mod shape_tests {
     };
     use crate::storage::{PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
+    use super::MUTATION_REVISION_SPACE;
+
     #[test]
-    fn write_set_across_g_spaces_lowers_to_g_put_many_calls_and_one_commit() {
+    fn write_set_commit_stamps_mutation_revision_in_same_backend_commit() {
         let backend = CountingBackend::default();
         let storage = StorageContext::new(backend.clone());
         let mut writes = storage.new_write_set();
@@ -363,7 +421,7 @@ mod shape_tests {
 
         assert_eq!(backend.state.begin_write_calls.get(), 1);
         assert_eq!(backend.state.commit_calls.get(), 1);
-        assert_eq!(backend.state.put_batches.borrow().len(), 3);
+        assert_eq!(backend.state.put_batches.borrow().len(), 4);
         assert_eq!(
             backend
                 .state
@@ -376,6 +434,7 @@ mod shape_tests {
                 (SpaceId(1), vec![key("a")]),
                 (SpaceId(2), vec![key("a")]),
                 (SpaceId(3), vec![key("a")]),
+                (MUTATION_REVISION_SPACE.id, vec![key("global")]),
             ]
         );
     }
