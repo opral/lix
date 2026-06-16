@@ -3,7 +3,7 @@ use lix_engine::{
     Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry,
     FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, InstalledPluginInfo, LixError,
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    ObserveEvents, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -94,6 +94,10 @@ where
     /// handle instead.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.session.execute(sql, params).await
+    }
+
+    pub fn observe(&self, sql: &str, params: &[Value]) -> Result<ObserveEvents<B>, LixError> {
+        self.session.observe(sql, params)
     }
 
     pub async fn begin_transaction(&self) -> Result<LixTransaction<B>, LixError> {

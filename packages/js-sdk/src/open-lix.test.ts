@@ -135,6 +135,110 @@ test("committed writes survive close and reopen", async () => {
 	await second.close();
 });
 
+test("observe emits initial snapshot and committed updates", async () => {
+	const lix = await openLix();
+	const events = lix.observe(
+		"SELECT key, value FROM lix_key_value WHERE key = $1 ORDER BY key",
+		["js-observe"],
+	);
+
+	const initial = await events.next();
+	expect(initial?.sequence).toBe(0);
+	expect(typeof initial?.mutationSequence).toBe("number");
+	expect(initial?.result.rows).toHaveLength(0);
+
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe', 'v0')",
+	);
+
+	const update = await events.next();
+	expect(update?.sequence).toBe(1);
+	expect(update?.mutationSequence).toBeGreaterThanOrEqual(
+		initial?.mutationSequence ?? 0,
+	);
+	expect(update?.result.rows).toHaveLength(1);
+	expect(update?.result.rows[0]?.value("key").toJS()).toBe("js-observe");
+	expect(update?.result.rows[0]?.value("value").toJS()).toBe("v0");
+
+	events.close();
+	await expect(events.next()).resolves.toBeUndefined();
+	await lix.close();
+});
+
+test("observe rejects concurrent next calls on the same handle", async () => {
+	const lix = await openLix();
+	const events = lix.observe("SELECT key FROM lix_key_value WHERE key = $1", [
+		"js-observe-concurrent",
+	]);
+
+	await events.next();
+	const pending = events.next();
+	await expect(events.next()).rejects.toMatchObject({
+		code: "LIX_OBSERVE_NEXT_IN_FLIGHT",
+	});
+
+	events.close();
+	await expect(withTimeout(pending)).resolves.toBeUndefined();
+	await lix.close();
+});
+
+test("observe close resolves a pending next call", async () => {
+	const lix = await openLix();
+	const events = lix.observe("SELECT key FROM lix_key_value WHERE key = $1", [
+		"js-observe-close",
+	]);
+
+	await events.next();
+	const pending = events.next();
+	events.close();
+
+	await expect(withTimeout(pending)).resolves.toBeUndefined();
+	await expect(events.next()).resolves.toBeUndefined();
+	await lix.close();
+});
+
+test("observe close reliably resolves pending next calls", async () => {
+	const lix = await openLix();
+
+	for (let i = 0; i < 50; i += 1) {
+		const events = lix.observe("SELECT key FROM lix_key_value WHERE key = $1", [
+			`js-observe-close-stress-${i}`,
+		]);
+
+		await events.next();
+		const pending = events.next();
+		events.close();
+		await expect(withTimeout(pending)).resolves.toBeUndefined();
+	}
+
+	await lix.close();
+});
+
+test("observe remains usable after next rejects", async () => {
+	const lix = await openLix();
+	const events = lix.observe(
+		"SELECT key, value FROM lix_key_value WHERE key = $1",
+		["js-observe-error"],
+	);
+
+	const tx = await lix.beginTransaction();
+	await tx.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe-error', 'rolled-back')",
+	);
+	await expect(events.next()).rejects.toMatchObject({ name: "LixError" });
+	await tx.rollback();
+
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe-error', 'after-error')",
+	);
+	const update = await events.next();
+	expect(update?.sequence).toBe(0);
+	expect(update?.result.rows[0]?.value("value").toJS()).toBe("after-error");
+
+	events.close();
+	await lix.close();
+});
+
 test.each([
 	["memory", () => openLix()],
 	[
@@ -1080,6 +1184,25 @@ async function taskTitle(lix: Lix, taskId: string): Promise<string> {
 
 function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {
 	return result.rows[rowIndex]?.get(column);
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(
+					() => reject(new Error(`timed out after ${ms}ms`)),
+					ms,
+				);
+			}),
+		]);
+	} finally {
+		if (timeout !== undefined) {
+			clearTimeout(timeout);
+		}
+	}
 }
 
 function tempLixPath(): string {
