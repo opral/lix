@@ -10,14 +10,15 @@ use lix_engine::{
     Backend, BackendError, BackendWrite, CommitResult, Engine, LixError, PutBatch, ReadOptions,
     SessionContext, SpaceId, Value, WriteOptions,
 };
-use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 
 #[cfg(feature = "sqlite")]
 use crate::sqlite_backend::SqliteBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const HOST_METADATA_GITIGNORE: &[u8] = b"*\n";
+const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -315,10 +316,34 @@ where
         state.sync_from_lix().await?;
 
         let (event_tx, event_rx) = mpsc::channel();
+        let callback_tx = event_tx.clone();
+        let watcher_config = Config::default().with_follow_symlinks(false);
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+            Duration::from_millis(500),
+            None,
+            move |_result: DebounceEventResult| {
+                let _ = callback_tx.send(FilesystemEvent::DiskChanged);
+            },
+            RecommendedCache::new(),
+            watcher_config,
+        )
+        .ok()
+        .and_then(|mut debouncer| {
+            if debouncer
+                .watch(state.root.as_path(), RecursiveMode::Recursive)
+                .is_ok()
+            {
+                Some(debouncer)
+            } else {
+                debouncer.stop();
+                None
+            }
+        });
+        let poll_filesystem = cfg!(target_os = "macos") || debouncer.is_none();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::Builder::new()
             .name("lix-sdk-filesystem-sync".to_string())
-            .spawn(move || filesystem_worker(worker_state, event_rx))
+            .spawn(move || filesystem_worker(worker_state, event_rx, poll_filesystem))
             .map_err(|error| {
                 LixError::new(
                     "LIX_FILESYSTEM_THREAD_ERROR",
@@ -326,23 +351,10 @@ where
                 )
             })?;
 
-        let callback_tx = event_tx.clone();
-        let mut debouncer = new_debouncer(
-            Duration::from_millis(250),
-            None,
-            move |_result: DebounceEventResult| {
-                let _ = callback_tx.send(FilesystemEvent::DiskChanged);
-            },
-        )
-        .map_err(notify_error)?;
-        debouncer
-            .watch(state.root.as_path(), RecursiveMode::Recursive)
-            .map_err(notify_error)?;
-
         Ok(Self {
             inner: Arc::new(FilesystemSupervisorInner {
                 event_tx,
-                debouncer: Mutex::new(Some(debouncer)),
+                debouncer: Mutex::new(debouncer),
                 worker: Mutex::new(Some(worker)),
             }),
             _marker: PhantomData,
@@ -788,8 +800,11 @@ where
     Ok(())
 }
 
-fn filesystem_worker<B>(state: Arc<FilesystemState<B>>, event_rx: mpsc::Receiver<FilesystemEvent>)
-where
+fn filesystem_worker<B>(
+    state: Arc<FilesystemState<B>>,
+    event_rx: mpsc::Receiver<FilesystemEvent>,
+    poll_filesystem: bool,
+) where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
@@ -798,8 +813,15 @@ where
         return;
     };
     loop {
-        match event_rx.recv() {
-            Ok(FilesystemEvent::DiskChanged) => {
+        let e = if poll_filesystem {
+            event_rx.recv_timeout(FILESYSTEM_POLL_INTERVAL)
+        } else {
+            event_rx
+                .recv()
+                .map_err(|mpsc::RecvError| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match e {
+            Ok(FilesystemEvent::DiskChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {
                 if drain_filesystem_events(&runtime, &state, &event_rx, true) {
                     return;
                 }
@@ -810,7 +832,7 @@ where
                     return;
                 }
             }
-            Ok(FilesystemEvent::Shutdown) | Err(_) => {
+            Ok(FilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.block_on(state.close());
                 return;
             }
@@ -1301,13 +1323,6 @@ fn io_error(operation: &str, path: &Path, error: std::io::Error) -> LixError {
     LixError::new(
         "LIX_FILESYSTEM_IO_ERROR",
         format!("{operation} {path}: {error}"),
-    )
-}
-
-fn notify_error(error: notify_debouncer_full::notify::Error) -> LixError {
-    LixError::new(
-        "LIX_FILESYSTEM_NOTIFY_ERROR",
-        format!("filesystem watcher error: {error}"),
     )
 }
 

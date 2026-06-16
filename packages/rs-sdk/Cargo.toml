@@ -28,7 +28,7 @@ wasmtime = { version = "45", default-features = false, features = ["component-mo
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-notify-debouncer-full = "0.7.0"
+notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]

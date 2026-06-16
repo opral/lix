@@ -1055,13 +1055,24 @@ async fn filesystem_materialization_skips_special_file_collisions() {
 
     drop(listener);
     std::fs::remove_file(tempdir.path().join("socket")).unwrap();
-    wait_for_disk_file(&tempdir.path().join("socket"), Some(b"lix"));
+    wait_for_disk_file_with_timeout(
+        &tempdir.path().join("socket"),
+        Some(b"lix"),
+        Duration::from_secs(20),
+    );
     lix.close().await.unwrap();
 }
 
 #[cfg(feature = "sqlite")]
+#[track_caller]
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
+}
+
+#[cfg(feature = "sqlite")]
+#[track_caller]
+fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     let path_display = path.display();
     loop {
         let actual = std::fs::read(path).ok();

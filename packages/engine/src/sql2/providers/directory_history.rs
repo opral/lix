@@ -34,9 +34,7 @@ use crate::storage::StorageRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history::entity_pk_json_array;
-use super::spec::{
-    PlannedScan, TableSpec, projected_schema, register_spec_table, row_source,
-};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -431,4 +429,3 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
     ]))
 }
-

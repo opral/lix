@@ -352,7 +352,6 @@ where
     Ok(output)
 }
 
-
 fn file_history_events(
     event_descriptors: &[FileHistoryDescriptorRecord],
     event_directories: &[FileHistoryDirectoryRecord],
@@ -688,7 +687,6 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
     ]))
 }
-
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)

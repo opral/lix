@@ -2,17 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::execution::context::ExecutionProps;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use serde_json::Value as JsonValue;
 
+use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
@@ -25,7 +26,6 @@ use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
     entity_surface_schema,
 };
-use crate::LixError;
 use crate::sql2::error::lix_error_to_datafusion_error;
 
 use crate::sql2::{
@@ -937,7 +937,6 @@ fn identity_matches_parts(
         })
 }
 
-
 fn apply_entity_row_filters(
     rows: &mut Vec<MaterializedLiveStateRow>,
     filters: &[EntityRowFilter],
@@ -1194,12 +1193,12 @@ mod tests {
     use super::super::spec::SpecTableProvider;
     use super::entity_record_batch;
     use crate::LixError;
-    use crate::sql2::WriteAccess;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
+    use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
         EntityColumnType, EntitySurfaceShape, derive_entity_surface_spec_from_schema,
         entity_surface_schema, schema_exposed_as_entity_surface,
@@ -1322,7 +1321,10 @@ mod tests {
             .expect_err("raw DataFusion INSERT must be rejected at plan time");
 
         assert!(
-            matches!(error, datafusion::common::DataFusionError::NotImplemented(_)),
+            matches!(
+                error,
+                datafusion::common::DataFusionError::NotImplemented(_)
+            ),
             "rejection should keep the NotImplemented error type: {error:?}"
         );
         assert!(
