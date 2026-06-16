@@ -241,8 +241,8 @@ where
         self.transaction_manager.begin_session_operation()
     }
 
-    pub(super) fn begin_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
-        self.transaction_manager.begin_write_lease()
+    pub(super) async fn begin_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
+        self.transaction_manager.begin_write_lease().await
     }
 
     pub(super) fn begin_explicit_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
@@ -250,7 +250,7 @@ where
     }
 
     pub(super) async fn begin_session_write_access(&self) -> Result<SessionWriteAccess, LixError> {
-        let write_lease = self.begin_session_write_lease()?;
+        let write_lease = self.begin_session_write_lease().await?;
         self.begin_session_write_access_with_lease(write_lease)
             .await
     }

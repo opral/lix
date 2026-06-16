@@ -289,8 +289,25 @@ impl SessionTransactionManager {
         })
     }
 
-    pub(super) fn begin_write_lease(&self) -> Result<SessionWriteLease, LixError> {
-        self.begin_write_lease_for(TransactionOwner::Automatic)
+    pub(super) async fn begin_write_lease(&self) -> Result<SessionWriteLease, LixError> {
+        loop {
+            let notified = self.inner.state_changed.notified();
+            let wait_for_session_operation = {
+                let mut state = self.lock_state();
+                if state.is_session_operation_in_progress() {
+                    true
+                } else {
+                    state.begin_write_lease(TransactionOwner::Automatic)?;
+                    false
+                }
+            };
+            if wait_for_session_operation {
+                notified.await;
+                continue;
+            }
+            self.inner.state_changed.notify_waiters();
+            return self.open_reserved_write_lease();
+        }
     }
 
     pub(super) fn begin_explicit_write_lease(&self) -> Result<SessionWriteLease, LixError> {
@@ -307,6 +324,10 @@ impl SessionTransactionManager {
         }
         self.inner.state_changed.notify_waiters();
 
+        self.open_reserved_write_lease()
+    }
+
+    fn open_reserved_write_lease(&self) -> Result<SessionWriteLease, LixError> {
         let operation_guard = SessionOperationGuard {
             manager: self.clone(),
         };
@@ -412,6 +433,10 @@ impl SessionTransactionState {
                 ..
             }
         )
+    }
+
+    fn is_session_operation_in_progress(&self) -> bool {
+        matches!(self, Self::OpenOperation { .. })
     }
 
     fn begin_operation(&mut self, scope: SessionOperationScope) -> Result<(), LixError> {

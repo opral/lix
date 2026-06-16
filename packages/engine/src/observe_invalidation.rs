@@ -52,7 +52,6 @@ impl ObserveInvalidation {
         for<'backend> B::Read<'backend>: Send,
         for<'backend> B::Write<'backend>: Send,
     {
-        let mut last_seen_revision = storage.load_mutation_revision()?;
         if self
             .external_watcher_started
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -60,6 +59,14 @@ impl ObserveInvalidation {
         {
             return Ok(());
         }
+        let mut last_seen_revision = match storage.load_mutation_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.external_watcher_started
+                    .store(false, Ordering::SeqCst);
+                return Err(error.into());
+            }
+        };
         let invalidation = Arc::downgrade(self);
         let spawn_result = thread::Builder::new()
             .name("lix-observe-invalidation".to_string())
