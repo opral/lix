@@ -13,6 +13,7 @@ use bytes::Bytes;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
+use lix_backends::{RedbBackend, RocksDbBackend, SqliteBackend};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
     InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
@@ -24,24 +25,9 @@ use lix_engine::storage::{
     PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
     StorageReadStats, StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
-use redb_backend_v2::RedbBackend;
-use rocksdb_backend_v2::RocksDbBackend;
 use rustc_hash::FxBuildHasher;
-use sqlite_backend_v2::SqliteBackend;
 use tempfile::TempDir;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
-
-#[expect(dead_code)]
-#[path = "../tests/backend/support/redb_backend.rs"]
-mod redb_backend_v2;
-
-#[expect(dead_code)]
-#[path = "../tests/backend/support/rocksdb_backend.rs"]
-mod rocksdb_backend_v2;
-
-#[expect(dead_code)]
-#[path = "../tests/backend/support/sqlite_backend.rs"]
-mod sqlite_backend_v2;
 
 fn storage_benchmark_group<'a>(
     c: &'a mut Criterion,

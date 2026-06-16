@@ -1,5 +1,3 @@
-#![expect(dead_code)]
-
 use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
     CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry, FsMkdirOptions,
@@ -15,6 +13,10 @@ use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 
 /// Per-mode handle exposed to tests using `simulation_test!`.
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 pub struct Simulation {
     mode: SimulationMode,
     backend: InMemoryBackend,
@@ -24,6 +26,10 @@ pub struct Simulation {
     assertions: SimulationAssertions,
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 impl Simulation {
     pub(super) async fn from_bootstrap(
         mode: SimulationMode,
@@ -98,6 +104,10 @@ impl Simulation {
 }
 
 /// Session wrapper that injects simulation behavior around normal execution.
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 pub struct SimSession {
     sim: Simulation,
     engine: Engine,
@@ -105,6 +115,10 @@ pub struct SimSession {
     pub fs: SimFs,
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 impl SimSession {
     pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> Self {
         Self {
@@ -201,12 +215,20 @@ impl SimSession {
 }
 
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 pub struct SimFs {
     sim: Simulation,
     engine: Engine,
     session: SessionContext,
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 impl SimFs {
     fn new(sim: Simulation, engine: Engine, session: SessionContext) -> Self {
         Self {
@@ -265,6 +287,10 @@ impl SimFs {
 }
 
 /// Transaction wrapper that injects simulation behavior around normal execution.
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 pub struct SimTransaction {
     sim: Simulation,
     engine: Engine,
@@ -273,6 +299,10 @@ pub struct SimTransaction {
     saw_write: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test harness is compiled once per test target"
+)]
 impl SimTransaction {
     pub async fn execute(
         &mut self,

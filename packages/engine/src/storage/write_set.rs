@@ -125,6 +125,7 @@ impl StorageWriteSet {
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
+    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn apply<B>(
         self,
         writer: &mut crate::storage::context::StorageWriteTransaction<'_, B>,

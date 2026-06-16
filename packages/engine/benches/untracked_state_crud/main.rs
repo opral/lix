@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use lix_backends::{RedbBackend, RocksDbBackend, SqliteBackend};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, Key, KeyRange,
     PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
@@ -21,20 +22,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
-
-#[expect(dead_code)]
-#[path = "../../tests/backend/support/redb_backend.rs"]
-mod redb_backend;
-#[expect(dead_code)]
-#[path = "../../tests/backend/support/rocksdb_backend.rs"]
-mod rocksdb_backend;
-#[expect(dead_code)]
-#[path = "../../tests/backend/support/sqlite_backend.rs"]
-mod sqlite_backend;
-
-use redb_backend::RedbBackend;
-use rocksdb_backend::RocksDbBackend;
-use sqlite_backend::SqliteBackend;
 
 const SMOKE_ROWS: usize = 1_000;
 const REAL_WORKLOAD_ROWS: usize = 10_000;

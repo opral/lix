@@ -1,8 +1,10 @@
 use super::types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitScanBatch,
-    CommitScanRequest, GcPlan, GcRoot,
+    CommitScanRequest,
 };
+#[cfg(feature = "storage-benches")]
+use super::types::{GcPlan, GcRoot};
 use crate::common::LixError;
 use crate::storage::{StorageSpace, StorageSpaceId};
 use async_trait::async_trait;
@@ -61,6 +63,7 @@ fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
 
 #[async_trait]
 pub(crate) trait ChangelogReader {
+    #[cfg(feature = "storage-benches")]
     async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 
     async fn load_commits(
@@ -88,6 +91,7 @@ pub(crate) trait ChangelogReader {
 pub(crate) trait ChangelogWriter {
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError>;
 
+    #[cfg(feature = "storage-benches")]
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 }
 

@@ -22,6 +22,7 @@ pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
     ChangeScanRequest, ChangelogAppend, CommitChangeRefChunk, CommitChangeRefSet, CommitId,
     CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitScanBatch, CommitScanRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet,
-    RebuildIndexStats, commit_row_snapshot_json,
+    CommitScanBatch, CommitScanRequest, commit_row_snapshot_json,
 };
+#[cfg(feature = "storage-benches")]
+pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats};

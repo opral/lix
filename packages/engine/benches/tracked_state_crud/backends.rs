@@ -1,18 +1,5 @@
+pub(crate) use lix_backends::{RedbBackend, RocksDbBackend, SqliteBackend};
 use tempfile::TempDir;
-
-#[expect(dead_code)]
-#[path = "../../tests/backend/support/redb_backend.rs"]
-mod redb_backend;
-#[expect(dead_code)]
-#[path = "../../tests/backend/support/rocksdb_backend.rs"]
-mod rocksdb_backend;
-#[expect(dead_code)]
-#[path = "../../tests/backend/support/sqlite_backend.rs"]
-mod sqlite_backend;
-
-pub(crate) use redb_backend::RedbBackend;
-pub(crate) use rocksdb_backend::RocksDbBackend;
-pub(crate) use sqlite_backend::SqliteBackend;
 
 #[derive(Clone, Copy)]
 pub(crate) enum BackendProfile {

@@ -1,25 +1,15 @@
 use std::sync::Arc;
 
+use lix_backends::{
+    RedbBackend, RedbRead, RedbWrite, RocksDbBackend, RocksDbRead, RocksDbWrite, SqliteBackend,
+    SqliteRead, SqliteWrite,
+};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
     InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
     ScanResult, ScanVisitor, SpaceId, WriteOptions,
 };
 use tempfile::TempDir;
-
-#[expect(dead_code)]
-#[path = "../../../tests/backend/support/redb_backend.rs"]
-mod redb_backend;
-#[expect(dead_code)]
-#[path = "../../../tests/backend/support/rocksdb_backend.rs"]
-mod rocksdb_backend;
-#[expect(dead_code)]
-#[path = "../../../tests/backend/support/sqlite_backend.rs"]
-mod sqlite_backend;
-
-use redb_backend::{RedbBackend, RedbRead, RedbWrite};
-use rocksdb_backend::{RocksDbBackend, RocksDbRead, RocksDbWrite};
-use sqlite_backend::{SqliteBackend, SqliteRead, SqliteWrite};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChangelogBenchBackend {

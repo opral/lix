@@ -3,7 +3,7 @@ use crate::LixError;
 use crate::storage_codec;
 use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
 
-#[cfg_attr(not(feature = "storage-benches"), expect(dead_code))]
+#[cfg(feature = "storage-benches")]
 pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("untracked-state row", &row)
 }

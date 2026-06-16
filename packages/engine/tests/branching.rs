@@ -1,5 +1,4 @@
 #[macro_use]
-#[path = "support/mod.rs"]
 mod support;
 
 use lix_engine::Value;

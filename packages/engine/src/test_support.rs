@@ -1,9 +1,8 @@
-#![cfg_attr(all(feature = "storage-benches", not(test)), expect(dead_code))]
-
+use std::collections::BTreeMap;
+#[cfg(test)]
 use std::sync::Arc;
 
-use std::collections::BTreeMap;
-
+#[cfg(test)]
 use crate::branch::BranchContext;
 use crate::changelog::CommitId;
 use crate::changelog::{
@@ -11,13 +10,16 @@ use crate::changelog::{
     ChangelogWriter, CommitChangeRefSet, CommitRecord,
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+#[cfg(test)]
 use crate::storage::StorageContext;
 use crate::storage::StorageRead;
 use crate::storage::StorageWriteSet;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
 };
+#[cfg(test)]
 use crate::transaction::prepare_branch_ref_row;
+#[cfg(test)]
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRow,
 };
@@ -25,8 +27,10 @@ use crate::untracked_state::{
 fn prepare_json_ref(value: &str) -> JsonRef {
     JsonRef::for_content(value.as_bytes())
 }
+#[cfg(test)]
 use crate::GLOBAL_BRANCH_ID;
 
+#[cfg(test)]
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000001";
 const TEST_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
@@ -47,16 +51,19 @@ fn test_change_id(value: &str) -> ChangeId {
 /// A branch ref that points at a commit without a tracked root is invalid for
 /// the serving state. This helper keeps that invariant in one place while
 /// still letting low-level tests use synthetic commit ids.
+#[cfg(test)]
 pub(crate) async fn seed_branch_head(storage: StorageContext, branch_id: &str, commit_id: &str) {
     seed_branch_head_with_rows(storage, branch_id, commit_id, &[]).await;
 }
 
 /// Seeds the global branch head to an empty tracked root for unit tests.
+#[cfg(test)]
 pub(crate) async fn seed_global_branch_head(storage: StorageContext) {
     seed_branch_head(storage, GLOBAL_BRANCH_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
 }
 
 /// Seeds a branch head and writes the tracked root contents for its commit.
+#[cfg(test)]
 pub(crate) async fn seed_branch_head_with_rows(
     storage: StorageContext,
     branch_id: &str,
@@ -162,6 +169,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
     read: &mut (impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
@@ -240,6 +248,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn stage_empty_changelog_commit(
     read: &mut (impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
@@ -266,6 +275,7 @@ pub(crate) async fn stage_empty_changelog_commit(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn stage_empty_changelog_commit_with_parents(
     read: &mut (impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
@@ -474,6 +484,7 @@ pub(crate) fn tracked_change_from_materialized(
 }
 
 #[expect(clippy::unnecessary_wraps)]
+#[cfg(test)]
 pub(crate) fn untracked_state_row_from_materialized(
     _writes: &mut StorageWriteSet,
     row: &MaterializedUntrackedStateRow,

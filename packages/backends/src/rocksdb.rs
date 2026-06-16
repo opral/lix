@@ -26,20 +26,29 @@ pub struct RocksDbBackendFixture {
 }
 
 #[derive(Clone)]
+#[allow(missing_debug_implementations)]
 pub struct RocksDbBackend {
     path: PathBuf,
     db: Arc<DB>,
 }
 
+#[allow(missing_debug_implementations)]
 pub struct RocksDbRead<'a> {
     snapshot: Snapshot<'a>,
 }
 
+#[allow(missing_debug_implementations)]
 pub struct RocksDbWrite {
     db: Arc<DB>,
     batch: WriteBatch,
     staged_put_keys: Vec<Key>,
     stats: WriteStats,
+}
+
+impl Default for RocksDbBackendFactory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RocksDbBackendFactory {
