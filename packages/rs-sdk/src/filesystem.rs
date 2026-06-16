@@ -79,7 +79,7 @@ where
     session: SessionContext<B>,
     root: PathBuf,
     sync_lock: tokio::sync::Mutex<()>,
-    last_materialized: Mutex<Option<Snapshot>>,
+    last_materialized: Mutex<Option<MaterializedSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -87,6 +87,12 @@ struct Snapshot {
     directories: BTreeSet<String>,
     files: BTreeMap<String, Vec<u8>>,
     unmanaged_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializedSnapshot {
+    disk: Snapshot,
+    lix: Snapshot,
 }
 
 enum FilesystemEvent {
@@ -385,24 +391,27 @@ where
 {
     async fn sync_from_lix(&self) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
-        let snapshot = self.collect_lix_snapshot().await?;
-        let materialized = self.materialize_snapshot(&snapshot)?;
-        self.remember_materialized(materialized);
+        let lix = self.collect_lix_snapshot().await?;
+        let disk = self.materialize_snapshot(&lix)?;
+        self.remember_materialized(disk, lix);
         Ok(())
     }
 
     async fn sync_disk_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
         let local = collect_local_snapshot(&self.root)?;
-        if skip_if_last_materialized && self.is_last_materialized(&local) {
-            return Ok(());
+        if skip_if_last_materialized && self.is_last_materialized_disk(&local) {
+            let lix = self.collect_lix_snapshot().await?;
+            if self.is_last_materialized(&local, &lix) {
+                return Ok(());
+            }
         }
-        let previous = self.last_materialized();
+        let previous = self.last_materialized_disk();
         self.apply_local_snapshot_to_lix(&local, previous.as_ref())
             .await?;
         let lix = self.collect_lix_snapshot().await?;
         let materialized = self.materialize_snapshot_after_disk_sync(&lix, &local)?;
-        self.remember_materialized(materialized);
+        self.remember_materialized(materialized, lix);
         Ok(())
     }
 
@@ -412,6 +421,7 @@ where
 
     async fn collect_lix_snapshot(&self) -> Result<Snapshot, LixError> {
         let mut snapshot = Snapshot::default();
+        snapshot.directories.insert("/".to_string());
         let directories = self
             .session
             .execute("SELECT path FROM lix_directory ORDER BY path", &[])
@@ -558,7 +568,7 @@ where
     ) -> Result<Snapshot, LixError> {
         ensure_filesystem_root_directory(&self.root)?;
         let local = collect_local_snapshot(&self.root)?;
-        let previous = self.last_materialized();
+        let previous = self.last_materialized_disk();
 
         for path in local.files.keys().filter(|path| {
             !target.files.contains_key(*path)
@@ -637,26 +647,36 @@ where
         Ok(remembered)
     }
 
-    fn remember_materialized(&self, snapshot: Snapshot) {
+    fn remember_materialized(&self, disk: Snapshot, lix: Snapshot) {
         *self
             .last_materialized
             .lock()
-            .expect("filesystem materialized snapshot lock should not poison") = Some(snapshot);
+            .expect("filesystem materialized snapshot lock should not poison") =
+            Some(MaterializedSnapshot { disk, lix });
     }
 
-    fn last_materialized(&self) -> Option<Snapshot> {
-        self.last_materialized
-            .lock()
-            .expect("filesystem materialized snapshot lock should not poison")
-            .clone()
-    }
-
-    fn is_last_materialized(&self, snapshot: &Snapshot) -> bool {
+    fn last_materialized_disk(&self) -> Option<Snapshot> {
         self.last_materialized
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
-            == Some(snapshot)
+            .map(|snapshot| snapshot.disk.clone())
+    }
+
+    fn is_last_materialized_disk(&self, snapshot: &Snapshot) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| &materialized.disk == snapshot)
+    }
+
+    fn is_last_materialized(&self, disk: &Snapshot, lix: &Snapshot) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| &materialized.disk == disk && &materialized.lix == lix)
     }
 }
 
@@ -1331,6 +1351,34 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn disk_sync_remembers_canonical_snapshot_for_idle_skip() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_engine(backend, None)
+            .await
+            .unwrap();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap();
+        let state = FilesystemState {
+            session: engine.open_workspace_session().await.unwrap(),
+            root,
+            sync_lock: tokio::sync::Mutex::new(()),
+            last_materialized: Mutex::new(None),
+        };
+
+        state.sync_disk_to_lix(false).await.unwrap();
+
+        let local = collect_local_snapshot(&state.root).unwrap();
+        let lix = state.collect_lix_snapshot().await.unwrap();
+        assert!(
+            state.is_last_materialized(&local, &lix),
+            "an unchanged filesystem should be recognized as already materialized"
+        );
+
+        state.close().await.unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn disk_sync_does_not_reimport_unchanged_materialized_file_deleted_in_lix() {
         let tempdir = tempfile::tempdir().unwrap();
         let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
@@ -1402,7 +1450,7 @@ mod tests {
         let disk_path = tempdir.path().join("disk.txt");
         std::fs::write(&disk_path, b"disk").unwrap();
         let local = collect_local_snapshot(&state.root).unwrap();
-        let previous = state.last_materialized();
+        let previous = state.last_materialized_disk();
         state
             .apply_local_snapshot_to_lix(&local, previous.as_ref())
             .await
@@ -1424,7 +1472,7 @@ mod tests {
         let materialized = state
             .materialize_snapshot_after_disk_sync(&target, &local)
             .unwrap();
-        state.remember_materialized(materialized);
+        state.remember_materialized(materialized, target);
         assert_eq!(std::fs::read(&disk_path).unwrap(), b"changed");
 
         state.sync_disk_to_lix(true).await.unwrap();

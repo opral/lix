@@ -580,8 +580,7 @@ async fn observe_next(
         changed = close_signal.changed() => {
             events.close();
             match changed {
-                Ok(()) => Ok(None),
-                Err(_) => Ok(None),
+                Ok(()) | Err(_) => Ok(None),
             }
         }
     };

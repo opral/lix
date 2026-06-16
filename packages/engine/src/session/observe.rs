@@ -37,7 +37,7 @@ pub struct ObserveEvent {
 }
 
 #[expect(missing_debug_implementations)]
-pub struct ObserveEvents<B: StorageBackend = InMemoryStorageBackend>
+pub struct ObserveEvents<B = InMemoryStorageBackend>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,

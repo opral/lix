@@ -141,8 +141,7 @@ impl ObserveQueryState {
                     return Ok(rows.clone());
                 }
 
-                if !inner.in_flight.contains(&generation) {
-                    inner.in_flight.insert(generation);
+                if inner.in_flight.insert(generation) {
                     break;
                 }
 
