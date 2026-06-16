@@ -19,7 +19,7 @@ mod binary_cas;
 pub(crate) mod branch;
 pub(crate) mod catalog;
 pub(crate) mod cel;
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 pub mod changelog;
 pub(crate) mod commit_graph;
 mod common;
@@ -29,20 +29,18 @@ pub(crate) mod entity_pk;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod init;
-#[allow(dead_code)]
 pub(crate) mod json_store;
 pub(crate) mod live_state;
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 pub mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
-#[cfg_attr(feature = "storage-benches", allow(dead_code))]
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
 #[cfg(feature = "storage-benches")]

@@ -342,7 +342,6 @@ pub(crate) struct CommitChangeRefChunkWireRef<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitProjection {
     Record,
-    ChangeRefs,
     Full,
 }
 
@@ -373,7 +372,6 @@ pub(crate) struct CommitScanBatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommitLoadEntry {
     Record(CommitRecord),
-    ChangeRefs(Vec<CommitChangeRefChunk>),
     Full {
         record: CommitRecord,
         change_ref_chunks: Vec<CommitChangeRefChunk>,
@@ -455,17 +453,6 @@ pub(crate) struct RebuildIndexStats {
     pub(crate) put: usize,
     pub(crate) deleted: usize,
     pub(crate) unchanged: usize,
-}
-
-impl RebuildIndexStats {
-    pub(crate) fn combine(self, other: Self) -> Self {
-        Self {
-            expected: self.expected + other.expected,
-            put: self.put + other.put,
-            deleted: self.deleted + other.deleted,
-            unchanged: self.unchanged + other.unchanged,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

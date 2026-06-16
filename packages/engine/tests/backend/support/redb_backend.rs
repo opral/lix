@@ -91,7 +91,6 @@ impl RedbBackend {
         Ok(Self { path, db })
     }
 
-    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -20,8 +20,6 @@ pub(crate) const COMMIT_CHANGE_REF_CHUNK_SPACE: StorageSpace = StorageSpace::new
     COMMIT_CHANGE_REF_CHUNK_NAMESPACE,
 );
 
-const ID_KEY_LEN: usize = 16;
-
 // Identity keys are the raw 16 UUID bytes. UUIDv7's big-endian byte order
 // matches the lexicographic order of its lowercase hyphenated text, so range
 // scans and resume tokens behave identically to the former text keys at
@@ -59,25 +57,6 @@ fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
             format!("changelog {kind} key is not a 16-byte uuid: {error}"),
         )
     })
-}
-
-pub(crate) fn commit_change_ref_chunk_ids_from_key(
-    key: &[u8],
-) -> Result<(CommitId, u32), LixError> {
-    if key.len() != ID_KEY_LEN + 4 {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "changelog commit_change_ref_chunk key has invalid length",
-        ));
-    }
-    let mut commit_id = [0u8; ID_KEY_LEN];
-    commit_id.copy_from_slice(&key[..ID_KEY_LEN]);
-    let mut chunk_no = [0u8; 4];
-    chunk_no.copy_from_slice(&key[ID_KEY_LEN..]);
-    Ok((
-        CommitId::new(uuid::Uuid::from_bytes(commit_id)),
-        u32::from_be_bytes(chunk_no),
-    ))
 }
 
 #[async_trait]
@@ -138,7 +117,7 @@ mod tests {
             change_key(change_id),
             change_id.as_uuid().as_bytes().to_vec()
         );
-        assert_eq!(commit_key(commit_id).len(), ID_KEY_LEN);
+        assert_eq!(commit_key(commit_id).len(), 16);
     }
 
     #[test]
@@ -167,9 +146,7 @@ mod tests {
         let key = commit_change_ref_chunk_key(commit_id, 42);
         assert!(key.starts_with(&prefix));
         assert!(!commit_change_ref_chunk_key(other_commit_id, 0).starts_with(&prefix));
-        assert_eq!(
-            commit_change_ref_chunk_ids_from_key(&key).unwrap(),
-            (commit_id, 42)
-        );
+        assert_eq!(&key[..16], commit_id.as_uuid().as_bytes());
+        assert_eq!(&key[16..], 42u32.to_be_bytes());
     }
 }

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![expect(dead_code)]
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;

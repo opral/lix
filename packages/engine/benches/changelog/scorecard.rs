@@ -12,6 +12,13 @@ use backends::ChangelogBenchBackend;
 
 type TimedFuture = Pin<Box<dyn Future<Output = Result<Duration, LixError>>>>;
 
+const BACKENDS: [ChangelogBenchBackend; 4] = [
+    ChangelogBenchBackend::Unit,
+    ChangelogBenchBackend::SqliteTempfile,
+    ChangelogBenchBackend::RocksDbTempdir,
+    ChangelogBenchBackend::RedbTempfile,
+];
+
 fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -328,7 +335,7 @@ async fn backend_row(
         redb_tempfile: Duration::ZERO,
     };
 
-    for backend in ChangelogBenchBackend::CI {
+    for backend in BACKENDS {
         eprintln!("scorecard: {label} / {backend:?}");
         let duration = measure_async(samples, || op(backend)).await?;
         match backend {

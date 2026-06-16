@@ -1,9 +1,7 @@
 use crate::LixError;
 use crate::json_store::store;
 use crate::json_store::types::{
-    JsonLoadBatch, JsonLoadRequestRef, JsonProjection, JsonProjectionBatch,
-    JsonProjectionLoadRequestRef, JsonRef, JsonValueBatch, JsonWritePlacementRef,
-    NormalizedJsonRef,
+    JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::storage::{StorageKey, StorageRead, StorageValue, StorageWriteSet};
 use bytes::Bytes;
@@ -68,61 +66,6 @@ where
         store::load_json_bytes_many_in_scope(&self.store, request.refs, request.scope)
             .await
             .map(JsonLoadBatch::new)
-    }
-
-    pub(crate) async fn load_values_many(
-        &mut self,
-        request: JsonLoadRequestRef<'_>,
-    ) -> Result<JsonValueBatch, LixError> {
-        let refs = request.refs;
-        let values = self
-            .load_bytes_many(request)
-            .await?
-            .into_values()
-            .into_iter()
-            .enumerate()
-            .map(|(index, bytes)| {
-                bytes.map_or(Ok(None), |bytes| {
-                    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!(
-                                "json ref '{}' is invalid JSON: {error}",
-                                refs[index].to_hex()
-                            ),
-                        )
-                    })
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(JsonValueBatch::new(values))
-    }
-
-    pub(crate) async fn load_projections_many(
-        &mut self,
-        request: JsonProjectionLoadRequestRef<'_>,
-    ) -> Result<JsonProjectionBatch, LixError> {
-        let values = self
-            .load_values_many(JsonLoadRequestRef {
-                refs: request.refs,
-                scope: request.scope,
-            })
-            .await?
-            .into_values()
-            .into_iter()
-            .map(|value| {
-                value.map(|value| {
-                    JsonProjection::new(
-                        request
-                            .paths
-                            .iter()
-                            .map(|path| value.pointer(path.as_str()).cloned())
-                            .collect(),
-                    )
-                })
-            })
-            .collect();
-        Ok(JsonProjectionBatch::new(values))
     }
 }
 

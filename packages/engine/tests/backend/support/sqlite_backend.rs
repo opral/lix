@@ -55,7 +55,7 @@ pub struct SqliteBackend {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct SqliteBackendOptions {
     pub path: PathBuf,
 }
@@ -118,7 +118,7 @@ impl BackendFixture for SqliteBackendFixture {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl SqliteBackend {
     pub fn new(options: SqliteBackendOptions) -> Result<Self, BackendError> {
         Self::open(options.path)

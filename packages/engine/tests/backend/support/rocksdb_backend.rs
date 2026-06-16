@@ -88,12 +88,10 @@ impl RocksDbBackend {
         Ok(Self { path, db })
     }
 
-    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    #[allow(dead_code)]
     pub fn flush(&self) -> Result<(), BackendError> {
         self.db.flush().map_err(rocksdb_error)
     }

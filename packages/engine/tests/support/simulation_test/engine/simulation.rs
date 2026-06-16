@@ -1,3 +1,5 @@
+#![expect(dead_code)]
+
 use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
     CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry, FsMkdirOptions,
@@ -15,7 +17,6 @@ use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 #[derive(Clone)]
 pub struct Simulation {
     mode: SimulationMode,
-    #[allow(dead_code)]
     backend: InMemoryBackend,
     engine: Engine,
     receipt: InitReceipt,
@@ -23,7 +24,6 @@ pub struct Simulation {
     assertions: SimulationAssertions,
 }
 
-#[allow(dead_code)]
 impl Simulation {
     pub(super) async fn from_bootstrap(
         mode: SimulationMode,
@@ -102,11 +102,9 @@ pub struct SimSession {
     sim: Simulation,
     engine: Engine,
     session: SessionContext,
-    #[allow(dead_code)]
     pub fs: SimFs,
 }
 
-#[allow(dead_code)]
 impl SimSession {
     pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> Self {
         Self {
@@ -209,7 +207,6 @@ pub struct SimFs {
     session: SessionContext,
 }
 
-#[allow(dead_code)]
 impl SimFs {
     fn new(sim: Simulation, engine: Engine, session: SessionContext) -> Self {
         Self {
@@ -268,7 +265,6 @@ impl SimFs {
 }
 
 /// Transaction wrapper that injects simulation behavior around normal execution.
-#[allow(dead_code)]
 pub struct SimTransaction {
     sim: Simulation,
     engine: Engine,
@@ -277,7 +273,6 @@ pub struct SimTransaction {
     saw_write: bool,
 }
 
-#[allow(dead_code)]
 impl SimTransaction {
     pub async fn execute(
         &mut self,

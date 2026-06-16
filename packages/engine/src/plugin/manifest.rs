@@ -16,22 +16,6 @@ pub enum PluginRuntime {
     WasmComponentV1,
 }
 
-#[allow(dead_code)]
-impl PluginRuntime {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::WasmComponentV1 => "wasm-component-v1",
-        }
-    }
-
-    pub fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "wasm-component-v1" => Some(Self::WasmComponentV1),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub key: String,
@@ -247,7 +231,7 @@ fn format_validation_errors<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginContentType, glob_matches_path, parse_plugin_manifest_json};
+    use super::{PluginContentType, PluginRuntime, glob_matches_path, parse_plugin_manifest_json};
 
     #[test]
     fn parses_valid_manifest() {
@@ -264,7 +248,7 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(validated.manifest.key, "plugin_json");
-        assert_eq!(validated.manifest.runtime.as_str(), "wasm-component-v1");
+        assert_eq!(validated.manifest.runtime, PluginRuntime::WasmComponentV1);
         assert_eq!(validated.manifest.entry, "plugin.wasm");
     }
 

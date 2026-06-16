@@ -26,10 +26,6 @@ impl NormalizedJson {
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_ref()
     }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.as_str().as_bytes()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -158,13 +154,6 @@ pub(crate) struct JsonLoadRequestRef<'a> {
     pub(crate) scope: JsonReadScopeRef,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct JsonProjectionLoadRequestRef<'a> {
-    pub(crate) refs: &'a [JsonRef],
-    pub(crate) scope: JsonReadScopeRef,
-    pub(crate) paths: &'a [JsonProjectionPath],
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JsonLoadBatch {
     values: Vec<Option<Vec<u8>>>,
@@ -175,77 +164,7 @@ impl JsonLoadBatch {
         Self { values }
     }
 
-    pub(crate) fn values(&self) -> &[Option<Vec<u8>>] {
-        &self.values
-    }
-
     pub(crate) fn into_values(self) -> Vec<Option<Vec<u8>>> {
-        self.values
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JsonValueBatch {
-    values: Vec<Option<serde_json::Value>>,
-}
-
-impl JsonValueBatch {
-    pub(crate) fn new(values: Vec<Option<serde_json::Value>>) -> Self {
-        Self { values }
-    }
-
-    pub(crate) fn values(&self) -> &[Option<serde_json::Value>] {
-        &self.values
-    }
-
-    pub(crate) fn into_values(self) -> Vec<Option<serde_json::Value>> {
-        self.values
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JsonProjectionPath(String);
-
-impl JsonProjectionPath {
-    pub(crate) fn new(pointer: impl Into<String>) -> Self {
-        Self(pointer.into())
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JsonProjection {
-    values: Vec<Option<serde_json::Value>>,
-}
-
-impl JsonProjection {
-    pub(crate) fn new(values: Vec<Option<serde_json::Value>>) -> Self {
-        Self { values }
-    }
-
-    pub(crate) fn values(&self) -> &[Option<serde_json::Value>] {
-        &self.values
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JsonProjectionBatch {
-    values: Vec<Option<JsonProjection>>,
-}
-
-impl JsonProjectionBatch {
-    pub(crate) fn new(values: Vec<Option<JsonProjection>>) -> Self {
-        Self { values }
-    }
-
-    pub(crate) fn values(&self) -> &[Option<JsonProjection>] {
-        &self.values
-    }
-
-    pub(crate) fn into_values(self) -> Vec<Option<JsonProjection>> {
         self.values
     }
 }

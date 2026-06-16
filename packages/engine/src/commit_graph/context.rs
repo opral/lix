@@ -264,7 +264,7 @@ where
                     record, change_ids,
                 )))
             }
-            _ => Err(LixError::new(
+            CommitLoadEntry::Record(_) => Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "changelog full commit projection returned non-full entry",
             )),

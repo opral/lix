@@ -10,10 +10,6 @@ pub(crate) fn encode_commit_record(record: &CommitRecord) -> Result<Vec<u8>, Lix
     storage_codec::encode("commit record", record)
 }
 
-pub(crate) fn decode_commit_record(bytes: &[u8]) -> Result<CommitRecord, LixError> {
-    storage_codec::decode("commit record", bytes)
-}
-
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
     // change_id is the storage key; the value intentionally omits it.
     storage_codec::encode(

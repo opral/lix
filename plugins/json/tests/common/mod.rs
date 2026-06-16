@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use plugin_json_v2::exports::lix::plugin::api::{EntityState, Guest};
 use plugin_json_v2::{DetectedChange, File, JsonPlugin, PluginError};

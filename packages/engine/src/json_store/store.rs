@@ -33,6 +33,7 @@ enum JsonHashCheck {
     /// hashes are computed at write time; exhaustive verification belongs in
     /// explicit integrity-check/fsck callers rather than every row scan.
     TrustedHotRead,
+    #[cfg(test)]
     Verify,
 }
 
@@ -92,15 +93,7 @@ pub(crate) fn encode_direct_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<
     encode_stored_json_payload(encoded_json)
 }
 
-pub(crate) fn encode_json_str_for_storage_with_ref(
-    json: &str,
-    json_ref: JsonRef,
-) -> Result<(JsonRef, Vec<u8>), LixError> {
-    let encoded_json = encode_json_for_storage_with_ref(json, json_ref)?;
-    let json_ref = encoded_json.json_ref;
-    Ok((json_ref, encode_stored_json_payload(&encoded_json)))
-}
-
+#[cfg(test)]
 async fn load_json_bytes_direct(
     store: &(impl StorageRead + ?Sized),
     json_ref: &JsonRef,
@@ -131,6 +124,7 @@ pub(crate) async fn load_json_bytes_many_in_scope(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn verify_json_bytes_many_in_scope(
     store: &impl StorageRead,
     json_refs: &[JsonRef],
@@ -333,6 +327,9 @@ fn decode_json_payload(
     stored_payload: StoredJsonPayload<'_>,
     hash_check: JsonHashCheck,
 ) -> Result<Vec<u8>, LixError> {
+    #[cfg(not(test))]
+    let _ = hash_check;
+
     let data = match stored_payload.codec {
         JsonCodec::Raw => Ok(stored_payload.data.to_vec()),
         JsonCodec::Zstd => decode_json_zstd_payload(
@@ -352,6 +349,7 @@ fn decode_json_payload(
             ),
         ));
     }
+    #[cfg(test)]
     if hash_check == JsonHashCheck::Verify && cfg!(debug_assertions) {
         let actual_hash = blake3::hash(&data);
         if actual_hash.as_bytes() != json_ref.as_hash_bytes() {

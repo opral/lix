@@ -1,3 +1,5 @@
+#![cfg_attr(all(feature = "storage-benches", not(test)), expect(dead_code))]
+
 use std::sync::Arc;
 
 use std::collections::BTreeMap;

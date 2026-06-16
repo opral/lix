@@ -648,9 +648,7 @@ async fn load_commits_from_store(
         let record = storage_codec::decode("commit record", &value)?;
         let chunks = match request.projection {
             CommitProjection::Record => Vec::new(),
-            CommitProjection::ChangeRefs | CommitProjection::Full => {
-                load_commit_change_ref_chunks(store, commit_id).await?
-            }
+            CommitProjection::Full => load_commit_change_ref_chunks(store, commit_id).await?,
         };
         entries.push(Some(project_commit_entry(
             request.projection,
@@ -817,7 +815,6 @@ fn project_commit_entry(
 ) -> CommitLoadEntry {
     match projection {
         CommitProjection::Record => CommitLoadEntry::Record(record),
-        CommitProjection::ChangeRefs => CommitLoadEntry::ChangeRefs(change_ref_chunks),
         CommitProjection::Full => CommitLoadEntry::Full {
             record,
             change_ref_chunks,
@@ -829,7 +826,6 @@ fn commit_entry_id(entry: &CommitLoadEntry) -> Option<CommitId> {
     match entry {
         CommitLoadEntry::Record(record) => Some(record.commit_id),
         CommitLoadEntry::Full { record, .. } => Some(record.commit_id),
-        CommitLoadEntry::ChangeRefs(chunks) => chunks.first().map(|chunk| chunk.commit_id),
     }
 }
 
