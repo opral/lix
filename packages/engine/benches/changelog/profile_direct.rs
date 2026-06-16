@@ -101,10 +101,19 @@ async fn run(backend: ChangelogBenchBackend, op: &str, duration: Duration) -> Re
 
     eprintln!(
         "changelog_direct_profile backend={} op={op} duration_ms={} iterations={iterations}",
-        backend.label(),
+        backend_label(backend),
         duration.as_millis()
     );
     Ok(())
+}
+
+fn backend_label(backend: ChangelogBenchBackend) -> &'static str {
+    match backend {
+        ChangelogBenchBackend::Unit => "mem_unit",
+        ChangelogBenchBackend::SqliteTempfile => "sqlite_tempfile",
+        ChangelogBenchBackend::RocksDbTempdir => "rocksdb_tempdir",
+        ChangelogBenchBackend::RedbTempfile => "redb_tempfile",
+    }
 }
 
 fn parse_backend(value: &str) -> Result<ChangelogBenchBackend, LixError> {

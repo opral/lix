@@ -152,6 +152,7 @@ impl ScanPlan {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn scan_prefix<R>(
     read: &R,
     space: SpaceId,
@@ -227,20 +228,6 @@ where
         entries: buffer.entries(),
         has_more: result.has_more,
     })
-}
-
-pub(crate) fn visit_scan_range<R, V>(
-    read: &R,
-    space: SpaceId,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    R: BackendRead,
-    V: ScanVisitor + ?Sized,
-{
-    Ok(visit_scan_range_with_stats(read, space, range, opts, visitor)?.value)
 }
 
 pub(crate) fn visit_scan_range_with_stats<R, V>(

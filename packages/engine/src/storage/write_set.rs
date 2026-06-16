@@ -944,14 +944,4 @@ mod tests {
             Ok(())
         }
     }
-
-    fn physical_space(key: &Key) -> SpaceId {
-        SpaceId(u32::from_be_bytes(
-            key.0[..4].try_into().expect("space prefix"),
-        ))
-    }
-
-    fn logical_key(key: Key) -> Key {
-        Key(key.0.slice(4..))
-    }
 }

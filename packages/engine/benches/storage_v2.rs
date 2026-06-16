@@ -31,15 +31,15 @@ use sqlite_backend_v2::SqliteBackend;
 use tempfile::TempDir;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../tests/backend/support/redb_backend.rs"]
 mod redb_backend_v2;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../tests/backend/support/rocksdb_backend.rs"]
 mod rocksdb_backend_v2;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../tests/backend/support/sqlite_backend.rs"]
 mod sqlite_backend_v2;
 

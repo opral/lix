@@ -12,8 +12,8 @@ mod test_support;
 mod types;
 
 pub(crate) use codec::{
-    decode_change_record, decode_commit_change_ref_chunk, decode_commit_record,
-    encode_change_record, encode_commit_change_ref_chunk, encode_commit_record,
+    decode_change_record, decode_commit_change_ref_chunk, encode_change_record,
+    encode_commit_change_ref_chunk, encode_commit_record,
 };
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key};

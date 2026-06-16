@@ -221,7 +221,7 @@ where
                 .flat_map(|chunk| chunk.entries)
                 .collect::<Vec<_>>(),
         ),
-        CommitLoadEntry::Record(_) | CommitLoadEntry::ChangeRefs(_) => {
+        CommitLoadEntry::Record(_) => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "changelog returned a partial commit load for commit-root rebuild",

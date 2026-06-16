@@ -7,13 +7,13 @@ use lix_engine::backend::{
 };
 use tempfile::TempDir;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../../../tests/backend/support/redb_backend.rs"]
 mod redb_backend;
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../../../tests/backend/support/rocksdb_backend.rs"]
 mod rocksdb_backend;
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../../../tests/backend/support/sqlite_backend.rs"]
 mod sqlite_backend;
 
@@ -61,24 +61,6 @@ pub(crate) enum ChangelogScoreWrite {
 }
 
 impl ChangelogBenchBackend {
-    #[allow(dead_code)]
-    pub(crate) const CI: [Self; 4] = [
-        Self::Unit,
-        Self::SqliteTempfile,
-        Self::RocksDbTempdir,
-        Self::RedbTempfile,
-    ];
-
-    #[allow(dead_code)]
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Unit => "mem_unit",
-            Self::SqliteTempfile => "sqlite_tempfile",
-            Self::RocksDbTempdir => "rocksdb_tempdir",
-            Self::RedbTempfile => "redb_tempfile",
-        }
-    }
-
     pub(crate) fn create(self) -> ChangelogScoreBackend {
         match self {
             Self::Unit => ChangelogScoreBackend::Unit(InMemoryBackend::new()),

@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::backend::{BackendError, Key, KeyRange, KeyRef, SpaceId};
+use crate::backend::{BackendError, Key, KeyRange, SpaceId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageSpace {
@@ -41,15 +41,7 @@ pub(crate) fn encode_physical_key(space: SpaceId, key: &Key) -> Key {
     Key(bytes.freeze())
 }
 
-pub(crate) fn decode_logical_key_ref(key: KeyRef<'_>) -> Result<KeyRef<'_>, BackendError> {
-    if key.0.len() < 4 {
-        return Err(BackendError::Corruption(
-            "storage physical key shorter than space prefix".into(),
-        ));
-    }
-    Ok(KeyRef(&key.0[4..]))
-}
-
+#[cfg(test)]
 pub(crate) fn decode_logical_key(key: &Key) -> Result<Key, BackendError> {
     if key.0.len() < 4 {
         return Err(BackendError::Corruption(

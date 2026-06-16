@@ -3,7 +3,7 @@ use crate::LixError;
 use crate::storage_codec;
 use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
 
-#[cfg_attr(not(feature = "storage-benches"), allow(dead_code))]
+#[cfg_attr(not(feature = "storage-benches"), expect(dead_code))]
 pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("untracked-state row", &row)
 }
@@ -46,7 +46,7 @@ pub(crate) fn decode_payload_with_identity(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
     storage_codec::decode("untracked-state row", bytes)
 }

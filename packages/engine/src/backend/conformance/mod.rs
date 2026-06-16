@@ -7,9 +7,7 @@ mod baseline;
 mod factory;
 #[cfg(test)]
 mod failure_tests;
-#[allow(dead_code)]
 mod fixtures;
-#[allow(dead_code)]
 mod model;
 mod model_based;
 mod persistence;

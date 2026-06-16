@@ -1,12 +1,12 @@
 use tempfile::TempDir;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../../tests/backend/support/redb_backend.rs"]
 mod redb_backend;
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../../tests/backend/support/rocksdb_backend.rs"]
 mod rocksdb_backend;
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../../tests/backend/support/sqlite_backend.rs"]
 mod sqlite_backend;
 

@@ -126,17 +126,6 @@ pub(crate) async fn render_materialized_plugin_file(
     Ok(Some(render_plugin_state(host, plugin, active_state).await?))
 }
 
-pub(crate) fn plugin_state_rows<'a>(
-    plugin: &InstalledPlugin,
-    rows: impl IntoIterator<Item = &'a MaterializedLiveStateRow>,
-) -> Vec<MaterializedLiveStateRow> {
-    let schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
-    rows.into_iter()
-        .filter(|row| schema_keys.contains(&row.schema_key) && row.snapshot_content.is_some())
-        .cloned()
-        .collect()
-}
-
 pub(crate) fn retain_plugin_state_rows(
     plugin: &InstalledPlugin,
     mut rows: Vec<MaterializedLiveStateRow>,
