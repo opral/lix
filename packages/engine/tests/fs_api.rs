@@ -1,7 +1,7 @@
 #[macro_use]
 mod support;
 
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,97 +10,50 @@ use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
-use lix_engine::{
-    Engine, FsDirEntryKind, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, LixError,
-    Value,
-};
-
-simulation_test!(fs_write_read_and_readdir_roundtrip, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open"),
-        &engine,
-    );
-
-    session
-        .fs
-        .write_file(
-            "/docs/readme.txt",
-            b"hello".to_vec(),
-            FsWriteOptions::default(),
-        )
-        .await
-        .expect("write_file should create parents and data");
-
-    assert_eq!(
-        session
-            .fs
-            .read_file("/docs/readme.txt")
-            .await
-            .expect("read_file should succeed"),
-        Some(b"hello".to_vec())
-    );
-    assert_eq!(
-        session
-            .fs
-            .read_file("/docs/missing.txt")
-            .await
-            .expect("missing read should succeed"),
-        None
-    );
-
-    let entries = session
-        .fs
-        .readdir("/docs/")
-        .await
-        .expect("readdir should succeed")
-        .expect("directory should exist");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "readme.txt");
-    assert_eq!(entries[0].path, "/docs/readme.txt");
-    assert_eq!(entries[0].kind, FsDirEntryKind::File);
-});
+use lix_engine::{Engine, ExecuteResult, InMemoryBackend, LixError, SessionContext, Value};
 
 simulation_test!(
-    fs_session_reads_reject_active_explicit_transaction,
+    sql_file_write_read_and_readdir_roundtrip,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
 
-        let transaction = session
-            .begin_transaction()
+        write_file(&session, "/docs/readme.txt", b"hello".to_vec())
             .await
-            .expect("transaction should begin");
+            .expect("file upsert should create parents and data");
 
-        let read_error = session
-            .fs()
-            .read_file("/docs/readme.txt")
-            .await
-            .expect_err("session fs read_file should reject active transaction");
-        assert_eq!(read_error.code, "LIX_INVALID_TRANSACTION_STATE");
+        assert_eq!(
+            read_file(&session, "/docs/readme.txt")
+                .await
+                .expect("file read should succeed"),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            read_file(&session, "/docs/missing.txt")
+                .await
+                .expect("missing file read should succeed"),
+            None
+        );
 
-        let readdir_error = session
-            .fs()
-            .readdir("/docs/")
+        let entries = readdir(&session, "/docs/")
             .await
-            .expect_err("session fs readdir should reject active transaction");
-        assert_eq!(readdir_error.code, "LIX_INVALID_TRANSACTION_STATE");
-
-        transaction
-            .rollback()
-            .await
-            .expect("transaction rollback should succeed");
+            .expect("directory read should succeed")
+            .expect("directory should exist");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "readme.txt");
+        assert_eq!(entries[0].path, "/docs/readme.txt");
+        assert_eq!(entries[0].kind, DirEntryKind::File);
     }
 );
 
 simulation_test!(
-    fs_read_file_treats_sql_path_only_file_as_empty,
+    sql_path_only_file_reads_as_empty_without_blob_ref,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -117,45 +70,14 @@ simulation_test!(
             .expect("path-only file insert should succeed");
 
         assert_eq!(
-            session
-                .fs
-                .read_file("/empty.txt")
+            read_file(&session, "/empty.txt")
                 .await
-                .expect("read_file should succeed"),
-            Some(Vec::new())
-        );
-    }
-);
-
-simulation_test!(
-    fs_write_file_canonicalizes_empty_file_without_blob_ref,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        session
-            .fs
-            .write_file("/empty-fs.txt", Vec::new(), FsWriteOptions::default())
-            .await
-            .expect("empty fs write should succeed");
-
-        assert_eq!(
-            session
-                .fs
-                .read_file("/empty-fs.txt")
-                .await
-                .expect("read_file should succeed"),
+                .expect("file read should succeed"),
             Some(Vec::new())
         );
 
         let file_result = session
-            .execute("SELECT id FROM lix_file WHERE path = '/empty-fs.txt'", &[])
+            .execute("SELECT id FROM lix_file WHERE path = '/empty.txt'", &[])
             .await
             .expect("file id read should succeed");
         let [Value::Text(file_id)] = file_result.rows()[0].values() else {
@@ -169,9 +91,9 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"{file_id}\"]')"
+                     FROM lix_state \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND entity_pk = lix_json('[\"{file_id}\"]')"
                 ),
                 &[],
             )
@@ -182,7 +104,7 @@ simulation_test!(
 );
 
 #[tokio::test]
-async fn fs_write_file_to_plugin_storage_installs_plugin_archive() {
+async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
         .await
@@ -194,251 +116,21 @@ async fn fs_write_file_to_plugin_storage_installs_plugin_archive() {
         .expect("workspace session should open");
     let archive = sentinel_plugin_archive();
 
-    session
-        .fs()
-        .write_file(
-            "/.lix_system/plugins/plugin_sentinel.lixplugin",
-            archive,
-            FsWriteOptions::default(),
-        )
+    install_plugin(&session, "plugin_sentinel", &archive)
         .await
-        .expect("fs.write_file should install plugin archive");
+        .expect("plugin archive upsert should install plugin");
+    install_plugin(&session, "plugin_sentinel", &archive)
+        .await
+        .expect("plugin archive upsert should update plugin");
 
-    let plugins = session
-        .list_installed_plugins()
-        .await
-        .expect("installed plugins should list");
-    assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0].key, "plugin_sentinel");
-
-    session.close().await.expect("session should close");
-}
-
-#[tokio::test]
-async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let runtime = Arc::new(SentinelPluginRuntime::default());
-    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
-        .await
-        .expect("engine should open with plugin runtime");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
-
-    session
-        .fs()
-        .write_file("/raw.sentinel", Vec::new(), FsWriteOptions::default())
-        .await
-        .expect("empty file write should succeed");
-    session
-        .install_plugin(&sentinel_plugin_archive())
-        .await
-        .expect("plugin install should succeed");
-
-    assert_eq!(
-        session
-            .fs()
-            .read_file("/raw.sentinel")
-            .await
-            .expect("read_file should succeed"),
-        Some(Vec::new())
-    );
-
-    let files = session
-        .execute(
-            "SELECT data FROM lix_file WHERE path = '/raw.sentinel'",
-            &[],
-        )
-        .await
-        .expect("lix_file data read should succeed");
-    assert_eq!(files.len(), 1);
-    assert_eq!(files.rows()[0].values(), &[Value::Blob(Vec::new())]);
-    assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 0);
-
-    session.close().await.expect("session should close");
-}
-
-#[tokio::test]
-async fn plugin_detect_changes_receives_descriptor_filename() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let runtime = Arc::new(SentinelPluginRuntime::default());
-    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
-        .await
-        .expect("engine should open with plugin runtime");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
-
-    session
-        .install_plugin(&sentinel_plugin_archive())
-        .await
-        .expect("plugin install should succeed");
-    session
-        .fs()
-        .write_file(
-            "/nested/raw.sentinel",
-            b"hello".to_vec(),
-            FsWriteOptions::default(),
-        )
-        .await
-        .expect("plugin file write should succeed");
-
-    let filenames = runtime
-        .detect_filenames
-        .lock()
-        .expect("detect filename lock should not be poisoned")
-        .clone();
-    assert_eq!(filenames, vec![Some("raw.sentinel".to_string())]);
-
-    session.close().await.expect("session should close");
-}
-
-#[tokio::test]
-async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let runtime = Arc::new(SentinelPluginRuntime::default());
-    let engine = Engine::new_with_wasm_runtime(backend, runtime)
-        .await
-        .expect("engine should open with plugin runtime");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
-
-    session
-        .install_plugin(&binary_sentinel_plugin_archive())
-        .await
-        .expect("plugin install should succeed");
-
-    session
-        .fs()
-        .write_file(
-            "/owned.binary-sentinel",
-            vec![0xff],
-            FsWriteOptions::default(),
-        )
-        .await
-        .expect("binary plugin write should succeed");
-
-    assert_eq!(
-        session
-            .fs()
-            .read_file("/owned.binary-sentinel")
-            .await
-            .expect("read_file should render plugin state"),
-        Some(b"plugin-rendered".to_vec())
-    );
-
-    let file_id_rows = session
-        .execute(
-            "SELECT id FROM lix_file WHERE path = '/owned.binary-sentinel'",
-            &[],
-        )
-        .await
-        .expect("file id read should succeed");
-    let [Value::Text(file_id)] = file_id_rows.rows()[0].values() else {
-        panic!(
-            "expected file id row, got {:?}",
-            file_id_rows.rows()[0].values()
-        );
-    };
-
-    let plugin_rows = session
-        .execute(
-            &format!(
-                "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'plugin_note' \
-                   AND file_id = '{file_id}'"
-            ),
-            &[],
-        )
-        .await
-        .expect("plugin state read should succeed");
-    assert_eq!(plugin_rows.len(), 1);
-
-    session
-        .fs()
-        .write_file(
-            "/owned.binary-sentinel",
-            Vec::new(),
-            FsWriteOptions::default(),
-        )
-        .await
-        .expect("empty plugin write should succeed");
-
-    assert_eq!(
-        session
-            .fs()
-            .read_file("/owned.binary-sentinel")
-            .await
-            .expect("read_file should succeed"),
-        Some(Vec::new())
-    );
-
-    let plugin_rows = session
-        .execute(
-            &format!(
-                "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'plugin_note' \
-                   AND file_id = '{file_id}'"
-            ),
-            &[],
-        )
-        .await
-        .expect("plugin state read should succeed");
-    assert_eq!(plugin_rows.len(), 0);
-
-    session.close().await.expect("session should close");
-}
-
-#[tokio::test]
-async fn sql_write_file_to_plugin_storage_installs_plugin_archive() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
-    let archive = sentinel_plugin_archive();
-
-    session
-        .execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text("/.lix_system/plugins/plugin_sentinel.lixplugin".to_string()),
-                Value::Blob(archive.clone()),
-            ],
-        )
-        .await
-        .expect("plugin archive file write should install plugin");
-
-    let plugins = session
-        .list_installed_plugins()
+    let plugins = list_installed_plugins(&session)
         .await
         .expect("installed plugins should list");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].key, "plugin_sentinel");
     assert_eq!(plugins[0].schema_keys, vec!["plugin_note".to_string()]);
     assert_eq!(
-        session
-            .fs()
-            .read_file("/.lix_system/plugins/plugin_sentinel.lixplugin")
+        read_file(&session, "/.lix_system/plugins/plugin_sentinel.lixplugin")
             .await
             .expect("archive read should succeed")
             .as_deref(),
@@ -447,7 +139,8 @@ async fn sql_write_file_to_plugin_storage_installs_plugin_archive() {
 
     let schemas = session
         .execute(
-            "SELECT value FROM lix_registered_schema WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
+            "SELECT value FROM lix_registered_schema \
+             WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
             &[],
         )
         .await
@@ -458,7 +151,7 @@ async fn sql_write_file_to_plugin_storage_installs_plugin_archive() {
 }
 
 #[tokio::test]
-async fn sql_write_file_to_plugin_storage_rejects_path_manifest_key_mismatch() {
+async fn sql_plugin_archive_path_must_match_manifest_key() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
         .await
@@ -469,14 +162,7 @@ async fn sql_write_file_to_plugin_storage_rejects_path_manifest_key_mismatch() {
         .await
         .expect("workspace session should open");
 
-    let error = session
-        .execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text("/.lix_system/plugins/plugin_other.lixplugin".to_string()),
-                Value::Blob(sentinel_plugin_archive()),
-            ],
-        )
+    let error = install_plugin(&session, "plugin_other", &sentinel_plugin_archive())
         .await
         .expect_err("mismatched plugin archive key should fail");
 
@@ -498,14 +184,7 @@ async fn sql_update_path_to_plugin_storage_rejects_plugin_archive_rename() {
         .await
         .expect("workspace session should open");
 
-    session
-        .execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text("/normal.txt".to_string()),
-                Value::Blob(b"normal".to_vec()),
-            ],
-        )
+    write_file(&session, "/normal.txt", b"normal".to_vec())
         .await
         .expect("normal file insert should succeed");
 
@@ -538,8 +217,7 @@ async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
         .await
         .expect("workspace session should open");
 
-    session
-        .install_plugin(&sentinel_plugin_archive())
+    install_plugin(&session, "plugin_sentinel", &sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
@@ -559,7 +237,7 @@ async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
 }
 
 #[tokio::test]
-async fn fs_rm_rejects_installed_plugin_storage_deletes() {
+async fn sql_delete_rejects_installed_plugin_storage() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
         .await
@@ -570,43 +248,41 @@ async fn fs_rm_rejects_installed_plugin_storage_deletes() {
         .await
         .expect("workspace session should open");
 
-    session
-        .install_plugin(&sentinel_plugin_archive())
+    install_plugin(&session, "plugin_sentinel", &sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
-    for (path, options) in [
-        (
-            "/.lix_system/plugins/plugin_sentinel.lixplugin",
-            FsRmOptions::default(),
-        ),
-        (
-            "/.lix_system/plugins/",
-            FsRmOptions {
-                recursive: true,
-                ..FsRmOptions::default()
-            },
-        ),
-        (
-            "/.lix_system/",
-            FsRmOptions {
-                recursive: true,
-                ..FsRmOptions::default()
-            },
-        ),
-    ] {
-        let error = session
-            .fs()
-            .rm(path, options)
-            .await
-            .expect_err("fs.rm should reject plugin storage deletes");
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert!(error.message.contains("reserved plugin storage path"));
-    }
+    let archive_error = session
+        .execute(
+            "DELETE FROM lix_file \
+             WHERE path = '/.lix_system/plugins/plugin_sentinel.lixplugin'",
+            &[],
+        )
+        .await
+        .expect_err("SQL delete should reject installed plugin archive tombstones");
+    assert_eq!(archive_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    assert!(
+        archive_error
+            .message
+            .contains("reserved plugin storage path")
+    );
+
+    let directory_error = session
+        .execute(
+            "DELETE FROM lix_directory WHERE path = '/.lix_system/plugins/'",
+            &[],
+        )
+        .await
+        .expect_err("SQL delete should reject plugin storage directory tombstones");
+    assert_eq!(directory_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    assert!(
+        directory_error
+            .message
+            .contains("reserved plugin storage path")
+    );
 
     assert_eq!(
-        session
-            .list_installed_plugins()
+        list_installed_plugins(&session)
             .await
             .expect("plugin should still be installed")
             .len(),
@@ -617,47 +293,172 @@ async fn fs_rm_rejects_installed_plugin_storage_deletes() {
 }
 
 #[tokio::test]
-async fn sql_delete_rejects_installed_plugin_storage_archive_tombstone() {
+async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
         .await
         .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
+        .await
+        .expect("engine should open with plugin runtime");
     let session = engine
         .open_workspace_session()
         .await
         .expect("workspace session should open");
 
-    session
-        .install_plugin(&sentinel_plugin_archive())
+    write_file(&session, "/raw.sentinel", Vec::new())
+        .await
+        .expect("empty file write should succeed");
+    install_plugin(&session, "plugin_sentinel", &sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
-    let error = session
+    assert_eq!(
+        read_file(&session, "/raw.sentinel")
+            .await
+            .expect("file read should succeed"),
+        Some(Vec::new())
+    );
+
+    let files = session
         .execute(
-            "DELETE FROM lix_file \
-             WHERE id = 'lix_plugin_archive::plugin_sentinel'",
+            "SELECT data FROM lix_file WHERE path = '/raw.sentinel'",
             &[],
         )
         .await
-        .expect_err("SQL delete should reject installed plugin archive tombstones");
+        .expect("lix_file data read should succeed");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files.rows()[0].values(), &[Value::Blob(Vec::new())]);
+    assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 0);
 
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-    assert!(error.message.contains("reserved plugin storage path"));
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn plugin_detect_changes_receives_descriptor_filename() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    install_plugin(&session, "plugin_sentinel", &sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+    write_file(&session, "/nested/raw.sentinel", b"hello".to_vec())
+        .await
+        .expect("plugin file write should succeed");
+
+    let filenames = runtime
+        .detect_filenames
+        .lock()
+        .expect("detect filename lock should not be poisoned")
+        .clone();
+    assert_eq!(filenames, vec![Some("raw.sentinel".to_string())]);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(backend, runtime)
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    install_plugin(
+        &session,
+        "plugin_binary_sentinel",
+        &binary_sentinel_plugin_archive(),
+    )
+    .await
+    .expect("plugin install should succeed");
+
+    write_file(&session, "/owned.binary-sentinel", vec![0xff])
+        .await
+        .expect("binary plugin write should succeed");
+
     assert_eq!(
-        session
-            .list_installed_plugins()
+        read_file(&session, "/owned.binary-sentinel")
             .await
-            .expect("plugin should still be installed")
-            .len(),
-        1
+            .expect("file read should render plugin state"),
+        Some(b"plugin-rendered".to_vec())
     );
+
+    let file_id_rows = session
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/owned.binary-sentinel'",
+            &[],
+        )
+        .await
+        .expect("file id read should succeed");
+    let [Value::Text(file_id)] = file_id_rows.rows()[0].values() else {
+        panic!(
+            "expected file id row, got {:?}",
+            file_id_rows.rows()[0].values()
+        );
+    };
+
+    let plugin_rows = session
+        .execute(
+            &format!(
+                "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'plugin_note' \
+                   AND file_id = '{file_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin state read should succeed");
+    assert_eq!(plugin_rows.len(), 1);
+
+    write_file(&session, "/owned.binary-sentinel", Vec::new())
+        .await
+        .expect("empty plugin write should succeed");
+
+    assert_eq!(
+        read_file(&session, "/owned.binary-sentinel")
+            .await
+            .expect("file read should succeed"),
+        Some(Vec::new())
+    );
+
+    let plugin_rows = session
+        .execute(
+            &format!(
+                "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'plugin_note' \
+                   AND file_id = '{file_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin state read should succeed");
+    assert_eq!(plugin_rows.len(), 0);
 
     session.close().await.expect("session should close");
 }
 
 simulation_test!(
-    fs_mkdir_is_idempotent_and_readdir_distinguishes_missing,
+    sql_mkdir_is_idempotent_and_readdir_distinguishes_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -668,37 +469,29 @@ simulation_test!(
             &engine,
         );
 
-        session
-            .fs
-            .mkdir("/empty/nested/", FsMkdirOptions::default())
+        mkdir(&session, "/empty/nested/")
             .await
             .expect("mkdir should create parents");
-        session
-            .fs
-            .mkdir("/empty/nested/", FsMkdirOptions::default())
+        mkdir(&session, "/empty/nested/")
             .await
             .expect("mkdir should be idempotent");
 
         assert_eq!(
-            session
-                .fs
-                .readdir("/empty/nested/")
+            readdir(&session, "/empty/nested/")
                 .await
-                .expect("readdir should succeed"),
+                .expect("directory read should succeed"),
             Some(Vec::new())
         );
         assert_eq!(
-            session
-                .fs
-                .readdir("/missing/")
+            readdir(&session, "/missing/")
                 .await
-                .expect("missing readdir should succeed"),
+                .expect("missing directory read should succeed"),
             None
         );
     }
 );
 
-simulation_test!(fs_write_file_upserts_existing_data, |sim| async move {
+simulation_test!(sql_write_file_upserts_existing_data, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -708,21 +501,15 @@ simulation_test!(fs_write_file_upserts_existing_data, |sim| async move {
         &engine,
     );
 
-    session
-        .fs
-        .write_file("/orders.xlsx", b"old".to_vec(), FsWriteOptions::default())
+    write_file(&session, "/orders.xlsx", b"old".to_vec())
         .await
         .expect("initial write should succeed");
-    session
-        .fs
-        .write_file("/orders.xlsx", b"new".to_vec(), FsWriteOptions::default())
+    write_file(&session, "/orders.xlsx", b"new".to_vec())
         .await
         .expect("second write should upsert");
 
     assert_eq!(
-        session
-            .fs
-            .read_file("/orders.xlsx")
+        read_file(&session, "/orders.xlsx")
             .await
             .expect("read should succeed"),
         Some(b"new".to_vec())
@@ -732,17 +519,13 @@ simulation_test!(fs_write_file_upserts_existing_data, |sim| async move {
         .execute("SELECT id FROM lix_file WHERE path = '/orders.xlsx'", &[])
         .await
         .expect("query should succeed");
-    assert_eq!(rows.len(), 1, "write_file should not duplicate descriptor");
+    assert_eq!(rows.len(), 1, "file upsert should not duplicate descriptor");
 
-    session
-        .fs
-        .write_file("/orders.xlsx", Vec::new(), FsWriteOptions::default())
+    write_file(&session, "/orders.xlsx", Vec::new())
         .await
         .expect("empty overwrite should succeed");
     assert_eq!(
-        session
-            .fs
-            .read_file("/orders.xlsx")
+        read_file(&session, "/orders.xlsx")
             .await
             .expect("read should succeed"),
         Some(Vec::new())
@@ -766,7 +549,7 @@ simulation_test!(fs_write_file_upserts_existing_data, |sim| async move {
     assert_eq!(blob_ref_rows.len(), 0);
 });
 
-simulation_test!(fs_rm_file_and_recursive_directory, |sim| async move {
+simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -776,123 +559,36 @@ simulation_test!(fs_rm_file_and_recursive_directory, |sim| async move {
         &engine,
     );
 
-    session
-        .fs
-        .write_file("/tmp/a.txt", b"a".to_vec(), FsWriteOptions::default())
+    write_file(&session, "/tmp/a.txt", b"a".to_vec())
         .await
         .expect("write should succeed");
-    session
-        .fs
-        .write_file(
-            "/tmp/nested/b.txt",
-            b"b".to_vec(),
-            FsWriteOptions::default(),
-        )
+    write_file(&session, "/tmp/nested/b.txt", b"b".to_vec())
         .await
         .expect("nested write should succeed");
 
-    let error = session
-        .fs
-        .rm("/tmp/", FsRmOptions::default())
+    rm_path(&session, "/tmp/")
         .await
-        .expect_err("non-recursive rm should reject non-empty directory");
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-
-    session
-        .fs
-        .rm(
-            "/tmp/",
-            FsRmOptions {
-                recursive: true,
-                ..FsRmOptions::default()
-            },
-        )
-        .await
-        .expect("recursive rm should remove tree");
+        .expect("recursive directory delete should remove tree");
 
     assert_eq!(
-        session
-            .fs
-            .read_file("/tmp/a.txt")
+        read_file(&session, "/tmp/a.txt")
             .await
             .expect("read should succeed"),
         None
     );
     assert_eq!(
-        session
-            .fs
-            .readdir("/tmp/")
+        readdir(&session, "/tmp/")
             .await
-            .expect("readdir should succeed"),
+            .expect("directory read should succeed"),
         None
     );
 
-    session
-        .fs
-        .rm("/tmp/missing.txt", FsRmOptions::default())
+    rm_path(&session, "/tmp/missing.txt")
         .await
-        .expect("missing rm should be a no-op");
+        .expect("missing delete should be a no-op");
 });
 
-simulation_test!(
-    fs_rm_resolves_directory_paths_and_rejects_root,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        session
-            .fs
-            .mkdir("/empty/", FsMkdirOptions::default())
-            .await
-            .expect("mkdir should succeed");
-        session
-            .fs
-            .rm("/empty", FsRmOptions::default())
-            .await
-            .expect("slashless rm should remove directory");
-        assert_eq!(
-            session
-                .fs
-                .readdir("/empty/")
-                .await
-                .expect("readdir should succeed"),
-            None
-        );
-
-        session
-            .fs
-            .write_file("/file.txt", b"file".to_vec(), FsWriteOptions::default())
-            .await
-            .expect("write should succeed");
-        session
-            .fs
-            .rm("/file.txt/", FsRmOptions::default())
-            .await
-            .expect_err("directory-form rm on file should fail");
-        assert_eq!(
-            session
-                .fs
-                .read_file("/file.txt")
-                .await
-                .expect("read should succeed"),
-            Some(b"file".to_vec())
-        );
-
-        session
-            .fs
-            .rm("/", FsRmOptions::default())
-            .await
-            .expect_err("rm should reject virtual root");
-    }
-);
-
-simulation_test!(fs_wrong_kind_errors, |sim| async move {
+simulation_test!(sql_file_directory_path_constraints, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -902,95 +598,263 @@ simulation_test!(fs_wrong_kind_errors, |sim| async move {
         &engine,
     );
 
-    session
-        .fs
-        .mkdir("/docs/", FsMkdirOptions::default())
+    mkdir(&session, "/docs/")
         .await
         .expect("mkdir should succeed");
-    session
-        .fs
-        .write_file("/file.txt", b"file".to_vec(), FsWriteOptions::default())
+    write_file(&session, "/file.txt", b"file".to_vec())
         .await
         .expect("write should succeed");
 
-    session
-        .fs
-        .read_file("/docs")
+    write_file(&session, "/docs", b"nope".to_vec())
         .await
-        .expect_err("read_file on directory should fail");
-    session
-        .fs
-        .readdir("/file.txt/")
+        .expect_err("file write over directory should fail");
+    mkdir(&session, "/file.txt/")
         .await
-        .expect_err("readdir on file should fail");
-    session
-        .fs
-        .write_file("/docs", b"nope".to_vec(), FsWriteOptions::default())
-        .await
-        .expect_err("write_file over directory should fail");
-    session
-        .fs
-        .mkdir("/file.txt/", FsMkdirOptions::default())
-        .await
-        .expect_err("mkdir over file should fail");
+        .expect_err("directory create over file should fail");
 });
 
-simulation_test!(
-    fs_untracked_write_is_visible_and_rejects_tracked_collision,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
+#[async_trait(?Send)]
+trait TestSession {
+    async fn execute_sql(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError>;
+}
 
-        session
-            .fs
-            .write_file(
-                "/scratch/preview.json",
-                b"preview".to_vec(),
-                FsWriteOptions {
-                    untracked: true,
-                    ..FsWriteOptions::default()
-                },
-            )
-            .await
-            .expect("untracked write should succeed");
-        assert_eq!(
-            session
-                .fs
-                .read_file("/scratch/preview.json")
-                .await
-                .expect("read should see untracked file"),
-            Some(b"preview".to_vec())
-        );
-
-        session
-            .fs
-            .write_file(
-                "/tracked.txt",
-                b"tracked".to_vec(),
-                FsWriteOptions::default(),
-            )
-            .await
-            .expect("tracked write should succeed");
-        session
-            .fs
-            .write_file(
-                "/tracked.txt",
-                b"untracked".to_vec(),
-                FsWriteOptions {
-                    untracked: true,
-                    ..FsWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("untracked write should not shadow tracked path");
+#[async_trait(?Send)]
+impl TestSession for SessionContext {
+    async fn execute_sql(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        self.execute(sql, params).await
     }
-);
+}
+
+#[async_trait(?Send)]
+impl TestSession for support::simulation_test::engine::SimSession {
+    async fn execute_sql(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        self.execute(sql, params).await
+    }
+}
+
+async fn install_plugin<S>(session: &S, key: &str, archive: &[u8]) -> Result<(), LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    write_file(
+        session,
+        &format!("/.lix_system/plugins/{key}.lixplugin"),
+        archive.to_vec(),
+    )
+    .await
+}
+
+async fn write_file<S>(session: &S, path: &str, data: Vec<u8>) -> Result<(), LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    session
+        .execute_sql(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            &[Value::Text(path.to_string()), Value::Blob(data)],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn read_file<S>(session: &S, path: &str) -> Result<Option<Vec<u8>>, LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    let result = session
+        .execute_sql(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    let Some(row) = result.rows().first() else {
+        return Ok(None);
+    };
+    match row.values() {
+        [Value::Blob(data)] => Ok(Some(data.clone())),
+        [Value::Null] => Ok(Some(Vec::new())),
+        other => panic!("expected one blob data column, got {other:?}"),
+    }
+}
+
+async fn mkdir<S>(session: &S, path: &str) -> Result<(), LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    session
+        .execute_sql(
+            "INSERT INTO lix_directory (path) VALUES ($1) \
+             ON CONFLICT (path) DO NOTHING",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn rm_path<S>(session: &S, path: &str) -> Result<(), LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    session
+        .execute_sql(
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    session
+        .execute_sql(
+            "DELETE FROM lix_directory WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DirEntry {
+    name: String,
+    path: String,
+    kind: DirEntryKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DirEntryKind {
+    File,
+    Directory,
+}
+
+async fn readdir<S>(session: &S, path: &str) -> Result<Option<Vec<DirEntry>>, LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    let exists = session
+        .execute_sql(
+            "SELECT path FROM lix_directory WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    let children = session
+        .execute_sql(
+            "SELECT path, 'file' AS kind FROM lix_file WHERE path LIKE $1 \
+             UNION ALL \
+             SELECT path, 'directory' AS kind FROM lix_directory WHERE path LIKE $1 AND path != $2 \
+             ORDER BY path",
+            &[
+                Value::Text(format!("{path}%")),
+                Value::Text(path.to_string()),
+            ],
+        )
+        .await?;
+    let mut entries = Vec::new();
+    for row in children.rows() {
+        let [Value::Text(child_path), Value::Text(kind)] = row.values() else {
+            panic!("expected path/kind row, got {:?}", row.values());
+        };
+        let Some(name) = direct_child_name(path, child_path) else {
+            continue;
+        };
+        entries.push(DirEntry {
+            name,
+            path: child_path.clone(),
+            kind: match kind.as_str() {
+                "file" => DirEntryKind::File,
+                "directory" => DirEntryKind::Directory,
+                other => panic!("unexpected directory entry kind {other}"),
+            },
+        });
+    }
+    if entries.is_empty() && exists.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(entries))
+    }
+}
+
+fn direct_child_name(parent: &str, child: &str) -> Option<String> {
+    let remainder = child.strip_prefix(parent)?;
+    if remainder.is_empty() {
+        return None;
+    }
+    let trimmed = remainder.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InstalledPluginInfo {
+    key: String,
+    schema_keys: Vec<String>,
+}
+
+async fn list_installed_plugins<S>(session: &S) -> Result<Vec<InstalledPluginInfo>, LixError>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    let result = session
+        .execute_sql(
+            "SELECT data FROM lix_file \
+             WHERE path LIKE '/.lix_system/plugins/%.lixplugin' \
+             ORDER BY path",
+            &[],
+        )
+        .await?;
+    let mut plugins = Vec::new();
+    for row in result.rows() {
+        let [Value::Blob(data)] = row.values() else {
+            panic!("expected plugin archive data row, got {:?}", row.values());
+        };
+        plugins.push(plugin_info_from_archive(data)?);
+    }
+    Ok(plugins)
+}
+
+fn plugin_info_from_archive(archive: &[u8]) -> Result<InstalledPluginInfo, LixError> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(archive)).map_err(test_parse_error)?;
+    let mut manifest_json = String::new();
+    zip.by_name("manifest.json")
+        .map_err(test_parse_error)?
+        .read_to_string(&mut manifest_json)
+        .map_err(test_parse_error)?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_json).map_err(test_parse_error)?;
+    let key = manifest
+        .get("key")
+        .and_then(|value| value.as_str())
+        .expect("test plugin manifest should include key")
+        .to_string();
+    let schema_paths = manifest
+        .get("schemas")
+        .and_then(|value| value.as_array())
+        .expect("test plugin manifest should include schemas");
+    let mut schema_keys = Vec::new();
+    for schema_path in schema_paths {
+        let schema_path = schema_path
+            .as_str()
+            .expect("test plugin schema path should be a string");
+        let mut schema_json = String::new();
+        zip.by_name(schema_path)
+            .map_err(test_parse_error)?
+            .read_to_string(&mut schema_json)
+            .map_err(test_parse_error)?;
+        let schema: serde_json::Value =
+            serde_json::from_str(&schema_json).map_err(test_parse_error)?;
+        schema_keys.push(
+            schema
+                .get("x-lix-key")
+                .and_then(|value| value.as_str())
+                .expect("test plugin schema should include x-lix-key")
+                .to_string(),
+        );
+    }
+    Ok(InstalledPluginInfo { key, schema_keys })
+}
+
+fn test_parse_error(error: impl std::fmt::Display) -> LixError {
+    LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string())
+}
 
 #[derive(Default)]
 struct SentinelPluginRuntime {
