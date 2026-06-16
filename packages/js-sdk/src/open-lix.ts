@@ -11,6 +11,7 @@ import type {
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
+	ObserveEvent,
 	OpenLixOptions,
 	SqlParam,
 	SqliteBackendOptions,
@@ -20,10 +21,16 @@ import type {
 } from "./types.js";
 
 type NativeExecuteResult = Parameters<typeof wrapExecuteResult>[0];
+type NativeObserveEvent = {
+	sequence: number;
+	mutationSequence: number;
+	rows: NativeExecuteResult;
+};
 type NativeParam = ReturnType<typeof toNativeValue>;
 
 type NativeLix = {
 	execute(sql: string, params: NativeParam[]): NativeExecuteResult;
+	observe(sql: string, params: NativeParam[]): NativeObserveEvents;
 	beginTransaction(): NativeLixTransaction;
 	activeBranchId(): string;
 	createBranch(options: CreateBranchOptions): CreateBranchReceipt;
@@ -37,6 +44,11 @@ type NativeLixTransaction = {
 	execute(sql: string, params: NativeParam[]): NativeExecuteResult;
 	commit(): void;
 	rollback(): void;
+};
+
+type NativeObserveEvents = {
+	next(): Promise<NativeObserveEvent | null | undefined>;
+	close(): void;
 };
 
 export class SqliteBackend {
@@ -106,6 +118,18 @@ export class Lix {
 		);
 	}
 
+	observe(sql: string, params: SqlParam[] = []): ObserveEvents {
+		assertSqlArgs("observe", "lix", sql, params);
+		return new ObserveEvents(
+			this.native.observe(
+				sql,
+				params.map((param, index) =>
+					toNativeValue(normalizeParam(param, index)),
+				),
+			),
+		);
+	}
+
 	async beginTransaction(): Promise<LixTransaction> {
 		return new LixTransaction(this.native.beginTransaction());
 	}
@@ -148,6 +172,26 @@ export class Lix {
 
 	async close(): Promise<void> {
 		return this.native.close();
+	}
+}
+
+export class ObserveEvents {
+	constructor(private readonly native: NativeObserveEvents) {}
+
+	async next(): Promise<ObserveEvent | undefined> {
+		const event = await this.native.next();
+		if (event == null) {
+			return undefined;
+		}
+		return {
+			sequence: event.sequence,
+			mutationSequence: event.mutationSequence,
+			result: wrapExecuteResult(event.rows),
+		};
+	}
+
+	close(): void {
+		this.native.close();
 	}
 }
 
@@ -253,12 +297,21 @@ function assertBytesArg(
 }
 
 function assertExecuteArgs(receiver: string, sql: string, params: SqlParam[]) {
+	assertSqlArgs("execute", receiver, sql, params);
+}
+
+function assertSqlArgs(
+	operation: string,
+	receiver: string,
+	sql: string,
+	params: SqlParam[],
+) {
 	if (typeof sql !== "string") {
-		throw invalidArgument("execute", "sql", "string", typeof sql, receiver);
+		throw invalidArgument(operation, "sql", "string", typeof sql, receiver);
 	}
 	if (!Array.isArray(params)) {
 		throw invalidArgument(
-			"execute",
+			operation,
 			"params",
 			"array",
 			typeof params,

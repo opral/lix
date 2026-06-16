@@ -31,7 +31,9 @@ pub(crate) mod functions;
 pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod live_state;
-#[allow(unused_imports)]
+pub(crate) mod observe_coordinator;
+pub(crate) mod observe_invalidation;
+#[allow(dead_code, unused_imports)]
 pub(crate) mod plugin;
 mod schema;
 pub mod session;
@@ -88,6 +90,6 @@ pub use session::{
     MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
     SessionFs, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
-pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
+pub use session::{ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue};
 
 pub(crate) const GLOBAL_BRANCH_ID: &str = "global";

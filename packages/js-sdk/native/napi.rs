@@ -4,13 +4,22 @@ use lix_sdk::{
     LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
     SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, open_lix,
     open_lix_with_backend,
 };
+use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::watch;
 
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "Lix")]
@@ -29,6 +38,12 @@ enum NativeLixTransactionInner {
     Memory(RsLixTransaction<InMemoryBackend>),
     Sqlite(RsLixTransaction<SqliteBackend>),
     Fs(RsLixTransaction<FsBackend>),
+}
+
+enum NativeObserveEventsInner {
+    Memory(RsObserveEvents<InMemoryBackend>),
+    Sqlite(RsObserveEvents<SqliteBackend>),
+    Fs(RsObserveEvents<FsBackend>),
 }
 
 impl NativeLixInner {
@@ -55,6 +70,18 @@ impl NativeLixInner {
             Self::Fs(lix) => Ok(NativeLixTransactionInner::Fs(
                 lix.begin_transaction().await?,
             )),
+        }
+    }
+
+    fn observe(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> std::result::Result<NativeObserveEventsInner, LixError> {
+        match self {
+            Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
+            Self::Sqlite(lix) => Ok(NativeObserveEventsInner::Sqlite(lix.observe(sql, params)?)),
+            Self::Fs(lix) => Ok(NativeObserveEventsInner::Fs(lix.observe(sql, params)?)),
         }
     }
 
@@ -149,6 +176,24 @@ impl NativeLixTransactionInner {
     }
 }
 
+impl NativeObserveEventsInner {
+    async fn next(&mut self) -> std::result::Result<Option<RsObserveEvent>, LixError> {
+        match self {
+            Self::Memory(events) => events.next().await,
+            Self::Sqlite(events) => events.next().await,
+            Self::Fs(events) => events.next().await,
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Self::Memory(events) => events.close(),
+            Self::Sqlite(events) => events.close(),
+            Self::Fs(events) => events.close(),
+        }
+    }
+}
+
 #[napi]
 impl NativeLix {
     #[napi(factory, js_name = "openMemory")]
@@ -225,6 +270,29 @@ impl NativeLix {
             )
             .map_err(|error| throw_lix_error(&env, error))?;
         ExecuteResult::try_from(result).map_err(|error| throw_lix_error(&env, error))
+    }
+
+    #[napi]
+    pub fn observe(
+        &self,
+        env: Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+    ) -> Result<NativeObserveEvents> {
+        let params = match params {
+            Some(params) => params
+                .into_iter()
+                .map(Value::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| throw_lix_error(&env, error))?,
+            None => Vec::new(),
+        };
+        let events = self
+            .lix()
+            .map_err(|error| throw_lix_error(&env, error))?
+            .observe(&sql, &params)
+            .map_err(|error| throw_lix_error(&env, error))?;
+        NativeObserveEvents::new(events)
     }
 
     #[napi(js_name = "beginTransaction")]
@@ -330,6 +398,247 @@ impl NativeLix {
         self.lix = None;
         Ok(())
     }
+}
+
+#[expect(missing_debug_implementations)]
+#[napi(js_name = "ObserveEvents")]
+pub struct NativeObserveEvents {
+    commands: Sender<ObserveCommand>,
+    closed: Arc<AtomicBool>,
+    close_signal: watch::Sender<bool>,
+    next_in_flight: Arc<AtomicBool>,
+}
+
+#[napi]
+impl NativeObserveEvents {
+    fn new(events: NativeObserveEventsInner) -> Result<Self> {
+        let (commands, receiver) = mpsc::channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        let (close_signal, actor_close_signal) = watch::channel(false);
+        let next_in_flight = Arc::new(AtomicBool::new(false));
+
+        let actor_closed = Arc::clone(&closed);
+        let actor_next_in_flight = Arc::clone(&next_in_flight);
+        thread::Builder::new()
+            .name("lix-observe-events".to_string())
+            .spawn(move || {
+                run_observe_actor(
+                    events,
+                    receiver,
+                    actor_closed,
+                    actor_close_signal,
+                    actor_next_in_flight,
+                );
+            })
+            .map_err(to_napi_error)?;
+
+        Ok(Self {
+            commands,
+            closed,
+            close_signal,
+            next_in_flight,
+        })
+    }
+
+    #[napi]
+    pub fn next<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        if self.closed.load(Ordering::SeqCst) {
+            let (deferred, promise): (ObserveNextDeferred, Object<'env>) = env.create_deferred()?;
+            resolve_observe_deferred(deferred, Ok(None), Arc::clone(&self.next_in_flight));
+            return Ok(promise);
+        }
+
+        if self
+            .next_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(throw_lix_error(
+                env,
+                LixError::new(
+                    "LIX_OBSERVE_NEXT_IN_FLIGHT",
+                    "ObserveEvents.next() is already in flight",
+                )
+                .with_hint("Await the pending next() call before calling next() again."),
+            ));
+        }
+
+        let (deferred, promise): (ObserveNextDeferred, Object<'env>) = match env.create_deferred() {
+            Ok(deferred) => deferred,
+            Err(error) => {
+                self.next_in_flight.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        match self.commands.send(ObserveCommand::Next(deferred)) {
+            Ok(()) => Ok(promise),
+            Err(error) => {
+                self.closed.store(true, Ordering::SeqCst);
+                let ObserveCommand::Next(deferred) = error.0 else {
+                    unreachable!("next() only sends ObserveCommand::Next");
+                };
+                resolve_observe_deferred(deferred, Ok(None), Arc::clone(&self.next_in_flight));
+                Ok(promise)
+            }
+        }
+    }
+
+    #[napi]
+    pub fn close(&self) {
+        close_observe_events(&self.commands, &self.closed, &self.close_signal);
+    }
+}
+
+impl Drop for NativeObserveEvents {
+    fn drop(&mut self) {
+        close_observe_events(&self.commands, &self.closed, &self.close_signal);
+    }
+}
+
+type ObserveNextResult = std::result::Result<Option<RsObserveEvent>, LixError>;
+type ObserveNextResolver = Box<dyn FnOnce(Env) -> Result<Option<ObserveEventDto>> + Send>;
+type ObserveNextDeferred = JsDeferred<Option<ObserveEventDto>, ObserveNextResolver>;
+
+enum ObserveCommand {
+    Next(ObserveNextDeferred),
+    Close,
+}
+
+fn run_observe_actor(
+    mut events: NativeObserveEventsInner,
+    receiver: mpsc::Receiver<ObserveCommand>,
+    closed: Arc<AtomicBool>,
+    mut close_signal: watch::Receiver<bool>,
+    next_in_flight: Arc<AtomicBool>,
+) {
+    let rt = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(error) => {
+            closed.store(true, Ordering::SeqCst);
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    ObserveCommand::Next(deferred) => {
+                        next_in_flight.store(false, Ordering::SeqCst);
+                        deferred.reject(to_napi_error(&error));
+                    }
+                    ObserveCommand::Close => break,
+                }
+            }
+            return;
+        }
+    };
+
+    while let Ok(command) = receiver.recv() {
+        match command {
+            ObserveCommand::Next(deferred) => {
+                let result = rt.block_on(observe_next(&mut events, &closed, &mut close_signal));
+                let result = match result {
+                    Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) => Ok(None),
+                    Err(error) if error.code == LixError::CODE_CLOSED => Ok(None),
+                    other => other,
+                };
+                let result = match result {
+                    Ok(Some(_)) | Err(_)
+                        if closed.load(Ordering::SeqCst) || *close_signal.borrow() =>
+                    {
+                        Ok(None)
+                    }
+                    other => other,
+                };
+                let terminal = observe_result_is_terminal(&result);
+                if terminal {
+                    closed.store(true, Ordering::SeqCst);
+                }
+                resolve_observe_deferred(deferred, result, Arc::clone(&next_in_flight));
+                if terminal {
+                    events.close();
+                    break;
+                }
+            }
+            ObserveCommand::Close => {
+                closed.store(true, Ordering::SeqCst);
+                events.close();
+                break;
+            }
+        }
+    }
+    closed.store(true, Ordering::SeqCst);
+}
+
+async fn observe_next(
+    events: &mut NativeObserveEventsInner,
+    closed: &AtomicBool,
+    close_signal: &mut watch::Receiver<bool>,
+) -> ObserveNextResult {
+    if closed.load(Ordering::SeqCst) || *close_signal.borrow() {
+        events.close();
+        return Ok(None);
+    }
+
+    let result = tokio::select! {
+        result = events.next() => result,
+        changed = close_signal.changed() => {
+            events.close();
+            match changed {
+                Ok(()) | Err(_) => Ok(None),
+            }
+        }
+    };
+
+    match result {
+        Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) || *close_signal.borrow() => {
+            events.close();
+            Ok(None)
+        }
+        Ok(Some(event)) => Ok(Some(event)),
+        Ok(None) => {
+            closed.store(true, Ordering::SeqCst);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn observe_result_is_terminal(result: &ObserveNextResult) -> bool {
+    match result {
+        Ok(None) => true,
+        Err(error) if error.code == LixError::CODE_CLOSED => true,
+        _ => false,
+    }
+}
+
+fn resolve_observe_deferred(
+    deferred: ObserveNextDeferred,
+    result: ObserveNextResult,
+    next_in_flight: Arc<AtomicBool>,
+) {
+    deferred.resolve(Box::new(move |env| {
+        next_in_flight.store(false, Ordering::SeqCst);
+        observe_next_to_js(&env, result)
+    }));
+}
+
+fn observe_next_to_js(env: &Env, result: ObserveNextResult) -> Result<Option<ObserveEventDto>> {
+    match result {
+        Ok(Some(event)) => Ok(Some(
+            ObserveEventDto::try_from(event)
+                .map_err(|error| lix_error_to_napi_error(env, error))?,
+        )),
+        Ok(None) => Ok(None),
+        Err(error) => Err(lix_error_to_napi_error(env, error)),
+    }
+}
+
+fn close_observe_events(
+    commands: &Sender<ObserveCommand>,
+    closed: &AtomicBool,
+    close_signal: &watch::Sender<bool>,
+) {
+    if closed.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = close_signal.send(true);
+    let _ = commands.send(ObserveCommand::Close);
 }
 
 impl NativeLix {
@@ -807,6 +1116,26 @@ impl TryFrom<RsExecuteResult> for ExecuteResult {
     }
 }
 
+#[napi(object)]
+pub struct ObserveEventDto {
+    pub sequence: f64,
+    pub mutation_sequence: f64,
+    pub rows: ExecuteResult,
+}
+
+impl TryFrom<RsObserveEvent> for ObserveEventDto {
+    type Error = LixError;
+
+    #[expect(clippy::cast_precision_loss)]
+    fn try_from(event: RsObserveEvent) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            sequence: event.sequence as f64,
+            mutation_sequence: event.mutation_sequence as f64,
+            rows: ExecuteResult::try_from(event.rows)?,
+        })
+    }
+}
+
 #[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct LixNotice {
@@ -819,17 +1148,28 @@ fn to_napi_error(error: impl std::fmt::Display) -> Error {
     Error::from_reason(error.to_string())
 }
 
+fn create_lix_error<'env>(env: &'env Env, error: &LixError) -> Result<Object<'env>> {
+    let mut js_error = env.create_error(Error::new(Status::GenericFailure, &error.message))?;
+    js_error.set_named_property("name", "LixError")?;
+    js_error.set_named_property("code", error.code.clone())?;
+    if let Some(hint) = &error.hint {
+        js_error.set_named_property("hint", hint.clone())?;
+    }
+    if let Some(details) = &error.details {
+        js_error.set_named_property("details", details.clone())?;
+    }
+    Ok(js_error)
+}
+
+fn lix_error_to_napi_error(env: &Env, error: LixError) -> Error {
+    create_lix_error(env, &error)
+        .map(|js_error| Error::from(js_error.to_unknown()))
+        .unwrap_or_else(|fallback| fallback)
+}
+
 fn throw_lix_error(env: &Env, error: LixError) -> Error {
     let thrown = (|| -> Result<()> {
-        let mut js_error = env.create_error(Error::new(Status::GenericFailure, &error.message))?;
-        js_error.set_named_property("name", "LixError")?;
-        js_error.set_named_property("code", error.code.clone())?;
-        if let Some(hint) = &error.hint {
-            js_error.set_named_property("hint", hint.clone())?;
-        }
-        if let Some(details) = &error.details {
-            js_error.set_named_property("details", details.clone())?;
-        }
+        let js_error = create_lix_error(env, &error)?;
         env.throw(js_error)?;
         Ok(())
     })();

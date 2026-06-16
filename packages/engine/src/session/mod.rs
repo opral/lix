@@ -15,6 +15,7 @@ mod create_branch;
 mod execute;
 mod fs;
 mod merge;
+pub(crate) mod observe;
 mod plugin;
 mod switch_branch;
 mod transaction;
@@ -29,6 +30,7 @@ pub use merge::{
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
     MergeConflictKind, MergeConflictSide,
 };
+pub use observe::{ObserveEvent, ObserveEvents};
 pub use plugin::InstalledPluginInfo;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;

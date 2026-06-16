@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
+use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use tokio::sync::Notify;
 
@@ -19,8 +20,9 @@ pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) transaction: Option<Transaction<B>>,
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,
+    observe_invalidation: Arc<ObserveInvalidation>,
     _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
-    _write_access: SessionWriteAccess,
+    write_access: Option<SessionWriteAccess>,
 }
 
 impl<B> SessionContext<B>
@@ -64,8 +66,9 @@ where
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             transaction_manager: self.transaction_manager(),
+            observe_invalidation: Arc::clone(&self.observe_invalidation),
             _deterministic_runtime_guard: deterministic_runtime_guard,
-            _write_access: write_access,
+            write_access: Some(write_access),
         })
     }
 }
@@ -97,12 +100,13 @@ where
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        let result = transaction
-            .commit(&self.runtime_functions)
-            .await
-            .map(|_| ());
+        let result = transaction.commit(&self.runtime_functions).await;
         drop(operation_guard);
-        result
+        let outcome = result?;
+        drop(self.write_access.take());
+        self.observe_invalidation
+            .bump_if_storage_changed(&outcome.storage_stats);
+        Ok(())
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {

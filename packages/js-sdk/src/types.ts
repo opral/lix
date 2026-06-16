@@ -42,6 +42,12 @@ export type ExecuteResult = {
 	}>;
 };
 
+export type ObserveEvent = {
+	sequence: number;
+	mutationSequence: number;
+	result: ExecuteResult;
+};
+
 export type LixFs = {
 	readFile(path: string): Promise<Uint8Array | undefined>;
 	writeFile(path: string, data: Uint8Array): Promise<void>;

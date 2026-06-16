@@ -100,7 +100,7 @@ paste = "1"
 rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd = "0.13"

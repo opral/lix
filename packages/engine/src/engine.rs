@@ -9,6 +9,8 @@ use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
+use crate::observe_coordinator::ObserveCoordinator;
+use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
 use crate::session::SessionContext;
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions, StorageWriteOptions};
@@ -28,6 +30,8 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+    observe_coordinator: Arc<ObserveCoordinator>,
+    observe_invalidation: Arc<ObserveInvalidation>,
     plugin_host: PluginRuntimeHost,
 }
 
@@ -95,6 +99,8 @@ where
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
+            observe_coordinator: Arc::new(ObserveCoordinator::new()),
+            observe_invalidation: Arc::new(ObserveInvalidation::new()),
             plugin_host: PluginRuntimeHost::new(wasm_runtime),
         })
     }
@@ -135,6 +141,8 @@ where
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.deterministic_runtime_gate),
+            Arc::clone(&self.observe_coordinator),
+            Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),
         )
         .await
@@ -149,6 +157,8 @@ where
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.deterministic_runtime_gate),
+            Arc::clone(&self.observe_coordinator),
+            Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),
         )
         .await

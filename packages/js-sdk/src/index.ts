@@ -2,6 +2,7 @@ export {
 	FsBackend,
 	Lix,
 	LixTransaction,
+	ObserveEvents,
 	openLix,
 	SqliteBackend,
 } from "./open-lix.js";
@@ -26,6 +27,7 @@ export type {
 	MergeChangeStats,
 	MergeConflict,
 	MergeConflictSide,
+	ObserveEvent,
 	OpenLixOptions,
 	SqlParam,
 	SqliteBackendOptions,

@@ -390,11 +390,16 @@ where
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
-        self.persist_runtime_functions_if_needed(
-            &read_result.runtime_functions,
-            runtime_write_access.as_ref(),
-        )
-        .await?;
+        let runtime_storage_stats = self
+            .persist_runtime_functions_if_needed(
+                &read_result.runtime_functions,
+                runtime_write_access.as_ref(),
+            )
+            .await?;
+        drop(runtime_write_access);
+        if let Some(stats) = runtime_storage_stats {
+            self.observe_invalidation.bump_if_storage_changed(&stats);
+        }
         Ok(ExecuteResult::from_sql_query_result(read_result.query))
     }
 
@@ -444,13 +449,13 @@ where
         &self,
         runtime_functions: &FunctionContext,
         runtime_write_access: Option<&SessionWriteAccess>,
-    ) -> Result<(), LixError> {
+    ) -> Result<Option<crate::storage::StorageWriteSetStats>, LixError> {
         let mut writes = StorageWriteSet::new();
         runtime_functions
             .stage_persist_if_needed(&mut writes)
             .await?;
         if writes.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         if runtime_write_access.is_none() {
             return Err(LixError::new(
@@ -463,11 +468,11 @@ where
         let prepared_commit = self
             .storage
             .prepare_write_set(writes, StorageWriteOptions::default())?;
-        commit_at_boundary(Some(&commit_boundary), || {
-            prepared_commit.commit()?;
-            Ok(())
+        let stats = commit_at_boundary(Some(&commit_boundary), || {
+            let (_commit, stats) = prepared_commit.commit()?;
+            Ok(stats)
         })?;
-        Ok(())
+        Ok(Some(stats))
     }
 }
 

@@ -17,6 +17,8 @@ use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
+use crate::observe_coordinator::ObserveCoordinator;
+use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
@@ -56,6 +58,8 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) observe_coordinator: Arc<ObserveCoordinator>,
+    pub(super) observe_invalidation: Arc<ObserveInvalidation>,
     pub(super) plugin_host: PluginRuntimeHost,
     transaction_manager: SessionTransactionManager,
 }
@@ -74,6 +78,8 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        observe_coordinator: Arc<ObserveCoordinator>,
+        observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
     ) -> Result<Self, LixError> {
         let session = Self::new(
@@ -85,6 +91,8 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            observe_coordinator,
+            observe_invalidation,
             plugin_host,
         );
         session.active_branch_id().await?;
@@ -100,6 +108,8 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        observe_coordinator: Arc<ObserveCoordinator>,
+        observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
@@ -113,6 +123,8 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            observe_coordinator,
+            observe_invalidation,
             plugin_host,
         ))
     }
@@ -126,6 +138,8 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        observe_coordinator: Arc<ObserveCoordinator>,
+        observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
     ) -> Self {
         Self::new_with_transaction_manager(
@@ -137,6 +151,8 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            observe_coordinator,
+            observe_invalidation,
             plugin_host,
             SessionTransactionManager::new(),
         )
@@ -151,6 +167,8 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        observe_coordinator: Arc<ObserveCoordinator>,
+        observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
         transaction_manager: SessionTransactionManager,
     ) -> Self {
@@ -163,6 +181,8 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            observe_coordinator,
+            observe_invalidation,
             plugin_host,
             transaction_manager,
         }
@@ -171,7 +191,9 @@ where
     /// Releases this logical session handle. This is a lifecycle boundary only:
     /// successful writes are committed before their operation returns.
     pub async fn close(&self) -> Result<(), LixError> {
-        self.transaction_manager.close().await
+        self.transaction_manager.close().await?;
+        self.observe_invalidation.bump();
+        Ok(())
     }
 
     pub fn is_closed(&self) -> bool {
@@ -355,7 +377,7 @@ where
 
     pub(super) async fn with_write_transaction_reserved<T, F>(
         &self,
-        _write_access: SessionWriteAccess,
+        write_access: SessionWriteAccess,
         f: F,
     ) -> Result<T, LixError>
     where
@@ -387,7 +409,10 @@ where
         match f(&mut transaction).await {
             Ok(value) => {
                 self.ensure_open()?;
-                transaction.commit(&runtime_functions).await?;
+                let outcome = transaction.commit(&runtime_functions).await?;
+                drop(write_access);
+                self.observe_invalidation
+                    .bump_if_storage_changed(&outcome.storage_stats);
                 Ok(value)
             }
             Err(error) => Err(error),
