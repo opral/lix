@@ -9,11 +9,11 @@
 //! absent and replaces when present.
 //!
 //! Each spec contributes only the small pieces that genuinely vary — its
-//! identity columns, its insert/candidate-scan/assignment-apply builders —
-//! via [`UpsertSupport`]. The loop, identity matching, and the `excluded`
+//! conflict-target resolution, its insert/candidate-scan/assignment-apply
+//! builders — via [`UpsertSupport`]. The loop, matching, and the `excluded`
 //! batch augmentation live here once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -38,6 +38,44 @@ pub(crate) enum UpsertAction {
     },
     /// `DO NOTHING` — keep the existing row.
     DoNothing,
+}
+
+/// The semantic identity the table resolved the SQL conflict target to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UpsertConflictKind {
+    Id,
+    Path,
+}
+
+/// A provider-resolved `ON CONFLICT (...)` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UpsertConflictTarget {
+    kind: UpsertConflictKind,
+    columns: Vec<&'static str>,
+}
+
+impl UpsertConflictTarget {
+    pub(super) fn id(columns: &[&'static str]) -> Self {
+        Self {
+            kind: UpsertConflictKind::Id,
+            columns: columns.to_vec(),
+        }
+    }
+
+    pub(super) fn path(columns: &[&'static str]) -> Self {
+        Self {
+            kind: UpsertConflictKind::Path,
+            columns: columns.to_vec(),
+        }
+    }
+
+    pub(super) fn kind(&self) -> UpsertConflictKind {
+        self.kind
+    }
+
+    pub(super) fn columns(&self) -> &[&'static str] {
+        &self.columns
+    }
 }
 
 /// The staged writes a spec produces for a slice of upsert rows: the state
@@ -78,9 +116,24 @@ impl StagedUpsert {
 /// reuses logic the spec already has for plain INSERT/UPDATE.
 #[async_trait]
 pub(super) trait UpsertSupport: Send + Sync {
-    /// The columns forming the unique identity; the conflicting-row lookup
-    /// matches on these, and the `ON CONFLICT` target must be a subset.
+    /// The columns forming the default physical identity.
     fn conflict_identity_columns(&self) -> &[&'static str];
+
+    /// Resolve and validate the SQL `ON CONFLICT (...)` target for this table.
+    fn resolve_conflict_target(
+        &self,
+        table_name: &str,
+        target_columns: &[String],
+    ) -> Result<UpsertConflictTarget> {
+        let identity = self.conflict_identity_columns();
+        validate_target_columns(
+            table_name,
+            target_columns,
+            identity,
+            "conflict identity columns",
+        )?;
+        Ok(UpsertConflictTarget::id(identity))
+    }
 
     /// Build staged INSERT rows for a proposed batch (the same builder
     /// `stage_insert` uses).
@@ -96,7 +149,22 @@ pub(super) trait UpsertSupport: Send + Sync {
         &self,
         write_ctx: &SqlWriteContext,
         proposed: &RecordBatch,
+        target: &UpsertConflictTarget,
     ) -> Result<RecordBatch>;
+
+    /// Validate a matched existing/proposed pair before applying the conflict
+    /// action. Most tables need no extra check; filesystem path targets use it
+    /// to reject tracked/untracked namespace collisions.
+    fn validate_conflict_pair(
+        &self,
+        _existing: &RecordBatch,
+        _existing_row: usize,
+        _proposed: &RecordBatch,
+        _proposed_row: usize,
+        _target: &UpsertConflictTarget,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Apply the `DO UPDATE` assignments to an augmented batch — this table's
     /// columns (carrying the existing row) plus `excluded.*` columns (carrying
@@ -115,22 +183,29 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
     spec: &S,
     write_ctx: &SqlWriteContext,
     proposed_batches: Vec<RecordBatch>,
+    target: &UpsertConflictTarget,
     action: &UpsertAction,
 ) -> Result<u64> {
-    let identity_columns = spec.conflict_identity_columns();
+    let conflict_columns = target.columns();
     let mut staged = StagedUpsert::default();
     let mut affected: u64 = 0;
 
     for batch in &proposed_batches {
-        let existing = spec.scan_conflict_candidates(write_ctx, batch).await?;
-        let existing_by_identity = index_by_identity(&existing, identity_columns)?;
+        let existing = spec
+            .scan_conflict_candidates(write_ctx, batch, target)
+            .await?;
+        let existing_by_identity = index_by_identity(&existing, conflict_columns)?;
 
         let mut matched_proposed = Vec::new();
         let mut matched_existing = Vec::new();
         let mut unmatched_proposed = Vec::new();
         for row in 0..batch.num_rows() {
-            let key = identity_key(batch, row, identity_columns)?;
-            if let Some(&existing_row) = existing_by_identity.get(&key) {
+            let key = identity_key(batch, row, conflict_columns)?;
+            if let Some(existing_rows) = existing_by_identity.get(&key) {
+                for &existing_row in existing_rows {
+                    spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
+                }
+                let existing_row = existing_rows[0];
                 matched_proposed.push(row as u64);
                 matched_existing.push(existing_row as u64);
             } else {
@@ -182,27 +257,33 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
     Ok(affected)
 }
 
-/// Validate the stated `ON CONFLICT (...)` target: it must be non-empty and
-/// every named column must be part of the table's conflict identity (the
-/// driver always matches on the full identity).
-pub(super) fn validate_conflict_target<S: UpsertSupport + ?Sized>(
-    spec: &S,
+pub(super) fn validate_target_columns(
     table_name: &str,
     target_columns: &[String],
+    expected_columns: &[&'static str],
+    expected_label: &str,
 ) -> Result<()> {
-    let identity = spec.conflict_identity_columns();
     if target_columns.is_empty() {
         return Err(DataFusionError::Execution(format!(
             "INSERT ON CONFLICT on {table_name} requires a conflict target"
         )));
     }
-    for column in target_columns {
-        if !identity.contains(&column.as_str()) {
-            return Err(DataFusionError::Execution(format!(
-                "INSERT ON CONFLICT on {table_name} does not support the conflict target column '{column}'; expected a subset of ({})",
-                identity.join(", ")
-            )));
-        }
+    if target_columns.len() != expected_columns.len() {
+        return Err(DataFusionError::Execution(format!(
+            "INSERT ON CONFLICT on {table_name} target must match {expected_label} ({})",
+            expected_columns.join(", ")
+        )));
+    }
+    let actual = target_columns
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected = expected_columns.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(DataFusionError::Execution(format!(
+            "INSERT ON CONFLICT on {table_name} target must match {expected_label} ({})",
+            expected_columns.join(", ")
+        )));
     }
     Ok(())
 }
@@ -217,10 +298,13 @@ pub(crate) fn excluded_field_name(column: &str) -> String {
 fn index_by_identity(
     batch: &RecordBatch,
     identity_columns: &[&str],
-) -> Result<HashMap<Vec<ScalarValue>, usize>> {
+) -> Result<HashMap<Vec<ScalarValue>, Vec<usize>>> {
     let mut index = HashMap::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        index.insert(identity_key(batch, row, identity_columns)?, row);
+        index
+            .entry(identity_key(batch, row, identity_columns)?)
+            .or_insert_with(Vec::new)
+            .push(row);
     }
     Ok(index)
 }

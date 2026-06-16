@@ -244,21 +244,10 @@ function createFsApi(
 		async writeFile(path: string, data: Uint8Array): Promise<void> {
 			assertPathArg(receiver, "fs.writeFile", path);
 			assertBytesArg(receiver, "fs.writeFile", "data", data);
-			const existing = await executeSql(
-				"SELECT id FROM lix_file WHERE path = $1",
-				[path],
+			await executeSql(
+				"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+				[path, data],
 			);
-			if (existing.rows.length === 0) {
-				await executeSql("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-					path,
-					data,
-				]);
-				return;
-			}
-			await executeSql("UPDATE lix_file SET data = $2 WHERE path = $1", [
-				path,
-				data,
-			]);
 		},
 	};
 }

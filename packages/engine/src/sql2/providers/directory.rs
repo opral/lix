@@ -40,7 +40,7 @@ use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
 };
-use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
+use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
 
 use crate::filesystem::{
     DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
@@ -57,10 +57,12 @@ use crate::sql2::{
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 use super::spec::{
-    PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema, row_source,
-    register_spec_table,
+    PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema,
+    register_spec_table, row_source,
 };
-use super::upsert::{StagedUpsert, UpsertSupport};
+use super::upsert::{
+    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport, validate_target_columns,
+};
 use crate::entity_pk::EntityPk;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -69,6 +71,8 @@ const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 /// A directory's identity is its `id`; the underlying live state keys on the
 /// directory id as a single-element entity primary key.
 const LIX_DIRECTORY_IDENTITY: &[&str] = &["id"];
+const LIX_DIRECTORY_PATH_IDENTITY: &[&str] = &["path"];
+const LIX_DIRECTORY_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
 
 pub(super) async fn register_lix_directory_active_provider(
     session: &SessionContext,
@@ -101,7 +105,9 @@ pub(super) async fn register_lix_directory_by_branch_provider(
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixDirectorySpec::by_branch(live_state, branch_ref, functions)),
+        Arc::new(LixDirectorySpec::by_branch(
+            live_state, branch_ref, functions,
+        )),
         WriteAccess::read_only(),
     )
 }
@@ -117,7 +123,9 @@ pub(super) async fn register_by_branch_write_provider(
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixDirectorySpec::by_branch(live_state, branch_ref, functions)),
+        Arc::new(LixDirectorySpec::by_branch(
+            live_state, branch_ref, functions,
+        )),
         WriteAccess::write(write_ctx),
     )
 }
@@ -208,7 +216,12 @@ impl LixDirectorySpec {
         captured: Arc<Mutex<Option<RecordBatch>>>,
     ) -> RowSource {
         row_source(
-            (write_ctx.clone(), request, Arc::clone(&self.schema), captured),
+            (
+                write_ctx.clone(),
+                request,
+                Arc::clone(&self.schema),
+                captured,
+            ),
             |(write_ctx, request, table_schema, captured)| async move {
                 let rows = write_ctx
                     .scan_live_state(&request)
@@ -216,8 +229,7 @@ impl LixDirectorySpec {
                     .map_err(lix_error_to_datafusion_error)?;
                 let source_batch = lix_directory_record_batch(&table_schema, rows)
                     .map_err(lix_error_to_datafusion_error)?;
-                *captured.lock().expect("dml source mutex poisoned") =
-                    Some(source_batch.clone());
+                *captured.lock().expect("dml source mutex poisoned") = Some(source_batch.clone());
                 Ok(source_batch)
             },
         )
@@ -484,9 +496,7 @@ impl TableSpec for LixDirectorySpec {
                         &mut || functions.call_uuid_v7().to_string(),
                     )?;
                     let count = u64::try_from(write_rows.len()).map_err(|_| {
-                        DataFusionError::Execution(
-                            "lix_directory UPDATE row count overflow".into(),
-                        )
+                        DataFusionError::Execution("lix_directory UPDATE row count overflow".into())
                     })?;
 
                     if count > 0 {
@@ -511,6 +521,35 @@ impl TableSpec for LixDirectorySpec {
 impl UpsertSupport for LixDirectorySpec {
     fn conflict_identity_columns(&self) -> &[&'static str] {
         LIX_DIRECTORY_IDENTITY
+    }
+
+    fn resolve_conflict_target(
+        &self,
+        table_name: &str,
+        target_columns: &[String],
+    ) -> Result<UpsertConflictTarget> {
+        if validate_target_columns(
+            table_name,
+            target_columns,
+            LIX_DIRECTORY_IDENTITY,
+            "conflict identity columns",
+        )
+        .is_ok()
+        {
+            return Ok(UpsertConflictTarget::id(LIX_DIRECTORY_IDENTITY));
+        }
+
+        let path_identity = match self.branch_binding {
+            BranchBinding::Active { .. } => LIX_DIRECTORY_PATH_IDENTITY,
+            BranchBinding::Explicit => LIX_DIRECTORY_BY_BRANCH_PATH_IDENTITY,
+        };
+        validate_target_columns(
+            table_name,
+            target_columns,
+            path_identity,
+            "path identity columns",
+        )?;
+        Ok(UpsertConflictTarget::path(path_identity))
     }
 
     /// Produce the staged INSERT rows for the non-conflicting proposed rows,
@@ -561,9 +600,18 @@ impl UpsertSupport for LixDirectorySpec {
         &self,
         write_ctx: &SqlWriteContext,
         proposed: &RecordBatch,
+        target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
         let mut request =
             lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = match target.kind() {
+                UpsertConflictKind::Id => proposed_branch_ids(proposed)?,
+                UpsertConflictKind::Path => {
+                    required_proposed_branch_ids(proposed, "lix_directory")?
+                }
+            };
+        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -571,13 +619,48 @@ impl UpsertSupport for LixDirectorySpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        request.filter.entity_pks = proposed_directory_entity_pks(proposed)?;
+        request.filter.entity_pks = match target.kind() {
+            UpsertConflictKind::Id => proposed_directory_entity_pks(proposed)?,
+            UpsertConflictKind::Path => {
+                validate_required_paths(proposed, "lix_directory")?;
+                Vec::new()
+            }
+        };
 
         let rows = write_ctx
             .scan_live_state(&request)
             .await
             .map_err(lix_error_to_datafusion_error)?;
         lix_directory_record_batch(&self.schema, rows).map_err(lix_error_to_datafusion_error)
+    }
+
+    fn validate_conflict_pair(
+        &self,
+        existing: &RecordBatch,
+        existing_row: usize,
+        proposed: &RecordBatch,
+        proposed_row: usize,
+        target: &UpsertConflictTarget,
+    ) -> Result<()> {
+        if target.kind() != UpsertConflictKind::Path {
+            return Ok(());
+        }
+        let existing_untracked =
+            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
+        let proposed_untracked =
+            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
+        if existing_untracked == proposed_untracked {
+            return Ok(());
+        }
+        let path = required_string_value(proposed, proposed_row, "path")?;
+        Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "INSERT ON CONFLICT (path) on lix_directory cannot write {} path {path:?} over existing {} directory",
+                lane_name(proposed_untracked),
+                lane_name(existing_untracked)
+            ),
+        )))
     }
 
     /// Apply the `DO UPDATE` assignments to the augmented batch (existing
@@ -622,6 +705,46 @@ fn proposed_directory_entity_pks(proposed: &RecordBatch) -> Result<Vec<EntityPk>
         }
     }
     Ok(entity_pks)
+}
+
+fn proposed_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
+    let mut branch_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        if let Some(branch_id) = optional_string_value(batch, row_index, "lixcol_branch_id")? {
+            branch_ids.insert(branch_id);
+        }
+    }
+    Ok(branch_ids.into_iter().collect())
+}
+
+fn required_proposed_branch_ids(batch: &RecordBatch, table_name: &str) -> Result<Vec<String>> {
+    let mut branch_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        let branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?.ok_or_else(
+            || {
+                DataFusionError::Execution(format!(
+                    "INSERT ON CONFLICT (path, lixcol_branch_id) on {table_name} requires non-null lixcol_branch_id"
+                ))
+            },
+        )?;
+        branch_ids.insert(branch_id);
+    }
+    Ok(branch_ids.into_iter().collect())
+}
+
+fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> {
+    for row_index in 0..batch.num_rows() {
+        if optional_string_value(batch, row_index, "path")?.is_none() {
+            return Err(DataFusionError::Execution(format!(
+                "INSERT ON CONFLICT (path) on {table_name} requires non-null path"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn lane_name(untracked: bool) -> &'static str {
+    if untracked { "untracked" } else { "tracked" }
 }
 
 fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
@@ -1074,9 +1197,15 @@ fn directory_row_context_from_update(
     row_index: usize,
     branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
+    let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
+    let explicit_branch_id = if explicit_global == Some(true) {
+        Some(GLOBAL_BRANCH_ID.to_string())
+    } else {
+        optional_string_value(batch, row_index, "lixcol_branch_id")?
+    };
     let scope = resolve_write_branch_scope(
-        optional_bool_value(batch, row_index, "lixcol_global")?,
-        optional_string_value(batch, row_index, "lixcol_branch_id")?,
+        explicit_global,
+        explicit_branch_id,
         branch_binding,
         "UPDATE into lix_directory_by_branch",
         "lix_directory",
@@ -1531,10 +1660,12 @@ mod tests {
         branch_binding: BranchBinding,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let live_state =
-            Arc::new(crate::sql2::WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref =
-            Arc::new(crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()));
+        let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
+            write_ctx.clone(),
+        ));
+        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
+            write_ctx.clone(),
+        ));
         let spec = match branch_binding {
             BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),
@@ -2058,10 +2189,12 @@ mod tests {
     fn directory_provider_is_writable_when_given_write_access() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let live_state =
-            Arc::new(crate::sql2::WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref =
-            Arc::new(crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()));
+        let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
+            write_ctx.clone(),
+        ));
+        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
+            write_ctx.clone(),
+        ));
         let provider = SpecTableProvider::new(
             Arc::new(LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),

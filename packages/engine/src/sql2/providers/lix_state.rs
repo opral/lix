@@ -8,10 +8,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::execution::context::ExecutionProps;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
@@ -44,12 +44,12 @@ use crate::sql2::predicate_typecheck::{
 use crate::sql2::result_metadata::json_field;
 
 use super::columns::{ColumnTableError, LIVE_STATE_COLS};
-use super::upsert::{StagedUpsert, UpsertSupport};
-use super::values::string_expr_literal;
 use super::spec::{
     PlannedDml, PlannedScan, RowSource, TableSpec, projected_schema, register_spec_table,
     row_source,
 };
+use super::upsert::{StagedUpsert, UpsertSupport};
+use super::values::string_expr_literal;
 
 pub(super) async fn register_lix_state_active_provider(
     session: &SessionContext,
@@ -183,8 +183,7 @@ impl LixStateSpec {
 /// The active surface scopes by the active branch implicitly; the by-branch
 /// surface carries `branch_id` as a column.
 const LIX_STATE_ACTIVE_IDENTITY: &[&str] = &["entity_pk", "schema_key", "file_id"];
-const LIX_STATE_BY_BRANCH_IDENTITY: &[&str] =
-    &["entity_pk", "schema_key", "file_id", "branch_id"];
+const LIX_STATE_BY_BRANCH_IDENTITY: &[&str] = &["entity_pk", "schema_key", "file_id", "branch_id"];
 
 #[async_trait]
 impl UpsertSupport for LixStateSpec {
@@ -210,8 +209,10 @@ impl UpsertSupport for LixStateSpec {
         &self,
         write_ctx: &SqlWriteContext,
         proposed: &RecordBatch,
+        _target: &super::upsert::UpsertConflictTarget,
     ) -> Result<RecordBatch> {
-        let request = lix_state_conflict_scan_request(&self.schema, &self.branch_binding, proposed)?;
+        let request =
+            lix_state_conflict_scan_request(&self.schema, &self.branch_binding, proposed)?;
         let rows = write_ctx
             .scan_live_state(&request)
             .await
@@ -591,8 +592,8 @@ fn update_optional_metadata_value(
 ) -> Result<Option<TransactionJson>> {
     update_optional_string_value(batch, assignment_values, row_index, column_name)?
         .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(lix_error_to_datafusion_error)?;
+            let metadata =
+                parse_row_metadata_value(&value, context).map_err(lix_error_to_datafusion_error)?;
             TransactionJson::from_value(metadata, &format!("{context} metadata"))
                 .map_err(lix_error_to_datafusion_error)
         })
@@ -728,8 +729,8 @@ fn optional_metadata_value(
 ) -> Result<Option<TransactionJson>> {
     optional_string_value(batch, row_index, column_name)?
         .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(lix_error_to_datafusion_error)?;
+            let metadata =
+                parse_row_metadata_value(&value, context).map_err(lix_error_to_datafusion_error)?;
             TransactionJson::from_value(metadata, &format!("{context} metadata"))
                 .map_err(lix_error_to_datafusion_error)
         })
@@ -1096,7 +1097,6 @@ fn nullable_key_literal(expr: &Expr) -> Option<NullableKeyFilter<String>> {
     }
     string_expr_literal(expr).map(NullableKeyFilter::Value)
 }
-
 
 fn is_null_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(ScalarValue::Null, _))

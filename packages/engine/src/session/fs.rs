@@ -69,44 +69,21 @@ where
         options: FsWriteOptions,
     ) -> Result<(), LixError> {
         let path_value = Value::Text(path.to_string());
-        let lane_value = Value::Boolean(options.untracked);
-        let existing = self
-            .session
+        let metadata_value = json_metadata_value(options.metadata);
+        self.session
             .execute(
-                "SELECT id, lixcol_untracked FROM lix_file WHERE path = $1",
-                std::slice::from_ref(&path_value),
+                "INSERT INTO lix_file (path, data, lixcol_metadata, lixcol_untracked) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (path) DO UPDATE SET \
+                 data = excluded.data, lixcol_metadata = excluded.lixcol_metadata",
+                &[
+                    path_value,
+                    Value::Blob(data),
+                    metadata_value,
+                    Value::Boolean(options.untracked),
+                ],
             )
             .await?;
-        let metadata_value = json_metadata_value(options.metadata);
-        for row in existing.rows() {
-            let existing_untracked: bool = row.get("lixcol_untracked")?;
-            if existing_untracked != options.untracked {
-                return Err(filesystem_conflict_error(format!(
-                    "fs.write_file cannot write {} path {path:?} over existing {} file",
-                    lane_name(options.untracked),
-                    lane_name(existing_untracked)
-                )));
-            }
-        }
-
-        if existing.is_empty() {
-            self.session
-                .execute(
-                    "INSERT INTO lix_file (path, data, lixcol_metadata, lixcol_untracked) \
-                     VALUES ($1, $2, $3, $4)",
-                    &[path_value, Value::Blob(data), metadata_value, lane_value],
-                )
-                .await?;
-        } else {
-            self.session
-                .execute(
-                    "UPDATE lix_file \
-                     SET data = $2, lixcol_metadata = $3 \
-                     WHERE path = $1 AND lixcol_untracked = $4",
-                    &[path_value, Value::Blob(data), metadata_value, lane_value],
-                )
-                .await?;
-        }
         Ok(())
     }
 
@@ -151,31 +128,11 @@ where
             return Ok(());
         }
 
-        let existing = self
-            .session
-            .execute(
-                "SELECT id, lixcol_untracked FROM lix_directory WHERE path = $1",
-                std::slice::from_ref(&path_value),
-            )
-            .await?;
-        for row in existing.rows() {
-            let existing_untracked: bool = row.get("lixcol_untracked")?;
-            if existing_untracked != options.untracked {
-                return Err(filesystem_conflict_error(format!(
-                    "fs.mkdir cannot write {} path {path:?} over existing {} directory",
-                    lane_name(options.untracked),
-                    lane_name(existing_untracked)
-                )));
-            }
-        }
-        if !existing.is_empty() {
-            return Ok(());
-        }
-
         self.session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata, lixcol_untracked) \
-                 VALUES ($1, $2, $3)",
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (path) DO NOTHING",
                 &[
                     path_value,
                     json_metadata_value(options.metadata),
@@ -349,10 +306,6 @@ where
     }
 }
 
-fn lane_name(untracked: bool) -> &'static str {
-    if untracked { "untracked" } else { "tracked" }
-}
-
 fn json_metadata_value(value: Option<JsonValue>) -> Value {
     value.map(Value::Json).unwrap_or(Value::Null)
 }
@@ -386,8 +339,4 @@ fn wrong_kind_error(path: &str, expected: &str, actual: &str) -> LixError {
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!("fs path {path:?} expected {expected}, found {actual}"),
     )
-}
-
-fn filesystem_conflict_error(message: String) -> LixError {
-    LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message)
 }

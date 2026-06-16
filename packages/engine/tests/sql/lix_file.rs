@@ -2261,3 +2261,346 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_file_insert_on_conflict_path_inserts_when_absent,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (path, data) \
+                 VALUES ('/docs/path-fresh.md', X'6E6577') \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect("path upsert on absent file should insert");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT path, data FROM lix_file WHERE path = '/docs/path-fresh.md'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("/docs/path-fresh.md".to_string()),
+                Value::Blob(b"new".to_vec()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_path_updates_existing_data_and_preserves_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-path-upsert', '/docs/path-upsert.md', X'6F6C64')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (path, data) \
+                 VALUES ('/docs/path-upsert.md', X'6E6577') \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect("path upsert DO UPDATE should succeed");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE path = '/docs/path-upsert.md'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("file-path-upsert".to_string()),
+                Value::Text("/docs/path-upsert.md".to_string()),
+                Value::Blob(b"new".to_vec()),
+            ]],
+        );
+
+        let files = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/docs/path-upsert.md'",
+                &[],
+            )
+            .await
+            .expect("file count read should succeed");
+        assert_eq!(files.len(), 1);
+
+        let blob_refs = session
+            .execute(
+                "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_binary_blob_ref' \
+                   AND entity_pk = lix_json('[\"file-path-upsert\"]')",
+                &[],
+            )
+            .await
+            .expect("blob ref read should succeed");
+        assert_eq!(blob_refs.len(), 1);
+    }
+);
+
+simulation_test!(
+    lix_file_by_branch_insert_on_conflict_path_branch_updates_existing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let branch_id = sim.main_branch_id();
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_branch \
+                     (id, path, data, lixcol_branch_id) \
+                     VALUES ('file-branch-path-upsert', '/docs/branch.md', X'6F6C64', '{branch_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect("seed by-branch insert should succeed");
+
+        let result = session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_branch \
+                     (path, data, lixcol_branch_id) \
+                     VALUES ('/docs/branch.md', X'6E6577', '{branch_id}') \
+                     ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET data = excluded.data"
+                ),
+                &[],
+            )
+            .await
+            .expect("by-branch path upsert should succeed");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, data FROM lix_file WHERE path = '/docs/branch.md'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("file-branch-path-upsert".to_string()),
+                Value::Blob(b"new".to_vec()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_by_branch_insert_on_conflict_path_without_branch_target_rejects,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let branch_id = sim.main_branch_id();
+
+        let error = session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_branch \
+                     (path, data, lixcol_branch_id) \
+                     VALUES ('/docs/reject.md', X'00', '{branch_id}') \
+                     ON CONFLICT (path) DO UPDATE SET data = excluded.data"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("by-branch path-only target should be rejected");
+        assert!(
+            error
+                .message
+                .contains("path identity columns (path, lixcol_branch_id)")
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_path_rejects_missing_path,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, data) \
+                 VALUES ('file-missing-path-upsert', X'00') \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect_err("path upsert without path should be rejected");
+        assert!(error.message.contains("requires non-null path"));
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_path_rejects_untracked_collision,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-tracked-collision', '/docs/collision.md', X'00')",
+                &[],
+            )
+            .await
+            .expect("tracked file insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (path, data, lixcol_untracked) \
+                 VALUES ('/docs/collision.md', X'01', true) \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect_err("tracked/untracked path collision should be rejected");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("existing tracked file"));
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_path_updates_visible_global_file,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_global) \
+                 VALUES ('file-global-path-upsert', '/docs/global.md', X'6F6C64', true)",
+                &[],
+            )
+            .await
+            .expect("global seed insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (path, data) \
+                 VALUES ('/docs/global.md', X'6E6577') \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect("path upsert should update visible global file");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, data, lixcol_global, lixcol_branch_id \
+                 FROM lix_file_by_branch \
+                 WHERE id = 'file-global-path-upsert' AND lixcol_branch_id = 'global'",
+                &[],
+            )
+            .await
+            .expect("global file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("file-global-path-upsert".to_string()),
+                Value::Blob(b"new".to_vec()),
+                Value::Boolean(true),
+                Value::Text("global".to_string()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_rejects_duplicate_target_columns,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (path, data) \
+                 VALUES ('/docs/duplicate-target.md', X'00') \
+                 ON CONFLICT (path, path) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect_err("duplicate conflict target columns should be rejected");
+        assert!(
+            error
+                .message
+                .contains("duplicate write target column 'path'"),
+            "unexpected error: {error:?}"
+        );
+    }
+);

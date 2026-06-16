@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
 use crate::LixError;
@@ -34,6 +35,7 @@ pub(crate) use upsert::{UpsertAction, excluded_field_name};
 /// The four builtin writable surfaces are all [`spec::SpecTableProvider`]s.
 pub(crate) async fn execute_spec_upsert(
     table: &Arc<dyn TableProvider>,
+    input: &Arc<dyn ExecutionPlan>,
     proposed_batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
     target_columns: &[String],
     action: &UpsertAction,
@@ -48,9 +50,31 @@ pub(crate) async fn execute_spec_upsert(
             )
         })?;
     provider
-        .execute_upsert(proposed_batches, target_columns, action)
+        .execute_upsert(input, proposed_batches, target_columns, action)
         .await
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
+
+/// Validate an `INSERT ... ON CONFLICT` against a registered table provider.
+pub(crate) async fn validate_spec_upsert(
+    table: &Arc<dyn TableProvider>,
+    input: &Arc<dyn ExecutionPlan>,
+    target_columns: &[String],
+) -> Result<(), LixError> {
+    let provider = table
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "INSERT ON CONFLICT is not supported on this table",
+            )
+        })?;
+    let _ = provider
+        .validate_upsert(input, target_columns)
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    Ok(())
 }
 
 pub(crate) async fn register_read<C>(session: &SessionContext, ctx: &C) -> Result<(), LixError>

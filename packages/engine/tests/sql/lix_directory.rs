@@ -1324,3 +1324,300 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_directory_insert_on_conflict_path_do_nothing_is_idempotent,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('dir-path-keep', '/path-keep/')",
+                &[],
+            )
+            .await
+            .expect("seed directory insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_directory (path) \
+                 VALUES ('/path-keep/') \
+                 ON CONFLICT (path) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("directory path DO NOTHING should succeed");
+        assert_eq!(result.rows_affected(), 0);
+
+        let read = session
+            .execute(
+                "SELECT id, path FROM lix_directory WHERE path = '/path-keep/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("dir-path-keep".to_string()),
+                Value::Text("/path-keep/".to_string()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_insert_on_conflict_path_do_update_metadata,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_metadata) \
+                 VALUES ('dir-path-meta', '/path-meta/', lix_json('{\"version\":1}'))",
+                &[],
+            )
+            .await
+            .expect("seed directory insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_metadata) \
+                 VALUES ('/path-meta/', lix_json('{\"version\":2}')) \
+                 ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
+                &[],
+            )
+            .await
+            .expect("directory path DO UPDATE should succeed");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, lixcol_metadata FROM lix_directory WHERE path = '/path-meta/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("dir-path-meta".to_string()),
+                Value::Json(json!({"version": 2})),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_by_branch_insert_on_conflict_path_branch_do_nothing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let branch_id = sim.main_branch_id();
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_branch \
+                     (id, path, lixcol_branch_id) \
+                     VALUES ('dir-branch-path-upsert', '/branch-dir/', '{branch_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect("seed by-branch directory insert should succeed");
+
+        let result = session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_branch \
+                     (path, lixcol_branch_id) \
+                     VALUES ('/branch-dir/', '{branch_id}') \
+                     ON CONFLICT (path, lixcol_branch_id) DO NOTHING"
+                ),
+                &[],
+            )
+            .await
+            .expect("by-branch directory path upsert should succeed");
+        assert_eq!(result.rows_affected(), 0);
+
+        let read = session
+            .execute(
+                "SELECT id FROM lix_directory WHERE path = '/branch-dir/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![Value::Text("dir-branch-path-upsert".to_string())]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_by_branch_insert_on_conflict_path_without_branch_target_rejects,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let branch_id = sim.main_branch_id();
+
+        let error = session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_branch \
+                     (path, lixcol_branch_id) \
+                     VALUES ('/dir-reject/', '{branch_id}') \
+                     ON CONFLICT (path) DO NOTHING"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("by-branch path-only target should be rejected");
+        assert!(
+            error
+                .message
+                .contains("path identity columns (path, lixcol_branch_id)")
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_insert_on_conflict_path_rejects_missing_path,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (id) \
+                 VALUES ('dir-missing-path-upsert') \
+                 ON CONFLICT (path) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("path upsert without path should be rejected");
+        assert!(error.message.contains("requires non-null path"));
+    }
+);
+
+simulation_test!(
+    lix_directory_insert_on_conflict_path_rejects_untracked_collision,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('dir-tracked-collision', '/dir-collision/')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_untracked) \
+                 VALUES ('/dir-collision/', true) \
+                 ON CONFLICT (path) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("tracked/untracked path collision should be rejected");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("existing tracked directory"));
+    }
+);
+
+simulation_test!(
+    lix_directory_insert_on_conflict_path_updates_visible_global_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_metadata, lixcol_global) \
+                 VALUES ('dir-global-path-upsert', '/global-dir/', lix_json('{\"version\":1}'), true)",
+                &[],
+            )
+            .await
+            .expect("global seed directory insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_metadata) \
+                 VALUES ('/global-dir/', lix_json('{\"version\":2}')) \
+                 ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
+                &[],
+            )
+            .await
+            .expect("path upsert should update visible global directory");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, lixcol_metadata, lixcol_global, lixcol_branch_id \
+                 FROM lix_directory_by_branch \
+                 WHERE id = 'dir-global-path-upsert' AND lixcol_branch_id = 'global'",
+                &[],
+            )
+            .await
+            .expect("global directory read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("dir-global-path-upsert".to_string()),
+                Value::Json(json!({"version": 2})),
+                Value::Boolean(true),
+                Value::Text("global".to_string()),
+            ]],
+        );
+    }
+);

@@ -282,10 +282,19 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                 return Ok(0);
             }
             if let Some(conflict) = &plan.bound.conflict {
-                let proposed_batches =
-                    crate::sql2::runtime::collect_input_plan(input, session.task_ctx())
-                        .await
-                        .map_err(datafusion_error_to_lix_error)?;
+                let target_columns: Vec<String> = conflict
+                    .target_columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect();
+                crate::sql2::providers::validate_spec_upsert(&table, &input, &target_columns)
+                    .await?;
+                let proposed_batches = crate::sql2::runtime::collect_input_plan(
+                    std::sync::Arc::clone(&input),
+                    session.task_ctx(),
+                )
+                .await
+                .map_err(datafusion_error_to_lix_error)?;
                 let action = match &conflict.action {
                     crate::sql2::bind::write::BoundConflictAction::DoNothing => {
                         crate::sql2::providers::UpsertAction::DoNothing
@@ -301,13 +310,9 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                         }
                     }
                 };
-                let target_columns: Vec<String> = conflict
-                    .target_columns
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect();
                 return crate::sql2::providers::execute_spec_upsert(
                     &table,
+                    &input,
                     proposed_batches,
                     &target_columns,
                     &action,
@@ -363,6 +368,13 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
         BoundWriteOp::Insert => {
             let input = insert_input_plan(&session, table_schema.clone(), plan, params).await?;
             if let Some(conflict) = &plan.bound.conflict {
+                let target_columns: Vec<String> = conflict
+                    .target_columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect();
+                crate::sql2::providers::validate_spec_upsert(&table, &input, &target_columns)
+                    .await?;
                 // Validate-only: compile DO UPDATE assignments to surface
                 // expression errors; the row-level upsert runs at execute time.
                 if let crate::sql2::bind::write::BoundConflictAction::DoUpdate { assignments } =
@@ -696,7 +708,13 @@ fn datafusion_conflict_assignments(
     schema: &Schema,
     assignments: &[crate::sql2::bind::write::BoundAssignment],
     params: &[Value],
-) -> Result<Vec<(String, std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>)>, LixError> {
+) -> Result<
+    Vec<(
+        String,
+        std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    )>,
+    LixError,
+> {
     let mut fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -722,8 +740,9 @@ fn datafusion_conflict_assignments(
             let expr = datafusion_expr_from_bound_expr(session, &assignment.value, params)?
                 .cast_to(field.data_type(), &df_schema)
                 .map_err(datafusion_error_to_lix_error)?;
-            let physical = datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
-                .map_err(datafusion_error_to_lix_error)?;
+            let physical =
+                datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
+                    .map_err(datafusion_error_to_lix_error)?;
             Ok((assignment.column.name.clone(), physical))
         })
         .collect()
