@@ -8,6 +8,7 @@ use crate::LixError;
 
 mod branch;
 mod change;
+mod columns;
 mod directory;
 mod directory_history;
 mod entity;
@@ -17,10 +18,40 @@ mod file_history;
 mod filesystem_history_path;
 mod history;
 mod lix_state;
+mod spec;
+mod upsert;
+mod values;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
+
+use datafusion::catalog::TableProvider;
+
+pub(crate) use upsert::{UpsertAction, excluded_field_name};
+
+/// Execute an `INSERT ... ON CONFLICT` against a registered table provider.
+/// The four builtin writable surfaces are all [`spec::SpecTableProvider`]s.
+pub(crate) async fn execute_spec_upsert(
+    table: &Arc<dyn TableProvider>,
+    proposed_batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+    target_columns: &[String],
+    action: &UpsertAction,
+) -> Result<u64, LixError> {
+    let provider = table
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "INSERT ON CONFLICT is not supported on this table",
+            )
+        })?;
+    provider
+        .execute_upsert(proposed_batches, target_columns, action)
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
 
 pub(crate) async fn register_read<C>(session: &SessionContext, ctx: &C) -> Result<(), LixError>
 where

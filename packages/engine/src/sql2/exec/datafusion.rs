@@ -264,7 +264,6 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     params: &[Value],
 ) -> Result<u64, LixError> {
     validate_bound_write_input(plan, params)?;
-    reject_datafusion_insert_conflict(plan)?;
     let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
@@ -281,6 +280,39 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                     .await?;
             if plan.bound.branch_scope == BranchScope::Empty {
                 return Ok(0);
+            }
+            if let Some(conflict) = &plan.bound.conflict {
+                let proposed_batches =
+                    crate::sql2::runtime::collect_input_plan(input, session.task_ctx())
+                        .await
+                        .map_err(datafusion_error_to_lix_error)?;
+                let action = match &conflict.action {
+                    crate::sql2::bind::write::BoundConflictAction::DoNothing => {
+                        crate::sql2::providers::UpsertAction::DoNothing
+                    }
+                    crate::sql2::bind::write::BoundConflictAction::DoUpdate { assignments } => {
+                        crate::sql2::providers::UpsertAction::DoUpdate {
+                            assignments: datafusion_conflict_assignments(
+                                &session,
+                                table_schema.as_ref(),
+                                assignments,
+                                params,
+                            )?,
+                        }
+                    }
+                };
+                let target_columns: Vec<String> = conflict
+                    .target_columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect();
+                return crate::sql2::providers::execute_spec_upsert(
+                    &table,
+                    proposed_batches,
+                    &target_columns,
+                    &action,
+                )
+                .await;
             }
             table.insert_into(&state, input, InsertOp::Append).await
         }
@@ -318,7 +350,6 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
     params: &[Value],
 ) -> Result<(), LixError> {
     validate_bound_write_input(plan, params)?;
-    reject_datafusion_insert_conflict(plan)?;
     let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
@@ -330,7 +361,22 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
 
     match plan.bound.op {
         BoundWriteOp::Insert => {
-            let input = insert_input_plan(&session, table_schema, plan, params).await?;
+            let input = insert_input_plan(&session, table_schema.clone(), plan, params).await?;
+            if let Some(conflict) = &plan.bound.conflict {
+                // Validate-only: compile DO UPDATE assignments to surface
+                // expression errors; the row-level upsert runs at execute time.
+                if let crate::sql2::bind::write::BoundConflictAction::DoUpdate { assignments } =
+                    &conflict.action
+                {
+                    datafusion_conflict_assignments(
+                        &session,
+                        table_schema.as_ref(),
+                        assignments,
+                        params,
+                    )?;
+                }
+                return Ok(());
+            }
             let _ = table
                 .insert_into(&state, input, InsertOp::Append)
                 .await
@@ -354,16 +400,6 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
         }
     }
 
-    Ok(())
-}
-
-fn reject_datafusion_insert_conflict(plan: &LogicalWritePlan) -> Result<(), LixError> {
-    if plan.bound.conflict.is_some() {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "INSERT ON CONFLICT is not supported by the DataFusion write path",
-        ));
-    }
     Ok(())
 }
 
@@ -651,6 +687,48 @@ fn datafusion_assignments(
         .collect()
 }
 
+/// Compile `DO UPDATE` conflict assignments to physical expressions over the
+/// augmented schema `[table cols..., excluded.<col>...]`, so `excluded.*`
+/// references resolve against the proposed-row columns the upsert driver
+/// appends.
+fn datafusion_conflict_assignments(
+    session: &SessionContext,
+    schema: &Schema,
+    assignments: &[crate::sql2::bind::write::BoundAssignment],
+    params: &[Value],
+) -> Result<Vec<(String, std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>)>, LixError> {
+    let mut fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    for field in schema.fields() {
+        fields.push(Field::new(
+            crate::sql2::providers::excluded_field_name(field.name()),
+            field.data_type().clone(),
+            field.is_nullable(),
+        ));
+    }
+    let augmented = Schema::new(fields);
+    let df_schema = DFSchema::try_from(augmented).map_err(datafusion_error_to_lix_error)?;
+    let props = session.state().execution_props().clone();
+
+    assignments
+        .iter()
+        .map(|assignment| {
+            let field = schema
+                .field_with_name(&assignment.column.name)
+                .map_err(|error| LixError::unknown(format!("unknown conflict column: {error}")))?;
+            let expr = datafusion_expr_from_bound_expr(session, &assignment.value, params)?
+                .cast_to(field.data_type(), &df_schema)
+                .map_err(datafusion_error_to_lix_error)?;
+            let physical = datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
+                .map_err(datafusion_error_to_lix_error)?;
+            Ok((assignment.column.name.clone(), physical))
+        })
+        .collect()
+}
+
 fn datafusion_write_filters(
     session: &SessionContext,
     schema: &Schema,
@@ -854,10 +932,11 @@ fn datafusion_expr_from_bound_expr(
 ) -> Result<Expr, LixError> {
     match expr {
         BoundExpr::Column(column) => Ok(Expr::Column(Column::from_name(column.name.clone()))),
-        BoundExpr::ExcludedColumn(_) => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "excluded columns are only supported in INSERT ON CONFLICT assignments",
-        )),
+        // `excluded.<col>` resolves to the proposed row's value, carried in the
+        // augmented conflict batch as an `excluded.<col>` column.
+        BoundExpr::ExcludedColumn(column) => Ok(Expr::Column(Column::from_name(
+            crate::sql2::providers::excluded_field_name(&column.name),
+        ))),
         BoundExpr::Literal(literal) => Ok(Expr::Literal(
             scalar_from_bound_literal(literal)?,
             bound_literal_metadata(literal),

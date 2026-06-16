@@ -22,7 +22,8 @@ use super::table::{
     BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
 };
 use super::write::{
-    BoundAssignment, BoundInsertConflict, BoundInsertValues, BoundParamMap, BoundWrite,
+    BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundParamMap,
+    BoundWrite,
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface,
     FileWriteSurface,
 };
@@ -102,10 +103,18 @@ pub(super) fn bind_insert_bound(
     if conflict.is_some() {
         if !matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
+            PublicSurfaceKind::EntityBase { .. }
+                | PublicSurfaceKind::EntityByBranch { .. }
+                | PublicSurfaceKind::LixState
+                | PublicSurfaceKind::LixStateByBranch
+                | PublicSurfaceKind::Branch
+                | PublicSurfaceKind::File
+                | PublicSurfaceKind::FileByBranch
+                | PublicSurfaceKind::Directory
+                | PublicSurfaceKind::DirectoryByBranch
         ) {
             return Err(super::error::unsupported(
-                "INSERT ON CONFLICT is supported for entity SQL surfaces only",
+                "INSERT ON CONFLICT is not supported for this SQL surface yet",
             ));
         }
         require_write_capability(&table.surface, BoundWriteOp::Update)?;
@@ -279,33 +288,34 @@ fn bind_insert_conflict(
             bind_public_column_ref(table, &column_name)
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let OnConflictAction::DoUpdate(update) = &conflict.action else {
-        return Err(super::error::unsupported(
-            "INSERT ON CONFLICT DO NOTHING is not supported",
-        ));
+    let action = match &conflict.action {
+        OnConflictAction::DoNothing => BoundConflictAction::DoNothing,
+        OnConflictAction::DoUpdate(update) => {
+            if update.selection.is_some() {
+                return Err(super::error::unsupported(
+                    "INSERT ON CONFLICT DO UPDATE WHERE is not supported",
+                ));
+            }
+            let mut seen_assignments = BTreeSet::new();
+            let assignments = update
+                .assignments
+                .iter()
+                .map(|assignment| {
+                    let column = bind_assignment_target(table, &assignment.target)?;
+                    reject_duplicate_target_column(&mut seen_assignments, &column.name)?;
+                    Ok(BoundAssignment {
+                        column,
+                        value: bind_conflict_expr(table, &assignment.value, params)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            BoundConflictAction::DoUpdate { assignments }
+        }
     };
-    if update.selection.is_some() {
-        return Err(super::error::unsupported(
-            "INSERT ON CONFLICT DO UPDATE WHERE is not supported",
-        ));
-    }
-    let mut seen_assignments = BTreeSet::new();
-    let assignments = update
-        .assignments
-        .iter()
-        .map(|assignment| {
-            let column = bind_assignment_target(table, &assignment.target)?;
-            reject_duplicate_target_column(&mut seen_assignments, &column.name)?;
-            Ok(BoundAssignment {
-                column,
-                value: bind_conflict_expr(table, &assignment.value, params)?,
-            })
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
 
     Ok(Some(BoundInsertConflict {
         target_columns,
-        assignments,
+        action,
     }))
 }
 

@@ -2120,3 +2120,144 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_file_insert_on_conflict_do_update_replaces_data,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-upsert', '/docs/upsert.md', X'6F6C64')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-upsert', '/docs/upsert.md', X'6E6577') \
+                 ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect("upsert DO UPDATE should succeed");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE id = 'file-upsert'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("file-upsert".to_string()),
+                Value::Text("/docs/upsert.md".to_string()),
+                Value::Blob(b"new".to_vec()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_do_nothing_keeps_existing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-nothing', '/docs/nothing.md', X'6B656570')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-nothing', '/docs/nothing.md', X'6967') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("upsert DO NOTHING should succeed");
+        assert_eq!(result.rows_affected(), 0);
+
+        let read = session
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE id = 'file-nothing'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("file-nothing".to_string()),
+                Value::Text("/docs/nothing.md".to_string()),
+                Value::Blob(b"keep".to_vec()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_inserts_when_absent,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-fresh', '/docs/fresh.md', X'6E6577') \
+                 ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+                &[],
+            )
+            .await
+            .expect("upsert on absent id should insert");
+        assert_eq!(result.rows_affected(), 1);
+
+        let read = session
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE id = 'file-fresh'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            read,
+            vec![vec![
+                Value::Text("file-fresh".to_string()),
+                Value::Text("/docs/fresh.md".to_string()),
+                Value::Blob(b"new".to_vec()),
+            ]],
+        );
+    }
+);

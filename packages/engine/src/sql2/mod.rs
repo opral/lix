@@ -14,7 +14,6 @@ mod plan;
 mod predicate_typecheck;
 mod providers;
 mod read_only;
-mod record_batch;
 mod result_metadata;
 mod runtime;
 mod session;

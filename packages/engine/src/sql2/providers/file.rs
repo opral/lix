@@ -10,32 +10,24 @@
     clippy::useless_let_if_seq
 )]
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, RecordBatchOptions, StringArray, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, RecordBatchOptions, StringArray,
 };
-use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, SchemaExt, not_impl_err};
-use datafusion::datasource::TableType;
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-};
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use futures_util::{TryStreamExt, stream};
+use futures_util::FutureExt;
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
@@ -59,7 +51,7 @@ use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,
 };
-use crate::sql2::dml::{InsertExec, InsertSink};
+use crate::sql2::dml::InsertSink;
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
@@ -94,6 +86,12 @@ use crate::transaction::types::{
     TransactionWriteOperation, TransactionWriteOrigin,
 };
 
+use super::spec::{
+    DmlApply, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch,
+    register_spec_table, row_source,
+};
+use super::upsert::{StagedUpsert, UpsertSupport};
+
 pub(super) async fn register_lix_file_active_provider(
     session: &SessionContext,
     surface_name: &str,
@@ -104,20 +102,19 @@ pub(super) async fn register_lix_file_active_provider(
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixFileProvider::active_branch(
-                active_branch_id,
-                live_state,
-                branch_ref,
-                blob_reader,
-                plugin_host,
-                functions,
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixFileSpec::active_branch(
+            active_branch_id,
+            live_state,
+            branch_ref,
+            blob_reader,
+            plugin_host,
+            functions,
+        )),
+        WriteAccess::read_only(),
+    )
 }
 
 pub(super) async fn register_lix_file_by_branch_provider(
@@ -129,19 +126,18 @@ pub(super) async fn register_lix_file_by_branch_provider(
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixFileProvider::by_branch(
-                live_state,
-                branch_ref,
-                blob_reader,
-                plugin_host,
-                functions,
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixFileSpec::by_branch(
+            live_state,
+            branch_ref,
+            blob_reader,
+            plugin_host,
+            functions,
+        )),
+        WriteAccess::read_only(),
+    )
 }
 
 pub(super) async fn register_by_branch_write_provider(
@@ -150,13 +146,12 @@ pub(super) async fn register_by_branch_write_provider(
     write_ctx: SqlWriteContext,
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixFileProvider::by_branch_with_write(write_ctx, options)),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixFileSpec::by_branch_with_write(write_ctx.clone(), options)),
+        WriteAccess::write(write_ctx),
+    )
 }
 
 pub(super) async fn register_active_write_provider(
@@ -165,37 +160,30 @@ pub(super) async fn register_active_write_provider(
     write_ctx: SqlWriteContext,
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixFileProvider::active_branch_with_write(
-                write_ctx, options,
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixFileSpec::active_branch_with_write(
+            write_ctx.clone(),
+            options,
+        )),
+        WriteAccess::write(write_ctx),
+    )
 }
 
-pub(crate) struct LixFileProvider {
+struct LixFileSpec {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
-    write_access: WriteAccess,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
     options: SqlWriteSessionOptions,
 }
 
-impl std::fmt::Debug for LixFileProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixFileProvider").finish()
-    }
-}
-
-impl LixFileProvider {
-    pub(crate) fn active_branch(
+impl LixFileSpec {
+    fn active_branch(
         active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
@@ -209,14 +197,13 @@ impl LixFileProvider {
             branch_ref,
             blob_reader,
             plugin_host,
-            write_access: WriteAccess::read_only(),
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             options: SqlWriteSessionOptions::default(),
         }
     }
 
-    pub(crate) fn active_branch_with_write(
+    fn active_branch_with_write(
         write_ctx: SqlWriteContext,
         options: SqlWriteSessionOptions,
     ) -> Self {
@@ -232,14 +219,13 @@ impl LixFileProvider {
             branch_ref,
             blob_reader,
             plugin_host,
-            write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             options,
         }
     }
 
-    pub(crate) fn by_branch(
+    fn by_branch(
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
@@ -252,14 +238,13 @@ impl LixFileProvider {
             branch_ref,
             blob_reader,
             plugin_host,
-            write_access: WriteAccess::read_only(),
             functions,
             branch_binding: BranchBinding::explicit(),
             options: SqlWriteSessionOptions::default(),
         }
     }
 
-    pub(crate) fn by_branch_with_write(
+    fn by_branch_with_write(
         write_ctx: SqlWriteContext,
         options: SqlWriteSessionOptions,
     ) -> Self {
@@ -274,55 +259,91 @@ impl LixFileProvider {
             branch_ref,
             blob_reader,
             plugin_host,
-            write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::explicit(),
             options,
         }
     }
+
+    /// Build the unprojected candidate-row source for UPDATE/DELETE: scan the
+    /// scoped live-state rows, then render the full `lix_file` batch the
+    /// statement filters run against.
+    fn dml_source(
+        &self,
+        write_ctx: &SqlWriteContext,
+        request: LiveStateScanRequest,
+        target_file_ids: FileIdConstraint,
+        needs_data: bool,
+    ) -> RowSource {
+        row_source(
+            (
+                write_ctx.clone(),
+                Arc::clone(&self.blob_reader),
+                self.plugin_host.clone(),
+                Arc::clone(&self.schema),
+                request,
+                target_file_ids,
+                needs_data,
+            ),
+            |(write_ctx, blob_reader, plugin_host, table_schema, request, target_file_ids, needs_data)| async move {
+                let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+                let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                let plugin_render = plugin_render_context_for_lix_file_scan(
+                    live_state,
+                    &blob_reader,
+                    &request,
+                    plugin_host,
+                    needs_data,
+                )
+                .await
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "sql2 lix_file plugin discovery failed: {error}"
+                    ))
+                })?;
+                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)
+            },
+        )
+    }
 }
 
 #[async_trait]
-impl TableProvider for LixFileProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TableSpec for LixFileSpec {
+    fn table_name(&self) -> &str {
+        "lix_file"
+    }
+
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+        Some(self)
     }
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
+    fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let analyzer = LixFileIdFilterAnalyzer;
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if ExactStringColumnFilterAnalyzer::new("lixcol_branch_id").supports(filter)
-                    || analyzer.supports(filter)
-                    || contains_column(filter, "path")
-                {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+        if ExactStringColumnFilterAnalyzer::new("lixcol_branch_id").supports(filter)
+            || analyzer.supports(filter)
+            || contains_column(filter, "path")
+        {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
     }
 
-    async fn scan(
+    async fn plan_scan(
         &self,
-        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let scan_limit = if filters.is_empty() { limit } else { None };
         let mut request = lix_file_scan_request(
@@ -347,68 +368,123 @@ impl TableProvider for LixFileProvider {
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, _state.execution_props()))
+            .map(|expr| create_physical_expr(expr, &df_schema, props))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(LixFileScanExec::new(
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.blob_reader),
-            self.plugin_host.clone(),
-            Arc::clone(&self.schema),
-            projected_schema,
-            projection.cloned(),
-            request,
-            target_file_ids,
-            physical_filters,
-            needs_data,
-            limit,
-        )))
+        Ok(PlannedScan {
+            schema: Arc::clone(&projected_schema),
+            load: row_source(
+                (
+                    Arc::clone(&self.live_state),
+                    Arc::clone(&self.blob_reader),
+                    self.plugin_host.clone(),
+                    Arc::clone(&self.schema),
+                    projection.cloned(),
+                    request,
+                    target_file_ids,
+                    physical_filters,
+                    needs_data,
+                    limit,
+                ),
+                |(
+                    live_state,
+                    blob_reader,
+                    plugin_host,
+                    batch_schema,
+                    projection,
+                    request,
+                    target_file_ids,
+                    filters,
+                    needs_data,
+                    limit,
+                )| async move {
+                    let rows =
+                        scan_lix_file_live_rows(Arc::clone(&live_state), &request, &target_file_ids)
+                            .await
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "sql2 lix_file scan failed: {error}"
+                                ))
+                            })?;
+                    let plugin_render = plugin_render_context_for_lix_file_scan(
+                        Arc::clone(&live_state),
+                        &blob_reader,
+                        &request,
+                        plugin_host,
+                        needs_data,
+                    )
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file plugin discovery failed: {error}"
+                        ))
+                    })?;
+                    let batch = lix_file_record_batch(
+                        &batch_schema,
+                        &blob_reader,
+                        plugin_render,
+                        needs_data,
+                        rows,
+                    )
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file batch build failed: {error}"
+                        ))
+                    })?;
+                    finish_scan_batch(batch, &filters, projection.as_deref(), limit, "lix_file")
+                },
+            ),
+        })
     }
 
-    async fn insert_into(
+    async fn plan_insert(
         &self,
-        _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for lix_file yet");
-        }
-        let write_ctx = self.write_access.require_write("INSERT into lix_file")?;
-        self.schema
-            .logically_equivalent_names_and_types(&input.schema())?;
-        let insert_intents = InsertColumnIntents::from_input(&input);
+        write_ctx: SqlWriteContext,
+        input: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<InsertApply>> {
+        let insert_intents = InsertColumnIntents::from_input(input);
         let include_data_writes = self.schema.field_with_name("data").is_ok()
             && insert_intents.includes_column("data")
             && !self.options.omitted_insert_columns.contains("data");
         if include_data_writes {
-            reject_non_binary_casts_for_insert_column(&input, "data", "INSERT into lix_file")?;
+            reject_non_binary_casts_for_insert_column(input, "data", "INSERT into lix_file")?;
         }
-        let sink = LixFileInsertSink::new(
+        let sink = Arc::new(LixFileInsertSink::new(
             write_ctx,
             self.functions.clone(),
             self.branch_binding.clone(),
             include_data_writes,
-        );
-        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
+        ));
+        let apply: InsertApply = Arc::new(move |batches| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.write_batches(batches, &Arc::new(TaskContext::default()))
+                    .await
+            }
+            .boxed()
+        });
+        Ok(Some(apply))
     }
 
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("DELETE FROM lix_file")?;
+    fn validate_update_assignments(&self, assignments: &[(String, Expr)]) -> Result<()> {
+        validate_lix_file_update_assignments(&self.schema, assignments)
+    }
+
+    fn prepare_write_filters(&self, filters: Vec<Expr>) -> Result<Vec<Expr>> {
         let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
+        Ok(filters)
+    }
+
+    async fn plan_delete(
+        &self,
+        write_ctx: SqlWriteContext,
+        filters: &[Expr],
+    ) -> Result<PlannedDml> {
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"));
-        let target_file_ids = file_id_constraint_from_filters(&filters)?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
+        let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
+        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -416,50 +492,58 @@ impl TableProvider for LixFileProvider {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        Ok(Arc::new(LixFileDeleteExec::new(
-            Arc::clone(&self.blob_reader),
-            self.plugin_host.clone(),
-            write_ctx,
-            Arc::clone(&self.schema),
-            self.branch_binding.clone(),
-            request,
-            target_file_ids,
-            physical_filters,
-            needs_data,
-        )))
+
+        let source = self.dml_source(&write_ctx, request.clone(), target_file_ids.clone(), needs_data);
+        let branch_binding = self.branch_binding.clone();
+        let apply: DmlApply = Arc::new(move |matched_batch| {
+            let write_ctx = write_ctx.clone();
+            let branch_binding = branch_binding.clone();
+            let request = request.clone();
+            let target_file_ids = target_file_ids.clone();
+            async move {
+                let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+                let rows = scan_lix_file_live_rows(live_state, &request, &target_file_ids)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                let blob_ref_keys =
+                    blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+                let staged = lix_file_delete_stage_from_batch(
+                    &matched_batch,
+                    branch_binding.active_branch_id(),
+                    &blob_ref_keys,
+                )?;
+                let count = staged.count;
+
+                if count > 0 {
+                    write_ctx
+                        .stage_write(TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Replace,
+                            rows: staged.state_rows,
+                        })
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
+
+                Ok(count)
+            }
+            .boxed()
+        });
+        Ok(PlannedDml { source, apply })
     }
 
-    async fn update(
+    async fn plan_update(
         &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("UPDATE lix_file")?;
-        validate_lix_file_update_assignments(&self.schema, &assignments)?;
-        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+    ) -> Result<PlannedDml> {
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
-            || assignments
-                .iter()
-                .any(|(column_name, expr)| column_name == "path" || contains_column(expr, "data"));
-        let target_file_ids = file_id_constraint_from_filters(&filters)?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
+            || assignments.iter().any(|(column_name, expr)| {
+                column_name == "path" || physical_expr_contains_column(expr, "data")
+            });
+        let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
+        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -467,20 +551,333 @@ impl TableProvider for LixFileProvider {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        Ok(Arc::new(LixFileUpdateExec::new(
-            Arc::clone(&self.blob_reader),
-            self.plugin_host.clone(),
-            write_ctx,
-            Arc::clone(&self.schema),
-            self.branch_binding.clone(),
-            self.functions.clone(),
-            request,
-            target_file_ids,
-            physical_assignments,
-            physical_filters,
-            needs_data,
-        )))
+
+        let source = self.dml_source(&write_ctx, request.clone(), target_file_ids.clone(), needs_data);
+        let branch_binding = self.branch_binding.clone();
+        let functions = self.functions.clone();
+        let blob_reader = Arc::clone(&self.blob_reader);
+        let plugin_host = self.plugin_host.clone();
+        let apply: DmlApply = Arc::new(move |matched_batch| {
+            let write_ctx = write_ctx.clone();
+            let branch_binding = branch_binding.clone();
+            let functions = functions.clone();
+            let blob_reader = Arc::clone(&blob_reader);
+            let plugin_host = plugin_host.clone();
+            let request = request.clone();
+            let target_file_ids = target_file_ids.clone();
+            let assignments = assignments.clone();
+            async move {
+                let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+                let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                let blob_ref_keys =
+                    blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+                let plugin_render = plugin_render_context_for_lix_file_scan(
+                    live_state,
+                    &blob_reader,
+                    &request,
+                    plugin_host,
+                    needs_data,
+                )
+                .await
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "sql2 lix_file plugin discovery failed: {error}"
+                    ))
+                })?;
+                let assignment_values =
+                    UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
+                let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
+                let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
+                    path_update_plugin_rewrite_file_ids(
+                        plugin_render.as_ref(),
+                        &matched_batch,
+                        &assignment_values,
+                        branch_binding.active_branch_id(),
+                    )?
+                } else {
+                    BTreeSet::new()
+                };
+                let mut path_resolvers = None;
+                if update_columns.path || update_columns.descriptor {
+                    path_resolvers = Some(
+                        directory_path_resolvers_from_live_state(
+                            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                            branch_binding.active_branch_id(),
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                    );
+                }
+                let staged = lix_file_update_stage_from_batch(
+                    &matched_batch,
+                    &assignment_values,
+                    branch_binding.active_branch_id(),
+                    update_columns,
+                    &blob_ref_keys,
+                    &plugin_rewrite_file_ids,
+                    path_resolvers.as_mut(),
+                    &mut || functions.call_uuid_v7().to_string(),
+                )?;
+                let count = staged.count;
+
+                if count > 0 {
+                    let intent = if staged.file_data_writes.is_empty() {
+                        TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Replace,
+                            rows: staged.state_rows,
+                        }
+                    } else {
+                        TransactionWrite::RowsWithFileData {
+                            mode: TransactionWriteMode::Replace,
+                            rows: staged.state_rows,
+                            file_data: staged.file_data_writes,
+                            count,
+                        }
+                    };
+                    write_ctx
+                        .stage_write(intent)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
+
+                Ok(count)
+            }
+            .boxed()
+        });
+        Ok(PlannedDml { source, apply })
     }
+}
+
+/// Physical-identity column the upsert driver matches conflicting `lix_file`
+/// rows on. A `lix_file` row is uniquely identified by its file `id`; the
+/// `ON CONFLICT (id)` target is the supported (and only) conflict target.
+const LIX_FILE_IDENTITY: &[&str] = &["id"];
+
+#[async_trait]
+impl UpsertSupport for LixFileSpec {
+    fn conflict_identity_columns(&self) -> &[&'static str] {
+        LIX_FILE_IDENTITY
+    }
+
+    async fn insert_staged_rows(
+        &self,
+        write_ctx: &SqlWriteContext,
+        batch: &RecordBatch,
+    ) -> Result<StagedUpsert> {
+        // Reuse the plain-INSERT staging the file insert sink performs, for a
+        // single proposed batch. The collected proposed batch has lost the
+        // per-column insert intent metadata, so `include_data_writes` is
+        // derived from whether the materialized `data` column carries a value.
+        let surface_name = lix_file_surface_name(&self.branch_binding);
+        let branch_binding = self.branch_binding.active_branch_id();
+        let include_data_writes = record_batch_has_non_null_column(batch, "data")?;
+
+        let mut path_resolvers = directory_path_resolvers_from_live_state(
+            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+            branch_binding,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let staged = if record_batch_has_non_null_column(batch, "path")? {
+            lix_file_insert_stage_from_batch_with_path_resolvers(
+                batch,
+                branch_binding,
+                surface_name,
+                &mut path_resolvers,
+                &mut || self.functions.call_uuid_v7().to_string(),
+                include_data_writes,
+            )?
+        } else {
+            lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
+                batch,
+                branch_binding,
+                surface_name,
+                &mut path_resolvers,
+                &mut || self.functions.call_uuid_v7().to_string(),
+                include_data_writes,
+            )?
+        };
+
+        Ok(StagedUpsert::with_file_data(
+            staged.state_rows,
+            staged.file_data_writes,
+        ))
+    }
+
+    async fn scan_conflict_candidates(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        // Existing rows whose `id` matches a proposed row, rendered as a full
+        // `lix_file` batch (with materialized `data`) so the driver can build
+        // the augmented `excluded.*` batch the conflict assignments run over.
+        let target_file_ids = proposed_file_id_constraint(proposed)?;
+        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = proposed_branch_ids(proposed)?;
+        }
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let plugin_render = plugin_render_context_for_lix_file_scan(
+            live_state,
+            &self.blob_reader,
+            &request,
+            self.plugin_host.clone(),
+            true,
+        )
+        .await
+        .map_err(|error| {
+            DataFusionError::Execution(format!("sql2 lix_file plugin discovery failed: {error}"))
+        })?;
+        lix_file_record_batch(&self.schema, &self.blob_reader, plugin_render, true, rows)
+            .await
+            .map_err(lix_error_to_datafusion_error)
+    }
+
+    async fn apply_conflict_update(
+        &self,
+        write_ctx: &SqlWriteContext,
+        augmented: &RecordBatch,
+        assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    ) -> Result<StagedUpsert> {
+        // Reuse the plain-UPDATE staging. `augmented` carries the existing file
+        // columns plus `excluded.*`; the physical assignments reference both.
+        let branch_binding = self.branch_binding.active_branch_id();
+        let assignment_values = UpdateAssignmentValues::evaluate(augmented, assignments)?;
+        let update_columns = LixFileUpdateColumns::from_assignments(assignments);
+
+        // Re-scan the conflicting files' live rows to recover their blob refs
+        // (needed to tombstone the old blob when `data` is replaced) and any
+        // plugins installed for path-move rewrites.
+        let target_file_ids = augmented_file_id_constraint(augmented)?;
+        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = augmented_branch_ids(augmented)?;
+        }
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let blob_ref_keys =
+            blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+
+        let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
+            let plugin_render = plugin_render_context_for_lix_file_scan(
+                live_state.clone(),
+                &self.blob_reader,
+                &request,
+                self.plugin_host.clone(),
+                true,
+            )
+            .await
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "sql2 lix_file plugin discovery failed: {error}"
+                ))
+            })?;
+            path_update_plugin_rewrite_file_ids(
+                plugin_render.as_ref(),
+                augmented,
+                &assignment_values,
+                branch_binding,
+            )?
+        } else {
+            BTreeSet::new()
+        };
+
+        let mut path_resolvers = None;
+        if update_columns.path || update_columns.descriptor {
+            path_resolvers = Some(
+                directory_path_resolvers_from_live_state(
+                    Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                    branch_binding,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?,
+            );
+        }
+
+        let staged = lix_file_update_stage_from_batch(
+            augmented,
+            &assignment_values,
+            branch_binding,
+            update_columns,
+            &blob_ref_keys,
+            &plugin_rewrite_file_ids,
+            path_resolvers.as_mut(),
+            &mut || self.functions.call_uuid_v7().to_string(),
+        )?;
+
+        Ok(StagedUpsert::with_file_data(
+            staged.state_rows,
+            staged.file_data_writes,
+        ))
+    }
+}
+
+/// The conflict-identity (`id`) constraint of the proposed insert batch: the
+/// distinct file ids whose existing rows must be scanned for conflicts.
+fn proposed_file_id_constraint(batch: &RecordBatch) -> Result<FileIdConstraint> {
+    let mut ids = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        if let Some(id) = optional_string_value(batch, row_index, "id")? {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        // No explicit ids: nothing can conflict (every inserted row will be
+        // assigned a fresh id), so the candidate scan should match nothing.
+        return Ok(FileIdConstraint::None);
+    }
+    Ok(FileIdConstraint::from_ids(ids))
+}
+
+/// The `id` constraint of an augmented conflict batch (existing-row columns).
+fn augmented_file_id_constraint(batch: &RecordBatch) -> Result<FileIdConstraint> {
+    let mut ids = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        ids.push(required_string_value(batch, row_index, "id")?);
+    }
+    Ok(FileIdConstraint::from_ids(ids))
+}
+
+/// Distinct explicit `lixcol_branch_id` values in a proposed insert batch
+/// (by-branch surface). Empty when the column is absent or all-null.
+fn proposed_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
+    let mut branch_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        if let Some(branch_id) = optional_string_value(batch, row_index, "lixcol_branch_id")? {
+            branch_ids.insert(branch_id);
+        }
+    }
+    Ok(branch_ids.into_iter().collect())
+}
+
+/// Distinct `lixcol_branch_id` values carried by an augmented conflict batch.
+fn augmented_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
+    proposed_branch_ids(batch)
 }
 
 struct LixFileInsertSink {
@@ -601,573 +998,6 @@ fn lix_file_surface_name(branch_binding: &BranchBinding) -> &'static str {
     match branch_binding {
         BranchBinding::Active { .. } => "lix_file",
         BranchBinding::Explicit => "lix_file_by_branch",
-    }
-}
-
-struct LixFileDeleteExec {
-    blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
-    write_ctx: SqlWriteContext,
-    table_schema: SchemaRef,
-    branch_binding: BranchBinding,
-    request: LiveStateScanRequest,
-    target_file_ids: FileIdConstraint,
-    filters: Vec<Arc<dyn PhysicalExpr>>,
-    needs_data: bool,
-    result_schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for LixFileDeleteExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixFileDeleteExec").finish()
-    }
-}
-
-impl LixFileDeleteExec {
-    fn new(
-        blob_reader: Arc<dyn BlobDataReader>,
-        plugin_host: PluginRuntimeHost,
-        write_ctx: SqlWriteContext,
-        table_schema: SchemaRef,
-        branch_binding: BranchBinding,
-        request: LiveStateScanRequest,
-        target_file_ids: FileIdConstraint,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-        needs_data: bool,
-    ) -> Self {
-        let result_schema = dml_count_schema();
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&result_schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        );
-        Self {
-            blob_reader,
-            plugin_host,
-            write_ctx,
-            table_schema,
-            branch_binding,
-            request,
-            target_file_ids,
-            filters,
-            needs_data,
-            result_schema,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixFileDeleteExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixFileDeleteExec(filters={})", self.filters.len())
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixFileDeleteExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixFileDeleteExec {
-    fn name(&self) -> &'static str {
-        "LixFileDeleteExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixFileDeleteExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixFileDeleteExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let blob_reader = Arc::clone(&self.blob_reader);
-        let plugin_host = self.plugin_host.clone();
-        let write_ctx = self.write_ctx.clone();
-        let table_schema = Arc::clone(&self.table_schema);
-        let branch_binding = self.branch_binding.clone();
-        let request = self.request.clone();
-        let target_file_ids = self.target_file_ids.clone();
-        let filters = self.filters.clone();
-        let needs_data = self.needs_data;
-        let result_schema = Arc::clone(&self.result_schema);
-        let stream_schema = Arc::clone(&result_schema);
-
-        let stream = stream::once(async move {
-            let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-            let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            let blob_ref_keys =
-                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let plugin_render = plugin_render_context_for_lix_file_scan(
-                live_state,
-                &blob_reader,
-                &request,
-                plugin_host,
-                needs_data,
-            )
-            .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_file plugin discovery failed: {error}"
-                ))
-            })?;
-            let source_batch =
-                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-            let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
-            let staged = lix_file_delete_stage_from_batch(
-                &matched_batch,
-                branch_binding.active_branch_id(),
-                &blob_ref_keys,
-            )?;
-            let count = staged.count;
-
-            if count > 0 {
-                write_ctx
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Replace,
-                        rows: staged.state_rows,
-                    })
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-            }
-
-            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
-                dml_count_batch(Arc::clone(&stream_schema), count)?,
-            )]))
-        })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            result_schema,
-            stream,
-        )))
-    }
-}
-
-struct LixFileUpdateExec {
-    blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
-    write_ctx: SqlWriteContext,
-    table_schema: SchemaRef,
-    branch_binding: BranchBinding,
-    functions: FunctionProviderHandle,
-    request: LiveStateScanRequest,
-    target_file_ids: FileIdConstraint,
-    assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
-    filters: Vec<Arc<dyn PhysicalExpr>>,
-    needs_data: bool,
-    result_schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for LixFileUpdateExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixFileUpdateExec").finish()
-    }
-}
-
-impl LixFileUpdateExec {
-    fn new(
-        blob_reader: Arc<dyn BlobDataReader>,
-        plugin_host: PluginRuntimeHost,
-        write_ctx: SqlWriteContext,
-        table_schema: SchemaRef,
-        branch_binding: BranchBinding,
-        functions: FunctionProviderHandle,
-        request: LiveStateScanRequest,
-        target_file_ids: FileIdConstraint,
-        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-        needs_data: bool,
-    ) -> Self {
-        let result_schema = dml_count_schema();
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&result_schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        );
-        Self {
-            blob_reader,
-            plugin_host,
-            write_ctx,
-            table_schema,
-            branch_binding,
-            functions,
-            request,
-            target_file_ids,
-            assignments,
-            filters,
-            needs_data,
-            result_schema,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixFileUpdateExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "LixFileUpdateExec(assignments={}, filters={})",
-                    self.assignments.len(),
-                    self.filters.len()
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixFileUpdateExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixFileUpdateExec {
-    fn name(&self) -> &'static str {
-        "LixFileUpdateExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixFileUpdateExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixFileUpdateExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let blob_reader = Arc::clone(&self.blob_reader);
-        let plugin_host = self.plugin_host.clone();
-        let write_ctx = self.write_ctx.clone();
-        let table_schema = Arc::clone(&self.table_schema);
-        let branch_binding = self.branch_binding.clone();
-        let functions = self.functions.clone();
-        let request = self.request.clone();
-        let target_file_ids = self.target_file_ids.clone();
-        let assignments = self.assignments.clone();
-        let filters = self.filters.clone();
-        let needs_data = self.needs_data;
-        let result_schema = Arc::clone(&self.result_schema);
-        let stream_schema = Arc::clone(&result_schema);
-
-        let stream = stream::once(async move {
-            let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-            let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            let blob_ref_keys =
-                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let plugin_render = plugin_render_context_for_lix_file_scan(
-                live_state,
-                &blob_reader,
-                &request,
-                plugin_host,
-                needs_data,
-            )
-            .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_file plugin discovery failed: {error}"
-                ))
-            })?;
-            let source_batch = lix_file_record_batch(
-                &table_schema,
-                &blob_reader,
-                plugin_render.clone(),
-                needs_data,
-                rows,
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-            let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
-            let assignment_values = UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
-            let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
-            let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
-                path_update_plugin_rewrite_file_ids(
-                    plugin_render.as_ref(),
-                    &matched_batch,
-                    &assignment_values,
-                    branch_binding.active_branch_id(),
-                )?
-            } else {
-                BTreeSet::new()
-            };
-            let mut path_resolvers = None;
-            if update_columns.path || update_columns.descriptor {
-                path_resolvers = Some(
-                    directory_path_resolvers_from_live_state(
-                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                        branch_binding.active_branch_id(),
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?,
-                );
-            }
-            let staged = lix_file_update_stage_from_batch(
-                &matched_batch,
-                &assignment_values,
-                branch_binding.active_branch_id(),
-                update_columns,
-                &blob_ref_keys,
-                &plugin_rewrite_file_ids,
-                path_resolvers.as_mut(),
-                &mut || functions.call_uuid_v7().to_string(),
-            )?;
-            let count = staged.count;
-
-            if count > 0 {
-                let intent = if staged.file_data_writes.is_empty() {
-                    TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Replace,
-                        rows: staged.state_rows,
-                    }
-                } else {
-                    TransactionWrite::RowsWithFileData {
-                        mode: TransactionWriteMode::Replace,
-                        rows: staged.state_rows,
-                        file_data: staged.file_data_writes,
-                        count,
-                    }
-                };
-                write_ctx
-                    .stage_write(intent)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-            }
-
-            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
-                dml_count_batch(Arc::clone(&stream_schema), count)?,
-            )]))
-        })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            result_schema,
-            stream,
-        )))
-    }
-}
-
-struct LixFileScanExec {
-    live_state: Arc<dyn LiveStateReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
-    batch_schema: SchemaRef,
-    output_schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    request: LiveStateScanRequest,
-    target_file_ids: FileIdConstraint,
-    filters: Vec<Arc<dyn PhysicalExpr>>,
-    needs_data: bool,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for LixFileScanExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixFileScanExec").finish()
-    }
-}
-
-impl LixFileScanExec {
-    fn new(
-        live_state: Arc<dyn LiveStateReader>,
-        blob_reader: Arc<dyn BlobDataReader>,
-        plugin_host: PluginRuntimeHost,
-        batch_schema: SchemaRef,
-        output_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        request: LiveStateScanRequest,
-        target_file_ids: FileIdConstraint,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-        needs_data: bool,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            live_state,
-            blob_reader,
-            plugin_host,
-            batch_schema,
-            output_schema,
-            projection,
-            request,
-            target_file_ids,
-            filters,
-            needs_data,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixFileScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixFileScanExec(limit={:?})", self.limit)
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixFileScanExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixFileScanExec {
-    fn name(&self) -> &'static str {
-        "LixFileScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixFileScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixFileScanExec only supports partition 0, got {partition}"
-            )));
-        }
-
-        let live_state = Arc::clone(&self.live_state);
-        let blob_reader = Arc::clone(&self.blob_reader);
-        let plugin_host = self.plugin_host.clone();
-        let request = self.request.clone();
-        let target_file_ids = self.target_file_ids.clone();
-        let filters = self.filters.clone();
-        let needs_data = self.needs_data;
-        let limit = self.limit;
-        let output_schema = Arc::clone(&self.output_schema);
-        let batch_schema = Arc::clone(&self.batch_schema);
-        let projection = self.projection.clone();
-        let fut = async move {
-            let rows = scan_lix_file_live_rows(Arc::clone(&live_state), &request, &target_file_ids)
-                .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
-                })?;
-            let plugin_render = plugin_render_context_for_lix_file_scan(
-                Arc::clone(&live_state),
-                &blob_reader,
-                &request,
-                plugin_host,
-                needs_data,
-            )
-            .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_file plugin discovery failed: {error}"
-                ))
-            })?;
-            let batch =
-                lix_file_record_batch(&batch_schema, &blob_reader, plugin_render, needs_data, rows)
-                    .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file batch build failed: {error}"
-                        ))
-                    })?;
-            let filtered = filter_lix_file_batch(batch, &filters)?;
-            let projected = match projection {
-                Some(indices) => filtered.project(&indices).map_err(DataFusionError::from),
-                None => Ok(filtered),
-            }?;
-            match limit {
-                Some(limit) => Ok(projected.slice(0, limit.min(projected.num_rows()))),
-                None => Ok(projected),
-            }
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            output_schema,
-            stream::once(fut).map_ok(|batch| batch),
-        )))
     }
 }
 
@@ -2355,7 +2185,7 @@ async fn plugin_render_context_for_lix_file_scan(
     }))
 }
 
-async fn load_single_blob_bytes(
+pub(super) async fn load_single_blob_bytes(
     blob_reader: &Arc<dyn BlobDataReader>,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
@@ -2640,6 +2470,24 @@ fn contains_column(expr: &Expr, column_name: &str) -> bool {
         .any(|column| column.name.as_str() == column_name)
 }
 
+/// Whether a physical assignment expression references `column_name`. Mirrors
+/// the logical `contains_column` check `main` applied to UPDATE assignment
+/// right-hand sides before physical conversion (the framework hands `plan_update`
+/// the already-compiled physical assignments).
+fn physical_expr_contains_column(expr: &Arc<dyn PhysicalExpr>, column_name: &str) -> bool {
+    if let Some(column) = expr
+        .as_any()
+        .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+    {
+        if column.name() == column_name {
+            return true;
+        }
+    }
+    expr.children()
+        .into_iter()
+        .any(|child| physical_expr_contains_column(child, column_name))
+}
+
 fn parse_normal_write_file_path(
     path: &str,
     operation: TransactionWriteOperation,
@@ -2748,63 +2596,6 @@ fn non_binary_lix_file_data_assignment_error() -> DataFusionError {
         "data",
         "use X'...' or a binary parameter for file contents",
     )
-}
-
-fn filter_lix_file_batch(
-    batch: RecordBatch,
-    filters: &[Arc<dyn PhysicalExpr>],
-) -> Result<RecordBatch> {
-    let Some(mask) = evaluate_lix_file_filters(&batch, filters)? else {
-        return Ok(batch);
-    };
-    Ok(filter_record_batch(&batch, &mask)?)
-}
-
-fn evaluate_lix_file_filters(
-    batch: &RecordBatch,
-    filters: &[Arc<dyn PhysicalExpr>],
-) -> Result<Option<BooleanArray>> {
-    if filters.is_empty() {
-        return Ok(None);
-    }
-
-    let mut combined_mask: Option<BooleanArray> = None;
-    for filter in filters {
-        let result = filter.evaluate(batch)?;
-        let array = result.into_array(batch.num_rows())?;
-        let bool_array = array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Execution("lix_file filter was not boolean".to_string())
-            })?;
-        let normalized = bool_array
-            .iter()
-            .map(|value| Some(value == Some(true)))
-            .collect::<BooleanArray>();
-        combined_mask = Some(match combined_mask {
-            Some(existing) => and(&existing, &normalized)?,
-            None => normalized,
-        });
-    }
-    Ok(combined_mask)
-}
-
-fn dml_count_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "count",
-        DataType::UInt64,
-        false,
-    )]))
-}
-
-#[expect(trivial_casts)]
-fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
-    RecordBatch::try_new(
-        schema,
-        vec![Arc::new(UInt64Array::from(vec![count])) as ArrayRef],
-    )
-    .map_err(DataFusionError::from)
 }
 
 fn record_batch_has_non_null_column(batch: &RecordBatch, column_name: &str) -> Result<bool> {
@@ -3080,10 +2871,6 @@ pub(super) fn lix_file_by_branch_schema() -> SchemaRef {
         .collect::<Vec<_>>();
     fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     Arc::new(Schema::new(fields))
-}
-
-fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {

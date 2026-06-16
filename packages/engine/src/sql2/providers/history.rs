@@ -1,29 +1,20 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
-use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-};
 use datafusion::prelude::SessionContext;
-use futures_util::{TryStreamExt, stream};
 use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphReader;
 use crate::{LixError, serialize_row_metadata};
 
 use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::WriteAccess;
+use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{
     HistoryColumnStyle, HistoryRoute, HistoryViewDescriptor, load_history_entries,
     parse_history_filter,
@@ -31,247 +22,101 @@ use crate::sql2::history_route::{
 use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
 
+use super::columns::{Col, ColumnTable, ColumnTableError};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+
 pub(super) async fn register_history_provider<S>(
     session: &SessionContext,
     surface_name: &str,
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlHistoryQuerySource<S>,
-) -> Result<Arc<dyn TableProvider>, LixError>
+) -> Result<(), LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new(
-        Arc::new(Mutex::new(commit_graph)),
-        query_source,
-    ));
-    session
-        .register_table(surface_name, Arc::clone(&provider))
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(provider)
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(StateHistorySpec {
+            commit_graph: Arc::new(Mutex::new(commit_graph)),
+            query_source,
+        }),
+        WriteAccess::read_only(),
+    )
 }
 
-pub(crate) struct LixStateHistoryProvider<S> {
-    schema: SchemaRef,
+/// SQL spec for `lix_state_history`.
+///
+/// The reachability-aware history surface over canonical state changes: rows
+/// are loaded by walking the commit graph from the routed start commits.
+struct StateHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
 }
 
-impl<S> std::fmt::Debug for LixStateHistoryProvider<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixStateHistoryProvider").finish()
-    }
-}
-
-impl<S> LixStateHistoryProvider<S> {
-    pub(crate) fn new(
-        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlHistoryQuerySource<S>,
-    ) -> Self {
-        Self {
-            schema: lix_state_history_schema(),
-            commit_graph,
-            query_source,
-        }
-    }
-}
-
 #[async_trait]
-impl<S> TableProvider for LixStateHistoryProvider<S>
+impl<S> TableSpec for StateHistorySpec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn as_any(&self) -> &dyn Any {
-        self
+    #[expect(clippy::unnecessary_literal_bound)]
+    fn table_name(&self) -> &str {
+        "lix_state_history"
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        lix_state_history_schema()
     }
 
     fn table_type(&self) -> TableType {
         TableType::View
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if parse_history_filter(filter, HistoryColumnStyle::Bare).is_some() {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+    fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        if parse_history_filter(filter, HistoryColumnStyle::Bare).is_some() {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
     }
 
-    async fn scan(
+    async fn plan_scan(
         &self,
-        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let projected_schema = projected_schema(&self.schema, projection)?;
-        Ok(Arc::new(LixStateHistoryScanExec::new(
-            Arc::clone(&self.commit_graph),
-            self.query_source.clone(),
-            projected_schema,
-            projection.cloned(),
-            HistoryRoute::from_filters(filters, HistoryColumnStyle::Bare),
-            limit,
-        )))
-    }
-}
-
-struct LixStateHistoryScanExec<S> {
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    route: HistoryRoute,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-#[expect(clippy::missing_fields_in_debug)]
-impl<S> std::fmt::Debug for LixStateHistoryScanExec<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixStateHistoryScanExec")
-            .field("limit", &self.limit)
-            .field("route", &self.route)
-            .finish()
-    }
-}
-
-impl<S> LixStateHistoryScanExec<S> {
-    fn new(
-        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlHistoryQuerySource<S>,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        route: HistoryRoute,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            commit_graph,
-            query_source,
-            schema,
-            projection,
-            route,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl<S> DisplayAs for LixStateHistoryScanExec<S> {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "LixStateHistoryScanExec(limit={:?}, route={:?})",
-                    self.limit, self.route
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixStateHistoryScanExec"),
-        }
-    }
-}
-
-impl<S> ExecutionPlan for LixStateHistoryScanExec<S>
-where
-    S: StorageRead + Clone + Send + Sync + 'static,
-{
-    fn name(&self) -> &'static str {
-        "LixStateHistoryScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixStateHistoryScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixStateHistoryScanExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let commit_graph = Arc::clone(&self.commit_graph);
-        let query_source = self.query_source.clone();
-        let route = self.route.clone();
-        let schema = Arc::clone(&self.schema);
-        let stream_schema = Arc::clone(&schema);
-        let limit = self.limit;
-        let zero_column_projection = self.projection.as_ref().is_some_and(Vec::is_empty);
-
-        let stream = stream::once(async move {
-            let rows = if route.is_contradictory() {
-                Vec::new()
-            } else {
-                load_state_history_rows(commit_graph, query_source, &route)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
-            let rows = if let Some(limit) = limit {
-                rows.into_iter().take(limit).collect::<Vec<_>>()
-            } else {
-                rows
-            };
-
-            let batch = if zero_column_projection {
-                let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
-                RecordBatch::try_new_with_options(Arc::clone(&stream_schema), vec![], &options)
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "failed to build zero-column lix_state_history batch: {error}"
-                        ))
-                    })?
-            } else {
-                state_history_record_batch(Arc::clone(&stream_schema), &rows)?
-            };
-            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
-                batch,
-            )]))
+        _props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
+        let schema = projected_schema(&lix_state_history_schema(), projection);
+        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Bare);
+        Ok(PlannedScan {
+            schema: Arc::clone(&schema),
+            load: row_source(
+                (
+                    Arc::clone(&self.commit_graph),
+                    self.query_source.clone(),
+                    route,
+                    schema,
+                ),
+                move |(commit_graph, query_source, route, schema)| async move {
+                    let rows = if route.is_contradictory() {
+                        Vec::new()
+                    } else {
+                        load_state_history_rows(commit_graph, query_source, &route)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                    };
+                    let rows = if let Some(limit) = limit {
+                        rows.into_iter().take(limit).collect::<Vec<_>>()
+                    } else {
+                        rows
+                    };
+                    LIX_STATE_HISTORY_COLS
+                        .build(schema, &rows)
+                        .map_err(state_history_batch_error)
+                },
+            ),
         })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -290,24 +135,15 @@ pub(super) fn lix_state_history_schema() -> SchemaRef {
     ]))
 }
 
-#[expect(clippy::unnecessary_wraps)]
-fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
-    let fields = projection.map_or_else(
-        || {
-            base_schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
-                .collect::<Vec<_>>()
-        },
-        |indices| {
-            indices
-                .iter()
-                .map(|index| base_schema.field(*index).as_ref().clone())
-                .collect::<Vec<_>>()
-        },
-    );
-    Ok(Arc::new(Schema::new(fields)))
+/// Project a single-string history entity pk as the canonical JSON array
+/// text the `lixcol_entity_pk` column exposes. Shared by the file and
+/// directory history surfaces.
+pub(super) fn entity_pk_json_array(entity_pk: &str) -> Result<String, LixError> {
+    serde_json::to_string(&[entity_pk]).map_err(|error| {
+        LixError::unknown(format!(
+            "failed to encode history entity pk as JSON: {error}"
+        ))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -324,54 +160,47 @@ struct StateHistorySqlRow {
     depth: i64,
 }
 
-#[expect(trivial_casts)]
-fn state_history_record_batch(
-    schema: SchemaRef,
-    rows: &[StateHistorySqlRow],
-) -> Result<RecordBatch> {
-    let arrays = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            Ok(match field.name().as_str() {
-                "entity_pk" => string_array(rows.iter().map(|row| Some(row.entity_pk.as_str()))),
-                "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
-                "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
-                "snapshot_content" => {
-                    string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
-                }
-                "metadata" => Arc::new(StringArray::from(
-                    rows.iter()
-                        .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
-                        .collect::<Vec<_>>(),
-                )),
-                "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
-                "observed_commit_id" => {
-                    string_array(rows.iter().map(|row| Some(row.observed_commit_id.as_str())))
-                }
-                "commit_created_at" => {
-                    string_array(rows.iter().map(|row| Some(row.commit_created_at.as_str())))
-                }
-                "start_commit_id" => {
-                    string_array(rows.iter().map(|row| Some(row.start_commit_id.as_str())))
-                }
-                "depth" => Arc::new(Int64Array::from(
-                    rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
-                )) as ArrayRef,
-                other => {
-                    return Err(DataFusionError::Execution(format!(
-                        "lix_state_history provider does not support projected column '{other}'"
-                    )));
-                }
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
-}
+static LIX_STATE_HISTORY_COLS: ColumnTable<StateHistorySqlRow> = ColumnTable {
+    columns: &[
+        ("entity_pk", Col::Utf8(|row| Some(row.entity_pk.as_str()))),
+        ("schema_key", Col::Utf8(|row| Some(row.schema_key.as_str()))),
+        ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
+        (
+            "snapshot_content",
+            Col::Utf8(|row| row.snapshot_content.as_deref()),
+        ),
+        (
+            "metadata",
+            Col::Utf8Owned(|row| row.metadata.as_deref().map(serialize_row_metadata)),
+        ),
+        ("change_id", Col::Utf8(|row| Some(row.change_id.as_str()))),
+        (
+            "observed_commit_id",
+            Col::Utf8(|row| Some(row.observed_commit_id.as_str())),
+        ),
+        (
+            "commit_created_at",
+            Col::Utf8(|row| Some(row.commit_created_at.as_str())),
+        ),
+        (
+            "start_commit_id",
+            Col::Utf8(|row| Some(row.start_commit_id.as_str())),
+        ),
+        ("depth", Col::I64(|row| Some(row.depth))),
+    ],
+};
 
-#[expect(trivial_casts)]
-fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
+fn state_history_batch_error(error: ColumnTableError) -> DataFusionError {
+    match error {
+        ColumnTableError::UnsupportedColumn(column) => DataFusionError::Execution(format!(
+            "lix_state_history provider does not support projected column '{column}'"
+        )),
+        ColumnTableError::Arrow(error) => DataFusionError::from(error),
+        ColumnTableError::ArrowZeroColumn(error) => DataFusionError::Execution(format!(
+            "failed to build zero-column lix_state_history batch: {error}"
+        )),
+        ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
 }
 
 async fn load_state_history_rows<S>(
@@ -420,12 +249,4 @@ where
             .then(left.change_id.cmp(&right.change_id))
     });
     Ok(rows)
-}
-
-fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    crate::sql2::error::datafusion_error_to_lix_error(error)
-}
-
-fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    crate::sql2::error::lix_error_to_datafusion_error(error)
 }

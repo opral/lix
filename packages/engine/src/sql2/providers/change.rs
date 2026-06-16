@@ -1,22 +1,10 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::datasource::TableType;
-use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-};
-use futures_util::stream;
+use datafusion::execution::context::ExecutionProps;
+use datafusion::logical_expr::Expr;
 
 use crate::LixError;
 use crate::changelog::{
@@ -26,12 +14,16 @@ use crate::changelog::{
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlChangelogQuerySource;
+use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::{
     MaterializedChange, materialize_changelog_change_record, materialize_commit_graph_change,
 };
-use crate::sql2::record_batch::record_batch_with_row_count;
+use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
+
+use super::columns::{Col, ColumnTable, ColumnTableError};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 
 pub(super) async fn register_lix_change_read_provider<S>(
     session: &datafusion::prelude::SessionContext,
@@ -41,200 +33,77 @@ pub(super) async fn register_lix_change_read_provider<S>(
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    session
-        .register_table(surface_name, Arc::new(LixChangeProvider::new(query_source)))
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(ChangeSpec { query_source }),
+        WriteAccess::read_only(),
+    )
 }
 
-/// SQL provider for `lix_change`.
+/// SQL spec for `lix_change`.
 ///
 /// `lix_change` is the unscoped durable change surface: it scans direct
 /// `changelog.change` records and unions derived `lix_commit` changes from
 /// `changelog.commit`. It does not prove branch reachability. History
 /// providers are the reachability-aware SQL surfaces.
-struct LixChangeProvider<S> {
-    schema: SchemaRef,
+struct ChangeSpec<S> {
     query_source: SqlChangelogQuerySource<S>,
-}
-
-impl<S> std::fmt::Debug for LixChangeProvider<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixChangeProvider").finish()
-    }
-}
-
-impl<S> LixChangeProvider<S> {
-    fn new(query_source: SqlChangelogQuerySource<S>) -> Self {
-        Self {
-            schema: lix_change_schema(),
-            query_source,
-        }
-    }
 }
 
 #[async_trait]
-impl<S> TableProvider for LixChangeProvider<S>
+impl<S> TableSpec for ChangeSpec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn as_any(&self) -> &dyn Any {
-        self
+    #[expect(clippy::unnecessary_literal_bound)]
+    fn table_name(&self) -> &str {
+        "lix_change"
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        lix_change_schema()
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
+    async fn plan_scan(
         &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|_| TableProviderFilterPushDown::Unsupported)
-            .collect())
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        _props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
         let pushed_limit = if filters.is_empty() { limit } else { None };
-        Ok(Arc::new(LixChangeScanExec::new(
-            self.query_source.clone(),
-            projected_schema(&self.schema, projection),
-            projection.cloned(),
-            pushed_limit,
-        )))
-    }
-}
-
-struct LixChangeScanExec<S> {
-    query_source: SqlChangelogQuerySource<S>,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-impl<S> std::fmt::Debug for LixChangeScanExec<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixChangeScanExec").finish()
-    }
-}
-
-impl<S> LixChangeScanExec<S> {
-    fn new(
-        query_source: SqlChangelogQuerySource<S>,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            query_source,
-            schema,
-            projection,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl<S> DisplayAs for LixChangeScanExec<S> {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixChangeScanExec")
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixChangeScanExec"),
-        }
-    }
-}
-
-impl<S> ExecutionPlan for LixChangeScanExec<S>
-where
-    S: StorageRead + Clone + Send + Sync + 'static,
-{
-    fn name(&self) -> &'static str {
-        "LixChangeScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixChangeScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixChangeScanExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let query_source = self.query_source.clone();
-        let projection = change_projection_for_scan(self.projection.as_ref());
-        let limit = self.limit;
-        let schema = Arc::clone(&self.schema);
-        let stream = stream::once(async move {
-            let mut json_reader = query_source.json_reader;
-            let canonical_changes = scan_changelog_changes(query_source.store, limit)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            let mut changes = Vec::with_capacity(canonical_changes.len());
-            for change in canonical_changes {
-                match change {
-                    LixChangeRow::Direct(change) => changes.push(
-                        materialize_changelog_change_record(&mut json_reader, change)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
-                    ),
-                    LixChangeRow::DerivedCommit(change) => changes.push(
-                        materialize_commit_graph_change(&mut json_reader, change)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
-                    ),
-                }
-            }
-            change_record_batch(&projection, &changes)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        let schema = projected_schema(&lix_change_schema(), projection);
+        Ok(PlannedScan {
+            schema: Arc::clone(&schema),
+            load: row_source(
+                (self.query_source.clone(), schema),
+                move |(query_source, schema)| async move {
+                    let mut json_reader = query_source.json_reader;
+                    let canonical_changes = scan_changelog_changes(query_source.store, pushed_limit)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let mut changes = Vec::with_capacity(canonical_changes.len());
+                    for change in canonical_changes {
+                        match change {
+                            LixChangeRow::Direct(change) => changes.push(
+                                materialize_changelog_change_record(&mut json_reader, change)
+                                    .await
+                                    .map_err(lix_error_to_datafusion_error)?,
+                            ),
+                            LixChangeRow::DerivedCommit(change) => changes.push(
+                                materialize_commit_graph_change(&mut json_reader, change)
+                                    .await
+                                    .map_err(lix_error_to_datafusion_error)?,
+                            ),
+                        }
+                    }
+                    LIX_CHANGE_COLS
+                        .build(schema, &changes)
+                        .map_err(change_batch_error)
+                },
+            ),
+        })
     }
 }
 
@@ -321,16 +190,6 @@ fn commit_record_canonical_change(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ChangeColumn {
-    Id,
-    EntityPk,
-    SchemaKey,
-    FileId,
-    Metadata,
-    CreatedAt,
-    SnapshotContent,
-}
 
 pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -344,104 +203,41 @@ pub(super) fn lix_change_schema() -> SchemaRef {
     ]))
 }
 
-fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeColumn> {
-    let all_columns = vec![
-        ChangeColumn::Id,
-        ChangeColumn::EntityPk,
-        ChangeColumn::SchemaKey,
-        ChangeColumn::FileId,
-        ChangeColumn::Metadata,
-        ChangeColumn::CreatedAt,
-        ChangeColumn::SnapshotContent,
-    ];
-    projection.map_or_else(
-        || all_columns.clone(),
-        |indices| {
-            indices
-                .iter()
-                .filter_map(|index| all_columns.get(*index).copied())
-                .collect()
-        },
-    )
-}
+static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
+    columns: &[
+        ("id", Col::Utf8(|row| Some(row.id.as_str()))),
+        (
+            "entity_pk",
+            Col::Utf8Owned(|row| {
+                Some(
+                    row.entity_pk
+                        .as_json_array_text()
+                        .expect("canonical change entity primary key should project"),
+                )
+            }),
+        ),
+        ("schema_key", Col::Utf8(|row| Some(row.schema_key.as_str()))),
+        ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
+        (
+            "metadata",
+            Col::Utf8Owned(|row| row.metadata.as_deref().map(serialize_row_metadata)),
+        ),
+        ("created_at", Col::Utf8(|row| Some(row.created_at.as_str()))),
+        (
+            "snapshot_content",
+            Col::Utf8(|row| row.snapshot_content.as_deref()),
+        ),
+    ],
+};
 
-fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> SchemaRef {
-    projection.map_or_else(
-        || Arc::clone(schema),
-        |projection| Arc::new(schema.project(projection).expect("projection is valid")),
-    )
-}
-
-#[expect(trivial_casts)]
-fn change_record_batch(
-    projection: &[ChangeColumn],
-    changes: &[MaterializedChange],
-) -> Result<RecordBatch> {
-    let arrays = projection
-        .iter()
-        .map(|column| match column {
-            ChangeColumn::Id => string_array(changes.iter().map(|row| Some(row.id.as_str()))),
-            ChangeColumn::EntityPk => Arc::new(StringArray::from(
-                changes
-                    .iter()
-                    .map(|row| {
-                        Some(
-                            row.entity_pk
-                                .as_json_array_text()
-                                .expect("canonical change entity primary key should project"),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            ChangeColumn::SchemaKey => {
-                string_array(changes.iter().map(|row| Some(row.schema_key.as_str())))
-            }
-            ChangeColumn::FileId => string_array(changes.iter().map(|row| row.file_id.as_deref())),
-            ChangeColumn::Metadata => Arc::new(StringArray::from(
-                changes
-                    .iter()
-                    .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
-                    .collect::<Vec<_>>(),
-            )),
-            ChangeColumn::CreatedAt => {
-                string_array(changes.iter().map(|row| Some(row.created_at.as_str())))
-            }
-            ChangeColumn::SnapshotContent => {
-                string_array(changes.iter().map(|row| row.snapshot_content.as_deref()))
-            }
-        })
-        .collect::<Vec<_>>();
-    record_batch_with_row_count(change_schema(projection), arrays, changes.len()).map_err(|error| {
-        DataFusionError::Execution(format!("failed to build lix_change batch: {error}"))
-    })
-}
-
-fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
-    Arc::new(Schema::new(
-        projection
-            .iter()
-            .map(|column| match column {
-                ChangeColumn::Id => Field::new("id", DataType::Utf8, false),
-                ChangeColumn::EntityPk => json_field("entity_pk", false),
-                ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
-                ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),
-                ChangeColumn::Metadata => json_field("metadata", true),
-                ChangeColumn::CreatedAt => Field::new("created_at", DataType::Utf8, false),
-                ChangeColumn::SnapshotContent => json_field("snapshot_content", true),
-            })
-            .collect::<Vec<_>>(),
-    ))
-}
-
-#[expect(trivial_casts)]
-fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
-}
-
-fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    crate::sql2::error::datafusion_error_to_lix_error(error)
-}
-
-fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    crate::sql2::error::lix_error_to_datafusion_error(error)
+fn change_batch_error(error: ColumnTableError) -> DataFusionError {
+    match error {
+        ColumnTableError::UnsupportedColumn(column) => DataFusionError::Execution(format!(
+            "sql2 does not support lix_change column '{column}'"
+        )),
+        ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => {
+            DataFusionError::Execution(format!("failed to build lix_change batch: {error}"))
+        }
+        ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
 }
