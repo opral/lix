@@ -53,7 +53,6 @@ impl ObserveInvalidation {
         for<'backend> B::Write<'backend>: Send,
     {
         let mut last_seen_revision = storage.load_mutation_revision()?;
-        let mut last_seen_generation = self.generation.load(Ordering::SeqCst);
         if self
             .external_watcher_started
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -75,12 +74,7 @@ impl ObserveInvalidation {
                     };
                     if current_revision != last_seen_revision {
                         last_seen_revision = current_revision;
-                        let current_generation = invalidation.generation.load(Ordering::SeqCst);
-                        if current_generation == last_seen_generation {
-                            last_seen_generation = invalidation.bump();
-                        } else {
-                            last_seen_generation = current_generation;
-                        }
+                        invalidation.bump();
                     }
                 }
             });

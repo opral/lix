@@ -1,13 +1,8 @@
 use std::time::Duration;
 
+use lix_backends::SqliteBackend;
 use lix_engine::{Backend, Engine, InMemoryBackend, ObserveEvent, ObserveEvents, Value};
 use serde_json::json;
-
-#[allow(dead_code)]
-#[path = "backend/support/sqlite_backend.rs"]
-mod sqlite_backend;
-
-use sqlite_backend::SqliteBackend;
 
 const NEXT_TIMEOUT: Duration = Duration::from_secs(1);
 const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -102,6 +97,46 @@ async fn observe_emits_when_another_engine_commits() {
     let update = next_event(&mut events, "external engine commit").await;
     assert_eq!(update.sequence, 1);
     assert_key_value_row(&update, "mutation-revision-external", "v0");
+}
+
+#[tokio::test]
+async fn observe_emits_after_local_generation_bump_without_storage_revision_change() {
+    let (observer_engine, writer_engine) = open_two_engines().await;
+    let observer_session = observer_engine
+        .open_workspace_session()
+        .await
+        .expect("observer session should open");
+    let local_session = observer_engine
+        .open_workspace_session()
+        .await
+        .expect("local session should open");
+    let writer_session = writer_engine
+        .open_workspace_session()
+        .await
+        .expect("writer session should open");
+    let mut events = observe_key(&observer_session, "mutation-revision-after-close");
+
+    let initial = next_event(&mut events, "initial empty snapshot").await;
+    assert_eq!(initial.sequence, 0);
+    assert!(initial.rows.is_empty());
+
+    local_session
+        .close()
+        .await
+        .expect("closing another local session should succeed");
+    expect_no_event(&mut events, "local close does not change observed rows").await;
+
+    writer_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('mutation-revision-after-close', 'v0')",
+            &[],
+        )
+        .await
+        .expect("external engine insert should commit");
+
+    let update = next_event(&mut events, "external commit after local generation bump").await;
+    assert_eq!(update.sequence, 1);
+    assert_key_value_row(&update, "mutation-revision-after-close", "v0");
 }
 
 #[tokio::test]
