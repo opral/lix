@@ -60,8 +60,15 @@ use super::spec::{
     PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema, row_source,
     register_spec_table,
 };
+use super::upsert::{StagedUpsert, UpsertSupport};
+use crate::entity_pk::EntityPk;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
+
+/// Physical-identity column the upsert driver matches conflicting rows on.
+/// A directory's identity is its `id`; the underlying live state keys on the
+/// directory id as a single-element entity primary key.
+const LIX_DIRECTORY_IDENTITY: &[&str] = &["id"];
 
 pub(super) async fn register_lix_directory_active_provider(
     session: &SessionContext,
@@ -221,6 +228,10 @@ impl LixDirectorySpec {
 impl TableSpec for LixDirectorySpec {
     fn table_name(&self) -> &str {
         "lix_directory"
+    }
+
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+        Some(self)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -494,6 +505,123 @@ impl TableSpec for LixDirectorySpec {
             }),
         })
     }
+}
+
+#[async_trait]
+impl UpsertSupport for LixDirectorySpec {
+    fn conflict_identity_columns(&self) -> &[&'static str] {
+        LIX_DIRECTORY_IDENTITY
+    }
+
+    /// Produce the staged INSERT rows for the non-conflicting proposed rows,
+    /// replicating `stage_insert`'s row production exactly: seed the directory
+    /// path resolvers from live state, then branch on whether the batch carries
+    /// a non-null `path` column. Directories have no file data, so the result
+    /// is plain state rows.
+    async fn insert_staged_rows(
+        &self,
+        write_ctx: &SqlWriteContext,
+        batch: &RecordBatch,
+    ) -> Result<StagedUpsert> {
+        let surface_name = lix_directory_surface_name(&self.branch_binding);
+        let mut path_resolvers = directory_path_resolvers_from_live_state(
+            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+            self.branch_binding.active_branch_id(),
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let rows = if record_batch_has_non_null_column(batch, "path")? {
+            lix_directory_write_rows_from_batch_with_path_resolvers(
+                batch,
+                self.branch_binding.active_branch_id(),
+                surface_name,
+                &mut path_resolvers,
+                &mut || self.functions.call_uuid_v7().to_string(),
+            )?
+        } else {
+            lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
+                batch,
+                self.branch_binding.active_branch_id(),
+                surface_name,
+                true,
+                Some(&mut path_resolvers),
+                None,
+            )?
+        };
+
+        Ok(StagedUpsert::rows(rows))
+    }
+
+    /// Scan the existing directories that could conflict with `proposed`,
+    /// scoped to the active/explicit branch and narrowed to the proposed
+    /// directory ids, returned as a batch in this table's column schema (the
+    /// same builder the scan path uses).
+    async fn scan_conflict_candidates(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let mut request =
+            lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+        request.filter.entity_pks = proposed_directory_entity_pks(proposed)?;
+
+        let rows = write_ctx
+            .scan_live_state(&request)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        lix_directory_record_batch(&self.schema, rows).map_err(lix_error_to_datafusion_error)
+    }
+
+    /// Apply the `DO UPDATE` assignments to the augmented batch (existing
+    /// directory columns plus `excluded.*` proposed columns), reusing the
+    /// directory UPDATE row builder with the same path-resolver/uuid-generator
+    /// threading `plan_update` uses. This supports every assignment shape the
+    /// plain UPDATE supports — `path` (recursive), `parent_id`, `name`, and
+    /// `lixcol_metadata` — because the augmented batch carries the existing
+    /// directory's `id`, `path`, and context columns.
+    async fn apply_conflict_update(
+        &self,
+        write_ctx: &SqlWriteContext,
+        augmented: &RecordBatch,
+        assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    ) -> Result<StagedUpsert> {
+        let mut path_resolvers = directory_path_resolvers_from_live_state(
+            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+            self.branch_binding.active_branch_id(),
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+        let rows = lix_directory_update_write_rows_from_batch(
+            augmented,
+            assignments,
+            self.branch_binding.active_branch_id(),
+            &mut path_resolvers,
+            &mut || self.functions.call_uuid_v7().to_string(),
+        )?;
+        Ok(StagedUpsert::rows(rows))
+    }
+}
+
+/// The proposed directory ids as single-element entity primary keys, used to
+/// narrow the conflict-candidate live-state scan. Rows without an explicit
+/// `id` (defaulted ids) contribute nothing — a generated id cannot collide
+/// with an existing row.
+fn proposed_directory_entity_pks(proposed: &RecordBatch) -> Result<Vec<EntityPk>> {
+    let mut entity_pks = Vec::new();
+    for row_index in 0..proposed.num_rows() {
+        if let Some(id) = optional_string_value(proposed, row_index, "id")? {
+            entity_pks.push(EntityPk::single(&id));
+        }
+    }
+    Ok(entity_pks)
 }
 
 fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {

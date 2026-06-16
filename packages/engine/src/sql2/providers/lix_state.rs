@@ -44,6 +44,7 @@ use crate::sql2::predicate_typecheck::{
 use crate::sql2::result_metadata::json_field;
 
 use super::columns::{ColumnTableError, LIVE_STATE_COLS};
+use super::upsert::{StagedUpsert, UpsertSupport};
 use super::values::string_expr_literal;
 use super::spec::{
     PlannedDml, PlannedScan, RowSource, TableSpec, projected_schema, register_spec_table,
@@ -178,10 +179,124 @@ impl LixStateSpec {
     }
 }
 
+/// Physical-identity columns the upsert driver matches conflicting rows on.
+/// The active surface scopes by the active branch implicitly; the by-branch
+/// surface carries `branch_id` as a column.
+const LIX_STATE_ACTIVE_IDENTITY: &[&str] = &["entity_pk", "schema_key", "file_id"];
+const LIX_STATE_BY_BRANCH_IDENTITY: &[&str] =
+    &["entity_pk", "schema_key", "file_id", "branch_id"];
+
+#[async_trait]
+impl UpsertSupport for LixStateSpec {
+    fn conflict_identity_columns(&self) -> &[&'static str] {
+        match self.branch_binding {
+            BranchBinding::Active { .. } => LIX_STATE_ACTIVE_IDENTITY,
+            BranchBinding::Explicit => LIX_STATE_BY_BRANCH_IDENTITY,
+        }
+    }
+
+    async fn insert_staged_rows(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        batch: &RecordBatch,
+    ) -> Result<StagedUpsert> {
+        let branch_binding = self.branch_binding.active_branch_id();
+        let rows = lix_state_write_rows_from_batch(batch, branch_binding, "INSERT into lix_state")?;
+        reject_read_only_stage_rows(&rows, "INSERT into lix_state")?;
+        Ok(StagedUpsert::rows(rows))
+    }
+
+    async fn scan_conflict_candidates(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let request = lix_state_conflict_scan_request(&self.schema, &self.branch_binding, proposed)?;
+        let rows = write_ctx
+            .scan_live_state(&request)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        LIVE_STATE_COLS
+            .build(Arc::clone(&self.schema), &rows)
+            .map_err(lix_state_batch_error)
+            .map_err(lix_error_to_datafusion_error)
+    }
+
+    async fn apply_conflict_update(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        augmented: &RecordBatch,
+        assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    ) -> Result<StagedUpsert> {
+        let branch_binding = self.branch_binding.active_branch_id();
+        let rows = lix_state_update_write_rows_from_batch(augmented, assignments, branch_binding)?;
+        reject_read_only_stage_rows(&rows, "INSERT into lix_state")?;
+        Ok(StagedUpsert::rows(rows))
+    }
+}
+
+/// Scan request for the existing rows that could conflict with `proposed`:
+/// the distinct (schema_key, entity_pk) identities present, scoped to the
+/// active/explicit branch.
+fn lix_state_conflict_scan_request(
+    schema: &SchemaRef,
+    branch_binding: &BranchBinding,
+    proposed: &RecordBatch,
+) -> Result<LiveStateScanRequest> {
+    let mut schema_keys = BTreeSet::new();
+    let mut entity_pks = Vec::new();
+    for row_index in 0..proposed.num_rows() {
+        schema_keys.insert(required_string_value(proposed, row_index, "schema_key")?);
+        let entity_pk = required_string_value(proposed, row_index, "entity_pk")?;
+        let entity_pk = EntityPk::from_json_array_text(&entity_pk).map_err(|error| {
+            DataFusionError::Execution(format!("lix_state upsert has invalid entity_pk: {error}"))
+        })?;
+        entity_pks.push(entity_pk);
+    }
+    let branch_ids = match branch_binding {
+        BranchBinding::Active { .. } => branch_binding
+            .active_branch_id()
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default(),
+        BranchBinding::Explicit => proposed_branch_ids(proposed)?,
+    };
+    Ok(LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: schema_keys.into_iter().collect(),
+            entity_pks,
+            branch_ids,
+            ..LiveStateFilter::default()
+        },
+        projection: LiveStateProjection {
+            columns: schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect(),
+        },
+        limit: None,
+    })
+}
+
+/// Distinct `branch_id` values present in the proposed batch (by-branch surface).
+fn proposed_branch_ids(proposed: &RecordBatch) -> Result<Vec<String>> {
+    let mut branch_ids = BTreeSet::new();
+    for row_index in 0..proposed.num_rows() {
+        if let Some(branch_id) = optional_string_value(proposed, row_index, "branch_id")? {
+            branch_ids.insert(branch_id);
+        }
+    }
+    Ok(branch_ids.into_iter().collect())
+}
+
 #[async_trait]
 impl TableSpec for LixStateSpec {
     fn table_name(&self) -> &str {
         "lix_state"
+    }
+
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+        Some(self)
     }
 
     fn schema(&self) -> SchemaRef {

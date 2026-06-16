@@ -35,6 +35,7 @@ use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{
     PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table, row_source,
 };
+use super::upsert::{StagedUpsert, UpsertSupport};
 use super::values::{
     optional_bool_value, optional_string_value, required_bool_value, required_string_value,
 };
@@ -88,6 +89,10 @@ impl TableSpec for BranchSpec {
 
     fn schema(&self) -> SchemaRef {
         lix_branch_schema()
+    }
+
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+        Some(self)
     }
 
     async fn plan_scan(
@@ -251,6 +256,68 @@ impl BranchSpec {
                     .map_err(branch_batch_error)
             },
         )
+    }
+}
+
+/// Identity column the upsert driver matches conflicting rows on: a branch row
+/// is uniquely its branch id.
+const LIX_BRANCH_IDENTITY: &[&str] = &["id"];
+
+#[async_trait]
+impl UpsertSupport for BranchSpec {
+    fn conflict_identity_columns(&self) -> &[&'static str] {
+        LIX_BRANCH_IDENTITY
+    }
+
+    async fn insert_staged_rows(
+        &self,
+        write_ctx: &SqlWriteContext,
+        batch: &RecordBatch,
+    ) -> Result<StagedUpsert> {
+        let default_commit_id = write_ctx
+            .load_branch_head(&write_ctx.active_branch_id())
+            .await
+            .map_err(lix_error_to_datafusion_error)?
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "INSERT into lix_branch could not resolve active branch head".to_string(),
+                )
+            })?;
+        let branch_rows = branch_insert_rows_from_batch(batch, &default_commit_id)?;
+        let rows = branch_rows
+            .into_iter()
+            .flat_map(branch_insert_stage_rows)
+            .collect::<Vec<_>>();
+        Ok(StagedUpsert::rows(rows))
+    }
+
+    async fn scan_conflict_candidates(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        _proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let rows = load_branch_rows(Arc::clone(&self.live_state), Arc::clone(&self.branch_ref))
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        LIX_BRANCH_COLS
+            .build(lix_branch_schema(), &rows)
+            .map_err(branch_batch_error)
+    }
+
+    async fn apply_conflict_update(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        augmented: &RecordBatch,
+        assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    ) -> Result<StagedUpsert> {
+        let branch_rows =
+            branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
+        reject_protected_branch_updates(&branch_rows)?;
+        let rows = branch_rows
+            .into_iter()
+            .flat_map(branch_update_stage_rows)
+            .collect::<Vec<_>>();
+        Ok(StagedUpsert::rows(rows))
     }
 }
 

@@ -90,6 +90,7 @@ use super::spec::{
     DmlApply, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch,
     register_spec_table, row_source,
 };
+use super::upsert::{StagedUpsert, UpsertSupport};
 
 pub(super) async fn register_lix_file_active_provider(
     session: &SessionContext,
@@ -314,6 +315,10 @@ impl LixFileSpec {
 impl TableSpec for LixFileSpec {
     fn table_name(&self) -> &str {
         "lix_file"
+    }
+
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+        Some(self)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -643,6 +648,236 @@ impl TableSpec for LixFileSpec {
         });
         Ok(PlannedDml { source, apply })
     }
+}
+
+/// Physical-identity column the upsert driver matches conflicting `lix_file`
+/// rows on. A `lix_file` row is uniquely identified by its file `id`; the
+/// `ON CONFLICT (id)` target is the supported (and only) conflict target.
+const LIX_FILE_IDENTITY: &[&str] = &["id"];
+
+#[async_trait]
+impl UpsertSupport for LixFileSpec {
+    fn conflict_identity_columns(&self) -> &[&'static str] {
+        LIX_FILE_IDENTITY
+    }
+
+    async fn insert_staged_rows(
+        &self,
+        write_ctx: &SqlWriteContext,
+        batch: &RecordBatch,
+    ) -> Result<StagedUpsert> {
+        // Reuse the plain-INSERT staging the file insert sink performs, for a
+        // single proposed batch. The collected proposed batch has lost the
+        // per-column insert intent metadata, so `include_data_writes` is
+        // derived from whether the materialized `data` column carries a value.
+        let surface_name = lix_file_surface_name(&self.branch_binding);
+        let branch_binding = self.branch_binding.active_branch_id();
+        let include_data_writes = record_batch_has_non_null_column(batch, "data")?;
+
+        let mut path_resolvers = directory_path_resolvers_from_live_state(
+            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+            branch_binding,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let staged = if record_batch_has_non_null_column(batch, "path")? {
+            lix_file_insert_stage_from_batch_with_path_resolvers(
+                batch,
+                branch_binding,
+                surface_name,
+                &mut path_resolvers,
+                &mut || self.functions.call_uuid_v7().to_string(),
+                include_data_writes,
+            )?
+        } else {
+            lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
+                batch,
+                branch_binding,
+                surface_name,
+                &mut path_resolvers,
+                &mut || self.functions.call_uuid_v7().to_string(),
+                include_data_writes,
+            )?
+        };
+
+        Ok(StagedUpsert::with_file_data(
+            staged.state_rows,
+            staged.file_data_writes,
+        ))
+    }
+
+    async fn scan_conflict_candidates(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        // Existing rows whose `id` matches a proposed row, rendered as a full
+        // `lix_file` batch (with materialized `data`) so the driver can build
+        // the augmented `excluded.*` batch the conflict assignments run over.
+        let target_file_ids = proposed_file_id_constraint(proposed)?;
+        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = proposed_branch_ids(proposed)?;
+        }
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let plugin_render = plugin_render_context_for_lix_file_scan(
+            live_state,
+            &self.blob_reader,
+            &request,
+            self.plugin_host.clone(),
+            true,
+        )
+        .await
+        .map_err(|error| {
+            DataFusionError::Execution(format!("sql2 lix_file plugin discovery failed: {error}"))
+        })?;
+        lix_file_record_batch(&self.schema, &self.blob_reader, plugin_render, true, rows)
+            .await
+            .map_err(lix_error_to_datafusion_error)
+    }
+
+    async fn apply_conflict_update(
+        &self,
+        write_ctx: &SqlWriteContext,
+        augmented: &RecordBatch,
+        assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    ) -> Result<StagedUpsert> {
+        // Reuse the plain-UPDATE staging. `augmented` carries the existing file
+        // columns plus `excluded.*`; the physical assignments reference both.
+        let branch_binding = self.branch_binding.active_branch_id();
+        let assignment_values = UpdateAssignmentValues::evaluate(augmented, assignments)?;
+        let update_columns = LixFileUpdateColumns::from_assignments(assignments);
+
+        // Re-scan the conflicting files' live rows to recover their blob refs
+        // (needed to tombstone the old blob when `data` is replaced) and any
+        // plugins installed for path-move rewrites.
+        let target_file_ids = augmented_file_id_constraint(augmented)?;
+        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = augmented_branch_ids(augmented)?;
+        }
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let blob_ref_keys =
+            blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+
+        let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
+            let plugin_render = plugin_render_context_for_lix_file_scan(
+                live_state.clone(),
+                &self.blob_reader,
+                &request,
+                self.plugin_host.clone(),
+                true,
+            )
+            .await
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "sql2 lix_file plugin discovery failed: {error}"
+                ))
+            })?;
+            path_update_plugin_rewrite_file_ids(
+                plugin_render.as_ref(),
+                augmented,
+                &assignment_values,
+                branch_binding,
+            )?
+        } else {
+            BTreeSet::new()
+        };
+
+        let mut path_resolvers = None;
+        if update_columns.path || update_columns.descriptor {
+            path_resolvers = Some(
+                directory_path_resolvers_from_live_state(
+                    Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                    branch_binding,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?,
+            );
+        }
+
+        let staged = lix_file_update_stage_from_batch(
+            augmented,
+            &assignment_values,
+            branch_binding,
+            update_columns,
+            &blob_ref_keys,
+            &plugin_rewrite_file_ids,
+            path_resolvers.as_mut(),
+            &mut || self.functions.call_uuid_v7().to_string(),
+        )?;
+
+        Ok(StagedUpsert::with_file_data(
+            staged.state_rows,
+            staged.file_data_writes,
+        ))
+    }
+}
+
+/// The conflict-identity (`id`) constraint of the proposed insert batch: the
+/// distinct file ids whose existing rows must be scanned for conflicts.
+fn proposed_file_id_constraint(batch: &RecordBatch) -> Result<FileIdConstraint> {
+    let mut ids = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        if let Some(id) = optional_string_value(batch, row_index, "id")? {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        // No explicit ids: nothing can conflict (every inserted row will be
+        // assigned a fresh id), so the candidate scan should match nothing.
+        return Ok(FileIdConstraint::None);
+    }
+    Ok(FileIdConstraint::from_ids(ids))
+}
+
+/// The `id` constraint of an augmented conflict batch (existing-row columns).
+fn augmented_file_id_constraint(batch: &RecordBatch) -> Result<FileIdConstraint> {
+    let mut ids = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        ids.push(required_string_value(batch, row_index, "id")?);
+    }
+    Ok(FileIdConstraint::from_ids(ids))
+}
+
+/// Distinct explicit `lixcol_branch_id` values in a proposed insert batch
+/// (by-branch surface). Empty when the column is absent or all-null.
+fn proposed_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
+    let mut branch_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        if let Some(branch_id) = optional_string_value(batch, row_index, "lixcol_branch_id")? {
+            branch_ids.insert(branch_id);
+        }
+    }
+    Ok(branch_ids.into_iter().collect())
+}
+
+/// Distinct `lixcol_branch_id` values carried by an augmented conflict batch.
+fn augmented_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
+    proposed_branch_ids(batch)
 }
 
 struct LixFileInsertSink {

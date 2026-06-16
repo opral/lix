@@ -84,7 +84,25 @@ pub(crate) struct BoundAssignment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundInsertConflict {
     pub(crate) target_columns: Vec<BoundColumnRef>,
-    pub(crate) assignments: Vec<BoundAssignment>,
+    pub(crate) action: BoundConflictAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BoundConflictAction {
+    /// `DO UPDATE SET ...` — apply the assignments to the conflicting row.
+    DoUpdate { assignments: Vec<BoundAssignment> },
+    /// `DO NOTHING` — keep the existing conflicting row unchanged.
+    DoNothing,
+}
+
+impl BoundConflictAction {
+    /// The DO UPDATE assignments, or an empty slice for DO NOTHING.
+    pub(crate) fn assignments(&self) -> &[BoundAssignment] {
+        match self {
+            Self::DoUpdate { assignments } => assignments,
+            Self::DoNothing => &[],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

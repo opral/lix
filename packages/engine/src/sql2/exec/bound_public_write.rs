@@ -7,7 +7,8 @@ use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
-    BoundAssignment, BoundInsertConflict, BoundInsertValues, BoundWriteInput, BoundWriteOp,
+    BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
+    BoundWriteOp,
     BoundWriteTarget, EntityWriteSurface,
 };
 use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
@@ -145,18 +146,21 @@ async fn entity_upsert(
         let inserted_entity_pk = insert_row_entity_pk(&insert_row, spec)?;
         let matching_candidate =
             find_conflict_candidate(&insert_row, &inserted_entity_pk, candidates.as_slice());
-        if let Some(candidate) = matching_candidate {
-            write_rows.push(entity_conflict_update_row(
-                ctx,
-                spec,
-                candidate,
-                &insert_row,
-                conflict.assignments.as_slice(),
-                params,
-                active_branch_commit_id,
-            )?);
-        } else {
-            write_rows.push(insert_row);
+        match (matching_candidate, &conflict.action) {
+            // DO NOTHING on a conflicting row: leave the existing row untouched.
+            (Some(_), BoundConflictAction::DoNothing) => {}
+            (Some(candidate), BoundConflictAction::DoUpdate { assignments }) => {
+                write_rows.push(entity_conflict_update_row(
+                    ctx,
+                    spec,
+                    candidate,
+                    &insert_row,
+                    assignments.as_slice(),
+                    params,
+                    active_branch_commit_id,
+                )?);
+            }
+            (None, _) => write_rows.push(insert_row),
         }
     }
 
@@ -1163,7 +1167,7 @@ fn validate_bound_write_supported(
         validate_expr_supported(&assignment.value)?;
     }
     if let Some(conflict) = &plan.bound.conflict {
-        for assignment in &conflict.assignments {
+        for assignment in conflict.action.assignments() {
             validate_expr_supported(&assignment.value)?;
         }
     }
@@ -1189,7 +1193,8 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
             .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
         && plan.bound.conflict.as_ref().is_none_or(|conflict| {
             conflict
-                .assignments
+                .action
+                .assignments()
                 .iter()
                 .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
         })

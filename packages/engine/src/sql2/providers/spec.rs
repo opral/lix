@@ -38,6 +38,8 @@ use crate::LixError;
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::{SqlWriteContext, WriteAccess};
 
+use super::upsert;
+
 /// Exec-time row loader. Captures whatever plan-time state the spec computed
 /// (scan requests, readers, projections) and produces the source batch.
 /// Re-invocable: DataFusion may execute a scan node more than once.
@@ -188,6 +190,11 @@ pub(super) trait TableSpec: Send + Sync + 'static {
             self.table_name()
         )))
     }
+
+    /// The spec's `INSERT ... ON CONFLICT` capability, if it supports upsert.
+    fn upsert_support(&self) -> Option<&dyn upsert::UpsertSupport> {
+        None
+    }
 }
 
 /// Register `spec` as a DataFusion table under its surface name.
@@ -224,6 +231,26 @@ impl SpecTableProvider {
     #[cfg(test)]
     pub(super) fn is_write(&self) -> bool {
         self.write_access.is_write()
+    }
+
+    /// Execute an `INSERT ... ON CONFLICT` against this table. The conflict
+    /// target columns are validated against the spec's identity, then the
+    /// generic upsert driver composes the spec's insert/scan/update builders.
+    pub(crate) async fn execute_upsert(
+        &self,
+        proposed_batches: Vec<RecordBatch>,
+        target_columns: &[String],
+        action: &upsert::UpsertAction,
+    ) -> Result<u64> {
+        let table = self.spec.table_name();
+        let write_ctx = self
+            .write_access
+            .require_write(&format!("INSERT into {table}"))?;
+        let support = self.spec.upsert_support().ok_or_else(|| {
+            DataFusionError::Execution(format!("INSERT ON CONFLICT is not supported on {table}"))
+        })?;
+        upsert::validate_conflict_target(support, table, target_columns)?;
+        upsert::execute_upsert(support, &write_ctx, proposed_batches, action).await
     }
 }
 

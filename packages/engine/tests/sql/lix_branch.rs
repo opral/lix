@@ -577,6 +577,134 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    lix_branch_insert_on_conflict_do_update_changes_name,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-upsert', 'Before')",
+                &[],
+            )
+            .await
+            .expect("initial branch insert should succeed");
+
+        let upsert_result = session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-upsert', 'After') \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+                &[],
+            )
+            .await
+            .expect("upsert DO UPDATE should succeed");
+        assert_eq!(upsert_result, ExecuteResult::from_rows_affected(1));
+
+        assert_single_branch_row(
+            &session,
+            "sql-branch-upsert",
+            "After",
+            false,
+            sim.initial_commit_id(),
+        )
+        .await;
+        assert_eq!(
+            count_rows(
+                &session,
+                "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-upsert'",
+            )
+            .await,
+            1
+        );
+    }
+);
+
+simulation_test!(
+    lix_branch_insert_on_conflict_do_nothing_keeps_name,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-upsert-nothing', 'Keep')",
+                &[],
+            )
+            .await
+            .expect("initial branch insert should succeed");
+
+        let upsert_result = session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-upsert-nothing', 'Discard') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("upsert DO NOTHING should succeed");
+        assert_eq!(upsert_result, ExecuteResult::from_rows_affected(0));
+
+        assert_single_branch_row(
+            &session,
+            "sql-branch-upsert-nothing",
+            "Keep",
+            false,
+            sim.initial_commit_id(),
+        )
+        .await;
+    }
+);
+
+simulation_test!(
+    lix_branch_insert_on_conflict_inserts_absent_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        let upsert_result = session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-upsert-absent', 'Fresh') \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+                &[],
+            )
+            .await
+            .expect("upsert on an absent id should insert");
+        assert_eq!(upsert_result, ExecuteResult::from_rows_affected(1));
+
+        assert_single_branch_row(
+            &session,
+            "sql-branch-upsert-absent",
+            "Fresh",
+            false,
+            sim.initial_commit_id(),
+        )
+        .await;
+    }
+);
+
 async fn assert_single_branch_row(
     session: &crate::support::simulation_test::engine::SimSession,
     branch_id: &str,
