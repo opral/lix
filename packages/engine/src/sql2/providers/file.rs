@@ -61,7 +61,7 @@ use crate::sql2::write_normalization::{
     reject_non_binary_casts_for_insert_column, scalar_is_binary_or_null,
 };
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
+use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -90,7 +90,9 @@ use super::spec::{
     DmlApply, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch,
     register_spec_table, row_source,
 };
-use super::upsert::{StagedUpsert, UpsertSupport};
+use super::upsert::{
+    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport, validate_target_columns,
+};
 
 pub(super) async fn register_lix_file_active_provider(
     session: &SessionContext,
@@ -149,7 +151,10 @@ pub(super) async fn register_by_branch_write_provider(
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixFileSpec::by_branch_with_write(write_ctx.clone(), options)),
+        Arc::new(LixFileSpec::by_branch_with_write(
+            write_ctx.clone(),
+            options,
+        )),
         WriteAccess::write(write_ctx),
     )
 }
@@ -244,10 +249,7 @@ impl LixFileSpec {
         }
     }
 
-    fn by_branch_with_write(
-        write_ctx: SqlWriteContext,
-        options: SqlWriteSessionOptions,
-    ) -> Self {
+    fn by_branch_with_write(write_ctx: SqlWriteContext, options: SqlWriteSessionOptions) -> Self {
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
@@ -285,7 +287,15 @@ impl LixFileSpec {
                 target_file_ids,
                 needs_data,
             ),
-            |(write_ctx, blob_reader, plugin_host, table_schema, request, target_file_ids, needs_data)| async move {
+            |(
+                write_ctx,
+                blob_reader,
+                plugin_host,
+                table_schema,
+                request,
+                target_file_ids,
+                needs_data,
+            )| async move {
                 let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
                 let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                     .await
@@ -397,14 +407,15 @@ impl TableSpec for LixFileSpec {
                     needs_data,
                     limit,
                 )| async move {
-                    let rows =
-                        scan_lix_file_live_rows(Arc::clone(&live_state), &request, &target_file_ids)
-                            .await
-                            .map_err(|error| {
-                                DataFusionError::Execution(format!(
-                                    "sql2 lix_file scan failed: {error}"
-                                ))
-                            })?;
+                    let rows = scan_lix_file_live_rows(
+                        Arc::clone(&live_state),
+                        &request,
+                        &target_file_ids,
+                    )
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
+                    })?;
                     let plugin_render = plugin_render_context_for_lix_file_scan(
                         Arc::clone(&live_state),
                         &blob_reader,
@@ -493,7 +504,12 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
-        let source = self.dml_source(&write_ctx, request.clone(), target_file_ids.clone(), needs_data);
+        let source = self.dml_source(
+            &write_ctx,
+            request.clone(),
+            target_file_ids.clone(),
+            needs_data,
+        );
         let branch_binding = self.branch_binding.clone();
         let apply: DmlApply = Arc::new(move |matched_batch| {
             let write_ctx = write_ctx.clone();
@@ -552,7 +568,12 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
-        let source = self.dml_source(&write_ctx, request.clone(), target_file_ids.clone(), needs_data);
+        let source = self.dml_source(
+            &write_ctx,
+            request.clone(),
+            target_file_ids.clone(),
+            needs_data,
+        );
         let branch_binding = self.branch_binding.clone();
         let functions = self.functions.clone();
         let blob_reader = Arc::clone(&self.blob_reader);
@@ -650,15 +671,46 @@ impl TableSpec for LixFileSpec {
     }
 }
 
-/// Physical-identity column the upsert driver matches conflicting `lix_file`
-/// rows on. A `lix_file` row is uniquely identified by its file `id`; the
-/// `ON CONFLICT (id)` target is the supported (and only) conflict target.
+/// Physical and path identities the upsert driver can match `lix_file` rows
+/// on. Path targets model the visible filesystem identity for active and
+/// by-branch surfaces.
 const LIX_FILE_IDENTITY: &[&str] = &["id"];
+const LIX_FILE_PATH_IDENTITY: &[&str] = &["path"];
+const LIX_FILE_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
 
 #[async_trait]
 impl UpsertSupport for LixFileSpec {
     fn conflict_identity_columns(&self) -> &[&'static str] {
         LIX_FILE_IDENTITY
+    }
+
+    fn resolve_conflict_target(
+        &self,
+        table_name: &str,
+        target_columns: &[String],
+    ) -> Result<UpsertConflictTarget> {
+        if validate_target_columns(
+            table_name,
+            target_columns,
+            LIX_FILE_IDENTITY,
+            "conflict identity columns",
+        )
+        .is_ok()
+        {
+            return Ok(UpsertConflictTarget::id(LIX_FILE_IDENTITY));
+        }
+
+        let path_identity = match self.branch_binding {
+            BranchBinding::Active { .. } => LIX_FILE_PATH_IDENTITY,
+            BranchBinding::Explicit => LIX_FILE_BY_BRANCH_PATH_IDENTITY,
+        };
+        validate_target_columns(
+            table_name,
+            target_columns,
+            path_identity,
+            "path identity columns",
+        )?;
+        Ok(UpsertConflictTarget::path(path_identity))
     }
 
     async fn insert_staged_rows(
@@ -711,14 +763,24 @@ impl UpsertSupport for LixFileSpec {
         &self,
         write_ctx: &SqlWriteContext,
         proposed: &RecordBatch,
+        target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
         // Existing rows whose `id` matches a proposed row, rendered as a full
         // `lix_file` batch (with materialized `data`) so the driver can build
         // the augmented `excluded.*` batch the conflict assignments run over.
-        let target_file_ids = proposed_file_id_constraint(proposed)?;
+        let target_file_ids = match target.kind() {
+            UpsertConflictKind::Id => proposed_file_id_constraint(proposed)?,
+            UpsertConflictKind::Path => {
+                validate_required_paths(proposed, "lix_file")?;
+                FileIdConstraint::All
+            }
+        };
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = proposed_branch_ids(proposed)?;
+            request.filter.branch_ids = match target.kind() {
+                UpsertConflictKind::Id => proposed_branch_ids(proposed)?,
+                UpsertConflictKind::Path => required_proposed_branch_ids(proposed, "lix_file")?,
+            };
         }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -746,6 +808,35 @@ impl UpsertSupport for LixFileSpec {
         lix_file_record_batch(&self.schema, &self.blob_reader, plugin_render, true, rows)
             .await
             .map_err(lix_error_to_datafusion_error)
+    }
+
+    fn validate_conflict_pair(
+        &self,
+        existing: &RecordBatch,
+        existing_row: usize,
+        proposed: &RecordBatch,
+        proposed_row: usize,
+        target: &UpsertConflictTarget,
+    ) -> Result<()> {
+        if target.kind() != UpsertConflictKind::Path {
+            return Ok(());
+        }
+        let existing_untracked =
+            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
+        let proposed_untracked =
+            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
+        if existing_untracked == proposed_untracked {
+            return Ok(());
+        }
+        let path = required_string_value(proposed, proposed_row, "path")?;
+        Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
+                lane_name(proposed_untracked),
+                lane_name(existing_untracked)
+            ),
+        )))
     }
 
     async fn apply_conflict_update(
@@ -875,9 +966,39 @@ fn proposed_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
     Ok(branch_ids.into_iter().collect())
 }
 
+fn required_proposed_branch_ids(batch: &RecordBatch, table_name: &str) -> Result<Vec<String>> {
+    let mut branch_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        let branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?.ok_or_else(
+            || {
+                DataFusionError::Execution(format!(
+                    "INSERT ON CONFLICT (path, lixcol_branch_id) on {table_name} requires non-null lixcol_branch_id"
+                ))
+            },
+        )?;
+        branch_ids.insert(branch_id);
+    }
+    Ok(branch_ids.into_iter().collect())
+}
+
 /// Distinct `lixcol_branch_id` values carried by an augmented conflict batch.
 fn augmented_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
     proposed_branch_ids(batch)
+}
+
+fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> {
+    for row_index in 0..batch.num_rows() {
+        if optional_string_value(batch, row_index, "path")?.is_none() {
+            return Err(DataFusionError::Execution(format!(
+                "INSERT ON CONFLICT (path) on {table_name} requires non-null path"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn lane_name(untracked: bool) -> &'static str {
+    if untracked { "untracked" } else { "tracked" }
 }
 
 struct LixFileInsertSink {
@@ -1862,9 +1983,14 @@ fn file_row_context_from_update(
     row_index: usize,
     branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
-    let explicit_branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?;
+    let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
+    let explicit_branch_id = if explicit_global == Some(true) {
+        Some(GLOBAL_BRANCH_ID.to_string())
+    } else {
+        optional_string_value(batch, row_index, "lixcol_branch_id")?
+    };
     let scope = resolve_write_branch_scope(
-        optional_bool_value(batch, row_index, "lixcol_global")?,
+        explicit_global,
         explicit_branch_id,
         branch_binding,
         "UPDATE into lix_file_by_branch",

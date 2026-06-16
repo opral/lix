@@ -559,17 +559,19 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_state_insert_on_conflict_do_update_uses_excluded, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
+simulation_test!(
+    lix_state_insert_on_conflict_do_update_uses_excluded,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
-    session
+        session
         .execute(
             "INSERT INTO lix_state (\
              entity_pk, schema_key, file_id, snapshot_content, global, untracked\
@@ -581,41 +583,44 @@ simulation_test!(lix_state_insert_on_conflict_do_update_uses_excluded, |sim| asy
         .await
         .expect("seed insert should succeed");
 
-    let result = session
+        let result = session
         .execute(
             "INSERT INTO lix_state (\
              entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
              lix_json('[\"state-upsert\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-upsert\",\"value\":\"new\"}'), false, false\
-             ) ON CONFLICT (entity_pk, schema_key) DO UPDATE SET snapshot_content = excluded.snapshot_content",
+             ) ON CONFLICT (entity_pk, schema_key, file_id) DO UPDATE SET snapshot_content = excluded.snapshot_content",
             &[],
         )
         .await
         .expect("upsert DO UPDATE should succeed");
-    assert_eq!(result.rows_affected(), 1);
+        assert_eq!(result.rows_affected(), 1);
 
-    let read = session
-        .execute(
-            "SELECT snapshot_content FROM lix_state \
+        let read = session
+            .execute(
+                "SELECT snapshot_content FROM lix_state \
              WHERE entity_pk = lix_json('[\"state-upsert\"]') AND schema_key = 'lix_key_value'",
-            &[],
-        )
-        .await
-        .expect("read should succeed");
-    assert_single_text(read, "{\"key\":\"state-upsert\",\"value\":\"new\"}");
-});
-
-simulation_test!(lix_state_insert_on_conflict_do_nothing_keeps_existing, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
+                &[],
+            )
             .await
-            .expect("main session should open"),
-        &engine,
-    );
+            .expect("read should succeed");
+        assert_single_text(read, "{\"key\":\"state-upsert\",\"value\":\"new\"}");
+    }
+);
 
-    session
+simulation_test!(
+    lix_state_insert_on_conflict_do_nothing_keeps_existing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
         .execute(
             "INSERT INTO lix_state (\
              entity_pk, schema_key, file_id, snapshot_content, global, untracked\
@@ -627,63 +632,100 @@ simulation_test!(lix_state_insert_on_conflict_do_nothing_keeps_existing, |sim| a
         .await
         .expect("seed insert should succeed");
 
-    let result = session
+        let result = session
         .execute(
             "INSERT INTO lix_state (\
              entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
              lix_json('[\"state-nothing\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-nothing\",\"value\":\"ignored\"}'), false, false\
-             ) ON CONFLICT (entity_pk, schema_key) DO NOTHING",
+             ) ON CONFLICT (entity_pk, schema_key, file_id) DO NOTHING",
             &[],
         )
         .await
         .expect("upsert DO NOTHING should succeed");
-    assert_eq!(result.rows_affected(), 0);
+        assert_eq!(result.rows_affected(), 0);
 
-    let read = session
-        .execute(
-            "SELECT snapshot_content FROM lix_state \
+        let read = session
+            .execute(
+                "SELECT snapshot_content FROM lix_state \
              WHERE entity_pk = lix_json('[\"state-nothing\"]') AND schema_key = 'lix_key_value'",
-            &[],
-        )
-        .await
-        .expect("read should succeed");
-    assert_single_text(read, "{\"key\":\"state-nothing\",\"value\":\"keep\"}");
-});
-
-simulation_test!(lix_state_insert_on_conflict_inserts_when_absent, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
+                &[],
+            )
             .await
-            .expect("main session should open"),
-        &engine,
-    );
+            .expect("read should succeed");
+        assert_single_text(read, "{\"key\":\"state-nothing\",\"value\":\"keep\"}");
+    }
+);
 
-    let result = session
+simulation_test!(
+    lix_state_insert_on_conflict_inserts_when_absent,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let result = session
         .execute(
             "INSERT INTO lix_state (\
              entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
              lix_json('[\"state-fresh\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-fresh\",\"value\":\"created\"}'), false, false\
-             ) ON CONFLICT (entity_pk, schema_key) DO UPDATE SET snapshot_content = excluded.snapshot_content",
+             ) ON CONFLICT (entity_pk, schema_key, file_id) DO UPDATE SET snapshot_content = excluded.snapshot_content",
             &[],
         )
         .await
         .expect("upsert on absent row should insert");
-    assert_eq!(result.rows_affected(), 1);
+        assert_eq!(result.rows_affected(), 1);
 
-    let read = session
-        .execute(
-            "SELECT snapshot_content FROM lix_state \
+        let read = session
+            .execute(
+                "SELECT snapshot_content FROM lix_state \
              WHERE entity_pk = lix_json('[\"state-fresh\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("read should succeed");
+        assert_single_text(read, "{\"key\":\"state-fresh\",\"value\":\"created\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_insert_on_conflict_rejects_partial_target,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+        .execute(
+            "INSERT INTO lix_state (\
+             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
+             ) VALUES (\
+             lix_json('[\"state-partial-target\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-partial-target\",\"value\":\"new\"}'), false, false\
+             ) ON CONFLICT (entity_pk, schema_key) DO NOTHING",
             &[],
         )
         .await
-        .expect("read should succeed");
-    assert_single_text(read, "{\"key\":\"state-fresh\",\"value\":\"created\"}");
-});
+        .expect_err("partial conflict target should be rejected");
+
+        assert!(
+            error
+                .message
+                .contains("target must match conflict identity columns"),
+            "expected conflict identity target error: {error}"
+        );
+    }
+);
 
 fn assert_single_text(result: ExecuteResult, expected: &str) {
     let row_set = result;

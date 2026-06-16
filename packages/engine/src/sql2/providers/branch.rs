@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::execution::context::ExecutionProps;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalExpr;
 use futures_util::FutureExt;
@@ -106,12 +106,18 @@ impl TableSpec for BranchSpec {
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
-                (Arc::clone(&self.live_state), Arc::clone(&self.branch_ref), schema),
+                (
+                    Arc::clone(&self.live_state),
+                    Arc::clone(&self.branch_ref),
+                    schema,
+                ),
                 |(live_state, branch_ref, schema)| async move {
                     let rows = load_branch_rows(live_state, branch_ref)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    LIX_BRANCH_COLS.build(schema, &rows).map_err(branch_batch_error)
+                    LIX_BRANCH_COLS
+                        .build(schema, &rows)
+                        .map_err(branch_batch_error)
                 },
             ),
         })
@@ -295,6 +301,7 @@ impl UpsertSupport for BranchSpec {
         &self,
         _write_ctx: &SqlWriteContext,
         _proposed: &RecordBatch,
+        _target: &super::upsert::UpsertConflictTarget,
     ) -> Result<RecordBatch> {
         let rows = load_branch_rows(Arc::clone(&self.live_state), Arc::clone(&self.branch_ref))
             .await
@@ -699,4 +706,3 @@ pub(super) fn lix_branch_schema() -> SchemaRef {
         Field::new("commit_id", DataType::Utf8, false),
     ]))
 }
-

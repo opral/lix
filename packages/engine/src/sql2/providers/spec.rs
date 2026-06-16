@@ -43,8 +43,7 @@ use super::upsert;
 /// Exec-time row loader. Captures whatever plan-time state the spec computed
 /// (scan requests, readers, projections) and produces the source batch.
 /// Re-invocable: DataFusion may execute a scan node more than once.
-pub(super) type RowSource =
-    Arc<dyn Fn() -> BoxFuture<'static, Result<RecordBatch>> + Send + Sync>;
+pub(super) type RowSource = Arc<dyn Fn() -> BoxFuture<'static, Result<RecordBatch>> + Send + Sync>;
 
 /// Build a [`RowSource`] from owned plan-time state and an async body taking
 /// that state by value. Owns the once-per-invocation clone that
@@ -234,23 +233,40 @@ impl SpecTableProvider {
     }
 
     /// Execute an `INSERT ... ON CONFLICT` against this table. The conflict
-    /// target columns are validated against the spec's identity, then the
-    /// generic upsert driver composes the spec's insert/scan/update builders.
+    /// target columns are resolved by the spec, then the generic upsert driver
+    /// composes the spec's insert/scan/update builders.
     pub(crate) async fn execute_upsert(
         &self,
+        input: &Arc<dyn ExecutionPlan>,
         proposed_batches: Vec<RecordBatch>,
         target_columns: &[String],
         action: &upsert::UpsertAction,
     ) -> Result<u64> {
+        let (write_ctx, support, target) = self.validate_upsert(input, target_columns).await?;
+        upsert::execute_upsert(support, &write_ctx, proposed_batches, &target, action).await
+    }
+
+    pub(crate) async fn validate_upsert(
+        &self,
+        input: &Arc<dyn ExecutionPlan>,
+        target_columns: &[String],
+    ) -> Result<(
+        SqlWriteContext,
+        &dyn upsert::UpsertSupport,
+        upsert::UpsertConflictTarget,
+    )> {
         let table = self.spec.table_name();
         let write_ctx = self
             .write_access
             .require_write(&format!("INSERT into {table}"))?;
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
         let support = self.spec.upsert_support().ok_or_else(|| {
             DataFusionError::Execution(format!("INSERT ON CONFLICT is not supported on {table}"))
         })?;
-        upsert::validate_conflict_target(support, table, target_columns)?;
-        upsert::execute_upsert(support, &write_ctx, proposed_batches, action).await
+        let target = support.resolve_conflict_target(table, target_columns)?;
+        self.spec.plan_insert(write_ctx.clone(), input).await?;
+        Ok((write_ctx, support, target))
     }
 }
 
@@ -319,20 +335,17 @@ impl TableProvider for SpecTableProvider {
             .require_write(&format!("INSERT into {table}"))?;
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
-        let sink: Arc<dyn InsertSink> = match self
-            .spec
-            .plan_insert(write_ctx.clone(), &input)
-            .await?
-        {
-            Some(apply) => Arc::new(PlannedInsertSink {
-                table: table.into(),
-                apply,
-            }),
-            None => Arc::new(SpecInsertSink {
-                spec: Arc::clone(&self.spec),
-                write_ctx,
-            }),
-        };
+        let sink: Arc<dyn InsertSink> =
+            match self.spec.plan_insert(write_ctx.clone(), &input).await? {
+                Some(apply) => Arc::new(PlannedInsertSink {
+                    table: table.into(),
+                    apply,
+                }),
+                None => Arc::new(SpecInsertSink {
+                    spec: Arc::clone(&self.spec),
+                    write_ctx,
+                }),
+            };
         Ok(Arc::new(InsertExec::new(input, sink)))
     }
 
