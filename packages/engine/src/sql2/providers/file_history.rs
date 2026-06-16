@@ -1,33 +1,23 @@
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
-use datafusion::execution::TaskContext;
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-};
-use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::binary_cas::{BlobDataReader, BlobHash};
+use crate::binary_cas::BlobDataReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
@@ -43,6 +33,11 @@ use crate::sql2::providers::filesystem_history_path::{
 use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
 
+use super::columns::{Col, ColumnTable, ColumnTableError};
+use super::file::load_single_blob_bytes;
+use super::history::entity_pk_json_array;
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -57,244 +52,104 @@ pub(super) async fn register_lix_file_history_surface<S>(
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixFileHistoryProvider::new(
-                Arc::new(Mutex::new(commit_graph)),
-                query_source,
-                blob_reader,
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixFileHistorySpec {
+            commit_graph: Arc::new(Mutex::new(commit_graph)),
+            query_source,
+            blob_reader,
+        }),
+        WriteAccess::read_only(),
+    )
 }
 
-struct LixFileHistoryProvider<S> {
-    schema: SchemaRef,
+/// SQL spec for `lix_file_history`.
+///
+/// The reachability-aware file history surface: rows are reconstructed by
+/// walking the commit graph from the routed start commits, resolving the
+/// nearest descriptor/blob/directory events per file.
+struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
 }
 
-impl<S> std::fmt::Debug for LixFileHistoryProvider<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixFileHistoryProvider").finish()
-    }
-}
-
-impl<S> LixFileHistoryProvider<S> {
-    fn new(
-        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlHistoryQuerySource<S>,
-        blob_reader: Arc<dyn BlobDataReader>,
-    ) -> Self {
-        Self {
-            schema: lix_file_history_schema(),
-            commit_graph,
-            query_source,
-            blob_reader,
-        }
-    }
-}
-
 #[async_trait]
-impl<S> TableProvider for LixFileHistoryProvider<S>
+impl<S> TableSpec for LixFileHistorySpec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn as_any(&self) -> &dyn Any {
-        self
+    #[expect(clippy::unnecessary_literal_bound)]
+    fn table_name(&self) -> &str {
+        "lix_file_history"
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        lix_file_history_schema()
     }
 
     fn table_type(&self) -> TableType {
         TableType::View
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+    fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
     }
 
-    async fn scan(
+    async fn plan_scan(
         &self,
-        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let schema = projected_schema(&self.schema, projection)?;
+        _props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
+        let full_schema = lix_file_history_schema();
+        let schema = projected_schema(&full_schema, projection);
         let needs_data = projection.is_none_or(|projection| {
             projection.iter().any(|index| {
-                self.schema
+                full_schema
                     .field(*index)
                     .name()
                     .as_str()
                     .eq_ignore_ascii_case("data")
             })
         });
-        Ok(Arc::new(LixFileHistoryScanExec::new(
-            Arc::clone(&self.commit_graph),
-            self.query_source.clone(),
-            Arc::clone(&self.blob_reader),
-            schema,
-            needs_data,
-            HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed),
-            limit,
-        )))
-    }
-}
-
-struct LixFileHistoryScanExec<S> {
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    blob_reader: Arc<dyn BlobDataReader>,
-    schema: SchemaRef,
-    needs_data: bool,
-    route: HistoryRoute,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-#[expect(clippy::missing_fields_in_debug)]
-impl<S> std::fmt::Debug for LixFileHistoryScanExec<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixFileHistoryScanExec")
-            .field("route", &self.route)
-            .field("limit", &self.limit)
-            .finish()
-    }
-}
-
-impl<S> LixFileHistoryScanExec<S> {
-    fn new(
-        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlHistoryQuerySource<S>,
-        blob_reader: Arc<dyn BlobDataReader>,
-        schema: SchemaRef,
-        needs_data: bool,
-        route: HistoryRoute,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            commit_graph,
-            query_source,
-            blob_reader,
-            schema,
-            needs_data,
-            route,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl<S> DisplayAs for LixFileHistoryScanExec<S> {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
-                f,
-                "LixFileHistoryScanExec(route={:?}, limit={:?})",
-                self.route, self.limit
+        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
+        Ok(PlannedScan {
+            schema: Arc::clone(&schema),
+            load: row_source(
+                (
+                    Arc::clone(&self.commit_graph),
+                    self.query_source.clone(),
+                    Arc::clone(&self.blob_reader),
+                    route,
+                    schema,
+                ),
+                move |(commit_graph, query_source, blob_reader, route, schema)| async move {
+                    let mut rows = load_file_history_rows(
+                        commit_graph,
+                        query_source,
+                        &blob_reader,
+                        &route,
+                        needs_data,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    if let Some(limit) = limit {
+                        rows.truncate(limit);
+                    }
+                    LIX_FILE_HISTORY_COLS
+                        .build(schema, &rows)
+                        .map_err(file_history_batch_error)
+                        .map_err(lix_error_to_datafusion_error)
+                },
             ),
-            DisplayFormatType::TreeRender => write!(f, "LixFileHistoryScanExec"),
-        }
-    }
-}
-
-impl<S> ExecutionPlan for LixFileHistoryScanExec<S>
-where
-    S: StorageRead + Clone + Send + Sync + 'static,
-{
-    fn name(&self) -> &'static str {
-        "LixFileHistoryScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixFileHistoryScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixFileHistoryScanExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let commit_graph = Arc::clone(&self.commit_graph);
-        let query_source = self.query_source.clone();
-        let blob_reader = Arc::clone(&self.blob_reader);
-        let schema = Arc::clone(&self.schema);
-        let stream_schema = Arc::clone(&schema);
-        let route = self.route.clone();
-        let limit = self.limit;
-        let needs_data = self.needs_data;
-
-        let fut = async move {
-            let mut rows = load_file_history_rows(
-                commit_graph,
-                query_source,
-                &blob_reader,
-                &route,
-                needs_data,
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-            if let Some(limit) = limit {
-                rows.truncate(limit);
-            }
-            file_history_record_batch(&stream_schema, &rows).map_err(lix_error_to_datafusion_error)
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::once(fut),
-        )))
+        })
     }
 }
 
@@ -497,19 +352,6 @@ where
     Ok(output)
 }
 
-async fn load_single_blob_bytes(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    blob_hash: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let hash = BlobHash::from_hex(blob_hash)?;
-    Ok(blob_reader
-        .load_bytes_many(&[hash])
-        .await?
-        .into_vec()
-        .into_iter()
-        .next()
-        .flatten())
-}
 
 fn file_history_events(
     event_descriptors: &[FileHistoryDescriptorRecord],
@@ -756,91 +598,75 @@ fn resolve_file_history_path(
     compose_file_path(Some(&directory_path), name).ok()
 }
 
-fn file_history_record_batch(
-    schema: &SchemaRef,
-    rows: &[FileHistoryOutputRow],
-) -> Result<RecordBatch, LixError> {
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| file_history_column_array(field.name(), rows))
-        .collect::<Result<Vec<_>, _>>()?;
-    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
-    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(|error| {
-        LixError::new(
+static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
+    columns: &[
+        ("id", Col::Utf8(|row| Some(row.id.as_str()))),
+        ("path", Col::Utf8(|row| row.path.as_deref())),
+        ("directory_id", Col::Utf8(|row| row.directory_id.as_deref())),
+        ("name", Col::Utf8(|row| row.name.as_deref())),
+        ("data", Col::Binary(|row| row.data.clone())),
+        (
+            HISTORY_COL_ENTITY_PK,
+            Col::Utf8Fallible(|row| entity_pk_json_array(&row.entity_pk).map(Some)),
+        ),
+        (
+            HISTORY_COL_SCHEMA_KEY,
+            Col::Utf8(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY)),
+        ),
+        (
+            HISTORY_COL_FILE_ID,
+            Col::Utf8(|row| Some(row.entity_pk.as_str())),
+        ),
+        (
+            HISTORY_COL_CHANGE_ID,
+            Col::Utf8(|row| Some(row.event.change.id.as_str())),
+        ),
+        (
+            HISTORY_COL_SNAPSHOT_CONTENT,
+            Col::Utf8(|row| row.descriptor_change.snapshot_content.as_deref()),
+        ),
+        (
+            HISTORY_COL_METADATA,
+            Col::Utf8Owned(|row| {
+                row.descriptor_change
+                    .metadata
+                    .as_deref()
+                    .map(serialize_row_metadata)
+            }),
+        ),
+        (
+            HISTORY_COL_OBSERVED_COMMIT_ID,
+            Col::Utf8(|row| Some(row.event.observed_commit_id.as_str())),
+        ),
+        (
+            HISTORY_COL_COMMIT_CREATED_AT,
+            Col::Utf8(|row| Some(row.event.commit_created_at.as_str())),
+        ),
+        (
+            HISTORY_COL_START_COMMIT_ID,
+            Col::Utf8(|row| Some(row.event.start_commit_id.as_str())),
+        ),
+        (
+            HISTORY_COL_DEPTH,
+            Col::I64(|row| Some(i64::from(row.event.depth))),
+        ),
+    ],
+};
+
+/// Map [`ColumnTableError`] from [`LIX_FILE_HISTORY_COLS`] builds onto the exact
+/// error messages the hand-written `file_history_record_batch` produced.
+fn file_history_batch_error(error: ColumnTableError) -> LixError {
+    match error {
+        ColumnTableError::UnsupportedColumn(other) => LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 lix_file_history provider does not support projected column '{other}'"),
+        ),
+        ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("sql2 failed to build lix_file_history record batch: {error}"),
-        )
-    })
-}
-
-#[expect(trivial_casts)]
-fn file_history_column_array(
-    column_name: &str,
-    rows: &[FileHistoryOutputRow],
-) -> Result<ArrayRef, LixError> {
-    Ok(match column_name {
-        "id" => string_array(rows.iter().map(|row| Some(row.id.as_str()))),
-        "path" => string_array(rows.iter().map(|row| row.path.as_deref())),
-        "directory_id" => string_array(rows.iter().map(|row| row.directory_id.as_deref())),
-        "name" => string_array(rows.iter().map(|row| row.name.as_deref())),
-        "data" => Arc::new(BinaryArray::from(
-            rows.iter()
-                .map(|row| row.data.as_deref())
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        HISTORY_COL_ENTITY_PK => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| entity_pk_json_array(&row.entity_pk).map(Some))
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        )) as ArrayRef,
-        HISTORY_COL_SCHEMA_KEY => {
-            string_array(rows.iter().map(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY)))
-        }
-        HISTORY_COL_FILE_ID => string_array(rows.iter().map(|row| Some(row.entity_pk.as_str()))),
-        HISTORY_COL_CHANGE_ID => {
-            string_array(rows.iter().map(|row| Some(row.event.change.id.as_str())))
-        }
-        HISTORY_COL_SNAPSHOT_CONTENT => string_array(
-            rows.iter()
-                .map(|row| row.descriptor_change.snapshot_content.as_deref()),
         ),
-        HISTORY_COL_METADATA => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| {
-                    row.descriptor_change
-                        .metadata
-                        .as_deref()
-                        .map(serialize_row_metadata)
-                })
-                .collect::<Vec<_>>(),
-        )),
-        HISTORY_COL_OBSERVED_COMMIT_ID => string_array(
-            rows.iter()
-                .map(|row| Some(row.event.observed_commit_id.as_str())),
-        ),
-        HISTORY_COL_COMMIT_CREATED_AT => string_array(
-            rows.iter()
-                .map(|row| Some(row.event.commit_created_at.as_str())),
-        ),
-        HISTORY_COL_START_COMMIT_ID => string_array(
-            rows.iter()
-                .map(|row| Some(row.event.start_commit_id.as_str())),
-        ),
-        HISTORY_COL_DEPTH => Arc::new(Int64Array::from(
-            rows.iter()
-                .map(|row| i64::from(row.event.depth))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "sql2 lix_file_history provider does not support projected column '{other}'"
-                ),
-            ));
-        }
-    })
+        ColumnTableError::Row(error) => error,
+    }
 }
 
 pub(super) fn lix_file_history_schema() -> SchemaRef {
@@ -863,29 +689,6 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
     ]))
 }
 
-fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
-    let Some(projection) = projection else {
-        return Ok(Arc::clone(base_schema));
-    };
-    Ok(Arc::new(base_schema.project(projection)?))
-}
-
-#[expect(trivial_casts)]
-fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
-}
-
-fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    crate::sql2::error::datafusion_error_to_lix_error(error)
-}
-
-fn entity_pk_json_array(entity_pk: &str) -> Result<String, LixError> {
-    serde_json::to_string(&[entity_pk]).map_err(|error| {
-        LixError::unknown(format!(
-            "failed to encode history entity pk as JSON: {error}"
-        ))
-    })
-}
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)

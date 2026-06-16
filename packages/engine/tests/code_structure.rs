@@ -2948,7 +2948,7 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         relative,
         &source,
         "pub(crate) async fn register_entity_write_providers",
-        "pub(crate) struct EntityProvider",
+        "fn catalog_entity_spec",
     );
 
     assert_source_contains_all(

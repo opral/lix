@@ -8,6 +8,7 @@ use crate::LixError;
 
 mod branch;
 mod change;
+mod columns;
 mod directory;
 mod directory_history;
 mod entity;
@@ -17,6 +18,8 @@ mod file_history;
 mod filesystem_history_path;
 mod history;
 mod lix_state;
+mod spec;
+mod values;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;

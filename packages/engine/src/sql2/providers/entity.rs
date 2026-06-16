@@ -1,26 +1,16 @@
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::execution::context::ExecutionProps;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
-use datafusion::datasource::TableType;
-use datafusion::execution::TaskContext;
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
-use futures_util::{TryStreamExt, stream};
 use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
@@ -35,14 +25,23 @@ use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
     entity_surface_schema,
 };
-use crate::{LixError, serialize_row_metadata};
+use crate::LixError;
+use crate::sql2::error::lix_error_to_datafusion_error;
 
 use crate::sql2::{
-    SqlHistoryQuerySource, SqlWriteContext, WriteContextBranchRefReader,
+    SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextBranchRefReader,
     WriteContextLiveStateReader,
 };
 
-use super::entity_history::EntityHistoryProvider;
+use super::entity_history::register_entity_history_surface;
+use datafusion::physical_plan::ExecutionPlan;
+
+use super::columns::{ColumnTableError, LIVE_STATE_COLS, build_array};
+use super::spec::{
+    InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table,
+    row_source,
+};
+use super::values::string_expr_literal;
 use crate::storage::StorageRead;
 
 pub(crate) async fn register_entity_providers<S>(
@@ -61,40 +60,40 @@ where
         match &surface.kind {
             PublicSurfaceKind::EntityBase { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
-                ctx.register_table(
+                register_spec_table(
+                    ctx,
                     &surface.name,
-                    Arc::new(EntityProvider::active(
+                    Arc::new(EntitySpec::active(
                         spec,
                         Arc::clone(&live_state),
                         Arc::clone(&branch_ref),
                         active_branch_id.to_string(),
                     )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                    WriteAccess::read_only(),
+                )?;
             }
             PublicSurfaceKind::EntityByBranch { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
-                ctx.register_table(
+                register_spec_table(
+                    ctx,
                     &surface.name,
-                    Arc::new(EntityProvider::by_branch(
+                    Arc::new(EntitySpec::by_branch(
                         spec,
                         Arc::clone(&live_state),
                         Arc::clone(&branch_ref),
                     )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                    WriteAccess::read_only(),
+                )?;
             }
             PublicSurfaceKind::EntityHistory { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
-                ctx.register_table(
+                register_entity_history_surface(
+                    ctx,
                     &surface.name,
-                    Arc::new(EntityHistoryProvider::new(
-                        spec,
-                        Arc::clone(&commit_graph),
-                        query_source.clone(),
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                    spec,
+                    Arc::clone(&commit_graph),
+                    query_source.clone(),
+                )?;
             }
             _ => {}
         }
@@ -112,22 +111,21 @@ pub(crate) async fn register_entity_write_providers(
         match &surface.kind {
             PublicSurfaceKind::EntityBase { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
-                ctx.register_table(
+                register_spec_table(
+                    ctx,
                     &surface.name,
-                    Arc::new(EntityProvider::active_with_write(spec, write_ctx.clone())),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                    Arc::new(EntitySpec::active_with_write(spec, write_ctx.clone())),
+                    WriteAccess::write(write_ctx.clone()),
+                )?;
             }
             PublicSurfaceKind::EntityByBranch { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
-                ctx.register_table(
+                register_spec_table(
+                    ctx,
                     &surface.name,
-                    Arc::new(EntityProvider::by_branch_with_write(
-                        spec,
-                        write_ctx.clone(),
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                    Arc::new(EntitySpec::by_branch_with_write(spec, write_ctx.clone())),
+                    WriteAccess::write(write_ctx.clone()),
+                )?;
             }
             _ => {}
         }
@@ -152,26 +150,19 @@ fn catalog_entity_spec(
         })
 }
 
-pub(crate) struct EntityProvider {
+/// One spec type covers every registered entity schema: the runtime
+/// [`EntitySurfaceSpec`] carries the per-schema column layout, and the
+/// surface name follows the catalog naming for the base/by-branch shapes.
+struct EntitySpec {
+    surface_name: String,
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
-    variant: EntitySurfaceShape,
     branch_binding: BranchBinding,
 }
 
-#[expect(clippy::missing_fields_in_debug)]
-impl std::fmt::Debug for EntityProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntityProvider")
-            .field("schema_key", &self.spec.schema_key)
-            .field("variant", &self.variant)
-            .finish()
-    }
-}
-
-impl EntityProvider {
+impl EntitySpec {
     fn active(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
@@ -179,11 +170,11 @@ impl EntityProvider {
         active_branch_id: String,
     ) -> Self {
         Self {
+            surface_name: spec.schema_key.clone(),
             schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
             spec,
             live_state,
             branch_ref,
-            variant: EntitySurfaceShape::Active,
             branch_binding: BranchBinding::active(active_branch_id),
         }
     }
@@ -192,14 +183,7 @@ impl EntityProvider {
         let active_branch_id = write_ctx.active_branch_id();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx));
-        Self {
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
-            spec,
-            live_state,
-            branch_ref,
-            variant: EntitySurfaceShape::Active,
-            branch_binding: BranchBinding::active(active_branch_id),
-        }
+        Self::active(spec, live_state, branch_ref, active_branch_id)
     }
 
     fn by_branch(
@@ -208,11 +192,11 @@ impl EntityProvider {
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         Self {
+            surface_name: format!("{}_by_branch", spec.schema_key),
             schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
             spec,
             live_state,
             branch_ref,
-            variant: EntitySurfaceShape::ByBranch,
             branch_binding: BranchBinding::explicit(),
         }
     }
@@ -220,60 +204,19 @@ impl EntityProvider {
     fn by_branch_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx));
-        Self {
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
-            spec,
-            live_state,
-            branch_ref,
-            variant: EntitySurfaceShape::ByBranch,
-            branch_binding: BranchBinding::explicit(),
-        }
-    }
-}
-
-#[async_trait]
-impl TableProvider for EntityProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
+        Self::by_branch(spec, live_state, branch_ref)
     }
 
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
+    /// Plan-time scan derivation shared by `plan_scan` and the unit tests:
+    /// the projected output schema, the live-state scan request (with branch
+    /// routing resolved), and the residual snapshot row filters.
+    async fn plan_scan_parts(
         &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
-        let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if ExactBranchIdFilterAnalyzer.supports(filter)
-                    || primary_key_analyzer.supports(filter)
-                    || row_filter_analyzer.supports(filter)
-                {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let projected_schema = projected_schema(&self.schema, projection)?;
+    ) -> Result<(SchemaRef, LiveStateScanRequest, Vec<EntityRowFilter>)> {
+        let projected_schema = projected_schema(&self.schema, projection);
         let row_filters = EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(filters)?;
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
@@ -291,39 +234,90 @@ impl TableProvider for EntityProvider {
         .map_err(lix_error_to_datafusion_error)?;
         apply_exact_branch_id_filter(&mut request, exact_branch_ids_from_filters(filters)?);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
+        Ok((projected_schema, request, row_filters))
+    }
+}
 
-        Ok(Arc::new(EntityScanExec::new(
-            Arc::clone(&self.spec),
-            Arc::clone(&self.live_state),
-            projected_schema,
-            request,
-            row_filters,
-        )))
+#[async_trait]
+impl TableSpec for EntitySpec {
+    fn table_name(&self) -> &str {
+        &self.surface_name
     }
 
-    async fn insert_into(
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
+        let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
+        if ExactBranchIdFilterAnalyzer.supports(filter)
+            || primary_key_analyzer.supports(filter)
+            || row_filter_analyzer.supports(filter)
+        {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
+    }
+
+    async fn plan_scan(
         &self,
-        _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        _props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
+        let (schema, request, row_filters) =
+            self.plan_scan_parts(projection, filters, limit).await?;
+        Ok(PlannedScan {
+            schema: Arc::clone(&schema),
+            load: row_source(
+                (
+                    Arc::clone(&self.spec),
+                    Arc::clone(&self.live_state),
+                    schema,
+                    request,
+                    row_filters,
+                ),
+                |(spec, live_state, schema, request, row_filters)| async move {
+                    let mut rows = live_state
+                        .scan_rows(&request)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    apply_entity_row_filters(&mut rows, &row_filters)?;
+                    entity_record_batch(&spec, schema, &rows)
+                },
+            ),
+        })
+    }
+
+    // Rejects at plan time so validate-only
+    // flows fail before the INSERT input plan executes; an exec-time rejection
+    // in stage_insert would let empty-branch-scope statements short-circuit to
+    // a silent 0-row success.
+    async fn plan_insert(
+        &self,
+        _write_ctx: SqlWriteContext,
+        _input: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<InsertApply>> {
         not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
     }
 
-    async fn delete_from(
+    async fn plan_delete(
         &self,
-        _state: &dyn Session,
-        _filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        _write_ctx: SqlWriteContext,
+        _filters: &[Expr],
+    ) -> Result<PlannedDml> {
         not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
     }
 
-    async fn update(
+    async fn plan_update(
         &self,
-        _state: &dyn Session,
-        _assignments: Vec<(String, Expr)>,
-        _filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        _write_ctx: SqlWriteContext,
+        _assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        _filters: &[Expr],
+    ) -> Result<PlannedDml> {
         not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
 }
@@ -943,138 +937,6 @@ fn identity_matches_parts(
         })
 }
 
-fn string_expr_literal(expr: &Expr) -> Option<String> {
-    let Expr::Literal(literal, _) = expr else {
-        return None;
-    };
-    match literal {
-        ScalarValue::Utf8(Some(value))
-        | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-struct EntityScanExec {
-    spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateReader>,
-    schema: SchemaRef,
-    request: LiveStateScanRequest,
-    row_filters: Vec<EntityRowFilter>,
-    properties: Arc<PlanProperties>,
-}
-
-#[expect(clippy::missing_fields_in_debug)]
-impl std::fmt::Debug for EntityScanExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntityScanExec")
-            .field("schema_key", &self.spec.schema_key)
-            .finish()
-    }
-}
-
-impl EntityScanExec {
-    fn new(
-        spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateReader>,
-        schema: SchemaRef,
-        request: LiveStateScanRequest,
-        row_filters: Vec<EntityRowFilter>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            spec,
-            live_state,
-            schema,
-            request,
-            row_filters,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for EntityScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "EntityScanExec(schema_key={}, limit={:?})",
-                    self.spec.schema_key, self.request.limit
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, "EntityScanExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for EntityScanExec {
-    fn name(&self) -> &'static str {
-        "EntityScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "EntityScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "EntityScanExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let spec = Arc::clone(&self.spec);
-        let live_state = Arc::clone(&self.live_state);
-        let schema = Arc::clone(&self.schema);
-        let request = self.request.clone();
-        let row_filters = self.row_filters.clone();
-        let stream_schema = Arc::clone(&schema);
-        let stream = stream::once(async move {
-            let mut rows = live_state
-                .scan_rows(&request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            apply_entity_row_filters(&mut rows, &row_filters)?;
-            let batch = entity_record_batch(&spec, Arc::clone(&stream_schema), &rows)?;
-            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
-                batch,
-            )]))
-        })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
 
 fn apply_entity_row_filters(
     rows: &mut Vec<MaterializedLiveStateRow>,
@@ -1235,55 +1097,33 @@ fn entity_column_array(
     })
 }
 
-#[expect(trivial_casts)]
+/// `lixcol_*` system columns share their accessors with the lix_state
+/// surface: strip the prefix and materialize via [`LIVE_STATE_COLS`].
 fn entity_system_column_array(
     column_name: &str,
     rows: &[MaterializedLiveStateRow],
 ) -> Result<ArrayRef> {
-    Ok(match column_name {
-        "entity_pk" => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| {
-                    row.entity_pk
-                        .as_json_array_text()
-                        .map(Some)
-                        .map_err(lix_error_to_datafusion_error)
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
-        "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
-        "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
-        "snapshot_content" => string_array(rows.iter().map(|row| row.snapshot_content.as_deref())),
-        "metadata" => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
-        "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
-        "global" => Arc::new(BooleanArray::from(
-            rows.iter().map(|row| row.global).collect::<Vec<_>>(),
-        )) as ArrayRef,
-        "change_id" => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.change_id.map(|id| id.to_string()))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        "commit_id" => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.commit_id.map(|id| id.to_string()))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        "untracked" => Arc::new(BooleanArray::from(
-            rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
-        )) as ArrayRef,
-        "branch_id" => string_array(rows.iter().map(|row| Some(row.branch_id.as_str()))),
-        other => {
-            return Err(DataFusionError::Execution(format!(
-                "sql2 entity provider does not support system column 'lixcol_{other}'"
-            )));
+    let col = LIVE_STATE_COLS.col(column_name).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "sql2 entity provider does not support system column 'lixcol_{column_name}'"
+        ))
+    })?;
+    build_array(col, rows).map_err(entity_system_column_error)
+}
+
+/// Map [`ColumnTableError`] onto entity's existing error surface. Only the
+/// `Row` variant is reachable from [`entity_system_column_array`] (the column
+/// lookup happens before the build); the rest are mapped for completeness.
+fn entity_system_column_error(error: ColumnTableError) -> DataFusionError {
+    match error {
+        ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+        ColumnTableError::UnsupportedColumn(other) => DataFusionError::Execution(format!(
+            "sql2 entity provider does not support system column 'lixcol_{other}'"
+        )),
+        ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => {
+            DataFusionError::from(error)
         }
-    })
+    }
 }
 
 pub(super) fn parse_snapshot(snapshot_content: Option<&str>) -> Result<Option<JsonValue>> {
@@ -1338,29 +1178,6 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
     })
 }
 
-#[expect(trivial_casts)]
-pub(super) fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    let values = values
-        .map(|value| value.map(ToOwned::to_owned))
-        .collect::<Vec<_>>();
-    Arc::new(StringArray::from(values)) as ArrayRef
-}
-
-fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
-    let Some(projection) = projection else {
-        return Ok(Arc::clone(schema));
-    };
-    Ok(Arc::new(schema.project(projection)?))
-}
-
-fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    crate::sql2::error::datafusion_error_to_lix_error(error)
-}
-
-fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::External(Box::new(error))
-}
-
 #[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
@@ -1368,15 +1185,16 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::catalog::TableProvider;
     use datafusion::common::{Column, ScalarValue};
-    use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-    use datafusion::prelude::SessionContext;
     use serde_json::json;
 
+    use super::super::spec::SpecTableProvider;
     use super::entity_record_batch;
     use crate::LixError;
+    use crate::sql2::WriteAccess;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::live_state::{
@@ -1420,6 +1238,99 @@ mod tests {
 
     fn empty_branch_ref() -> Arc<dyn BranchRefReader> {
         Arc::new(EmptyBranchRefReader)
+    }
+
+    #[derive(Default)]
+    struct DummyWriteContext;
+
+    #[async_trait]
+    impl crate::sql2::SqlWriteExecutionContext for DummyWriteContext {
+        #[expect(clippy::unnecessary_literal_bound)]
+        fn active_branch_id(&self) -> &str {
+            "branch-a"
+        }
+
+        fn functions(&self) -> crate::functions::FunctionProviderHandle {
+            crate::functions::FunctionProviderHandle::system()
+        }
+
+        fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_bytes_many(
+            &mut self,
+            hashes: &[crate::binary_cas::BlobHash],
+        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
+        }
+
+        async fn scan_live_state(
+            &mut self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<CommitId>, LixError> {
+            Ok(Some(CommitId::for_test_label(&format!(
+                "commit-{branch_id}"
+            ))))
+        }
+
+        async fn stage_write(
+            &mut self,
+            _write: crate::transaction::types::TransactionWrite,
+        ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
+            panic!("raw DataFusion entity INSERT must never stage writes");
+        }
+    }
+
+    // Guards the plan-time phase of the entity INSERT rejection: validate-only
+    // flows rely on `insert_into` failing before the input plan executes, and
+    // an exec-time rejection would let empty-branch-scope statements
+    // short-circuit into a silent 0-row success.
+    #[tokio::test]
+    async fn insert_into_rejects_raw_datafusion_inserts_at_plan_time() {
+        let session = datafusion::prelude::SessionContext::new();
+        let mut write_context = DummyWriteContext;
+        let write_ctx = crate::sql2::SqlWriteContext::new(&mut write_context);
+        let provider = SpecTableProvider::new(
+            Arc::new(super::EntitySpec::active_with_write(
+                entity_insert_spec_with_primary_key(),
+                write_ctx.clone(),
+            )),
+            WriteAccess::write(write_ctx),
+        );
+        let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            provider.schema(),
+        )) as Arc<dyn datafusion::physical_plan::ExecutionPlan>;
+
+        let error = provider
+            .insert_into(
+                &session.state(),
+                input,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect_err("raw DataFusion INSERT must be rejected at plan time");
+
+        assert!(
+            matches!(error, datafusion::common::DataFusionError::NotImplemented(_)),
+            "rejection should keep the NotImplemented error type: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline"),
+            "unexpected error: {error}"
+        );
     }
 
     fn live_row() -> MaterializedLiveStateRow {
@@ -1707,13 +1618,21 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let provider = super::EntityProvider::by_branch(
-            spec,
-            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
-            empty_branch_ref(),
+        let provider = SpecTableProvider::new(
+            Arc::new(super::EntitySpec::by_branch(
+                spec,
+                Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+                empty_branch_ref(),
+            )),
+            WriteAccess::read_only(),
         );
 
-        assert!(provider.schema.field_with_name("lixcol_branch_id").is_ok());
+        assert!(
+            provider
+                .schema()
+                .field_with_name("lixcol_branch_id")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1795,44 +1714,34 @@ mod tests {
     #[tokio::test]
     async fn payload_filter_scan_forces_snapshot_and_removes_pushed_limit() {
         let spec = filter_pushdown_spec();
-        let provider = super::EntityProvider::by_branch(
+        let provider = super::EntitySpec::by_branch(
             Arc::clone(&spec),
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             empty_branch_ref(),
         );
-        let ctx = SessionContext::new();
         let entity_pk_index = provider
             .schema
             .index_of("lixcol_entity_pk")
             .expect("system entity-pk column should exist");
         let projection = vec![entity_pk_index];
 
-        let plan = provider
-            .scan(
-                &ctx.state(),
-                Some(&projection),
-                &[eq_filter("kind", "todo")],
-                Some(5),
-            )
+        let (_schema, request, row_filters) = provider
+            .plan_scan_parts(Some(&projection), &[eq_filter("kind", "todo")], Some(5))
             .await
             .expect("scan should plan");
-        let exec = plan
-            .as_any()
-            .downcast_ref::<super::EntityScanExec>()
-            .expect("entity provider should produce EntityScanExec");
 
-        assert_eq!(exec.request.limit, None);
+        assert_eq!(request.limit, None);
         assert!(
-            exec.request
+            request
                 .projection
                 .columns
                 .iter()
                 .any(|column| column == "snapshot_content"),
             "filter-only payload column should force snapshot_content projection: {:?}",
-            exec.request.projection.columns
+            request.projection.columns
         );
         assert_eq!(
-            exec.row_filters,
+            row_filters,
             vec![super::EntityRowFilter::ColumnEq {
                 column: "kind".to_string(),
                 column_type: EntityColumnType::String,
@@ -1844,12 +1753,11 @@ mod tests {
     #[tokio::test]
     async fn unsupported_payload_filter_keeps_limit_and_no_snapshot_projection() {
         let spec = filter_pushdown_spec();
-        let provider = super::EntityProvider::by_branch(
+        let provider = super::EntitySpec::by_branch(
             Arc::clone(&spec),
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             empty_branch_ref(),
         );
-        let ctx = SessionContext::new();
         let entity_pk_index = provider
             .schema
             .index_of("lixcol_entity_pk")
@@ -1861,27 +1769,22 @@ mod tests {
             Box::new(Expr::Literal(ScalarValue::Float64(Some(5.0)), None)),
         ));
 
-        let plan = provider
-            .scan(&ctx.state(), Some(&projection), &[range_filter], Some(5))
+        let (_schema, request, row_filters) = provider
+            .plan_scan_parts(Some(&projection), &[range_filter], Some(5))
             .await
             .expect("scan should plan");
-        let exec = plan
-            .as_any()
-            .downcast_ref::<super::EntityScanExec>()
-            .expect("entity provider should produce EntityScanExec");
 
-        assert_eq!(exec.request.limit, Some(5));
+        assert_eq!(request.limit, Some(5));
         assert!(
-            !exec
-                .request
+            !request
                 .projection
                 .columns
                 .iter()
                 .any(|column| column == "snapshot_content"),
             "unsupported payload filter should remain residual and not change projection: {:?}",
-            exec.request.projection.columns
+            request.projection.columns
         );
-        assert!(exec.row_filters.is_empty());
+        assert!(row_filters.is_empty());
     }
 
     #[test]

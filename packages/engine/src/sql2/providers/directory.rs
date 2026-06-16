@@ -6,31 +6,19 @@
     clippy::unnecessary_wraps
 )]
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, RecordBatchOptions, StringArray, UInt64Array,
-};
-use datafusion::arrow::compute::{and, filter_record_batch};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatchOptions, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, SchemaExt, not_impl_err};
-use datafusion::datasource::TableType;
-use datafusion::execution::TaskContext;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-};
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::prelude::SessionContext;
-use futures_util::{TryStreamExt, stream};
+use futures_util::FutureExt;
 use serde::Deserialize;
 
 use crate::branch::BranchRefReader;
@@ -44,7 +32,6 @@ use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,
 };
-use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
@@ -69,6 +56,11 @@ use crate::sql2::{
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
+use super::spec::{
+    PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema, row_source,
+    register_spec_table,
+};
+
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 pub(super) async fn register_lix_directory_active_provider(
@@ -79,18 +71,17 @@ pub(super) async fn register_lix_directory_active_provider(
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixDirectoryProvider::active_branch(
-                active_branch_id,
-                live_state,
-                branch_ref,
-                functions,
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixDirectorySpec::active_branch(
+            active_branch_id,
+            live_state,
+            branch_ref,
+            functions,
+        )),
+        WriteAccess::read_only(),
+    )
 }
 
 pub(super) async fn register_lix_directory_by_branch_provider(
@@ -100,15 +91,12 @@ pub(super) async fn register_lix_directory_by_branch_provider(
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixDirectoryProvider::by_branch(
-                live_state, branch_ref, functions,
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixDirectorySpec::by_branch(live_state, branch_ref, functions)),
+        WriteAccess::read_only(),
+    )
 }
 
 pub(super) async fn register_by_branch_write_provider(
@@ -116,13 +104,15 @@ pub(super) async fn register_by_branch_write_provider(
     surface_name: &str,
     write_ctx: SqlWriteContext,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixDirectoryProvider::by_branch_with_write(write_ctx)),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    let functions = write_ctx.functions();
+    let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixDirectorySpec::by_branch(live_state, branch_ref, functions)),
+        WriteAccess::write(write_ctx),
+    )
 }
 
 pub(super) async fn register_active_write_provider(
@@ -130,31 +120,32 @@ pub(super) async fn register_active_write_provider(
     surface_name: &str,
     write_ctx: SqlWriteContext,
 ) -> Result<(), LixError> {
-    session
-        .register_table(
-            surface_name,
-            Arc::new(LixDirectoryProvider::active_branch_with_write(write_ctx)),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(())
+    let active_branch_id = write_ctx.active_branch_id();
+    let functions = write_ctx.functions();
+    let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+    register_spec_table(
+        session,
+        surface_name,
+        Arc::new(LixDirectorySpec::active_branch(
+            active_branch_id,
+            live_state,
+            branch_ref,
+            functions,
+        )),
+        WriteAccess::write(write_ctx),
+    )
 }
 
-pub(crate) struct LixDirectoryProvider {
+struct LixDirectorySpec {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    write_access: WriteAccess,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
 }
 
-impl std::fmt::Debug for LixDirectoryProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixDirectoryProvider").finish()
-    }
-}
-
-impl LixDirectoryProvider {
+impl LixDirectorySpec {
     fn active_branch(
         active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
@@ -165,22 +156,6 @@ impl LixDirectoryProvider {
             schema: lix_directory_schema(),
             live_state,
             branch_ref,
-            write_access: WriteAccess::read_only(),
-            functions,
-            branch_binding: BranchBinding::active(active_branch_id),
-        }
-    }
-
-    fn active_branch_with_write(write_ctx: SqlWriteContext) -> Self {
-        let active_branch_id = write_ctx.active_branch_id();
-        let functions = write_ctx.functions();
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
-        Self {
-            schema: lix_directory_schema(),
-            live_state,
-            branch_ref,
-            write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
         }
@@ -195,63 +170,79 @@ impl LixDirectoryProvider {
             schema: lix_directory_by_branch_schema(),
             live_state,
             branch_ref,
-            write_access: WriteAccess::read_only(),
             functions,
             branch_binding: BranchBinding::explicit(),
         }
     }
 
-    fn by_branch_with_write(write_ctx: SqlWriteContext) -> Self {
-        let functions = write_ctx.functions();
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
-        Self {
-            schema: lix_directory_by_branch_schema(),
-            live_state,
-            branch_ref,
-            write_access: WriteAccess::write(write_ctx),
-            functions,
-            branch_binding: BranchBinding::explicit(),
-        }
+    /// Resolve the candidate-row scan request for an UPDATE/DELETE, scoped by
+    /// the explicit branch ids from the statement filters.
+    async fn dml_scan_request(&self, filters: &[Expr]) -> Result<LiveStateScanRequest> {
+        let mut request =
+            lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
+        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+        Ok(request)
+    }
+
+    /// Unprojected candidate-row source for UPDATE/DELETE. The full source
+    /// batch is stashed into `captured` so DELETE's plugin-storage rejection
+    /// can inspect every directory path, not just the filter-matched rows.
+    fn dml_source(
+        &self,
+        write_ctx: &SqlWriteContext,
+        request: LiveStateScanRequest,
+        captured: Arc<Mutex<Option<RecordBatch>>>,
+    ) -> RowSource {
+        row_source(
+            (write_ctx.clone(), request, Arc::clone(&self.schema), captured),
+            |(write_ctx, request, table_schema, captured)| async move {
+                let rows = write_ctx
+                    .scan_live_state(&request)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                let source_batch = lix_directory_record_batch(&table_schema, rows)
+                    .map_err(lix_error_to_datafusion_error)?;
+                *captured.lock().expect("dml source mutex poisoned") =
+                    Some(source_batch.clone());
+                Ok(source_batch)
+            },
+        )
     }
 }
 
 #[async_trait]
-impl TableProvider for LixDirectoryProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TableSpec for LixDirectorySpec {
+    fn table_name(&self) -> &str {
+        "lix_directory"
     }
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
+    fn filter_pushdown(&self, _filter: &Expr) -> TableProviderFilterPushDown {
+        TableProviderFilterPushDown::Exact
     }
 
-    fn supports_filters_pushdown(
+    async fn plan_scan(
         &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|_| TableProviderFilterPushDown::Exact)
-            .collect())
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let projected_schema = projected_schema(&self.schema, projection)?;
+        props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
+        let output_schema = projected_schema(&self.schema, projection);
         let scan_limit = if filters.is_empty() { limit } else { None };
         let mut request = lix_directory_scan_request(
             self.branch_binding.active_branch_id(),
-            Some(projected_schema.as_ref()),
+            Some(output_schema.as_ref()),
             scan_limit,
         );
         request.filter.branch_ids = resolve_provider_branch_ids(
@@ -266,168 +257,59 @@ impl TableProvider for LixDirectoryProvider {
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, _state.execution_props()))
+            .map(|expr| create_physical_expr(expr, &df_schema, props))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(LixDirectoryScanExec::new(
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.schema),
-            projected_schema,
-            projection.cloned(),
-            request,
-            physical_filters,
-            limit,
-        )))
+
+        Ok(PlannedScan {
+            schema: Arc::clone(&output_schema),
+            load: row_source(
+                (
+                    Arc::clone(&self.live_state),
+                    Arc::clone(&self.schema),
+                    output_schema,
+                    projection.cloned(),
+                    request,
+                    physical_filters,
+                    limit,
+                ),
+                |(
+                    live_state,
+                    batch_schema,
+                    _output_schema,
+                    projection,
+                    request,
+                    physical_filters,
+                    limit,
+                )| async move {
+                    let rows = live_state.scan_rows(&request).await.map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_directory scan failed: {error}"
+                        ))
+                    })?;
+                    let batch =
+                        lix_directory_record_batch(&batch_schema, rows).map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "sql2 lix_directory batch build failed: {error}"
+                            ))
+                        })?;
+                    finish_scan_batch(
+                        batch,
+                        &physical_filters,
+                        projection.as_deref(),
+                        limit,
+                        "lix_directory",
+                    )
+                },
+            ),
+        })
     }
 
-    async fn insert_into(
+    async fn stage_insert(
         &self,
-        _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for lix_directory yet");
-        }
-        let write_ctx = self
-            .write_access
-            .require_write("INSERT into lix_directory")?;
-        self.schema
-            .logically_equivalent_names_and_types(&input.schema())?;
-        let sink = LixDirectoryInsertSink::new(
-            write_ctx,
-            self.functions.clone(),
-            self.branch_binding.clone(),
-        );
-        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self
-            .write_access
-            .require_write("DELETE FROM lix_directory")?;
-        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut request =
-            lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
-        request.filter.branch_ids = resolve_provider_branch_ids(
-            self.branch_ref.as_ref(),
-            &self.branch_binding,
-            request.filter.branch_ids,
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
-        Ok(Arc::new(LixDirectoryDeleteExec::new(
-            write_ctx,
-            Arc::clone(&self.schema),
-            self.branch_binding.clone(),
-            request,
-            physical_filters,
-        )))
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("UPDATE lix_directory")?;
-        validate_lix_directory_update_assignments(&self.schema, &assignments)?;
-        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut request =
-            lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
-        request.filter.branch_ids = resolve_provider_branch_ids(
-            self.branch_ref.as_ref(),
-            &self.branch_binding,
-            request.filter.branch_ids,
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
-        Ok(Arc::new(LixDirectoryUpdateExec::new(
-            write_ctx,
-            Arc::clone(&self.schema),
-            self.branch_binding.clone(),
-            self.functions.clone(),
-            request,
-            physical_assignments,
-            physical_filters,
-        )))
-    }
-}
-
-struct LixDirectoryInsertSink {
-    write_ctx: SqlWriteContext,
-    functions: FunctionProviderHandle,
-    branch_binding: BranchBinding,
-    surface_name: &'static str,
-}
-
-impl std::fmt::Debug for LixDirectoryInsertSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixDirectoryInsertSink").finish()
-    }
-}
-
-impl LixDirectoryInsertSink {
-    fn new(
-        write_ctx: SqlWriteContext,
-        functions: FunctionProviderHandle,
-        branch_binding: BranchBinding,
-    ) -> Self {
-        let surface_name = lix_directory_surface_name(&branch_binding);
-        Self {
-            write_ctx,
-            functions,
-            branch_binding,
-            surface_name,
-        }
-    }
-}
-
-impl DisplayAs for LixDirectoryInsertSink {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixDirectoryInsertSink")
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixDirectoryInsertSink"),
-        }
-    }
-}
-
-#[async_trait]
-impl InsertSink for LixDirectoryInsertSink {
-    async fn write_batches(
-        &self,
+        write_ctx: &SqlWriteContext,
         batches: Vec<RecordBatch>,
-        _context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        let surface_name = lix_directory_surface_name(&self.branch_binding);
         let mut path_resolvers = None;
         let mut rows = Vec::new();
         let mut count = 0_u64;
@@ -435,7 +317,7 @@ impl InsertSink for LixDirectoryInsertSink {
             if path_resolvers.is_none() {
                 path_resolvers = Some(
                     directory_path_resolvers_from_live_state(
-                        Arc::new(WriteContextLiveStateReader::new(self.write_ctx.clone())),
+                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
                         self.branch_binding.active_branch_id(),
                     )
                     .await
@@ -453,7 +335,7 @@ impl InsertSink for LixDirectoryInsertSink {
                 rows.extend(lix_directory_write_rows_from_batch_with_path_resolvers(
                     &batch,
                     self.branch_binding.active_branch_id(),
-                    self.surface_name,
+                    surface_name,
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
@@ -464,7 +346,7 @@ impl InsertSink for LixDirectoryInsertSink {
                     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                         &batch,
                         self.branch_binding.active_branch_id(),
-                        self.surface_name,
+                        surface_name,
                         true,
                         path_resolvers.as_mut(),
                         None,
@@ -473,7 +355,7 @@ impl InsertSink for LixDirectoryInsertSink {
             }
         }
 
-        self.write_ctx
+        write_ctx
             .stage_write(TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows,
@@ -483,459 +365,141 @@ impl InsertSink for LixDirectoryInsertSink {
 
         Ok(count)
     }
+
+    fn validate_update_assignments(&self, assignments: &[(String, Expr)]) -> Result<()> {
+        validate_lix_directory_update_assignments(&self.schema, assignments)
+    }
+
+    fn prepare_write_filters(&self, filters: Vec<Expr>) -> Result<Vec<Expr>> {
+        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
+        Ok(filters)
+    }
+
+    async fn plan_delete(
+        &self,
+        write_ctx: SqlWriteContext,
+        filters: &[Expr],
+    ) -> Result<PlannedDml> {
+        let request = self.dml_scan_request(filters).await?;
+        let captured: Arc<Mutex<Option<RecordBatch>>> = Arc::new(Mutex::new(None));
+        let branch_binding = self.branch_binding.clone();
+        Ok(PlannedDml {
+            source: self.dml_source(&write_ctx, request, Arc::clone(&captured)),
+            apply: Arc::new(move |matched_batch| {
+                let write_ctx = write_ctx.clone();
+                let branch_binding = branch_binding.clone();
+                let captured = Arc::clone(&captured);
+                async move {
+                    let source_batch = captured
+                        .lock()
+                        .expect("dml source mutex poisoned")
+                        .clone()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "lix_directory DELETE source batch missing".to_string(),
+                            )
+                        })?;
+                    reject_lix_directory_delete_plugin_storage_paths(&matched_batch, &source_batch)
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let branch_ids = directory_branch_ids_from_batch(
+                        &matched_batch,
+                        branch_binding.active_branch_id(),
+                    )?;
+                    let mut visible_filesystems = BTreeMap::new();
+                    for branch_id in branch_ids {
+                        visible_filesystems.insert(
+                            branch_id.clone(),
+                            VisibleFilesystem::load(
+                                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                                &branch_id,
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                        );
+                    }
+                    let (write_rows, count) = lix_directory_recursive_delete_rows_from_batch(
+                        &matched_batch,
+                        branch_binding.active_branch_id(),
+                        &visible_filesystems,
+                    )?;
+
+                    if count > 0 {
+                        write_ctx
+                            .stage_write(TransactionWrite::Rows {
+                                mode: TransactionWriteMode::Replace,
+                                rows: write_rows,
+                            })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+
+                    Ok(count)
+                }
+                .boxed()
+            }),
+        })
+    }
+
+    async fn plan_update(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+    ) -> Result<PlannedDml> {
+        let request = self.dml_scan_request(filters).await?;
+        let captured: Arc<Mutex<Option<RecordBatch>>> = Arc::new(Mutex::new(None));
+        let branch_binding = self.branch_binding.clone();
+        let functions = self.functions.clone();
+        Ok(PlannedDml {
+            source: self.dml_source(&write_ctx, request, captured),
+            apply: Arc::new(move |matched_batch| {
+                let write_ctx = write_ctx.clone();
+                let branch_binding = branch_binding.clone();
+                let functions = functions.clone();
+                let assignments = assignments.clone();
+                async move {
+                    let mut path_resolvers = directory_path_resolvers_from_live_state(
+                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                        branch_binding.active_branch_id(),
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    let write_rows = lix_directory_update_write_rows_from_batch(
+                        &matched_batch,
+                        &assignments,
+                        branch_binding.active_branch_id(),
+                        &mut path_resolvers,
+                        &mut || functions.call_uuid_v7().to_string(),
+                    )?;
+                    let count = u64::try_from(write_rows.len()).map_err(|_| {
+                        DataFusionError::Execution(
+                            "lix_directory UPDATE row count overflow".into(),
+                        )
+                    })?;
+
+                    if count > 0 {
+                        write_ctx
+                            .stage_write(TransactionWrite::Rows {
+                                mode: TransactionWriteMode::Replace,
+                                rows: write_rows,
+                            })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+
+                    Ok(count)
+                }
+                .boxed()
+            }),
+        })
+    }
 }
 
 fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
     match branch_binding {
         BranchBinding::Active { .. } => "lix_directory",
         BranchBinding::Explicit => "lix_directory_by_branch",
-    }
-}
-
-struct LixDirectoryDeleteExec {
-    write_ctx: SqlWriteContext,
-    table_schema: SchemaRef,
-    branch_binding: BranchBinding,
-    request: LiveStateScanRequest,
-    filters: Vec<Arc<dyn PhysicalExpr>>,
-    result_schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for LixDirectoryDeleteExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixDirectoryDeleteExec").finish()
-    }
-}
-
-impl LixDirectoryDeleteExec {
-    fn new(
-        write_ctx: SqlWriteContext,
-        table_schema: SchemaRef,
-        branch_binding: BranchBinding,
-        request: LiveStateScanRequest,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> Self {
-        let result_schema = dml_count_schema();
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&result_schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        );
-        Self {
-            write_ctx,
-            table_schema,
-            branch_binding,
-            request,
-            filters,
-            result_schema,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixDirectoryDeleteExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixDirectoryDeleteExec(filters={})", self.filters.len())
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixDirectoryDeleteExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixDirectoryDeleteExec {
-    fn name(&self) -> &'static str {
-        "LixDirectoryDeleteExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixDirectoryDeleteExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixDirectoryDeleteExec only exposes one partition, got {partition}"
-            )));
-        }
-        let write_ctx = self.write_ctx.clone();
-        let table_schema = Arc::clone(&self.table_schema);
-        let branch_binding = self.branch_binding.clone();
-        let request = self.request.clone();
-        let filters = self.filters.clone();
-        let result_schema = Arc::clone(&self.result_schema);
-        let stream_schema = Arc::clone(&result_schema);
-
-        let stream = stream::once(async move {
-            let rows = write_ctx
-                .scan_live_state(&request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_directory_record_batch(&table_schema, rows)
-                .map_err(lix_error_to_datafusion_error)?;
-            let matched_batch = filter_lix_directory_batch(source_batch.clone(), &filters)?;
-            reject_lix_directory_delete_plugin_storage_paths(&matched_batch, &source_batch)
-                .map_err(lix_error_to_datafusion_error)?;
-            let branch_ids =
-                directory_branch_ids_from_batch(&matched_batch, branch_binding.active_branch_id())?;
-            let mut visible_filesystems = BTreeMap::new();
-            for branch_id in branch_ids {
-                visible_filesystems.insert(
-                    branch_id.clone(),
-                    VisibleFilesystem::load(
-                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                        &branch_id,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?,
-                );
-            }
-            let (write_rows, count) = lix_directory_recursive_delete_rows_from_batch(
-                &matched_batch,
-                branch_binding.active_branch_id(),
-                &visible_filesystems,
-            )?;
-
-            if count > 0 {
-                write_ctx
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Replace,
-                        rows: write_rows,
-                    })
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-            }
-
-            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
-                dml_count_batch(Arc::clone(&stream_schema), count)?,
-            )]))
-        })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            result_schema,
-            stream,
-        )))
-    }
-}
-
-struct LixDirectoryUpdateExec {
-    write_ctx: SqlWriteContext,
-    table_schema: SchemaRef,
-    branch_binding: BranchBinding,
-    functions: FunctionProviderHandle,
-    request: LiveStateScanRequest,
-    assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
-    filters: Vec<Arc<dyn PhysicalExpr>>,
-    result_schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for LixDirectoryUpdateExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixDirectoryUpdateExec").finish()
-    }
-}
-
-impl LixDirectoryUpdateExec {
-    fn new(
-        write_ctx: SqlWriteContext,
-        table_schema: SchemaRef,
-        branch_binding: BranchBinding,
-        functions: FunctionProviderHandle,
-        request: LiveStateScanRequest,
-        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> Self {
-        let result_schema = dml_count_schema();
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&result_schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        );
-        Self {
-            write_ctx,
-            table_schema,
-            branch_binding,
-            functions,
-            request,
-            assignments,
-            filters,
-            result_schema,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixDirectoryUpdateExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "LixDirectoryUpdateExec(assignments={}, filters={})",
-                    self.assignments.len(),
-                    self.filters.len()
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixDirectoryUpdateExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixDirectoryUpdateExec {
-    fn name(&self) -> &'static str {
-        "LixDirectoryUpdateExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixDirectoryUpdateExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixDirectoryUpdateExec only exposes one partition, got {partition}"
-            )));
-        }
-        let write_ctx = self.write_ctx.clone();
-        let table_schema = Arc::clone(&self.table_schema);
-        let branch_binding = self.branch_binding.clone();
-        let functions = self.functions.clone();
-        let request = self.request.clone();
-        let assignments = self.assignments.clone();
-        let filters = self.filters.clone();
-        let result_schema = Arc::clone(&self.result_schema);
-        let stream_schema = Arc::clone(&result_schema);
-
-        let stream = stream::once(async move {
-            let rows = write_ctx
-                .scan_live_state(&request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_directory_record_batch(&table_schema, rows)
-                .map_err(lix_error_to_datafusion_error)?;
-            let matched_batch = filter_lix_directory_batch(source_batch, &filters)?;
-            let mut path_resolvers = directory_path_resolvers_from_live_state(
-                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                branch_binding.active_branch_id(),
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-            let write_rows = lix_directory_update_write_rows_from_batch(
-                &matched_batch,
-                &assignments,
-                branch_binding.active_branch_id(),
-                &mut path_resolvers,
-                &mut || functions.call_uuid_v7().to_string(),
-            )?;
-            let count = u64::try_from(write_rows.len()).map_err(|_| {
-                DataFusionError::Execution("lix_directory UPDATE row count overflow".into())
-            })?;
-
-            if count > 0 {
-                write_ctx
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Replace,
-                        rows: write_rows,
-                    })
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-            }
-
-            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
-                dml_count_batch(Arc::clone(&stream_schema), count)?,
-            )]))
-        })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            result_schema,
-            stream,
-        )))
-    }
-}
-
-struct LixDirectoryScanExec {
-    live_state: Arc<dyn LiveStateReader>,
-    batch_schema: SchemaRef,
-    output_schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    request: LiveStateScanRequest,
-    filters: Vec<Arc<dyn PhysicalExpr>>,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for LixDirectoryScanExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixDirectoryScanExec").finish()
-    }
-}
-
-impl LixDirectoryScanExec {
-    fn new(
-        live_state: Arc<dyn LiveStateReader>,
-        batch_schema: SchemaRef,
-        output_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        request: LiveStateScanRequest,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&output_schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            live_state,
-            batch_schema,
-            output_schema,
-            projection,
-            request,
-            filters,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixDirectoryScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixDirectoryScanExec(limit={:?})", self.limit)
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixDirectoryScanExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixDirectoryScanExec {
-    fn name(&self) -> &'static str {
-        "LixDirectoryScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixDirectoryScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixDirectoryScanExec only supports partition 0, got {partition}"
-            )));
-        }
-
-        let live_state = Arc::clone(&self.live_state);
-        let request = self.request.clone();
-        let filters = self.filters.clone();
-        let limit = self.limit;
-        let output_schema = Arc::clone(&self.output_schema);
-        let batch_schema = Arc::clone(&self.batch_schema);
-        let projection = self.projection.clone();
-        let fut = async move {
-            let rows = live_state.scan_rows(&request).await.map_err(|error| {
-                DataFusionError::Execution(format!("sql2 lix_directory scan failed: {error}"))
-            })?;
-            let batch = lix_directory_record_batch(&batch_schema, rows).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_directory batch build failed: {error}"
-                ))
-            })?;
-            let filtered = filter_lix_directory_batch(batch, &filters)?;
-            let projected = match projection {
-                Some(indices) => filtered.project(&indices).map_err(DataFusionError::from),
-                None => Ok(filtered),
-            }?;
-            match limit {
-                Some(limit) => Ok(projected.slice(0, limit.min(projected.num_rows()))),
-                None => Ok(projected),
-            }
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            output_schema,
-            stream::once(fut).map_ok(|batch| batch),
-        )))
     }
 }
 
@@ -1525,21 +1089,6 @@ fn lix_directory_record_batch(
     })
 }
 
-fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
-    let fields = match projection {
-        Some(indices) => indices
-            .iter()
-            .map(|index| base_schema.field(*index).as_ref().clone())
-            .collect::<Vec<_>>(),
-        None => base_schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>(),
-    };
-    Ok(Arc::new(Schema::new(fields)))
-}
-
 fn lix_directory_scan_request(
     branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
@@ -1602,63 +1151,6 @@ fn validate_lix_directory_update_assignments(
         }
     }
     Ok(())
-}
-
-fn filter_lix_directory_batch(
-    batch: RecordBatch,
-    filters: &[Arc<dyn PhysicalExpr>],
-) -> Result<RecordBatch> {
-    let Some(mask) = evaluate_lix_directory_filters(&batch, filters)? else {
-        return Ok(batch);
-    };
-    Ok(filter_record_batch(&batch, &mask)?)
-}
-
-fn evaluate_lix_directory_filters(
-    batch: &RecordBatch,
-    filters: &[Arc<dyn PhysicalExpr>],
-) -> Result<Option<BooleanArray>> {
-    if filters.is_empty() {
-        return Ok(None);
-    }
-
-    let mut combined_mask: Option<BooleanArray> = None;
-    for filter in filters {
-        let result = filter.evaluate(batch)?;
-        let array = result.into_array(batch.num_rows())?;
-        let bool_array = array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Execution("lix_directory filter was not boolean".to_string())
-            })?;
-        let normalized = bool_array
-            .iter()
-            .map(|value| Some(value == Some(true)))
-            .collect::<BooleanArray>();
-        combined_mask = Some(match combined_mask {
-            Some(existing) => and(&existing, &normalized)?,
-            None => normalized,
-        });
-    }
-    Ok(combined_mask)
-}
-
-fn dml_count_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "count",
-        DataType::UInt64,
-        false,
-    )]))
-}
-
-#[expect(trivial_casts)]
-fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
-    RecordBatch::try_new(
-        schema,
-        vec![Arc::new(UInt64Array::from(vec![count])) as ArrayRef],
-    )
-    .map_err(DataFusionError::from)
 }
 
 fn record_batch_has_non_null_column(batch: &RecordBatch, column_name: &str) -> Result<bool> {
@@ -1856,10 +1348,6 @@ pub(super) fn lix_directory_by_branch_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    crate::sql2::error::datafusion_error_to_lix_error(error)
-}
-
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
 }
@@ -1874,7 +1362,6 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::execution::TaskContext;
     use serde_json::json;
 
     use crate::LixError;
@@ -1882,17 +1369,18 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
-    use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
         TransactionWriteRow,
     };
 
+    use super::super::spec::{SpecTableProvider, TableSpec};
     use super::{
-        BranchBinding, DirectoryDescriptorRecord, LixDirectoryInsertSink, derive_directory_paths,
-        lix_directory_by_branch_schema, lix_directory_insert_origin, lix_directory_record_batch,
-        lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
+        BranchBinding, DirectoryDescriptorRecord, LixDirectorySpec, WriteAccess,
+        derive_directory_paths, lix_directory_by_branch_schema, lix_directory_insert_origin,
+        lix_directory_record_batch, lix_directory_recursive_delete_rows_from_batch,
+        lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
     use crate::filesystem::{
@@ -1906,6 +1394,31 @@ mod tests {
 
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
+    }
+
+    /// Stage a single INSERT batch through the directory spec, exercising the
+    /// same `stage_insert` path the writable provider uses.
+    async fn stage_directory_insert(
+        write_ctx: SqlWriteContext,
+        branch_binding: BranchBinding,
+        batch: RecordBatch,
+    ) -> Result<u64, datafusion::common::DataFusionError> {
+        let live_state =
+            Arc::new(crate::sql2::WriteContextLiveStateReader::new(write_ctx.clone()));
+        let branch_ref =
+            Arc::new(crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()));
+        let spec = match branch_binding {
+            BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
+                write_ctx.active_branch_id(),
+                live_state,
+                branch_ref,
+                test_functions(),
+            ),
+            BranchBinding::Explicit => {
+                LixDirectorySpec::by_branch(live_state, branch_ref, test_functions())
+            }
+        };
+        spec.stage_insert(&write_ctx, vec![batch]).await
     }
 
     #[derive(Default)]
@@ -2351,12 +1864,9 @@ mod tests {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_insert_batch(true, false);
-        let sink =
-            LixDirectoryInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit());
-        let count = sink
-            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
+        let count = stage_directory_insert(write_ctx, BranchBinding::explicit(), batch)
             .await
-            .expect("directory sink should stage write");
+            .expect("directory spec should stage write");
 
         assert_eq!(count, 1);
         assert_eq!(
@@ -2401,12 +1911,9 @@ mod tests {
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_path_insert_batch("/docs/nested/");
-        let sink =
-            LixDirectoryInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit());
-        let count = sink
-            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
+        let count = stage_directory_insert(write_ctx, BranchBinding::explicit(), batch)
             .await
-            .expect("directory sink should stage path write");
+            .expect("directory spec should stage path write");
 
         assert_eq!(count, 1);
         let [TransactionWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
@@ -2417,5 +1924,25 @@ mod tests {
         assert_eq!(snapshot["id"], "dir-nested");
         assert_eq!(snapshot["parent_id"], "dir-docs");
         assert_eq!(snapshot["name"], "nested");
+    }
+
+    #[test]
+    fn directory_provider_is_writable_when_given_write_access() {
+        let mut write_context = CapturingWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let live_state =
+            Arc::new(crate::sql2::WriteContextLiveStateReader::new(write_ctx.clone()));
+        let branch_ref =
+            Arc::new(crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()));
+        let provider = SpecTableProvider::new(
+            Arc::new(LixDirectorySpec::active_branch(
+                write_ctx.active_branch_id(),
+                live_state,
+                branch_ref,
+                test_functions(),
+            )),
+            WriteAccess::write(write_ctx),
+        );
+        assert!(provider.is_write());
     }
 }
