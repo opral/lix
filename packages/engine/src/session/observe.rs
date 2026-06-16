@@ -62,10 +62,6 @@ where
             self.closed = true;
             return Ok(None);
         }
-        self.session
-            .observe_invalidation
-            .ensure_external_watcher(self.session.storage.clone())?;
-
         if self.last_rows.is_none() {
             let Some((mutation_sequence, rows)) = self.evaluate_stable_snapshot().await? else {
                 return Ok(None);
@@ -124,6 +120,9 @@ where
     async fn evaluate_stable_snapshot(&mut self) -> Result<Option<(u64, ExecuteResult)>, LixError> {
         loop {
             let operation_guard = self.session.begin_session_operation()?;
+            self.session
+                .observe_invalidation
+                .ensure_external_watcher(self.session.storage.clone())?;
             let before = *self.receiver.borrow_and_update();
             let rows = self.execute_or_share(before).await;
             drop(operation_guard);

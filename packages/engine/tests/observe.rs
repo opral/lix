@@ -1,8 +1,9 @@
 mod support;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use lix_engine::{
     Backend, BackendError, BackendRead, Engine, GetOptions, InMemoryBackend, InMemoryRead,
@@ -87,6 +88,67 @@ simulation_test!(observe_next_returns_initial_snapshot, |sim| async move {
     assert_eq!(initial.sequence, 0);
     assert_key_value_row(&initial, "observe-initial", "v0");
 });
+
+#[tokio::test]
+async fn observe_initial_next_waits_without_rejecting_same_session_write() {
+    let backend = BlockingBeginReadBackend::new();
+    let gate = backend.gate();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+    let mut warmup = session
+        .observe("SELECT 1", &[])
+        .expect("warmup observe should open");
+    let _ = next_event(&mut warmup, "warmup snapshot").await;
+    let params = [Value::Text("observe-blocked-initial-write".to_string())];
+    let mut events = session
+        .observe(KEY_VALUE_SQL, &params)
+        .expect("observe should open");
+
+    gate.block_next_read();
+    let observer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { events.next().await })
+    });
+    gate.wait_until_blocked();
+
+    let writer_session = Arc::clone(&session);
+    let writer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            writer_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) \
+                     VALUES ('observe-blocked-initial-write', 'v0')",
+                    &[],
+                )
+                .await
+        })
+    });
+
+    gate.release();
+    let initial = observer
+        .join()
+        .expect("observer thread should not panic")
+        .expect("observe next should not fail")
+        .expect("observe next should emit initial snapshot");
+    assert_eq!(initial.sequence, 0);
+    writer
+        .join()
+        .expect("writer thread should not panic")
+        .expect("write should succeed after observe initial read finishes");
+}
 
 simulation_test!(
     observe_emits_after_committed_mutation_changes_result,
@@ -551,6 +613,137 @@ simulation_test!(
 struct CountingReadBackend {
     inner: InMemoryBackend,
     read_count: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct BlockingBeginReadBackend {
+    inner: InMemoryBackend,
+    gate: BlockingReadGate,
+}
+
+impl BlockingBeginReadBackend {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryBackend::new(),
+            gate: BlockingReadGate::new(),
+        }
+    }
+
+    fn gate(&self) -> BlockingReadGate {
+        self.gate.clone()
+    }
+}
+
+impl Backend for BlockingBeginReadBackend {
+    type Read<'a>
+        = InMemoryRead
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = InMemoryWrite
+    where
+        Self: 'a;
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.gate.maybe_block();
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.inner.begin_write(opts)
+    }
+}
+
+#[derive(Clone)]
+struct BlockingReadGate {
+    state: Arc<(Mutex<BlockingReadState>, Condvar)>,
+}
+
+impl BlockingReadGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(BlockingReadState::default()), Condvar::new())),
+        }
+    }
+
+    fn block_next_read(&self) {
+        let (lock, _) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("blocking read gate lock should not poison");
+        state.block_next = true;
+        state.blocked = false;
+        state.released = false;
+    }
+
+    fn maybe_block(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("blocking read gate lock should not poison");
+        if !state.block_next {
+            return;
+        }
+        state.block_next = false;
+        state.blocked = true;
+        condvar.notify_all();
+        let deadline = Instant::now() + NEXT_TIMEOUT;
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for blocking read gate release"
+            );
+            let (next_state, wait_result) = condvar
+                .wait_timeout(state, remaining)
+                .expect("blocking read gate lock should not poison after wait");
+            state = next_state;
+            assert!(
+                !wait_result.timed_out() || state.released,
+                "timed out waiting for blocking read gate release"
+            );
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("blocking read gate lock should not poison");
+        let deadline = Instant::now() + NEXT_TIMEOUT;
+        while !state.blocked {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for blocking read gate"
+            );
+            let (next_state, wait_result) = condvar
+                .wait_timeout(state, remaining)
+                .expect("blocking read gate lock should not poison after wait");
+            state = next_state;
+            assert!(
+                !wait_result.timed_out() || state.blocked,
+                "timed out waiting for blocking read gate"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("blocking read gate lock should not poison");
+        state.released = true;
+        condvar.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct BlockingReadState {
+    block_next: bool,
+    blocked: bool,
+    released: bool,
 }
 
 struct CountingRead {
