@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 use crate::observe_coordinator::{ObserveQueryKey, ObserveQueryState, ObserveSessionScope};
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
-use crate::{ExecuteResult, LixError, Value, sql2};
+use crate::{sql2, ExecuteResult, LixError, Value};
 
 use super::{SessionContext, SessionMode};
 
@@ -119,7 +119,7 @@ where
 
     async fn evaluate_stable_snapshot(&mut self) -> Result<Option<(u64, ExecuteResult)>, LixError> {
         loop {
-            let operation_guard = self.session.begin_session_operation()?;
+            let operation_guard = self.session.begin_waitable_session_operation().await?;
             self.session
                 .observe_invalidation
                 .ensure_external_watcher(self.session.storage.clone())?;
@@ -177,7 +177,7 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     pub fn observe(&self, sql: &str, params: &[Value]) -> Result<ObserveEvents<B>, LixError> {
-        let operation_guard = self.begin_session_operation()?;
+        self.ensure_observe_registration_allowed()?;
         if sql.trim().is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -199,7 +199,6 @@ where
         }
         let key = ObserveQueryKey::new(self.observe_scope(), sql, params)?;
         let shared_state = Some(self.observe_coordinator.state_for(&key));
-        drop(operation_guard);
 
         Ok(ObserveEvents {
             session: self.clone(),

@@ -3,12 +3,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lix_engine::Engine;
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
     InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
     ScanResult, ScanVisitor, SpaceId, WriteOptions,
 };
+use lix_engine::Engine;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -663,6 +663,63 @@ async fn begin_transaction_cannot_race_with_opening_session_write() {
         .await
         .expect("timed out closing after transaction reservation rejection")
         .expect("session close should succeed after reservation rejection");
+}
+
+#[tokio::test]
+async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
+    let backend = BlockingBeginWriteBackend::new();
+    let gate = backend.gate();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+
+    gate.block_next_write();
+    let writer_session = Arc::clone(&session);
+    let writer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            writer_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('read-after-automatic-write', 'value')",
+                    &[],
+                )
+                .await
+        })
+    });
+    gate.wait_until_blocked();
+
+    let reader_session = Arc::clone(&session);
+    let reader = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            reader_session
+                .execute(
+                    "SELECT key FROM lix_key_value WHERE key = 'read-after-automatic-write'",
+                    &[],
+                )
+                .await
+        })
+    });
+
+    gate.release();
+    join_thread(writer, "blocked automatic writer")
+        .expect("automatic write should finish after release");
+    let result = join_thread(reader, "reader waiting for automatic write")
+        .expect("session read should wait behind automatic write");
+    assert_eq!(result.len(), 1);
 }
 
 #[derive(Clone, Default)]

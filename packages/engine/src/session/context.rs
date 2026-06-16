@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
@@ -27,7 +26,8 @@ use crate::sql2::{
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{Transaction, open_transaction};
+use crate::transaction::{open_transaction, Transaction};
+use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
@@ -237,8 +237,17 @@ where
             .await
     }
 
-    pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
-        self.transaction_manager.begin_session_operation()
+    pub(super) fn ensure_observe_registration_allowed(&self) -> Result<(), LixError> {
+        self.transaction_manager
+            .ensure_observe_registration_allowed()
+    }
+
+    pub(super) async fn begin_waitable_session_operation(
+        &self,
+    ) -> Result<SessionOperationGuard, LixError> {
+        self.transaction_manager
+            .begin_waitable_session_operation()
+            .await
     }
 
     pub(super) async fn begin_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
@@ -285,7 +294,7 @@ where
     /// `lix_key_value` state so multiple open app sessions can observe the same
     /// active workspace branch.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
+        let _operation_guard = self.begin_waitable_session_operation().await?;
         let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
         let result = self.active_branch_id_from_reader(&read).await;
         match result {
@@ -535,11 +544,11 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crate::Engine;
     use crate::backend::{
         Backend, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions,
         WriteOptions,
     };
+    use crate::Engine;
     use futures_util::task::noop_waker_ref;
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -650,7 +659,8 @@ mod tests {
     async fn close_waits_for_session_operation_guard_to_drop() {
         let session = open_session().await;
         let guard = session
-            .begin_session_operation()
+            .begin_waitable_session_operation()
+            .await
             .expect("session operation should begin");
         let mut close = Box::pin(session.close());
         assert_close_pending(close.as_mut());

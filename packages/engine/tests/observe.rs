@@ -150,6 +150,112 @@ async fn observe_initial_next_waits_without_rejecting_same_session_write() {
         .expect("write should succeed after observe initial read finishes");
 }
 
+#[tokio::test]
+async fn observe_registration_allows_automatic_write_instead_of_rejecting() {
+    let backend = BlockingBeginWriteBackend::new();
+    let gate = backend.gate();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+
+    gate.block_next();
+    let writer_session = Arc::clone(&session);
+    let writer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            writer_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) \
+                     VALUES ('observe-registration-after-automatic-write', 'v0')",
+                    &[],
+                )
+                .await
+        })
+    });
+    gate.wait_until_blocked();
+
+    let params = [Value::Text(
+        "observe-registration-after-automatic-write".to_string(),
+    )];
+    let mut events = session
+        .observe(KEY_VALUE_SQL, &params)
+        .expect("observe registration should not reject an automatic transaction");
+
+    gate.release();
+    writer
+        .join()
+        .expect("writer thread should not panic")
+        .expect("automatic write should finish after release");
+    let initial = next_event(&mut events, "observe after automatic write").await;
+    assert_key_value_row(&initial, "observe-registration-after-automatic-write", "v0");
+}
+
+#[tokio::test]
+async fn observe_initial_next_waits_for_automatic_write_instead_of_rejecting() {
+    let backend = BlockingBeginWriteBackend::new();
+    let gate = backend.gate();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+    let params = [Value::Text("observe-after-automatic-write".to_string())];
+    let mut events = session
+        .observe(KEY_VALUE_SQL, &params)
+        .expect("observe should open");
+
+    gate.block_next();
+    let writer_session = Arc::clone(&session);
+    let writer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            writer_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) \
+                     VALUES ('observe-after-automatic-write', 'v0')",
+                    &[],
+                )
+                .await
+        })
+    });
+    gate.wait_until_blocked();
+
+    let observer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { events.next().await })
+    });
+
+    gate.release();
+    writer
+        .join()
+        .expect("writer thread should not panic")
+        .expect("automatic write should finish after release");
+    let initial = observer
+        .join()
+        .expect("observer thread should not panic")
+        .expect("observe next should not fail")
+        .expect("observe next should emit initial snapshot");
+    assert_key_value_row(&initial, "observe-after-automatic-write", "v0");
+}
+
 simulation_test!(
     observe_emits_after_committed_mutation_changes_result,
     |sim| async move {
@@ -621,7 +727,26 @@ struct BlockingBeginReadBackend {
     gate: BlockingReadGate,
 }
 
+#[derive(Clone)]
+struct BlockingBeginWriteBackend {
+    inner: InMemoryBackend,
+    gate: BlockingReadGate,
+}
+
 impl BlockingBeginReadBackend {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryBackend::new(),
+            gate: BlockingReadGate::new(),
+        }
+    }
+
+    fn gate(&self) -> BlockingReadGate {
+        self.gate.clone()
+    }
+}
+
+impl BlockingBeginWriteBackend {
     fn new() -> Self {
         Self {
             inner: InMemoryBackend::new(),
@@ -655,6 +780,27 @@ impl Backend for BlockingBeginReadBackend {
     }
 }
 
+impl Backend for BlockingBeginWriteBackend {
+    type Read<'a>
+        = InMemoryRead
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = InMemoryWrite
+    where
+        Self: 'a;
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.gate.maybe_block();
+        self.inner.begin_write(opts)
+    }
+}
+
 #[derive(Clone)]
 struct BlockingReadGate {
     state: Arc<(Mutex<BlockingReadState>, Condvar)>,
@@ -668,6 +814,10 @@ impl BlockingReadGate {
     }
 
     fn block_next_read(&self) {
+        self.block_next();
+    }
+
+    fn block_next(&self) {
         let (lock, _) = &*self.state;
         let mut state = lock
             .lock()
