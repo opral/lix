@@ -470,11 +470,11 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
 
     assert_eq!(
         std::fs::read(tempdir.path().join(".lix/.gitignore")).unwrap(),
-        b"*\n!.gitignore\n"
+        b"*\n"
     );
     assert_eq!(
         std::fs::read(tempdir.path().join(".lix_system/.gitignore")).unwrap(),
-        b"*\n!.gitignore\n"
+        b"*\n"
     );
     assert_eq!(lix.read_file("/.lix/.gitignore").await.unwrap(), None);
     assert_eq!(
