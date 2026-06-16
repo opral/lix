@@ -1,4 +1,3 @@
-#![expect(dead_code)]
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -81,11 +80,8 @@ const TARGET_CORE_MODULES: &[&str] = &["backend", "live_state", "session", "sql2
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
-    module_source: String,
     modules_analyzed: Vec<String>,
     edges: Vec<DependencyEdge>,
-    strongly_connected_components: Vec<StronglyConnectedComponent>,
-    adjacency_by_module: BTreeMap<String, ModuleAdjacency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,18 +89,6 @@ struct DependencyEdge {
     from: String,
     to: String,
     via_files: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StronglyConnectedComponent {
-    modules: Vec<String>,
-    internal_edges: Vec<DependencyEdge>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModuleAdjacency {
-    incoming: Vec<String>,
-    outgoing: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -190,22 +174,6 @@ fn source_between<'a>(
     &source[start..end]
 }
 
-fn assert_source_contains_in_order(relative: &str, source: &str, needles: &[&str]) {
-    let mut previous: Option<(&str, usize)> = None;
-    for needle in needles {
-        let index = source
-            .find(needle)
-            .unwrap_or_else(|| panic!("{relative} should contain `{needle}`"));
-        if let Some((previous_needle, previous_index)) = previous {
-            assert!(
-                previous_index < index,
-                "{relative} should keep `{previous_needle}` before `{needle}`",
-            );
-        }
-        previous = Some((needle, index));
-    }
-}
-
 fn assert_source_contains_all(relative: &str, source: &str, needles: &[&str]) {
     for needle in needles {
         assert!(
@@ -279,81 +247,10 @@ fn analyze_engine_dependency_graph() -> EngineDependencyGraph {
         })
         .collect();
 
-    let strongly_connected_components = tarjan(&top_level_modules, &graph)
-        .into_iter()
-        .filter(|component| component.len() > 1)
-        .map(|component| {
-            let members: BTreeSet<String> = component.into_iter().collect();
-            let mut modules: Vec<String> = members.iter().cloned().collect();
-            modules.sort();
-
-            let internal_edges: Vec<DependencyEdge> = edges
-                .iter()
-                .filter(|edge| members.contains(&edge.from) && members.contains(&edge.to))
-                .cloned()
-                .collect();
-
-            StronglyConnectedComponent {
-                modules,
-                internal_edges,
-            }
-        })
-        .collect();
-
-    let adjacency_by_module = build_adjacency_map(&top_level_modules, &edges);
-
     EngineDependencyGraph {
-        module_source: "src/lib.rs".to_string(),
         modules_analyzed: top_level_modules,
         edges,
-        strongly_connected_components,
-        adjacency_by_module,
     }
-}
-
-fn build_adjacency_map(
-    modules: &[String],
-    edges: &[DependencyEdge],
-) -> BTreeMap<String, ModuleAdjacency> {
-    let mut incoming: BTreeMap<String, BTreeSet<String>> = modules
-        .iter()
-        .cloned()
-        .map(|module| (module, BTreeSet::new()))
-        .collect();
-    let mut outgoing: BTreeMap<String, BTreeSet<String>> = modules
-        .iter()
-        .cloned()
-        .map(|module| (module, BTreeSet::new()))
-        .collect();
-
-    for edge in edges {
-        incoming
-            .get_mut(&edge.to)
-            .expect("all destination modules should exist in adjacency map")
-            .insert(edge.from.clone());
-        outgoing
-            .get_mut(&edge.from)
-            .expect("all source modules should exist in adjacency map")
-            .insert(edge.to.clone());
-    }
-
-    modules
-        .iter()
-        .cloned()
-        .map(|module| {
-            let incoming = incoming
-                .remove(&module)
-                .expect("all modules should have incoming adjacency entries")
-                .into_iter()
-                .collect();
-            let outgoing = outgoing
-                .remove(&module)
-                .expect("all modules should have outgoing adjacency entries")
-                .into_iter()
-                .collect();
-            (module, ModuleAdjacency { incoming, outgoing })
-        })
-        .collect()
 }
 
 fn parse_top_level_modules(lib_source: &str) -> Vec<String> {
@@ -1362,21 +1259,27 @@ fn production_source_files() -> Vec<(String, String)> {
     files
 }
 
-fn source_and_test_rust_files() -> Vec<(String, String)> {
+fn source_test_and_bench_rust_files() -> Vec<(String, String)> {
     let mut files = production_source_files();
-    let mut test_files = Vec::new();
-    let tests_root = engine_root().join("tests");
-    walk_rust_files(&tests_root, &mut test_files);
 
-    for absolute_path in test_files {
-        let relative_path = absolute_path
-            .strip_prefix(engine_root())
-            .expect("test source file should be inside the engine root")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let source =
-            fs::read_to_string(&absolute_path).expect("test source file should be readable");
-        files.push((relative_path, source));
+    for directory in ["tests", "benches"] {
+        let root = engine_root().join(directory);
+        if !root.exists() {
+            continue;
+        }
+        let mut extra_files = Vec::new();
+        walk_rust_files(&root, &mut extra_files);
+
+        for absolute_path in extra_files {
+            let relative_path = absolute_path
+                .strip_prefix(engine_root())
+                .expect("test or bench source file should be inside the engine root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = fs::read_to_string(&absolute_path)
+                .expect("test or bench source file should be readable");
+            files.push((relative_path, source));
+        }
     }
 
     files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2524,6 +2427,27 @@ fn current_schema_invalid_param_violations() -> Vec<RawSqlExecutionViolation> {
     }
 
     violations.into_iter().collect()
+}
+
+#[test]
+fn rust_modules_do_not_use_path_attributes() {
+    let violations = source_test_and_bench_rust_files()
+        .into_iter()
+        .flat_map(|(relative_path, source)| {
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.trim_start().starts_with("#[path"))
+                .map(move |(index, line)| format!("{relative_path}:{}: {}", index + 1, line.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        violations.is_empty(),
+        "Rust modules must not use path attributes; move modules under a normal owner instead.\n\n{}",
+        violations.join("\n"),
+    );
 }
 
 #[test]

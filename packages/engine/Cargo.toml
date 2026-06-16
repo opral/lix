@@ -18,8 +18,8 @@ autobenches = false
 workspace = true
 
 [features]
-rocksdb = ["dep:rocksdb"]
-redb = ["dep:redb"]
+rocksdb = ["dep:rocksdb", "lix_backends/rocksdb"]
+redb = ["dep:redb", "lix_backends/redb"]
 storage-benches = ["rocksdb", "redb"]
 
 [[bench]]
@@ -95,6 +95,7 @@ redb = { version = "4.1.0", optional = true }
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 iref = "4.0.0"
+lix_backends = { workspace = true, features = ["sqlite"] }
 paste = "1"
 rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }

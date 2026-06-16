@@ -1,5 +1,3 @@
-#![expect(dead_code)]
-
 use plugin_json_v2::exports::lix::plugin::api::{EntityState, Guest};
 use plugin_json_v2::{DetectedChange, File, JsonPlugin, PluginError};
 use serde::Deserialize;
@@ -7,11 +5,19 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 struct SnapshotContent {
     path: String,
     value: Value,
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn file_from_json(json: &str) -> File {
     File {
         filename: None,
@@ -19,6 +25,10 @@ pub fn file_from_json(json: &str) -> File {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn parse_snapshot_value_from_change(change: &DetectedChange) -> Value {
     let Some(snapshot_content) = change.snapshot_content.as_ref() else {
         panic!("change should have snapshot_content");
@@ -30,6 +40,10 @@ pub fn parse_snapshot_value_from_change(change: &DetectedChange) -> Value {
     parsed.value
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn snapshot_content(path: &str, value: Value) -> String {
     serde_json::json!({
         "path": path,
@@ -38,10 +52,18 @@ pub fn snapshot_content(path: &str, value: Value) -> String {
     .to_string()
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn active_state_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {
     apply_changes_to_active_state(Vec::new(), changes)
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn apply_changes_to_active_state(
     active_state: Vec<EntityState>,
     changes: Vec<DetectedChange>,
@@ -74,6 +96,10 @@ pub fn apply_changes_to_active_state(
     rows.into_values().collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn entity_state_rows_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {
     changes
         .into_iter()
@@ -88,6 +114,10 @@ pub fn entity_state_rows_from_changes(changes: Vec<DetectedChange>) -> Vec<Entit
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn detect_changes_from_files(
     before: Option<File>,
     after: File,
@@ -99,6 +129,10 @@ pub fn detect_changes_from_files(
     JsonPlugin::detect_changes(state, after)
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper is compiled once per test target"
+)]
 pub fn render_projection(changes: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> {
     JsonPlugin::render(entity_state_rows_from_changes(changes))
 }

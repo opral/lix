@@ -26,8 +26,10 @@ use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, ChangelogReader, ChangelogWriter, CommitChangeRefChunk, CommitChangeRefSet,
     CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitScanBatch, CommitScanRequest, GcPlan, GcRoot,
+    CommitScanBatch, CommitScanRequest,
 };
+#[cfg(feature = "storage-benches")]
+use crate::changelog::{GcPlan, GcRoot};
 use crate::json_store::JsonSlot;
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
@@ -167,6 +169,7 @@ impl<S> ChangelogReader for ChangelogStoreReader<S>
 where
     S: ChangelogStorageRead + Send,
 {
+    #[cfg(feature = "storage-benches")]
     async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
         Ok(empty_gc_plan(roots))
     }
@@ -205,6 +208,7 @@ impl<S> ChangelogReader for ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
+    #[cfg(feature = "storage-benches")]
     async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
         Ok(empty_gc_plan(roots))
     }
@@ -358,6 +362,7 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "storage-benches")]
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
         Ok(empty_gc_plan(roots))
     }
@@ -883,6 +888,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "storage-benches")]
 fn empty_gc_plan(roots: &[GcRoot]) -> GcPlan {
     GcPlan {
         roots: roots.to_vec(),

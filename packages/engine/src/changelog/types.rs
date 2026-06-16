@@ -447,6 +447,7 @@ pub(crate) struct ChangeScanBatch {
     pub(crate) next_start_after: Option<ChangeId>,
 }
 
+#[cfg(feature = "storage-benches")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RebuildIndexStats {
     pub(crate) expected: usize,
@@ -455,11 +456,13 @@ pub(crate) struct RebuildIndexStats {
     pub(crate) unchanged: usize,
 }
 
+#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GcRoot {
     BranchHead(CommitId),
 }
 
+#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcLiveSet {
     pub(crate) commits: Vec<CommitId>,
@@ -467,6 +470,7 @@ pub(crate) struct GcLiveSet {
     pub(crate) payloads: Vec<JsonRef>,
 }
 
+#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcSweepSet {
     pub(crate) commits: Vec<CommitId>,
@@ -475,9 +479,11 @@ pub(crate) struct GcSweepSet {
     pub(crate) json_payloads: Vec<JsonRef>,
 }
 
+#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcRepairSet {}
 
+#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcPlan {
     pub(crate) roots: Vec<GcRoot>,

@@ -30,18 +30,27 @@ pub struct RedbBackendFixture {
 }
 
 #[derive(Clone)]
+#[allow(missing_debug_implementations)]
 pub struct RedbBackend {
     path: PathBuf,
     db: Arc<Database>,
 }
 
+#[allow(missing_debug_implementations)]
 pub struct RedbRead {
     read: ReadTransaction,
 }
 
+#[allow(missing_debug_implementations)]
 pub struct RedbWrite {
     write: RedbWriteTxn,
     stats: WriteStats,
+}
+
+impl Default for RedbBackendFactory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RedbBackendFactory {

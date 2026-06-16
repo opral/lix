@@ -1,6 +1,5 @@
-#![expect(dead_code)]
 use plugin_json_v2::exports::lix::plugin::api::{EntityState, Guest};
-use plugin_json_v2::{DetectedChange, File, JsonPlugin, SCHEMA_KEY};
+use plugin_json_v2::{DetectedChange, File, JsonPlugin};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -95,22 +94,6 @@ pub fn file_from_bytes(data: &[u8]) -> File {
     }
 }
 
-pub fn merge_latest_state_rows(changesets: Vec<Vec<DetectedChange>>) -> Vec<DetectedChange> {
-    let mut latest = BTreeMap::new();
-    for changes in changesets {
-        for change in changes {
-            if change.schema_key != SCHEMA_KEY {
-                continue;
-            }
-            latest.insert(
-                (change.schema_key.clone(), change.entity_pk.clone()),
-                change,
-            );
-        }
-    }
-    latest.into_values().collect()
-}
-
 pub fn active_state_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {
     apply_changes_to_active_state(Vec::new(), changes)
 }
@@ -147,6 +130,10 @@ pub fn apply_changes_to_active_state(
     rows.into_values().collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "shared benchmark helper is compiled once per bench target"
+)]
 pub fn active_state_for_transition(before: &[u8], after: &[u8]) -> Vec<EntityState> {
     let before_file = file_from_bytes(before);
     let after_file = file_from_bytes(after);

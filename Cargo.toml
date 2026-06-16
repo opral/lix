@@ -21,6 +21,7 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 lix_cli = { path = "packages/cli", version = "0.6.0" }
+lix_backends = { path = "packages/backends", version = "0.6.2", default-features = false }
 lix_engine = { path = "packages/engine", version = "0.6.2" }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.6.0" }
 lix_order_key = { path = "plugins/order-key", version = "0.6.2" }

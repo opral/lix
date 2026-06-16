@@ -1,6 +1,5 @@
+use lix_backends::{RocksDbBackend, RocksDbBackendFactory};
 use lix_engine::run_backend_conformance;
-
-use super::support::rocksdb_backend::{RocksDbBackend, RocksDbBackendFactory};
 
 #[test]
 fn rocksdb_backend_passes_backend_conformance() {

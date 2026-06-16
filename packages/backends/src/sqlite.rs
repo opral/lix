@@ -13,10 +13,6 @@ use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
-// NOTE: this file is duplicated at
-// packages/engine/tests/backend/support/sqlite_backend.rs (the engine cannot
-// depend on lix_sdk); keep the two copies byte-identical.
-
 /// Format v2: one table per storage space instead of a single interleaved
 /// entries table. Hard cut; v1 files are rejected without migration.
 pub const SQLITE_FORMAT_VERSION: u32 = 3;
@@ -55,7 +51,6 @@ pub struct SqliteBackend {
 }
 
 #[derive(Clone, Debug)]
-#[expect(dead_code)]
 pub struct SqliteBackendOptions {
     pub path: PathBuf,
 }
@@ -118,7 +113,6 @@ impl BackendFixture for SqliteBackendFixture {
     }
 }
 
-#[expect(dead_code)]
 impl SqliteBackend {
     pub fn new(options: SqliteBackendOptions) -> Result<Self, BackendError> {
         Self::open(options.path)

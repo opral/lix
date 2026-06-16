@@ -17,6 +17,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+lix_backends = { workspace = true, optional = true }
 lix_engine = { workspace = true }
 
 async-trait = "0.1"
@@ -39,7 +40,7 @@ zip = { version = "8", default-features = false }
 [features]
 default = ["default_wasm_runtime"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
-sqlite = ["dep:rusqlite", "dep:tempfile"]
+sqlite = ["dep:lix_backends", "lix_backends/sqlite", "dep:rusqlite", "dep:tempfile"]
 
 [[example]]
 name = "create_sqlite_fixture"

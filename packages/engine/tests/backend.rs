@@ -1,16 +1,11 @@
-#[cfg(feature = "redb")]
-#[path = "backend/redb.rs"]
-mod redb;
+mod backend {
+    #[cfg(feature = "redb")]
+    mod redb;
 
-#[cfg(feature = "rocksdb")]
-#[path = "backend/rocksdb.rs"]
-mod rocksdb;
+    #[cfg(feature = "rocksdb")]
+    mod rocksdb;
 
-#[path = "backend/scrambled.rs"]
-mod scrambled;
+    mod scrambled;
 
-#[path = "backend/sqlite.rs"]
-mod sqlite;
-
-#[path = "backend/support/mod.rs"]
-mod support;
+    mod sqlite;
+}

@@ -1,6 +1,5 @@
+use lix_backends::{RedbBackend, RedbBackendFactory};
 use lix_engine::run_backend_conformance;
-
-use super::support::redb_backend::{RedbBackend, RedbBackendFactory};
 
 #[test]
 fn redb_backend_passes_backend_conformance() {
