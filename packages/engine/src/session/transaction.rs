@@ -5,15 +5,15 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use tokio::sync::Notify;
 
-use crate::LixError;
 #[cfg(test)]
 use crate::transaction::CommitBoundaryGuard;
 use crate::transaction::{
-    CommitBoundaryState, Transaction, TransactionCommitBoundary, open_transaction,
+    open_transaction, CommitBoundaryState, Transaction, TransactionCommitBoundary,
 };
+use crate::LixError;
 
+use super::context::{closed_error, SessionWriteAccess};
 use super::SessionContext;
-use super::context::{SessionWriteAccess, closed_error};
 
 #[expect(missing_debug_implementations)]
 pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
@@ -255,8 +255,39 @@ impl SessionTransactionManager {
         Ok(())
     }
 
-    pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
-        self.begin_operation(SessionOperationScope::Session)
+    pub(super) fn ensure_observe_registration_allowed(&self) -> Result<(), LixError> {
+        self.lock_state().ensure_observe_registration_allowed()
+    }
+
+    pub(super) async fn begin_waitable_session_operation(
+        &self,
+    ) -> Result<SessionOperationGuard, LixError> {
+        loop {
+            let notified = self.inner.state_changed.notified();
+            let should_wait = {
+                let mut state = self.lock_state();
+                if state.is_automatic_transaction_in_progress() {
+                    true
+                } else {
+                    state.begin_operation(SessionOperationScope::Session)?;
+                    false
+                }
+            };
+            if should_wait {
+                notified.await;
+                continue;
+            }
+            self.inner.state_changed.notify_waiters();
+
+            if let Err(error) = self.ensure_open() {
+                self.finish_operation();
+                return Err(error);
+            }
+
+            return Ok(SessionOperationGuard {
+                manager: self.clone(),
+            });
+        }
     }
 
     pub(super) fn begin_transaction_operation(&self) -> Result<SessionOperationGuard, LixError> {
@@ -437,6 +468,29 @@ impl SessionTransactionState {
 
     fn is_session_operation_in_progress(&self) -> bool {
         matches!(self, Self::OpenOperation { .. })
+    }
+
+    fn is_automatic_transaction_in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::OpenTransaction {
+                owner: TransactionOwner::Automatic,
+                ..
+            }
+        )
+    }
+
+    fn ensure_observe_registration_allowed(&self) -> Result<(), LixError> {
+        match self {
+            Self::OpenIdle
+            | Self::OpenOperation { .. }
+            | Self::OpenTransaction {
+                owner: TransactionOwner::Automatic,
+                ..
+            } => Ok(()),
+            Self::OpenTransaction { .. } => Err(active_transaction_error()),
+            Self::Closing { .. } | Self::Closed => Err(closed_error()),
+        }
     }
 
     fn begin_operation(&mut self, scope: SessionOperationScope) -> Result<(), LixError> {

@@ -1,11 +1,11 @@
-use crate::LixError;
-use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
+use crate::filesystem::{filesystem_schema_keys, FilesystemIndex};
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::plugin::{
-    PluginContentType, load_installed_plugins_from_filesystem, parse_plugin_archive_for_install,
-    plugin_storage_archive_path,
+    load_installed_plugins_from_filesystem, parse_plugin_archive_for_install,
+    plugin_storage_archive_path, PluginContentType,
 };
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
+use crate::LixError;
 
 use super::{FsWriteOptions, SessionContext};
 
@@ -39,7 +39,7 @@ where
     }
 
     pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
+        let _operation_guard = self.begin_waitable_session_operation().await?;
         let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
         let active_branch_id = self.active_branch_id_from_reader(&read).await?;
         let live_state = self.live_state.reader(&read);

@@ -341,7 +341,7 @@ where
         let _operation_guard = if runtime_write_access.is_some() {
             None
         } else {
-            Some(self.begin_session_operation()?)
+            Some(self.begin_waitable_session_operation().await?)
         };
         // Lock by statement shape, not by a pre-lock mode read. The read
         // snapshot below is where FunctionContext observes deterministic mode;
