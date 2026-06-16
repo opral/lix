@@ -463,6 +463,84 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
+async fn filesystem_creates_gitignore_files_for_lix_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_eq!(
+        std::fs::read(tempdir.path().join(".lix/.gitignore")).unwrap(),
+        b"*\n!.gitignore\n"
+    );
+    assert_eq!(
+        std::fs::read(tempdir.path().join(".lix_system/.gitignore")).unwrap(),
+        b"*\n!.gitignore\n"
+    );
+    assert_eq!(lix.read_file("/.lix/.gitignore").await.unwrap(), None);
+    assert_eq!(
+        lix.read_file("/.lix_system/.gitignore").await.unwrap(),
+        None
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_initial_import_ignores_git_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
+    std::fs::write(tempdir.path().join(".git/config"), b"git").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("nested/.git")).unwrap();
+    std::fs::write(tempdir.path().join("nested/.git/config"), b"nested").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+    std::fs::write(tempdir.path().join("docs/.git"), b"git-file").unwrap();
+    std::fs::write(tempdir.path().join("docs/readme.txt"), b"normal").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_eq!(
+        lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
+        Some(b"normal".as_slice())
+    );
+    assert_eq!(lix.readdir("/.git/").await.unwrap(), None);
+    assert_eq!(lix.read_file("/.git/config").await.unwrap(), None);
+    assert_eq!(lix.readdir("/nested/.git/").await.unwrap(), None);
+    assert_eq!(lix.read_file("/nested/.git/config").await.unwrap(), None);
+    assert_eq!(lix.read_file("/docs/.git").await.unwrap(), None);
+    assert!(tempdir.path().join(".git/config").is_file());
+    assert!(tempdir.path().join("nested/.git/config").is_file());
+    assert!(tempdir.path().join("docs/.git").is_file());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let metadata_dir = tempdir.path().join(".lix");
+    std::fs::create_dir(&metadata_dir).unwrap();
+    let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
+        .await
+        .unwrap();
+    seed.write_file("/.git/config", b"old".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    seed.write_file("/docs/.git", b"old".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_eq!(lix.read_file("/.git/config").await.unwrap(), None);
+    assert_eq!(lix.read_file("/docs/.git").await.unwrap(), None);
+    assert!(!tempdir.path().join(".git").exists());
+    assert!(!tempdir.path().join("docs/.git").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let tempdir = tempfile::tempdir().unwrap();
     let metadata_dir = tempdir.path().join(".lix");
@@ -586,6 +664,51 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 
     std::fs::remove_dir(tempdir.path().join("empty-disk")).unwrap();
     wait_for_lix_directory(&lix, "/empty-disk/", false).await;
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_watcher_ignores_git_entries_created_after_open() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
+    std::fs::write(tempdir.path().join(".git/config"), b"git").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+    std::fs::write(tempdir.path().join("docs/.git"), b"git-file").unwrap();
+    std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
+
+    wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
+    assert_eq!(lix.readdir("/.git/").await.unwrap(), None);
+    assert_eq!(lix.read_file("/.git/config").await.unwrap(), None);
+    assert_eq!(lix.read_file("/docs/.git").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_materialization_skips_git_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    lix.write_file("/.git/config", b"lix".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    lix.write_file("/docs/.git", b"lix".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lix.read_file("/.git/config").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert_eq!(
+        lix.read_file("/docs/.git").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert!(!tempdir.path().join(".git/config").exists());
+    assert!(!tempdir.path().join("docs/.git").exists());
     lix.close().await.unwrap();
 }
 

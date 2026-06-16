@@ -17,6 +17,7 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 use crate::sqlite_backend::SqliteBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
+const HOST_METADATA_GITIGNORE: &[u8] = b"*\n!.gitignore\n";
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -289,6 +290,7 @@ where
         ensure_filesystem_root_directory(root)?;
         let root = std::fs::canonicalize(root)
             .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
+        ensure_filesystem_system_directory(&root)?;
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
             session,
@@ -761,6 +763,9 @@ fn collect_local_directory(
             continue;
         }
         let path = entry.path();
+        if is_filesystem_sync_ignored_local_path(root, &path) {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -829,7 +834,43 @@ fn validate_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
     Ok(())
 }
 
+fn ensure_filesystem_system_directory(root: &Path) -> Result<PathBuf, LixError> {
+    let system_dir = root.join(".lix_system");
+    match std::fs::create_dir(&system_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(io_error(
+                "create filesystem system directory",
+                &system_dir,
+                error,
+            ));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(&system_dir)
+        .map_err(|error| io_error("read filesystem system directory", &system_dir, error))?;
+    if metadata.file_type().is_symlink() {
+        let path = system_dir.display();
+        return Err(filesystem_error(format!(
+            "filesystem system path {path} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let path = system_dir.display();
+        return Err(filesystem_error(format!(
+            "filesystem system path {path} must be a directory"
+        )));
+    }
+
+    ensure_metadata_gitignore(&system_dir)?;
+    Ok(system_dir)
+}
+
 fn remove_materialized_file(root: &Path, path: &str) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path) {
+        return Ok(());
+    }
     let Some(local_path) = materialization_local_path(root, path) else {
         return Ok(());
     };
@@ -855,6 +896,9 @@ fn remove_materialized_file(root: &Path, path: &str) -> Result<(), LixError> {
 }
 
 fn remove_materialized_directory(root: &Path, path: &str) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path) {
+        return Ok(());
+    }
     let Some(local_path) = materialization_local_path(root, path) else {
         return Ok(());
     };
@@ -883,6 +927,9 @@ fn remove_materialized_directory(root: &Path, path: &str) -> Result<(), LixError
 }
 
 fn create_materialized_directory(root: &Path, path: &str) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path) {
+        return Ok(());
+    }
     let Some(local_path) = materialization_local_path(root, path) else {
         return Ok(());
     };
@@ -894,6 +941,9 @@ fn create_materialized_directory(root: &Path, path: &str) -> Result<(), LixError
 }
 
 fn write_materialized_file(root: &Path, path: &str, data: &[u8]) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path) {
+        return Ok(());
+    }
     let Some(local_path) = materialization_local_path(root, path) else {
         return Ok(());
     };
@@ -1062,6 +1112,41 @@ fn is_filesystem_metadata_file_name(name: &std::ffi::OsStr) -> bool {
     matches!(name.to_str(), Some(".lix"))
 }
 
+fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    let mut depth = 0usize;
+    let mut first_segment_is_lix_system = false;
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return true;
+        };
+        depth += 1;
+        let segment = segment.to_str();
+        if segment == Some(".git") {
+            return true;
+        }
+        if depth == 1 && segment == Some(".lix_system") {
+            first_segment_is_lix_system = true;
+        }
+        if depth == 2 && first_segment_is_lix_system && segment == Some(".gitignore") {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_filesystem_sync_ignored_lix_path(path: &str) -> bool {
+    lix_path_contains_segment(path, ".git") || path == "/.lix_system/.gitignore"
+}
+
+fn lix_path_contains_segment(path: &str, segment: &str) -> bool {
+    path.trim_matches('/')
+        .split('/')
+        .any(|candidate| candidate == segment)
+}
+
 fn sort_directories_deepest_first(paths: &mut [String]) {
     paths.sort_by(|left, right| {
         path_depth(right)
@@ -1151,7 +1236,26 @@ fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, Li
         )));
     }
 
+    ensure_metadata_gitignore(&metadata_dir)?;
     Ok(metadata_dir)
+}
+
+fn ensure_metadata_gitignore(directory: &Path) -> Result<(), LixError> {
+    let gitignore = directory.join(".gitignore");
+    match std::fs::read(&gitignore) {
+        Ok(existing) if existing == HOST_METADATA_GITIGNORE => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error(
+                "read filesystem metadata .gitignore",
+                &gitignore,
+                error,
+            ));
+        }
+    }
+    std::fs::write(&gitignore, HOST_METADATA_GITIGNORE)
+        .map_err(|error| io_error("write filesystem metadata .gitignore", &gitignore, error))
 }
 
 #[cfg(feature = "sqlite")]
