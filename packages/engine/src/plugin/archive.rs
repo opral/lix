@@ -180,6 +180,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
 pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
     plugin_key: &str,
     archive_path: &str,
+    archive_blob_hash: &str,
     archive_bytes: &[u8],
 ) -> Result<InstalledPluginMetadata, LixError> {
     let files = read_plugin_archive_files(archive_path, archive_bytes)?;
@@ -243,7 +244,7 @@ pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
     Ok(InstalledPluginMetadata {
         key: manifest.key,
         archive_path: archive_path.to_string(),
-        archive_blob_hash: String::new(),
+        archive_blob_hash: archive_blob_hash.to_string(),
         path_glob: manifest.file_match.path_glob,
         content_type,
         schema_keys,

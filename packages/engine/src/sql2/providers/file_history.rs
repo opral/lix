@@ -1012,13 +1012,14 @@ async fn load_installed_plugin_metadata_from_filesystem(
         let Some(archive_bytes) = batch.pop().flatten() else {
             continue;
         };
-        let Ok(mut plugin) =
-            load_installed_plugin_metadata_from_archive_bytes(&plugin_key, path, &archive_bytes)
-        else {
+        let Ok(plugin) = load_installed_plugin_metadata_from_archive_bytes(
+            &plugin_key,
+            path,
+            blob_hash,
+            &archive_bytes,
+        ) else {
             continue;
         };
-        plugin.archive_path = path.to_string();
-        plugin.archive_blob_hash = blob_hash.to_string();
         plugins.push(plugin);
     }
     Ok(plugins)
