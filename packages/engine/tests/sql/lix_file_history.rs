@@ -1,4 +1,13 @@
+use std::io::{Cursor, Write};
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use lix_engine::Value;
+use lix_engine::wasm::{
+    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
+    WasmPluginFile, WasmRuntime,
+};
+use lix_engine::{Engine, FsWriteOptions, InMemoryBackend, LixError};
 use serde_json::json;
 
 use super::assert_rows_eq;
@@ -169,6 +178,101 @@ simulation_test!(
     }
 );
 
+#[tokio::test]
+async fn lix_file_history_renders_plugin_state_at_each_depth() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new_with_wasm_runtime(backend, Arc::new(HistoryRenderPluginRuntime))
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .install_plugin(&history_render_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+    session
+        .fs()
+        .write_file(
+            "/note.history-render",
+            b"first".to_vec(),
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("plugin file write should succeed");
+    session
+        .fs()
+        .write_file(
+            "/note.history-render",
+            b"second".to_vec(),
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("plugin file update should succeed");
+
+    let commit_id_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("active branch commit id should load");
+    let [Value::Text(commit_id)] = commit_id_rows.rows()[0].values() else {
+        panic!(
+            "expected active branch commit id row, got {:?}",
+            commit_id_rows.rows()[0].values()
+        );
+    };
+    let file_id_rows = session
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/note.history-render'",
+            &[],
+        )
+        .await
+        .expect("file id read should succeed");
+    let [Value::Text(file_id)] = file_id_rows.rows()[0].values() else {
+        panic!(
+            "expected file id row, got {:?}",
+            file_id_rows.rows()[0].values()
+        );
+    };
+
+    let result = session
+        .execute(
+            &format!(
+                "SELECT path, data, lixcol_depth \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                   AND id = '{file_id}' \
+                   AND lixcol_depth IN (0, 1) \
+                 ORDER BY lixcol_depth"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin file history read should succeed");
+
+    assert_rows_eq(
+        result,
+        vec![
+            vec![
+                Value::Text("/note.history-render".to_string()),
+                Value::Blob(b"rendered:second-a|second-b".to_vec()),
+                Value::Integer(0),
+            ],
+            vec![
+                Value::Text("/note.history-render".to_string()),
+                Value::Blob(b"rendered:first-a|first-b".to_vec()),
+                Value::Integer(1),
+            ],
+        ],
+    );
+
+    session.close().await.expect("session should close");
+}
+
 simulation_test!(
     lix_file_history_requires_start_commit_id,
     |sim| async move {
@@ -200,6 +304,160 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_file_history_ignores_unrelated_file_scoped_state_events,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('ordinary-history-file', '/ordinary-history.txt', X'68656C6C6F')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content) \
+                 VALUES (lix_json('[\"ordinary-sidecar\"]'), 'lix_key_value', \
+                         'ordinary-history-file', \
+                         lix_json('{\"key\":\"ordinary-sidecar\",\"value\":\"noise\"}'))",
+                &[],
+            )
+            .await
+            .expect("unrelated file-scoped state insert should succeed");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head commit should load")
+            .expect("head commit should exist");
+
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT path, data, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                       AND id = 'ordinary-history-file' \
+                     ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("file history read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("/ordinary-history.txt".to_string()),
+                Value::Blob(b"hello".to_vec()),
+                Value::Integer(1),
+            ]],
+        );
+    }
+);
+
+struct HistoryRenderPluginRuntime;
+
+struct HistoryRenderPluginComponent;
+
+#[async_trait]
+impl WasmRuntime for HistoryRenderPluginRuntime {
+    async fn init_component(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+        Ok(Arc::new(HistoryRenderPluginComponent))
+    }
+}
+
+#[async_trait]
+impl WasmComponentInstance for HistoryRenderPluginComponent {
+    async fn detect_changes(
+        &self,
+        _state: Vec<WasmPluginEntityState>,
+        file: WasmPluginFile,
+    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+        let value = String::from_utf8(file.data).map_err(|error| {
+            LixError::unknown(format!("plugin test data was not UTF-8: {error}"))
+        })?;
+        Ok(["a", "b"]
+            .into_iter()
+            .map(|suffix| WasmPluginDetectedChange {
+                entity_pk: vec![format!("note-{suffix}")],
+                schema_key: "plugin_history_note".to_string(),
+                snapshot_content: Some(format!(
+                    "{{\"id\":\"note-{suffix}\",\"value\":{}}}",
+                    serde_json::to_string(&format!("{value}-{suffix}"))
+                        .expect("test value should serialize")
+                )),
+                metadata: None,
+            })
+            .collect())
+    }
+
+    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
+        let mut values = state
+            .iter()
+            .filter(|row| row.schema_key == "plugin_history_note")
+            .filter_map(|row| serde_json::from_str::<serde_json::Value>(&row.snapshot_content).ok())
+            .filter_map(|snapshot| {
+                snapshot
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        Ok(format!("rendered:{}", values.join("|")).into_bytes())
+    }
+}
+
+fn history_render_plugin_archive() -> Vec<u8> {
+    const MANIFEST_JSON: &[u8] = br#"{
+        "key": "plugin_history_render",
+        "runtime": "wasm-component-v1",
+        "api_version": "0.1.0",
+        "match": { "path_glob": "*.history-render" },
+        "entry": "plugin.wasm",
+        "schemas": ["schema/plugin_history_note.json"]
+    }"#;
+    const SCHEMA_JSON: &[u8] = br#"{
+        "x-lix-key": "plugin_history_note",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "value": { "type": "string" }
+        },
+        "required": ["id", "value"],
+        "additionalProperties": false
+    }"#;
+    const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        ("manifest.json", MANIFEST_JSON),
+        ("schema/plugin_history_note.json", SCHEMA_JSON),
+        ("plugin.wasm", WASM_HEADER),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
 
 simulation_test!(
     lix_file_history_exposes_file_descriptor_schema_key,

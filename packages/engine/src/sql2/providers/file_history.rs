@@ -10,10 +10,17 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::binary_cas::BlobDataReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
+use crate::filesystem::FilesystemIndex;
+use crate::live_state::MaterializedLiveStateRow;
+use crate::plugin::{
+    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem,
+    render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
+};
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlHistoryQuerySource;
@@ -48,6 +55,7 @@ pub(super) async fn register_lix_file_history_surface<S>(
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -59,6 +67,7 @@ where
             commit_graph: Arc::new(Mutex::new(commit_graph)),
             query_source,
             blob_reader,
+            plugin_host,
         }),
         WriteAccess::read_only(),
     )
@@ -73,6 +82,7 @@ struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
 }
 
 #[async_trait]
@@ -127,14 +137,16 @@ where
                     Arc::clone(&self.commit_graph),
                     self.query_source.clone(),
                     Arc::clone(&self.blob_reader),
+                    self.plugin_host.clone(),
                     route,
                     schema,
                 ),
-                move |(commit_graph, query_source, blob_reader, route, schema)| async move {
+                move |(commit_graph, query_source, blob_reader, plugin_host, route, schema)| async move {
                     let mut rows = load_file_history_rows(
                         commit_graph,
                         query_source,
                         &blob_reader,
+                        plugin_host,
                         &route,
                         needs_data,
                     )
@@ -195,6 +207,12 @@ struct FileHistoryBlobRecord {
 }
 
 #[derive(Debug, Clone)]
+struct FileHistoryPluginStateRecord {
+    file_id: String,
+    entry: HistoryEntry,
+}
+
+#[derive(Debug, Clone)]
 struct FileHistoryEvent {
     file_id: String,
     start_commit_id: String,
@@ -241,6 +259,7 @@ async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     route: &HistoryRoute,
     needs_data: bool,
 ) -> Result<Vec<FileHistoryOutputRow>, LixError>
@@ -256,11 +275,9 @@ where
         Arc::clone(&commit_graph),
         query_source.json_reader.clone(),
         &event_route,
-        vec![
-            FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            BLOB_REF_SCHEMA_KEY.to_string(),
-        ],
+        // File history is descriptor-shaped publicly, but data may be
+        // represented by plugin-owned state rows.
+        Vec::new(),
     )
     .await?;
     let context_route = route.starts_only();
@@ -272,26 +289,37 @@ where
         commit_graph,
         query_source.json_reader,
         &context_route,
-        vec![
-            FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            BLOB_REF_SCHEMA_KEY.to_string(),
-        ],
+        // Context loading needs the full reachable state snapshot for plugin
+        // rendering and historical plugin installation lookup.
+        Vec::new(),
     )
     .await?;
 
     let event_descriptors = parse_file_history_descriptors(&event_entries)?;
     let event_directories = parse_file_history_directories(&event_entries)?;
     let event_blobs = parse_file_history_blobs(&event_entries)?;
+    let event_plugin_state = parse_file_history_plugin_state(&event_entries);
     let descriptors = parse_file_history_descriptors(&context_entries)?;
     let directories = parse_file_history_directories(&context_entries)?;
     let blobs = parse_file_history_blobs(&context_entries)?;
+    let plugin_state = parse_file_history_plugin_state(&context_entries);
+    let mut installed_plugins_cache = BTreeMap::<(String, u32), Vec<InstalledPlugin>>::new();
     let events = file_history_events(
         &event_descriptors,
         &event_directories,
         &event_blobs,
         &descriptors,
     );
+    let plugin_events = file_history_plugin_events(
+        blob_reader,
+        &mut installed_plugins_cache,
+        &event_plugin_state,
+        &descriptors,
+        &directories,
+        &blobs,
+    )
+    .await?;
+    let events = sorted_deduped_file_history_events(events.into_iter().chain(plugin_events));
 
     let mut output = Vec::new();
     for event in events {
@@ -299,15 +327,33 @@ where
             continue;
         };
         let blob = nearest_blob_ref(&blobs, &event);
+        let path = resolve_file_history_path(descriptor, &directories, event.depth);
         let data = if needs_data && descriptor.name.is_some() {
             match blob.and_then(|blob| blob.blob_hash.as_deref()) {
                 Some(blob_hash) => load_single_blob_bytes(blob_reader, blob_hash).await?,
-                None => Some(Vec::new()),
+                None => match path.as_deref() {
+                    Some(path) => {
+                        let rendered = render_plugin_file_history_data(
+                            blob_reader,
+                            &plugin_host,
+                            &mut installed_plugins_cache,
+                            &descriptors,
+                            &directories,
+                            &blobs,
+                            &plugin_state,
+                            descriptor,
+                            &event,
+                            path,
+                        )
+                        .await?;
+                        Some(rendered.unwrap_or_default())
+                    }
+                    None => Some(Vec::new()),
+                },
             }
         } else {
             None
         };
-        let path = resolve_file_history_path(descriptor, &directories, event.depth);
         let id = tombstone_identity_column_value(
             "id",
             &descriptor.id,
@@ -351,7 +397,6 @@ where
     });
     Ok(output)
 }
-
 
 fn file_history_events(
     event_descriptors: &[FileHistoryDescriptorRecord],
@@ -408,7 +453,14 @@ fn file_history_events(
             ));
         }
     }
+    sorted_deduped_file_history_events(candidates)
+}
 
+fn sorted_deduped_file_history_events<I>(events: I) -> Vec<FileHistoryEvent>
+where
+    I: IntoIterator<Item = FileHistoryEvent>,
+{
+    let mut candidates = events.into_iter().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.file_id
             .cmp(&right.file_id)
@@ -423,6 +475,48 @@ fn file_history_events(
             && left.depth == right.depth
     });
     candidates
+}
+
+async fn file_history_plugin_events(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    installed_plugins_cache: &mut BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    event_plugin_state: &[FileHistoryPluginStateRecord],
+    descriptors: &[FileHistoryDescriptorRecord],
+    directories: &[FileHistoryDirectoryRecord],
+    blobs: &[FileHistoryBlobRecord],
+) -> Result<Vec<FileHistoryEvent>, LixError> {
+    let mut events = Vec::new();
+    for plugin_state in event_plugin_state {
+        let event =
+            file_history_event_from_entry(plugin_state.file_id.clone(), &plugin_state.entry, 4);
+        let Some(descriptor) = nearest_file_descriptor(descriptors, &event) else {
+            continue;
+        };
+        let Some(path) = resolve_file_history_path(descriptor, directories, event.depth) else {
+            continue;
+        };
+        let plugins = installed_plugins_at_history_depth(
+            blob_reader,
+            installed_plugins_cache,
+            descriptors,
+            directories,
+            blobs,
+            &event.start_commit_id,
+            event.depth,
+        )
+        .await?;
+        let Some(plugin) = select_plugin_for_path(plugins, &path) else {
+            continue;
+        };
+        if plugin
+            .schema_keys
+            .iter()
+            .any(|schema_key| schema_key == &plugin_state.entry.change.schema_key)
+        {
+            events.push(event);
+        }
+    }
+    Ok(events)
 }
 
 fn file_history_event_from_entry(
@@ -537,6 +631,24 @@ fn parse_file_history_blobs(
         .collect()
 }
 
+fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryPluginStateRecord> {
+    entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.change.schema_key.as_str(),
+                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY
+            )
+        })
+        .filter_map(|entry| {
+            Some(FileHistoryPluginStateRecord {
+                file_id: entry.change.file_id.clone()?,
+                entry: entry.clone(),
+            })
+        })
+        .collect()
+}
+
 fn nearest_file_descriptor<'a>(
     descriptors: &'a [FileHistoryDescriptorRecord],
     event: &FileHistoryEvent,
@@ -596,6 +708,234 @@ fn resolve_file_history_path(
         &mut BTreeSet::new(),
     )?;
     compose_file_path(Some(&directory_path), name).ok()
+}
+
+async fn render_plugin_file_history_data(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_host: &PluginRuntimeHost,
+    installed_plugins_cache: &mut BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    descriptors: &[FileHistoryDescriptorRecord],
+    directories: &[FileHistoryDirectoryRecord],
+    blobs: &[FileHistoryBlobRecord],
+    plugin_state: &[FileHistoryPluginStateRecord],
+    descriptor: &FileHistoryDescriptorRecord,
+    event: &FileHistoryEvent,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let plugins = installed_plugins_at_history_depth(
+        blob_reader,
+        installed_plugins_cache,
+        descriptors,
+        directories,
+        blobs,
+        &event.start_commit_id,
+        event.depth,
+    )
+    .await?;
+    let Some(plugin) = select_plugin_for_path(plugins, path) else {
+        return Ok(None);
+    };
+    let rows = plugin_state_live_rows_at_depth(plugin_state, plugin, descriptor, event);
+    let active_state = retain_plugin_state_rows(plugin, rows);
+    render_materialized_plugin_file(plugin_host, plugin, &active_state).await
+}
+
+async fn installed_plugins_at_history_depth<'a>(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    installed_plugins_cache: &'a mut BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    descriptors: &[FileHistoryDescriptorRecord],
+    directories: &[FileHistoryDirectoryRecord],
+    blobs: &[FileHistoryBlobRecord],
+    start_commit_id: &str,
+    depth: u32,
+) -> Result<&'a [InstalledPlugin], LixError> {
+    let key = (start_commit_id.to_string(), depth);
+    if !installed_plugins_cache.contains_key(&key) {
+        let rows = filesystem_live_rows_at_history_depth(
+            descriptors,
+            directories,
+            blobs,
+            start_commit_id,
+            depth,
+        );
+        let filesystem = FilesystemIndex::from_live_rows(rows)?;
+        let plugins =
+            load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await?;
+        installed_plugins_cache.insert(key.clone(), plugins);
+    }
+    Ok(installed_plugins_cache
+        .get(&key)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]))
+}
+
+fn filesystem_live_rows_at_history_depth(
+    descriptors: &[FileHistoryDescriptorRecord],
+    directories: &[FileHistoryDirectoryRecord],
+    blobs: &[FileHistoryBlobRecord],
+    start_commit_id: &str,
+    depth: u32,
+) -> Vec<MaterializedLiveStateRow> {
+    let mut rows = Vec::new();
+    let mut descriptor_ids = descriptors
+        .iter()
+        .filter(|record| record.entry.start_commit_id == start_commit_id)
+        .map(|record| record.id.clone())
+        .collect::<BTreeSet<_>>();
+    for descriptor_id in std::mem::take(&mut descriptor_ids) {
+        if let Some(record) = nearest_history_record(
+            descriptors.iter().filter(|record| {
+                record.id == descriptor_id && record.entry.start_commit_id == start_commit_id
+            }),
+            depth,
+        ) {
+            rows.push(history_entry_to_live_row(&record.entry));
+        }
+    }
+
+    let mut directory_ids = directories
+        .iter()
+        .filter(|record| record.entry.start_commit_id == start_commit_id)
+        .map(|record| record.id.clone())
+        .collect::<BTreeSet<_>>();
+    for directory_id in std::mem::take(&mut directory_ids) {
+        if let Some(record) = nearest_history_record(
+            directories.iter().filter(|record| {
+                record.id == directory_id && record.entry.start_commit_id == start_commit_id
+            }),
+            depth,
+        ) {
+            rows.push(history_entry_to_live_row(&record.entry));
+        }
+    }
+
+    let mut blob_file_ids = blobs
+        .iter()
+        .filter(|record| record.entry.start_commit_id == start_commit_id)
+        .map(|record| record.file_id.clone())
+        .collect::<BTreeSet<_>>();
+    for file_id in std::mem::take(&mut blob_file_ids) {
+        if let Some(record) = nearest_history_record(
+            blobs.iter().filter(|record| {
+                record.file_id == file_id && record.entry.start_commit_id == start_commit_id
+            }),
+            depth,
+        ) {
+            rows.push(history_entry_to_live_row(&record.entry));
+        }
+    }
+
+    rows
+}
+
+fn plugin_state_live_rows_at_depth(
+    plugin_state: &[FileHistoryPluginStateRecord],
+    plugin: &InstalledPlugin,
+    descriptor: &FileHistoryDescriptorRecord,
+    event: &FileHistoryEvent,
+) -> Vec<MaterializedLiveStateRow> {
+    let plugin_schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
+    let mut identities = plugin_state
+        .iter()
+        .filter(|record| {
+            record.file_id == descriptor.id
+                && record.entry.start_commit_id == event.start_commit_id
+                && plugin_schema_keys.contains(&record.entry.change.schema_key)
+        })
+        .map(|record| {
+            (
+                record.entry.change.schema_key.clone(),
+                record
+                    .entry
+                    .change
+                    .entity_pk
+                    .as_json_array_text()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut rows = Vec::new();
+    for (schema_key, entity_pk) in std::mem::take(&mut identities) {
+        if let Some(record) = nearest_history_record(
+            plugin_state.iter().filter(|record| {
+                record.file_id == descriptor.id
+                    && record.entry.start_commit_id == event.start_commit_id
+                    && record.entry.change.schema_key == schema_key
+                    && record
+                        .entry
+                        .change
+                        .entity_pk
+                        .as_json_array_text()
+                        .is_ok_and(|candidate| candidate == entity_pk)
+            }),
+            event.depth,
+        ) {
+            rows.push(history_entry_to_live_row(&record.entry));
+        }
+    }
+    rows
+}
+
+trait FileHistoryRecord {
+    fn entry(&self) -> &HistoryEntry;
+}
+
+impl FileHistoryRecord for FileHistoryDescriptorRecord {
+    fn entry(&self) -> &HistoryEntry {
+        &self.entry
+    }
+}
+
+impl FileHistoryRecord for FileHistoryDirectoryRecord {
+    fn entry(&self) -> &HistoryEntry {
+        &self.entry
+    }
+}
+
+impl FileHistoryRecord for FileHistoryBlobRecord {
+    fn entry(&self) -> &HistoryEntry {
+        &self.entry
+    }
+}
+
+impl FileHistoryRecord for FileHistoryPluginStateRecord {
+    fn entry(&self) -> &HistoryEntry {
+        &self.entry
+    }
+}
+
+fn nearest_history_record<'a, T, I>(records: I, depth: u32) -> Option<&'a T>
+where
+    T: FileHistoryRecord + 'a,
+    I: Iterator<Item = &'a T>,
+{
+    records
+        .filter(|record| record.entry().depth >= depth)
+        .min_by(|left, right| {
+            left.entry()
+                .depth
+                .cmp(&right.entry().depth)
+                .then(left.entry().change.id.cmp(&right.entry().change.id))
+        })
+}
+
+fn history_entry_to_live_row(entry: &HistoryEntry) -> MaterializedLiveStateRow {
+    MaterializedLiveStateRow {
+        entity_pk: entry.change.entity_pk.clone(),
+        schema_key: entry.change.schema_key.clone(),
+        file_id: entry.change.file_id.clone(),
+        snapshot_content: entry.change.snapshot_content.clone(),
+        metadata: entry.change.metadata.clone(),
+        deleted: entry.change.snapshot_content.is_none(),
+        created_at: entry.change.created_at.clone(),
+        updated_at: entry.change.created_at.clone(),
+        global: false,
+        change_id: None,
+        commit_id: None,
+        untracked: false,
+        branch_id: GLOBAL_BRANCH_ID.to_string(),
+    }
 }
 
 static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
@@ -688,7 +1028,6 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
     ]))
 }
-
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
