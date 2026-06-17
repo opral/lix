@@ -164,6 +164,7 @@ where
                     ctx.commit_graph(),
                     history_query_source.clone(),
                     ctx.blob_reader(),
+                    ctx.plugin_host(),
                 )
                 .await?;
             }

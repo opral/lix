@@ -820,9 +820,11 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                         stats.delete_batches,
                         u64::from(case.expected_delete_batches())
                     );
+                    let expected_revision_put_batches =
+                        u64::from((expected_puts + expected_deletes) > 0);
                     assert_eq!(
                         backend.state.put_many_calls.get(),
-                        u64::from(case.expected_put_batches())
+                        u64::from(case.expected_put_batches()) + expected_revision_put_batches
                     );
                     assert_eq!(
                         backend.state.delete_many_calls.get(),
@@ -3514,7 +3516,7 @@ fn assert_cursor_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCas
         ScanChunkingMode::Prefix => {
             assert_eq!(stats.read_stats.range_scan_chunks, 0);
             assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
-            assert_eq!(stats.read_stats.prefix_lowered, 1);
+            assert_eq!(stats.read_stats.prefix_lowered, expected_chunks as u64);
         }
     }
 }

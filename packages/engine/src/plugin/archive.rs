@@ -7,7 +7,7 @@ use zip::read::ZipArchive;
 use crate::LixError;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
-use super::{InstalledPlugin, PluginManifest, parse_plugin_manifest_json};
+use super::{InstalledPlugin, InstalledPluginMetadata, PluginManifest, parse_plugin_manifest_json};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedPluginArchive {
@@ -174,6 +174,80 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
         schema_keys,
         manifest_json: validated_manifest.normalized_json,
         wasm: wasm.clone(),
+    })
+}
+
+pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
+    plugin_key: &str,
+    archive_path: &str,
+    archive_blob_hash: &str,
+    archive_bytes: &[u8],
+) -> Result<InstalledPluginMetadata, LixError> {
+    let files = read_plugin_archive_files(archive_path, archive_bytes)?;
+    let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        message: format!(
+            "plugin metadata discovery: archive '{archive_path}' is missing manifest.json"
+        ),
+        hint: None,
+        details: None,
+    })?;
+    let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        message: format!(
+            "plugin metadata discovery: archive '{archive_path}' manifest.json must be UTF-8: {error}"
+        ),
+        hint: None,
+        details: None,
+    })?;
+    let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
+    if validated_manifest.manifest.key != plugin_key {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            message: format!(
+                "plugin metadata discovery: archive '{}' key mismatch: file id key '{}' vs manifest key '{}'",
+                archive_path, plugin_key, validated_manifest.manifest.key
+            ),
+            hint: None,
+            details: None,
+        });
+    }
+
+    let manifest = validated_manifest.manifest;
+    let content_type = manifest.file_match.content_type;
+    let mut schema_keys = Vec::with_capacity(manifest.schemas.len());
+    for schema_path in &manifest.schemas {
+        let schema_entry_path = parse_plugin_archive_path_for_materialization(schema_path)?;
+        let schema_bytes = files.get(&schema_entry_path).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            message: format!(
+                "plugin metadata discovery: archive '{archive_path}' is missing schema file '{schema_path}'"
+            ),
+            hint: None,
+            details: None,
+        })?;
+        let schema_json: JsonValue = serde_json::from_slice(schema_bytes).map_err(|error| {
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                message: format!(
+                    "plugin metadata discovery: archive '{archive_path}' schema '{schema_path}' is invalid JSON: {error}"
+                ),
+                hint: None,
+                details: None,
+            }
+        })?;
+        validate_lix_schema_definition(&schema_json)?;
+        let schema_key = schema_key_from_definition(&schema_json)?;
+        schema_keys.push(schema_key.schema_key);
+    }
+
+    Ok(InstalledPluginMetadata {
+        key: manifest.key,
+        archive_path: archive_path.to_string(),
+        archive_blob_hash: archive_blob_hash.to_string(),
+        path_glob: manifest.file_match.path_glob,
+        content_type,
+        schema_keys,
     })
 }
 

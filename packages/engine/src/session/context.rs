@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
@@ -26,8 +27,7 @@ use crate::sql2::{
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{open_transaction, Transaction};
-use crate::GLOBAL_BRANCH_ID;
+use crate::transaction::{Transaction, open_transaction};
 use crate::{LixError, NullableKeyFilter};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
@@ -544,11 +544,11 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use crate::Engine;
     use crate::backend::{
         Backend, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions,
         WriteOptions,
     };
-    use crate::Engine;
     use futures_util::task::noop_waker_ref;
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);

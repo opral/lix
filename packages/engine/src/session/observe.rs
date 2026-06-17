@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 use crate::observe_coordinator::{ObserveQueryKey, ObserveQueryState, ObserveSessionScope};
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
-use crate::{sql2, ExecuteResult, LixError, Value};
+use crate::{ExecuteResult, LixError, Value, sql2};
 
 use super::{SessionContext, SessionMode};
 
