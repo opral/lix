@@ -100,6 +100,7 @@ struct MaterializedSnapshot {
 struct LixRevision {
     active_branch_id: String,
     active_branch_commit_id: String,
+    storage_mutation_revision: Option<Vec<u8>>,
 }
 
 enum FilesystemEvent {
@@ -485,10 +486,12 @@ where
                 )
             })?
             .get::<String>("active_branch_commit_id")?;
+        let storage_mutation_revision = self.session.storage_mutation_revision().await?;
 
         Ok(LixRevision {
             active_branch_id,
             active_branch_commit_id,
+            storage_mutation_revision,
         })
     }
 

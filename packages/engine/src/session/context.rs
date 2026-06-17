@@ -303,6 +303,15 @@ where
         }
     }
 
+    #[doc(hidden)]
+    pub async fn storage_mutation_revision(&self) -> Result<Option<Vec<u8>>, LixError> {
+        let _operation_guard = self.begin_waitable_session_operation().await?;
+        Ok(self
+            .storage
+            .load_mutation_revision()?
+            .map(|revision| revision.to_vec()))
+    }
+
     pub(super) async fn active_branch_id_from_reader<S>(
         &self,
         reader: &S,

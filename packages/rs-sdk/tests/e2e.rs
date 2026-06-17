@@ -753,6 +753,41 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
+async fn filesystem_materializes_untracked_sdk_sql_writes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, data, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text("file-untracked".to_string()),
+            Value::Text("/untracked.txt".to_string()),
+            Value::Blob(b"untracked".to_vec()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(tempdir.path().join("untracked.txt")).unwrap(),
+        b"untracked"
+    );
+
+    lix.execute(
+        "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
+        &[
+            Value::Text("dir-untracked".to_string()),
+            Value::Text("/untracked-dir/".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(tempdir.path().join("untracked-dir").is_dir());
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
