@@ -451,13 +451,11 @@ where
         }
         let files = self
             .session
-            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
             .await?;
         for row in files.rows() {
             let path = row.get::<String>("path")?;
-            let data = lix_read_file(&self.session, &path)
-                .await?
-                .unwrap_or_default();
+            let data = row.get::<Vec<u8>>("data")?;
             snapshot.files.insert(path, data);
         }
         Ok(snapshot)
@@ -708,28 +706,6 @@ where
                 &materialized.disk == disk && &materialized.lix_revision == lix_revision
             })
     }
-}
-
-async fn lix_read_file<B>(
-    session: &SessionContext<B>,
-    path: &str,
-) -> Result<Option<Vec<u8>>, LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let result = session
-        .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
-        .await?;
-    result
-        .rows()
-        .first()
-        .map(|row| row.get::<Vec<u8>>("data"))
-        .transpose()
 }
 
 async fn lix_write_file<B>(
@@ -1411,6 +1387,28 @@ mod tests {
     use super::*;
     #[cfg(feature = "sqlite")]
     use lix_engine::Value;
+
+    async fn lix_read_file<B>(
+        session: &SessionContext<B>,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, LixError>
+    where
+        B: Backend + Clone + Send + Sync + 'static,
+        for<'backend> B::Read<'backend>: Send,
+        for<'backend> B::Write<'backend>: Send,
+    {
+        let result = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(path.to_string())],
+            )
+            .await?;
+        result
+            .rows()
+            .first()
+            .map(|row| row.get::<Vec<u8>>("data"))
+            .transpose()
+    }
 
     #[test]
     fn local_paths_render_opaque_segments() {
