@@ -409,6 +409,11 @@ where
 {
     async fn sync_from_lix(&self) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
+        let local = collect_local_snapshot(&self.root)?;
+        let lix_revision = self.collect_lix_revision().await?;
+        if self.is_last_materialized(&local, &lix_revision) {
+            return Ok(());
+        }
         let lix = self.collect_lix_snapshot().await?;
         let disk = self.materialize_snapshot(&lix)?;
         let lix_revision = self.collect_lix_revision().await?;
