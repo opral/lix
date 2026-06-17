@@ -12,14 +12,16 @@ use tokio::sync::Mutex;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::binary_cas::BlobDataReader;
+use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
 use crate::filesystem::FilesystemIndex;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::plugin::{
-    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem,
-    render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
+    InstalledPlugin, InstalledPluginMetadata, PluginContentType, PluginRuntimeHost,
+    load_installed_plugin_from_archive_bytes, load_installed_plugin_metadata_from_archive_bytes,
+    plugin_key_from_archive_path, render_materialized_plugin_file, retain_plugin_state_rows,
+    select_best_glob_match,
 };
 use crate::serialize_row_metadata;
 
@@ -275,6 +277,15 @@ async fn load_file_history_rows<S>(
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
+    if !route.schema_keys.is_empty()
+        && !route
+            .schema_keys
+            .iter()
+            .any(|schema_key| schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+    {
+        return Ok(Vec::new());
+    }
+
     let event_route = route.traversal_only();
     let context_route = route.starts_only();
     let filesystem_context = load_file_history_filesystem_context(
@@ -284,7 +295,9 @@ where
         &context_route,
     )
     .await?;
-    let mut installed_plugins_cache = BTreeMap::<(String, u32), Vec<InstalledPlugin>>::new();
+    let mut installed_plugins_cache = BTreeMap::<(String, u32, String), InstalledPlugin>::new();
+    let mut installed_plugin_metadata_cache =
+        BTreeMap::<(String, u32), Vec<InstalledPluginMetadata>>::new();
     let events = file_history_events(
         &filesystem_context.event_descriptors,
         &filesystem_context.event_directories,
@@ -293,7 +306,7 @@ where
     );
     let plugin_schema_keys = discover_file_history_plugin_schema_keys(
         blob_reader,
-        &mut installed_plugins_cache,
+        &mut installed_plugin_metadata_cache,
         &filesystem_context,
         &events,
     )
@@ -312,13 +325,13 @@ where
     };
     cache_installed_plugins_for_plugin_state_depths(
         blob_reader,
-        &mut installed_plugins_cache,
+        &mut installed_plugin_metadata_cache,
         &filesystem_context,
         &event_plugin_state,
     )
     .await?;
     let plugin_events = file_history_plugin_events(
-        &installed_plugins_cache,
+        &installed_plugin_metadata_cache,
         &event_plugin_state,
         &filesystem_context.descriptors,
         &filesystem_context.directories,
@@ -341,7 +354,9 @@ where
                     Some(path) => {
                         let rendered = render_plugin_file_history_data(
                             &plugin_host,
-                            &installed_plugins_cache,
+                            blob_reader,
+                            &mut installed_plugins_cache,
+                            &installed_plugin_metadata_cache,
                             &plugin_state,
                             descriptor,
                             &event,
@@ -576,7 +591,7 @@ where
 
 async fn discover_file_history_plugin_schema_keys(
     blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &mut BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    installed_plugin_metadata_cache: &mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
     filesystem_context: &FileHistoryFilesystemContext,
     events: &[FileHistoryEvent],
 ) -> Result<Vec<String>, LixError> {
@@ -598,7 +613,7 @@ async fn discover_file_history_plugin_schema_keys(
         );
         let plugins = installed_plugins_at_history_depth(
             blob_reader,
-            installed_plugins_cache,
+            installed_plugin_metadata_cache,
             &filesystem_context.descriptors,
             &filesystem_context.directories,
             &filesystem_context.blobs,
@@ -608,7 +623,7 @@ async fn discover_file_history_plugin_schema_keys(
         .await?;
         for plugin in plugins {
             if paths.iter().any(|path| {
-                select_plugin_for_path(plugins, path)
+                select_plugin_metadata_for_path(plugins, path)
                     .is_some_and(|candidate| candidate.key == plugin.key)
             }) {
                 schema_keys.extend(plugin.schema_keys.iter().cloned());
@@ -657,7 +672,7 @@ where
 
 async fn cache_installed_plugins_for_plugin_state_depths(
     blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &mut BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    installed_plugin_metadata_cache: &mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
     filesystem_context: &FileHistoryFilesystemContext,
     event_plugin_state: &[FileHistoryPluginStateRecord],
 ) -> Result<(), LixError> {
@@ -668,7 +683,7 @@ async fn cache_installed_plugins_for_plugin_state_depths(
     for (start_commit_id, depth) in depths {
         installed_plugins_at_history_depth(
             blob_reader,
-            installed_plugins_cache,
+            installed_plugin_metadata_cache,
             &filesystem_context.descriptors,
             &filesystem_context.directories,
             &filesystem_context.blobs,
@@ -681,7 +696,7 @@ async fn cache_installed_plugins_for_plugin_state_depths(
 }
 
 fn file_history_plugin_events(
-    installed_plugins_cache: &BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    installed_plugin_metadata_cache: &BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
     event_plugin_state: &[FileHistoryPluginStateRecord],
     descriptors: &[FileHistoryDescriptorRecord],
     directories: &[FileHistoryDirectoryRecord],
@@ -696,11 +711,11 @@ fn file_history_plugin_events(
         let Some(path) = resolve_file_history_path(descriptor, directories, event.depth) else {
             continue;
         };
-        let plugins = installed_plugins_cache
+        let plugins = installed_plugin_metadata_cache
             .get(&(event.start_commit_id.clone(), event.depth))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let Some(plugin) = select_plugin_for_path(plugins, &path) else {
+        let Some(plugin) = select_plugin_metadata_for_path(plugins, &path) else {
             continue;
         };
         if plugin
@@ -907,35 +922,58 @@ fn resolve_file_history_path(
 
 async fn render_plugin_file_history_data(
     plugin_host: &PluginRuntimeHost,
-    installed_plugins_cache: &BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    installed_plugins_cache: &mut BTreeMap<(String, u32, String), InstalledPlugin>,
+    installed_plugin_metadata_cache: &BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
     plugin_state: &[FileHistoryPluginStateRecord],
     descriptor: &FileHistoryDescriptorRecord,
     event: &FileHistoryEvent,
     path: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let plugins = installed_plugins_cache
+    let plugins = installed_plugin_metadata_cache
         .get(&(event.start_commit_id.clone(), event.depth))
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let Some(plugin) = select_plugin_for_path(plugins, path) else {
+    let Some(plugin_metadata) = select_plugin_metadata_for_path(plugins, path) else {
         return Ok(None);
     };
+    let plugin = installed_plugin_at_history_depth(
+        blob_reader,
+        installed_plugins_cache,
+        plugin_metadata,
+        &event.start_commit_id,
+        event.depth,
+    )
+    .await?;
     let rows = plugin_state_live_rows_at_depth(plugin_state, plugin, descriptor, event);
     let active_state = retain_plugin_state_rows(plugin, rows);
     render_materialized_plugin_file(plugin_host, plugin, &active_state).await
 }
 
+fn select_plugin_metadata_for_path<'a>(
+    plugins: &'a [InstalledPluginMetadata],
+    path: &str,
+) -> Option<&'a InstalledPluginMetadata> {
+    select_best_glob_match(
+        path,
+        None::<PluginContentType>,
+        plugins,
+        |plugin| plugin.path_glob.as_str(),
+        |plugin| plugin.content_type,
+    )
+}
+
 async fn installed_plugins_at_history_depth<'a>(
     blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &'a mut BTreeMap<(String, u32), Vec<InstalledPlugin>>,
+    installed_plugin_metadata_cache: &'a mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
     descriptors: &[FileHistoryDescriptorRecord],
     directories: &[FileHistoryDirectoryRecord],
     blobs: &[FileHistoryBlobRecord],
     start_commit_id: &str,
     depth: u32,
-) -> Result<&'a [InstalledPlugin], LixError> {
+) -> Result<&'a [InstalledPluginMetadata], LixError> {
     let key = (start_commit_id.to_string(), depth);
-    if !installed_plugins_cache.contains_key(&key) {
+    if !installed_plugin_metadata_cache.contains_key(&key) {
         let rows = filesystem_live_rows_at_history_depth(
             descriptors,
             directories,
@@ -945,13 +983,92 @@ async fn installed_plugins_at_history_depth<'a>(
         );
         let filesystem = FilesystemIndex::from_live_rows(rows)?;
         let plugins =
-            load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await?;
-        installed_plugins_cache.insert(key.clone(), plugins);
+            load_installed_plugin_metadata_from_filesystem(&filesystem, blob_reader.as_ref())
+                .await?;
+        installed_plugin_metadata_cache.insert(key.clone(), plugins);
     }
-    Ok(installed_plugins_cache
+    Ok(installed_plugin_metadata_cache
         .get(&key)
         .map(Vec::as_slice)
         .unwrap_or(&[]))
+}
+
+async fn load_installed_plugin_metadata_from_filesystem(
+    filesystem: &FilesystemIndex,
+    blob_reader: &dyn BlobDataReader,
+) -> Result<Vec<InstalledPluginMetadata>, LixError> {
+    let mut plugins = Vec::new();
+    for (path, file) in filesystem.file_entries() {
+        let Some(plugin_key) = plugin_key_from_archive_path(path) else {
+            continue;
+        };
+        let Some(blob_hash) = file.blob_hash.as_deref() else {
+            continue;
+        };
+        let Ok(hash) = BlobHash::from_hex(blob_hash) else {
+            continue;
+        };
+        let mut batch = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
+        let Some(archive_bytes) = batch.pop().flatten() else {
+            continue;
+        };
+        let Ok(mut plugin) =
+            load_installed_plugin_metadata_from_archive_bytes(&plugin_key, path, &archive_bytes)
+        else {
+            continue;
+        };
+        plugin.archive_path = path.to_string();
+        plugin.archive_blob_hash = blob_hash.to_string();
+        plugins.push(plugin);
+    }
+    Ok(plugins)
+}
+
+async fn installed_plugin_at_history_depth<'a>(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    installed_plugins_cache: &'a mut BTreeMap<(String, u32, String), InstalledPlugin>,
+    plugin_metadata: &InstalledPluginMetadata,
+    start_commit_id: &str,
+    depth: u32,
+) -> Result<&'a InstalledPlugin, LixError> {
+    let cache_key = (
+        start_commit_id.to_string(),
+        depth,
+        plugin_metadata.key.clone(),
+    );
+    if !installed_plugins_cache.contains_key(&cache_key) {
+        let Some(plugin) =
+            load_installed_plugin_at_history_depth(blob_reader, plugin_metadata).await?
+        else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "installed plugin archive '{}' is unavailable at history depth {}",
+                    plugin_metadata.key, depth
+                ),
+            ));
+        };
+        installed_plugins_cache.insert(cache_key.clone(), plugin);
+    }
+    Ok(installed_plugins_cache
+        .get(&cache_key)
+        .expect("plugin should be cached after load"))
+}
+
+async fn load_installed_plugin_at_history_depth(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_metadata: &InstalledPluginMetadata,
+) -> Result<Option<InstalledPlugin>, LixError> {
+    let hash = BlobHash::from_hex(&plugin_metadata.archive_blob_hash)?;
+    let mut batch = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
+    let Some(archive_bytes) = batch.pop().flatten() else {
+        return Ok(None);
+    };
+    Ok(Some(load_installed_plugin_from_archive_bytes(
+        &plugin_metadata.key,
+        &plugin_metadata.archive_path,
+        &archive_bytes,
+    )?))
 }
 
 fn filesystem_live_rows_at_history_depth(

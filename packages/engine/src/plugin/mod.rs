@@ -12,7 +12,8 @@ mod materializer;
 mod storage;
 
 pub(crate) use archive::{
-    ParsedPluginArchive, load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install,
+    ParsedPluginArchive, load_installed_plugin_from_archive_bytes,
+    load_installed_plugin_metadata_from_archive_bytes, parse_plugin_archive_for_install,
 };
 pub(crate) use component::{CachedPluginComponent, PluginComponentHost, PluginRuntimeHost};
 pub(crate) use install::plugin_schema_rows_from_archive_path;
@@ -45,4 +46,14 @@ pub(crate) struct InstalledPlugin {
     pub schema_keys: Vec<String>,
     pub manifest_json: String,
     pub wasm: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledPluginMetadata {
+    pub key: String,
+    pub archive_path: String,
+    pub archive_blob_hash: String,
+    pub path_glob: String,
+    pub content_type: Option<PluginContentType>,
+    pub schema_keys: Vec<String>,
 }
