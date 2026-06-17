@@ -105,24 +105,35 @@ where
 
     pub(crate) fn load_mutation_revision(&self) -> Result<Option<Bytes>, BackendError> {
         let read = self.backend.begin_read(ReadOptions::default())?;
-        let values = get_many(
-            &read,
-            MUTATION_REVISION_SPACE.id,
-            &[mutation_revision_key()],
-            GetOptions {
-                projection: CoreProjection::FullValue,
-                ..GetOptions::default()
-            },
-        )?;
-        Ok(values
-            .values
-            .into_iter()
-            .next()
-            .flatten()
-            .and_then(|value| match value {
-                ProjectedValue::FullValue(bytes) => Some(bytes),
-                ProjectedValue::KeyOnly => None,
-            }))
+        Self::load_mutation_revision_from_read(&StorageReadScope::new(read))
+    }
+
+    pub(crate) fn load_mutation_revision_from_read<R>(
+        read: &R,
+    ) -> Result<Option<Bytes>, BackendError>
+    where
+        R: StorageRead + ?Sized,
+    {
+        read.with_backend(|backend_read| {
+            let values = get_many(
+                backend_read,
+                MUTATION_REVISION_SPACE.id,
+                &[mutation_revision_key()],
+                GetOptions {
+                    projection: CoreProjection::FullValue,
+                    ..GetOptions::default()
+                },
+            )?;
+            Ok(values
+                .values
+                .into_iter()
+                .next()
+                .flatten()
+                .and_then(|value| match value {
+                    ProjectedValue::FullValue(bytes) => Some(bytes),
+                    ProjectedValue::KeyOnly => None,
+                }))
+        })
     }
 
     pub fn delete_range(
@@ -385,6 +396,41 @@ mod tests {
         assert_eq!(
             result.value[0],
             Some(ProjectedValue::FullValue(Bytes::from_static(b"A")))
+        );
+    }
+
+    #[test]
+    fn mutation_revision_loaded_from_read_uses_that_read_snapshot() {
+        let storage = StorageContext::new(InMemoryBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.put(space(1), key("a"), value("A"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let revision_at_read =
+            StorageContext::<InMemoryBackend>::load_mutation_revision_from_read(&read)
+                .expect("load revision from read");
+
+        let mut later = storage.new_write_set();
+        later.put(space(1), key("a"), value("B"));
+        storage
+            .commit_write_set(later, WriteOptions::default())
+            .expect("later commit");
+
+        assert_ne!(
+            storage
+                .load_mutation_revision()
+                .expect("load latest revision"),
+            revision_at_read
+        );
+        assert_eq!(
+            StorageContext::<InMemoryBackend>::load_mutation_revision_from_read(&read)
+                .expect("load old revision"),
+            revision_at_read
         );
     }
 }

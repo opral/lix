@@ -1,11 +1,12 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::functions::FunctionContext;
+use crate::branch::BranchRefReader;
+use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql2;
 use crate::storage::{
-    SharedStorageRead, StorageBackend, StorageReadOptions, StorageReadScope, StorageWriteOptions,
-    StorageWriteSet,
+    SharedStorageRead, StorageBackend, StorageContext, StorageReadOptions, StorageReadScope,
+    StorageWriteOptions, StorageWriteSet,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
@@ -24,6 +25,15 @@ pub struct ExecuteResult {
     rows: Vec<Row>,
     rows_affected: u64,
     notices: Vec<LixNotice>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoherentReadBatch {
+    pub active_branch_id: String,
+    pub active_branch_commit_id: String,
+    pub storage_mutation_revision: Option<Vec<u8>>,
+    pub results: Vec<ExecuteResult>,
 }
 
 impl ExecuteResult {
@@ -354,35 +364,9 @@ where
         };
         let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result =
-            with_static_session_sql_read::<B, _, _>(read_scope, |read_store| async move {
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
-                let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-                let functions = runtime_functions.provider();
-                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let visible_schemas = self
-                    .catalog_context
-                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                    .await?;
-                let ctx = SessionSqlExecutionContext {
-                    active_branch_id: &active_branch_id,
-                    read_store,
-                    live_state: Arc::clone(&self.live_state),
-                    binary_cas: Arc::clone(&self.binary_cas),
-                    branch_ctx: Arc::clone(&self.branch_ctx),
-                    visible_schemas,
-                    functions: functions.clone(),
-                    plugin_host: self.plugin_host.clone(),
-                };
-
-                let result =
-                    sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
-                drop(ctx);
-                drop(live_state);
-                Ok::<_, LixError>(sql2::SessionReadSqlResult {
-                    runtime_functions,
-                    query: result,
-                })
+            with_static_session_sql_read::<B, _, _, _>(read_scope, |read_store| async move {
+                self.execute_read_statement_with_store(read_store, sql, statement, params)
+                    .await
             });
         let read_result = match read_result.await {
             Ok(result) => result,
@@ -401,6 +385,96 @@ where
             self.observe_invalidation.bump_if_storage_changed(&stats);
         }
         Ok(ExecuteResult::from_sql_query_result(read_result.query))
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_coherent_read_batch(
+        &self,
+        statements: &[(&str, &[Value])],
+    ) -> Result<CoherentReadBatch, LixError> {
+        self.ensure_open()?;
+        let parsed = statements
+            .iter()
+            .map(|(sql, _)| {
+                let statement = sql2::parse_statement(sql)?;
+                if sql2::statement_has_durable_runtime_function(&statement) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "execute_coherent_read_batch does not support durable runtime functions",
+                    ));
+                }
+                match sql2::bind_statement_route(&statement)? {
+                    sql2::BoundStatementRoute::Read => Ok(statement),
+                    sql2::BoundStatementRoute::Write => Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "execute_coherent_read_batch only accepts read statements",
+                    )),
+                }
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+
+        let _operation_guard = self.begin_waitable_session_operation().await?;
+        let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
+        with_static_session_sql_read::<B, _, _, _>(read_scope, |read_store| async move {
+            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+            let active_branch_commit_id = self
+                .branch_ctx
+                .ref_reader(read_store.clone())
+                .load_head(&active_branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::branch_not_found(
+                        active_branch_id.clone(),
+                        "execute coherent read batch",
+                        "active branch",
+                    )
+                })?
+                .commit_id
+                .to_string();
+            let storage_mutation_revision =
+                StorageContext::<B>::load_mutation_revision_from_read(&read_store)?
+                    .map(|revision| revision.to_vec());
+            if parsed.is_empty() {
+                return Ok(CoherentReadBatch {
+                    active_branch_id,
+                    active_branch_commit_id,
+                    storage_mutation_revision,
+                    results: Vec::new(),
+                });
+            }
+            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let visible_schemas = self
+                .catalog_context
+                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+                .await?;
+            let ctx = SessionSqlExecutionContext {
+                active_branch_id: &active_branch_id,
+                read_store,
+                live_state: Arc::clone(&self.live_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                branch_ctx: Arc::clone(&self.branch_ctx),
+                visible_schemas,
+                functions: FunctionProviderHandle::system(),
+                plugin_host: self.plugin_host.clone(),
+            };
+            let mut results = Vec::with_capacity(statements.len());
+            for ((sql, params), statement) in statements.iter().zip(parsed) {
+                let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                results.push(ExecuteResult::from_sql_query_result(query));
+            }
+            drop(ctx);
+            drop(live_state);
+            Ok(CoherentReadBatch {
+                active_branch_id,
+                active_branch_commit_id,
+                storage_mutation_revision,
+                results,
+            })
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -474,6 +548,42 @@ where
         })?;
         Ok(Some(stats))
     }
+
+    async fn execute_read_statement_with_store(
+        &self,
+        read_store: SharedStorageRead<B::Read<'static>>,
+        sql: &str,
+        statement: datafusion::sql::parser::Statement,
+        params: &[Value],
+    ) -> Result<sql2::SessionReadSqlResult, LixError> {
+        let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+            Arc::new(self.live_state.reader(read_store.clone()));
+        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
+        let functions = runtime_functions.provider();
+        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        let visible_schemas = self
+            .catalog_context
+            .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+            .await?;
+        let ctx = SessionSqlExecutionContext {
+            active_branch_id: &active_branch_id,
+            read_store,
+            live_state: Arc::clone(&self.live_state),
+            binary_cas: Arc::clone(&self.binary_cas),
+            branch_ctx: Arc::clone(&self.branch_ctx),
+            visible_schemas,
+            functions: functions.clone(),
+            plugin_host: self.plugin_host.clone(),
+        };
+
+        let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
+        drop(ctx);
+        drop(live_state);
+        Ok(sql2::SessionReadSqlResult {
+            runtime_functions,
+            query,
+        })
+    }
 }
 
 /// Runs one session SQL read using a widened backend-read lifetime.
@@ -482,14 +592,14 @@ where
 /// backends such as RocksDB/redb naturally expose borrowed read snapshots. Keep
 /// the lifetime erasure private to session SQL execution so callers cannot
 /// receive the widened read as a general crate capability.
-async fn with_static_session_sql_read<B, F, Fut>(
+async fn with_static_session_sql_read<B, F, Fut, T>(
     read: StorageReadScope<B::Read<'_>>,
     f: F,
-) -> Result<sql2::SessionReadSqlResult, LixError>
+) -> Result<T, LixError>
 where
     B: StorageBackend + 'static,
     F: FnOnce(SharedStorageRead<B::Read<'static>>) -> Fut,
-    Fut: Future<Output = Result<sql2::SessionReadSqlResult, LixError>>,
+    Fut: Future<Output = Result<T, LixError>>,
 {
     // SAFETY: the widened read is wrapped immediately in `SharedStorageRead`,
     // only passed into this private SQL execution closure, and explicitly
@@ -700,6 +810,21 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Engine, InMemoryBackend};
+
+    async fn open_session() -> SessionContext<InMemoryBackend> {
+        let backend = InMemoryBackend::default();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("backend should initialize");
+        let engine = Engine::new(backend)
+            .await
+            .expect("initialized backend should create engine");
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open")
+    }
 
     #[test]
     fn row_get_converts_native_values_and_value_keeps_wrapper() {
@@ -731,5 +856,80 @@ mod tests {
 
         let wrong_type = row.get::<bool>("title").unwrap_err();
         assert_eq!(wrong_type.code, "LIX_ERROR_VALUE_TYPE");
+    }
+
+    #[tokio::test]
+    async fn coherent_read_batch_rejects_write_statements() {
+        let session = open_session().await;
+        let statements: [(&str, &[Value]); 1] = [(
+            "INSERT INTO lix_key_value (key, value) VALUES ('batch-write', 'value')",
+            &[],
+        )];
+
+        let error = session
+            .execute_coherent_read_batch(&statements)
+            .await
+            .expect_err("write statement should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            error
+                .message
+                .contains("execute_coherent_read_batch only accepts read statements")
+        );
+    }
+
+    #[tokio::test]
+    async fn coherent_read_batch_returns_metadata_and_ordered_results() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('batch-read', 'value')",
+                &[],
+            )
+            .await
+            .expect("seed row");
+        let active_branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch id should load");
+        let storage_mutation_revision = session
+            .storage_mutation_revision()
+            .await
+            .expect("mutation revision should load");
+        let active_branch_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("active branch commit should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("commit id should be text");
+        let statements: [(&str, &[Value]); 2] = [
+            ("SELECT 'first' AS label", &[]),
+            (
+                "SELECT key, value FROM lix_key_value WHERE key = 'batch-read'",
+                &[],
+            ),
+        ];
+
+        let batch = session
+            .execute_coherent_read_batch(&statements)
+            .await
+            .expect("coherent read batch should execute");
+
+        assert_eq!(batch.active_branch_id, active_branch_id);
+        assert_eq!(batch.active_branch_commit_id, active_branch_commit_id);
+        assert_eq!(batch.storage_mutation_revision, storage_mutation_revision);
+        assert_eq!(batch.results.len(), 2);
+        assert_eq!(
+            batch.results[0].rows()[0].get::<String>("label").unwrap(),
+            "first"
+        );
+        let row = &batch.results[1].rows()[0];
+        assert_eq!(row.get::<String>("key").unwrap(), "batch-read");
+        assert_eq!(
+            row.get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("value")
+        );
     }
 }

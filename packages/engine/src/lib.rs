@@ -84,11 +84,13 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
+    CoherentReadBatch, ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue,
+};
+pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
     MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
-pub use session::{ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue};
 
 pub(crate) const GLOBAL_BRANCH_ID: &str = "global";
