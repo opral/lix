@@ -88,9 +88,7 @@ pub(super) fn optional_scalar_value(
 
 /// Extract a string literal from a logical expression, shared by the specs
 /// that parse pushed-down filters.
-pub(super) fn string_expr_literal(
-    expr: &datafusion::logical_expr::Expr,
-) -> Option<String> {
+pub(super) fn string_expr_literal(expr: &datafusion::logical_expr::Expr) -> Option<String> {
     let datafusion::logical_expr::Expr::Literal(literal, _) = expr else {
         return None;
     };

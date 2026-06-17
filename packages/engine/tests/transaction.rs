@@ -3,12 +3,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lix_engine::Engine;
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
     InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
     ScanResult, ScanVisitor, SpaceId, WriteOptions,
 };
-use lix_engine::Engine;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 

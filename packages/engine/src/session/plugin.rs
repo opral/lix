@@ -1,11 +1,11 @@
-use crate::filesystem::{filesystem_schema_keys, FilesystemIndex};
+use crate::LixError;
+use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::plugin::{
-    load_installed_plugins_from_filesystem, parse_plugin_archive_for_install,
-    plugin_storage_archive_path, PluginContentType,
+    PluginContentType, load_installed_plugins_from_filesystem, parse_plugin_archive_for_install,
+    plugin_storage_archive_path,
 };
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
-use crate::LixError;
 
 use super::{FsWriteOptions, SessionContext};
 

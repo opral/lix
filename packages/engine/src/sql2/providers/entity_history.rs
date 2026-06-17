@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::execution::context::ExecutionProps;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::prelude::SessionContext;
 use serde_json::Value as JsonValue;
@@ -342,4 +342,3 @@ fn entity_history_column_value(
     )
     .map_err(|error| DataFusionError::Execution(error.to_string()))
 }
-

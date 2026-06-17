@@ -5,15 +5,15 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use tokio::sync::Notify;
 
+use crate::LixError;
 #[cfg(test)]
 use crate::transaction::CommitBoundaryGuard;
 use crate::transaction::{
-    open_transaction, CommitBoundaryState, Transaction, TransactionCommitBoundary,
+    CommitBoundaryState, Transaction, TransactionCommitBoundary, open_transaction,
 };
-use crate::LixError;
 
-use super::context::{closed_error, SessionWriteAccess};
 use super::SessionContext;
+use super::context::{SessionWriteAccess, closed_error};
 
 #[expect(missing_debug_implementations)]
 pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {

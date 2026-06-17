@@ -8,8 +8,7 @@ use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
-    BoundWriteOp,
-    BoundWriteTarget, EntityWriteSurface,
+    BoundWriteOp, BoundWriteTarget, EntityWriteSurface,
 };
 use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
 use crate::sql2::catalog::{
