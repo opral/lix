@@ -7,7 +7,7 @@ use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
-use lix_engine::{Engine, FsWriteOptions, InMemoryBackend, LixError};
+use lix_engine::{Engine, InMemoryBackend, LixError};
 use serde_json::json;
 
 use super::assert_rows_eq;
@@ -305,24 +305,32 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
         .expect("workspace session should open");
 
     session
-        .install_plugin(&history_render_plugin_archive())
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix_system/plugins/plugin_history_render.lixplugin".to_string()),
+                Value::Blob(history_render_plugin_archive()),
+            ],
+        )
         .await
-        .expect("plugin install should succeed");
+        .expect("plugin archive write should install plugin");
     session
-        .fs()
-        .write_file(
-            "/note.history-render",
-            b"first".to_vec(),
-            FsWriteOptions::default(),
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/note.history-render".to_string()),
+                Value::Blob(b"first".to_vec()),
+            ],
         )
         .await
         .expect("plugin file write should succeed");
     session
-        .fs()
-        .write_file(
-            "/note.history-render",
-            b"second".to_vec(),
-            FsWriteOptions::default(),
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            &[
+                Value::Blob(b"second".to_vec()),
+                Value::Text("/note.history-render".to_string()),
+            ],
         )
         .await
         .expect("plugin file update should succeed");
