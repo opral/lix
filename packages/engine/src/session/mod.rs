@@ -21,7 +21,7 @@ mod transaction;
 pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
-pub use execute::{ExecuteResult, Row, RowRef, TryFromValue};
+pub use execute::{CoherentReadBatch, ExecuteResult, Row, RowRef, TryFromValue};
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,

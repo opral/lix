@@ -103,6 +103,12 @@ struct LixRevision {
     storage_mutation_revision: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LixSnapshotRead {
+    snapshot: Snapshot,
+    revision: LixRevision,
+}
+
 enum FilesystemEvent {
     DiskChanged,
     SyncFromLix {
@@ -410,15 +416,16 @@ where
 {
     async fn sync_from_lix(&self) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
-        let local = collect_local_snapshot(&self.root)?;
         let lix_revision = self.collect_lix_revision().await?;
-        if self.is_last_materialized(&local, &lix_revision) {
-            return Ok(());
+        if self.is_last_materialized_lix_revision(&lix_revision) {
+            let local = collect_local_snapshot(&self.root)?;
+            if self.is_last_materialized_disk(&local) {
+                return Ok(());
+            }
         }
-        let lix = self.collect_lix_snapshot().await?;
-        let disk = self.materialize_snapshot(&lix)?;
-        let lix_revision = self.collect_lix_revision().await?;
-        self.remember_materialized(disk, lix_revision);
+        let lix = self.collect_lix_snapshot_read().await?;
+        let disk = self.materialize_snapshot(&lix.snapshot)?;
+        self.remember_materialized(disk, lix.revision);
         Ok(())
     }
 
@@ -434,10 +441,9 @@ where
         let previous = self.last_materialized_disk();
         self.apply_local_snapshot_to_lix(&local, previous.as_ref())
             .await?;
-        let lix = self.collect_lix_snapshot().await?;
-        let materialized = self.materialize_snapshot_after_disk_sync(&lix, &local)?;
-        let lix_revision = self.collect_lix_revision().await?;
-        self.remember_materialized(materialized, lix_revision);
+        let lix = self.collect_lix_snapshot_read().await?;
+        let materialized = self.materialize_snapshot_after_disk_sync(&lix.snapshot, &local)?;
+        self.remember_materialized(materialized, lix.revision);
         Ok(())
     }
 
@@ -445,53 +451,51 @@ where
         self.session.close().await
     }
 
-    async fn collect_lix_snapshot(&self) -> Result<Snapshot, LixError> {
+    async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
         let mut snapshot = Snapshot::default();
         snapshot.directories.insert("/".to_string());
-        let directories = self
+        let statements: [(&str, &[Value]); 2] = [
+            ("SELECT path FROM lix_directory ORDER BY path", &[]),
+            ("SELECT path, data FROM lix_file ORDER BY path", &[]),
+        ];
+        let batch = self
             .session
-            .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+            .execute_coherent_read_batch(&statements)
             .await?;
+        let [directories, files] = batch.results.try_into().map_err(|results: Vec<_>| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "coherent filesystem snapshot read returned {} result sets",
+                    results.len()
+                ),
+            )
+        })?;
         for row in directories.rows() {
             snapshot.directories.insert(row.get::<String>("path")?);
         }
-        let files = self
-            .session
-            .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
-            .await?;
         for row in files.rows() {
             let path = row.get::<String>("path")?;
             let data = row.get::<Vec<u8>>("data")?;
             snapshot.files.insert(path, data);
         }
-        Ok(snapshot)
+
+        Ok(LixSnapshotRead {
+            snapshot,
+            revision: LixRevision {
+                active_branch_id: batch.active_branch_id,
+                active_branch_commit_id: batch.active_branch_commit_id,
+                storage_mutation_revision: batch.storage_mutation_revision,
+            },
+        })
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let active_branch_id = self.session.active_branch_id().await?;
-        let rows = self
-            .session
-            .execute(
-                "SELECT lix_active_branch_commit_id() AS active_branch_commit_id",
-                &[],
-            )
-            .await?;
-        let active_branch_commit_id = rows
-            .rows()
-            .first()
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "lix_active_branch_commit_id() returned no rows",
-                )
-            })?
-            .get::<String>("active_branch_commit_id")?;
-        let storage_mutation_revision = self.session.storage_mutation_revision().await?;
-
+        let batch = self.session.execute_coherent_read_batch(&[]).await?;
         Ok(LixRevision {
-            active_branch_id,
-            active_branch_commit_id,
-            storage_mutation_revision,
+            active_branch_id: batch.active_branch_id,
+            active_branch_commit_id: batch.active_branch_commit_id,
+            storage_mutation_revision: batch.storage_mutation_revision,
         })
     }
 
@@ -500,7 +504,7 @@ where
         local: &Snapshot,
         previous: Option<&Snapshot>,
     ) -> Result<(), LixError> {
-        let lix = self.collect_lix_snapshot().await?;
+        let lix = self.collect_lix_snapshot_read().await?.snapshot;
 
         for path in lix.files.keys() {
             if !local.files.contains_key(path)
@@ -703,6 +707,14 @@ where
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
             .is_some_and(|materialized| &materialized.disk == snapshot)
+    }
+
+    fn is_last_materialized_lix_revision(&self, lix_revision: &LixRevision) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| &materialized.lix_revision == lix_revision)
     }
 
     fn is_last_materialized(&self, disk: &Snapshot, lix_revision: &LixRevision) -> bool {
@@ -1627,12 +1639,11 @@ mod tests {
         );
         std::fs::write(&disk_path, b"changed").unwrap();
 
-        let target = state.collect_lix_snapshot().await.unwrap();
+        let target = state.collect_lix_snapshot_read().await.unwrap();
         let materialized = state
-            .materialize_snapshot_after_disk_sync(&target, &local)
+            .materialize_snapshot_after_disk_sync(&target.snapshot, &local)
             .unwrap();
-        let target_revision = state.collect_lix_revision().await.unwrap();
-        state.remember_materialized(materialized, target_revision);
+        state.remember_materialized(materialized, target.revision);
         assert_eq!(std::fs::read(&disk_path).unwrap(), b"changed");
 
         state.sync_disk_to_lix(true).await.unwrap();
