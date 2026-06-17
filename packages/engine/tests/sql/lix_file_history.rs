@@ -178,6 +178,118 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    lix_file_history_limit_applies_after_sql_ordering,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('aaa-older-history-file', '/older.txt', X'6F6C646572')",
+                &[],
+            )
+            .await
+            .expect("older file insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('zzz-newer-history-file', '/newer.txt', X'6E65776572')",
+                &[],
+            )
+            .await
+            .expect("newer file insert should succeed");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("file commit head should load")
+            .expect("file commit head should exist");
+
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     ORDER BY lixcol_depth \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("file history read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("zzz-newer-history-file".to_string()),
+                Value::Text("/newer.txt".to_string()),
+                Value::Integer(0),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_history_limit_applies_after_residual_path_filters,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                    ('aaa-history-noise-1', '/noise/one.txt', X'6F6E65'), \
+                    ('aaa-history-noise-2', '/noise/two.txt', X'74776F'), \
+                    ('zzz-history-target', '/target/three.txt', X'7468726565')",
+                &[],
+            )
+            .await
+            .expect("file inserts should succeed");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("file commit head should load")
+            .expect("file commit head should exist");
+
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, data \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                       AND path LIKE '/target/%' \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("file history read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("zzz-history-target".to_string()),
+                Value::Text("/target/three.txt".to_string()),
+                Value::Blob(b"three".to_vec()),
+            ]],
+        );
+    }
+);
+
 #[tokio::test]
 async fn lix_file_history_renders_plugin_state_at_each_depth() {
     let backend = InMemoryBackend::new();
@@ -214,6 +326,14 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
         )
         .await
         .expect("plugin file update should succeed");
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) \
+             VALUES ('history-render-sidecar', 'newer non-file commit')",
+            &[],
+        )
+        .await
+        .expect("non-file commit should succeed");
 
     let commit_id_rows = session
         .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
@@ -246,8 +366,8 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
                  FROM lix_file_history \
                  WHERE lixcol_start_commit_id = '{commit_id}' \
                    AND id = '{file_id}' \
-                   AND lixcol_depth IN (0, 1) \
-                 ORDER BY lixcol_depth"
+                 ORDER BY lixcol_depth \
+                 LIMIT 2"
             ),
             &[],
         )
@@ -260,12 +380,12 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
             vec![
                 Value::Text("/note.history-render".to_string()),
                 Value::Blob(b"rendered:second-a|second-b".to_vec()),
-                Value::Integer(0),
+                Value::Integer(1),
             ],
             vec![
                 Value::Text("/note.history-render".to_string()),
                 Value::Blob(b"rendered:first-a|first-b".to_vec()),
-                Value::Integer(1),
+                Value::Integer(2),
             ],
         ],
     );
