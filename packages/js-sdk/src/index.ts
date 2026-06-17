@@ -19,7 +19,6 @@ export type {
 	FsBackendOptions,
 	JsonValue,
 	LixValue,
-	LixFs,
 	MergeBranchOptions,
 	MergeBranchOutcome,
 	MergeBranchPreview,

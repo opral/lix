@@ -1,9 +1,9 @@
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry,
-    FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, InstalledPluginInfo, LixError,
-    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    ObserveEvents, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InMemoryBackend,
+    LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, ObserveEvents, SessionContext, SwitchBranchOptions, SwitchBranchReceipt,
+    Value,
 };
 use std::sync::Arc;
 
@@ -137,39 +137,6 @@ where
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
         self.session.merge_branch_preview(options).await
-    }
-
-    pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.session.install_plugin(archive_bytes).await
-    }
-
-    pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {
-        self.session.list_installed_plugins().await
-    }
-
-    pub async fn write_file(
-        &self,
-        path: &str,
-        data: Vec<u8>,
-        options: FsWriteOptions,
-    ) -> Result<(), LixError> {
-        self.session.fs().write_file(path, data, options).await
-    }
-
-    pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
-        self.session.fs().read_file(path).await
-    }
-
-    pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
-        self.session.fs().mkdir(path, options).await
-    }
-
-    pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
-        self.session.fs().readdir(path).await
-    }
-
-    pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
-        self.session.fs().rm(path, options).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

@@ -62,8 +62,7 @@ impl ObserveInvalidation {
         let mut last_seen_revision = match storage.load_mutation_revision() {
             Ok(revision) => revision,
             Err(error) => {
-                self.external_watcher_started
-                    .store(false, Ordering::SeqCst);
+                self.external_watcher_started.store(false, Ordering::SeqCst);
                 return Err(error.into());
             }
         };

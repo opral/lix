@@ -88,7 +88,7 @@ mod tests {
             "/.lix_system/plugins/plugin_json.lixplugin",
             "/.lix_system/plugins/nested/file.txt",
         ] {
-            let error = reject_normal_plugin_storage_mutation(path, "fs.write_file")
+            let error = reject_normal_plugin_storage_mutation(path, "lix_file write")
                 .expect_err("plugin storage paths should be reserved");
             assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
             assert!(error.message.contains("reserved plugin storage path"));
@@ -102,7 +102,7 @@ mod tests {
 
         reject_normal_plugin_storage_mutation(
             "/.lix_system/plugins-adjacent/file.txt",
-            "fs.write_file",
+            "lix_file write",
         )
         .expect("adjacent paths should remain writable");
     }

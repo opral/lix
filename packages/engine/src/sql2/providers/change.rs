@@ -80,9 +80,10 @@ where
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {
                     let mut json_reader = query_source.json_reader;
-                    let canonical_changes = scan_changelog_changes(query_source.store, pushed_limit)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                    let canonical_changes =
+                        scan_changelog_changes(query_source.store, pushed_limit)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
                     let mut changes = Vec::with_capacity(canonical_changes.len());
                     for change in canonical_changes {
                         match change {
@@ -189,7 +190,6 @@ fn commit_record_canonical_change(
         created_at: commit.created_at,
     }
 }
-
 
 pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![

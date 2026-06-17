@@ -23,9 +23,8 @@ use super::table::{
 };
 use super::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundParamMap,
-    BoundWrite,
-    BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface,
-    FileWriteSurface,
+    BoundWrite, BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
+    EntityWriteSurface, FileWriteSurface,
 };
 
 pub(crate) fn bind_statement(
