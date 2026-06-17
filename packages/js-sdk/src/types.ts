@@ -48,11 +48,6 @@ export type ObserveEvent = {
 	result: ExecuteResult;
 };
 
-export type LixFs = {
-	readFile(path: string): Promise<Uint8Array | undefined>;
-	writeFile(path: string, data: Uint8Array): Promise<void>;
-};
-
 export type RowLike = {
 	get(column: string): unknown;
 	value(column: string): ValueLike;

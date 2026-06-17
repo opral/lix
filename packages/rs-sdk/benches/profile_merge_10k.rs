@@ -12,7 +12,7 @@
 //! frames appear that the bench's in-process setup absorbs. Profile shapes are
 //! comparable; absolute times are not.
 
-use lix_sdk::{FsWriteOptions, OpenLixOptions, SqliteBackend, Value, open_lix};
+use lix_sdk::{OpenLixOptions, SqliteBackend, Value, open_lix};
 use std::io::{Cursor, Write as _};
 use std::path::Path;
 use std::time::Instant;
@@ -55,12 +55,10 @@ fn main() {
             ))
             .await
             .unwrap();
-            lix.install_plugin(&plugin).await.unwrap();
+            install_plugin(&lix, "plugin_csv", &plugin).await;
             let initial_csv = csv_bytes_from_rows(&initial_rows);
             let start = Instant::now();
-            lix.write_file(CSV_PATH, initial_csv, FsWriteOptions::default())
-                .await
-                .unwrap();
+            write_file(&lix, CSV_PATH, initial_csv).await;
             eprintln!("setup insert took {:?}", start.elapsed());
             lix.close().await.unwrap();
         }),
@@ -77,13 +75,7 @@ fn main() {
             .unwrap();
             // Warm: compiles the wasm component and primes caches outside the
             // measured region, mirroring warm_lix_csv_plugin in the bench.
-            lix.write_file(
-                CSV_PLUGIN_WARMUP_PATH,
-                Vec::new(),
-                FsWriteOptions::default(),
-            )
-            .await
-            .unwrap();
+            write_file(&lix, CSV_PLUGIN_WARMUP_PATH, Vec::new()).await;
             lix.execute(
                 "DELETE FROM lix_file WHERE path = $1",
                 &[Value::Text(CSV_PLUGIN_WARMUP_PATH.to_string())],
@@ -105,9 +97,22 @@ fn main() {
 
 #[inline(never)]
 async fn profile_merge_phase(lix: &lix_sdk::Lix<SqliteBackend>, updated_csv: Vec<u8>) {
-    lix.write_file(CSV_PATH, updated_csv, FsWriteOptions::default())
-        .await
-        .unwrap();
+    write_file(lix, CSV_PATH, updated_csv).await;
+}
+
+async fn install_plugin(lix: &lix_sdk::Lix<SqliteBackend>, key: &str, archive: &[u8]) {
+    let path = format!("/.lix_system/plugins/{key}.lixplugin");
+    write_file(lix, &path, archive.to_vec()).await;
+}
+
+async fn write_file(lix: &lix_sdk::Lix<SqliteBackend>, path: &str, data: Vec<u8>) {
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[Value::Text(path.to_string()), Value::Blob(data)],
+    )
+    .await
+    .unwrap();
 }
 
 /// Deterministic splitmix64 generator. The bench (e2e.rs) seeds rand's

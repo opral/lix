@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlite")]
 use lix_engine::run_backend_conformance;
 use lix_sdk::{
-    FsBackend, FsWriteOptions, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend,
+    Backend, FsBackend, Lix, LixError, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend,
     SqliteBackendFactory, Value, WasmComponentInstance, WasmLimits, WasmPluginDetectedChange,
     WasmPluginEntityState, WasmPluginFile, WasmRuntime, open_lix, open_lix_with_backend,
 };
@@ -125,26 +125,22 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
             "fs backend should store SQLite at dir/.lix/db.sqlite"
         );
         assert_eq!(
-            lix.read_file("/.lix")
+            read_file(&lix, "/.lix")
                 .await
                 .expect("reserved backing file path reads"),
             None,
             "dir/.lix should not be imported into Lix as a file"
         );
         assert_eq!(
-            lix.readdir("/.lix/")
+            readdir(&lix, "/.lix/")
                 .await
                 .expect("reserved backing directory path reads"),
             None,
             "dir/.lix should not be imported into Lix as a directory"
         );
-        lix.write_file(
-            "/persisted.txt",
-            b"persisted".to_vec(),
-            FsWriteOptions::default(),
-        )
-        .await
-        .expect("file write succeeds");
+        write_file(&lix, "/persisted.txt", b"persisted".to_vec())
+            .await
+            .expect("file write succeeds");
         wait_for_disk_file(
             &filesystem_path.join("persisted.txt"),
             Some(b"persisted".as_slice()),
@@ -160,8 +156,7 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
         .await
         .expect("plain lix opens on sqlite backend");
         assert_eq!(
-            plain
-                .read_file("/persisted.txt")
+            read_file(&plain, "/persisted.txt")
                 .await
                 .expect("persisted file reads")
                 .as_deref(),
@@ -177,13 +172,13 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
         .await
         .expect("lix reopens on fs backend");
     assert_eq!(
-        lix.read_file("/persisted.txt")
+        read_file(&lix, "/persisted.txt")
             .await
             .expect("persisted file reads after reopen")
             .as_deref(),
         Some(b"persisted".as_slice())
     );
-    lix.write_file("/second.txt", b"second".to_vec(), FsWriteOptions::default())
+    write_file(&lix, "/second.txt", b"second".to_vec())
         .await
         .expect("second file write succeeds");
     wait_for_disk_file(
@@ -213,7 +208,7 @@ async fn fs_backend_ignores_sqlite_sidecar_paths() {
         "/.lix/db.sqlite-journal",
     ] {
         assert_eq!(
-            lix.read_file(path).await.expect("metadata path reads"),
+            read_file(&lix, path).await.expect("metadata path reads"),
             None,
             "{path} should not be visible as a synced Lix file"
         );
@@ -236,22 +231,21 @@ async fn sqlite_backend_open_lix_options_supplies_plugin_wasm_runtime() {
     .await
     .expect("lix opens on sqlite backend with wasm runtime");
 
-    lix.install_plugin(&build_runtime_test_plugin_archive())
-        .await
-        .expect("plugin archive installs");
-    lix.write_file(
-        "/custom.runtime",
-        b"source bytes".to_vec(),
-        FsWriteOptions::default(),
+    install_plugin(
+        &lix,
+        "plugin_runtime_test",
+        &build_runtime_test_plugin_archive(),
     )
     .await
-    .expect("matching plugin file write uses the supplied wasm runtime");
+    .expect("plugin archive installs");
+    write_file(&lix, "/custom.runtime", b"source bytes".to_vec())
+        .await
+        .expect("matching plugin file write uses the supplied wasm runtime");
 
     assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.detect_calls.load(Ordering::SeqCst), 1);
 
-    let rendered = lix
-        .read_file("/custom.runtime")
+    let rendered = read_file(&lix, "/custom.runtime")
         .await
         .expect("plugin file reads");
     assert_eq!(
@@ -285,6 +279,88 @@ fn wait_for_disk_file(path: &std::path::Path, expected: Option<&[u8]>) {
     }
 }
 
+async fn install_plugin<B>(lix: &Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    write_file(
+        lix,
+        &format!("/.lix_system/plugins/{key}.lixplugin"),
+        archive.to_vec(),
+    )
+    .await
+}
+
+async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[Value::Text(path.to_string()), Value::Blob(data)],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    result
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("data"))
+        .transpose()
+}
+
+async fn readdir<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<String>>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let directory = lix
+        .execute(
+            "SELECT id FROM lix_directory WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    let Some(directory) = directory.rows().first() else {
+        return Ok(None);
+    };
+    let directory_id = directory.get::<String>("id")?;
+    let entries = lix
+        .execute(
+            "SELECT name FROM lix_directory WHERE parent_id = $1 \
+             UNION ALL \
+             SELECT name FROM lix_file WHERE directory_id = $1 \
+             ORDER BY name",
+            &[Value::Text(directory_id)],
+        )
+        .await?;
+    Ok(Some(
+        entries
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("name"))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
 #[derive(Default)]
 struct RecordingWasmRuntime {
     init_calls: Arc<AtomicUsize>,
@@ -303,7 +379,7 @@ impl WasmRuntime for RecordingWasmRuntime {
         &self,
         bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, lix_sdk::LixError> {
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         assert!(bytes.starts_with(b"\0asm"));
         self.init_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(RecordingWasmComponent {
@@ -319,7 +395,7 @@ impl WasmComponentInstance for RecordingWasmComponent {
         &self,
         _state: Vec<WasmPluginEntityState>,
         _file: WasmPluginFile,
-    ) -> Result<Vec<WasmPluginDetectedChange>, lix_sdk::LixError> {
+    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
         self.detect_calls.fetch_add(1, Ordering::SeqCst);
         Ok(vec![WasmPluginDetectedChange {
             entity_pk: vec!["doc".to_string()],
@@ -329,10 +405,7 @@ impl WasmComponentInstance for RecordingWasmComponent {
         }])
     }
 
-    async fn render(
-        &self,
-        _state: Vec<WasmPluginEntityState>,
-    ) -> Result<Vec<u8>, lix_sdk::LixError> {
+    async fn render(&self, _state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
         self.render_calls.fetch_add(1, Ordering::SeqCst);
         Ok(b"rendered by custom runtime".to_vec())
     }

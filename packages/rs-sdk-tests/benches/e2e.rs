@@ -1,6 +1,6 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lix_sdk::{
-    FsWriteOptions, InMemoryBackend, LixError, OpenLixOptions, SqliteBackend, Value,
+    Backend, InMemoryBackend, LixError, OpenLixOptions, SqliteBackend, Value,
     WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, open_lix,
 };
 use plugin_csv::exports::lix::plugin::api::EntityState as CsvEntityState;
@@ -388,23 +388,27 @@ impl BenchLix {
         }
     }
 
-    async fn write_file(
-        &self,
-        path: &str,
-        data: Vec<u8>,
-        options: FsWriteOptions,
-    ) -> Result<(), LixError> {
-        match self {
-            Self::Sqlite { lix, .. } => lix.write_file(path, data, options).await,
-            Self::InMemory { lix } => lix.write_file(path, data, options).await,
-        }
+    async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<(), LixError> {
+        self.execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            &[Value::Text(path.to_string()), Value::Blob(data)],
+        )
+        .await?;
+        Ok(())
     }
 
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
-        match self {
-            Self::Sqlite { lix, .. } => lix.read_file(path).await,
-            Self::InMemory { lix } => lix.read_file(path).await,
-        }
+        let result = self
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(path.to_string())],
+            )
+            .await?;
+        Ok(result
+            .rows()
+            .first()
+            .and_then(|row| row.get::<Vec<u8>>("data").ok()))
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -500,7 +504,7 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
     .await
     .unwrap();
 
-    lix.install_plugin(plugin).await.unwrap();
+    install_plugin(&lix, "plugin_csv", plugin).await.unwrap();
 
     BenchLix::Sqlite {
         lix,
@@ -511,9 +515,27 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
 async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin(plugin).await.unwrap();
+    install_plugin(&lix, "plugin_csv", plugin).await.unwrap();
 
     BenchLix::InMemory { lix }
+}
+
+async fn install_plugin<B>(lix: &lix_sdk::Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[
+            Value::Text(format!("/.lix_system/plugins/{key}.lixplugin")),
+            Value::Blob(archive.to_vec()),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn open_lix_with_warmed_csv_plugin(plugin: &[u8]) -> BenchLix {
@@ -529,13 +551,9 @@ async fn open_lix_with_warmed_csv_plugin_inmemory(plugin: &[u8]) -> BenchLix {
 }
 
 async fn warm_lix_csv_plugin(lix: &BenchLix) {
-    lix.write_file(
-        CSV_PLUGIN_WARMUP_PATH,
-        Vec::new(),
-        FsWriteOptions::default(),
-    )
-    .await
-    .unwrap();
+    lix.write_file(CSV_PLUGIN_WARMUP_PATH, Vec::new())
+        .await
+        .unwrap();
     let removed = lix
         .execute(
             "DELETE FROM lix_file WHERE path = $1",
@@ -553,7 +571,7 @@ async fn warm_wasm_csv_plugin_component(component: &Arc<dyn lix_sdk::WasmCompone
 }
 
 async fn large_csv_fixture(lix: BenchLix, initial_csv: &[u8]) -> LargeCsvFixture {
-    lix.write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
+    lix.write_file(CSV_PATH, initial_csv.to_vec())
         .await
         .unwrap();
 
@@ -659,7 +677,7 @@ async fn csv_schema_changes_insert_fixture(
 }
 
 async fn insert_large_csv(lix: BenchLix, initial_csv: &[u8]) {
-    lix.write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
+    lix.write_file(CSV_PATH, initial_csv.to_vec())
         .await
         .unwrap();
     black_box(initial_csv);
@@ -681,7 +699,7 @@ async fn validate_overwrite_large_csv(fixture: LargeCsvFixture, updated_csv: &[u
 async fn write_updated_csv(fixture: &LargeCsvFixture, updated_csv: &[u8]) {
     fixture
         .lix
-        .write_file(CSV_PATH, updated_csv.to_vec(), FsWriteOptions::default())
+        .write_file(CSV_PATH, updated_csv.to_vec())
         .await
         .unwrap();
 }

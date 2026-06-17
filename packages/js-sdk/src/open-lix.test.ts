@@ -335,14 +335,14 @@ test.skipIf(process.platform === "win32")(
 	},
 );
 
-test("fs readFile and writeFile use paths", async () => {
+test("SQL file upsert and read use paths", async () => {
 	const lix = await openLix();
-	const data = new TextEncoder().encode("hello from fs wrapper");
+	const data = new TextEncoder().encode("hello from SQL");
 
-	expect(await lix.fs.readFile("/docs/missing.txt")).toBeUndefined();
-	await lix.fs.writeFile("/docs/wrapper.txt", data);
+	expect(await readFile(lix, "/docs/missing.txt")).toBeUndefined();
+	await writeFile(lix, "/docs/wrapper.txt", data);
 
-	const stored = await lix.fs.readFile("/docs/wrapper.txt");
+	const stored = await readFile(lix, "/docs/wrapper.txt");
 	expect(stored).toEqual(data);
 	const sqlRead = await lix.execute(
 		"SELECT data FROM lix_file WHERE path = $1",
@@ -351,31 +351,31 @@ test("fs readFile and writeFile use paths", async () => {
 	expect(get(sqlRead, "data")).toEqual(data);
 
 	const updated = new TextEncoder().encode("updated");
-	await lix.fs.writeFile("/docs/wrapper.txt", updated);
-	expect(await lix.fs.readFile("/docs/wrapper.txt")).toEqual(updated);
+	await writeFile(lix, "/docs/wrapper.txt", updated);
+	expect(await readFile(lix, "/docs/wrapper.txt")).toEqual(updated);
 
 	await lix.close();
 });
 
-test("transaction fs wrappers use transaction SQL execution", async () => {
+test("transaction SQL file writes use transaction execution", async () => {
 	const lix = await openLix();
 	const tx = await lix.beginTransaction();
 	const data = new TextEncoder().encode("transactional");
 
-	await tx.fs.writeFile("/tx.txt", data);
-	expect(await tx.fs.readFile("/tx.txt")).toEqual(data);
+	await writeFile(tx, "/tx.txt", data);
+	expect(await readFile(tx, "/tx.txt")).toEqual(data);
 	await tx.commit();
-	expect(await lix.fs.readFile("/tx.txt")).toEqual(data);
+	expect(await readFile(lix, "/tx.txt")).toEqual(data);
 
 	await lix.close();
 });
 
-test("installPlugin installs bundled plugin archive schemas", async () => {
+test("SQL plugin archive upsert installs bundled plugin archive schemas", async () => {
 	const lix = await openLix();
 	const plugins = await bundledPluginArchives();
 
 	for (const plugin of plugins) {
-		await lix.installPlugin(plugin.archiveBytes);
+		await upsertPluginArchive(lix, plugin.key, plugin.archiveBytes);
 		const stored = await lix.execute(
 			"SELECT data FROM lix_file WHERE id = $1",
 			[`lix_plugin_archive::${plugin.key}`],
@@ -400,7 +400,7 @@ test("installPlugin installs bundled plugin archive schemas", async () => {
 	await lix.close();
 });
 
-test("installPlugin stores the archive and installs schemas", async () => {
+test("SQL plugin archive upsert stores the archive and installs schemas", async () => {
 	const lix = await openLix();
 	const csvPlugin = (await bundledPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_csv",
@@ -409,7 +409,7 @@ test("installPlugin stores the archive and installs schemas", async () => {
 		throw new Error("expected bundled CSV plugin");
 	}
 
-	await lix.installPlugin(csvPlugin.archiveBytes);
+	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
 	const stored = await lix.execute(
 		"SELECT name, data FROM lix_file WHERE id = $1",
 		[`lix_plugin_archive::${csvPlugin.key}`],
@@ -1180,6 +1180,41 @@ async function taskTitle(lix: Lix, taskId: string): Promise<string> {
 	const title = get(result, "title");
 	expect(typeof title).toBe("string");
 	return title as string;
+}
+
+type SqlExecutor = Pick<Lix, "execute">;
+
+async function upsertPluginArchive(
+	lix: SqlExecutor,
+	key: string,
+	archiveBytes: Uint8Array,
+): Promise<void> {
+	await writeFile(lix, `/.lix_system/plugins/${key}.lixplugin`, archiveBytes);
+}
+
+async function writeFile(
+	lix: SqlExecutor,
+	path: string,
+	data: Uint8Array,
+): Promise<void> {
+	await lix.execute(
+		"INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+		 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		[path, data],
+	);
+}
+
+async function readFile(
+	lix: SqlExecutor,
+	path: string,
+): Promise<Uint8Array | undefined> {
+	const result = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
+		path,
+	]);
+	if (result.rows.length === 0) {
+		return undefined;
+	}
+	return result.rows[0]?.value("data").asBytes() ?? new Uint8Array();
 }
 
 function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {

@@ -39,7 +39,10 @@ const lix = await openLix({
   backend: new SqliteBackend({ path: "app.lix" }),
 });
 
-await lix.fs.writeFile("/notes/status.txt", new TextEncoder().encode("draft"));
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/notes/status.txt", new TextEncoder().encode("draft")],
+);
 
 const main = await lix.activeBranchId();
 
@@ -47,9 +50,9 @@ const draft = await lix.createBranch({ name: "Explore" });
 
 await lix.switchBranch({ branchId: draft.id });
 
-await lix.fs.writeFile(
-  "/notes/status.txt",
-  new TextEncoder().encode("ready for review"),
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/notes/status.txt", new TextEncoder().encode("ready for review")],
 );
 
 await lix.switchBranch({ branchId: main });
@@ -93,8 +96,14 @@ Write files, blobs, and history in one transaction.
 const tx = await lix.beginTransaction();
 
 try {
-  await tx.fs.writeFile("/spec.docx", body);
-  await tx.fs.writeFile("/spec.png", image);
+  await tx.execute(
+    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+    ["/spec.docx", body],
+  );
+  await tx.execute(
+    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+    ["/spec.png", image],
+  );
   await tx.commit();
 } catch (error) {
   await tx.rollback();
@@ -114,13 +123,22 @@ const pricing = await lix.createBranch({ name: "Pricing draft" });
 const qa = await lix.createBranch({ name: "QA draft" });
 
 await lix.switchBranch({ branchId: copy.id });
-await lix.fs.writeFile("/landing.md", copyDraft);
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/landing.md", copyDraft],
+);
 
 await lix.switchBranch({ branchId: pricing.id });
-await lix.fs.writeFile("/plans.json", priceModel);
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/plans.json", priceModel],
+);
 
 await lix.switchBranch({ branchId: qa.id });
-await lix.fs.writeFile("/checks/report.json", testRun);
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/checks/report.json", testRun],
+);
 
 await lix.switchBranch({ branchId: main });
 ```

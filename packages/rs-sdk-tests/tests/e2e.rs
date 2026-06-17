@@ -1,7 +1,7 @@
-use lix_sdk::Lix;
+use lix_sdk::{Backend, Lix, LixError};
 use lix_sdk::{FsBackend, open_lix_with_backend};
-use lix_sdk::{FsWriteOptions, OpenLixOptions, Value, open_lix};
-use std::io::{Cursor, Write};
+use lix_sdk::{OpenLixOptions, Value, open_lix};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,8 +10,8 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin(&archive).await.unwrap();
-    let plugins = lix.list_installed_plugins().await.unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
+    let plugins = list_installed_plugins(&lix).await;
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].key, "plugin_csv");
     assert_eq!(
@@ -19,8 +19,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         vec!["csv_table".to_string(), "csv_row".to_string()]
     );
 
-    let stored_archive = lix
-        .read_file("/.lix_system/plugins/plugin_csv.lixplugin")
+    let stored_archive = read_file(&lix, "/.lix_system/plugins/plugin_csv.lixplugin")
         .await
         .unwrap();
     assert_eq!(stored_archive.as_deref(), Some(archive.as_slice()));
@@ -45,15 +44,11 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     );
 
     let original_csv = b"name,age\nAda,37\n".to_vec();
-    lix.write_file(
-        "/people.csv",
-        original_csv.clone(),
-        FsWriteOptions::default(),
-    )
-    .await
-    .unwrap();
+    write_file(&lix, "/people.csv", original_csv.clone())
+        .await
+        .unwrap();
     assert_eq!(
-        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/people.csv").await.unwrap().as_deref(),
         Some(original_csv.as_slice())
     );
 
@@ -69,15 +64,11 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     let file_changes_before_update = file_changes(&lix, &file_id).await;
 
     let updated_csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
-    lix.write_file(
-        "/people.csv",
-        updated_csv.clone(),
-        FsWriteOptions::default(),
-    )
-    .await
-    .unwrap();
+    write_file(&lix, "/people.csv", updated_csv.clone())
+        .await
+        .unwrap();
     assert_eq!(
-        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/people.csv").await.unwrap().as_deref(),
         Some(updated_csv.as_slice())
     );
 
@@ -135,11 +126,11 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
 
     let file_changes_before_empty = file_changes(&lix, &file_id).await;
     let empty_csv = Vec::new();
-    lix.write_file("/people.csv", empty_csv.clone(), FsWriteOptions::default())
+    write_file(&lix, "/people.csv", empty_csv.clone())
         .await
         .unwrap();
     assert_eq!(
-        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/people.csv").await.unwrap().as_deref(),
         Some(empty_csv.as_slice())
     );
     let files_empty_by_id = lix
@@ -176,7 +167,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     .await
     .unwrap();
     assert_eq!(
-        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/sql-people.csv").await.unwrap().as_deref(),
         Some(sql_csv.as_slice())
     );
 
@@ -218,7 +209,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     .await
     .unwrap();
     assert_eq!(
-        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/sql-people.csv").await.unwrap().as_deref(),
         Some(sql_updated_csv.as_slice())
     );
     let sql_update_changes = file_changes(&lix, &sql_file_id)
@@ -257,7 +248,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     .await
     .unwrap();
     assert_eq!(
-        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/sql-people.csv").await.unwrap().as_deref(),
         Some(sql_predicate_updated_csv.as_slice())
     );
     let sql_predicate_update_changes = file_changes(&lix, &sql_file_id)
@@ -314,7 +305,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     .await
     .unwrap();
     assert_eq!(
-        lix.read_file("/sql-empty.csv").await.unwrap().as_deref(),
+        read_file(&lix, "/sql-empty.csv").await.unwrap().as_deref(),
         Some(sql_empty_bytes.as_slice())
     );
     let sql_empty_update_changes = file_changes(&lix, &sql_empty_file_id)
@@ -358,9 +349,9 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         .await
         .unwrap();
     assert_eq!(rename.rows_affected(), 1);
-    assert_eq!(lix.read_file("/sql-rename.csv").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/sql-rename.csv").await.unwrap(), None);
     assert_eq!(
-        lix.read_file("/sql-rename.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/sql-rename.txt").await.unwrap().as_deref(),
         Some(sql_rename_csv.as_slice())
     );
     let renamed_files = lix
@@ -405,7 +396,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     )
     .await
     .unwrap();
-    assert_eq!(lix.read_file("/sql-people.csv").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/sql-people.csv").await.unwrap(), None);
     let sql_delete_changes = file_changes(&lix, &sql_file_id)
         .await
         .into_iter()
@@ -441,9 +432,9 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin(&archive).await.unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
     let csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
-    lix.write_file("/tx-plugin.csv", csv.clone(), FsWriteOptions::default())
+    write_file(&lix, "/tx-plugin.csv", csv.clone())
         .await
         .unwrap();
     let file_id = lix
@@ -479,7 +470,7 @@ async fn filesystem_materializes_internal_lix_plugin_paths() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
     let archive = build_csv_plugin_archive();
 
-    lix.install_plugin(&archive).await.unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
 
     wait_for_disk_file(
         &tempdir
@@ -530,6 +521,110 @@ async fn file_changes(lix: &Lix, file_id: &str) -> Vec<FileChange> {
 async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     let backend = FsBackend::open(path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
+}
+
+async fn install_plugin<B>(lix: &Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    write_file(
+        lix,
+        &format!("/.lix_system/plugins/{key}.lixplugin"),
+        archive.to_vec(),
+    )
+    .await
+}
+
+async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[Value::Text(path.to_string()), Value::Blob(data)],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    result
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("data"))
+        .transpose()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledPluginInfo {
+    key: String,
+    schema_keys: Vec<String>,
+}
+
+async fn list_installed_plugins<B>(lix: &Lix<B>) -> Vec<InstalledPluginInfo>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let archives = lix
+        .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
+        .await
+        .unwrap();
+    archives
+        .rows()
+        .iter()
+        .filter_map(|row| {
+            let path = row.get::<String>("path").unwrap();
+            if !path.starts_with("/.lix_system/plugins/") || !path.ends_with(".lixplugin") {
+                return None;
+            }
+            Some(plugin_info_from_archive(
+                row.get::<Vec<u8>>("data").unwrap(),
+            ))
+        })
+        .collect()
+}
+
+fn plugin_info_from_archive(archive_bytes: Vec<u8>) -> InstalledPluginInfo {
+    let mut archive = zip::ZipArchive::new(Cursor::new(archive_bytes)).unwrap();
+    let mut manifest_json = String::new();
+    archive
+        .by_name("manifest.json")
+        .unwrap()
+        .read_to_string(&mut manifest_json)
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+    let key = manifest["key"].as_str().unwrap().to_string();
+    let schema_paths = manifest["schemas"].as_array().unwrap();
+    let mut schema_keys = Vec::with_capacity(schema_paths.len());
+    for schema_path in schema_paths {
+        let mut schema_json = String::new();
+        archive
+            .by_name(schema_path.as_str().unwrap())
+            .unwrap()
+            .read_to_string(&mut schema_json)
+            .unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&schema_json).unwrap();
+        schema_keys.push(schema["x-lix-key"].as_str().unwrap().to_string());
+    }
+    InstalledPluginInfo { key, schema_keys }
 }
 
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {

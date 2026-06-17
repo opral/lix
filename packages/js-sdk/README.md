@@ -17,9 +17,15 @@ const lix = await openLix({
   backend: new SqliteBackend({ path: "app.lix" }),
 });
 
-await lix.fs.writeFile("/hello.txt", new TextEncoder().encode("world"));
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/hello.txt", new TextEncoder().encode("world")],
+);
 
-const bytes = await lix.fs.readFile("/hello.txt");
+const result = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
+  "/hello.txt",
+]);
+const bytes = result.rows[0]?.value("data").asBytes();
 
 console.log(bytes && new TextDecoder().decode(bytes));
 
@@ -33,7 +39,10 @@ const main = await lix.activeBranchId();
 const draft = await lix.createBranch({ name: "Draft" });
 
 await lix.switchBranch({ branchId: draft.id });
-await lix.fs.writeFile("/status.txt", new TextEncoder().encode("draft"));
+await lix.execute(
+  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+  ["/status.txt", new TextEncoder().encode("draft")],
+);
 
 await lix.switchBranch({ branchId: main });
 const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
@@ -46,8 +55,14 @@ const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 const tx = await lix.beginTransaction();
 
 try {
-  await tx.fs.writeFile("/a.txt", new TextEncoder().encode("1"));
-  await tx.fs.writeFile("/b.txt", new TextEncoder().encode("2"));
+  await tx.execute(
+    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+    ["/a.txt", new TextEncoder().encode("1")],
+  );
+  await tx.execute(
+    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+    ["/b.txt", new TextEncoder().encode("2")],
+  );
   await tx.commit();
 } catch (error) {
   await tx.rollback();

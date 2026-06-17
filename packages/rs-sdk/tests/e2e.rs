@@ -1,9 +1,9 @@
 use lix_sdk::{
-    CreateBranchOptions, FsWriteOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
+    Backend, CreateBranchOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 #[cfg(feature = "sqlite")]
-use lix_sdk::{FsBackend, FsMkdirOptions, FsRmOptions, SqliteBackend, open_lix_with_backend};
+use lix_sdk::{FsBackend, SqliteBackend, open_lix_with_backend};
 #[cfg(feature = "sqlite")]
 use std::path::Path;
 #[cfg(feature = "sqlite")]
@@ -444,10 +444,13 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(
-        lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/docs/readme.txt")
+            .await
+            .unwrap()
+            .as_deref(),
         Some(b"local".as_slice())
     );
-    assert!(lix.readdir("/empty/").await.unwrap().unwrap().is_empty());
+    assert!(readdir(&lix, "/empty/").await.unwrap().unwrap().is_empty());
     assert_eq!(
         std::fs::read(tempdir.path().join("docs/readme.txt")).unwrap(),
         b"local"
@@ -459,6 +462,121 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
 async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     let backend = FsBackend::open(path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
+}
+
+async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    result
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("data"))
+        .transpose()
+}
+
+async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[Value::Text(path.to_string()), Value::Blob(data)],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn mkdir<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    lix.execute(
+        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        &[Value::Text(path.to_string())],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rm<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    lix.execute(
+        "DELETE FROM lix_directory WHERE path = $1",
+        &[Value::Text(path.to_string())],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn readdir<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<String>>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    if path == "/" {
+        let entries = lix
+            .execute(
+                "SELECT name FROM lix_directory WHERE parent_id IS NULL \
+                 UNION ALL \
+                 SELECT name FROM lix_file WHERE directory_id IS NULL \
+                 ORDER BY name",
+                &[],
+            )
+            .await?;
+        return Ok(Some(
+            entries
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("name"))
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+    }
+
+    let directory = lix
+        .execute(
+            "SELECT id FROM lix_directory WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    let Some(directory) = directory.rows().first() else {
+        return Ok(None);
+    };
+    let directory_id = directory.get::<String>("id")?;
+    let entries = lix
+        .execute(
+            "SELECT name FROM lix_directory WHERE parent_id = $1 \
+             UNION ALL \
+             SELECT name FROM lix_file WHERE directory_id = $1 \
+             ORDER BY name",
+            &[Value::Text(directory_id)],
+        )
+        .await?;
+    Ok(Some(
+        entries
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("name"))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
 }
 
 #[tokio::test]
@@ -476,9 +594,9 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
         std::fs::read(tempdir.path().join(".lix_system/.gitignore")).unwrap(),
         b"*\n"
     );
-    assert_eq!(lix.read_file("/.lix/.gitignore").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/.lix/.gitignore").await.unwrap(), None);
     assert_eq!(
-        lix.read_file("/.lix_system/.gitignore").await.unwrap(),
+        read_file(&lix, "/.lix_system/.gitignore").await.unwrap(),
         None
     );
     lix.close().await.unwrap();
@@ -499,14 +617,17 @@ async fn filesystem_initial_import_ignores_git_entries() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(
-        lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/docs/readme.txt")
+            .await
+            .unwrap()
+            .as_deref(),
         Some(b"normal".as_slice())
     );
-    assert_eq!(lix.readdir("/.git/").await.unwrap(), None);
-    assert_eq!(lix.read_file("/.git/config").await.unwrap(), None);
-    assert_eq!(lix.readdir("/nested/.git/").await.unwrap(), None);
-    assert_eq!(lix.read_file("/nested/.git/config").await.unwrap(), None);
-    assert_eq!(lix.read_file("/docs/.git").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/.git/").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/nested/.git/").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/nested/.git/config").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
     assert!(tempdir.path().join(".git/config").is_file());
     assert!(tempdir.path().join("nested/.git/config").is_file());
     assert!(tempdir.path().join("docs/.git").is_file());
@@ -522,18 +643,18 @@ async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
     let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
         .await
         .unwrap();
-    seed.write_file("/.git/config", b"old".to_vec(), FsWriteOptions::default())
+    write_file(&seed, "/.git/config", b"old".to_vec())
         .await
         .unwrap();
-    seed.write_file("/docs/.git", b"old".to_vec(), FsWriteOptions::default())
+    write_file(&seed, "/docs/.git", b"old".to_vec())
         .await
         .unwrap();
     seed.close().await.unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(lix.read_file("/.git/config").await.unwrap(), None);
-    assert_eq!(lix.read_file("/docs/.git").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
     assert!(!tempdir.path().join(".git").exists());
     assert!(!tempdir.path().join("docs/.git").exists());
     lix.close().await.unwrap();
@@ -548,18 +669,16 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
         .await
         .unwrap();
-    seed.write_file("/old.txt", b"old".to_vec(), FsWriteOptions::default())
+    write_file(&seed, "/old.txt", b"old".to_vec())
         .await
         .unwrap();
-    seed.mkdir("/old-empty/", FsMkdirOptions::default())
-        .await
-        .unwrap();
+    mkdir(&seed, "/old-empty/").await.unwrap();
     seed.close().await.unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(lix.read_file("/old.txt").await.unwrap(), None);
-    assert_eq!(lix.readdir("/old-empty/").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/old.txt").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/old-empty/").await.unwrap(), None);
     assert!(!tempdir.path().join("old.txt").exists());
     assert!(!tempdir.path().join("old-empty").exists());
     lix.close().await.unwrap();
@@ -572,9 +691,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
-    lix.write_file("/sdk.txt", b"sdk".to_vec(), FsWriteOptions::default())
-        .await
-        .unwrap();
+    write_file(&lix, "/sdk.txt", b"sdk".to_vec()).await.unwrap();
     wait_for_disk_file(&tempdir.path().join("sdk.txt"), Some(b"sdk"));
     assert_eq!(
         std::fs::read(tempdir.path().join("pending-local.txt")).unwrap(),
@@ -582,9 +699,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     );
     wait_for_lix_file(&lix, "/pending-local.txt", Some(b"pending")).await;
 
-    lix.mkdir("/empty-sdk/", FsMkdirOptions::default())
-        .await
-        .unwrap();
+    mkdir(&lix, "/empty-sdk/").await.unwrap();
     assert!(tempdir.path().join("empty-sdk").is_dir());
 
     lix.execute(
@@ -631,15 +746,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     .unwrap();
     wait_for_disk_file(&tempdir.path().join("sql.txt"), None);
 
-    lix.rm(
-        "/empty-sdk/",
-        FsRmOptions {
-            recursive: true,
-            ..FsRmOptions::default()
-        },
-    )
-    .await
-    .unwrap();
+    rm(&lix, "/empty-sdk/").await.unwrap();
     assert!(!tempdir.path().join("empty-sdk").exists());
     lix.close().await.unwrap();
 }
@@ -680,9 +787,9 @@ async fn filesystem_watcher_ignores_git_entries_created_after_open() {
     std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
 
     wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
-    assert_eq!(lix.readdir("/.git/").await.unwrap(), None);
-    assert_eq!(lix.read_file("/.git/config").await.unwrap(), None);
-    assert_eq!(lix.read_file("/docs/.git").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/.git/").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
     lix.close().await.unwrap();
 }
 
@@ -692,19 +799,19 @@ async fn filesystem_materialization_skips_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    lix.write_file("/.git/config", b"lix".to_vec(), FsWriteOptions::default())
+    write_file(&lix, "/.git/config", b"lix".to_vec())
         .await
         .unwrap();
-    lix.write_file("/docs/.git", b"lix".to_vec(), FsWriteOptions::default())
+    write_file(&lix, "/docs/.git", b"lix".to_vec())
         .await
         .unwrap();
 
     assert_eq!(
-        lix.read_file("/.git/config").await.unwrap().as_deref(),
+        read_file(&lix, "/.git/config").await.unwrap().as_deref(),
         Some(b"lix".as_slice())
     );
     assert_eq!(
-        lix.read_file("/docs/.git").await.unwrap().as_deref(),
+        read_file(&lix, "/docs/.git").await.unwrap().as_deref(),
         Some(b"lix".as_slice())
     );
     assert!(!tempdir.path().join(".git/config").exists());
@@ -722,20 +829,16 @@ async fn filesystem_imports_opaque_lix_path_names() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(
-        lix.read_file("/bad%name.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/bad%name.txt").await.unwrap().as_deref(),
         Some(b"bad".as_slice())
     );
     assert_eq!(
-        lix.read_file("/#hash.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/#hash.txt").await.unwrap().as_deref(),
         Some(b"hash".as_slice())
     );
-    lix.write_file(
-        "/written%23.txt",
-        b"written".to_vec(),
-        FsWriteOptions::default(),
-    )
-    .await
-    .unwrap();
+    write_file(&lix, "/written%23.txt", b"written".to_vec())
+        .await
+        .unwrap();
     wait_for_disk_file(&tempdir.path().join("written%23.txt"), Some(b"written"));
     lix.close().await.unwrap();
 }
@@ -771,19 +874,19 @@ async fn filesystem_ignores_symlinks_on_initial_import() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(
-        lix.read_file("/target.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/target.txt").await.unwrap().as_deref(),
         Some(b"target".as_slice())
     );
     assert_eq!(
-        lix.read_file("/real-dir/file.txt")
+        read_file(&lix, "/real-dir/file.txt")
             .await
             .unwrap()
             .as_deref(),
         Some(b"nested".as_slice())
     );
-    assert_eq!(lix.read_file("/link.txt").await.unwrap(), None);
-    assert_eq!(lix.readdir("/linked-dir/").await.unwrap(), None);
-    assert_eq!(lix.read_file("/linked-dir/file.txt").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/linked-dir/").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
     assert!(
         std::fs::symlink_metadata(tempdir.path().join("link.txt"))
             .unwrap()
@@ -817,7 +920,7 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(lix.read_file("/socket").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/socket").await.unwrap(), None);
     assert_eq!(
         lix.execute("SELECT path FROM lix_file ORDER BY path", &[])
             .await
@@ -853,9 +956,9 @@ async fn filesystem_watcher_ignores_symlinks_created_after_open() {
     std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
 
     wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
-    assert_eq!(lix.read_file("/link.txt").await.unwrap(), None);
-    assert_eq!(lix.readdir("/linked-dir/").await.unwrap(), None);
-    assert_eq!(lix.read_file("/linked-dir/file.txt").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/linked-dir/").await.unwrap(), None);
+    assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
     lix.close().await.unwrap();
 }
 
@@ -875,23 +978,19 @@ async fn filesystem_materialization_skips_symlink_collisions() {
     symlink(outside.path(), tempdir.path().join("blocked-dir")).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    lix.write_file("/blocked.txt", b"lix".to_vec(), FsWriteOptions::default())
+    write_file(&lix, "/blocked.txt", b"lix".to_vec())
         .await
         .unwrap();
-    lix.write_file(
-        "/blocked-dir/file.txt",
-        b"nested".to_vec(),
-        FsWriteOptions::default(),
-    )
-    .await
-    .unwrap();
+    write_file(&lix, "/blocked-dir/file.txt", b"nested".to_vec())
+        .await
+        .unwrap();
 
     assert_eq!(
-        lix.read_file("/blocked.txt").await.unwrap().as_deref(),
+        read_file(&lix, "/blocked.txt").await.unwrap().as_deref(),
         Some(b"lix".as_slice())
     );
     assert_eq!(
-        lix.read_file("/blocked-dir/file.txt")
+        read_file(&lix, "/blocked-dir/file.txt")
             .await
             .unwrap()
             .as_deref(),
@@ -941,12 +1040,10 @@ async fn filesystem_materialization_skips_special_file_collisions() {
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    lix.write_file("/socket", b"lix".to_vec(), FsWriteOptions::default())
-        .await
-        .unwrap();
+    write_file(&lix, "/socket", b"lix".to_vec()).await.unwrap();
 
     assert_eq!(
-        lix.read_file("/socket").await.unwrap().as_deref(),
+        read_file(&lix, "/socket").await.unwrap().as_deref(),
         Some(b"lix".as_slice())
     );
     assert!(
@@ -958,13 +1055,24 @@ async fn filesystem_materialization_skips_special_file_collisions() {
 
     drop(listener);
     std::fs::remove_file(tempdir.path().join("socket")).unwrap();
-    wait_for_disk_file(&tempdir.path().join("socket"), Some(b"lix"));
+    wait_for_disk_file_with_timeout(
+        &tempdir.path().join("socket"),
+        Some(b"lix"),
+        Duration::from_secs(20),
+    );
     lix.close().await.unwrap();
 }
 
 #[cfg(feature = "sqlite")]
+#[track_caller]
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
+}
+
+#[cfg(feature = "sqlite")]
+#[track_caller]
+fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     let path_display = path.display();
     loop {
         let actual = std::fs::read(path).ok();
@@ -983,7 +1091,7 @@ fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
 async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let actual = lix.read_file(path).await.unwrap();
+        let actual = read_file(lix, path).await.unwrap();
         if actual.as_deref() == expected {
             return;
         }
@@ -999,7 +1107,7 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
 async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let actual = lix.readdir(path).await.unwrap().is_some();
+        let actual = readdir(lix, path).await.unwrap().is_some();
         if actual == expected {
             return;
         }

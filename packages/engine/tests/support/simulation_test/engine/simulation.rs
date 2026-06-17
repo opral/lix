@@ -1,9 +1,8 @@
 use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry, FsMkdirOptions,
-    FsRmOptions, FsWriteOptions, InitReceipt, MergeBranchOptions, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, SessionContext, SessionTransaction,
-    SwitchBranchOptions, SwitchBranchReceipt,
+    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InitReceipt,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 use lix_engine::{LixError, Value};
 
@@ -238,13 +237,16 @@ impl SimFs {
         }
     }
 
-    pub async fn write_file(
-        &self,
-        path: &str,
-        data: Vec<u8>,
-        options: FsWriteOptions,
-    ) -> Result<(), LixError> {
-        let result = self.session.fs().write_file(path, data, options).await;
+    pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<(), LixError> {
+        let result = self
+            .session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[Value::Text(path.to_string()), Value::Blob(data)],
+            )
+            .await
+            .map(|_| ());
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
@@ -257,33 +259,105 @@ impl SimFs {
             .rebuild_tracked_state
             .before_read(&self.engine, &active_branch_id)
             .await?;
-        self.session.fs().read_file(path).await
+        let result = self
+            .session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(path.to_string())],
+            )
+            .await?;
+        Ok(result
+            .rows()
+            .first()
+            .and_then(|row| row.get::<Vec<u8>>("data").ok()))
     }
 
-    pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
-        let result = self.session.fs().mkdir(path, options).await;
+    pub async fn mkdir(&self, path: &str) -> Result<(), LixError> {
+        let result = self
+            .session
+            .execute(
+                "INSERT INTO lix_directory (path) VALUES ($1) \
+                 ON CONFLICT (path) DO NOTHING",
+                &[Value::Text(path.to_string())],
+            )
+            .await
+            .map(|_| ());
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
         result
     }
 
-    pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
+    pub async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>, LixError> {
         let active_branch_id = self.session.active_branch_id().await?;
         self.sim
             .rebuild_tracked_state
             .before_read(&self.engine, &active_branch_id)
             .await?;
-        self.session.fs().readdir(path).await
+        let result = self
+            .session
+            .execute(
+                "SELECT path FROM lix_file WHERE path LIKE $1 \
+                 UNION ALL \
+                 SELECT path FROM lix_directory WHERE path LIKE $1 AND path != $2 \
+                 ORDER BY path",
+                &[
+                    Value::Text(format!("{path}%")),
+                    Value::Text(path.to_string()),
+                ],
+            )
+            .await?;
+        let mut entries = Vec::new();
+        for row in result.rows() {
+            let child_path = row.get::<String>("path")?;
+            let Some(name) = direct_child_name(path, &child_path) else {
+                continue;
+            };
+            entries.push(name);
+        }
+        if entries.is_empty() {
+            Ok(None)
+        } else {
+            entries.sort();
+            entries.dedup();
+            Ok(Some(entries))
+        }
     }
 
-    pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
-        let result = self.session.fs().rm(path, options).await;
+    pub async fn rm(&self, path: &str) -> Result<(), LixError> {
+        let result = async {
+            self.session
+                .execute(
+                    "DELETE FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.to_string())],
+                )
+                .await?;
+            self.session
+                .execute(
+                    "DELETE FROM lix_directory WHERE path = $1",
+                    &[Value::Text(path.to_string())],
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
         result
     }
+}
+
+fn direct_child_name(parent: &str, child: &str) -> Option<String> {
+    let remainder = child.strip_prefix(parent)?;
+    if remainder.is_empty() {
+        return None;
+    }
+    let trimmed = remainder.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Transaction wrapper that injects simulation behavior around normal execution.

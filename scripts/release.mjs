@@ -174,15 +174,26 @@ export function updateCargoToml(root, version) {
 		/(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")[^"]+(")/,
 		`$1${version}$2`,
 	);
-	text = text.replace(
-		/(lix_engine\s*=\s*\{\s*path\s*=\s*"packages\/engine",\s*version\s*=\s*")[^"]+(")/,
-		`$1${version}$2`,
-	);
-	text = text.replace(
-		/(lix_sdk\s*=\s*\{\s*path\s*=\s*"packages\/rs-sdk",\s*version\s*=\s*")[^"]+(")/,
-		`$1${version}$2`,
-	);
+	text = updatePathDependencyVersions(text, version);
 	writeText(root, "Cargo.toml", text);
+
+	for (const path of ["packages/js-sdk/Cargo.toml", "packages/rs-sdk-tests/Cargo.toml"]) {
+		let packageText = readText(root, path);
+		packageText = updatePackageVersionField(packageText, version);
+		packageText = updatePathDependencyVersions(packageText, version);
+		writeText(root, path, packageText);
+	}
+}
+
+function updatePackageVersionField(text, version) {
+	return text.replace(/(\[package\][\s\S]*?\nversion\s*=\s*")[^"]+(")/, `$1${version}$2`);
+}
+
+function updatePathDependencyVersions(text, version) {
+	return text.replace(
+		/((?:^|\n)[A-Za-z0-9_-]+\s*=\s*\{[^}\n]*\bpath\s*=\s*"[^"]+"[^}\n]*\bversion\s*=\s*")[^"]+(")/g,
+		`$1${version}$2`,
+	);
 }
 
 export function updatePackageVersion(root, version) {

@@ -7,17 +7,18 @@ use std::time::Duration;
 
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, BackendError, BackendWrite, CommitResult, Engine, FsMkdirOptions, FsRmOptions,
-    FsWriteOptions, LixError, PutBatch, ReadOptions, SessionContext, SpaceId, WriteOptions,
+    Backend, BackendError, BackendWrite, CommitResult, Engine, LixError, PutBatch, ReadOptions,
+    SessionContext, SpaceId, Value, WriteOptions,
 };
-use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 
 #[cfg(feature = "sqlite")]
 use crate::sqlite_backend::SqliteBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const HOST_METADATA_GITIGNORE: &[u8] = b"*\n";
+const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -315,10 +316,34 @@ where
         state.sync_from_lix().await?;
 
         let (event_tx, event_rx) = mpsc::channel();
+        let callback_tx = event_tx.clone();
+        let watcher_config = Config::default().with_follow_symlinks(false);
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+            Duration::from_millis(500),
+            None,
+            move |_result: DebounceEventResult| {
+                let _ = callback_tx.send(FilesystemEvent::DiskChanged);
+            },
+            RecommendedCache::new(),
+            watcher_config,
+        )
+        .ok()
+        .and_then(|mut debouncer| {
+            if debouncer
+                .watch(state.root.as_path(), RecursiveMode::Recursive)
+                .is_ok()
+            {
+                Some(debouncer)
+            } else {
+                debouncer.stop();
+                None
+            }
+        });
+        let poll_filesystem = cfg!(target_os = "macos") || debouncer.is_none();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::Builder::new()
             .name("lix-sdk-filesystem-sync".to_string())
-            .spawn(move || filesystem_worker(worker_state, event_rx))
+            .spawn(move || filesystem_worker(worker_state, event_rx, poll_filesystem))
             .map_err(|error| {
                 LixError::new(
                     "LIX_FILESYSTEM_THREAD_ERROR",
@@ -326,23 +351,10 @@ where
                 )
             })?;
 
-        let callback_tx = event_tx.clone();
-        let mut debouncer = new_debouncer(
-            Duration::from_millis(250),
-            None,
-            move |_result: DebounceEventResult| {
-                let _ = callback_tx.send(FilesystemEvent::DiskChanged);
-            },
-        )
-        .map_err(notify_error)?;
-        debouncer
-            .watch(state.root.as_path(), RecursiveMode::Recursive)
-            .map_err(notify_error)?;
-
         Ok(Self {
             inner: Arc::new(FilesystemSupervisorInner {
                 event_tx,
-                debouncer: Mutex::new(Some(debouncer)),
+                debouncer: Mutex::new(debouncer),
                 worker: Mutex::new(Some(worker)),
             }),
             _marker: PhantomData,
@@ -443,10 +455,7 @@ where
             .await?;
         for row in files.rows() {
             let path = row.get::<String>("path")?;
-            let data = self
-                .session
-                .fs()
-                .read_file(&path)
+            let data = lix_read_file(&self.session, &path)
                 .await?
                 .unwrap_or_default();
             snapshot.files.insert(path, data);
@@ -503,7 +512,7 @@ where
                 {
                     continue;
                 }
-                self.session.fs().rm(path, FsRmOptions::default()).await?;
+                lix_remove_file(&self.session, path).await?;
             }
         }
 
@@ -530,16 +539,7 @@ where
         }
         sort_directories_deepest_first(&mut directories_to_remove);
         for path in directories_to_remove {
-            self.session
-                .fs()
-                .rm(
-                    &path,
-                    FsRmOptions {
-                        recursive: true,
-                        ..FsRmOptions::default()
-                    },
-                )
-                .await?;
+            lix_remove_directory_recursive(&self.session, &path).await?;
         }
 
         let mut directories_to_create = local
@@ -555,10 +555,7 @@ where
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
         for path in directories_to_create {
-            self.session
-                .fs()
-                .mkdir(&path, FsMkdirOptions::default())
-                .await?;
+            lix_make_directory(&self.session, &path).await?;
         }
 
         for (path, data) in local
@@ -573,10 +570,7 @@ where
                 continue;
             }
             if lix.files.get(path) != Some(data) {
-                self.session
-                    .fs()
-                    .write_file(path, data.clone(), FsWriteOptions::default())
-                    .await?;
+                lix_write_file(&self.session, path, data.clone()).await?;
             }
         }
 
@@ -716,8 +710,101 @@ where
     }
 }
 
-fn filesystem_worker<B>(state: Arc<FilesystemState<B>>, event_rx: mpsc::Receiver<FilesystemEvent>)
+async fn lix_read_file<B>(
+    session: &SessionContext<B>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError>
 where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = session
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    result
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("data"))
+        .transpose()
+}
+
+async fn lix_write_file<B>(
+    session: &SessionContext<B>,
+    path: &str,
+    data: Vec<u8>,
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            &[Value::Text(path.to_string()), Value::Blob(data)],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn lix_make_directory<B>(session: &SessionContext<B>, path: &str) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    session
+        .execute(
+            "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn lix_remove_file<B>(session: &SessionContext<B>, path: &str) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    session
+        .execute(
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn lix_remove_directory_recursive<B>(
+    session: &SessionContext<B>,
+    path: &str,
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    session
+        .execute(
+            "DELETE FROM lix_directory WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+fn filesystem_worker<B>(
+    state: Arc<FilesystemState<B>>,
+    event_rx: mpsc::Receiver<FilesystemEvent>,
+    poll_filesystem: bool,
+) where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
@@ -726,8 +813,15 @@ where
         return;
     };
     loop {
-        match event_rx.recv() {
-            Ok(FilesystemEvent::DiskChanged) => {
+        let e = if poll_filesystem {
+            event_rx.recv_timeout(FILESYSTEM_POLL_INTERVAL)
+        } else {
+            event_rx
+                .recv()
+                .map_err(|mpsc::RecvError| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match e {
+            Ok(FilesystemEvent::DiskChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {
                 if drain_filesystem_events(&runtime, &state, &event_rx, true) {
                     return;
                 }
@@ -738,7 +832,7 @@ where
                     return;
                 }
             }
-            Ok(FilesystemEvent::Shutdown) | Err(_) => {
+            Ok(FilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.block_on(state.close());
                 return;
             }
@@ -1232,13 +1326,6 @@ fn io_error(operation: &str, path: &Path, error: std::io::Error) -> LixError {
     )
 }
 
-fn notify_error(error: notify_debouncer_full::notify::Error) -> LixError {
-    LixError::new(
-        "LIX_FILESYSTEM_NOTIFY_ERROR",
-        format!("filesystem watcher error: {error}"),
-    )
-}
-
 fn filesystem_sync_backend_error(error: LixError) -> BackendError {
     BackendError::Io(format!("filesystem sync failed: {}", error.format()))
 }
@@ -1427,10 +1514,7 @@ mod tests {
         };
 
         state.sync_disk_to_lix(false).await.unwrap();
-        state
-            .session
-            .fs()
-            .write_file("/sql.txt", b"updated".to_vec(), FsWriteOptions::default())
+        lix_write_file(&state.session, "/sql.txt", b"updated".to_vec())
             .await
             .unwrap();
         state.sync_from_lix().await.unwrap();
@@ -1480,10 +1564,7 @@ mod tests {
         };
 
         state.sync_disk_to_lix(false).await.unwrap();
-        state
-            .session
-            .fs()
-            .write_file("/sql.txt", b"first".to_vec(), FsWriteOptions::default())
+        lix_write_file(&state.session, "/sql.txt", b"first".to_vec())
             .await
             .unwrap();
         state.sync_from_lix().await.unwrap();
@@ -1492,10 +1573,7 @@ mod tests {
             b"first"
         );
 
-        state
-            .session
-            .fs()
-            .write_file("/sql.txt", b"second".to_vec(), FsWriteOptions::default())
+        lix_write_file(&state.session, "/sql.txt", b"second".to_vec())
             .await
             .unwrap();
         state.sync_disk_to_lix(true).await.unwrap();
@@ -1535,10 +1613,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            state
-                .session
-                .fs()
-                .read_file("/disk.txt")
+            lix_read_file(&state.session, "/disk.txt")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -1556,10 +1631,7 @@ mod tests {
 
         state.sync_disk_to_lix(true).await.unwrap();
         assert_eq!(
-            state
-                .session
-                .fs()
-                .read_file("/disk.txt")
+            lix_read_file(&state.session, "/disk.txt")
                 .await
                 .unwrap()
                 .as_deref(),
