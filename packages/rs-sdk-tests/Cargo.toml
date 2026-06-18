@@ -1,6 +1,6 @@
 [package]
 name = "lix_sdk_tests"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 description = "Integration tests and benchmarks for the Lix Rust SDK."
 license = "LicenseRef-opral"
@@ -10,7 +10,7 @@ rust-version = "1.93"
 publish = false
 
 [dependencies]
-lix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false, features = ["default_wasm_runtime", "sqlite"] }
+lix_sdk = { path = "../rs-sdk", version = "0.7.0", default-features = false, features = ["default_wasm_runtime", "sqlite"] }
 
 [dev-dependencies]
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
