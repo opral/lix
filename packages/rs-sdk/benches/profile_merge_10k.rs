@@ -101,7 +101,7 @@ async fn profile_merge_phase(lix: &lix_sdk::Lix<SqliteBackend>, updated_csv: Vec
 }
 
 async fn install_plugin(lix: &lix_sdk::Lix<SqliteBackend>, key: &str, archive: &[u8]) {
-    let path = format!("/.lix_system/plugins/{key}.lixplugin");
+    let path = format!("/.lix/plugins/{key}.lixplugin");
     write_file(lix, &path, archive.to_vec()).await;
 }
 

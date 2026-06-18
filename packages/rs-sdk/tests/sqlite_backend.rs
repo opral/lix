@@ -114,29 +114,36 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
         let lix = open_lix_with_backend(backend)
             .await
             .expect("lix opens on fs backend");
-        let sqlite_dir = filesystem_path.join(".lix");
+        let sqlite_dir = filesystem_path.join(".lix/.internal");
         let sqlite_path = sqlite_dir.join("db.sqlite");
         assert!(
             sqlite_dir.is_dir(),
-            "fs backend should store SQLite in dir/.lix"
+            "fs backend should store SQLite in dir/.lix/.internal"
         );
         assert!(
             sqlite_path.is_file(),
-            "fs backend should store SQLite at dir/.lix/db.sqlite"
+            "fs backend should store SQLite at dir/.lix/.internal/db.sqlite"
         );
         assert_eq!(
             read_file(&lix, "/.lix")
                 .await
-                .expect("reserved backing file path reads"),
+                .expect(".lix file path reads"),
             None,
             "dir/.lix should not be imported into Lix as a file"
         );
         assert_eq!(
             readdir(&lix, "/.lix/")
                 .await
-                .expect("reserved backing directory path reads"),
+                .expect(".lix directory path reads"),
+            Some(Vec::new()),
+            "dir/.lix should be visible but private children should not"
+        );
+        assert_eq!(
+            readdir(&lix, "/.lix/.internal/")
+                .await
+                .expect(".lix/.internal directory path reads"),
             None,
-            "dir/.lix should not be imported into Lix as a directory"
+            "dir/.lix/.internal should not be visible as a synced Lix directory"
         );
         write_file(&lix, "/persisted.txt", b"persisted".to_vec())
             .await
@@ -150,7 +157,7 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
 
     {
         let plain = open_lix_with_backend(
-            SqliteBackend::open(filesystem_path.join(".lix").join("db.sqlite"))
+            SqliteBackend::open(filesystem_path.join(".lix/.internal").join("db.sqlite"))
                 .expect("sqlite backend reopens"),
         )
         .await
@@ -189,9 +196,120 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
 }
 
 #[tokio::test]
+async fn fs_backend_moves_legacy_root_sqlite_metadata_into_internal_dir() {
+    let tempdir = tempfile::tempdir().expect("tempdir should create");
+    let filesystem_path = tempdir.path().join("filesystem");
+    let legacy_sqlite_dir = filesystem_path.join(".lix");
+    let legacy_sqlite_path = legacy_sqlite_dir.join("db.sqlite");
+    std::fs::create_dir_all(&legacy_sqlite_dir).expect("legacy sqlite dir creates");
+
+    {
+        let lix = open_lix_with_backend(
+            SqliteBackend::open(&legacy_sqlite_path).expect("legacy sqlite backend opens"),
+        )
+        .await
+        .expect("legacy lix opens");
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('legacy-key', 'legacy-value')",
+            &[],
+        )
+        .await
+        .expect("legacy key value write succeeds");
+        lix.close().await.expect("legacy lix closes");
+    }
+    for name in ["db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
+        std::fs::write(legacy_sqlite_dir.join(name), b"legacy-sidecar")
+            .expect("legacy sidecar writes");
+    }
+
+    let lix = open_lix_with_backend(
+        FsBackend::open(&filesystem_path)
+            .await
+            .expect("fs backend opens"),
+    )
+    .await
+    .expect("lix opens on fs backend");
+
+    assert!(
+        !legacy_sqlite_path.exists(),
+        "legacy SQLite path should move"
+    );
+    for name in ["db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
+        assert!(
+            !legacy_sqlite_dir.join(name).exists(),
+            "legacy {name} should move"
+        );
+    }
+    for name in ["db.sqlite-wal", "db.sqlite-shm"] {
+        assert!(
+            filesystem_path.join(".lix/.internal").join(name).is_file(),
+            "{name} should move into .lix/.internal"
+        );
+    }
+    assert!(
+        filesystem_path.join(".lix/.internal/db.sqlite").is_file(),
+        "SQLite file should move into .lix/.internal"
+    );
+    let rows = lix
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = 'legacy-key' AND value = lix_json('\"legacy-value\"')",
+            &[],
+        )
+        .await
+        .expect("legacy key value reads");
+    assert_eq!(rows.len(), 1, "moved SQLite database should be reused");
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite")
+            .await
+            .expect("legacy metadata file path reads"),
+        None,
+        "legacy SQLite file should not be imported as a Lix file"
+    );
+
+    lix.close().await.expect("lix closes");
+}
+
+#[tokio::test]
+async fn fs_backend_legacy_sqlite_metadata_conflict_does_not_partially_move() {
+    let tempdir = tempfile::tempdir().expect("tempdir should create");
+    let filesystem_path = tempdir.path().join("filesystem");
+    let legacy_sqlite_dir = filesystem_path.join(".lix");
+    let internal_sqlite_dir = filesystem_path.join(".lix/.internal");
+    std::fs::create_dir_all(&legacy_sqlite_dir).expect("legacy sqlite dir creates");
+    std::fs::create_dir_all(&internal_sqlite_dir).expect("internal sqlite dir creates");
+    std::fs::write(legacy_sqlite_dir.join("db.sqlite"), b"legacy").expect("legacy sqlite writes");
+    std::fs::write(legacy_sqlite_dir.join("db.sqlite-wal"), b"legacy-wal")
+        .expect("legacy wal writes");
+    std::fs::write(internal_sqlite_dir.join("db.sqlite-wal"), b"target-wal")
+        .expect("target wal writes");
+
+    let Err(error) = FsBackend::open(&filesystem_path).await else {
+        panic!("conflicting legacy metadata should fail");
+    };
+
+    assert!(
+        error.message.contains("target already exists"),
+        "error should explain metadata conflict: {error:?}"
+    );
+    assert!(
+        legacy_sqlite_dir.join("db.sqlite").is_file(),
+        "legacy db.sqlite should remain in place after preflight failure"
+    );
+    assert!(
+        legacy_sqlite_dir.join("db.sqlite-wal").is_file(),
+        "legacy db.sqlite-wal should remain in place after preflight failure"
+    );
+}
+
+#[tokio::test]
 async fn fs_backend_ignores_sqlite_sidecar_paths() {
     let tempdir = tempfile::tempdir().expect("tempdir should create");
     let filesystem_path = tempdir.path().join("filesystem");
+    std::fs::create_dir_all(filesystem_path.join(".lix")).expect("legacy .lix dir creates");
+    for name in ["db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
+        std::fs::write(filesystem_path.join(".lix").join(name), b"legacy")
+            .expect("legacy sqlite sidecar writes");
+    }
     let lix = open_lix_with_backend(
         FsBackend::open(&filesystem_path)
             .await
@@ -201,7 +319,11 @@ async fn fs_backend_ignores_sqlite_sidecar_paths() {
     .expect("lix opens on fs backend");
 
     for path in [
-        "/.lix",
+        "/.lix/.internal",
+        "/.lix/.internal/db.sqlite",
+        "/.lix/.internal/db.sqlite-wal",
+        "/.lix/.internal/db.sqlite-shm",
+        "/.lix/.internal/db.sqlite-journal",
         "/.lix/db.sqlite",
         "/.lix/db.sqlite-wal",
         "/.lix/db.sqlite-shm",
@@ -213,6 +335,18 @@ async fn fs_backend_ignores_sqlite_sidecar_paths() {
             "{path} should not be visible as a synced Lix file"
         );
     }
+    assert_eq!(
+        readdir(&lix, "/.lix/.internal/")
+            .await
+            .expect("internal directory reads"),
+        None,
+        "/.lix/.internal should not be visible as a synced Lix directory"
+    );
+    assert_eq!(
+        readdir(&lix, "/.lix/").await.expect(".lix directory reads"),
+        Some(Vec::new()),
+        "legacy root SQLite sidecars should not appear in /.lix/"
+    );
 
     lix.close().await.expect("lix closes");
 }
@@ -287,7 +421,7 @@ where
 {
     write_file(
         lix,
-        &format!("/.lix_system/plugins/{key}.lixplugin"),
+        &format!("/.lix/plugins/{key}.lixplugin"),
         archive.to_vec(),
     )
     .await

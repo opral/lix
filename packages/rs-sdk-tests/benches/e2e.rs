@@ -530,7 +530,7 @@ where
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",
         &[
-            Value::Text(format!("/.lix_system/plugins/{key}.lixplugin")),
+            Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec()),
         ],
     )

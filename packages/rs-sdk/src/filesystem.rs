@@ -17,7 +17,7 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 use crate::sqlite_backend::SqliteBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
-const HOST_METADATA_GITIGNORE: &[u8] = b"*\n";
+const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -310,7 +310,8 @@ where
         ensure_filesystem_root_directory(root)?;
         let root = std::fs::canonicalize(root)
             .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
-        ensure_filesystem_system_directory(&root)?;
+        ensure_filesystem_lix_directory(&root)?;
+        migrate_legacy_filesystem_system_directory(&root)?;
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
             session,
@@ -319,6 +320,7 @@ where
             last_materialized: Mutex::new(None),
         });
 
+        state.migrate_legacy_lix_system_paths().await?;
         state.sync_disk_to_lix(false).await?;
         state.sync_from_lix().await?;
 
@@ -449,6 +451,51 @@ where
 
     async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
+    }
+
+    async fn migrate_legacy_lix_system_paths(&self) -> Result<(), LixError> {
+        let files = self
+            .session
+            .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
+            .await?;
+        let legacy_files = files
+            .rows()
+            .iter()
+            .map(|row| Ok((row.get::<String>("path")?, row.get::<Vec<u8>>("data")?)))
+            .collect::<Result<Vec<_>, LixError>>()?;
+        for (path, data) in legacy_files
+            .iter()
+            .filter(|(path, _)| is_legacy_lix_system_path(path))
+        {
+            if let Some(new_path) = migrate_legacy_lix_system_path(path) {
+                lix_write_file(&self.session, &new_path, data.clone()).await?;
+                write_materialized_file(&self.root, &new_path, data)?;
+            }
+            lix_remove_file(&self.session, path).await?;
+        }
+
+        let directories = self
+            .session
+            .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+            .await?;
+        let mut directory_paths = directories
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("path"))
+            .collect::<Result<Vec<_>, _>>()?;
+        directory_paths.retain(|path| is_legacy_lix_system_path(path));
+        sort_directories_shallowest_first(&mut directory_paths);
+        for path in &directory_paths {
+            if let Some(new_path) = migrate_legacy_lix_system_path(path) {
+                lix_make_directory(&self.session, &new_path).await?;
+                create_materialized_directory(&self.root, &new_path)?;
+            }
+        }
+        sort_directories_deepest_first(&mut directory_paths);
+        for path in directory_paths {
+            lix_remove_directory_recursive(&self.session, &path).await?;
+        }
+        Ok(())
     }
 
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
@@ -902,9 +949,6 @@ fn collect_local_directory(
     for entry in entries {
         let entry =
             entry.map_err(|error| io_error("read filesystem directory entry", directory, error))?;
-        if directory == root && is_filesystem_metadata_file_name(&entry.file_name()) {
-            continue;
-        }
         let path = entry.path();
         if is_filesystem_sync_ignored_local_path(root, &path) {
             continue;
@@ -977,37 +1021,170 @@ fn validate_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
     Ok(())
 }
 
-fn ensure_filesystem_system_directory(root: &Path) -> Result<PathBuf, LixError> {
-    let system_dir = root.join(".lix_system");
-    match std::fs::create_dir(&system_dir) {
+fn ensure_filesystem_lix_directory(root: &Path) -> Result<PathBuf, LixError> {
+    let lix_dir = root.join(".lix");
+    match std::fs::create_dir(&lix_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
             return Err(io_error(
-                "create filesystem system directory",
-                &system_dir,
+                "create filesystem .lix directory",
+                &lix_dir,
                 error,
             ));
         }
     }
 
-    let metadata = std::fs::symlink_metadata(&system_dir)
-        .map_err(|error| io_error("read filesystem system directory", &system_dir, error))?;
+    let metadata = std::fs::symlink_metadata(&lix_dir)
+        .map_err(|error| io_error("read filesystem .lix directory", &lix_dir, error))?;
     if metadata.file_type().is_symlink() {
-        let path = system_dir.display();
+        let path = lix_dir.display();
         return Err(filesystem_error(format!(
-            "filesystem system path {path} must not be a symlink"
+            "filesystem .lix path {path} must not be a symlink"
         )));
     }
     if !metadata.is_dir() {
-        let path = system_dir.display();
+        let path = lix_dir.display();
         return Err(filesystem_error(format!(
-            "filesystem system path {path} must be a directory"
+            "filesystem .lix path {path} must be a directory"
         )));
     }
 
-    ensure_metadata_gitignore(&system_dir)?;
-    Ok(system_dir)
+    ensure_gitignore(&lix_dir, LIX_DIRECTORY_GITIGNORE)?;
+    Ok(lix_dir)
+}
+
+fn migrate_legacy_filesystem_system_directory(root: &Path) -> Result<(), LixError> {
+    let legacy_dir = root.join(".lix_system");
+    let metadata = match std::fs::symlink_metadata(&legacy_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read legacy filesystem system directory",
+                &legacy_dir,
+                error,
+            ));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        merge_legacy_directory_contents(root, &legacy_dir, &root.join(".lix"))?;
+        std::fs::remove_dir_all(&legacy_dir).map_err(|error| {
+            io_error(
+                "remove legacy filesystem system directory",
+                &legacy_dir,
+                error,
+            )
+        })
+    } else {
+        std::fs::remove_file(&legacy_dir)
+            .map_err(|error| io_error("remove legacy filesystem system path", &legacy_dir, error))
+    }
+}
+
+fn merge_legacy_directory_contents(
+    root: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<(), LixError> {
+    let entries = std::fs::read_dir(source)
+        .map_err(|error| io_error("read legacy filesystem system directory", source, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            io_error(
+                "read legacy filesystem system directory entry",
+                source,
+                error,
+            )
+        })?;
+        let source_path = entry.path();
+        let file_name = entry.file_name();
+        if is_discarded_legacy_system_entry_name(&file_name) {
+            remove_legacy_system_entry(&source_path)?;
+            continue;
+        }
+        let target_path = target.join(&file_name);
+        let Ok(target_lix_path) = local_path_to_lix_path(root, &target_path, false) else {
+            remove_legacy_system_entry(&source_path)?;
+            continue;
+        };
+        if is_filesystem_metadata_path(&target_lix_path) {
+            remove_legacy_system_entry(&source_path)?;
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            io_error(
+                "read legacy filesystem system entry type",
+                &source_path,
+                error,
+            )
+        })?;
+        if file_type.is_dir() {
+            match std::fs::symlink_metadata(&target_path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    merge_legacy_directory_contents(root, &source_path, &target_path)?;
+                    std::fs::remove_dir(&source_path).map_err(|error| {
+                        io_error(
+                            "remove migrated legacy filesystem system directory",
+                            &source_path,
+                            error,
+                        )
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(filesystem_error(format!(
+                        "cannot migrate legacy filesystem system directory {} to {} because the target exists",
+                        source_path.display(),
+                        target_path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::rename(&source_path, &target_path).map_err(|error| {
+                        io_error(
+                            "move legacy filesystem system directory",
+                            &source_path,
+                            error,
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    return Err(io_error(
+                        "read legacy filesystem system target",
+                        &target_path,
+                        error,
+                    ));
+                }
+            }
+        } else {
+            if target_path.exists() {
+                return Err(filesystem_error(format!(
+                    "cannot migrate legacy filesystem system file {} to {} because the target exists",
+                    source_path.display(),
+                    target_path.display()
+                )));
+            }
+            std::fs::rename(&source_path, &target_path).map_err(|error| {
+                io_error("move legacy filesystem system file", &source_path, error)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn is_discarded_legacy_system_entry_name(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some(".gitignore" | ".DS_Store"))
+}
+
+fn remove_legacy_system_entry(path: &Path) -> Result<(), LixError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_error("read legacy filesystem system entry", path, error))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+            .map_err(|error| io_error("remove legacy filesystem system entry", path, error))
+    } else {
+        std::fs::remove_file(path)
+            .map_err(|error| io_error("remove legacy filesystem system entry", path, error))
+    }
 }
 
 fn remove_materialized_file(root: &Path, path: &str) -> Result<(), LixError> {
@@ -1244,15 +1421,47 @@ fn push_lix_path_segment(local: &mut PathBuf, segment: &str, path: &str) -> Resu
 }
 
 fn is_plugin_storage_path(path: &str) -> bool {
-    path == "/.lix_system/plugins" || path.starts_with("/.lix_system/plugins/")
+    path == "/.lix/plugins" || path.starts_with("/.lix/plugins/")
 }
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
-    path == "/.lix" || path.starts_with("/.lix/")
+    path == "/.lix/.gitignore"
+        || path == "/.lix/.gitignore/"
+        || is_filesystem_internal_path(path)
+        || is_legacy_filesystem_sqlite_metadata_path(path)
 }
 
-fn is_filesystem_metadata_file_name(name: &std::ffi::OsStr) -> bool {
-    matches!(name.to_str(), Some(".lix"))
+fn is_filesystem_internal_path(path: &str) -> bool {
+    path == "/.lix/.internal" || path.starts_with("/.lix/.internal/")
+}
+
+fn is_legacy_lix_system_path(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path == "/.lix_system" || path.starts_with("/.lix_system/")
+}
+
+fn migrate_legacy_lix_system_path(path: &str) -> Option<String> {
+    if path == "/.lix_system" {
+        return Some("/.lix".to_string());
+    }
+    if path == "/.lix_system/" {
+        return Some("/.lix/".to_string());
+    }
+    let new_path = path
+        .strip_prefix("/.lix_system/")
+        .map(|suffix| format!("/.lix/{suffix}"))?;
+    if is_filesystem_metadata_path(&new_path) {
+        None
+    } else {
+        Some(new_path)
+    }
+}
+
+fn is_legacy_filesystem_sqlite_metadata_path(path: &str) -> bool {
+    matches!(
+        path.strip_prefix("/.lix/"),
+        Some("db.sqlite" | "db.sqlite-wal" | "db.sqlite-shm" | "db.sqlite-journal")
+    )
 }
 
 fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
@@ -1260,7 +1469,7 @@ fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
         return true;
     };
     let mut depth = 0usize;
-    let mut first_segment_is_lix_system = false;
+    let mut first_segment_is_lix = false;
     for component in relative.components() {
         let Component::Normal(segment) = component else {
             return true;
@@ -1270,10 +1479,22 @@ fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
         if segment == Some(".git") {
             return true;
         }
-        if depth == 1 && segment == Some(".lix_system") {
-            first_segment_is_lix_system = true;
+        if depth == 1 && segment == Some(".lix") {
+            first_segment_is_lix = true;
         }
-        if depth == 2 && first_segment_is_lix_system && segment == Some(".gitignore") {
+        if depth == 2 && first_segment_is_lix && segment == Some(".gitignore") {
+            return true;
+        }
+        if depth == 2 && first_segment_is_lix && segment == Some(".internal") {
+            return true;
+        }
+        if depth == 2
+            && first_segment_is_lix
+            && matches!(
+                segment,
+                Some("db.sqlite" | "db.sqlite-wal" | "db.sqlite-shm" | "db.sqlite-journal")
+            )
+        {
             return true;
         }
     }
@@ -1281,7 +1502,7 @@ fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
 }
 
 fn is_filesystem_sync_ignored_lix_path(path: &str) -> bool {
-    lix_path_contains_segment(path, ".git") || path == "/.lix_system/.gitignore"
+    lix_path_contains_segment(path, ".git") || is_filesystem_metadata_path(path)
 }
 
 fn lix_path_contains_segment(path: &str, segment: &str) -> bool {
@@ -1339,7 +1560,8 @@ fn open_filesystem_sqlite_backend(dir: &Path) -> Result<SqliteBackend, LixError>
 
 #[cfg(feature = "sqlite")]
 fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
-    let metadata_dir = dir.join(".lix");
+    let lix_dir = ensure_filesystem_lix_directory(dir)?;
+    let metadata_dir = lix_dir.join(".internal");
     match std::fs::create_dir(&metadata_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1372,26 +1594,74 @@ fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, Li
         )));
     }
 
-    ensure_metadata_gitignore(&metadata_dir)?;
+    move_legacy_filesystem_sqlite_metadata(&lix_dir, &metadata_dir)?;
     Ok(metadata_dir)
 }
 
-fn ensure_metadata_gitignore(directory: &Path) -> Result<(), LixError> {
+fn move_legacy_filesystem_sqlite_metadata(
+    lix_dir: &Path,
+    metadata_dir: &Path,
+) -> Result<(), LixError> {
+    let mut files_to_move = Vec::new();
+    for file_name in [
+        "db.sqlite",
+        "db.sqlite-wal",
+        "db.sqlite-shm",
+        "db.sqlite-journal",
+    ] {
+        let legacy_path = lix_dir.join(file_name);
+        let target_path = metadata_dir.join(file_name);
+        let legacy_metadata = match std::fs::symlink_metadata(&legacy_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io_error(
+                    "read legacy filesystem SQLite metadata",
+                    &legacy_path,
+                    error,
+                ));
+            }
+        };
+        if !legacy_metadata.is_file() {
+            return Err(filesystem_error(format!(
+                "legacy filesystem SQLite metadata {} must be a regular file",
+                legacy_path.display()
+            )));
+        }
+        if target_path.exists() {
+            return Err(filesystem_error(format!(
+                "cannot move legacy filesystem SQLite metadata {} to {} because the target already exists",
+                legacy_path.display(),
+                target_path.display()
+            )));
+        }
+        files_to_move.push((legacy_path, target_path));
+    }
+
+    for (legacy_path, target_path) in files_to_move {
+        std::fs::rename(&legacy_path, &target_path).map_err(|error| {
+            io_error(
+                "move legacy filesystem SQLite metadata",
+                &legacy_path,
+                error,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_gitignore(directory: &Path, content: &[u8]) -> Result<(), LixError> {
     let gitignore = directory.join(".gitignore");
     match std::fs::read(&gitignore) {
-        Ok(existing) if existing == HOST_METADATA_GITIGNORE => return Ok(()),
+        Ok(existing) if existing == content => return Ok(()),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(io_error(
-                "read filesystem metadata .gitignore",
-                &gitignore,
-                error,
-            ));
+            return Err(io_error("read filesystem .gitignore", &gitignore, error));
         }
     }
-    std::fs::write(&gitignore, HOST_METADATA_GITIGNORE)
-        .map_err(|error| io_error("write filesystem metadata .gitignore", &gitignore, error))
+    std::fs::write(&gitignore, content)
+        .map_err(|error| io_error("write filesystem .gitignore", &gitignore, error))
 }
 
 #[cfg(feature = "sqlite")]

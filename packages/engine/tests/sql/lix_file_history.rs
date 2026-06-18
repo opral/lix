@@ -308,7 +308,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
         .execute(
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
             &[
-                Value::Text("/.lix_system/plugins/plugin_history_render.lixplugin".to_string()),
+                Value::Text("/.lix/plugins/plugin_history_render.lixplugin".to_string()),
                 Value::Blob(history_render_plugin_archive()),
             ],
         )
