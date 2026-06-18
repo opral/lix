@@ -57,7 +57,7 @@ This is the data your review UI renders. See [Change History](./history.md) for 
 
 Merge is per-entity today: two versions editing different rows merge cleanly; two versions editing the same row produce a `sameEntityChanged` conflict. Wrap `mergeVersion()` and handle the conflict in your review flow.
 
-Don't reshape your schemas around this. Conflict semantics are an active roadmap item; design entities for how your code reads them, not around today's merge granularity. See [Versions & Merging](./versions.md#dont-shape-entities-around-merge).
+Don't reshape your schemas around this. Conflict semantics are still evolving; design entities for how your code reads them, not around today's merge granularity. See [Versions & Merging](./versions.md#dont-shape-entities-around-merge).
 
 ## Next
 

@@ -94,7 +94,7 @@ Each conflict has the shape:
 }
 ```
 
-Conflict detection is row-level today, not field-level: two versions editing different fields of the same row still conflict. Conflict semantics and resolution are an active roadmap item (see [Roadmap](https://github.com/opral/lix#roadmap)). **Don't reshape your schemas to avoid this**; design entities around how your code reads them, not around today's merge granularity.
+Conflict detection is row-level today, not field-level: two versions editing different fields of the same row still conflict. Conflict semantics and resolution are still evolving. **Don't reshape your schemas to avoid this**; design entities around how your code reads them, not around today's merge granularity.
 
 Always wrap `mergeVersion()` when conflicts are possible:
 

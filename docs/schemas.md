@@ -6,7 +6,7 @@ description: Define the entity types Lix tracks for you. The x-lix-* JSON Schema
 
 Schemas describe the entities Lix tracks. You declare each entity type as a JSON Schema with a few `x-lix-*` extensions, and Lix exposes a SQL table for it.
 
-Schemas are also the foundation file-format plugins build on: a plugin parses a file format (XLSX, DOCX, CAD, ...) into entities described by a schema. Today you register schemas yourself; once the plugin API lands, plugin authors register theirs.
+Schemas are also the foundation file-format plugins build on: a plugin parses a file format (XLSX, DOCX, CAD, ...) into entities described by a schema. You can register schemas yourself, and plugin authors can register schemas for the entities their format exposes.
 
 > [!NOTE]
 > **For agents.** Lix is self-documenting. When operating against a Lix repository, query `lix_registered_schema` to discover every schema currently in effect (including Lix's own internal schemas `lix_*`) rather than relying on a snapshot of these docs. The schemas you read back are authoritative and current.
@@ -165,6 +165,6 @@ ORDER BY lixcol_entity_pk;
 
 Shape your entities the way your reads want them. Document blocks, spreadsheet cells, line items: model whatever's natural for the questions your code asks.
 
-Don't shrink rows just to avoid merge conflicts. Lix's conflict detection is row-level today (two versions editing different fields of the same row still conflict), but conflict semantics and resolution are an active roadmap item; designs that bend around today's limitation will look strange once that lands. See the [roadmap](https://github.com/opral/lix#roadmap).
+Don't shrink rows just to avoid merge conflicts. Lix's conflict detection is row-level today (two versions editing different fields of the same row still conflict), but conflict semantics and resolution are still evolving; designs that bend around today's limitation will look strange as merge behavior matures.
 
 If two collaborators are likely to edit the same logical thing concurrently and your domain naturally splits it (a document into blocks, an invoice into line items), split it because the _data_ makes sense that way. Don't split a single record into ten just because a future merge might collide.

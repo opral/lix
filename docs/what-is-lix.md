@@ -1,14 +1,14 @@
 ---
-description: Lix is an embeddable version control system for files of any format. Diffs are semantic and per entity (which cells changed in a spreadsheet, which clauses moved in a contract), exposed as SQL, all in-process.
+description: Lix is a version control system for every file format. It tracks semantic changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom formats, exposed as SQL.
 ---
 
 # What is Lix?
 
-Lix is an **embeddable version control system for files of any format**. A spreadsheet diff tells you which cells changed. A contract diff tells you which clauses moved. A CAD diff tells you which parts changed. Lix diffs files **semantically, per entity**, across DOCX, XLSX, CAD, PDF, JSON, and any format with a parser plugin.
+Lix is a **version control system for every file format**. It tracks changes across Markdown, DOCX, XLSX, JSON, PDFs, CAD files, and custom formats as semantic entities: a spreadsheet cell, document clause, JSON property, PDF section, CAD part, or application row.
 
-Versions, merge, and an immutable change history, exposed as SQL, all running in-process inside your program.
+Versions, branches, merge, rollback, and immutable change history are exposed through SQL, so products and tools can bring version control workflows beyond source code.
 
-> Lix is to version control what DuckDB is to analytics: an embeddable engine with pluggable support for file formats.
+> Lix makes version control a runtime primitive for files: products can store, query, review, sync, and merge changes without inventing a custom history system.
 
 [See what a semantic diff looks like →](./comparison-to-git.md#what-this-looks-like)
 
@@ -31,28 +31,27 @@ const changes = await lix.execute(
 
 Each file format is parsed into **entities**: cells in a spreadsheet, clauses in a document, parts in a CAD drawing. Lix versions those entities. Per-row merge and history fall out for free.
 
-**Status:** the entity foundation ships today. Register a JSON Schema, write rows through SQL, version structured data end-to-end. A plugin API for file formats is on the [roadmap](https://github.com/opral/lix#roadmap); once it lands, anyone can author a plugin that turns a format (XLSX, DOCX, CAD, PDF, anything else) into entities, and the same primitives apply.
-
-## Three shapes
+## Where Lix fits
 
 The same `openLix()` powers three different shapes:
 
-**A library inside an end-user product.** Lawyers redlining a contract, analysts iterating on a forecast, engineers updating a BOM, designers exploring a layout: give them Git-like drafts, review, and rollback inside your product UI, no terminal in sight.
+**Inside an end-user product.** Lawyers redlining a contract, analysts iterating on a forecast, engineers updating a BOM, designers exploring a layout: give them drafts, review, rollback, and history inside your product UI.
 
-**A library inside an AI agent platform.** Every agent task gets an isolated workspace; humans or policies review the diff and merge or discard. See [Lix for AI Agents](./lix-for-ai-agents.md).
+**Inside an AI workflow.** Every agent task gets an isolated workspace; humans or policies review the diff and merge or discard. See [Lix for AI Agents](./lix-for-ai-agents.md).
 
-**The engine of an infrastructure product.** Build a versioned filesystem, an artifact or model registry, a configuration service, a Git-style branchable database, or a domain-specific CLI. Lix is the version-control core; you ship the surface.
+**As the version-control backend for file-based products.** Build a versioned filesystem, an artifact or model registry, a configuration service, a branchable database, or a domain-specific CLI. Lix is the version-control core; you ship the surface.
 
-## Why embed it
+## Why this matters
 
-Git's diff model is line-based on text, so it doesn't surface meaningful changes for binary or structured files (DOCX, XLSX, CAD). Git is also CLI-driven and operates outside your process, which makes it awkward for runtime data, programmatic edits, or end-user workflows that aren't a developer at a terminal.
+Source-code version control works best when text diffs explain the change. Many products edit files where the useful diff is a domain entity instead: a cell, clause, property, section, part, record, or generated output.
 
-Lix is the opposite shape:
+Lix gives those files version-control primitives directly:
 
-- A **library** you import; call it from an app, a service, a CLI, or another database engine.
+- **Any file format** can be represented through parser plugins or custom schemas.
+- **Semantic changes** are stored per entity instead of only as whole-file snapshots.
+- **SQL** is the query interface for application code, AI agents, and tools.
 - **Pluggable storage.** Run in-memory, persist to a `.lix` SQLite file, or implement the [backend interface](./backend.md) to put Lix on Postgres, S3, Cloudflare, IndexedDB, OPFS, or anything transactional and key-value-shaped.
-- **SQL** as the query interface, for application code, AI agents, and tools.
-- **ACID** transactions across files and entities.
+- **ACID transactions** work across files and entities.
 
 No daemon, no protocol, no remote.
 
@@ -73,7 +72,7 @@ Whether the entity is a spreadsheet cell, a document clause, a CAD part, or an a
 
 ## Examples of what Lix versions
 
-Once the plugin API lands and people start writing plugins:
+With parser plugins, Lix can version:
 
 - DOCX contracts, with clause-level diffs and redlines
 - XLSX models, with cell-level history and conflict-aware merges
