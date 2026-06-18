@@ -1,4 +1,5 @@
 import {
+	existsSync,
 	mkdirSync,
 	readFileSync,
 	statSync,
@@ -12,6 +13,7 @@ import {
 	bundledPluginArchives,
 	FsBackend,
 	openLix,
+	FilesBackend,
 	SqliteBackend,
 	Value,
 	type ExecuteResult,
@@ -246,6 +248,16 @@ test.each([
 		() => openLix({ backend: new SqliteBackend({ path: tempLixPath() }) }),
 	],
 	["fs", () => openLix({ backend: new FsBackend({ path: tempFsDir() }) })],
+	[
+		"files",
+		() => {
+			const dir = tempFsDir();
+			mkdirSync(dir, { recursive: true });
+			const path = join(dir, "matrix.md");
+			writeFileSync(path, "matrix");
+			return openLix({ backend: new FilesBackend({ path }) });
+		},
+	],
 ] as const)("core native flow works with %s backend", async (_name, open) => {
 	const lix = await open();
 
@@ -307,6 +319,53 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	await reopened.close();
 });
 
+test("files backend imports only the selected file and writes edits back", async () => {
+	const dir = tempFsDir();
+	const filePath = join(dir, "note.md");
+	const siblingPath = join(dir, "sibling.md");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(filePath, "local");
+	writeFileSync(siblingPath, "sibling");
+
+	const lix = await openLix({
+		backend: new FilesBackend({ path: filePath }),
+	});
+
+	const files = await lix.execute(
+		"SELECT path, data FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
+		["/note.md", "/sibling.md"],
+	);
+	expect(files.rows.map((row) => row.get("path"))).toEqual(["/note.md"]);
+	expect(new TextDecoder().decode(get(files, "data") as Uint8Array)).toBe(
+		"local",
+	);
+	expect(existsSync(join(dir, ".lix"))).toBe(false);
+	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
+
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+		new TextEncoder().encode("updated"),
+		"/note.md",
+	]);
+	expect(readFileSync(filePath, "utf8")).toBe("updated");
+	expect(readFileSync(siblingPath, "utf8")).toBe("sibling");
+
+	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+		"/generated.md",
+		new TextEncoder().encode("generated"),
+	]);
+	expect(existsSync(join(dir, "generated.md"))).toBe(false);
+	expect(existsSync(join(dir, ".lix"))).toBe(false);
+	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
+
+	writeFileSync(filePath, "external");
+	await waitFor(async () => {
+		const bytes = await readFile(lix, "/note.md");
+		return bytes ? new TextDecoder().decode(bytes) : undefined;
+	}, "external");
+
+	await lix.close();
+});
+
 test.skipIf(process.platform === "win32")(
 	"fs backend ignores symlinks",
 	async () => {
@@ -328,9 +387,7 @@ test.skipIf(process.platform === "win32")(
 			"SELECT path FROM lix_directory WHERE path IN ($1, $2) ORDER BY path",
 			["/docs/", "/linked-docs/"],
 		);
-		expect(directories.rows.map((row) => row.get("path"))).toEqual([
-			"/docs/",
-		]);
+		expect(directories.rows.map((row) => row.get("path"))).toEqual(["/docs/"]);
 		await lix.close();
 	},
 );
@@ -1208,9 +1265,10 @@ async function readFile(
 	lix: SqlExecutor,
 	path: string,
 ): Promise<Uint8Array | undefined> {
-	const result = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
-		path,
-	]);
+	const result = await lix.execute(
+		"SELECT data FROM lix_file WHERE path = $1",
+		[path],
+	);
 	if (result.rows.length === 0) {
 		return undefined;
 	}
@@ -1238,6 +1296,23 @@ async function withTimeout<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
 			clearTimeout(timeout);
 		}
 	}
+}
+
+async function waitFor<T>(
+	read: () => Promise<T>,
+	expected: T,
+	ms = 3_000,
+): Promise<void> {
+	const started = Date.now();
+	let latest: T | undefined;
+	do {
+		latest = await read();
+		if (latest === expected) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	} while (Date.now() - started < ms);
+	expect(latest).toBe(expected);
 }
 
 function tempLixPath(): string {

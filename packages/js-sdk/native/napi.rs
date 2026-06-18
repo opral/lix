@@ -1,7 +1,7 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, FsBackend, InMemoryBackend, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
+    ExecuteResult as RsExecuteResult, FilesBackend, FsBackend, InMemoryBackend, Lix as RsLix,
+    LixError, LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
@@ -32,18 +32,21 @@ enum NativeLixInner {
     Memory(RsLix<InMemoryBackend>),
     Sqlite(RsLix<SqliteBackend>),
     Fs(RsLix<FsBackend>),
+    Files(RsLix<FilesBackend>),
 }
 
 enum NativeLixTransactionInner {
     Memory(RsLixTransaction<InMemoryBackend>),
     Sqlite(RsLixTransaction<SqliteBackend>),
     Fs(RsLixTransaction<FsBackend>),
+    Files(RsLixTransaction<FilesBackend>),
 }
 
 enum NativeObserveEventsInner {
     Memory(RsObserveEvents<InMemoryBackend>),
     Sqlite(RsObserveEvents<SqliteBackend>),
     Fs(RsObserveEvents<FsBackend>),
+    Files(RsObserveEvents<FilesBackend>),
 }
 
 impl NativeLixInner {
@@ -56,6 +59,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.execute(sql, params).await,
             Self::Sqlite(lix) => lix.execute(sql, params).await,
             Self::Fs(lix) => lix.execute(sql, params).await,
+            Self::Files(lix) => lix.execute(sql, params).await,
         }
     }
 
@@ -70,6 +74,9 @@ impl NativeLixInner {
             Self::Fs(lix) => Ok(NativeLixTransactionInner::Fs(
                 lix.begin_transaction().await?,
             )),
+            Self::Files(lix) => Ok(NativeLixTransactionInner::Files(
+                lix.begin_transaction().await?,
+            )),
         }
     }
 
@@ -82,6 +89,7 @@ impl NativeLixInner {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
             Self::Sqlite(lix) => Ok(NativeObserveEventsInner::Sqlite(lix.observe(sql, params)?)),
             Self::Fs(lix) => Ok(NativeObserveEventsInner::Fs(lix.observe(sql, params)?)),
+            Self::Files(lix) => Ok(NativeObserveEventsInner::Files(lix.observe(sql, params)?)),
         }
     }
 
@@ -90,6 +98,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.active_branch_id().await,
             Self::Sqlite(lix) => lix.active_branch_id().await,
             Self::Fs(lix) => lix.active_branch_id().await,
+            Self::Files(lix) => lix.active_branch_id().await,
         }
     }
 
@@ -101,6 +110,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.create_branch(options).await,
             Self::Sqlite(lix) => lix.create_branch(options).await,
             Self::Fs(lix) => lix.create_branch(options).await,
+            Self::Files(lix) => lix.create_branch(options).await,
         }
     }
 
@@ -112,6 +122,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.switch_branch(options).await,
             Self::Sqlite(lix) => lix.switch_branch(options).await,
             Self::Fs(lix) => lix.switch_branch(options).await,
+            Self::Files(lix) => lix.switch_branch(options).await,
         }
     }
 
@@ -123,6 +134,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
             Self::Sqlite(lix) => lix.merge_branch_preview(options).await,
             Self::Fs(lix) => lix.merge_branch_preview(options).await,
+            Self::Files(lix) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -134,6 +146,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.merge_branch(options).await,
             Self::Sqlite(lix) => lix.merge_branch(options).await,
             Self::Fs(lix) => lix.merge_branch(options).await,
+            Self::Files(lix) => lix.merge_branch(options).await,
         }
     }
 
@@ -142,6 +155,7 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.close().await,
             Self::Sqlite(lix) => lix.close().await,
             Self::Fs(lix) => lix.close().await,
+            Self::Files(lix) => lix.close().await,
         }
     }
 }
@@ -156,6 +170,7 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => transaction.execute(sql, params).await,
             Self::Sqlite(transaction) => transaction.execute(sql, params).await,
             Self::Fs(transaction) => transaction.execute(sql, params).await,
+            Self::Files(transaction) => transaction.execute(sql, params).await,
         }
     }
 
@@ -164,6 +179,7 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => transaction.commit().await,
             Self::Sqlite(transaction) => transaction.commit().await,
             Self::Fs(transaction) => transaction.commit().await,
+            Self::Files(transaction) => transaction.commit().await,
         }
     }
 
@@ -172,6 +188,7 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => transaction.rollback().await,
             Self::Sqlite(transaction) => transaction.rollback().await,
             Self::Fs(transaction) => transaction.rollback().await,
+            Self::Files(transaction) => transaction.rollback().await,
         }
     }
 }
@@ -182,6 +199,7 @@ impl NativeObserveEventsInner {
             Self::Memory(events) => events.next().await,
             Self::Sqlite(events) => events.next().await,
             Self::Fs(events) => events.next().await,
+            Self::Files(events) => events.next().await,
         }
     }
 
@@ -190,6 +208,7 @@ impl NativeObserveEventsInner {
             Self::Memory(events) => events.close(),
             Self::Sqlite(events) => events.close(),
             Self::Fs(events) => events.close(),
+            Self::Files(events) => events.close(),
         }
     }
 }
@@ -243,6 +262,24 @@ impl NativeLix {
         Ok(Self {
             rt,
             lix: Some(NativeLixInner::Fs(lix)),
+        })
+    }
+
+    #[napi(factory, js_name = "openFiles")]
+    pub fn open_files(env: Env, path: String) -> Result<Self> {
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(to_napi_error)?;
+        let backend = rt
+            .block_on(FilesBackend::open(path))
+            .map_err(|error| throw_lix_error(&env, error))?;
+        let lix = rt
+            .block_on(open_lix_with_backend(backend))
+            .map_err(|error| throw_lix_error(&env, error))?;
+        Ok(Self {
+            rt,
+            lix: Some(NativeLixInner::Files(lix)),
         })
     }
 

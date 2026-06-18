@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, BackendError, BackendWrite, CommitResult, Engine, LixError, PutBatch, ReadOptions,
-    SessionContext, SpaceId, Value, WriteOptions,
+    Backend, BackendError, BackendWrite, CommitResult, Engine, InMemoryBackend, LixError, PutBatch,
+    ReadOptions, SessionContext, SpaceId, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -52,6 +52,17 @@ pub struct FsBackend {
 #[expect(missing_debug_implementations)]
 pub struct FsWrite<'a> {
     inner: FilesystemWrite<'a, SqliteBackend>,
+}
+
+#[derive(Clone)]
+#[expect(missing_debug_implementations)]
+pub struct FilesBackend {
+    inner: FilesFilesystemSync<InMemoryBackend>,
+}
+
+#[expect(missing_debug_implementations)]
+pub struct FilesWrite<'a> {
+    inner: FilesFilesystemWrite<'a, InMemoryBackend>,
 }
 
 #[derive(Clone)]
@@ -117,6 +128,71 @@ enum FilesystemEvent {
     Shutdown,
 }
 
+#[derive(Clone)]
+struct FilesFilesystemSync<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    inner: B,
+    supervisor: FilesFilesystemSupervisor<B>,
+}
+
+struct FilesFilesystemWrite<'a, B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    inner: B::Write<'a>,
+    supervisor: FilesFilesystemSupervisor<B>,
+}
+
+#[derive(Clone)]
+struct FilesFilesystemSupervisor<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    inner: Arc<FilesFilesystemSupervisorInner>,
+    _marker: PhantomData<fn() -> B>,
+}
+
+struct FilesFilesystemSupervisorInner {
+    event_tx: mpsc::Sender<FilesFilesystemEvent>,
+    debouncer: Mutex<Option<FilesystemDebouncer>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct FilesFilesystemState<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    session: SessionContext<B>,
+    host_path: PathBuf,
+    lix_path: String,
+    sync_lock: tokio::sync::Mutex<()>,
+    last_materialized: Mutex<Option<FilesMaterializedSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesMaterializedSnapshot {
+    host: Option<Vec<u8>>,
+    lix_revision: LixRevision,
+}
+
+enum FilesFilesystemEvent {
+    HostChanged,
+    SyncFromLix {
+        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+    },
+    Shutdown,
+}
+
 #[cfg(feature = "sqlite")]
 impl FsBackend {
     pub async fn open<P>(dir: P) -> Result<Self, LixError>
@@ -167,6 +243,68 @@ impl Backend for FsBackend {
 
 #[cfg(feature = "sqlite")]
 impl BackendWrite for FsWrite<'_> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(space, entries)
+    }
+
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[lix_engine::Key],
+    ) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys)
+    }
+
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: lix_engine::KeyRange,
+    ) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range)
+    }
+
+    fn commit(self) -> Result<CommitResult, BackendError> {
+        self.inner.commit()
+    }
+
+    fn rollback(self) -> Result<(), BackendError> {
+        self.inner.rollback()
+    }
+}
+
+impl FilesBackend {
+    pub async fn open<P>(file: P) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        let inner = FilesFilesystemSync::open(InMemoryBackend::new(), file.as_ref()).await?;
+        Ok(Self { inner })
+    }
+}
+
+impl Backend for FilesBackend {
+    type Read<'a>
+        = <InMemoryBackend as Backend>::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = FilesWrite<'a>
+    where
+        Self: 'a;
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        Ok(FilesWrite {
+            inner: self.inner.begin_write(opts)?,
+        })
+    }
+}
+
+impl BackendWrite for FilesWrite<'_> {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         self.inner.put_many(space, entries)
     }
@@ -264,6 +402,88 @@ where
 }
 
 impl<B> BackendWrite for FilesystemWrite<'_, B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(space, entries)
+    }
+
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[lix_engine::Key],
+    ) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys)
+    }
+
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: lix_engine::KeyRange,
+    ) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range)
+    }
+
+    fn commit(self) -> Result<CommitResult, BackendError> {
+        let result = self.inner.commit()?;
+        self.supervisor.sync_from_lix_blocking()?;
+        Ok(result)
+    }
+
+    fn rollback(self) -> Result<(), BackendError> {
+        self.inner.rollback()
+    }
+}
+
+impl<B> FilesFilesystemSync<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    async fn open(backend: B, file: &Path) -> Result<Self, LixError> {
+        let host_path = validate_single_file_path(file)?;
+        let lix_path = single_file_lix_path(&host_path)?;
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
+        Ok(Self {
+            inner: backend,
+            supervisor: FilesFilesystemSupervisor::open(engine, host_path, lix_path).await?,
+        })
+    }
+}
+
+impl<B> Backend for FilesFilesystemSync<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    type Read<'a>
+        = B::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = FilesFilesystemWrite<'a, B>
+    where
+        Self: 'a;
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        Ok(FilesFilesystemWrite {
+            inner: self.inner.begin_write(opts)?,
+            supervisor: self.supervisor.clone(),
+        })
+    }
+}
+
+impl<B> BackendWrite for FilesFilesystemWrite<'_, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -410,6 +630,263 @@ impl FilesystemSupervisorInner {
     }
 }
 
+impl<B> FilesFilesystemSupervisor<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    async fn open(
+        engine: Engine<B>,
+        host_path: PathBuf,
+        lix_path: String,
+    ) -> Result<Self, LixError> {
+        let session = engine.open_workspace_session().await?;
+        let state = Arc::new(FilesFilesystemState {
+            session,
+            host_path,
+            lix_path,
+            sync_lock: tokio::sync::Mutex::new(()),
+            last_materialized: Mutex::new(None),
+        });
+
+        state.sync_host_to_lix(false).await?;
+        state.sync_from_lix().await?;
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let callback_tx = event_tx.clone();
+        let watched_host_path = state.host_path.clone();
+        let watched_host_parent = watched_host_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                let path = watched_host_path.display();
+                filesystem_error(format!("single-file filesystem path {path} has no parent"))
+            })?;
+        let callback_host_path = watched_host_path.clone();
+        let callback_host_parent = watched_host_parent.clone();
+        let watcher_config = Config::default().with_follow_symlinks(false);
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+            Duration::from_millis(500),
+            None,
+            move |result: DebounceEventResult| {
+                if single_file_debounce_touches_path(
+                    &result,
+                    &callback_host_path,
+                    &callback_host_parent,
+                ) {
+                    let _ = callback_tx.send(FilesFilesystemEvent::HostChanged);
+                }
+            },
+            RecommendedCache::new(),
+            watcher_config,
+        )
+        .ok()
+        .and_then(|mut debouncer| {
+            let parent_watched = debouncer
+                .watch(watched_host_parent.as_path(), RecursiveMode::NonRecursive)
+                .is_ok();
+            let file_watched = debouncer
+                .watch(watched_host_path.as_path(), RecursiveMode::NonRecursive)
+                .is_ok();
+            if parent_watched || file_watched {
+                Some(debouncer)
+            } else {
+                debouncer.stop();
+                None
+            }
+        });
+        let poll_host = cfg!(target_os = "macos") || debouncer.is_none();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::Builder::new()
+            .name("lix-sdk-single-file-sync".to_string())
+            .spawn(move || single_file_filesystem_worker(worker_state, event_rx, poll_host))
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_FILESYSTEM_THREAD_ERROR",
+                    format!("failed to start single-file filesystem sync worker: {error}"),
+                )
+            })?;
+
+        Ok(Self {
+            inner: Arc::new(FilesFilesystemSupervisorInner {
+                event_tx,
+                debouncer: Mutex::new(debouncer),
+                worker: Mutex::new(Some(worker)),
+            }),
+            _marker: PhantomData,
+        })
+    }
+
+    fn sync_from_lix_blocking(&self) -> Result<(), BackendError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.inner
+            .event_tx
+            .send(FilesFilesystemEvent::SyncFromLix { reply_tx })
+            .map_err(|error| {
+                BackendError::Io(format!(
+                    "single-file filesystem sync failed: filesystem worker stopped: {error}"
+                ))
+            })?;
+        match reply_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(filesystem_sync_backend_error(error)),
+            Err(error) => Err(BackendError::Io(format!(
+                "single-file filesystem sync failed: filesystem worker stopped: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for FilesFilesystemSupervisorInner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl FilesFilesystemSupervisorInner {
+    fn shutdown(&self) {
+        if let Ok(mut debouncer) = self.debouncer.lock() {
+            let _ = debouncer.take().map(FilesystemDebouncer::stop);
+        }
+        let _ = self.event_tx.send(FilesFilesystemEvent::Shutdown);
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+impl<B> FilesFilesystemState<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    async fn sync_host_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
+        let _guard = self.sync_lock.lock().await;
+        let host = read_single_file_host(&self.host_path)?;
+        if skip_if_last_materialized && self.is_last_materialized_host(host.as_ref()) {
+            let lix_revision = self.collect_lix_revision().await?;
+            if self.is_last_materialized(host.as_ref(), &lix_revision) {
+                return Ok(());
+            }
+        }
+
+        let lix = self.collect_lix_file().await?;
+        match (host.as_ref(), lix.as_ref()) {
+            (Some(host_data), Some(lix_data)) if host_data == lix_data => {}
+            (Some(host_data), _) => {
+                self.session
+                    .execute(
+                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                        &[
+                            Value::Text(self.lix_path.clone()),
+                            Value::Blob(host_data.clone()),
+                        ],
+                    )
+                    .await?;
+            }
+            (None, Some(_)) => {
+                self.session
+                    .execute(
+                        "DELETE FROM lix_file WHERE path = $1",
+                        &[Value::Text(self.lix_path.clone())],
+                    )
+                    .await?;
+            }
+            (None, None) => {}
+        }
+
+        let lix_revision = self.collect_lix_revision().await?;
+        self.remember_materialized(host, lix_revision);
+        Ok(())
+    }
+
+    async fn sync_from_lix(&self) -> Result<(), LixError> {
+        let _guard = self.sync_lock.lock().await;
+        let target = self.collect_lix_file().await?;
+        let host = read_single_file_host(&self.host_path)?;
+        let previous = self.last_materialized_host();
+        let can_materialize = previous.is_none_or(|snapshot| snapshot == host);
+
+        if can_materialize && host != target {
+            match target.as_ref() {
+                Some(data) => write_single_file_host(&self.host_path, data)?,
+                None => remove_single_file_host(&self.host_path)?,
+            }
+        }
+
+        let lix_revision = self.collect_lix_revision().await?;
+        self.remember_materialized(target, lix_revision);
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), LixError> {
+        self.session.close().await
+    }
+
+    async fn collect_lix_file(&self) -> Result<Option<Vec<u8>>, LixError> {
+        let result = self
+            .session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(self.lix_path.clone())],
+            )
+            .await?;
+        result
+            .rows()
+            .first()
+            .map(|row| row.get::<Vec<u8>>("data"))
+            .transpose()
+    }
+
+    async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
+        let batch = self.session.execute_coherent_read_batch(&[]).await?;
+        Ok(LixRevision {
+            active_branch_id: batch.active_branch_id,
+            active_branch_commit_id: batch.active_branch_commit_id,
+            storage_mutation_revision: batch.storage_mutation_revision,
+        })
+    }
+
+    fn remember_materialized(&self, host: Option<Vec<u8>>, lix_revision: LixRevision) {
+        *self
+            .last_materialized
+            .lock()
+            .expect("single-file materialized snapshot lock should not poison") =
+            Some(FilesMaterializedSnapshot { host, lix_revision });
+    }
+
+    fn last_materialized_host(&self) -> Option<Option<Vec<u8>>> {
+        self.last_materialized
+            .lock()
+            .expect("single-file materialized snapshot lock should not poison")
+            .as_ref()
+            .map(|snapshot| snapshot.host.clone())
+    }
+
+    fn is_last_materialized_host(&self, host: Option<&Vec<u8>>) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("single-file materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| materialized.host.as_ref() == host)
+    }
+
+    fn is_last_materialized(&self, host: Option<&Vec<u8>>, lix_revision: &LixRevision) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("single-file materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| {
+                materialized.host.as_ref() == host && &materialized.lix_revision == lix_revision
+            })
+    }
+}
+
 impl<B> FilesystemState<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -468,10 +945,21 @@ where
             .filter(|(path, _)| is_legacy_lix_system_path(path))
         {
             if let Some(new_path) = migrate_legacy_lix_system_path(path) {
-                lix_write_file(&self.session, &new_path, data.clone()).await?;
+                self.session
+                    .execute(
+                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                        &[Value::Text(new_path.clone()), Value::Blob(data.clone())],
+                    )
+                    .await?;
                 write_materialized_file(&self.root, &new_path, data)?;
             }
-            lix_remove_file(&self.session, path).await?;
+            self.session
+                .execute(
+                    "DELETE FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.clone())],
+                )
+                .await?;
         }
 
         let directories = self
@@ -487,13 +975,23 @@ where
         sort_directories_shallowest_first(&mut directory_paths);
         for path in &directory_paths {
             if let Some(new_path) = migrate_legacy_lix_system_path(path) {
-                lix_make_directory(&self.session, &new_path).await?;
+                self.session
+                    .execute(
+                        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+                        &[Value::Text(new_path.clone())],
+                    )
+                    .await?;
                 create_materialized_directory(&self.root, &new_path)?;
             }
         }
         sort_directories_deepest_first(&mut directory_paths);
         for path in directory_paths {
-            lix_remove_directory_recursive(&self.session, &path).await?;
+            self.session
+                .execute(
+                    "DELETE FROM lix_directory WHERE path = $1",
+                    &[Value::Text(path)],
+                )
+                .await?;
         }
         Ok(())
     }
@@ -569,7 +1067,12 @@ where
                 {
                     continue;
                 }
-                lix_remove_file(&self.session, path).await?;
+                self.session
+                    .execute(
+                        "DELETE FROM lix_file WHERE path = $1",
+                        &[Value::Text(path.clone())],
+                    )
+                    .await?;
             }
         }
 
@@ -596,7 +1099,12 @@ where
         }
         sort_directories_deepest_first(&mut directories_to_remove);
         for path in directories_to_remove {
-            lix_remove_directory_recursive(&self.session, &path).await?;
+            self.session
+                .execute(
+                    "DELETE FROM lix_directory WHERE path = $1",
+                    &[Value::Text(path)],
+                )
+                .await?;
         }
 
         let mut directories_to_create = local
@@ -612,7 +1120,12 @@ where
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
         for path in directories_to_create {
-            lix_make_directory(&self.session, &path).await?;
+            self.session
+                .execute(
+                    "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+                    &[Value::Text(path)],
+                )
+                .await?;
         }
 
         for (path, data) in local
@@ -627,7 +1140,13 @@ where
                 continue;
             }
             if lix.files.get(path) != Some(data) {
-                lix_write_file(&self.session, path, data.clone()).await?;
+                self.session
+                    .execute(
+                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                        &[Value::Text(path.clone()), Value::Blob(data.clone())],
+                    )
+                    .await?;
             }
         }
 
@@ -775,74 +1294,6 @@ where
     }
 }
 
-async fn lix_write_file<B>(
-    session: &SessionContext<B>,
-    path: &str,
-    data: Vec<u8>,
-) -> Result<(), LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    session
-        .execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-            &[Value::Text(path.to_string()), Value::Blob(data)],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn lix_make_directory<B>(session: &SessionContext<B>, path: &str) -> Result<(), LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    session
-        .execute(
-            "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-            &[Value::Text(path.to_string())],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn lix_remove_file<B>(session: &SessionContext<B>, path: &str) -> Result<(), LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    session
-        .execute(
-            "DELETE FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn lix_remove_directory_recursive<B>(
-    session: &SessionContext<B>,
-    path: &str,
-) -> Result<(), LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    session
-        .execute(
-            "DELETE FROM lix_directory WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
-        .await?;
-    Ok(())
-}
-
 fn filesystem_worker<B>(
     state: Arc<FilesystemState<B>>,
     event_rx: mpsc::Receiver<FilesystemEvent>,
@@ -930,6 +1381,127 @@ fn sync_from_lix_for_replies<B>(
     }
 }
 
+fn single_file_debounce_touches_path(
+    result: &DebounceEventResult,
+    host_path: &Path,
+    host_parent: &Path,
+) -> bool {
+    result.as_ref().map_or(true, |events| {
+        events.iter().any(|event| {
+            event.paths.is_empty()
+                || event
+                    .paths
+                    .iter()
+                    .any(|path| single_file_event_path_matches(path, host_path, host_parent))
+        })
+    })
+}
+
+fn single_file_event_path_matches(path: &Path, host_path: &Path, host_parent: &Path) -> bool {
+    if path == host_path || path == host_parent {
+        return true;
+    }
+
+    if path.file_name() != host_path.file_name() {
+        return false;
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent == host_parent
+        || std::fs::canonicalize(parent)
+            .as_deref()
+            .is_ok_and(|parent| parent == host_parent)
+}
+
+fn single_file_filesystem_worker<B>(
+    state: Arc<FilesFilesystemState<B>>,
+    event_rx: mpsc::Receiver<FilesFilesystemEvent>,
+    poll_host: bool,
+) where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
+        return;
+    };
+    loop {
+        let e = if poll_host {
+            event_rx.recv_timeout(FILESYSTEM_POLL_INTERVAL)
+        } else {
+            event_rx
+                .recv()
+                .map_err(|mpsc::RecvError| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match e {
+            Ok(FilesFilesystemEvent::HostChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                if drain_single_file_events(&runtime, &state, &event_rx, true) {
+                    return;
+                }
+            }
+            Ok(FilesFilesystemEvent::SyncFromLix { reply_tx }) => {
+                single_file_sync_from_lix_for_replies(&runtime, &state, vec![reply_tx]);
+                if drain_single_file_events(&runtime, &state, &event_rx, false) {
+                    return;
+                }
+            }
+            Ok(FilesFilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = runtime.block_on(state.close());
+                return;
+            }
+        }
+    }
+}
+
+fn drain_single_file_events<B>(
+    runtime: &tokio::runtime::Runtime,
+    state: &Arc<FilesFilesystemState<B>>,
+    event_rx: &mpsc::Receiver<FilesFilesystemEvent>,
+    mut sync_host: bool,
+) -> bool
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let mut sync_replies = Vec::new();
+    loop {
+        match event_rx.try_recv() {
+            Ok(FilesFilesystemEvent::HostChanged) => sync_host = true,
+            Ok(FilesFilesystemEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
+            Ok(FilesFilesystemEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = runtime.block_on(state.close());
+                return true;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+        }
+    }
+    if sync_host {
+        let _ = runtime.block_on(state.sync_host_to_lix(true));
+    }
+    if !sync_replies.is_empty() {
+        single_file_sync_from_lix_for_replies(runtime, state, sync_replies);
+    }
+    false
+}
+
+fn single_file_sync_from_lix_for_replies<B>(
+    runtime: &tokio::runtime::Runtime,
+    state: &Arc<FilesFilesystemState<B>>,
+    replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
+) where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = runtime.block_on(state.sync_from_lix());
+    for reply in replies {
+        let _ = reply.send(result.clone());
+    }
+}
+
 fn collect_local_snapshot(root: &Path) -> Result<Snapshot, LixError> {
     validate_filesystem_root_directory(root)?;
 
@@ -995,6 +1567,117 @@ fn remember_unmanaged_local_path(
             snapshot.unmanaged_paths.insert(parent_path);
         }
     }
+}
+
+fn validate_single_file_path(path: &Path) -> Result<PathBuf, LixError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_error("read single-file filesystem metadata", path, error))?;
+    if metadata.file_type().is_symlink() {
+        let path = path.display();
+        return Err(filesystem_error(format!(
+            "single-file filesystem path {path} must not be a symlink"
+        )));
+    }
+    if !metadata.is_file() {
+        let path = path.display();
+        return Err(filesystem_error(format!(
+            "single-file filesystem path {path} must be a file"
+        )));
+    }
+    std::fs::canonicalize(path)
+        .map_err(|error| io_error("canonicalize single-file filesystem path", path, error))
+}
+
+fn single_file_lix_path(path: &Path) -> Result<String, LixError> {
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            let path = path.display();
+            filesystem_error(format!(
+                "single-file filesystem path {path} does not have a valid UTF-8 file name"
+            ))
+        })?;
+    let mut local = PathBuf::new();
+    push_lix_path_segment(&mut local, file_name, file_name)?;
+    Ok(format!("/{file_name}"))
+}
+
+fn read_single_file_host(path: &Path) -> Result<Option<Vec<u8>>, LixError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io_error(
+                "read single-file filesystem metadata",
+                path,
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        let path = path.display();
+        return Err(filesystem_error(format!(
+            "single-file filesystem path {path} must remain a regular file"
+        )));
+    }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|error| io_error("read single-file filesystem file", path, error))
+}
+
+fn write_single_file_host(path: &Path, data: &[u8]) -> Result<(), LixError> {
+    if let Some(parent) = path.parent() {
+        let metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+            io_error("read single-file filesystem parent metadata", parent, error)
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            let parent = parent.display();
+            return Err(filesystem_error(format!(
+                "single-file filesystem parent path {parent} must be a directory"
+            )));
+        }
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            let path = path.display();
+            return Err(filesystem_error(format!(
+                "single-file filesystem path {path} must remain a regular file"
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error(
+                "read single-file filesystem metadata",
+                path,
+                error,
+            ));
+        }
+    }
+
+    std::fs::write(path, data)
+        .map_err(|error| io_error("write single-file filesystem file", path, error))
+}
+
+fn remove_single_file_host(path: &Path) -> Result<(), LixError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read single-file filesystem metadata",
+                path,
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(());
+    }
+    std::fs::remove_file(path)
+        .map_err(|error| io_error("remove single-file filesystem file", path, error))
 }
 
 fn ensure_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
@@ -1698,6 +2381,26 @@ mod tests {
             .first()
             .map(|row| row.get::<Vec<u8>>("data"))
             .transpose()
+    }
+
+    async fn lix_write_file<B>(
+        session: &SessionContext<B>,
+        path: &str,
+        data: Vec<u8>,
+    ) -> Result<(), LixError>
+    where
+        B: Backend + Clone + Send + Sync + 'static,
+        for<'backend> B::Read<'backend>: Send,
+        for<'backend> B::Write<'backend>: Send,
+    {
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                &[Value::Text(path.to_string()), Value::Blob(data)],
+            )
+            .await?;
+        Ok(())
     }
 
     #[test]

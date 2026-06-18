@@ -12,6 +12,8 @@ mod lix;
 #[cfg(feature = "sqlite")]
 mod sqlite_backend;
 
+#[cfg(not(target_family = "wasm"))]
+pub use filesystem::FilesBackend;
 #[cfg(all(not(target_family = "wasm"), feature = "sqlite"))]
 pub use filesystem::FsBackend;
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
