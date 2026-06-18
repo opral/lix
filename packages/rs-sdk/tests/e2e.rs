@@ -610,31 +610,48 @@ async fn filesystem_removes_legacy_lix_system_directory() {
         .unwrap();
     write_file(
         &seed,
-        "/.lix_system/plugins/plugin_legacy.lixplugin",
+        "/.lix_system/settings.json",
         b"stored legacy".to_vec(),
     )
     .await
     .unwrap();
     seed.close().await.unwrap();
 
-    std::fs::create_dir_all(tempdir.path().join(".lix_system/plugins")).unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".lix_system/app_data")).unwrap();
     std::fs::write(
-        tempdir
-            .path()
-            .join(".lix_system/plugins/plugin_legacy.lixplugin"),
-        b"legacy",
+        tempdir.path().join(".lix_system/app_data/legacy.txt"),
+        b"disk legacy",
     )
     .unwrap();
+    std::fs::write(tempdir.path().join(".lix_system/.gitignore"), b"*\n").unwrap();
+    std::fs::write(tempdir.path().join(".lix_system/.DS_Store"), b"ds-store").unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert!(!tempdir.path().join(".lix_system").exists());
+    assert_eq!(
+        std::fs::read(tempdir.path().join(".lix/app_data/legacy.txt")).unwrap(),
+        b"disk legacy"
+    );
+    assert!(!tempdir.path().join(".lix/.DS_Store").exists());
     assert_eq!(readdir(&lix, "/.lix_system/").await.unwrap(), None);
     assert_eq!(
-        read_file(&lix, "/.lix_system/plugins/plugin_legacy.lixplugin")
-            .await
-            .unwrap(),
+        read_file(&lix, "/.lix_system/settings.json").await.unwrap(),
         None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/settings.json")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"stored legacy".as_slice())
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/app_data/legacy.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"disk legacy".as_slice())
     );
     lix.close().await.unwrap();
 }
