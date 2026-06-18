@@ -615,6 +615,16 @@ async fn filesystem_removes_legacy_lix_system_directory() {
     )
     .await
     .unwrap();
+    write_file(&seed, "/.lix_system/db.sqlite", b"legacy db".to_vec())
+        .await
+        .unwrap();
+    write_file(
+        &seed,
+        "/.lix_system/.internal/private",
+        b"legacy private".to_vec(),
+    )
+    .await
+    .unwrap();
     seed.close().await.unwrap();
 
     std::fs::create_dir_all(tempdir.path().join(".lix_system/app_data")).unwrap();
@@ -625,6 +635,17 @@ async fn filesystem_removes_legacy_lix_system_directory() {
     .unwrap();
     std::fs::write(tempdir.path().join(".lix_system/.gitignore"), b"*\n").unwrap();
     std::fs::write(tempdir.path().join(".lix_system/.DS_Store"), b"ds-store").unwrap();
+    std::fs::write(
+        tempdir.path().join(".lix_system/db.sqlite"),
+        b"disk legacy db",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".lix_system/.internal")).unwrap();
+    std::fs::write(
+        tempdir.path().join(".lix_system/.internal/private"),
+        b"disk private",
+    )
+    .unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
@@ -639,6 +660,23 @@ async fn filesystem_removes_legacy_lix_system_directory() {
         read_file(&lix, "/.lix_system/settings.json").await.unwrap(),
         None
     );
+    assert_eq!(
+        read_file(&lix, "/.lix_system/db.sqlite").await.unwrap(),
+        None
+    );
+    assert_eq!(read_file(&lix, "/.lix/db.sqlite").await.unwrap(), None);
+    assert!(!tempdir.path().join(".lix/db.sqlite").exists());
+    assert_eq!(
+        read_file(&lix, "/.lix_system/.internal/private")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/.internal/private").await.unwrap(),
+        None
+    );
+    assert!(!tempdir.path().join(".lix/.internal/private").exists());
     assert_eq!(
         read_file(&lix, "/.lix/settings.json")
             .await

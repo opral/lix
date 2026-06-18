@@ -283,9 +283,8 @@ async fn fs_backend_legacy_sqlite_metadata_conflict_does_not_partially_move() {
     std::fs::write(internal_sqlite_dir.join("db.sqlite-wal"), b"target-wal")
         .expect("target wal writes");
 
-    let error = match FsBackend::open(&filesystem_path).await {
-        Ok(_) => panic!("conflicting legacy metadata should fail"),
-        Err(error) => error,
+    let Err(error) = FsBackend::open(&filesystem_path).await else {
+        panic!("conflicting legacy metadata should fail");
     };
 
     assert!(

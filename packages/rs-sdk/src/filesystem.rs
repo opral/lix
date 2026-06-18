@@ -1068,7 +1068,7 @@ fn migrate_legacy_filesystem_system_directory(root: &Path) -> Result<(), LixErro
         }
     };
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        merge_legacy_directory_contents(&legacy_dir, &root.join(".lix"))?;
+        merge_legacy_directory_contents(root, &legacy_dir, &root.join(".lix"))?;
         std::fs::remove_dir_all(&legacy_dir).map_err(|error| {
             io_error(
                 "remove legacy filesystem system directory",
@@ -1082,7 +1082,11 @@ fn migrate_legacy_filesystem_system_directory(root: &Path) -> Result<(), LixErro
     }
 }
 
-fn merge_legacy_directory_contents(source: &Path, target: &Path) -> Result<(), LixError> {
+fn merge_legacy_directory_contents(
+    root: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<(), LixError> {
     let entries = std::fs::read_dir(source)
         .map_err(|error| io_error("read legacy filesystem system directory", source, error))?;
     for entry in entries {
@@ -1100,6 +1104,14 @@ fn merge_legacy_directory_contents(source: &Path, target: &Path) -> Result<(), L
             continue;
         }
         let target_path = target.join(&file_name);
+        let Ok(target_lix_path) = local_path_to_lix_path(root, &target_path, false) else {
+            remove_legacy_system_entry(&source_path)?;
+            continue;
+        };
+        if is_filesystem_metadata_path(&target_lix_path) {
+            remove_legacy_system_entry(&source_path)?;
+            continue;
+        }
         let file_type = entry.file_type().map_err(|error| {
             io_error(
                 "read legacy filesystem system entry type",
@@ -1110,7 +1122,7 @@ fn merge_legacy_directory_contents(source: &Path, target: &Path) -> Result<(), L
         if file_type.is_dir() {
             match std::fs::symlink_metadata(&target_path) {
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    merge_legacy_directory_contents(&source_path, &target_path)?;
+                    merge_legacy_directory_contents(root, &source_path, &target_path)?;
                     std::fs::remove_dir(&source_path).map_err(|error| {
                         io_error(
                             "remove migrated legacy filesystem system directory",
@@ -1435,17 +1447,20 @@ fn migrate_legacy_lix_system_path(path: &str) -> Option<String> {
     if path == "/.lix_system/" {
         return Some("/.lix/".to_string());
     }
-    path.strip_prefix("/.lix_system/")
-        .map(|suffix| format!("/.lix/{suffix}"))
+    let new_path = path
+        .strip_prefix("/.lix_system/")
+        .map(|suffix| format!("/.lix/{suffix}"))?;
+    if is_filesystem_metadata_path(&new_path) {
+        None
+    } else {
+        Some(new_path)
+    }
 }
 
 fn is_legacy_filesystem_sqlite_metadata_path(path: &str) -> bool {
     matches!(
         path.strip_prefix("/.lix/"),
-        Some("db.sqlite")
-            | Some("db.sqlite-wal")
-            | Some("db.sqlite-shm")
-            | Some("db.sqlite-journal")
+        Some("db.sqlite" | "db.sqlite-wal" | "db.sqlite-shm" | "db.sqlite-journal")
     )
 }
 
@@ -1477,10 +1492,7 @@ fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
             && first_segment_is_lix
             && matches!(
                 segment,
-                Some("db.sqlite")
-                    | Some("db.sqlite-wal")
-                    | Some("db.sqlite-shm")
-                    | Some("db.sqlite-journal")
+                Some("db.sqlite" | "db.sqlite-wal" | "db.sqlite-shm" | "db.sqlite-journal")
             )
         {
             return true;
