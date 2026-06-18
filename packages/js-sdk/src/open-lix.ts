@@ -12,6 +12,7 @@ import type {
 	MergeBranchReceipt,
 	ObserveEvent,
 	OpenLixOptions,
+	FilesBackendOptions,
 	SqlParam,
 	SqliteBackendOptions,
 	SwitchBranchOptions,
@@ -79,6 +80,21 @@ export class FsBackend {
 	}
 }
 
+export class FilesBackend {
+	readonly path: string;
+
+	constructor(options: FilesBackendOptions) {
+		if (
+			!options ||
+			typeof options.path !== "string" ||
+			options.path.length === 0
+		) {
+			throw new TypeError("FilesBackend requires a non-empty path");
+		}
+		this.path = options.path;
+	}
+}
+
 export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (!options || typeof options !== "object") {
 		throw new TypeError("openLix() options must be an object");
@@ -92,8 +108,11 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (options.backend instanceof FsBackend) {
 		return new Lix(addon.Lix.openFs(options.backend.path));
 	}
+	if (options.backend instanceof FilesBackend) {
+		return new Lix(addon.Lix.openFiles(options.backend.path));
+	}
 	throw new TypeError(
-		"openLix() requires { backend: new SqliteBackend({ path }) } or { backend: new FsBackend({ path }) }",
+		"openLix() requires { backend: new SqliteBackend({ path }) }, { backend: new FsBackend({ path }) }, or { backend: new FilesBackend({ path }) }",
 	);
 }
 
