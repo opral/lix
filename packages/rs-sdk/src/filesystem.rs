@@ -320,6 +320,7 @@ where
             last_materialized: Mutex::new(None),
         });
 
+        state.remove_legacy_lix_system_paths().await?;
         state.sync_disk_to_lix(false).await?;
         state.sync_from_lix().await?;
 
@@ -450,6 +451,40 @@ where
 
     async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
+    }
+
+    async fn remove_legacy_lix_system_paths(&self) -> Result<(), LixError> {
+        let files = self
+            .session
+            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .await?;
+        let file_paths = files
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("path"))
+            .collect::<Result<Vec<_>, _>>()?;
+        for path in file_paths
+            .iter()
+            .filter(|path| is_legacy_lix_system_path(path))
+        {
+            lix_remove_file(&self.session, path).await?;
+        }
+
+        let directories = self
+            .session
+            .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+            .await?;
+        let mut directory_paths = directories
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("path"))
+            .collect::<Result<Vec<_>, _>>()?;
+        directory_paths.retain(|path| is_legacy_lix_system_path(path));
+        sort_directories_deepest_first(&mut directory_paths);
+        for path in directory_paths {
+            lix_remove_directory_recursive(&self.session, &path).await?;
+        }
+        Ok(())
     }
 
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
@@ -1281,6 +1316,11 @@ fn is_filesystem_metadata_path(path: &str) -> bool {
 
 fn is_filesystem_internal_path(path: &str) -> bool {
     path == "/.lix/.internal" || path.starts_with("/.lix/.internal/")
+}
+
+fn is_legacy_lix_system_path(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path == "/.lix_system" || path.starts_with("/.lix_system/")
 }
 
 fn is_legacy_filesystem_sqlite_metadata_path(path: &str) -> bool {

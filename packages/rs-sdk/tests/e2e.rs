@@ -603,6 +603,20 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
 #[cfg(feature = "sqlite")]
 async fn filesystem_removes_legacy_lix_system_directory() {
     let tempdir = tempfile::tempdir().unwrap();
+    let metadata_dir = tempdir.path().join(".lix/.internal");
+    std::fs::create_dir_all(&metadata_dir).unwrap();
+    let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
+        .await
+        .unwrap();
+    write_file(
+        &seed,
+        "/.lix_system/plugins/plugin_legacy.lixplugin",
+        b"stored legacy".to_vec(),
+    )
+    .await
+    .unwrap();
+    seed.close().await.unwrap();
+
     std::fs::create_dir_all(tempdir.path().join(".lix_system/plugins")).unwrap();
     std::fs::write(
         tempdir
