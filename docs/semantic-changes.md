@@ -6,7 +6,7 @@ description: Lix tracks semantic changes at the entity level, so apps and agents
 
 Semantic changes are changes to the things your app understands: rows, cells, paragraphs, clauses, nodes, tasks, symbols, or any other entity described by a Lix schema.
 
-Git sees text lines and file bytes. Lix can see structured entities.
+Text-based diffs see lines and file bytes. Lix can see structured entities.
 
 That means Lix can represent:
 
@@ -57,7 +57,7 @@ Given a JSON file:
 {"theme":"dark","notifications":true,"language":"en"}
 ```
 
-Git sees:
+Text-based diff:
 
 ```diff
 -{"theme":"light","notifications":true,"language":"en"}
@@ -75,8 +75,6 @@ property theme:
 ## Excel example
 
 The same idea applies to binary formats. With an XLSX plugin, Lix can expose cell or row level changes.
-
-> **v0.6 status:** entity-level change tracking and the physical storage layout are stable. The file plugin API for writing custom plugins (XLSX, DOCX, PDF, code) is being finalized. See the [roadmap](https://github.com/opral/lix#roadmap).
 
 **Before:**
 
@@ -96,7 +94,7 @@ The same idea applies to binary formats. With an XLSX plugin, Lix can expose cel
 | 1002     | Widget B | shipped |
 ```
 
-Git sees:
+Byte-level diff:
 
 ```diff
 -Binary files differ

@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Embeddable version control system for AI agents</h3>
+<h3 align="center">Version control system for every file format</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,13 +11,22 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix gives AI agents versions, branches, checkpoints, reviewable changes, rollback, merging, immutable history, and SQL-queryable context for **non-code files** like PDF, DOCX, XLSX, CSV, JSON, and agent-generated work.
+Lix tracks, reviews, branches, merges, and rolls back changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom file formats.
 
-- **Runs in process.** Import it as a library and run it inside your worker, service, CLI, or app. No daemon, no protocol.
-- **Works for any file format.** Track changes as entities across files, structured data, and custom formats.
-- **Real-time multiplayer.** Give agents and tools shared versions, branches, and live change history.
-- **Bring your own backend.** Start in memory, then plug into SQLite, Postgres, S3, Cloudflare, or your own adapter.
-- **SQL interface.** Agents can query history and changes without rereading whole files.
+Use Lix standalone or as the change-control backend for editors, knowledge bases, AI workflows, and file-based products. Lix stores files, tracks semantic changes, exposes history through SQL, and brings version control workflows beyond source code.
+
+- 📌 **Supports any file format.** Create drafts, branches, checkpoints, and releases for Markdown, DOCX, XLSX, JSON, PDFs, and custom formats.
+- 🔍 **Track semantic changes.** See the paragraph, cell, property, clause, or custom entity that changed.
+- 🔀 **Review and merge changes.** Build change proposals, accept/reject flows, rollback, and merge workflows around files.
+- 🤝 **Sync in real time.** Keep versions and changes in sync across users, agents, devices, and runtimes.
+- ✅ **Validate and automate.** Run checks, enforce rules, and trigger workflows when files change.
+- 🧠 **Query everything with SQL.** Ask what changed, where, when, and by whom without rereading whole files.
+
+## Try a demo app
+
+[Flashtype](https://flashtype.com) is a Markdown editor for Claude and Codex built on Lix. Open local Markdown files, let agents edit them, review changes as diffs, and restore previous versions from history.
+
+[![Flashtype app preview](https://flashtype.com/og.png)](https://flashtype.com)
 
 ## Getting started
 
@@ -64,13 +73,13 @@ const changes = await lix.execute(
 
 ## Why Lix?
 
-### Git is great for code. Non-code files need semantic change tracking.
+### Version control should not stop at source code.
 
-AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, versions, reviewable changes, and rollback.
+Most version control systems assume source code and text diffs. But many important products edit files where the useful change is a paragraph, spreadsheet cell, JSON property, PDF section, knowledge-base page, or custom entity.
 
-Git works well for source code, but it cannot meaningfully track many non-code files by default. Agents increasingly operate on files where the useful diff is a spreadsheet cell, document clause, generated JSON property, CSV row, PDF section, or agent action.
+Lix is built for those files. Plugins translate file updates into semantic changes that can be queried, reviewed, branched, merged, and rolled back.
 
-Lix is built to make those domain-level changes queryable, reviewable, and mergeable.
+[Flashtype](https://flashtype.com), a Markdown editor for Claude and Codex, uses Lix so every local Markdown edit can be checkpointed, reviewed as a diff, and restored.
 
 [How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
@@ -78,7 +87,7 @@ Lix is built to make those domain-level changes queryable, reviewable, and merge
 
 #### Import as a library
 
-Import Lix and open it inside your worker, service, CLI, or app. No daemon, no protocol.
+Import Lix and open it inside your worker, service, CLI, browser, desktop app, or server-side runtime. No daemon, no protocol.
 
 ```ts
 import { openLix, SqliteBackend } from "@lix-js/sdk";
@@ -111,9 +120,9 @@ try {
 }
 ```
 
-#### Parallel branches. No worktrees.
+#### Parallel branches
 
-Give every agent its own isolated branch without creating Git-style multi-checkout worktrees.
+Give every draft, user, tool, or AI agent its own isolated branch.
 
 ```ts
 const main = await lix.activeBranchId();
@@ -145,7 +154,7 @@ await lix.switchBranch({ branchId: main });
 
 #### Semantic changes
 
-Unlike Git's line-based diffs, Lix can track structured entities: XLSX rows, DOCX clauses, JSON properties, app records, and more.
+Lix can track structured entities: XLSX rows, DOCX clauses, JSON properties, app records, custom entities, and more.
 
 ```ts
 const changes = await lix.execute(`
@@ -156,7 +165,7 @@ const changes = await lix.execute(`
 `);
 ```
 
-For example, an agent edits an orders spreadsheet:
+For example, a workflow edits an orders spreadsheet:
 
 ```text
 Before:
@@ -172,7 +181,7 @@ After:
 | 1002     | Widget B | shipped |
 ```
 
-Git can only tell you the file changed:
+A text-based diff can only tell you the file changed:
 
 ```diff
 -Binary files differ
@@ -191,7 +200,7 @@ order_id 1002 status:
 
 #### SQL interface
 
-Agents burn fewer tokens and keep cleaner context when version-control questions are answered with SQL instead of whole-file rereads.
+Answer version-control questions with SQL instead of whole-file rereads.
 
 <img src="./website/public/assets/claude-sql-question.svg" alt="Claude Code asks: Which orders changed status in this branch? Executing SQL" width="460" />
 
@@ -206,9 +215,9 @@ const rows = await lix.execute(`
 
 Every change, across every file and every branch, is a row in `lix_change`. Filter by branch, file, schema, or time without re-reading whole files.
 
-#### Bring your own backend
+#### Portable runtimes and storage
 
-Start in memory, then plug Lix into the infrastructure your app already runs.
+Use Lix standalone or plug it into the infrastructure your product already runs.
 
 <p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://api.iconify.design/logos:aws-s3.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
 
@@ -220,16 +229,16 @@ const lix = await openLix({
 
 ## How Lix works
 
-Lix runs in-process inside your app.
+Lix runs in-process inside your runtime.
 
-It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. You plug it into whatever backend you need: in-memory, SQLite, Postgres, S3, Cloudflare, or your own adapter.
+It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. Use it standalone or plug it into whatever backend you need: in-memory, SQLite, Postgres, S3, Cloudflare, or your own adapter.
 
-SQL is the query interface on top. Agents can ask what changed without rereading whole files.
+SQL is the query interface on top. Products, scripts, and agents can ask what changed without rereading whole files.
 
 ```
 ┌─────────────────────────────────────────────────┐
 │                  Your runtime                   │
-│        agent worker · server · CLI · app         │
+│       browser · desktop · server · CLI · worker  │
 │                                                 │
 │   ┌─────────────────────────────────────────┐   │
 │   │                  Lix                    │   │
@@ -246,53 +255,12 @@ SQL is the query interface on top. Agents can ask what changed without rereading
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
 
-## What you can build with Lix
-
-- **AI agent filesystems** - isolated workspaces, versioned explore steps, semantic change history, and rollback when a run goes sideways.
-- **Version control for Postgres & SQLite** - time-travel and versioned schemas on top of an existing database. Reviewable migrations. Diffable rows.
-- **Apps with version control** - add versions, review, rollback, and history to editors, CMSs, design tools, internal ops apps, and AI-native products.
-- **Review for AI-generated changes** - surface what an agent actually changed at the entity level. Approve, request edits, or revert by symbol instead of patch.
-
-## Roadmap
-
-**v0.6: Lix SDK (current)**
-
-- [x] Importable SDK
-- [x] ACID transactions across state, blobs, and history
-- [x] Parallel sessions and versions
-- [x] Entity-level change tracking, queryable via SQL
-- [x] Stable physical storage layout
-- [x] Pluggable backend interface
-
-**v0.7: Lix CLI**
-
-- [ ] CLI for creating, inspecting, and scripting Lix repositories
-
-**v0.8: file plugin API**
-
-- [ ] Finalized file plugin API for DOCX, XLSX, CAD, PDF, and code
-
-**v0.9: merge conflicts**
-
-- [ ] Merge conflicts as first-class citizens
-
-**v0.10: working changes**
-
-- [ ] Working changes and checkpointing
-
 ## Learn More
 
 - **[Getting Started Guide](https://lix.dev/docs/getting-started)** - Build your first app with Lix
 - **[Documentation](https://lix.dev/docs)** - Full API reference and guides
 - **[Discord](https://discord.gg/gdMPPWy57R)** - Get help and join the community
 - **[GitHub](https://github.com/opral/lix)** - Report issues and contribute
-
-## Blog posts
-
-- [Introducing Lix: An embeddable version control system](https://lix.dev/blog/introducing-lix)
-- [What if a Git SDK to build apps exists?](https://samuelstroschein.com/blog/what-if-a-git-sdk-exists)
-- [Git is unsuited for applications](https://samuelstroschein.com/blog/git-limitations)
-- [Does a git-based architecture make sense?](https://samuelstroschein.com/blog/git-based-architecture)
 
 ## License
 

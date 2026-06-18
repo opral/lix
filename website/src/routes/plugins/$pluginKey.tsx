@@ -8,7 +8,8 @@ import {
 } from "../../lib/seo";
 
 const title = "Lix Plugins";
-const description = "Plugins are coming soon.";
+const description =
+  "File plugins map formats into semantic entities. The public plugin directory is being rebuilt.";
 
 export const Route = createFileRoute("/plugins/$pluginKey")({
   head: () => {
@@ -61,10 +62,11 @@ function PluginsComingSoonPage() {
           Plugins
         </p>
         <h1 className="mt-4 text-4xl font-semibold tracking-tight sm:text-5xl">
-          Plugins are coming soon
+          Plugin directory is being rebuilt
         </h1>
         <p className="mt-6 text-lg leading-8 text-slate-600">
-          We are rewriting this section as part of the website cleanup.
+          File plugins are available today. We are rewriting this section as
+          part of the website cleanup.
         </p>
       </main>
       <Footer />

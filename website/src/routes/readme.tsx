@@ -1,7 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Header } from "../components/header";
 import { LandingReadme } from "../components/landing-page";
-import { V2Footer, V2Hero } from "../components/v2-landing-page";
 import markdownPageCss from "../components/markdown-page.style.css?url";
 import { loadReadmeContent } from "../lib/readme-content";
 import {
@@ -15,9 +14,9 @@ export const Route = createFileRoute("/readme")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix README | An embeddable version control system";
+    const title = "Lix README | Version control system for every file format";
     const description =
-      "Read the Lix project README, including package details, examples, and repository information.";
+      "Read how Lix tracks, reviews, branches, merges, and rolls back changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom file formats.";
     const canonicalUrl = buildCanonicalUrl("/readme");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
@@ -65,13 +64,7 @@ function ReadmeRoute() {
   return (
     <>
       <Header />
-      <div className="bg-[#fafaf7] text-[#0a0a0a] font-[Geist,ui-sans-serif,system-ui,sans-serif] tracking-[-0.005em] [font-feature-settings:'ss01','ss02','cv11']">
-        <main>
-          <V2Hero />
-          <LandingReadme readmeHtml={html} />
-          <V2Footer />
-        </main>
-      </div>
+      <LandingReadme readmeHtml={html} />
     </>
   );
 }

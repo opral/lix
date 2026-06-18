@@ -1,6 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Header } from "../components/header";
-import { V2LandingPage } from "../components/v2-landing-page";
+import { LandingReadme } from "../components/landing-page";
+import markdownPageCss from "../components/markdown-page.style.css?url";
+import { loadReadmeContent } from "../lib/readme-content";
 import {
   buildCanonicalUrl,
   buildWebSiteJsonLd,
@@ -8,10 +10,13 @@ import {
 } from "../lib/seo";
 
 export const Route = createFileRoute("/")({
+  loader: async () => {
+    return await loadReadmeContent();
+  },
   head: () => {
-    const title = "Lix | An embeddable version control system for AI agents";
+    const title = "Lix | Version control system for every file format";
     const description =
-      "Lix gives agents branches, checkpoints, semantic diffs, rollback, immutable history, and SQL-queryable context without wrapping Git.";
+      "Lix tracks, reviews, branches, merges, and rolls back changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom file formats.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
@@ -54,7 +59,10 @@ export const Route = createFileRoute("/")({
         { name: "twitter:image", content: ogImage.url },
         { name: "twitter:image:alt", content: ogImage.alt },
       ],
-      links: [{ rel: "canonical", href: canonicalUrl }],
+      links: [
+        { rel: "canonical", href: canonicalUrl },
+        { rel: "stylesheet", href: markdownPageCss },
+      ],
       scripts: [
         {
           type: "application/ld+json",
@@ -71,10 +79,12 @@ export const Route = createFileRoute("/")({
 });
 
 function HomeRoute() {
+  const { html } = Route.useLoaderData();
+
   return (
     <>
       <Header />
-      <V2LandingPage />
+      <LandingReadme readmeHtml={html} />
     </>
   );
 }
