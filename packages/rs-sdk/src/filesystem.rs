@@ -173,15 +173,20 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     session: SessionContext<B>,
-    host_path: PathBuf,
-    lix_path: String,
+    mappings: Vec<FilesHostMapping>,
     sync_lock: tokio::sync::Mutex<()>,
     last_materialized: Mutex<Option<FilesMaterializedSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesHostMapping {
+    host_path: PathBuf,
+    lix_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FilesMaterializedSnapshot {
-    host: Option<Vec<u8>>,
+    host: BTreeMap<String, Option<Vec<u8>>>,
     lix_revision: LixRevision,
 }
 
@@ -273,11 +278,12 @@ impl BackendWrite for FsWrite<'_> {
 }
 
 impl FilesBackend {
-    pub async fn open<P>(file: P) -> Result<Self, LixError>
+    pub async fn open<P>(root: P, files: Vec<PathBuf>) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
     {
-        let inner = FilesFilesystemSync::open(InMemoryBackend::new(), file.as_ref()).await?;
+        let mappings = validate_files_mappings(root.as_ref(), files)?;
+        let inner = FilesFilesystemSync::open(InMemoryBackend::new(), mappings).await?;
         Ok(Self { inner })
     }
 }
@@ -444,13 +450,11 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    async fn open(backend: B, file: &Path) -> Result<Self, LixError> {
-        let host_path = validate_single_file_path(file)?;
-        let lix_path = single_file_lix_path(&host_path)?;
+    async fn open(backend: B, mappings: Vec<FilesHostMapping>) -> Result<Self, LixError> {
         let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
         Ok(Self {
             inner: backend,
-            supervisor: FilesFilesystemSupervisor::open(engine, host_path, lix_path).await?,
+            supervisor: FilesFilesystemSupervisor::open(engine, mappings).await?,
         })
     }
 }
@@ -636,16 +640,11 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    async fn open(
-        engine: Engine<B>,
-        host_path: PathBuf,
-        lix_path: String,
-    ) -> Result<Self, LixError> {
+    async fn open(engine: Engine<B>, mappings: Vec<FilesHostMapping>) -> Result<Self, LixError> {
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesFilesystemState {
             session,
-            host_path,
-            lix_path,
+            mappings,
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         });
@@ -655,26 +654,19 @@ where
 
         let (event_tx, event_rx) = mpsc::channel();
         let callback_tx = event_tx.clone();
-        let watched_host_path = state.host_path.clone();
-        let watched_host_parent = watched_host_path
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| {
-                let path = watched_host_path.display();
-                filesystem_error(format!("single-file filesystem path {path} has no parent"))
-            })?;
-        let callback_host_path = watched_host_path.clone();
-        let callback_host_parent = watched_host_parent.clone();
+        let watched_host_paths: Vec<PathBuf> = state
+            .mappings
+            .iter()
+            .map(|mapping| mapping.host_path.clone())
+            .collect();
+        let watched_host_parents = selected_host_parents(&watched_host_paths)?;
+        let callback_host_paths = watched_host_paths.clone();
         let watcher_config = Config::default().with_follow_symlinks(false);
         let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
             Duration::from_millis(500),
             None,
             move |result: DebounceEventResult| {
-                if single_file_debounce_touches_path(
-                    &result,
-                    &callback_host_path,
-                    &callback_host_parent,
-                ) {
+                if selected_files_debounce_touches_path(&result, &callback_host_paths) {
                     let _ = callback_tx.send(FilesFilesystemEvent::HostChanged);
                 }
             },
@@ -683,13 +675,18 @@ where
         )
         .ok()
         .and_then(|mut debouncer| {
-            let parent_watched = debouncer
-                .watch(watched_host_parent.as_path(), RecursiveMode::NonRecursive)
-                .is_ok();
-            let file_watched = debouncer
-                .watch(watched_host_path.as_path(), RecursiveMode::NonRecursive)
-                .is_ok();
-            if parent_watched || file_watched {
+            let mut watched_any = false;
+            for parent in &watched_host_parents {
+                watched_any |= debouncer
+                    .watch(parent.as_path(), RecursiveMode::NonRecursive)
+                    .is_ok();
+            }
+            for host_path in &watched_host_paths {
+                watched_any |= debouncer
+                    .watch(host_path.as_path(), RecursiveMode::NonRecursive)
+                    .is_ok();
+            }
+            if watched_any {
                 Some(debouncer)
             } else {
                 debouncer.stop();
@@ -699,7 +696,7 @@ where
         let poll_host = cfg!(target_os = "macos") || debouncer.is_none();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::Builder::new()
-            .name("lix-sdk-single-file-sync".to_string())
+            .name("lix-sdk-selected-files-sync".to_string())
             .spawn(move || single_file_filesystem_worker(worker_state, event_rx, poll_host))
             .map_err(|error| {
                 LixError::new(
@@ -766,38 +763,42 @@ where
 {
     async fn sync_host_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
-        let host = read_single_file_host(&self.host_path)?;
-        if skip_if_last_materialized && self.is_last_materialized_host(host.as_ref()) {
+        let host = self.collect_host_files()?;
+        if skip_if_last_materialized && self.is_last_materialized_host(&host) {
             let lix_revision = self.collect_lix_revision().await?;
-            if self.is_last_materialized(host.as_ref(), &lix_revision) {
+            if self.is_last_materialized(&host, &lix_revision) {
                 return Ok(());
             }
         }
 
-        let lix = self.collect_lix_file().await?;
-        match (host.as_ref(), lix.as_ref()) {
-            (Some(host_data), Some(lix_data)) if host_data == lix_data => {}
-            (Some(host_data), _) => {
-                self.session
-                    .execute(
-                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-                        &[
-                            Value::Text(self.lix_path.clone()),
-                            Value::Blob(host_data.clone()),
-                        ],
-                    )
-                    .await?;
+        let lix = self.collect_lix_files().await?;
+        for mapping in &self.mappings {
+            let host_data = host.get(&mapping.lix_path).and_then(Option::as_ref);
+            let lix_data = lix.get(&mapping.lix_path).and_then(Option::as_ref);
+            match (host_data, lix_data) {
+                (Some(host_data), Some(lix_data)) if host_data == lix_data => {}
+                (Some(host_data), _) => {
+                    self.session
+                        .execute(
+                            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                            &[
+                                Value::Text(mapping.lix_path.clone()),
+                                Value::Blob(host_data.clone()),
+                            ],
+                        )
+                        .await?;
+                }
+                (None, Some(_)) => {
+                    self.session
+                        .execute(
+                            "DELETE FROM lix_file WHERE path = $1",
+                            &[Value::Text(mapping.lix_path.clone())],
+                        )
+                        .await?;
+                }
+                (None, None) => {}
             }
-            (None, Some(_)) => {
-                self.session
-                    .execute(
-                        "DELETE FROM lix_file WHERE path = $1",
-                        &[Value::Text(self.lix_path.clone())],
-                    )
-                    .await?;
-            }
-            (None, None) => {}
         }
 
         let lix_revision = self.collect_lix_revision().await?;
@@ -807,15 +808,22 @@ where
 
     async fn sync_from_lix(&self) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
-        let target = self.collect_lix_file().await?;
-        let host = read_single_file_host(&self.host_path)?;
+        let target = self.collect_lix_files().await?;
+        let host = self.collect_host_files()?;
         let previous = self.last_materialized_host();
-        let can_materialize = previous.is_none_or(|snapshot| snapshot == host);
 
-        if can_materialize && host != target {
-            match target.as_ref() {
-                Some(data) => write_single_file_host(&self.host_path, data)?,
-                None => remove_single_file_host(&self.host_path)?,
+        for mapping in &self.mappings {
+            let host_data = host.get(&mapping.lix_path).cloned().flatten();
+            let target_data = target.get(&mapping.lix_path).cloned().flatten();
+            let can_materialize = previous.as_ref().is_none_or(|snapshot| {
+                snapshot.get(&mapping.lix_path).cloned().flatten() == host_data
+            });
+
+            if can_materialize && host_data != target_data {
+                match target_data.as_ref() {
+                    Some(data) => write_single_file_host(&mapping.host_path, data)?,
+                    None => remove_single_file_host(&mapping.host_path)?,
+                }
             }
         }
 
@@ -828,19 +836,35 @@ where
         self.session.close().await
     }
 
-    async fn collect_lix_file(&self) -> Result<Option<Vec<u8>>, LixError> {
-        let result = self
-            .session
-            .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
-                &[Value::Text(self.lix_path.clone())],
-            )
-            .await?;
-        result
-            .rows()
-            .first()
-            .map(|row| row.get::<Vec<u8>>("data"))
-            .transpose()
+    fn collect_host_files(&self) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
+        let mut snapshot = BTreeMap::new();
+        for mapping in &self.mappings {
+            snapshot.insert(
+                mapping.lix_path.clone(),
+                read_single_file_host(&mapping.host_path)?,
+            );
+        }
+        Ok(snapshot)
+    }
+
+    async fn collect_lix_files(&self) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
+        let mut snapshot = BTreeMap::new();
+        for mapping in &self.mappings {
+            let result = self
+                .session
+                .execute(
+                    "SELECT data FROM lix_file WHERE path = $1",
+                    &[Value::Text(mapping.lix_path.clone())],
+                )
+                .await?;
+            let data = result
+                .rows()
+                .first()
+                .map(|row| row.get::<Vec<u8>>("data"))
+                .transpose()?;
+            snapshot.insert(mapping.lix_path.clone(), data);
+        }
+        Ok(snapshot)
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
@@ -852,7 +876,11 @@ where
         })
     }
 
-    fn remember_materialized(&self, host: Option<Vec<u8>>, lix_revision: LixRevision) {
+    fn remember_materialized(
+        &self,
+        host: BTreeMap<String, Option<Vec<u8>>>,
+        lix_revision: LixRevision,
+    ) {
         *self
             .last_materialized
             .lock()
@@ -860,7 +888,7 @@ where
             Some(FilesMaterializedSnapshot { host, lix_revision });
     }
 
-    fn last_materialized_host(&self) -> Option<Option<Vec<u8>>> {
+    fn last_materialized_host(&self) -> Option<BTreeMap<String, Option<Vec<u8>>>> {
         self.last_materialized
             .lock()
             .expect("single-file materialized snapshot lock should not poison")
@@ -868,21 +896,25 @@ where
             .map(|snapshot| snapshot.host.clone())
     }
 
-    fn is_last_materialized_host(&self, host: Option<&Vec<u8>>) -> bool {
+    fn is_last_materialized_host(&self, host: &BTreeMap<String, Option<Vec<u8>>>) -> bool {
         self.last_materialized
             .lock()
             .expect("single-file materialized snapshot lock should not poison")
             .as_ref()
-            .is_some_and(|materialized| materialized.host.as_ref() == host)
+            .is_some_and(|materialized| &materialized.host == host)
     }
 
-    fn is_last_materialized(&self, host: Option<&Vec<u8>>, lix_revision: &LixRevision) -> bool {
+    fn is_last_materialized(
+        &self,
+        host: &BTreeMap<String, Option<Vec<u8>>>,
+        lix_revision: &LixRevision,
+    ) -> bool {
         self.last_materialized
             .lock()
             .expect("single-file materialized snapshot lock should not poison")
             .as_ref()
             .is_some_and(|materialized| {
-                materialized.host.as_ref() == host && &materialized.lix_revision == lix_revision
+                &materialized.host == host && &materialized.lix_revision == lix_revision
             })
     }
 }
@@ -1381,10 +1413,9 @@ fn sync_from_lix_for_replies<B>(
     }
 }
 
-fn single_file_debounce_touches_path(
+fn selected_files_debounce_touches_path(
     result: &DebounceEventResult,
-    host_path: &Path,
-    host_parent: &Path,
+    host_paths: &[PathBuf],
 ) -> bool {
     result.as_ref().map_or(true, |events| {
         events.iter().any(|event| {
@@ -1392,8 +1423,16 @@ fn single_file_debounce_touches_path(
                 || event
                     .paths
                     .iter()
-                    .any(|path| single_file_event_path_matches(path, host_path, host_parent))
+                    .any(|path| selected_file_event_path_matches(path, host_paths))
         })
+    })
+}
+
+fn selected_file_event_path_matches(path: &Path, host_paths: &[PathBuf]) -> bool {
+    host_paths.iter().any(|host_path| {
+        host_path
+            .parent()
+            .is_some_and(|host_parent| single_file_event_path_matches(path, host_path, host_parent))
     })
 }
 
@@ -1569,6 +1608,110 @@ fn remember_unmanaged_local_path(
     }
 }
 
+fn validate_files_mappings(
+    root: &Path,
+    files: Vec<PathBuf>,
+) -> Result<Vec<FilesHostMapping>, LixError> {
+    if files.is_empty() {
+        return Err(filesystem_error(
+            "selected-files filesystem requires at least one file",
+        ));
+    }
+
+    let root = validate_files_root_directory(root)?;
+    let mut seen_host_paths = BTreeSet::new();
+    let mut seen_lix_paths = BTreeSet::new();
+    let mut mappings = Vec::with_capacity(files.len());
+    for relative_path in files {
+        let lix_path = relative_file_lix_path(&relative_path)?;
+        let host_path = validate_single_file_path(&root.join(&relative_path))?;
+        if !seen_host_paths.insert(host_path.clone()) {
+            let path = host_path.display();
+            return Err(filesystem_error(format!(
+                "selected-files filesystem path {path} is duplicated"
+            )));
+        }
+        if !seen_lix_paths.insert(lix_path.clone()) {
+            return Err(filesystem_error(format!(
+                "selected-files Lix path {lix_path:?} is duplicated"
+            )));
+        }
+        mappings.push(FilesHostMapping {
+            host_path,
+            lix_path,
+        });
+    }
+    Ok(mappings)
+}
+
+fn validate_files_root_directory(root: &Path) -> Result<PathBuf, LixError> {
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| io_error("read selected-files root metadata", root, error))?;
+    if metadata.file_type().is_symlink() {
+        let root = root.display();
+        return Err(filesystem_error(format!(
+            "selected-files filesystem root {root} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let root = root.display();
+        return Err(filesystem_error(format!(
+            "selected-files filesystem root {root} must be a directory"
+        )));
+    }
+    std::fs::canonicalize(root)
+        .map_err(|error| io_error("canonicalize selected-files root", root, error))
+}
+
+fn relative_file_lix_path(relative_path: &Path) -> Result<String, LixError> {
+    if relative_path.is_absolute() {
+        let path = relative_path.display();
+        return Err(filesystem_error(format!(
+            "selected-files path {path} must be relative"
+        )));
+    }
+
+    let mut segments = Vec::new();
+    let mut local = PathBuf::new();
+    for component in relative_path.components() {
+        let Component::Normal(segment) = component else {
+            let path = relative_path.display();
+            return Err(filesystem_error(format!(
+                "selected-files path {path} contains an unsupported path component"
+            )));
+        };
+        let segment = segment.to_str().ok_or_else(|| {
+            let path = relative_path.display();
+            filesystem_error(format!("selected-files path {path} is not valid UTF-8"))
+        })?;
+        push_lix_path_segment(&mut local, segment, &relative_path.display().to_string())?;
+        segments.push(segment.to_string());
+    }
+    if segments.is_empty() {
+        return Err(filesystem_error(
+            "selected-files path must not be empty".to_string(),
+        ));
+    }
+    Ok(format!("/{}", segments.join("/")))
+}
+
+fn selected_host_parents(host_paths: &[PathBuf]) -> Result<Vec<PathBuf>, LixError> {
+    let mut seen = BTreeSet::new();
+    let mut parents = Vec::new();
+    for host_path in host_paths {
+        let parent = host_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+            let path = host_path.display();
+            filesystem_error(format!(
+                "selected-files filesystem path {path} has no parent"
+            ))
+        })?;
+        if seen.insert(parent.clone()) {
+            parents.push(parent);
+        }
+    }
+    Ok(parents)
+}
+
 fn validate_single_file_path(path: &Path) -> Result<PathBuf, LixError> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| io_error("read single-file filesystem metadata", path, error))?;
@@ -1586,21 +1729,6 @@ fn validate_single_file_path(path: &Path) -> Result<PathBuf, LixError> {
     }
     std::fs::canonicalize(path)
         .map_err(|error| io_error("canonicalize single-file filesystem path", path, error))
-}
-
-fn single_file_lix_path(path: &Path) -> Result<String, LixError> {
-    let file_name = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| {
-            let path = path.display();
-            filesystem_error(format!(
-                "single-file filesystem path {path} does not have a valid UTF-8 file name"
-            ))
-        })?;
-    let mut local = PathBuf::new();
-    push_lix_path_segment(&mut local, file_name, file_name)?;
-    Ok(format!("/{file_name}"))
 }
 
 fn read_single_file_host(path: &Path) -> Result<Option<Vec<u8>>, LixError> {

@@ -12,6 +12,7 @@ use lix_sdk::{
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{
     Arc,
@@ -266,13 +267,14 @@ impl NativeLix {
     }
 
     #[napi(factory, js_name = "openFiles")]
-    pub fn open_files(env: Env, path: String) -> Result<Self> {
+    pub fn open_files(env: Env, root: String, files: Vec<String>) -> Result<Self> {
         let rt = Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(to_napi_error)?;
+        let files = files.into_iter().map(PathBuf::from).collect();
         let backend = rt
-            .block_on(FilesBackend::open(path))
+            .block_on(FilesBackend::open(root, files))
             .map_err(|error| throw_lix_error(&env, error))?;
         let lix = rt
             .block_on(open_lix_with_backend(backend))
