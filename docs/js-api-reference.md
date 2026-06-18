@@ -4,7 +4,7 @@ description: "Reference for the JavaScript SDK Lix instance, transactions, execu
 
 # JavaScript API Reference
 
-The JavaScript SDK exports `openLix()` and `SqliteBackend` from `@lix-js/sdk`.
+The JavaScript SDK exports `openLix()`, `SqliteBackend`, and `FsBackend` from `@lix-js/sdk`.
 `openLix()` returns a `Lix` instance: an in-process handle to one Lix
 repository.
 
@@ -22,15 +22,26 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option    | Type            | Description                                                          |
-| --------- | --------------- | -------------------------------------------------------------------- |
-| `backend` | `SqliteBackend` | Optional storage backend. Omit it for the default in-memory backend. |
+| Option    | Type                        | Description                                                          |
+| --------- | --------------------------- | -------------------------------------------------------------------- |
+| `backend` | `SqliteBackend \| FsBackend` | Optional storage backend. Omit it for the default in-memory backend. |
 
 ```ts
 import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
   backend: new SqliteBackend({ path: "app.lix" }),
+});
+```
+
+Use `FsBackend` for a filesystem workspace directory backed by
+`<workspace>/.lix/.internal/db.sqlite`:
+
+```ts
+import { FsBackend, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  backend: new FsBackend({ path: "workspace" }),
 });
 ```
 

@@ -947,7 +947,7 @@ fn reject_lix_directory_delete_plugin_storage_paths(
             path_is_inside_directory(candidate, &path) && is_plugin_storage_path(candidate)
         }) {
             reject_normal_plugin_storage_mutation(
-                "/.lix_system/plugins/",
+                "/.lix/plugins/",
                 "DELETE FROM lix_directory recursive directory delete",
             )?;
         }

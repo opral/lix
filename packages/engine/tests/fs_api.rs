@@ -130,7 +130,7 @@ async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
     assert_eq!(plugins[0].key, "plugin_sentinel");
     assert_eq!(plugins[0].schema_keys, vec!["plugin_note".to_string()]);
     assert_eq!(
-        read_file(&session, "/.lix_system/plugins/plugin_sentinel.lixplugin")
+        read_file(&session, "/.lix/plugins/plugin_sentinel.lixplugin")
             .await
             .expect("archive read should succeed")
             .as_deref(),
@@ -192,7 +192,7 @@ async fn sql_update_path_to_plugin_storage_rejects_plugin_archive_rename() {
         .execute(
             "UPDATE lix_file SET path = $1, data = $2 WHERE path = $3",
             &[
-                Value::Text("/.lix_system/plugins/plugin_sentinel.lixplugin".to_string()),
+                Value::Text("/.lix/plugins/plugin_sentinel.lixplugin".to_string()),
                 Value::Blob(sentinel_plugin_archive()),
                 Value::Text("/normal.txt".to_string()),
             ],
@@ -225,7 +225,7 @@ async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
         .execute(
             "UPDATE lix_file \
              SET data = X'626164' \
-             WHERE path = '/.lix_system/plugins/plugin_sentinel.lixplugin'",
+             WHERE path = '/.lix/plugins/plugin_sentinel.lixplugin'",
             &[],
         )
         .await
@@ -255,7 +255,7 @@ async fn sql_delete_rejects_installed_plugin_storage() {
     let archive_error = session
         .execute(
             "DELETE FROM lix_file \
-             WHERE path = '/.lix_system/plugins/plugin_sentinel.lixplugin'",
+             WHERE path = '/.lix/plugins/plugin_sentinel.lixplugin'",
             &[],
         )
         .await
@@ -269,7 +269,7 @@ async fn sql_delete_rejects_installed_plugin_storage() {
 
     let directory_error = session
         .execute(
-            "DELETE FROM lix_directory WHERE path = '/.lix_system/plugins/'",
+            "DELETE FROM lix_directory WHERE path = '/.lix/plugins/'",
             &[],
         )
         .await
@@ -638,7 +638,7 @@ where
 {
     write_file(
         session,
-        &format!("/.lix_system/plugins/{key}.lixplugin"),
+        &format!("/.lix/plugins/{key}.lixplugin"),
         archive.to_vec(),
     )
     .await
@@ -796,7 +796,7 @@ where
     let result = session
         .execute_sql(
             "SELECT data FROM lix_file \
-             WHERE path LIKE '/.lix_system/plugins/%.lixplugin' \
+             WHERE path LIKE '/.lix/plugins/%.lixplugin' \
              ORDER BY path",
             &[],
         )
