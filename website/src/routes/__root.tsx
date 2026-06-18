@@ -8,11 +8,29 @@ import React from "react";
 import { PostHogProvider } from "posthog-js/react";
 import appCss from "../styles.css?url";
 
-const GA_MEASUREMENT_ID = "G-3GEP4W5688";
+const GA_MEASUREMENT_ID = "G-1M7SY9LBT7";
 const posthogOptions = {
   api_host: import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
   defaults: "2025-11-30",
 } as const;
+
+const googleAnalyticsScripts = import.meta.env.PROD
+  ? [
+      {
+        async: true,
+        src: `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`,
+      },
+      {
+        children: `
+          window.dataLayer = window.dataLayer || [];
+          function gtag(){window.dataLayer.push(arguments);}
+          window.gtag = gtag;
+          gtag('js', new Date());
+          gtag('config', '${GA_MEASUREMENT_ID}', { send_page_view: false });
+        `,
+      },
+    ]
+  : [];
 
 export const Route = createRootRoute({
   head: () => ({
@@ -67,6 +85,7 @@ export const Route = createRootRoute({
           ],
         }),
       },
+      ...googleAnalyticsScripts,
     ],
   }),
 
@@ -74,37 +93,28 @@ export const Route = createRootRoute({
   shellComponent: RootDocument,
 });
 
-function GoogleAnalytics() {
+function GoogleAnalyticsPageViews() {
   const router = useRouter();
 
   React.useEffect(() => {
     if (!import.meta.env.PROD) return;
-    if ((window as any).__gaInitialized) return;
-    (window as any).__gaInitialized = true;
-
-    (window as any).dataLayer = (window as any).dataLayer || [];
-    function gtag(...args: unknown[]) {
-      (window as any).dataLayer.push(args);
-    }
-    (window as any).gtag = gtag;
-
-    const script = document.createElement("script");
-    script.async = true;
-    script.src = `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`;
-    document.head.appendChild(script);
-
-    gtag("js", new Date());
-    gtag("config", GA_MEASUREMENT_ID, { send_page_view: false });
+    const gtag = (window as any).gtag;
+    if (typeof gtag !== "function") return;
 
     const sendPageView = (location: {
       href: string;
+      publicHref?: string;
       pathname: string;
       search: string;
       hash: string;
     }) => {
+      const publicPath =
+        location.publicHref ??
+        `${location.pathname}${location.search}${location.hash}`;
+
       gtag("event", "page_view", {
-        page_location: location.href,
-        page_path: `${location.pathname}${location.search}${location.hash}`,
+        page_location: new URL(publicPath, window.location.origin).href,
+        page_path: publicPath,
         page_title: document.title,
       });
     };
@@ -152,7 +162,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <HeadContent />
       </head>
       <body>
-        <GoogleAnalytics />
+        <GoogleAnalyticsPageViews />
         {appContent}
         <Scripts />
       </body>
