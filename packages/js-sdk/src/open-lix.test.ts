@@ -278,7 +278,7 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 
 	const lix = await openLix({ backend: new FsBackend({ path: dir }) });
 	expect(statSync(join(dir, ".lix")).isDirectory()).toBe(true);
-	expect(statSync(join(dir, ".lix", "db.sqlite")).isFile()).toBe(true);
+	expect(statSync(join(dir, ".lix", ".internal", "db.sqlite")).isFile()).toBe(true);
 
 	const imported = await lix.execute(
 		"SELECT path, data FROM lix_file WHERE name = $1",
@@ -1189,7 +1189,7 @@ async function upsertPluginArchive(
 	key: string,
 	archiveBytes: Uint8Array,
 ): Promise<void> {
-	await writeFile(lix, `/.lix_system/plugins/${key}.lixplugin`, archiveBytes);
+	await writeFile(lix, `/.lix/plugins/${key}.lixplugin`, archiveBytes);
 }
 
 async function writeFile(

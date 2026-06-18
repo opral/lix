@@ -19,7 +19,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         vec!["csv_table".to_string(), "csv_row".to_string()]
     );
 
-    let stored_archive = read_file(&lix, "/.lix_system/plugins/plugin_csv.lixplugin")
+    let stored_archive = read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
         .await
         .unwrap();
     assert_eq!(stored_archive.as_deref(), Some(archive.as_slice()));
@@ -473,10 +473,31 @@ async fn filesystem_materializes_internal_lix_plugin_paths() {
     install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
 
     wait_for_disk_file(
-        &tempdir
-            .path()
-            .join(".lix_system/plugins/plugin_csv.lixplugin"),
+        &tempdir.path().join(".lix/plugins/plugin_csv.lixplugin"),
         Some(archive.as_slice()),
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_imports_lix_plugin_archives_from_disk() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let archive = build_csv_plugin_archive();
+    let plugin_path = tempdir.path().join(".lix/plugins/plugin_csv.lixplugin");
+    std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+    std::fs::write(&plugin_path, &archive).unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    let plugins = list_installed_plugins(&lix).await;
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].key, "plugin_csv");
+    assert_eq!(
+        read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(archive.as_slice())
     );
     lix.close().await.unwrap();
 }
@@ -531,7 +552,7 @@ where
 {
     write_file(
         lix,
-        &format!("/.lix_system/plugins/{key}.lixplugin"),
+        &format!("/.lix/plugins/{key}.lixplugin"),
         archive.to_vec(),
     )
     .await
@@ -592,7 +613,7 @@ where
         .iter()
         .filter_map(|row| {
             let path = row.get::<String>("path").unwrap();
-            if !path.starts_with("/.lix_system/plugins/") || !path.ends_with(".lixplugin") {
+            if !path.starts_with("/.lix/plugins/") || !path.ends_with(".lixplugin") {
                 return None;
             }
             Some(plugin_info_from_archive(

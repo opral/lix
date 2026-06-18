@@ -590,13 +590,36 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
         std::fs::read(tempdir.path().join(".lix/.gitignore")).unwrap(),
         b"*\n"
     );
-    assert_eq!(
-        std::fs::read(tempdir.path().join(".lix_system/.gitignore")).unwrap(),
-        b"*\n"
-    );
+    assert!(!tempdir.path().join(".lix/.internal/.gitignore").exists());
     assert_eq!(read_file(&lix, "/.lix/.gitignore").await.unwrap(), None);
     assert_eq!(
-        read_file(&lix, "/.lix_system/.gitignore").await.unwrap(),
+        read_file(&lix, "/.lix/.internal/.gitignore").await.unwrap(),
+        None
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_removes_legacy_lix_system_directory() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".lix_system/plugins")).unwrap();
+    std::fs::write(
+        tempdir
+            .path()
+            .join(".lix_system/plugins/plugin_legacy.lixplugin"),
+        b"legacy",
+    )
+    .unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert!(!tempdir.path().join(".lix_system").exists());
+    assert_eq!(readdir(&lix, "/.lix_system/").await.unwrap(), None);
+    assert_eq!(
+        read_file(&lix, "/.lix_system/plugins/plugin_legacy.lixplugin")
+            .await
+            .unwrap(),
         None
     );
     lix.close().await.unwrap();
@@ -638,8 +661,8 @@ async fn filesystem_initial_import_ignores_git_entries() {
 #[cfg(feature = "sqlite")]
 async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
-    let metadata_dir = tempdir.path().join(".lix");
-    std::fs::create_dir(&metadata_dir).unwrap();
+    let metadata_dir = tempdir.path().join(".lix/.internal");
+    std::fs::create_dir_all(&metadata_dir).unwrap();
     let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
         .await
         .unwrap();
@@ -664,8 +687,8 @@ async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
 #[cfg(feature = "sqlite")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let tempdir = tempfile::tempdir().unwrap();
-    let metadata_dir = tempdir.path().join(".lix");
-    std::fs::create_dir(&metadata_dir).unwrap();
+    let metadata_dir = tempdir.path().join(".lix/.internal");
+    std::fs::create_dir_all(&metadata_dir).unwrap();
     let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
         .await
         .unwrap();

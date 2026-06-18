@@ -31,6 +31,7 @@ talks to the outside system where Lix data lives, it is a backend.
 | ----------- | ------------------------------- | ---------------------------- |
 | In-memory   | default (no `backend` argument) | tests, demos, ephemeral work |
 | SQLite file | `@lix-js/sdk`                   | persistent Node apps         |
+| Filesystem workspace | `@lix-js/sdk`           | local folders with synced files |
 
 ```ts
 import { openLix, SqliteBackend } from "@lix-js/sdk";
@@ -40,7 +41,20 @@ const lix = await openLix({
 });
 ```
 
-Anything beyond these two is not shipped by the Lix team. Custom backends
+Use `FsBackend` when the Lix should sync a local directory. The backend stores
+its private SQLite database at `<workspace>/.lix/.internal/db.sqlite` and syncs
+workspace files, including user-editable files under `.lix/` such as plugin
+archives, through Lix.
+
+```ts
+import { FsBackend, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  backend: new FsBackend({ path: "/var/data/workspace" }),
+});
+```
+
+Anything beyond these shipped backends is not shipped by the Lix team. Custom backends
 implement the same contract for the host/runtime they target. This page is the
 contract.
 

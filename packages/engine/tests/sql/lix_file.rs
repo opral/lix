@@ -131,7 +131,7 @@ simulation_test!(
         let insert_error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('plugin-poison', '/.lix_system/plugins/nested/plugin_sentinel.lixplugin', X'626164')",
+                 VALUES ('plugin-poison', '/.lix/plugins/nested/plugin_sentinel.lixplugin', X'626164')",
                 &[],
             )
             .await
@@ -155,7 +155,7 @@ simulation_test!(
         let update_error = session
             .execute(
                 "UPDATE lix_file \
-                 SET path = '/.lix_system/plugins/plugin_sentinel.lixplugin' \
+                 SET path = '/.lix/plugins/plugin_sentinel.lixplugin' \
                  WHERE id = 'safe-file'",
                 &[],
             )
