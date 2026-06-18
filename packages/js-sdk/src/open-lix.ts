@@ -2,6 +2,7 @@ import { invalidArgument } from "./errors.js";
 import { addon } from "./native.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
+import path from "node:path";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -81,17 +82,46 @@ export class FsBackend {
 }
 
 export class FilesBackend {
-	readonly path: string;
+	readonly path?: string;
+	readonly root: string;
+	readonly files: readonly string[];
 
 	constructor(options: FilesBackendOptions) {
-		if (
-			!options ||
-			typeof options.path !== "string" ||
-			options.path.length === 0
-		) {
-			throw new TypeError("FilesBackend requires a non-empty path");
+		if (!options || typeof options !== "object") {
+			throw new TypeError(
+				"FilesBackend requires a non-empty path or files list",
+			);
 		}
-		this.path = options.path;
+		if ("path" in options) {
+			if (typeof options.path !== "string" || options.path.length === 0) {
+				throw new TypeError("FilesBackend requires a non-empty path");
+			}
+			this.path = options.path;
+			this.root = path.dirname(options.path);
+			this.files = [path.basename(options.path)];
+			return;
+		}
+		if (
+			!("root" in options) ||
+			typeof options.root !== "string" ||
+			options.root.length === 0 ||
+			!("files" in options) ||
+			!Array.isArray(options.files) ||
+			options.files.length === 0
+		) {
+			throw new TypeError(
+				"FilesBackend requires a non-empty root and files list",
+			);
+		}
+		this.root = options.root;
+		this.files = options.files.map((file, index) => {
+			if (typeof file !== "string" || file.length === 0) {
+				throw new TypeError(
+					`FilesBackend files[${index}] requires a non-empty relative path`,
+				);
+			}
+			return file;
+		});
 	}
 }
 
@@ -109,7 +139,9 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		return new Lix(addon.Lix.openFs(options.backend.path));
 	}
 	if (options.backend instanceof FilesBackend) {
-		return new Lix(addon.Lix.openFiles(options.backend.path));
+		return new Lix(
+			addon.Lix.openFiles(options.backend.root, [...options.backend.files]),
+		);
 	}
 	throw new TypeError(
 		"openLix() requires { backend: new SqliteBackend({ path }) }, { backend: new FsBackend({ path }) }, or { backend: new FilesBackend({ path }) }",

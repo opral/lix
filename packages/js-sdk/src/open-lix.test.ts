@@ -290,7 +290,9 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 
 	const lix = await openLix({ backend: new FsBackend({ path: dir }) });
 	expect(statSync(join(dir, ".lix")).isDirectory()).toBe(true);
-	expect(statSync(join(dir, ".lix", ".internal", "db.sqlite")).isFile()).toBe(true);
+	expect(statSync(join(dir, ".lix", ".internal", "db.sqlite")).isFile()).toBe(
+		true,
+	);
 
 	const imported = await lix.execute(
 		"SELECT path, data FROM lix_file WHERE name = $1",
@@ -362,6 +364,66 @@ test("files backend imports only the selected file and writes edits back", async
 		const bytes = await readFile(lix, "/note.md");
 		return bytes ? new TextDecoder().decode(bytes) : undefined;
 	}, "external");
+
+	await lix.close();
+});
+
+test("files backend imports selected files and writes each mapped file back", async () => {
+	const dir = tempFsDir();
+	const alphaPath = join(dir, "alpha.md");
+	const betaPath = join(dir, "nested", "beta.md");
+	const siblingPath = join(dir, "sibling.md");
+	mkdirSync(join(dir, "nested"), { recursive: true });
+	writeFileSync(alphaPath, "alpha");
+	writeFileSync(betaPath, "beta");
+	writeFileSync(siblingPath, "sibling");
+
+	const lix = await openLix({
+		backend: new FilesBackend({
+			root: dir,
+			files: ["alpha.md", "nested/beta.md"],
+		}),
+	});
+
+	const files = await lix.execute(
+		"SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3) ORDER BY path",
+		["/alpha.md", "/nested/beta.md", "/sibling.md"],
+	);
+	expect(files.rows.map((row) => row.get("path"))).toEqual([
+		"/alpha.md",
+		"/nested/beta.md",
+	]);
+	expect(existsSync(join(dir, ".lix"))).toBe(false);
+	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
+
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+		new TextEncoder().encode("alpha-updated"),
+		"/alpha.md",
+	]);
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+		new TextEncoder().encode("beta-updated"),
+		"/nested/beta.md",
+	]);
+	expect(readFileSync(alphaPath, "utf8")).toBe("alpha-updated");
+	expect(readFileSync(betaPath, "utf8")).toBe("beta-updated");
+	expect(readFileSync(siblingPath, "utf8")).toBe("sibling");
+
+	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+		"/generated.md",
+		new TextEncoder().encode("generated"),
+	]);
+	expect(existsSync(join(dir, "generated.md"))).toBe(false);
+
+	writeFileSync(betaPath, "external-beta");
+	await waitFor(async () => {
+		const bytes = await readFile(lix, "/nested/beta.md");
+		return bytes ? new TextDecoder().decode(bytes) : undefined;
+	}, "external-beta");
+
+	await lix.execute("DELETE FROM lix_file WHERE path = $1", ["/alpha.md"]);
+	expect(existsSync(alphaPath)).toBe(false);
+	expect(existsSync(join(dir, ".lix"))).toBe(false);
+	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
 	await lix.close();
 });

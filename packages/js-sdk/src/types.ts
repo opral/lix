@@ -6,9 +6,14 @@ export type FsBackendOptions = {
 	path: string;
 };
 
-export type FilesBackendOptions = {
-	path: string;
-};
+export type FilesBackendOptions =
+	| {
+			path: string;
+	  }
+	| {
+			root: string;
+			files: readonly string[];
+	  };
 
 export type OpenLixOptions = {
 	backend?:
