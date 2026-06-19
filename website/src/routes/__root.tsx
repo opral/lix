@@ -8,7 +8,7 @@ import React from "react";
 import { PostHogProvider } from "posthog-js/react";
 import appCss from "../styles.css?url";
 
-const GA_MEASUREMENT_ID = "G-1M7SY9LBT7";
+const GA_MEASUREMENT_ID = "G-3GEP4W5688";
 const posthogOptions = {
   api_host: import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
   defaults: "2025-11-30",
