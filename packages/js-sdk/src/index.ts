@@ -4,7 +4,7 @@ export {
 	LixTransaction,
 	ObserveEvents,
 	openLix,
-	FilesBackend,
+	FsEphemeralBackend,
 	SqliteBackend,
 } from "./open-lix.js";
 export {
@@ -18,6 +18,7 @@ export type {
 	CreateBranchReceipt,
 	ExecuteResult,
 	FsBackendOptions,
+	FsEphemeralBackendOptions,
 	JsonValue,
 	LixValue,
 	MergeBranchOptions,
@@ -29,7 +30,6 @@ export type {
 	MergeConflictSide,
 	ObserveEvent,
 	OpenLixOptions,
-	FilesBackendOptions,
 	SqlParam,
 	SqliteBackendOptions,
 	SwitchBranchOptions,

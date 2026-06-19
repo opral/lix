@@ -72,7 +72,7 @@ try {
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new SqliteBackend({ path })` for a raw SQLite `.lix` file, `new FsBackend({ path })` for a filesystem workspace directory backed by `<path>/.lix/.internal/db.sqlite`, or `new FilesBackend({ path })` for select files mirrored into an in-memory Lix.
+- `openLix()` opens a fresh in-memory Lix. Pass `new SqliteBackend({ path })` for a raw SQLite `.lix` file, `new FsBackend({ path })` for a filesystem workspace directory backed by `<path>/.lix/.internal/db.sqlite`, or `new FsEphemeralBackend({ path })` for filesystem sync backed by an in-memory repository.
 - The SDK is Node/native only right now; it is not browser-compatible.
 - The package is ESM-only.
 - The native addon is built from Rust and loaded by the TypeScript wrapper.

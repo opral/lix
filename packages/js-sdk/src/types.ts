@@ -6,20 +6,15 @@ export type FsBackendOptions = {
 	path: string;
 };
 
-export type FilesBackendOptions =
-	| {
-			path: string;
-	  }
-	| {
-			root: string;
-			files: readonly string[];
-	  };
+export type FsEphemeralBackendOptions = {
+	path: string;
+};
 
 export type OpenLixOptions = {
 	backend?:
 		| import("./open-lix.js").SqliteBackend
 		| import("./open-lix.js").FsBackend
-		| import("./open-lix.js").FilesBackend;
+		| import("./open-lix.js").FsEphemeralBackend;
 };
 
 export type LixValue =
