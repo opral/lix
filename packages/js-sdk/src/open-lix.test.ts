@@ -12,8 +12,8 @@ import { expect, test } from "vitest";
 import {
 	bundledPluginArchives,
 	FsBackend,
+	FsEphemeralBackend,
 	openLix,
-	FilesBackend,
 	SqliteBackend,
 	Value,
 	type ExecuteResult,
@@ -249,13 +249,12 @@ test.each([
 	],
 	["fs", () => openLix({ backend: new FsBackend({ path: tempFsDir() }) })],
 	[
-		"files",
+		"fs-ephemeral",
 		() => {
 			const dir = tempFsDir();
 			mkdirSync(dir, { recursive: true });
-			const path = join(dir, "matrix.md");
-			writeFileSync(path, "matrix");
-			return openLix({ backend: new FilesBackend({ path }) });
+			writeFileSync(join(dir, "matrix.md"), "matrix");
+			return openLix({ backend: new FsEphemeralBackend({ path: dir }) });
 		},
 	],
 ] as const)("core native flow works with %s backend", async (_name, open) => {
@@ -321,7 +320,7 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	await reopened.close();
 });
 
-test("files backend imports only the selected file and writes edits back", async () => {
+test("fs ephemeral backend imports the directory and writes normal files back", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
 	const siblingPath = join(dir, "sibling.md");
@@ -330,14 +329,17 @@ test("files backend imports only the selected file and writes edits back", async
 	writeFileSync(siblingPath, "sibling");
 
 	const lix = await openLix({
-		backend: new FilesBackend({ path: filePath }),
+		backend: new FsEphemeralBackend({ path: dir }),
 	});
 
 	const files = await lix.execute(
 		"SELECT path, data FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
 		["/note.md", "/sibling.md"],
 	);
-	expect(files.rows.map((row) => row.get("path"))).toEqual(["/note.md"]);
+	expect(files.rows.map((row) => row.get("path"))).toEqual([
+		"/note.md",
+		"/sibling.md",
+	]);
 	expect(new TextDecoder().decode(get(files, "data") as Uint8Array)).toBe(
 		"local",
 	);
@@ -355,7 +357,7 @@ test("files backend imports only the selected file and writes edits back", async
 		"/generated.md",
 		new TextEncoder().encode("generated"),
 	]);
-	expect(existsSync(join(dir, "generated.md"))).toBe(false);
+	expect(readFileSync(join(dir, "generated.md"), "utf8")).toBe("generated");
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
 	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
@@ -368,64 +370,54 @@ test("files backend imports only the selected file and writes edits back", async
 	await lix.close();
 });
 
-test("files backend imports selected files and writes each mapped file back", async () => {
+test("fs ephemeral backend keeps lix storage paths in memory only", async () => {
 	const dir = tempFsDir();
-	const alphaPath = join(dir, "alpha.md");
-	const betaPath = join(dir, "nested", "beta.md");
-	const siblingPath = join(dir, "sibling.md");
-	mkdirSync(join(dir, "nested"), { recursive: true });
-	writeFileSync(alphaPath, "alpha");
-	writeFileSync(betaPath, "beta");
-	writeFileSync(siblingPath, "sibling");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "note.md"), "note");
 
 	const lix = await openLix({
-		backend: new FilesBackend({
-			root: dir,
-			files: ["alpha.md", "nested/beta.md"],
-		}),
+		backend: new FsEphemeralBackend({ path: dir }),
 	});
 
-	const files = await lix.execute(
-		"SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3) ORDER BY path",
-		["/alpha.md", "/nested/beta.md", "/sibling.md"],
-	);
-	expect(files.rows.map((row) => row.get("path"))).toEqual([
-		"/alpha.md",
-		"/nested/beta.md",
-	]);
-	expect(existsSync(join(dir, ".lix"))).toBe(false);
-	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
-
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
-		new TextEncoder().encode("alpha-updated"),
-		"/alpha.md",
-	]);
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
-		new TextEncoder().encode("beta-updated"),
-		"/nested/beta.md",
-	]);
-	expect(readFileSync(alphaPath, "utf8")).toBe("alpha-updated");
-	expect(readFileSync(betaPath, "utf8")).toBe("beta-updated");
-	expect(readFileSync(siblingPath, "utf8")).toBe("sibling");
-
 	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-		"/generated.md",
-		new TextEncoder().encode("generated"),
+		"/.lix/ephemeral.txt",
+		new TextEncoder().encode("ephemeral"),
 	]);
-	expect(existsSync(join(dir, "generated.md"))).toBe(false);
-
-	writeFileSync(betaPath, "external-beta");
-	await waitFor(async () => {
-		const bytes = await readFile(lix, "/nested/beta.md");
-		return bytes ? new TextDecoder().decode(bytes) : undefined;
-	}, "external-beta");
-
-	await lix.execute("DELETE FROM lix_file WHERE path = $1", ["/alpha.md"]);
-	expect(existsSync(alphaPath)).toBe(false);
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
 	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
 	await lix.close();
+});
+
+test("fs ephemeral backend reimports disk state on reopen without persisting lix storage", async () => {
+	const dir = tempFsDir();
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "note.md"), "first");
+
+	const lix = await openLix({
+		backend: new FsEphemeralBackend({ path: dir }),
+	});
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+		new TextEncoder().encode("second"),
+		"/note.md",
+	]);
+	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+		"/.lix/ephemeral.txt",
+		new TextEncoder().encode("ephemeral"),
+	]);
+	await lix.close();
+
+	const reopened = await openLix({
+		backend: new FsEphemeralBackend({ path: dir }),
+	});
+	const bytes = await readFile(reopened, "/note.md");
+	expect(bytes ? new TextDecoder().decode(bytes) : undefined).toBe("second");
+	const ephemeral = await readFile(reopened, "/.lix/ephemeral.txt");
+	expect(ephemeral).toBeUndefined();
+	expect(existsSync(join(dir, ".lix"))).toBe(false);
+	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
+
+	await reopened.close();
 });
 
 test.skipIf(process.platform === "win32")(

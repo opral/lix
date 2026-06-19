@@ -31,6 +31,12 @@ where
     supervisor: FilesystemSupervisor<B>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesystemMetadataMode {
+    Persistent,
+    Ephemeral,
+}
+
 pub(crate) struct FilesystemWrite<'a, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -56,13 +62,13 @@ pub struct FsWrite<'a> {
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct FilesBackend {
-    inner: FilesFilesystemSync<InMemoryBackend>,
+pub struct FsEphemeralBackend {
+    inner: FilesystemSync<InMemoryBackend>,
 }
 
 #[expect(missing_debug_implementations)]
-pub struct FilesWrite<'a> {
-    inner: FilesFilesystemWrite<'a, InMemoryBackend>,
+pub struct FsEphemeralWrite<'a> {
+    inner: FilesystemWrite<'a, InMemoryBackend>,
 }
 
 #[derive(Clone)]
@@ -90,6 +96,7 @@ where
 {
     session: SessionContext<B>,
     root: PathBuf,
+    metadata_mode: FilesystemMetadataMode,
     sync_lock: tokio::sync::Mutex<()>,
     last_materialized: Mutex<Option<MaterializedSnapshot>>,
 }
@@ -122,76 +129,6 @@ struct LixSnapshotRead {
 
 enum FilesystemEvent {
     DiskChanged,
-    SyncFromLix {
-        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
-    },
-    Shutdown,
-}
-
-#[derive(Clone)]
-struct FilesFilesystemSync<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    inner: B,
-    supervisor: FilesFilesystemSupervisor<B>,
-}
-
-struct FilesFilesystemWrite<'a, B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    inner: B::Write<'a>,
-    supervisor: FilesFilesystemSupervisor<B>,
-}
-
-#[derive(Clone)]
-struct FilesFilesystemSupervisor<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    inner: Arc<FilesFilesystemSupervisorInner>,
-    _marker: PhantomData<fn() -> B>,
-}
-
-struct FilesFilesystemSupervisorInner {
-    event_tx: mpsc::Sender<FilesFilesystemEvent>,
-    debouncer: Mutex<Option<FilesystemDebouncer>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-}
-
-struct FilesFilesystemState<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    session: SessionContext<B>,
-    mappings: Vec<FilesHostMapping>,
-    sync_lock: tokio::sync::Mutex<()>,
-    last_materialized: Mutex<Option<FilesMaterializedSnapshot>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FilesHostMapping {
-    host_path: PathBuf,
-    lix_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FilesMaterializedSnapshot {
-    host: BTreeMap<String, Option<Vec<u8>>>,
-    lix_revision: LixRevision,
-}
-
-enum FilesFilesystemEvent {
-    HostChanged,
     SyncFromLix {
         reply_tx: mpsc::SyncSender<Result<(), LixError>>,
     },
@@ -277,25 +214,30 @@ impl BackendWrite for FsWrite<'_> {
     }
 }
 
-impl FilesBackend {
-    pub async fn open<P>(root: P, files: Vec<PathBuf>) -> Result<Self, LixError>
+impl FsEphemeralBackend {
+    pub async fn open<P>(dir: P) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
     {
-        let mappings = validate_files_mappings(root.as_ref(), files)?;
-        let inner = FilesFilesystemSync::open(InMemoryBackend::new(), mappings).await?;
+        let backend = InMemoryBackend::new();
+        let inner = FilesystemSync::open_with_metadata_mode(
+            backend,
+            dir.as_ref(),
+            FilesystemMetadataMode::Ephemeral,
+        )
+        .await?;
         Ok(Self { inner })
     }
 }
 
-impl Backend for FilesBackend {
+impl Backend for FsEphemeralBackend {
     type Read<'a>
         = <InMemoryBackend as Backend>::Read<'a>
     where
         Self: 'a;
 
     type Write<'a>
-        = FilesWrite<'a>
+        = FsEphemeralWrite<'a>
     where
         Self: 'a;
 
@@ -304,13 +246,13 @@ impl Backend for FilesBackend {
     }
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(FilesWrite {
+        Ok(FsEphemeralWrite {
             inner: self.inner.begin_write(opts)?,
         })
     }
 }
 
-impl BackendWrite for FilesWrite<'_> {
+impl BackendWrite for FsEphemeralWrite<'_> {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         self.inner.put_many(space, entries)
     }
@@ -350,8 +292,7 @@ where
     where
         P: AsRef<Path>,
     {
-        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
-        Self::open_with_engine(backend, engine, root.as_ref()).await
+        Self::open_with_metadata_mode(backend, root, FilesystemMetadataMode::Persistent).await
     }
 
     pub async fn open_with_wasm_runtime<P>(
@@ -364,17 +305,36 @@ where
     {
         let engine =
             crate::lix::open_or_initialize_engine(backend.clone(), Some(wasm_runtime)).await?;
-        Self::open_with_engine(backend, engine, root.as_ref()).await
+        Self::open_with_engine(
+            backend,
+            engine,
+            root.as_ref(),
+            FilesystemMetadataMode::Persistent,
+        )
+        .await
+    }
+
+    async fn open_with_metadata_mode<P>(
+        backend: B,
+        root: P,
+        metadata_mode: FilesystemMetadataMode,
+    ) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
+        Self::open_with_engine(backend, engine, root.as_ref(), metadata_mode).await
     }
 
     async fn open_with_engine(
         backend: B,
         engine: Engine<B>,
         root: &Path,
+        metadata_mode: FilesystemMetadataMode,
     ) -> Result<Self, LixError> {
         Ok(Self {
             inner: backend,
-            supervisor: FilesystemSupervisor::open(engine, root).await?,
+            supervisor: FilesystemSupervisor::open(engine, root, metadata_mode).await?,
         })
     }
 }
@@ -444,107 +404,36 @@ where
     }
 }
 
-impl<B> FilesFilesystemSync<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    async fn open(backend: B, mappings: Vec<FilesHostMapping>) -> Result<Self, LixError> {
-        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
-        Ok(Self {
-            inner: backend,
-            supervisor: FilesFilesystemSupervisor::open(engine, mappings).await?,
-        })
-    }
-}
-
-impl<B> Backend for FilesFilesystemSync<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    type Read<'a>
-        = B::Read<'a>
-    where
-        Self: 'a;
-
-    type Write<'a>
-        = FilesFilesystemWrite<'a, B>
-    where
-        Self: 'a;
-
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        self.inner.begin_read(opts)
-    }
-
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(FilesFilesystemWrite {
-            inner: self.inner.begin_write(opts)?,
-            supervisor: self.supervisor.clone(),
-        })
-    }
-}
-
-impl<B> BackendWrite for FilesFilesystemWrite<'_, B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        self.inner.put_many(space, entries)
-    }
-
-    fn delete_many(
-        &mut self,
-        space: SpaceId,
-        keys: &[lix_engine::Key],
-    ) -> Result<(), BackendError> {
-        self.inner.delete_many(space, keys)
-    }
-
-    fn delete_range(
-        &mut self,
-        space: SpaceId,
-        range: lix_engine::KeyRange,
-    ) -> Result<(), BackendError> {
-        self.inner.delete_range(space, range)
-    }
-
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        let result = self.inner.commit()?;
-        self.supervisor.sync_from_lix_blocking()?;
-        Ok(result)
-    }
-
-    fn rollback(self) -> Result<(), BackendError> {
-        self.inner.rollback()
-    }
-}
-
 impl<B> FilesystemSupervisor<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    async fn open(engine: Engine<B>, root: &Path) -> Result<Self, LixError> {
+    async fn open(
+        engine: Engine<B>,
+        root: &Path,
+        metadata_mode: FilesystemMetadataMode,
+    ) -> Result<Self, LixError> {
         ensure_filesystem_root_directory(root)?;
         let root = std::fs::canonicalize(root)
             .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
-        ensure_filesystem_lix_directory(&root)?;
-        migrate_legacy_filesystem_system_directory(&root)?;
+        if metadata_mode == FilesystemMetadataMode::Persistent {
+            ensure_filesystem_lix_directory(&root)?;
+            migrate_legacy_filesystem_system_directory(&root)?;
+        }
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
             session,
             root,
+            metadata_mode,
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         });
 
-        state.migrate_legacy_lix_system_paths().await?;
+        if metadata_mode == FilesystemMetadataMode::Persistent {
+            state.migrate_legacy_lix_system_paths().await?;
+        }
         state.sync_disk_to_lix(false).await?;
         state.sync_from_lix().await?;
 
@@ -634,291 +523,6 @@ impl FilesystemSupervisorInner {
     }
 }
 
-impl<B> FilesFilesystemSupervisor<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    async fn open(engine: Engine<B>, mappings: Vec<FilesHostMapping>) -> Result<Self, LixError> {
-        let session = engine.open_workspace_session().await?;
-        let state = Arc::new(FilesFilesystemState {
-            session,
-            mappings,
-            sync_lock: tokio::sync::Mutex::new(()),
-            last_materialized: Mutex::new(None),
-        });
-
-        state.sync_host_to_lix(false).await?;
-        state.sync_from_lix().await?;
-
-        let (event_tx, event_rx) = mpsc::channel();
-        let callback_tx = event_tx.clone();
-        let watched_host_paths: Vec<PathBuf> = state
-            .mappings
-            .iter()
-            .map(|mapping| mapping.host_path.clone())
-            .collect();
-        let watched_host_parents = selected_host_parents(&watched_host_paths)?;
-        let callback_host_paths = watched_host_paths.clone();
-        let watcher_config = Config::default().with_follow_symlinks(false);
-        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
-            Duration::from_millis(500),
-            None,
-            move |result: DebounceEventResult| {
-                if selected_files_debounce_touches_path(&result, &callback_host_paths) {
-                    let _ = callback_tx.send(FilesFilesystemEvent::HostChanged);
-                }
-            },
-            RecommendedCache::new(),
-            watcher_config,
-        )
-        .ok()
-        .and_then(|mut debouncer| {
-            let mut watched_any = false;
-            for parent in &watched_host_parents {
-                watched_any |= debouncer
-                    .watch(parent.as_path(), RecursiveMode::NonRecursive)
-                    .is_ok();
-            }
-            for host_path in &watched_host_paths {
-                watched_any |= debouncer
-                    .watch(host_path.as_path(), RecursiveMode::NonRecursive)
-                    .is_ok();
-            }
-            if watched_any {
-                Some(debouncer)
-            } else {
-                debouncer.stop();
-                None
-            }
-        });
-        let poll_host = cfg!(target_os = "macos") || debouncer.is_none();
-        let worker_state = Arc::clone(&state);
-        let worker = std::thread::Builder::new()
-            .name("lix-sdk-selected-files-sync".to_string())
-            .spawn(move || single_file_filesystem_worker(worker_state, event_rx, poll_host))
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_FILESYSTEM_THREAD_ERROR",
-                    format!("failed to start single-file filesystem sync worker: {error}"),
-                )
-            })?;
-
-        Ok(Self {
-            inner: Arc::new(FilesFilesystemSupervisorInner {
-                event_tx,
-                debouncer: Mutex::new(debouncer),
-                worker: Mutex::new(Some(worker)),
-            }),
-            _marker: PhantomData,
-        })
-    }
-
-    fn sync_from_lix_blocking(&self) -> Result<(), BackendError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.inner
-            .event_tx
-            .send(FilesFilesystemEvent::SyncFromLix { reply_tx })
-            .map_err(|error| {
-                BackendError::Io(format!(
-                    "single-file filesystem sync failed: filesystem worker stopped: {error}"
-                ))
-            })?;
-        match reply_rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(filesystem_sync_backend_error(error)),
-            Err(error) => Err(BackendError::Io(format!(
-                "single-file filesystem sync failed: filesystem worker stopped: {error}"
-            ))),
-        }
-    }
-}
-
-impl Drop for FilesFilesystemSupervisorInner {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-impl FilesFilesystemSupervisorInner {
-    fn shutdown(&self) {
-        if let Ok(mut debouncer) = self.debouncer.lock() {
-            let _ = debouncer.take().map(FilesystemDebouncer::stop);
-        }
-        let _ = self.event_tx.send(FilesFilesystemEvent::Shutdown);
-        if let Ok(mut worker) = self.worker.lock() {
-            if let Some(worker) = worker.take() {
-                let _ = worker.join();
-            }
-        }
-    }
-}
-
-impl<B> FilesFilesystemState<B>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    async fn sync_host_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
-        let _guard = self.sync_lock.lock().await;
-        let host = self.collect_host_files()?;
-        if skip_if_last_materialized && self.is_last_materialized_host(&host) {
-            let lix_revision = self.collect_lix_revision().await?;
-            if self.is_last_materialized(&host, &lix_revision) {
-                return Ok(());
-            }
-        }
-
-        let lix = self.collect_lix_files().await?;
-        for mapping in &self.mappings {
-            let host_data = host.get(&mapping.lix_path).and_then(Option::as_ref);
-            let lix_data = lix.get(&mapping.lix_path).and_then(Option::as_ref);
-            match (host_data, lix_data) {
-                (Some(host_data), Some(lix_data)) if host_data == lix_data => {}
-                (Some(host_data), _) => {
-                    self.session
-                        .execute(
-                            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-                            &[
-                                Value::Text(mapping.lix_path.clone()),
-                                Value::Blob(host_data.clone()),
-                            ],
-                        )
-                        .await?;
-                }
-                (None, Some(_)) => {
-                    self.session
-                        .execute(
-                            "DELETE FROM lix_file WHERE path = $1",
-                            &[Value::Text(mapping.lix_path.clone())],
-                        )
-                        .await?;
-                }
-                (None, None) => {}
-            }
-        }
-
-        let lix_revision = self.collect_lix_revision().await?;
-        self.remember_materialized(host, lix_revision);
-        Ok(())
-    }
-
-    async fn sync_from_lix(&self) -> Result<(), LixError> {
-        let _guard = self.sync_lock.lock().await;
-        let target = self.collect_lix_files().await?;
-        let host = self.collect_host_files()?;
-        let previous = self.last_materialized_host();
-
-        for mapping in &self.mappings {
-            let host_data = host.get(&mapping.lix_path).cloned().flatten();
-            let target_data = target.get(&mapping.lix_path).cloned().flatten();
-            let can_materialize = previous.as_ref().is_none_or(|snapshot| {
-                snapshot.get(&mapping.lix_path).cloned().flatten() == host_data
-            });
-
-            if can_materialize && host_data != target_data {
-                match target_data.as_ref() {
-                    Some(data) => write_single_file_host(&mapping.host_path, data)?,
-                    None => remove_single_file_host(&mapping.host_path)?,
-                }
-            }
-        }
-
-        let lix_revision = self.collect_lix_revision().await?;
-        self.remember_materialized(target, lix_revision);
-        Ok(())
-    }
-
-    async fn close(&self) -> Result<(), LixError> {
-        self.session.close().await
-    }
-
-    fn collect_host_files(&self) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
-        let mut snapshot = BTreeMap::new();
-        for mapping in &self.mappings {
-            snapshot.insert(
-                mapping.lix_path.clone(),
-                read_single_file_host(&mapping.host_path)?,
-            );
-        }
-        Ok(snapshot)
-    }
-
-    async fn collect_lix_files(&self) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
-        let mut snapshot = BTreeMap::new();
-        for mapping in &self.mappings {
-            let result = self
-                .session
-                .execute(
-                    "SELECT data FROM lix_file WHERE path = $1",
-                    &[Value::Text(mapping.lix_path.clone())],
-                )
-                .await?;
-            let data = result
-                .rows()
-                .first()
-                .map(|row| row.get::<Vec<u8>>("data"))
-                .transpose()?;
-            snapshot.insert(mapping.lix_path.clone(), data);
-        }
-        Ok(snapshot)
-    }
-
-    async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let batch = self.session.execute_coherent_read_batch(&[]).await?;
-        Ok(LixRevision {
-            active_branch_id: batch.active_branch_id,
-            active_branch_commit_id: batch.active_branch_commit_id,
-            storage_mutation_revision: batch.storage_mutation_revision,
-        })
-    }
-
-    fn remember_materialized(
-        &self,
-        host: BTreeMap<String, Option<Vec<u8>>>,
-        lix_revision: LixRevision,
-    ) {
-        *self
-            .last_materialized
-            .lock()
-            .expect("single-file materialized snapshot lock should not poison") =
-            Some(FilesMaterializedSnapshot { host, lix_revision });
-    }
-
-    fn last_materialized_host(&self) -> Option<BTreeMap<String, Option<Vec<u8>>>> {
-        self.last_materialized
-            .lock()
-            .expect("single-file materialized snapshot lock should not poison")
-            .as_ref()
-            .map(|snapshot| snapshot.host.clone())
-    }
-
-    fn is_last_materialized_host(&self, host: &BTreeMap<String, Option<Vec<u8>>>) -> bool {
-        self.last_materialized
-            .lock()
-            .expect("single-file materialized snapshot lock should not poison")
-            .as_ref()
-            .is_some_and(|materialized| &materialized.host == host)
-    }
-
-    fn is_last_materialized(
-        &self,
-        host: &BTreeMap<String, Option<Vec<u8>>>,
-        lix_revision: &LixRevision,
-    ) -> bool {
-        self.last_materialized
-            .lock()
-            .expect("single-file materialized snapshot lock should not poison")
-            .as_ref()
-            .is_some_and(|materialized| {
-                &materialized.host == host && &materialized.lix_revision == lix_revision
-            })
-    }
-}
-
 impl<B> FilesystemState<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -929,7 +533,7 @@ where
         let _guard = self.sync_lock.lock().await;
         let lix_revision = self.collect_lix_revision().await?;
         if self.is_last_materialized_lix_revision(&lix_revision) {
-            let local = collect_local_snapshot(&self.root)?;
+            let local = collect_local_snapshot(&self.root, self.metadata_mode)?;
             if self.is_last_materialized_disk(&local) {
                 return Ok(());
             }
@@ -942,7 +546,7 @@ where
 
     async fn sync_disk_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
-        let local = collect_local_snapshot(&self.root)?;
+        let local = collect_local_snapshot(&self.root, self.metadata_mode)?;
         if skip_if_last_materialized && self.is_last_materialized_disk(&local) {
             let lix_revision = self.collect_lix_revision().await?;
             if self.is_last_materialized(&local, &lix_revision) {
@@ -984,7 +588,7 @@ where
                         &[Value::Text(new_path.clone()), Value::Blob(data.clone())],
                     )
                     .await?;
-                write_materialized_file(&self.root, &new_path, data)?;
+                write_materialized_file(&self.root, &new_path, data, self.metadata_mode)?;
             }
             self.session
                 .execute(
@@ -1013,7 +617,7 @@ where
                         &[Value::Text(new_path.clone())],
                     )
                     .await?;
-                create_materialized_directory(&self.root, &new_path)?;
+                create_materialized_directory(&self.root, &new_path, self.metadata_mode)?;
             }
         }
         sort_directories_deepest_first(&mut directory_paths);
@@ -1086,7 +690,7 @@ where
         for path in lix.files.keys() {
             if !local.files.contains_key(path)
                 && !is_plugin_storage_path(path)
-                && !is_filesystem_metadata_path(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
             {
                 if previous
                     .as_ref()
@@ -1112,7 +716,7 @@ where
         for path in lix.directories.difference(&local.directories) {
             if path.as_str() == "/"
                 || is_plugin_storage_path(path)
-                || is_filesystem_metadata_path(path)
+                || is_materialization_ignored_path(path, self.metadata_mode)
             {
                 continue;
             }
@@ -1163,7 +767,7 @@ where
         for (path, data) in local
             .files
             .iter()
-            .filter(|(path, _)| !is_filesystem_metadata_path(path))
+            .filter(|(path, _)| !is_materialization_ignored_path(path, self.metadata_mode))
         {
             if previous
                 .as_ref()
@@ -1203,12 +807,12 @@ where
         base: Option<&Snapshot>,
     ) -> Result<Snapshot, LixError> {
         ensure_filesystem_root_directory(&self.root)?;
-        let local = collect_local_snapshot(&self.root)?;
+        let local = collect_local_snapshot(&self.root, self.metadata_mode)?;
         let previous = self.last_materialized_disk();
 
         for path in local.files.keys().filter(|path| {
             !target.files.contains_key(*path)
-                && !is_filesystem_metadata_path(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
                 && previous
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.files.contains_key(*path))
@@ -1219,13 +823,15 @@ where
             }) {
                 continue;
             }
-            remove_materialized_file(&self.root, path)?;
+            remove_materialized_file(&self.root, path, self.metadata_mode)?;
         }
 
         let mut directories_to_remove = local
             .directories
             .difference(&target.directories)
-            .filter(|path| path.as_str() != "/" && !is_filesystem_metadata_path(path))
+            .filter(|path| {
+                path.as_str() != "/" && !is_materialization_ignored_path(path, self.metadata_mode)
+            })
             .filter(|path| {
                 previous
                     .as_ref()
@@ -1241,13 +847,15 @@ where
             .collect::<Vec<_>>();
         sort_directories_deepest_first(&mut directories_to_remove);
         for path in directories_to_remove {
-            remove_materialized_directory(&self.root, &path)?;
+            remove_materialized_directory(&self.root, &path, self.metadata_mode)?;
         }
 
         let mut directories_to_create = target
             .directories
             .iter()
-            .filter(|path| path.as_str() != "/" && !is_filesystem_metadata_path(path))
+            .filter(|path| {
+                path.as_str() != "/" && !is_materialization_ignored_path(path, self.metadata_mode)
+            })
             .filter(|path| base.is_none_or(|snapshot| !snapshot.directories.contains(*path)))
             .filter(|path| {
                 base.is_none_or(|snapshot| {
@@ -1258,13 +866,13 @@ where
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
         for path in directories_to_create {
-            create_materialized_directory(&self.root, &path)?;
+            create_materialized_directory(&self.root, &path, self.metadata_mode)?;
         }
 
         for (path, data) in target
             .files
             .iter()
-            .filter(|(path, _)| !is_filesystem_metadata_path(path))
+            .filter(|(path, _)| !is_materialization_ignored_path(path, self.metadata_mode))
         {
             if base.is_some_and(|snapshot| snapshot.files.get(path) == Some(data)) {
                 continue;
@@ -1273,11 +881,11 @@ where
                 continue;
             }
             if local.files.get(path) != Some(data) {
-                write_materialized_file(&self.root, path, data)?;
+                write_materialized_file(&self.root, path, data, self.metadata_mode)?;
             }
         }
 
-        let materialized = collect_local_snapshot(&self.root)?;
+        let materialized = collect_local_snapshot(&self.root, self.metadata_mode)?;
         let mut remembered = target.clone();
         remembered.unmanaged_paths = materialized.unmanaged_paths;
         Ok(remembered)
@@ -1413,146 +1021,22 @@ fn sync_from_lix_for_replies<B>(
     }
 }
 
-fn selected_files_debounce_touches_path(
-    result: &DebounceEventResult,
-    host_paths: &[PathBuf],
-) -> bool {
-    result.as_ref().map_or(true, |events| {
-        events.iter().any(|event| {
-            event.paths.is_empty()
-                || event
-                    .paths
-                    .iter()
-                    .any(|path| selected_file_event_path_matches(path, host_paths))
-        })
-    })
-}
-
-fn selected_file_event_path_matches(path: &Path, host_paths: &[PathBuf]) -> bool {
-    host_paths.iter().any(|host_path| {
-        host_path
-            .parent()
-            .is_some_and(|host_parent| single_file_event_path_matches(path, host_path, host_parent))
-    })
-}
-
-fn single_file_event_path_matches(path: &Path, host_path: &Path, host_parent: &Path) -> bool {
-    if path == host_path || path == host_parent {
-        return true;
-    }
-
-    if path.file_name() != host_path.file_name() {
-        return false;
-    }
-
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    parent == host_parent
-        || std::fs::canonicalize(parent)
-            .as_deref()
-            .is_ok_and(|parent| parent == host_parent)
-}
-
-fn single_file_filesystem_worker<B>(
-    state: Arc<FilesFilesystemState<B>>,
-    event_rx: mpsc::Receiver<FilesFilesystemEvent>,
-    poll_host: bool,
-) where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
-        return;
-    };
-    loop {
-        let e = if poll_host {
-            event_rx.recv_timeout(FILESYSTEM_POLL_INTERVAL)
-        } else {
-            event_rx
-                .recv()
-                .map_err(|mpsc::RecvError| mpsc::RecvTimeoutError::Disconnected)
-        };
-        match e {
-            Ok(FilesFilesystemEvent::HostChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                if drain_single_file_events(&runtime, &state, &event_rx, true) {
-                    return;
-                }
-            }
-            Ok(FilesFilesystemEvent::SyncFromLix { reply_tx }) => {
-                single_file_sync_from_lix_for_replies(&runtime, &state, vec![reply_tx]);
-                if drain_single_file_events(&runtime, &state, &event_rx, false) {
-                    return;
-                }
-            }
-            Ok(FilesFilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = runtime.block_on(state.close());
-                return;
-            }
-        }
-    }
-}
-
-fn drain_single_file_events<B>(
-    runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesFilesystemState<B>>,
-    event_rx: &mpsc::Receiver<FilesFilesystemEvent>,
-    mut sync_host: bool,
-) -> bool
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let mut sync_replies = Vec::new();
-    loop {
-        match event_rx.try_recv() {
-            Ok(FilesFilesystemEvent::HostChanged) => sync_host = true,
-            Ok(FilesFilesystemEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
-            Ok(FilesFilesystemEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
-                let _ = runtime.block_on(state.close());
-                return true;
-            }
-            Err(mpsc::TryRecvError::Empty) => break,
-        }
-    }
-    if sync_host {
-        let _ = runtime.block_on(state.sync_host_to_lix(true));
-    }
-    if !sync_replies.is_empty() {
-        single_file_sync_from_lix_for_replies(runtime, state, sync_replies);
-    }
-    false
-}
-
-fn single_file_sync_from_lix_for_replies<B>(
-    runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesFilesystemState<B>>,
-    replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
-) where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let result = runtime.block_on(state.sync_from_lix());
-    for reply in replies {
-        let _ = reply.send(result.clone());
-    }
-}
-
-fn collect_local_snapshot(root: &Path) -> Result<Snapshot, LixError> {
+fn collect_local_snapshot(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<Snapshot, LixError> {
     validate_filesystem_root_directory(root)?;
 
     let mut snapshot = Snapshot::default();
     snapshot.directories.insert("/".to_string());
-    collect_local_directory(root, root, &mut snapshot)?;
+    collect_local_directory(root, root, metadata_mode, &mut snapshot)?;
     Ok(snapshot)
 }
 
 fn collect_local_directory(
     root: &Path,
     directory: &Path,
+    metadata_mode: FilesystemMetadataMode,
     snapshot: &mut Snapshot,
 ) -> Result<(), LixError> {
     let entries = std::fs::read_dir(directory)
@@ -1561,7 +1045,7 @@ fn collect_local_directory(
         let entry =
             entry.map_err(|error| io_error("read filesystem directory entry", directory, error))?;
         let path = entry.path();
-        if is_filesystem_sync_ignored_local_path(root, &path) {
+        if is_filesystem_sync_ignored_local_path(root, &path, metadata_mode) {
             continue;
         }
         let file_type = match entry.file_type() {
@@ -1579,7 +1063,7 @@ fn collect_local_directory(
                 continue;
             };
             snapshot.directories.insert(lix_path);
-            collect_local_directory(root, &path, snapshot)?;
+            collect_local_directory(root, &path, metadata_mode, snapshot)?;
         } else if file_type.is_file() {
             let Ok(lix_path) = local_path_to_lix_path(root, &path, false) else {
                 remember_unmanaged_local_path(root, directory, &path, snapshot);
@@ -1606,206 +1090,6 @@ fn remember_unmanaged_local_path(
             snapshot.unmanaged_paths.insert(parent_path);
         }
     }
-}
-
-fn validate_files_mappings(
-    root: &Path,
-    files: Vec<PathBuf>,
-) -> Result<Vec<FilesHostMapping>, LixError> {
-    if files.is_empty() {
-        return Err(filesystem_error(
-            "selected-files filesystem requires at least one file",
-        ));
-    }
-
-    let root = validate_files_root_directory(root)?;
-    let mut seen_host_paths = BTreeSet::new();
-    let mut seen_lix_paths = BTreeSet::new();
-    let mut mappings = Vec::with_capacity(files.len());
-    for relative_path in files {
-        let lix_path = relative_file_lix_path(&relative_path)?;
-        let host_path = validate_single_file_path(&root.join(&relative_path))?;
-        if !seen_host_paths.insert(host_path.clone()) {
-            let path = host_path.display();
-            return Err(filesystem_error(format!(
-                "selected-files filesystem path {path} is duplicated"
-            )));
-        }
-        if !seen_lix_paths.insert(lix_path.clone()) {
-            return Err(filesystem_error(format!(
-                "selected-files Lix path {lix_path:?} is duplicated"
-            )));
-        }
-        mappings.push(FilesHostMapping {
-            host_path,
-            lix_path,
-        });
-    }
-    Ok(mappings)
-}
-
-fn validate_files_root_directory(root: &Path) -> Result<PathBuf, LixError> {
-    let metadata = std::fs::symlink_metadata(root)
-        .map_err(|error| io_error("read selected-files root metadata", root, error))?;
-    if metadata.file_type().is_symlink() {
-        let root = root.display();
-        return Err(filesystem_error(format!(
-            "selected-files filesystem root {root} must not be a symlink"
-        )));
-    }
-    if !metadata.is_dir() {
-        let root = root.display();
-        return Err(filesystem_error(format!(
-            "selected-files filesystem root {root} must be a directory"
-        )));
-    }
-    std::fs::canonicalize(root)
-        .map_err(|error| io_error("canonicalize selected-files root", root, error))
-}
-
-fn relative_file_lix_path(relative_path: &Path) -> Result<String, LixError> {
-    if relative_path.is_absolute() {
-        let path = relative_path.display();
-        return Err(filesystem_error(format!(
-            "selected-files path {path} must be relative"
-        )));
-    }
-
-    let mut segments = Vec::new();
-    let mut local = PathBuf::new();
-    for component in relative_path.components() {
-        let Component::Normal(segment) = component else {
-            let path = relative_path.display();
-            return Err(filesystem_error(format!(
-                "selected-files path {path} contains an unsupported path component"
-            )));
-        };
-        let segment = segment.to_str().ok_or_else(|| {
-            let path = relative_path.display();
-            filesystem_error(format!("selected-files path {path} is not valid UTF-8"))
-        })?;
-        push_lix_path_segment(&mut local, segment, &relative_path.display().to_string())?;
-        segments.push(segment.to_string());
-    }
-    if segments.is_empty() {
-        return Err(filesystem_error(
-            "selected-files path must not be empty".to_string(),
-        ));
-    }
-    Ok(format!("/{}", segments.join("/")))
-}
-
-fn selected_host_parents(host_paths: &[PathBuf]) -> Result<Vec<PathBuf>, LixError> {
-    let mut seen = BTreeSet::new();
-    let mut parents = Vec::new();
-    for host_path in host_paths {
-        let parent = host_path.parent().map(Path::to_path_buf).ok_or_else(|| {
-            let path = host_path.display();
-            filesystem_error(format!(
-                "selected-files filesystem path {path} has no parent"
-            ))
-        })?;
-        if seen.insert(parent.clone()) {
-            parents.push(parent);
-        }
-    }
-    Ok(parents)
-}
-
-fn validate_single_file_path(path: &Path) -> Result<PathBuf, LixError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| io_error("read single-file filesystem metadata", path, error))?;
-    if metadata.file_type().is_symlink() {
-        let path = path.display();
-        return Err(filesystem_error(format!(
-            "single-file filesystem path {path} must not be a symlink"
-        )));
-    }
-    if !metadata.is_file() {
-        let path = path.display();
-        return Err(filesystem_error(format!(
-            "single-file filesystem path {path} must be a file"
-        )));
-    }
-    std::fs::canonicalize(path)
-        .map_err(|error| io_error("canonicalize single-file filesystem path", path, error))
-}
-
-fn read_single_file_host(path: &Path) -> Result<Option<Vec<u8>>, LixError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(io_error(
-                "read single-file filesystem metadata",
-                path,
-                error,
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        let path = path.display();
-        return Err(filesystem_error(format!(
-            "single-file filesystem path {path} must remain a regular file"
-        )));
-    }
-    std::fs::read(path)
-        .map(Some)
-        .map_err(|error| io_error("read single-file filesystem file", path, error))
-}
-
-fn write_single_file_host(path: &Path, data: &[u8]) -> Result<(), LixError> {
-    if let Some(parent) = path.parent() {
-        let metadata = std::fs::symlink_metadata(parent).map_err(|error| {
-            io_error("read single-file filesystem parent metadata", parent, error)
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            let parent = parent.display();
-            return Err(filesystem_error(format!(
-                "single-file filesystem parent path {parent} must be a directory"
-            )));
-        }
-    }
-
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            let path = path.display();
-            return Err(filesystem_error(format!(
-                "single-file filesystem path {path} must remain a regular file"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(io_error(
-                "read single-file filesystem metadata",
-                path,
-                error,
-            ));
-        }
-    }
-
-    std::fs::write(path, data)
-        .map_err(|error| io_error("write single-file filesystem file", path, error))
-}
-
-fn remove_single_file_host(path: &Path) -> Result<(), LixError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(io_error(
-                "read single-file filesystem metadata",
-                path,
-                error,
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Ok(());
-    }
-    std::fs::remove_file(path)
-        .map_err(|error| io_error("remove single-file filesystem file", path, error))
 }
 
 fn ensure_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
@@ -1998,8 +1282,12 @@ fn remove_legacy_system_entry(path: &Path) -> Result<(), LixError> {
     }
 }
 
-fn remove_materialized_file(root: &Path, path: &str) -> Result<(), LixError> {
-    if is_filesystem_sync_ignored_lix_path(path) {
+fn remove_materialized_file(
+    root: &Path,
+    path: &str,
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path, metadata_mode) {
         return Ok(());
     }
     let Some(local_path) = materialization_local_path(root, path) else {
@@ -2026,8 +1314,12 @@ fn remove_materialized_file(root: &Path, path: &str) -> Result<(), LixError> {
         .map_err(|error| io_error("remove filesystem file", &local_path, error))
 }
 
-fn remove_materialized_directory(root: &Path, path: &str) -> Result<(), LixError> {
-    if is_filesystem_sync_ignored_lix_path(path) {
+fn remove_materialized_directory(
+    root: &Path,
+    path: &str,
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path, metadata_mode) {
         return Ok(());
     }
     let Some(local_path) = materialization_local_path(root, path) else {
@@ -2057,8 +1349,12 @@ fn remove_materialized_directory(root: &Path, path: &str) -> Result<(), LixError
     }
 }
 
-fn create_materialized_directory(root: &Path, path: &str) -> Result<(), LixError> {
-    if is_filesystem_sync_ignored_lix_path(path) {
+fn create_materialized_directory(
+    root: &Path,
+    path: &str,
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path, metadata_mode) {
         return Ok(());
     }
     let Some(local_path) = materialization_local_path(root, path) else {
@@ -2071,8 +1367,13 @@ fn create_materialized_directory(root: &Path, path: &str) -> Result<(), LixError
         .map_err(|error| io_error("create filesystem directory", &local_path, error))
 }
 
-fn write_materialized_file(root: &Path, path: &str, data: &[u8]) -> Result<(), LixError> {
-    if is_filesystem_sync_ignored_lix_path(path) {
+fn write_materialized_file(
+    root: &Path,
+    path: &str,
+    data: &[u8],
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<(), LixError> {
+    if is_filesystem_sync_ignored_lix_path(path, metadata_mode) {
         return Ok(());
     }
     let Some(local_path) = materialization_local_path(root, path) else {
@@ -2275,7 +1576,11 @@ fn is_legacy_filesystem_sqlite_metadata_path(path: &str) -> bool {
     )
 }
 
-fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
+fn is_filesystem_sync_ignored_local_path(
+    root: &Path,
+    path: &Path,
+    metadata_mode: FilesystemMetadataMode,
+) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
@@ -2288,6 +1593,12 @@ fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
         depth += 1;
         let segment = segment.to_str();
         if segment == Some(".git") {
+            return true;
+        }
+        if metadata_mode == FilesystemMetadataMode::Ephemeral
+            && depth == 1
+            && matches!(segment, Some(".lix" | ".lix_system"))
+        {
             return true;
         }
         if depth == 1 && segment == Some(".lix") {
@@ -2312,8 +1623,22 @@ fn is_filesystem_sync_ignored_local_path(root: &Path, path: &Path) -> bool {
     false
 }
 
-fn is_filesystem_sync_ignored_lix_path(path: &str) -> bool {
-    lix_path_contains_segment(path, ".git") || is_filesystem_metadata_path(path)
+fn is_materialization_ignored_path(path: &str, metadata_mode: FilesystemMetadataMode) -> bool {
+    match metadata_mode {
+        FilesystemMetadataMode::Persistent => is_filesystem_metadata_path(path),
+        FilesystemMetadataMode::Ephemeral => {
+            is_lix_storage_path(path) || is_legacy_lix_system_path(path)
+        }
+    }
+}
+
+fn is_filesystem_sync_ignored_lix_path(path: &str, metadata_mode: FilesystemMetadataMode) -> bool {
+    lix_path_contains_segment(path, ".git") || is_materialization_ignored_path(path, metadata_mode)
+}
+
+fn is_lix_storage_path(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path == "/.lix" || path.starts_with("/.lix/")
 }
 
 fn lix_path_contains_segment(path: &str, segment: &str) -> bool {
@@ -2600,13 +1925,14 @@ mod tests {
         let state = FilesystemState {
             session: engine.open_workspace_session().await.unwrap(),
             root,
+            metadata_mode: FilesystemMetadataMode::Persistent,
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         };
 
         state.sync_disk_to_lix(false).await.unwrap();
 
-        let local = collect_local_snapshot(&state.root).unwrap();
+        let local = collect_local_snapshot(&state.root, state.metadata_mode).unwrap();
         let lix_revision = state.collect_lix_revision().await.unwrap();
         assert!(
             state.is_last_materialized(&local, &lix_revision),
@@ -2628,6 +1954,7 @@ mod tests {
         let state = FilesystemState {
             session: engine.open_workspace_session().await.unwrap(),
             root,
+            metadata_mode: FilesystemMetadataMode::Persistent,
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         };
@@ -2678,6 +2005,7 @@ mod tests {
         let state = FilesystemState {
             session: engine.open_workspace_session().await.unwrap(),
             root,
+            metadata_mode: FilesystemMetadataMode::Persistent,
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         };
@@ -2717,6 +2045,7 @@ mod tests {
         let state = FilesystemState {
             session: engine.open_workspace_session().await.unwrap(),
             root,
+            metadata_mode: FilesystemMetadataMode::Persistent,
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         };
@@ -2724,7 +2053,7 @@ mod tests {
         state.sync_disk_to_lix(false).await.unwrap();
         let disk_path = tempdir.path().join("disk.txt");
         std::fs::write(&disk_path, b"disk").unwrap();
-        let local = collect_local_snapshot(&state.root).unwrap();
+        let local = collect_local_snapshot(&state.root, state.metadata_mode).unwrap();
         let previous = state.last_materialized_disk();
         state
             .apply_local_snapshot_to_lix(&local, previous.as_ref())
