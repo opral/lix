@@ -11,7 +11,7 @@ such as changelog commits, changelog changes, commit change-ref chunks, JSON
 payload rows, and tracked-state tree chunks. The backend is responsible for the
 physical layout underneath those rows: pages, B-trees, LSM/SST files, WALs,
 checksums, caches, locks, compaction, and file/object placement. In other
-words, Lix defines *what facts exist*; the backend decides *how bytes are stored*.
+words, Lix defines _what facts exist_; the backend decides _how bytes are stored_.
 
 ## The system interface
 
@@ -27,21 +27,22 @@ talks to the outside system where Lix data lives, it is a backend.
 
 ## What ships today
 
-| Backend     | Module                          | Use for                      |
-| ----------- | ------------------------------- | ---------------------------- |
-| In-memory   | default (no `backend` argument) | tests, demos, ephemeral work |
-| SQLite file | `@lix-js/sdk`                   | persistent Node apps         |
-| Filesystem workspace | `@lix-js/sdk`           | local folders with synced files |
+| Backend              | Module                          | Use for                         |
+| -------------------- | ------------------------------- | ------------------------------- |
+| In-memory            | default (no `backend` argument) | tests, demos, ephemeral work    |
+| Filesystem workspace | `@lix-js/sdk`                   | local folders with synced files |
+| SQLite file          | `@lix-js/sdk`                   | single-file application formats |
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new SqliteBackend({ path: "/var/data/app.lix" }),
+	backend: new FsBackend({ path: "/var/data/workspace" }),
 });
 ```
 
-Use `FsBackend` when the Lix should sync a local directory. The backend stores
+Use `FsBackend` when the Lix should sync a local directory. This is the
+recommended persistent backend for filesystem workspaces. The backend stores
 its private SQLite database at `<workspace>/.lix/.internal/db.sqlite` and syncs
 workspace files, including user-editable files under `.lix/` such as plugin
 archives, through Lix.
@@ -50,7 +51,23 @@ archives, through Lix.
 import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new FsBackend({ path: "/var/data/workspace" }),
+	backend: new FsBackend({ path: "/Users/me/Downloads", storage: "memory" }),
+});
+```
+
+Pass `storage: "memory"` when the filesystem should be synced but Lix should not
+write `.lix` repository metadata into that folder.
+
+Use `SqliteBackend` when the `.lix` SQLite file is the application document
+itself. This is useful when defining a new file format and using Lix as the
+application file format: one portable file containing versioned application
+state.
+
+```ts
+import { openLix, SqliteBackend } from "@lix-js/sdk";
+
+const lix = await openLix({
+	backend: new SqliteBackend({ path: "/var/data/app.lix" }),
 });
 ```
 
@@ -72,118 +89,118 @@ storage:
 
 ```ts
 type LixBackend = {
-  beginReadTransaction(): LixBackendReadTransaction;
-  beginWriteTransaction(): LixBackendWriteTransaction;
-  close?(): void;
+	beginReadTransaction(): LixBackendReadTransaction;
+	beginWriteTransaction(): LixBackendWriteTransaction;
+	close?(): void;
 };
 
 type LixBackendReadTransaction = {
-  getValues(request: BackendKvGetRequest): BackendKvValueBatch;
-  existsMany(request: BackendKvGetRequest): BackendKvExistsBatch;
-  scanKeys(request: BackendKvScanRequest): BackendKvKeyPage;
-  scanValues(request: BackendKvScanRequest): BackendKvValuePage;
-  scanEntries(request: BackendKvScanRequest): BackendKvEntryPage;
-  rollback(): void;
+	getValues(request: BackendKvGetRequest): BackendKvValueBatch;
+	existsMany(request: BackendKvGetRequest): BackendKvExistsBatch;
+	scanKeys(request: BackendKvScanRequest): BackendKvKeyPage;
+	scanValues(request: BackendKvScanRequest): BackendKvValuePage;
+	scanEntries(request: BackendKvScanRequest): BackendKvEntryPage;
+	rollback(): void;
 };
 
 type LixBackendWriteTransaction = LixBackendReadTransaction & {
-  writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats;
-  commit(): void;
+	writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats;
+	commit(): void;
 };
 
 // ── Scan ranges ────────────────────────────────────────────────────────────
 
 type BackendKvScanRange =
-  | { kind: "prefix"; prefix: Uint8Array }
-  | { kind: "range"; start: Uint8Array; end: Uint8Array };
+	| { kind: "prefix"; prefix: Uint8Array }
+	| { kind: "range"; start: Uint8Array; end: Uint8Array };
 
 // ── Get / exists ───────────────────────────────────────────────────────────
 
 type BackendKvGetRequest = {
-  groups: BackendKvGetGroup[];
+	groups: BackendKvGetGroup[];
 };
 
 type BackendKvGetGroup = {
-  namespace: string;
-  keys: Uint8Array[];
+	namespace: string;
+	keys: Uint8Array[];
 };
 
 type BackendKvValueBatch = {
-  groups: BackendKvValueGroup[];
+	groups: BackendKvValueGroup[];
 };
 
 type BackendKvValueGroup = {
-  namespace: string;
-  values: Array<Uint8Array | null>; // null = key not present
+	namespace: string;
+	values: Array<Uint8Array | null>; // null = key not present
 };
 
 type BackendKvExistsBatch = {
-  groups: BackendKvExistsGroup[];
+	groups: BackendKvExistsGroup[];
 };
 
 type BackendKvExistsGroup = {
-  namespace: string;
-  exists: boolean[];
+	namespace: string;
+	exists: boolean[];
 };
 
 // ── Scan ───────────────────────────────────────────────────────────────────
 
 type BackendKvScanRequest = {
-  namespace: string;
-  range: BackendKvScanRange;
-  after?: Uint8Array | null; // exclusive cursor; returns keys strictly greater
-  limit: number;
+	namespace: string;
+	range: BackendKvScanRange;
+	after?: Uint8Array | null; // exclusive cursor; returns keys strictly greater
+	limit: number;
 };
 
 type BackendKvKeyPage = {
-  keys: Uint8Array[];
-  resumeAfter?: Uint8Array | null;
+	keys: Uint8Array[];
+	resumeAfter?: Uint8Array | null;
 };
 
 type BackendKvValuePage = {
-  values: Uint8Array[];
-  resumeAfter?: Uint8Array | null;
+	values: Uint8Array[];
+	resumeAfter?: Uint8Array | null;
 };
 
 type BackendKvEntryPage = {
-  keys: Uint8Array[];
-  values: Uint8Array[];
-  resumeAfter?: Uint8Array | null;
+	keys: Uint8Array[];
+	values: Uint8Array[];
+	resumeAfter?: Uint8Array | null;
 };
 
 // ── Write ──────────────────────────────────────────────────────────────────
 
 type BackendKvWriteBatch = {
-  groups: BackendKvWriteGroup[];
+	groups: BackendKvWriteGroup[];
 };
 
 type BackendKvWriteGroup = {
-  namespace: string;
-  ops: BackendKvWriteOp[];
+	namespace: string;
+	ops: BackendKvWriteOp[];
 };
 
 type BackendKvWriteOp =
-  | { kind: "put"; key: Uint8Array; value: Uint8Array }
-  | { kind: "delete"; key: Uint8Array }
-  | { kind: "deleteRange"; range: BackendKvScanRange };
+	| { kind: "put"; key: Uint8Array; value: Uint8Array }
+	| { kind: "delete"; key: Uint8Array }
+	| { kind: "deleteRange"; range: BackendKvScanRange };
 
 type BackendKvWriteStats = {
-  puts: number;
-  deletes: number;
-  deleteRanges: number;
-  bytesWritten: number;
+	puts: number;
+	deletes: number;
+	deleteRanges: number;
+	bytesWritten: number;
 };
 ```
 
 ### Operations
 
-| Method                                    | Purpose                                                                                                                                                                                                                                                              |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `getValues`                               | Batch fetch values by exact key, grouped by namespace. Missing keys come back as `null` in the same position.                                                                                                                                                        |
-| `existsMany`                              | Same request shape as `getValues`, returns booleans. Used when Lix only needs to know whether a key is present.                                                                                                                                                      |
-| `scanKeys` / `scanValues` / `scanEntries` | Range or prefix scan within one namespace, with `limit` and a resumable `after` cursor.                                                                                                                                                                              |
-| `writeKvBatch`                            | Atomic batch of ordered `ops`, grouped by namespace. Apply operations in list order. Either all of it lands or none of it does. `deleteRange` removes every key matching the same half-open range or prefix shape used by scans.                                     |
-| `commit` / `rollback`                     | Transaction control. After either, the transaction object is finished; do not call further methods on it.                                                                                                                                                            |
+| Method                                    | Purpose                                                                                                                                                                                                                                                             |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `getValues`                               | Batch fetch values by exact key, grouped by namespace. Missing keys come back as `null` in the same position.                                                                                                                                                       |
+| `existsMany`                              | Same request shape as `getValues`, returns booleans. Used when Lix only needs to know whether a key is present.                                                                                                                                                     |
+| `scanKeys` / `scanValues` / `scanEntries` | Range or prefix scan within one namespace, with `limit` and a resumable `after` cursor.                                                                                                                                                                             |
+| `writeKvBatch`                            | Atomic batch of ordered `ops`, grouped by namespace. Apply operations in list order. Either all of it lands or none of it does. `deleteRange` removes every key matching the same half-open range or prefix shape used by scans.                                    |
+| `commit` / `rollback`                     | Transaction control. After either, the transaction object is finished; do not call further methods on it.                                                                                                                                                           |
 | `close()` / `destroy()` (on the backend)  | Lifecycle. `close()` releases handles without affecting durability. `destroy()` (optional, not in the type signature above for backends that don't own their target) removes the entire storage target: file plus WAL/SHM, the OPFS target, the schema, the bucket. |
 
 ### Scan semantics

@@ -1,6 +1,6 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, FsBackend, FsEphemeralBackend, InMemoryBackend, Lix as RsLix,
+    ExecuteResult as RsExecuteResult, FsBackend, FsBackendFilter, InMemoryBackend, Lix as RsLix,
     LixError, LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
@@ -32,21 +32,18 @@ enum NativeLixInner {
     Memory(RsLix<InMemoryBackend>),
     Sqlite(RsLix<SqliteBackend>),
     Fs(RsLix<FsBackend>),
-    FsEphemeral(RsLix<FsEphemeralBackend>),
 }
 
 enum NativeLixTransactionInner {
     Memory(RsLixTransaction<InMemoryBackend>),
     Sqlite(RsLixTransaction<SqliteBackend>),
     Fs(RsLixTransaction<FsBackend>),
-    FsEphemeral(RsLixTransaction<FsEphemeralBackend>),
 }
 
 enum NativeObserveEventsInner {
     Memory(RsObserveEvents<InMemoryBackend>),
     Sqlite(RsObserveEvents<SqliteBackend>),
     Fs(RsObserveEvents<FsBackend>),
-    FsEphemeral(RsObserveEvents<FsEphemeralBackend>),
 }
 
 impl NativeLixInner {
@@ -59,7 +56,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.execute(sql, params).await,
             Self::Sqlite(lix) => lix.execute(sql, params).await,
             Self::Fs(lix) => lix.execute(sql, params).await,
-            Self::FsEphemeral(lix) => lix.execute(sql, params).await,
         }
     }
 
@@ -74,9 +70,6 @@ impl NativeLixInner {
             Self::Fs(lix) => Ok(NativeLixTransactionInner::Fs(
                 lix.begin_transaction().await?,
             )),
-            Self::FsEphemeral(lix) => Ok(NativeLixTransactionInner::FsEphemeral(
-                lix.begin_transaction().await?,
-            )),
         }
     }
 
@@ -89,9 +82,6 @@ impl NativeLixInner {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
             Self::Sqlite(lix) => Ok(NativeObserveEventsInner::Sqlite(lix.observe(sql, params)?)),
             Self::Fs(lix) => Ok(NativeObserveEventsInner::Fs(lix.observe(sql, params)?)),
-            Self::FsEphemeral(lix) => Ok(NativeObserveEventsInner::FsEphemeral(
-                lix.observe(sql, params)?,
-            )),
         }
     }
 
@@ -100,7 +90,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.active_branch_id().await,
             Self::Sqlite(lix) => lix.active_branch_id().await,
             Self::Fs(lix) => lix.active_branch_id().await,
-            Self::FsEphemeral(lix) => lix.active_branch_id().await,
         }
     }
 
@@ -112,7 +101,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.create_branch(options).await,
             Self::Sqlite(lix) => lix.create_branch(options).await,
             Self::Fs(lix) => lix.create_branch(options).await,
-            Self::FsEphemeral(lix) => lix.create_branch(options).await,
         }
     }
 
@@ -124,7 +112,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.switch_branch(options).await,
             Self::Sqlite(lix) => lix.switch_branch(options).await,
             Self::Fs(lix) => lix.switch_branch(options).await,
-            Self::FsEphemeral(lix) => lix.switch_branch(options).await,
         }
     }
 
@@ -136,7 +123,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
             Self::Sqlite(lix) => lix.merge_branch_preview(options).await,
             Self::Fs(lix) => lix.merge_branch_preview(options).await,
-            Self::FsEphemeral(lix) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -148,7 +134,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.merge_branch(options).await,
             Self::Sqlite(lix) => lix.merge_branch(options).await,
             Self::Fs(lix) => lix.merge_branch(options).await,
-            Self::FsEphemeral(lix) => lix.merge_branch(options).await,
         }
     }
 
@@ -157,7 +142,6 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.close().await,
             Self::Sqlite(lix) => lix.close().await,
             Self::Fs(lix) => lix.close().await,
-            Self::FsEphemeral(lix) => lix.close().await,
         }
     }
 }
@@ -172,7 +156,6 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => transaction.execute(sql, params).await,
             Self::Sqlite(transaction) => transaction.execute(sql, params).await,
             Self::Fs(transaction) => transaction.execute(sql, params).await,
-            Self::FsEphemeral(transaction) => transaction.execute(sql, params).await,
         }
     }
 
@@ -181,7 +164,6 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => transaction.commit().await,
             Self::Sqlite(transaction) => transaction.commit().await,
             Self::Fs(transaction) => transaction.commit().await,
-            Self::FsEphemeral(transaction) => transaction.commit().await,
         }
     }
 
@@ -190,7 +172,6 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => transaction.rollback().await,
             Self::Sqlite(transaction) => transaction.rollback().await,
             Self::Fs(transaction) => transaction.rollback().await,
-            Self::FsEphemeral(transaction) => transaction.rollback().await,
         }
     }
 }
@@ -201,7 +182,6 @@ impl NativeObserveEventsInner {
             Self::Memory(events) => events.next().await,
             Self::Sqlite(events) => events.next().await,
             Self::Fs(events) => events.next().await,
-            Self::FsEphemeral(events) => events.next().await,
         }
     }
 
@@ -210,9 +190,46 @@ impl NativeObserveEventsInner {
             Self::Memory(events) => events.close(),
             Self::Sqlite(events) => events.close(),
             Self::Fs(events) => events.close(),
-            Self::FsEphemeral(events) => events.close(),
         }
     }
+}
+
+enum NativeFsBackendStorage {
+    Persistent,
+    Memory,
+}
+
+fn parse_fs_backend_storage(env: &Env, storage: Option<String>) -> Result<NativeFsBackendStorage> {
+    match storage.as_deref().unwrap_or("persistent") {
+        "persistent" => Ok(NativeFsBackendStorage::Persistent),
+        "memory" => Ok(NativeFsBackendStorage::Memory),
+        value => Err(throw_lix_error(
+            env,
+            LixError::new(
+                "LIX_INVALID_ARGUMENT",
+                format!("unsupported filesystem backend storage '{value}'"),
+            ),
+        )),
+    }
+}
+
+fn parse_fs_backend_filter(
+    env: &Env,
+    include_paths: Option<Vec<String>>,
+) -> Result<FsBackendFilter> {
+    let Some(include_paths) = include_paths else {
+        return Ok(FsBackendFilter::default());
+    };
+    if include_paths.is_empty() {
+        return Err(throw_lix_error(
+            env,
+            LixError::new(
+                "LIX_INVALID_ARGUMENT",
+                "filesystem backend filter.includePaths must contain at least one path",
+            ),
+        ));
+    }
+    Ok(FsBackendFilter::include_paths(include_paths))
 }
 
 #[napi]
@@ -250,13 +267,29 @@ impl NativeLix {
     }
 
     #[napi(factory, js_name = "openFs")]
-    pub fn open_fs(env: Env, path: String) -> Result<Self> {
+    pub fn open_fs(
+        env: Env,
+        path: String,
+        storage: Option<String>,
+        include_paths: Option<Vec<String>>,
+    ) -> Result<Self> {
         let rt = Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(to_napi_error)?;
+        let storage = parse_fs_backend_storage(&env, storage)?;
+        let filter = parse_fs_backend_filter(&env, include_paths)?;
         let backend = rt
-            .block_on(FsBackend::open(path))
+            .block_on(async {
+                match storage {
+                    NativeFsBackendStorage::Persistent => {
+                        FsBackend::open_with_filter(path, filter).await
+                    }
+                    NativeFsBackendStorage::Memory => {
+                        FsBackend::open_memory_with_filter(path, filter).await
+                    }
+                }
+            })
             .map_err(|error| throw_lix_error(&env, error))?;
         let lix = rt
             .block_on(open_lix_with_backend(backend))
@@ -264,24 +297,6 @@ impl NativeLix {
         Ok(Self {
             rt,
             lix: Some(NativeLixInner::Fs(lix)),
-        })
-    }
-
-    #[napi(factory, js_name = "openFsEphemeral")]
-    pub fn open_fs_ephemeral(env: Env, path: String) -> Result<Self> {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(to_napi_error)?;
-        let backend = rt
-            .block_on(FsEphemeralBackend::open(path))
-            .map_err(|error| throw_lix_error(&env, error))?;
-        let lix = rt
-            .block_on(open_lix_with_backend(backend))
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(Self {
-            rt,
-            lix: Some(NativeLixInner::FsEphemeral(lix)),
         })
     }
 

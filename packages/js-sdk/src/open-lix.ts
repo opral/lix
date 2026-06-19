@@ -7,7 +7,6 @@ import type {
 	CreateBranchReceipt,
 	ExecuteResult,
 	FsBackendOptions,
-	FsEphemeralBackendOptions,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
@@ -67,6 +66,8 @@ export class SqliteBackend {
 
 export class FsBackend {
 	readonly path: string;
+	readonly storage: "persistent" | "memory";
+	readonly filter: { includePaths: readonly string[] } | undefined;
 
 	constructor(options: FsBackendOptions) {
 		if (
@@ -76,22 +77,43 @@ export class FsBackend {
 		) {
 			throw new TypeError("FsBackend requires a non-empty path");
 		}
-		this.path = options.path;
-	}
-}
-
-export class FsEphemeralBackend {
-	readonly path: string;
-
-	constructor(options: FsEphemeralBackendOptions) {
 		if (
-			!options ||
-			typeof options.path !== "string" ||
-			options.path.length === 0
+			options.storage !== undefined &&
+			options.storage !== "persistent" &&
+			options.storage !== "memory"
 		) {
-			throw new TypeError("FsEphemeralBackend requires a non-empty path");
+			throw new TypeError('FsBackend storage must be "persistent" or "memory"');
+		}
+		if (options.filter !== undefined) {
+			if (!options.filter || typeof options.filter !== "object") {
+				throw new TypeError("FsBackend filter must be an object");
+			}
+			if (!Array.isArray(options.filter.includePaths)) {
+				throw new TypeError("FsBackend filter.includePaths must be an array");
+			}
+			if (options.filter.includePaths.length === 0) {
+				throw new TypeError(
+					"FsBackend filter.includePaths must contain at least one path",
+				);
+			}
+			for (const includePath of options.filter.includePaths) {
+				if (typeof includePath !== "string" || includePath.length === 0) {
+					throw new TypeError(
+						"FsBackend filter.includePaths must contain non-empty strings",
+					);
+				}
+				if (includePath.endsWith("/")) {
+					throw new TypeError(
+						"FsBackend filter.includePaths must contain file paths, not directory paths",
+					);
+				}
+			}
 		}
 		this.path = options.path;
+		this.storage = options.storage ?? "persistent";
+		this.filter = options.filter
+			? { includePaths: [...options.filter.includePaths] }
+			: undefined;
 	}
 }
 
@@ -106,13 +128,16 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		return new Lix(addon.Lix.openSqlite(options.backend.path));
 	}
 	if (options.backend instanceof FsBackend) {
-		return new Lix(addon.Lix.openFs(options.backend.path));
-	}
-	if (options.backend instanceof FsEphemeralBackend) {
-		return new Lix(addon.Lix.openFsEphemeral(options.backend.path));
+		return new Lix(
+			addon.Lix.openFs(
+				options.backend.path,
+				options.backend.storage,
+				options.backend.filter?.includePaths,
+			),
+		);
 	}
 	throw new TypeError(
-		"openLix() requires { backend: new SqliteBackend({ path }) }, { backend: new FsBackend({ path }) }, or { backend: new FsEphemeralBackend({ path }) }",
+		"openLix() requires backend to be SqliteBackend or FsBackend",
 	);
 }
 

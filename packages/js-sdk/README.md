@@ -11,19 +11,19 @@ npm install @lix-js/sdk
 ## Usage
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new SqliteBackend({ path: "app.lix" }),
+	backend: new FsBackend({ path: "./workspace" }),
 });
 
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/hello.txt", new TextEncoder().encode("world")],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/hello.txt", new TextEncoder().encode("world")],
 );
 
 const result = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
-  "/hello.txt",
+	"/hello.txt",
 ]);
 const bytes = result.rows[0]?.value("data").asBytes();
 
@@ -40,8 +40,8 @@ const draft = await lix.createBranch({ name: "Draft" });
 
 await lix.switchBranch({ branchId: draft.id });
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/status.txt", new TextEncoder().encode("draft")],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/status.txt", new TextEncoder().encode("draft")],
 );
 
 await lix.switchBranch({ branchId: main });
@@ -55,24 +55,27 @@ const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 const tx = await lix.beginTransaction();
 
 try {
-  await tx.execute(
-    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-    ["/a.txt", new TextEncoder().encode("1")],
-  );
-  await tx.execute(
-    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-    ["/b.txt", new TextEncoder().encode("2")],
-  );
-  await tx.commit();
+	await tx.execute(
+		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		["/a.txt", new TextEncoder().encode("1")],
+	);
+	await tx.execute(
+		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		["/b.txt", new TextEncoder().encode("2")],
+	);
+	await tx.commit();
 } catch (error) {
-  await tx.rollback();
-  throw error;
+	await tx.rollback();
+	throw error;
 }
 ```
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new SqliteBackend({ path })` for a raw SQLite `.lix` file, `new FsBackend({ path })` for a filesystem workspace directory backed by `<path>/.lix/.internal/db.sqlite`, or `new FsEphemeralBackend({ path })` for filesystem sync backed by an in-memory repository.
+- `openLix()` opens a fresh in-memory Lix. Pass `new FsBackend({ path })` for a filesystem workspace directory backed by `<path>/.lix/.internal/db.sqlite`.
+- Use `new FsBackend({ path, storage: "memory" })` when you want to sync files from a directory but keep Lix repository storage in memory and avoid writing `.lix` metadata to that directory.
+- Add `filter: { includePaths: ["notes/today.md"] }` to sync only selected files from a filesystem backend. `includePaths` entries are exact workspace-relative file paths, not directories or globs. They may be written with or without a leading slash, and only affect filesystem sync.
+- Use `new SqliteBackend({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 - The SDK is Node/native only right now; it is not browser-compatible.
 - The package is ESM-only.
 - The native addon is built from Rust and loaded by the TypeScript wrapper.

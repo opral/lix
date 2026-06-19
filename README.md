@@ -42,15 +42,15 @@ npm install @lix-js/sdk
 ```
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new SqliteBackend({ path: "app.lix" }),
+	backend: new FsBackend({ path: "./workspace" }),
 });
 
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/notes/status.txt", new TextEncoder().encode("draft")],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/notes/status.txt", new TextEncoder().encode("draft")],
 );
 
 const main = await lix.activeBranchId();
@@ -60,14 +60,14 @@ const draft = await lix.createBranch({ name: "Explore" });
 await lix.switchBranch({ branchId: draft.id });
 
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/notes/status.txt", new TextEncoder().encode("ready for review")],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/notes/status.txt", new TextEncoder().encode("ready for review")],
 );
 
 await lix.switchBranch({ branchId: main });
 
 const changes = await lix.execute(
-  "SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key",
+	"SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key",
 );
 ```
 
@@ -90,10 +90,10 @@ Lix is built for those files. Plugins translate file updates into semantic chang
 Import Lix and open it inside your worker, service, CLI, browser, desktop app, or server-side runtime. No daemon, no protocol.
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new SqliteBackend({ path: "app.lix" }),
+	backend: new FsBackend({ path: "./workspace" }),
 });
 ```
 
@@ -105,18 +105,18 @@ Write files, blobs, and history in one transaction.
 const tx = await lix.beginTransaction();
 
 try {
-  await tx.execute(
-    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-    ["/spec.docx", body],
-  );
-  await tx.execute(
-    "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-    ["/spec.png", image],
-  );
-  await tx.commit();
+	await tx.execute(
+		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		["/spec.docx", body],
+	);
+	await tx.execute(
+		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		["/spec.png", image],
+	);
+	await tx.commit();
 } catch (error) {
-  await tx.rollback();
-  throw error;
+	await tx.rollback();
+	throw error;
 }
 ```
 
@@ -133,20 +133,20 @@ const qa = await lix.createBranch({ name: "QA draft" });
 
 await lix.switchBranch({ branchId: copy.id });
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/landing.md", copyDraft],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/landing.md", copyDraft],
 );
 
 await lix.switchBranch({ branchId: pricing.id });
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/plans.json", priceModel],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/plans.json", priceModel],
 );
 
 await lix.switchBranch({ branchId: qa.id });
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-  ["/checks/report.json", testRun],
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	["/checks/report.json", testRun],
 );
 
 await lix.switchBranch({ branchId: main });
@@ -222,16 +222,20 @@ Use Lix standalone or plug it into the infrastructure your product already runs.
 <p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://api.iconify.design/logos:aws-s3.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
 
 ```ts
+import { FsBackend, openLix } from "@lix-js/sdk";
+
 const lix = await openLix({
-  backend: new SqliteBackend({ path: "app.lix" }),
+	backend: new FsBackend({ path: "./workspace" }),
 });
 ```
+
+Use `SqliteBackend` when a single `.lix` SQLite file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 
 ## How Lix works
 
 Lix runs in-process inside your runtime.
 
-It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. Use it standalone or plug it into whatever backend you need: in-memory, SQLite, Postgres, S3, Cloudflare, or your own adapter.
+It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. Use it standalone with `FsBackend` for filesystem workspaces, use SQLite for single-file application formats, or plug it into whatever backend you need: in-memory, Postgres, S3, Cloudflare, or your own adapter.
 
 SQL is the query interface on top. Products, scripts, and agents can ask what changed without rereading whole files.
 
