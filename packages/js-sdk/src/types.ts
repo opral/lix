@@ -4,17 +4,16 @@ export type SqliteBackendOptions = {
 
 export type FsBackendOptions = {
 	path: string;
-};
-
-export type FsEphemeralBackendOptions = {
-	path: string;
+	storage?: "persistent" | "memory";
+	filter?: {
+		includePaths: readonly string[];
+	};
 };
 
 export type OpenLixOptions = {
 	backend?:
 		| import("./open-lix.js").SqliteBackend
-		| import("./open-lix.js").FsBackend
-		| import("./open-lix.js").FsEphemeralBackend;
+		| import("./open-lix.js").FsBackend;
 };
 
 export type LixValue =

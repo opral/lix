@@ -22,17 +22,9 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option    | Type                        | Description                                                          |
-| --------- | --------------------------- | -------------------------------------------------------------------- |
-| `backend` | `SqliteBackend \| FsBackend` | Optional storage backend. Omit it for the default in-memory backend. |
-
-```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
-
-const lix = await openLix({
-  backend: new SqliteBackend({ path: "app.lix" }),
-});
-```
+| Option    | Type                         | Description                                                          |
+| --------- | ---------------------------- | -------------------------------------------------------------------- |
+| `backend` | `FsBackend \| SqliteBackend` | Optional storage backend. Omit it for the default in-memory backend. |
 
 Use `FsBackend` for a filesystem workspace directory backed by
 `<workspace>/.lix/.internal/db.sqlite`:
@@ -41,7 +33,44 @@ Use `FsBackend` for a filesystem workspace directory backed by
 import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new FsBackend({ path: "workspace" }),
+	backend: new FsBackend({ path: "./workspace" }),
+});
+```
+
+Pass `storage: "memory"` to sync files from a directory without writing `.lix`
+repository metadata into that directory:
+
+```ts
+const lix = await openLix({
+	backend: new FsBackend({ path: "./workspace", storage: "memory" }),
+});
+```
+
+Add `filter.includePaths` to limit filesystem sync to selected files.
+`includePaths` entries are exact workspace-relative file paths, not directories
+or globs. They may be written with or without a leading slash, for example
+`"notes/today.md"` or `"/notes/today.md"`. The filter scopes disk import, file
+watching, and materialization; it does not filter unrelated Lix SQL state.
+
+```ts
+const lix = await openLix({
+	backend: new FsBackend({
+		path: "./workspace",
+		storage: "memory",
+		filter: { includePaths: ["notes/today.md"] },
+	}),
+});
+```
+
+Use `SqliteBackend` when a single `.lix` SQLite file is the application document
+itself, for example when defining a new file format and using Lix as the
+application file format:
+
+```ts
+import { openLix, SqliteBackend } from "@lix-js/sdk";
+
+const lix = await openLix({
+	backend: new SqliteBackend({ path: "app.lix" }),
 });
 ```
 
@@ -68,10 +97,10 @@ Result:
 
 ```ts
 type ExecuteResult = {
-  columns: string[];
-  rows: Row[];
-  rowsAffected: number;
-  notices: LixNotice[];
+	columns: string[];
+	rows: Row[];
+	rowsAffected: number;
+	notices: LixNotice[];
 };
 ```
 
@@ -86,8 +115,8 @@ Example:
 
 ```ts
 const result = await lix.execute(
-  "SELECT path, data FROM lix_file WHERE path = $1",
-  ["/hello.txt"],
+	"SELECT path, data FROM lix_file WHERE path = $1",
+	["/hello.txt"],
 );
 
 const path = result.rows[0]?.value("path").asText();
@@ -105,14 +134,14 @@ Starts a transaction. While it is open, execute statements on the transaction ha
 ```ts
 const tx = await lix.beginTransaction();
 try {
-  await tx.execute("INSERT INTO lix_file (path, data) VALUES (?, ?)", [
-    "/hello.txt",
-    new TextEncoder().encode("hello"),
-  ]);
-  await tx.commit();
+	await tx.execute("INSERT INTO lix_file (path, data) VALUES (?, ?)", [
+		"/hello.txt",
+		new TextEncoder().encode("hello"),
+	]);
+	await tx.commit();
 } catch (error) {
-  await tx.rollback();
-  throw error;
+	await tx.rollback();
+	throw error;
 }
 ```
 
@@ -128,7 +157,7 @@ Returns the id of the version the Lix handle is currently reading and writing.
 
 ```ts
 const version = await lix.createVersion({
-  name: "Explore",
+	name: "Explore",
 });
 ```
 
@@ -146,10 +175,10 @@ Result:
 
 ```ts
 type CreateVersionResult = {
-  id: string;
-  name: string;
-  hidden: boolean;
-  commitId: string;
+	id: string;
+	name: string;
+	hidden: boolean;
+	commitId: string;
 };
 ```
 
@@ -165,7 +194,7 @@ Switches the Lix handle to another version. Plain SQL tables read and write the 
 
 ```ts
 const preview = await lix.mergeVersionPreview({
-  sourceVersionId: draft.id,
+	sourceVersionId: draft.id,
 });
 ```
 
@@ -175,14 +204,14 @@ Result:
 
 ```ts
 type MergeVersionPreviewResult = {
-  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
-  targetVersionId: string;
-  sourceVersionId: string;
-  baseCommitId: string;
-  targetHeadCommitId: string;
-  sourceHeadCommitId: string;
-  changeStats: MergeChangeStats;
-  conflicts: MergeConflict[];
+	outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
+	targetVersionId: string;
+	sourceVersionId: string;
+	baseCommitId: string;
+	targetHeadCommitId: string;
+	sourceHeadCommitId: string;
+	changeStats: MergeChangeStats;
+	conflicts: MergeConflict[];
 };
 ```
 
@@ -190,7 +219,7 @@ type MergeVersionPreviewResult = {
 
 ```ts
 const merge = await lix.mergeVersion({
-  sourceVersionId: draft.id,
+	sourceVersionId: draft.id,
 });
 ```
 
@@ -200,15 +229,15 @@ Result:
 
 ```ts
 type MergeVersionResult = {
-  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
-  targetVersionId: string;
-  sourceVersionId: string;
-  baseCommitId: string;
-  targetHeadBeforeCommitId: string;
-  sourceHeadBeforeCommitId: string;
-  targetHeadAfterCommitId: string;
-  createdMergeCommitId: string | null;
-  changeStats: MergeChangeStats;
+	outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
+	targetVersionId: string;
+	sourceVersionId: string;
+	baseCommitId: string;
+	targetHeadBeforeCommitId: string;
+	sourceHeadBeforeCommitId: string;
+	targetHeadAfterCommitId: string;
+	createdMergeCommitId: string | null;
+	changeStats: MergeChangeStats;
 };
 ```
 
@@ -216,10 +245,10 @@ type MergeVersionResult = {
 
 ```ts
 type MergeChangeStats = {
-  total: number;
-  added: number;
-  modified: number;
-  removed: number;
+	total: number;
+	added: number;
+	modified: number;
+	removed: number;
 };
 ```
 
@@ -227,12 +256,12 @@ type MergeChangeStats = {
 
 ```ts
 type MergeConflict = {
-  kind: "sameEntityChanged";
-  schemaKey: string;
-  entityPk: string[];
-  fileId: string | null;
-  target: MergeConflictSide;
-  source: MergeConflictSide;
+	kind: "sameEntityChanged";
+	schemaKey: string;
+	entityPk: string[];
+	fileId: string | null;
+	target: MergeConflictSide;
+	source: MergeConflictSide;
 };
 ```
 

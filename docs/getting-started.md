@@ -12,7 +12,7 @@ This walks through opening Lix, registering a schema, writing a row, isolating a
 npm install @lix-js/sdk
 ```
 
-`openLix()` with no arguments opens an in-memory Lix, enough for tests and demos. For persistent storage see [Persistence](./persistence.md).
+`openLix()` with no arguments opens an in-memory Lix, enough for tests and demos. For persistent local files, use `FsBackend`; see [Persistence](./persistence.md).
 
 ## Open Lix
 
@@ -22,28 +22,36 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix();
 ```
 
+```ts
+import { FsBackend, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+	backend: new FsBackend({ path: "./workspace" }),
+});
+```
+
 ## Register a schema
 
 Lix stores application state as typed entities. Register a schema once, then read and write through the generated SQL table named after `x-lix-key`.
 
 ```ts
 await lix.execute(
-  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-  [
-    JSON.stringify({
-      $schema: "https://json-schema.org/draft/2020-12/schema",
-      "x-lix-key": "task",
-      "x-lix-primary-key": ["/id"],
-      type: "object",
-      required: ["id", "title", "done"],
-      properties: {
-        id: { type: "string" },
-        title: { type: "string" },
-        done: { type: "boolean" },
-      },
-      additionalProperties: false,
-    }),
-  ],
+	"INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+	[
+		JSON.stringify({
+			$schema: "https://json-schema.org/draft/2020-12/schema",
+			"x-lix-key": "task",
+			"x-lix-primary-key": ["/id"],
+			type: "object",
+			required: ["id", "title", "done"],
+			properties: {
+				id: { type: "string" },
+				title: { type: "string" },
+				done: { type: "boolean" },
+			},
+			additionalProperties: false,
+		}),
+	],
 );
 ```
 
@@ -53,14 +61,14 @@ await lix.execute(
 
 ```ts
 await lix.execute("INSERT INTO task (id, title, done) VALUES ($1, $2, $3)", [
-  "task-1",
-  "Review agent changes",
-  false,
+	"task-1",
+	"Review agent changes",
+	false,
 ]);
 
 const result = await lix.execute(
-  "SELECT id, title, done FROM task WHERE id = $1",
-  ["task-1"],
+	"SELECT id, title, done FROM task WHERE id = $1",
+	["task-1"],
 );
 
 const row = result.rows[0]!;
@@ -73,20 +81,20 @@ console.log(row.value("title").asText(), row.value("done").asBoolean());
 
 Each row is a `Row`. Use `row.value(name)` for a typed `Value`, or `row.get(name)` / `row.toObject()` for plain JavaScript values.
 
-| Accessor | Use for |
-| --- | --- |
-| `asText()` | text columns |
-| `asBoolean()` | boolean columns |
-| `asInteger()` | integer columns |
-| `asReal()` | decimal columns |
-| `asJson()` | JSON columns such as `snapshot_content` and `entity_pk` |
-| `asBytes()` | binary columns such as `lix_file.data` |
+| Accessor      | Use for                                                 |
+| ------------- | ------------------------------------------------------- |
+| `asText()`    | text columns                                            |
+| `asBoolean()` | boolean columns                                         |
+| `asInteger()` | integer columns                                         |
+| `asReal()`    | decimal columns                                         |
+| `asJson()`    | JSON columns such as `snapshot_content` and `entity_pk` |
+| `asBytes()`   | binary columns such as `lix_file.data`                  |
 
 Use `asBytes()` for byte content:
 
 ```ts
 const file = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
-  "/orders.xlsx",
+	"/orders.xlsx",
 ]);
 const bytes = file.rows[0]!.value("data").asBytes();
 ```
@@ -116,7 +124,7 @@ console.log(preview.outcome, preview.changeStats);
 // fastForward { total: 1, added: 0, modified: 1, removed: 0 }
 
 if (preview.conflicts.length === 0) {
-  await lix.mergeVersion({ sourceVersionId: draft.id });
+	await lix.mergeVersion({ sourceVersionId: draft.id });
 }
 ```
 

@@ -50,7 +50,7 @@ Lix gives those files version-control primitives directly:
 - **Any file format** can be represented through parser plugins or custom schemas.
 - **Semantic changes** are stored per entity instead of only as whole-file snapshots.
 - **SQL** is the query interface for application code, AI agents, and tools.
-- **Pluggable storage.** Run in-memory, persist to a `.lix` SQLite file, or implement the [backend interface](./backend.md) to put Lix on Postgres, S3, Cloudflare, IndexedDB, OPFS, or anything transactional and key-value-shaped.
+- **Pluggable storage.** Run in-memory, sync a filesystem workspace with `FsBackend`, use a `.lix` SQLite file as an application file format, or implement the [backend interface](./backend.md) to put Lix on Postgres, S3, Cloudflare, IndexedDB, OPFS, or anything transactional and key-value-shaped.
 - **ACID transactions** work across files and entities.
 
 No daemon, no protocol, no remote.
