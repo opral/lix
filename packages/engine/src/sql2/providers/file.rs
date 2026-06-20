@@ -1273,6 +1273,9 @@ pub(crate) async fn execute_fast_lix_file_path_write(
     let filesystem = FilesystemIndex::from_live_rows(live_rows.clone())?;
 
     if let Some(existing) = filesystem.file_entry(&parsed.path).cloned() {
+        if conflict != FastLixFilePathWriteConflict::None {
+            validate_fast_lix_file_path_conflict_pair(existing.scope.untracked, &parsed.path)?;
+        }
         return match conflict {
             FastLixFilePathWriteConflict::None => {
                 let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
@@ -1352,6 +1355,24 @@ pub(crate) async fn execute_fast_lix_file_path_write(
         }
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await
+}
+
+fn validate_fast_lix_file_path_conflict_pair(
+    existing_untracked: bool,
+    path: &str,
+) -> Result<(), LixError> {
+    let proposed_untracked = false;
+    if existing_untracked == proposed_untracked {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
+            lane_name(proposed_untracked),
+            lane_name(existing_untracked)
+        ),
+    ))
 }
 
 async fn stage_lix_file_fast_batch(
