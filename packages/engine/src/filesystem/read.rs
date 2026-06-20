@@ -147,6 +147,13 @@ impl FilesystemIndex {
                 FilesystemEntry::Directory => None,
             })
     }
+
+    pub(crate) fn file_entry(&self, path: &str) -> Option<&FilesystemFileEntry> {
+        match self.entries_by_path.get(path) {
+            Some(FilesystemEntry::File(file)) => Some(file),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn filesystem_schema_keys() -> Vec<String> {
@@ -180,7 +187,7 @@ pub(crate) struct RowScope {
 }
 
 impl RowScope {
-    fn context(&self, file_id: Option<String>) -> FilesystemRowContext {
+    pub(crate) fn context(&self, file_id: Option<String>) -> FilesystemRowContext {
         FilesystemRowContext {
             branch_id: self.branch_id.clone(),
             global: self.global,

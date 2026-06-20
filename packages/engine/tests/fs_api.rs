@@ -151,6 +151,41 @@ async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
 }
 
 #[tokio::test]
+async fn sql_plugin_archive_plain_insert_reuses_deterministic_file_id() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+    let archive = sentinel_plugin_archive();
+    let path = "/.lix/plugins/plugin_sentinel.lixplugin";
+
+    install_plugin(&session, "plugin_sentinel", &archive)
+        .await
+        .expect("plugin archive upsert should install plugin");
+
+    let error = session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[Value::Text(path.to_string()), Value::Blob(archive.clone())],
+        )
+        .await
+        .expect_err("plain plugin archive insert should reject duplicate archive id");
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
+    assert!(
+        error
+            .message
+            .contains("lix_plugin_archive::plugin_sentinel")
+    );
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
 async fn sql_plugin_archive_path_must_match_manifest_key() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())

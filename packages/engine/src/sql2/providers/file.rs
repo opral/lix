@@ -34,7 +34,7 @@ use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::filesystem::FilesystemIndex;
+use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
     LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -72,14 +72,16 @@ use crate::filesystem::{
     FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
     FilesystemBlobRefKey, FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
     blob_ref_row, blob_ref_tombstone_row, derive_directory_paths,
-    directory_path_resolvers_from_live_state, file_descriptor_row, file_descriptor_write_row,
-    filesystem_storage_scope_key, plan_file_delete, plan_file_descriptor_write,
-    plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
+    directory_path_resolvers_from_live_state, directory_path_resolvers_from_state_rows,
+    file_descriptor_row, file_descriptor_write_row, filesystem_storage_scope_key, plan_file_delete,
+    plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
+    plan_parsed_file_path_write_with_resolvers,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
+    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
+    WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
@@ -1238,6 +1240,171 @@ impl LixFileStagedBatch {
         self.state_rows.extend(plan.rows);
         self.count += plan.count;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastLixFilePathWriteConflict {
+    None,
+    DoNothing,
+    UpdateData,
+}
+
+pub(crate) async fn execute_fast_lix_file_path_write(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    path: String,
+    data: Vec<u8>,
+    conflict: FastLixFilePathWriteConflict,
+) -> Result<u64, LixError> {
+    let active_branch_id = ctx.active_branch_id().to_string();
+    let parsed = parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+
+    let live_rows = ctx
+        .scan_live_state(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: filesystem_schema_keys(),
+                branch_ids: vec![active_branch_id.clone()],
+                include_tombstones: false,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        })
+        .await?;
+    let filesystem = FilesystemIndex::from_live_rows(live_rows.clone())?;
+
+    if let Some(existing) = filesystem.file_entry(&parsed.path).cloned() {
+        if conflict != FastLixFilePathWriteConflict::None {
+            validate_fast_lix_file_path_conflict_pair(existing.scope.untracked, &parsed.path)?;
+        }
+        return match conflict {
+            FastLixFilePathWriteConflict::None => {
+                let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
+                let context = FilesystemRowContext {
+                    branch_id: active_branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                };
+                let plan = plan_parsed_file_path_write_with_resolvers(
+                    &mut path_resolvers,
+                    parsed.parsed_path,
+                    Some(
+                        parsed
+                            .plugin_key
+                            .as_deref()
+                            .map(plugin_storage_archive_file_id)
+                            .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
+                    ),
+                    Some(data),
+                    context,
+                    &mut || ctx.functions().call_uuid_v7().to_string(),
+                )?;
+                let mut staged = LixFileStagedBatch::default();
+                staged.extend_filesystem_plan(plan);
+                stage_lix_file_fast_batch(ctx, TransactionWriteMode::Insert, staged).await
+            }
+            FastLixFilePathWriteConflict::DoNothing => Ok(0),
+            FastLixFilePathWriteConflict::UpdateData => {
+                let mut staged = LixFileStagedBatch::default();
+                let mut context = existing.scope.context(Some(existing.id.clone()));
+                if context.global {
+                    context.branch_id = GLOBAL_BRANCH_ID.to_string();
+                }
+                stage_lix_file_data_update_write(
+                    &mut staged,
+                    existing.id.clone(),
+                    Some(parsed.path),
+                    Some(existing.name.clone()),
+                    data,
+                    context,
+                    existing.blob_hash.is_some(),
+                    None,
+                )
+                .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                staged.count = 1;
+                stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
+            }
+        };
+    }
+
+    let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
+    let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, false, None);
+    path_resolvers.entry(resolver_key).or_default();
+    let context = FilesystemRowContext {
+        branch_id: active_branch_id,
+        global: false,
+        untracked: false,
+        file_id: None,
+        metadata: None,
+    };
+    let file_id = parsed
+        .plugin_key
+        .as_deref()
+        .map(plugin_storage_archive_file_id)
+        .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
+    let mut plan = plan_parsed_file_path_write_with_resolvers(
+        &mut path_resolvers,
+        parsed.parsed_path,
+        Some(file_id.clone()),
+        Some(data),
+        context,
+        &mut || ctx.functions().call_uuid_v7().to_string(),
+    )?;
+    attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
+    let mut staged = LixFileStagedBatch::default();
+    staged.extend_filesystem_plan(plan);
+    let mode = match conflict {
+        FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
+        FastLixFilePathWriteConflict::DoNothing | FastLixFilePathWriteConflict::UpdateData => {
+            TransactionWriteMode::Replace
+        }
+    };
+    stage_lix_file_fast_batch(ctx, mode, staged).await
+}
+
+fn validate_fast_lix_file_path_conflict_pair(
+    existing_untracked: bool,
+    path: &str,
+) -> Result<(), LixError> {
+    let proposed_untracked = false;
+    if existing_untracked == proposed_untracked {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
+            lane_name(proposed_untracked),
+            lane_name(existing_untracked)
+        ),
+    ))
+}
+
+async fn stage_lix_file_fast_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    mode: TransactionWriteMode,
+    staged: LixFileStagedBatch,
+) -> Result<u64, LixError> {
+    let count = staged.count;
+    if staged.state_rows.is_empty() && staged.file_data_writes.is_empty() {
+        return Ok(count);
+    }
+    let write = if staged.file_data_writes.is_empty() {
+        TransactionWrite::Rows {
+            mode,
+            rows: staged.state_rows,
+        }
+    } else {
+        TransactionWrite::RowsWithFileData {
+            mode,
+            rows: staged.state_rows,
+            file_data: staged.file_data_writes,
+            count,
+        }
+    };
+    let outcome = ctx.stage_write(write).await?;
+    Ok(outcome.count)
 }
 
 #[cfg(test)]

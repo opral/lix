@@ -8,7 +8,7 @@ use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
-    BoundWriteOp, BoundWriteTarget, EntityWriteSurface,
+    BoundWriteOp, BoundWriteTarget, EntityWriteSurface, FileWriteSurface,
 };
 use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
 use crate::sql2::catalog::{
@@ -23,22 +23,40 @@ use crate::transaction::types::{
 };
 use crate::{LixError, Value, parse_row_metadata_value};
 
+#[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
-    matches!(plan.bound.target, BoundWriteTarget::Entity(_))
-        && bound_public_write_shape_supported(plan)
+    match &plan.bound.target {
+        BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
+        BoundWriteTarget::File(surface) => fast_file_path_write_shape(plan, surface).is_some(),
+        _ => false,
+    }
 }
 
-pub(crate) async fn execute_bound_public_write(
+pub(crate) enum BoundPublicWriteExecution {
+    Executed(u64),
+    Unsupported,
+}
+
+pub(crate) async fn try_execute_bound_public_write(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     params: &[Value],
-) -> Result<u64, LixError> {
+) -> Result<BoundPublicWriteExecution, LixError> {
     match &plan.bound.target {
-        BoundWriteTarget::Entity(surface) => execute_entity_write(ctx, plan, surface, params).await,
-        _ => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "bound public write executor does not support this target yet",
-        )),
+        BoundWriteTarget::Entity(surface) if bound_public_write_shape_supported(plan) => {
+            execute_entity_write(ctx, plan, surface, params)
+                .await
+                .map(BoundPublicWriteExecution::Executed)
+        }
+        BoundWriteTarget::File(surface) => {
+            let Some(shape) = fast_file_path_write_shape(plan, surface) else {
+                return Ok(BoundPublicWriteExecution::Unsupported);
+            };
+            execute_file_path_write(ctx, plan, params, shape)
+                .await
+                .map(BoundPublicWriteExecution::Executed)
+        }
+        _ => Ok(BoundPublicWriteExecution::Unsupported),
     }
 }
 
@@ -109,6 +127,159 @@ async fn load_active_branch_commit_id(
                 "active branch",
             )
         })
+}
+
+#[derive(Clone, Copy)]
+struct FastFilePathWriteShape {
+    path_index: usize,
+    data_index: usize,
+    conflict: crate::sql2::providers::FastLixFilePathWriteConflict,
+}
+
+async fn execute_file_path_write(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+    shape: FastFilePathWriteShape,
+) -> Result<u64, LixError> {
+    let BoundWriteInput::Values(values) = &plan.bound.input else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound lix_file fast write supports VALUES only",
+        ));
+    };
+    let mut affected = 0u64;
+    for row in &values.rows {
+        let path = eval_fast_file_text(&row[shape.path_index], params, "path")?;
+        let data = eval_fast_file_blob(&row[shape.data_index], params, "data")?;
+        affected += crate::sql2::providers::execute_fast_lix_file_path_write(
+            ctx,
+            path,
+            data,
+            shape.conflict,
+        )
+        .await?;
+    }
+    Ok(affected)
+}
+
+fn fast_file_path_write_shape(
+    plan: &LogicalWritePlan,
+    surface: &FileWriteSurface,
+) -> Option<FastFilePathWriteShape> {
+    if !matches!(surface, FileWriteSurface::Base) || plan.bound.op != BoundWriteOp::Insert {
+        return None;
+    }
+    let BoundWriteInput::Values(values) = &plan.bound.input else {
+        return None;
+    };
+    if values.rows.len() != 1 || values.columns.len() != 2 {
+        return None;
+    }
+    let path_index = values.column_index("path")?;
+    let data_index = values.column_index("data")?;
+    if values.rows.iter().any(|row| {
+        row.len() != values.columns.len()
+            || !fast_file_value_expr_supported(&row[path_index])
+            || !fast_file_value_expr_supported(&row[data_index])
+    }) {
+        return None;
+    }
+    let conflict = match &plan.bound.conflict {
+        None => crate::sql2::providers::FastLixFilePathWriteConflict::None,
+        Some(conflict) => fast_file_path_conflict_shape(conflict)?,
+    };
+    Some(FastFilePathWriteShape {
+        path_index,
+        data_index,
+        conflict,
+    })
+}
+
+fn fast_file_path_conflict_shape(
+    conflict: &BoundInsertConflict,
+) -> Option<crate::sql2::providers::FastLixFilePathWriteConflict> {
+    if conflict.target_columns.len() != 1 || conflict.target_columns[0].name != "path" {
+        return None;
+    }
+    match &conflict.action {
+        BoundConflictAction::DoNothing => {
+            Some(crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing)
+        }
+        BoundConflictAction::DoUpdate { assignments } => {
+            if assignments.len() != 1 {
+                return None;
+            }
+            let assignment = &assignments[0];
+            if assignment.column.name != "data" {
+                return None;
+            }
+            let BoundExpr::ExcludedColumn(column) = &assignment.value else {
+                return None;
+            };
+            if column.name != "data" {
+                return None;
+            }
+            Some(crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData)
+        }
+    }
+}
+
+fn fast_file_value_expr_supported(expr: &BoundExpr) -> bool {
+    matches!(
+        expr,
+        BoundExpr::Param(_) | BoundExpr::Literal(BoundLiteral::Text(_) | BoundLiteral::Blob(_))
+    )
+}
+
+fn eval_fast_file_text(
+    expr: &BoundExpr,
+    params: &[Value],
+    column: &str,
+) -> Result<String, LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Text(value)) => Ok(value.clone()),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Text(value)) => Ok(value.clone()),
+            Some(_) => Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("lix_file fast write column '{column}' expects text"),
+            )),
+            None => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("missing SQL parameter ${}", param.index),
+            )),
+        },
+        _ => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!("lix_file fast write column '{column}' supports params and literals only"),
+        )),
+    }
+}
+
+fn eval_fast_file_blob(
+    expr: &BoundExpr,
+    params: &[Value],
+    column: &str,
+) -> Result<Vec<u8>, LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Blob(value)) => Ok(value.clone()),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Blob(value)) => Ok(value.clone()),
+            Some(_) => Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("lix_file fast write column '{column}' expects blob data"),
+            )),
+            None => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("missing SQL parameter ${}", param.index),
+            )),
+        },
+        _ => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!("lix_file fast write column '{column}' supports params and blob literals only"),
+        )),
+    }
 }
 
 async fn entity_insert(
