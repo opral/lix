@@ -79,7 +79,12 @@ mod tests {
         if matches!(case.expected_execution, ExpectedExecution::Err { .. }) {
             assert_independent_no_mutation(case, &reference).await;
         } else if case.expectation == DifferentialExpectation::FastRequiredParity {
-            assert_independent_no_mutation(case, &reference).await;
+            if matches!(
+                reference.execution,
+                ExecutionSignature::Ok { rows_affected: 0 }
+            ) {
+                assert_independent_no_mutation(case, &reference).await;
+            }
             assert_eq!(
                 candidate.executor_path,
                 Some(WriteExecutorPath::Fast),
@@ -333,6 +338,8 @@ mod tests {
                         serde_json::from_str(value).expect("differential JSON param should parse");
                     Value::Json(value)
                 }
+                DifferentialParam::Text(value) => Value::Text((*value).to_string()),
+                DifferentialParam::Blob(value) => Value::Blob((*value).to_vec()),
             })
             .collect()
     }
@@ -518,6 +525,29 @@ mod tests {
                     ),
                     params,
                     branch_column_indexes: &[2],
+                }
+            }
+            DifferentialProbe::LixFileActive { paths } => {
+                let mut params = Vec::with_capacity(paths.len());
+                let placeholders = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        params.push(Value::Text((*path).to_string()));
+                        format!("${}", index + 1)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ProbeQuery {
+                    name: format!("lix_file:{paths:?}"),
+                    sql: format!(
+                        "SELECT path, data \
+                         FROM lix_file \
+                         WHERE path IN ({placeholders}) \
+                         ORDER BY path"
+                    ),
+                    params,
+                    branch_column_indexes: &[],
                 }
             }
         }

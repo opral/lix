@@ -38,6 +38,8 @@ pub(crate) enum ExpectedExecution {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DifferentialParam {
     Json(&'static str),
+    Text(&'static str),
+    Blob(&'static [u8]),
 }
 
 #[cfg(test)]
@@ -55,6 +57,9 @@ pub(crate) enum DifferentialProbe {
     RegisteredSchemaActive,
     RegisteredSchemaByBranch {
         branch_ids: &'static [&'static str],
+    },
+    LixFileActive {
+        paths: &'static [&'static str],
     },
 }
 
@@ -121,6 +126,29 @@ const PARAM_ENTITY_PK_AND_METADATA: &[DifferentialParam] = &[
     DifferentialParam::Json("[\"diff-key\"]"),
     DifferentialParam::Json("{\"seen\":\"param\"}"),
 ];
+
+#[cfg(test)]
+const PARAM_FILE_PATH_AND_DATA: &[DifferentialParam] = &[
+    DifferentialParam::Text("/diff/param.md"),
+    DifferentialParam::Blob(b"param data"),
+];
+
+#[cfg(test)]
+const SETUP_SEED_LIX_FILE_ROW: &[&str] = &[
+    "INSERT INTO lix_file (id, path, data) VALUES ('diff-existing-file', '/diff/existing.md', X'6f6c64')",
+];
+
+#[cfg(test)]
+const LIX_FILE_PROBE: &[DifferentialProbe] = &[DifferentialProbe::LixFileActive {
+    paths: &[
+        "/diff/insert.md",
+        "/diff/param.md",
+        "/diff/upsert-new.md",
+        "/diff/existing.md",
+        "/diff/multi-a.md",
+        "/diff/multi-b.md",
+    ],
+}];
 
 #[cfg(test)]
 pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
@@ -314,6 +342,66 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
     }
 
     cases.extend([
+        DifferentialSqlCase {
+            seed: "generated/lix-file/insert-path-data-literal".into(),
+            setup_sql: &[],
+            transaction_setup_sql: &[],
+            sql: "INSERT INTO lix_file (path, data) VALUES ('/diff/insert.md', X'696e73657274')".into(),
+            params: EMPTY_PARAMS,
+            probes: LIX_FILE_PROBE,
+            expectation: DifferentialExpectation::FastRequiredParity,
+            expected_execution: ExpectedExecution::Ok,
+        },
+        DifferentialSqlCase {
+            seed: "generated/lix-file/insert-path-data-params".into(),
+            setup_sql: &[],
+            transaction_setup_sql: &[],
+            sql: "INSERT INTO lix_file (path, data) VALUES ($1, $2)".into(),
+            params: PARAM_FILE_PATH_AND_DATA,
+            probes: LIX_FILE_PROBE,
+            expectation: DifferentialExpectation::FastRequiredParity,
+            expected_execution: ExpectedExecution::Ok,
+        },
+        DifferentialSqlCase {
+            seed: "generated/lix-file/upsert-path-data-insert".into(),
+            setup_sql: &[],
+            transaction_setup_sql: &[],
+            sql: "INSERT INTO lix_file (path, data) VALUES ('/diff/upsert-new.md', X'6e6577') ON CONFLICT (path) DO UPDATE SET data = excluded.data".into(),
+            params: EMPTY_PARAMS,
+            probes: LIX_FILE_PROBE,
+            expectation: DifferentialExpectation::FastRequiredParity,
+            expected_execution: ExpectedExecution::Ok,
+        },
+        DifferentialSqlCase {
+            seed: "generated/lix-file/upsert-path-data-update".into(),
+            setup_sql: SETUP_SEED_LIX_FILE_ROW,
+            transaction_setup_sql: &[],
+            sql: "INSERT INTO lix_file (path, data) VALUES ('/diff/existing.md', X'6e6577') ON CONFLICT (path) DO UPDATE SET data = excluded.data".into(),
+            params: EMPTY_PARAMS,
+            probes: LIX_FILE_PROBE,
+            expectation: DifferentialExpectation::FastRequiredParity,
+            expected_execution: ExpectedExecution::Ok,
+        },
+        DifferentialSqlCase {
+            seed: "generated/lix-file/upsert-path-data-do-nothing".into(),
+            setup_sql: SETUP_SEED_LIX_FILE_ROW,
+            transaction_setup_sql: &[],
+            sql: "INSERT INTO lix_file (path, data) VALUES ('/diff/existing.md', X'736b6970') ON CONFLICT (path) DO NOTHING".into(),
+            params: EMPTY_PARAMS,
+            probes: LIX_FILE_PROBE,
+            expectation: DifferentialExpectation::FastRequiredParity,
+            expected_execution: ExpectedExecution::Ok,
+        },
+        DifferentialSqlCase {
+            seed: "generated/lix-file/multi-row-path-data-falls-back".into(),
+            setup_sql: &[],
+            transaction_setup_sql: &[],
+            sql: "INSERT INTO lix_file (path, data) VALUES ('/diff/multi-a.md', X'61'), ('/diff/multi-b.md', X'62')".into(),
+            params: EMPTY_PARAMS,
+            probes: LIX_FILE_PROBE,
+            expectation: DifferentialExpectation::SemanticParityMayFallback,
+            expected_execution: ExpectedExecution::Ok,
+        },
         DifferentialSqlCase {
             seed: "generated/lix-state-by-branch/update-explicit-miss".into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,

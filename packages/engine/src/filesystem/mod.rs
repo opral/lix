@@ -5,7 +5,6 @@ mod read;
 mod visibility;
 
 pub(crate) use self::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
-#[cfg(test)]
 pub(crate) use self::planner::directory_path_resolvers_from_state_rows;
 pub(crate) use self::planner::{
     BlobRefRowInput, DirectoryDescriptorWriteIntent, DirectoryPathResolver, FileDeleteInput,

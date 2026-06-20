@@ -115,14 +115,16 @@ async fn execute_write_logical_plan_with_mode_inner(
     let write_plan = resolve_parameterized_branch_scope(write_plan.plan, params)?;
     validate_write_parameter_count(&write_plan, params.len())?;
 
-    if mode != WriteExecutorModeInner::ForceDataFusion
-        && super::bound_public_write::supports_bound_public_write(&write_plan)
-    {
-        let rows_affected =
-            super::bound_public_write::execute_bound_public_write(ctx, &write_plan, params)
-                .await
-                .map_err(normalize_bound_public_write_error)?;
-        return Ok((rows_affected, WriteExecutorPath::Fast));
+    if mode != WriteExecutorModeInner::ForceDataFusion {
+        match super::bound_public_write::try_execute_bound_public_write(ctx, &write_plan, params)
+            .await
+            .map_err(normalize_bound_public_write_error)?
+        {
+            super::bound_public_write::BoundPublicWriteExecution::Executed(rows_affected) => {
+                return Ok((rows_affected, WriteExecutorPath::Fast));
+            }
+            super::bound_public_write::BoundPublicWriteExecution::Unsupported => {}
+        }
     }
 
     if mode != WriteExecutorModeInner::ForceDataFusion {

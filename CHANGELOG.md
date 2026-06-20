@@ -11,9 +11,6 @@
 - Added filesystem sync: a lix can mirror into a plain directory and back.
 
   Edits made in the directory with any tool flow into Lix with full history. Switching branches updates the directory contents.
-- Added the `lix.fs` file API for reading and writing files.
-
-  `lix.fs.writeFile` and `lix.fs.readFile` replace raw SQL on `lix_file` for the common path.
 - Added `lix.observe()` for subscribing to SQL query results.
 
   The Rust and JavaScript SDKs can now create observe streams that emit an initial result and re-run after Lix mutations, making it possible to build reactive views without manual polling.
@@ -25,16 +22,10 @@
 
 ### Patch
 
-- Added a typed file API for storing, reading, querying, and versioning file bytes in Lix:
-
-  ```js
-  await lix.fs.writeFile("/orders.xlsx", bytes);
-  const bytes = await lix.fs.readFile("/orders.xlsx");
-  await lix.fs.mkdir("/exports/");
-  await lix.fs.rm("/orders.xlsx");
-  ```
+- Added SQL file surfaces for storing, reading, querying, and versioning file bytes in Lix:
 
   ```sql
+  INSERT INTO lix_file (path, data) VALUES ('/orders.xlsx', $1);
   SELECT data FROM lix_file WHERE path = '/orders.xlsx';
   SELECT data FROM lix_file_history WHERE path = '/orders.xlsx';
   ```
