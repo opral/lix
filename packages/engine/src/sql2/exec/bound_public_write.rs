@@ -228,9 +228,7 @@ fn fast_file_path_conflict_shape(
 fn fast_file_value_expr_supported(expr: &BoundExpr) -> bool {
     matches!(
         expr,
-        BoundExpr::Param(_)
-            | BoundExpr::Literal(BoundLiteral::Text(_))
-            | BoundExpr::Literal(BoundLiteral::Blob(_))
+        BoundExpr::Param(_) | BoundExpr::Literal(BoundLiteral::Text(_) | BoundLiteral::Blob(_))
     )
 }
 
