@@ -1289,7 +1289,13 @@ pub(crate) async fn execute_fast_lix_file_path_write(
                 let plan = plan_parsed_file_path_write_with_resolvers(
                     &mut path_resolvers,
                     parsed.parsed_path,
-                    Some(ctx.functions().call_uuid_v7().to_string()),
+                    Some(
+                        parsed
+                            .plugin_key
+                            .as_deref()
+                            .map(plugin_storage_archive_file_id)
+                            .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
+                    ),
                     Some(data),
                     context,
                     &mut || ctx.functions().call_uuid_v7().to_string(),
