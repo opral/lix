@@ -76,6 +76,7 @@ pub use backend::{
     ScanOptions, ScanResult, ScanVisitor, SnapshotRef, SpaceId, StoredValue, Value as BackendValue,
     WriteOptions, WriteStats, get_many as backend_get_many,
 };
+pub use binary_cas::{BinaryCasStorageStats, collect_binary_cas_storage_stats};
 pub use common::LixError;
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};

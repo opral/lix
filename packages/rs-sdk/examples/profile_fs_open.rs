@@ -11,6 +11,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use lix_engine::{
+    Backend as _, BackendRead as _, BinaryCasStorageStats, ReadOptions,
+    collect_binary_cas_storage_stats,
+};
 use lix_sdk::FsBackend;
 #[cfg(feature = "rocksdb")]
 use lix_sdk::{FsBackendFilter, RocksDbBlobOptions};
@@ -52,6 +56,14 @@ struct ProfileStats {
     rocksdb_manifest_bytes: u64,
     rocksdb_options_bytes: u64,
     rocksdb_other_bytes: u64,
+    binary_cas_manifest_rows: u64,
+    binary_cas_empty_blob_rows: u64,
+    binary_cas_single_chunk_blob_rows: u64,
+    binary_cas_chunked_blob_rows: u64,
+    binary_cas_manifest_chunk_rows: u64,
+    binary_cas_chunk_rows: u64,
+    binary_cas_total_chunk_refs: u64,
+    binary_cas_logical_blob_bytes: u64,
 }
 
 impl ProfileBackend {
@@ -215,6 +227,27 @@ fn collect_profile_stats(workspace: &Path) -> ProfileStats {
     stats
 }
 
+fn collect_backend_profile_stats(backend: &FsBackend, stats: &mut ProfileStats) {
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .expect("profile backend read should open");
+    let binary_cas =
+        collect_binary_cas_storage_stats(&read).expect("profile binary CAS stats should collect");
+    read.close().expect("profile backend read should close");
+    apply_binary_cas_stats(stats, binary_cas);
+}
+
+fn apply_binary_cas_stats(stats: &mut ProfileStats, binary_cas: BinaryCasStorageStats) {
+    stats.binary_cas_manifest_rows = binary_cas.manifest_rows;
+    stats.binary_cas_empty_blob_rows = binary_cas.empty_blob_rows;
+    stats.binary_cas_single_chunk_blob_rows = binary_cas.single_chunk_blob_rows;
+    stats.binary_cas_chunked_blob_rows = binary_cas.chunked_blob_rows;
+    stats.binary_cas_manifest_chunk_rows = binary_cas.manifest_chunk_rows;
+    stats.binary_cas_chunk_rows = binary_cas.chunk_rows;
+    stats.binary_cas_total_chunk_refs = binary_cas.total_chunk_refs;
+    stats.binary_cas_logical_blob_bytes = binary_cas.logical_blob_bytes;
+}
+
 fn collect_corpus_stats(root: &Path, stats: &mut ProfileStats) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -363,7 +396,15 @@ fn print_result(
                     "\"rocksdb_log_bytes\":{},",
                     "\"rocksdb_manifest_bytes\":{},",
                     "\"rocksdb_options_bytes\":{},",
-                    "\"rocksdb_other_bytes\":{}",
+                    "\"rocksdb_other_bytes\":{},",
+                    "\"binary_cas_manifest_rows\":{},",
+                    "\"binary_cas_empty_blob_rows\":{},",
+                    "\"binary_cas_single_chunk_blob_rows\":{},",
+                    "\"binary_cas_chunked_blob_rows\":{},",
+                    "\"binary_cas_manifest_chunk_rows\":{},",
+                    "\"binary_cas_chunk_rows\":{},",
+                    "\"binary_cas_total_chunk_refs\":{},",
+                    "\"binary_cas_logical_blob_bytes\":{}",
                     "}}"
                 ),
                 args.backend.name(),
@@ -386,7 +427,15 @@ fn print_result(
                 stats.rocksdb_log_bytes,
                 stats.rocksdb_manifest_bytes,
                 stats.rocksdb_options_bytes,
-                stats.rocksdb_other_bytes
+                stats.rocksdb_other_bytes,
+                stats.binary_cas_manifest_rows,
+                stats.binary_cas_empty_blob_rows,
+                stats.binary_cas_single_chunk_blob_rows,
+                stats.binary_cas_chunked_blob_rows,
+                stats.binary_cas_manifest_chunk_rows,
+                stats.binary_cas_chunk_rows,
+                stats.binary_cas_total_chunk_refs,
+                stats.binary_cas_logical_blob_bytes
             ),
             _ => println!(
                 concat!(
@@ -409,7 +458,15 @@ fn print_result(
                     "\"rocksdb_log_bytes\":{},",
                     "\"rocksdb_manifest_bytes\":{},",
                     "\"rocksdb_options_bytes\":{},",
-                    "\"rocksdb_other_bytes\":{}",
+                    "\"rocksdb_other_bytes\":{},",
+                    "\"binary_cas_manifest_rows\":{},",
+                    "\"binary_cas_empty_blob_rows\":{},",
+                    "\"binary_cas_single_chunk_blob_rows\":{},",
+                    "\"binary_cas_chunked_blob_rows\":{},",
+                    "\"binary_cas_manifest_chunk_rows\":{},",
+                    "\"binary_cas_chunk_rows\":{},",
+                    "\"binary_cas_total_chunk_refs\":{},",
+                    "\"binary_cas_logical_blob_bytes\":{}",
                     "}}"
                 ),
                 args.backend.name(),
@@ -430,7 +487,15 @@ fn print_result(
                 stats.rocksdb_log_bytes,
                 stats.rocksdb_manifest_bytes,
                 stats.rocksdb_options_bytes,
-                stats.rocksdb_other_bytes
+                stats.rocksdb_other_bytes,
+                stats.binary_cas_manifest_rows,
+                stats.binary_cas_empty_blob_rows,
+                stats.binary_cas_single_chunk_blob_rows,
+                stats.binary_cas_chunked_blob_rows,
+                stats.binary_cas_manifest_chunk_rows,
+                stats.binary_cas_chunk_rows,
+                stats.binary_cas_total_chunk_refs,
+                stats.binary_cas_logical_blob_bytes
             ),
         }
     } else if args.in_place {
@@ -461,6 +526,35 @@ fn print_text_stats(stats: &ProfileStats, workspace_path: Option<&Path>) {
     println!("ROCKSDB_MANIFEST_BYTES={}", stats.rocksdb_manifest_bytes);
     println!("ROCKSDB_OPTIONS_BYTES={}", stats.rocksdb_options_bytes);
     println!("ROCKSDB_OTHER_BYTES={}", stats.rocksdb_other_bytes);
+    println!(
+        "BINARY_CAS_MANIFEST_ROWS={}",
+        stats.binary_cas_manifest_rows
+    );
+    println!(
+        "BINARY_CAS_EMPTY_BLOB_ROWS={}",
+        stats.binary_cas_empty_blob_rows
+    );
+    println!(
+        "BINARY_CAS_SINGLE_CHUNK_BLOB_ROWS={}",
+        stats.binary_cas_single_chunk_blob_rows
+    );
+    println!(
+        "BINARY_CAS_CHUNKED_BLOB_ROWS={}",
+        stats.binary_cas_chunked_blob_rows
+    );
+    println!(
+        "BINARY_CAS_MANIFEST_CHUNK_ROWS={}",
+        stats.binary_cas_manifest_chunk_rows
+    );
+    println!("BINARY_CAS_CHUNK_ROWS={}", stats.binary_cas_chunk_rows);
+    println!(
+        "BINARY_CAS_TOTAL_CHUNK_REFS={}",
+        stats.binary_cas_total_chunk_refs
+    );
+    println!(
+        "BINARY_CAS_LOGICAL_BLOB_BYTES={}",
+        stats.binary_cas_logical_blob_bytes
+    );
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -473,8 +567,9 @@ async fn main() {
         let backend = args.backend.open(src).await;
         let open_elapsed = t_open.elapsed();
         eprintln!("{} in-place open: {open_elapsed:?}", args.backend.name());
+        let mut stats = collect_profile_stats(src);
+        collect_backend_profile_stats(&backend, &mut stats);
         drop(backend);
-        let stats = collect_profile_stats(src);
         print_result(&args, None, open_elapsed, None, &stats, Some(src));
         return;
     }
@@ -503,8 +598,9 @@ async fn main() {
     let backend = args.backend.open(&work).await;
     let warm_elapsed = t_warm.elapsed();
     eprintln!("{} warm reopen: {warm_elapsed:?}", args.backend.name());
+    let mut stats = collect_profile_stats(&work);
+    collect_backend_profile_stats(&backend, &mut stats);
     drop(backend);
-    let stats = collect_profile_stats(&work);
 
     // Repeated cold opens into fresh temp dirs for profiling sample density.
     for i in 0..repeat {
