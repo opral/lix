@@ -925,7 +925,7 @@ fn plan_parsed_file_path_write_with_fallback(
         );
         if !file_payload.is_empty() {
             rows.push(blob_ref_row(BlobRefRowInput {
-                file_id: file_id.clone(),
+                file_id,
                 blob_hash: file_payload
                     .blob_hash()
                     .expect("non-empty payload should have blob hash"),
@@ -933,7 +933,7 @@ fn plan_parsed_file_path_write_with_fallback(
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
-                    ..context.clone()
+                    ..context
                 },
             })?);
         }
@@ -980,7 +980,7 @@ pub(crate) fn plan_file_descriptor_write(
         );
         if !file_payload.is_empty() {
             rows.push(blob_ref_row(BlobRefRowInput {
-                file_id: file_id.clone(),
+                file_id,
                 blob_hash: file_payload
                     .blob_hash()
                     .expect("non-empty payload should have blob hash"),

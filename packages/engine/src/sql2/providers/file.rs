@@ -2020,7 +2020,7 @@ fn stage_lix_file_data_insert_write(
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let file_payload = TransactionFileData::new(
-        file_id.clone(),
+        file_id,
         path,
         filename,
         context.branch_id.clone(),
@@ -2056,7 +2056,7 @@ fn stage_lix_file_data_update_write(
     );
     if file_payload.is_empty() {
         if has_blob_ref {
-            let mut row = blob_ref_tombstone_row(file_id.clone(), context.clone());
+            let mut row = blob_ref_tombstone_row(file_id, context.clone());
             row.origin = origin;
             staged.state_rows.push(row);
         }

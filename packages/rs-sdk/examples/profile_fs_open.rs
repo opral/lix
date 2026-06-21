@@ -41,7 +41,8 @@ async fn main() {
 
     let t_copy = Instant::now();
     copy_dir(src, &work);
-    eprintln!("copy: {:?}", t_copy.elapsed());
+    let copy_elapsed = t_copy.elapsed();
+    eprintln!("copy: {copy_elapsed:?}");
 
     let repeat: usize = std::env::var("REPEAT")
         .ok()
@@ -51,13 +52,14 @@ async fn main() {
     let t_open = Instant::now();
     let backend = FsBackend::open(&work).await.unwrap();
     let open_elapsed = t_open.elapsed();
-    eprintln!("cold open: {:?}", open_elapsed);
+    eprintln!("cold open: {open_elapsed:?}");
     drop(backend);
 
     // Warm reopen (now .lix exists).
     let t_warm = Instant::now();
     let backend = FsBackend::open(&work).await.unwrap();
-    eprintln!("warm reopen: {:?}", t_warm.elapsed());
+    let warm_elapsed = t_warm.elapsed();
+    eprintln!("warm reopen: {warm_elapsed:?}");
     drop(backend);
 
     // Repeated cold opens into fresh temp dirs for profiling sample density.
@@ -68,7 +70,8 @@ async fn main() {
         let t = Instant::now();
         let backend = FsBackend::open(&work_i).await.unwrap();
         if i == repeat - 1 {
-            eprintln!("cold open (repeat {}): {:?}", repeat, t.elapsed());
+            let elapsed = t.elapsed();
+            eprintln!("cold open (repeat {repeat}): {elapsed:?}");
         }
         drop(backend);
     }

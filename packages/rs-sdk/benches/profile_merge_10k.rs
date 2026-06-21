@@ -59,7 +59,8 @@ fn main() {
             let initial_csv = csv_bytes_from_rows(&initial_rows);
             let start = Instant::now();
             write_file(&lix, CSV_PATH, initial_csv).await;
-            eprintln!("setup insert took {:?}", start.elapsed());
+            let elapsed = start.elapsed();
+            eprintln!("setup insert took {elapsed:?}");
             lix.close().await.unwrap();
         }),
         "merge" => runtime.block_on(async {
@@ -85,7 +86,8 @@ fn main() {
 
             let start = Instant::now();
             profile_merge_phase(&lix, updated_csv).await;
-            eprintln!("merge took {:?}", start.elapsed());
+            let elapsed = start.elapsed();
+            eprintln!("merge took {elapsed:?}");
             lix.close().await.unwrap();
         }),
         other => {
