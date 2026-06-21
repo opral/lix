@@ -435,7 +435,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
-async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
+async fn filesystem_initial_import_stages_descriptors_without_file_data() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
     std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
@@ -443,18 +443,110 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(
-        read_file(&lix, "/docs/readme.txt")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(b"local".as_slice())
+    assert_unresolved_file_data(&lix, "/docs/readme.txt").await;
+    let error = lix
+        .execute(
+            "UPDATE lix_file SET lixcol_metadata = lix_json('{}') WHERE path = $1",
+            &[Value::Text("/docs/readme.txt".to_string())],
+        )
+        .await
+        .expect_err("metadata-only update must not resolve file data");
+    assert!(
+        error
+            .message
+            .contains("cannot modify metadata for unresolved filesystem data"),
+        "unexpected error: {error:?}"
     );
     assert!(readdir(&lix, "/empty/").await.unwrap().unwrap().is_empty());
     assert_eq!(
         std::fs::read(tempdir.path().join("docs/readme.txt")).unwrap(),
         b"local"
     );
+    write_file(&lix, "/docs/readme.txt", b"hydrated".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&lix, "/docs/readme.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"hydrated".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn lix_file_fast_upsert_preserves_public_metadata() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+
+    lix.execute(
+        "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, lix_json($3))",
+        &[
+            Value::Text("/metadata.txt".to_string()),
+            Value::Blob(b"old".to_vec()),
+            Value::Text(r#"{"owner":"user"}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    write_file(&lix, "/metadata.txt", b"new".to_vec())
+        .await
+        .unwrap();
+
+    let rows = lix
+        .execute(
+            "SELECT data, lixcol_metadata FROM lix_file WHERE path = $1",
+            &[Value::Text("/metadata.txt".to_string())],
+        )
+        .await
+        .unwrap();
+    let row = rows.rows().first().expect("metadata file should exist");
+    assert_eq!(row.get::<Vec<u8>>("data").unwrap(), b"new");
+    assert_eq!(
+        row.get::<serde_json::Value>("lixcol_metadata").unwrap(),
+        serde_json::json!({"owner": "user"})
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_initial_import_creates_nested_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join("a/b/c")).unwrap();
+    std::fs::write(tempdir.path().join("a/b/c/file.txt"), b"nested").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_unresolved_file_data(&lix, "/a/b/c/file.txt").await;
+    assert_eq!(
+        readdir(&lix, "/a/b/c/").await.unwrap(),
+        Some(vec!["file.txt".to_string()])
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_initial_import_handles_more_files_than_one_upsert_chunk() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join("batch")).unwrap();
+    for index in 0..410 {
+        std::fs::write(
+            tempdir.path().join(format!("batch/file-{index:03}.txt")),
+            format!("content-{index:03}"),
+        )
+        .unwrap();
+    }
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    let entries = readdir(&lix, "/batch/").await.unwrap().unwrap();
+    assert_eq!(entries.len(), 410);
+    assert_eq!(entries.first().map(String::as_str), Some("file-000.txt"));
+    assert_eq!(entries.last().map(String::as_str), Some("file-409.txt"));
+    assert_unresolved_file_data(&lix, "/batch/file-409.txt").await;
     lix.close().await.unwrap();
 }
 
@@ -481,6 +573,21 @@ where
         .first()
         .map(|row| row.get::<Vec<u8>>("data"))
         .transpose()
+}
+
+async fn assert_unresolved_file_data<B>(lix: &Lix<B>, path: &str)
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let error = read_file(lix, path)
+        .await
+        .expect_err("descriptor-only file data should be unresolved");
+    assert!(
+        error.message.contains("LIX_FILESYSTEM_DATA_UNRESOLVED"),
+        "unexpected error: {error:?}"
+    );
 }
 
 async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
@@ -708,13 +815,7 @@ async fn filesystem_initial_import_ignores_git_entries() {
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(
-        read_file(&lix, "/docs/readme.txt")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(b"normal".as_slice())
-    );
+    assert_unresolved_file_data(&lix, "/docs/readme.txt").await;
     assert_eq!(readdir(&lix, "/.git/").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
     assert_eq!(readdir(&lix, "/nested/.git/").await.unwrap(), None);
@@ -845,6 +946,71 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
+async fn filesystem_inventory_mode_syncs_resolved_disk_edits() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("resolved.txt"), b"initial").unwrap();
+    std::fs::write(tempdir.path().join("still-unresolved.txt"), b"lazy").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    write_file(&lix, "/resolved.txt", b"hydrated".to_vec())
+        .await
+        .unwrap();
+    wait_for_disk_file(&tempdir.path().join("resolved.txt"), Some(b"hydrated"));
+
+    std::fs::write(tempdir.path().join("resolved.txt"), b"disk-change").unwrap();
+    wait_for_lix_file(&lix, "/resolved.txt", Some(b"disk-change")).await;
+    assert_unresolved_file_data(&lix, "/still-unresolved.txt").await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_inventory_mode_applies_lix_deletes_to_disk() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("deleted.txt"), b"delete me").unwrap();
+    std::fs::write(tempdir.path().join("still-unresolved.txt"), b"lazy").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/deleted.txt".to_string())],
+    )
+    .await
+    .unwrap();
+
+    wait_for_disk_file(&tempdir.path().join("deleted.txt"), None);
+    assert_eq!(read_file(&lix, "/deleted.txt").await.unwrap(), None);
+    assert_unresolved_file_data(&lix, "/still-unresolved.txt").await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_inventory_mode_does_not_resurrect_lix_delete_after_disk_event() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("deleted.txt"), b"delete me").unwrap();
+    std::fs::write(tempdir.path().join("still-unresolved.txt"), b"lazy").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/deleted.txt".to_string())],
+    )
+    .await
+    .unwrap();
+    std::fs::write(tempdir.path().join("local-add.txt"), b"local").unwrap();
+
+    wait_for_disk_file(&tempdir.path().join("deleted.txt"), None);
+    assert_eq!(read_file(&lix, "/deleted.txt").await.unwrap(), None);
+    wait_for_lix_unresolved_file(&lix, "/local-add.txt").await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_materializes_untracked_sdk_sql_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -948,6 +1114,61 @@ async fn filesystem_materialization_skips_git_entries() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
+async fn filesystem_inventory_ignores_invalid_plugin_descendants() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".lix/plugins/nested")).unwrap();
+    std::fs::write(tempdir.path().join(".lix/plugins/nested/file.txt"), b"bad").unwrap();
+    std::fs::write(tempdir.path().join("normal.txt"), b"normal").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_unresolved_file_data(&lix, "/normal.txt").await;
+    assert_eq!(readdir(&lix, "/.lix/plugins/nested/").await.unwrap(), None);
+    assert_eq!(
+        read_file(&lix, "/.lix/plugins/nested/file.txt")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        tempdir
+            .path()
+            .join(".lix/plugins/nested/file.txt")
+            .is_file()
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(all(unix, feature = "sqlite"))]
+async fn filesystem_inventory_mode_preserves_lix_entry_blocked_by_unmanaged_path() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("blocked.txt"), b"initial").unwrap();
+    std::fs::write(tempdir.path().join("still-unresolved.txt"), b"lazy").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+    write_file(&lix, "/blocked.txt", b"hydrated".to_vec())
+        .await
+        .unwrap();
+    wait_for_disk_file(&tempdir.path().join("blocked.txt"), Some(b"hydrated"));
+
+    std::fs::remove_file(tempdir.path().join("blocked.txt")).unwrap();
+    symlink("still-unresolved.txt", tempdir.path().join("blocked.txt")).unwrap();
+    std::fs::write(tempdir.path().join("local-trigger.txt"), b"local").unwrap();
+
+    wait_for_lix_unresolved_file(&lix, "/local-trigger.txt").await;
+    assert_eq!(
+        read_file(&lix, "/blocked.txt").await.unwrap().as_deref(),
+        Some(b"hydrated".as_slice())
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_imports_opaque_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
@@ -955,14 +1176,8 @@ async fn filesystem_imports_opaque_lix_path_names() {
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(
-        read_file(&lix, "/bad%name.txt").await.unwrap().as_deref(),
-        Some(b"bad".as_slice())
-    );
-    assert_eq!(
-        read_file(&lix, "/#hash.txt").await.unwrap().as_deref(),
-        Some(b"hash".as_slice())
-    );
+    assert_unresolved_file_data(&lix, "/bad%name.txt").await;
+    assert_unresolved_file_data(&lix, "/#hash.txt").await;
     write_file(&lix, "/written%23.txt", b"written".to_vec())
         .await
         .unwrap();
@@ -1000,17 +1215,8 @@ async fn filesystem_ignores_symlinks_on_initial_import() {
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(
-        read_file(&lix, "/target.txt").await.unwrap().as_deref(),
-        Some(b"target".as_slice())
-    );
-    assert_eq!(
-        read_file(&lix, "/real-dir/file.txt")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(b"nested".as_slice())
-    );
+    assert_unresolved_file_data(&lix, "/target.txt").await;
+    assert_unresolved_file_data(&lix, "/real-dir/file.txt").await;
     assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
     assert_eq!(readdir(&lix, "/linked-dir/").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
@@ -1226,6 +1432,25 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
             Instant::now() < deadline,
             "timed out waiting for Lix file {path} to be {expected:?}, got {actual:?}"
         );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(feature = "sqlite")]
+async fn wait_for_lix_unresolved_file(lix: &Lix<FsBackend>, path: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match read_file(lix, path).await {
+            Err(error) if error.message.contains("LIX_FILESYSTEM_DATA_UNRESOLVED") => return,
+            Ok(actual) => assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Lix file {path} to be unresolved, got {actual:?}"
+            ),
+            Err(error) => assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Lix file {path} to be unresolved, got error {error:?}"
+            ),
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }

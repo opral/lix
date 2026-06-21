@@ -44,3 +44,4 @@ pub(crate) use exec::{
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
+pub(crate) use providers::filesystem_unresolved_metadata;

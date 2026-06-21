@@ -1465,6 +1465,9 @@ mod tests {
         ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
     };
     use crate::sql2::{
+        WriteExecutorMode, WriteExecutorPath, execute_write_logical_plan_with_mode_and_trace,
+    };
+    use crate::sql2::{
         bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
         plan_write,
     };
@@ -1713,6 +1716,16 @@ mod tests {
             rows: vec![vec![Value::Integer(count as i64)]],
             notices: Vec::new(),
         })
+    }
+
+    async fn execute_write_sql_trace(
+        ctx: &mut dyn SqlWriteExecutionContext,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(u64, WriteExecutorPath), LixError> {
+        let plan = create_write_logical_plan(ctx, sql).await?;
+        execute_write_logical_plan_with_mode_and_trace(ctx, plan, params, WriteExecutorMode::Auto)
+            .await
     }
 
     #[async_trait]
@@ -3994,6 +4007,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_data_insert_uses_fast_path() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let (count, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/multi-a.txt', X'61'), ('/multi-b.txt', X'62')",
+            &[],
+        )
+        .await
+        .expect("multi-row path/data INSERT should use fast path");
+
+        assert_eq!(count, 2);
+        assert_eq!(path, WriteExecutorPath::Fast);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        assert_eq!(
+            overlay
+                .visible_semantic_rows(false, "lix_file_descriptor")
+                .len(),
+            2
+        );
+        assert_eq!(
+            overlay
+                .visible_semantic_rows(false, "lix_binary_blob_ref")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_do_nothing_uses_fast_path() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                live_file_row("file-existing", "branch-a", None, "existing.md"),
+                live_blob_ref_row("file-existing", "branch-a", b"old"),
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let (count, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/existing.md', X'78'), ('/fresh.md', X'79') \
+             ON CONFLICT (path) DO NOTHING",
+            &[],
+        )
+        .await
+        .expect("multi-row path/data INSERT DO NOTHING should use fast path");
+
+        assert_eq!(count, 1);
+        assert_eq!(path, WriteExecutorPath::Fast);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_rows.len(), 1);
+        assert_eq!(descriptor_rows[0].branch_id, "branch-a");
+        let snapshot: JsonValue =
+            serde_json::from_str(descriptor_rows[0].snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["name"], "fresh.md");
+        assert_eq!(
+            overlay
+                .visible_semantic_rows(false, "lix_binary_blob_ref")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_do_update_uses_fast_path() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                live_file_row("file-existing", "branch-a", None, "existing.md"),
+                live_blob_ref_row("file-existing", "branch-a", b"old"),
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let (count, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/existing.md', X'78'), ('/fresh.md', X'79') \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            &[],
+        )
+        .await
+        .expect("multi-row path/data INSERT DO UPDATE should use fast path");
+
+        assert_eq!(count, 2);
+        assert_eq!(path, WriteExecutorPath::Fast);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        assert_eq!(
+            overlay
+                .visible_semantic_rows(false, "lix_file_descriptor")
+                .len(),
+            1
+        );
+        assert_eq!(
+            overlay
+                .visible_semantic_rows(false, "lix_binary_blob_ref")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_plain_insert_rejects_duplicate_new_path() {
+        assert_duplicate_lix_file_path_values_rejected(
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/dup.md', X'61'), ('/dup.md', X'62')",
+            vec![],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_do_nothing_rejects_duplicate_new_path() {
+        assert_duplicate_lix_file_path_values_rejected(
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/dup.md', X'61'), ('/dup.md', X'62') \
+             ON CONFLICT (path) DO NOTHING",
+            vec![],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_do_update_rejects_duplicate_new_path() {
+        assert_duplicate_lix_file_path_values_rejected(
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/dup.md', X'61'), ('/dup.md', X'62') \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            vec![],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_do_nothing_rejects_duplicate_existing_path() {
+        assert_duplicate_lix_file_path_values_rejected(
+            "INSERT INTO lix_file (path, data) VALUES \
+             ('/existing.md', X'61'), ('/existing.md', X'62') \
+             ON CONFLICT (path) DO NOTHING",
+            vec![
+                live_file_row("file-existing", "branch-a", None, "existing.md"),
+                live_blob_ref_row("file-existing", "branch-a", b"old"),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sql_non_fast_lix_file_path_do_nothing_rejects_duplicate_new_path() {
+        assert_duplicate_lix_file_path_values_rejected(
+            "INSERT INTO lix_file (id, path, data) VALUES \
+             ('file-a', '/dup.md', X'61'), ('file-b', '/dup.md', X'62') \
+             ON CONFLICT (path) DO NOTHING",
+            vec![],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sql_non_fast_lix_file_path_do_update_rejects_duplicate_existing_path() {
+        assert_duplicate_lix_file_path_values_rejected(
+            "INSERT INTO lix_file (id, path, data) VALUES \
+             ('file-a', '/existing.md', X'61'), ('file-b', '/existing.md', X'62') \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            vec![
+                live_file_row("file-existing", "branch-a", None, "existing.md"),
+                live_blob_ref_row("file-existing", "branch-a", b"old"),
+            ],
+        )
+        .await;
+    }
+
+    async fn assert_duplicate_lix_file_path_values_rejected(
+        sql: &str,
+        live_rows: Vec<MaterializedLiveStateRow>,
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: live_rows });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let err = execute_write_sql_trace(&mut ctx, sql, &[])
+            .await
+            .expect_err("duplicate paths in one VALUES list should be rejected");
+
+        assert_eq!(err.code, LixError::CODE_UNIQUE);
+        assert!(err.message.contains("duplicate lix_file VALUES path"));
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert!(staged_writes.deltas.is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
@@ -4799,7 +5050,7 @@ mod tests {
             &mut ctx,
             plan,
             &[],
-            crate::sql2::WriteExecutorMode::ForceDataFusion,
+            WriteExecutorMode::ForceDataFusion,
         )
         .await
         .expect_err("unsupported reference writer target should not become a fast no-op");
@@ -4838,7 +5089,7 @@ mod tests {
             &mut ctx,
             plan,
             &[],
-            crate::sql2::WriteExecutorMode::ForceDataFusion,
+            WriteExecutorMode::ForceDataFusion,
         )
         .await
         .expect_err("unsupported target with empty scope should not become a no-op");

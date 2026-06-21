@@ -9,7 +9,7 @@ use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
     InMemoryBackend, Key, KeyRange, LixError, PointVisitor, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SessionContext, SpaceId, Value, WriteOptions,
+    ScanResult, ScanVisitor, SessionContext, SessionTransaction, SpaceId, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -20,6 +20,11 @@ use crate::sqlite_backend::SqliteBackend;
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
+// Each file upsert uses two SQL parameters. 400 rows stays under SQLite's
+// historical 999-parameter floor while reducing per-chunk live-state scans.
+const FILESYSTEM_FILE_UPSERT_CHUNK_SIZE: usize = 400;
+const FILESYSTEM_FILE_UPSERT_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+const FILESYSTEM_UNRESOLVED_METADATA_KEY: &str = "lix_fs_unresolved";
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -126,13 +131,20 @@ where
     metadata_mode: FilesystemMetadataMode,
     path_filter: FilesystemPathFilter,
     sync_lock: tokio::sync::Mutex<()>,
-    last_materialized: Mutex<Option<MaterializedSnapshot>>,
+    last_materialized: Mutex<Option<MaterializedState>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Snapshot {
     directories: BTreeSet<String>,
     files: BTreeMap<String, Vec<u8>>,
+    unmanaged_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct InventorySnapshot {
+    directories: BTreeSet<String>,
+    files: BTreeSet<String>,
     unmanaged_paths: BTreeSet<String>,
 }
 
@@ -220,6 +232,15 @@ struct MaterializedSnapshot {
     lix_revision: LixRevision,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MaterializedState {
+    Bytes(MaterializedSnapshot),
+    Inventory {
+        disk: InventorySnapshot,
+        lix_revision: LixRevision,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LixRevision {
     active_branch_id: String,
@@ -231,6 +252,20 @@ struct LixRevision {
 struct LixSnapshotRead {
     snapshot: Snapshot,
     revision: LixRevision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LixInventoryRead {
+    directories: BTreeSet<String>,
+    directory_ids: BTreeMap<String, String>,
+    files: BTreeSet<String>,
+    unresolved_files: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskSyncOutcome {
+    NeedsMaterialization,
+    InventoryMaterialized,
 }
 
 enum FilesystemEvent {
@@ -559,8 +594,9 @@ where
         if metadata_mode == FilesystemMetadataMode::Persistent {
             state.migrate_legacy_lix_system_paths().await?;
         }
-        state.sync_disk_to_lix(false).await?;
-        state.sync_from_lix().await?;
+        if state.sync_disk_to_lix(false).await? == DiskSyncOutcome::NeedsMaterialization {
+            state.sync_from_lix().await?;
+        }
 
         let (event_tx, event_rx) = mpsc::channel();
         let callback_tx = event_tx.clone();
@@ -653,6 +689,17 @@ where
 {
     async fn sync_from_lix(&self) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
+        if let Some(lix_inventory) = self.lix_inventory_for_inventory_sync().await? {
+            let resolved = self
+                .collect_lix_resolved_snapshot_read(&lix_inventory)
+                .await?;
+            self.materialize_inventory_snapshot(&resolved, &lix_inventory)?;
+            let lix_revision = self.collect_lix_revision().await?;
+            let materialized_inventory =
+                collect_local_inventory(&self.root, self.metadata_mode, &self.path_filter)?;
+            self.remember_inventory(materialized_inventory, lix_revision);
+            return Ok(());
+        }
         let lix_revision = self.collect_lix_revision().await?;
         if self.is_last_materialized_lix_revision(&lix_revision) {
             let local = collect_local_snapshot(&self.root, self.metadata_mode, &self.path_filter)?;
@@ -666,13 +713,51 @@ where
         Ok(())
     }
 
-    async fn sync_disk_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
+    async fn sync_disk_to_lix(
+        &self,
+        skip_if_last_materialized: bool,
+    ) -> Result<DiskSyncOutcome, LixError> {
         let _guard = self.sync_lock.lock().await;
+        if let Some(lix_inventory) = self.lix_inventory_for_inventory_sync().await? {
+            let inventory =
+                collect_local_inventory(&self.root, self.metadata_mode, &self.path_filter)?;
+            let has_resolved_files = lix_inventory
+                .files
+                .difference(&lix_inventory.unresolved_files)
+                .next()
+                .is_some();
+            let has_plugin_files = inventory
+                .files
+                .iter()
+                .any(|path| is_plugin_storage_path(path));
+            if skip_if_last_materialized
+                && !has_resolved_files
+                && !has_plugin_files
+                && self.is_last_materialized_inventory(&inventory)
+            {
+                let lix_revision = self.collect_lix_revision().await?;
+                if self.is_last_materialized_inventory_with_revision(&inventory, &lix_revision) {
+                    return Ok(DiskSyncOutcome::InventoryMaterialized);
+                }
+            }
+            self.apply_local_inventory_to_lix(
+                &inventory,
+                &lix_inventory,
+                !skip_if_last_materialized,
+            )
+            .await?;
+            self.apply_plugin_local_file_data_to_lix(&inventory).await?;
+            self.apply_resolved_local_file_data_to_lix(&inventory, &lix_inventory)
+                .await?;
+            let lix_revision = self.collect_lix_revision().await?;
+            self.remember_inventory(inventory, lix_revision);
+            return Ok(DiskSyncOutcome::InventoryMaterialized);
+        }
         let local = collect_local_snapshot(&self.root, self.metadata_mode, &self.path_filter)?;
         if skip_if_last_materialized && self.is_last_materialized_disk(&local) {
             let lix_revision = self.collect_lix_revision().await?;
             if self.is_last_materialized(&local, &lix_revision) {
-                return Ok(());
+                return Ok(DiskSyncOutcome::NeedsMaterialization);
             }
         }
         let previous = self.last_materialized_disk();
@@ -681,7 +766,7 @@ where
         let lix = self.collect_lix_snapshot_read().await?;
         let materialized = self.materialize_snapshot_after_disk_sync(&lix.snapshot, &local)?;
         self.remember_materialized(materialized, lix.revision);
-        Ok(())
+        Ok(DiskSyncOutcome::NeedsMaterialization)
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -691,18 +776,46 @@ where
     async fn migrate_legacy_lix_system_paths(&self) -> Result<(), LixError> {
         let files = self
             .session
-            .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
+            .execute(
+                "SELECT path FROM lix_file \
+                 WHERE path = '/.lix_system' OR path = '/.lix_system/' OR path LIKE '/.lix_system/%' \
+                 ORDER BY path",
+                &[],
+            )
             .await?;
         let legacy_files = files
             .rows()
             .iter()
-            .map(|row| Ok((row.get::<String>("path")?, row.get::<Vec<u8>>("data")?)))
+            .map(|row| row.get::<String>("path"))
             .collect::<Result<Vec<_>, LixError>>()?;
-        for (path, data) in legacy_files
+        for path in legacy_files
             .iter()
-            .filter(|(path, _)| is_legacy_lix_system_path(path))
+            .filter(|path| is_legacy_lix_system_path(path))
         {
             if let Some(new_path) = migrate_legacy_lix_system_path(path) {
+                let rows = self
+                    .session
+                    .execute(
+                        "SELECT data FROM lix_file WHERE path = $1",
+                        &[Value::Text(path.clone())],
+                    )
+                    .await?;
+                let Some(row) = rows.rows().first() else {
+                    continue;
+                };
+                let data = row.get::<Vec<u8>>("data").map_err(|error| {
+                    if error.code == "LIX_FILESYSTEM_DATA_UNRESOLVED" {
+                        LixError::new(
+                            "LIX_FILESYSTEM_LEGACY_UNRESOLVED",
+                            format!("legacy filesystem path {path:?} has unresolved data"),
+                        )
+                        .with_hint(
+                            "Hydrate or remove the legacy .lix_system file before filesystem open.",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
                 self.session
                     .execute(
                         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -710,7 +823,7 @@ where
                         &[Value::Text(new_path.clone()), Value::Blob(data.clone())],
                     )
                     .await?;
-                write_materialized_file(&self.root, &new_path, data, self.metadata_mode)?;
+                write_materialized_file(&self.root, &new_path, &data, self.metadata_mode)?;
             }
             self.session
                 .execute(
@@ -793,6 +906,289 @@ where
         })
     }
 
+    async fn collect_lix_inventory_read(&self) -> Result<LixInventoryRead, LixError> {
+        let mut directories = BTreeSet::from(["/".to_string()]);
+        let mut directory_ids = BTreeMap::new();
+        let mut files = BTreeSet::new();
+        let mut unresolved_files = BTreeSet::new();
+        let statements: [(&str, &[Value]); 2] = [
+            ("SELECT path, id FROM lix_directory ORDER BY path", &[]),
+            (
+                "SELECT path, lixcol_metadata FROM lix_file ORDER BY path",
+                &[],
+            ),
+        ];
+        let batch = self
+            .session
+            .execute_coherent_read_batch(&statements)
+            .await?;
+        let [directory_rows, file_rows] = batch.results.try_into().map_err(|results: Vec<_>| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "coherent filesystem inventory read returned {} result sets",
+                    results.len()
+                ),
+            )
+        })?;
+        for row in directory_rows.rows() {
+            let path = row.get::<String>("path")?;
+            if path != "/" {
+                let id = row.get::<String>("id")?;
+                directory_ids.insert(path.clone(), id);
+            }
+            directories.insert(path);
+        }
+        for row in file_rows.rows() {
+            let path = row.get::<String>("path")?;
+            if metadata_value_is_filesystem_unresolved(row.value("lixcol_metadata")?)? {
+                unresolved_files.insert(path.clone());
+            }
+            files.insert(path);
+        }
+        Ok(LixInventoryRead {
+            directories,
+            directory_ids,
+            files,
+            unresolved_files,
+        })
+    }
+
+    async fn collect_lix_resolved_snapshot_read(
+        &self,
+        inventory: &LixInventoryRead,
+    ) -> Result<Snapshot, LixError> {
+        let mut snapshot = Snapshot::default();
+        snapshot.directories = inventory.directories.clone();
+        for path in inventory.files.difference(&inventory.unresolved_files) {
+            if is_materialization_ignored_path(path, self.metadata_mode) {
+                continue;
+            }
+            let rows = self
+                .session
+                .execute(
+                    "SELECT data FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.clone())],
+                )
+                .await?;
+            let Some(row) = rows.rows().first() else {
+                continue;
+            };
+            snapshot
+                .files
+                .insert(path.clone(), row.get::<Vec<u8>>("data")?);
+        }
+        Ok(snapshot)
+    }
+
+    async fn lix_inventory_for_inventory_sync(&self) -> Result<Option<LixInventoryRead>, LixError> {
+        let inventory = self.collect_lix_inventory_read().await?;
+        let should_sync = !inventory.unresolved_files.is_empty()
+            || (inventory.files.is_empty()
+                && inventory.directories.iter().all(|path| {
+                    path == "/" || is_materialization_ignored_path(path, self.metadata_mode)
+                }));
+        Ok(should_sync.then_some(inventory))
+    }
+
+    async fn apply_local_inventory_to_lix(
+        &self,
+        local: &InventorySnapshot,
+        lix: &LixInventoryRead,
+        delete_all_missing: bool,
+    ) -> Result<(), LixError> {
+        let previous_inventory = self.last_materialized_inventory();
+        let mut files_to_import = local
+            .files
+            .difference(&lix.files)
+            .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
+            .filter(|path| {
+                delete_all_missing
+                    || !previous_inventory
+                        .as_ref()
+                        .is_some_and(|previous| previous.files.contains(*path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        files_to_import.sort();
+        let mut directories_to_import = local
+            .directories
+            .difference(&lix.directories)
+            .filter(|path| path.as_str() != "/")
+            .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
+            .filter(|path| {
+                delete_all_missing
+                    || !previous_inventory
+                        .as_ref()
+                        .is_some_and(|previous| previous.directories.contains(*path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_directories_shallowest_first(&mut directories_to_import);
+
+        if !directories_to_import.is_empty() || !files_to_import.is_empty() {
+            let existing_directory_ids = lix
+                .directory_ids
+                .iter()
+                .map(|(path, id)| (path.clone(), id.clone()))
+                .collect::<Vec<_>>();
+            self.session
+                .import_unresolved_filesystem_inventory(
+                    &existing_directory_ids,
+                    &directories_to_import,
+                    &files_to_import,
+                )
+                .await?;
+        }
+
+        for path in lix.files.difference(&local.files) {
+            if !delete_all_missing
+                && !previous_inventory
+                    .as_ref()
+                    .is_some_and(|previous| previous.files.contains(path))
+            {
+                continue;
+            }
+            if self.path_filter.includes_file(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
+            {
+                if inventory_unmanaged_blocks_lix_path(local, path)
+                    || lix_path_blocked_by_unmanaged(&self.root, path)?
+                {
+                    continue;
+                }
+                self.session
+                    .execute(
+                        "DELETE FROM lix_file WHERE path = $1",
+                        &[Value::Text(path.clone())],
+                    )
+                    .await?;
+            }
+        }
+
+        if self.path_filter.is_unfiltered() {
+            let mut directories_to_remove = lix
+                .directories
+                .difference(&local.directories)
+                .filter(|path| path.as_str() != "/")
+                .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
+                .filter(|path| {
+                    delete_all_missing
+                        || previous_inventory
+                            .as_ref()
+                            .is_some_and(|previous| previous.directories.contains(*path))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            sort_directories_deepest_first(&mut directories_to_remove);
+            for path in directories_to_remove {
+                if inventory_unmanaged_blocks_lix_path(local, &path)
+                    || lix_path_blocked_by_unmanaged(&self.root, &path)?
+                {
+                    continue;
+                }
+                self.session
+                    .execute(
+                        "DELETE FROM lix_directory WHERE path = $1",
+                        &[Value::Text(path)],
+                    )
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_resolved_local_file_data_to_lix(
+        &self,
+        local: &InventorySnapshot,
+        lix: &LixInventoryRead,
+    ) -> Result<(), LixError> {
+        self.apply_selected_local_file_data_to_lix(
+            local.files.iter().filter(|path| {
+                lix.files.contains(*path)
+                    && !lix.unresolved_files.contains(*path)
+                    && !is_plugin_storage_path(path)
+            }),
+            true,
+        )
+        .await
+    }
+
+    async fn apply_plugin_local_file_data_to_lix(
+        &self,
+        local: &InventorySnapshot,
+    ) -> Result<(), LixError> {
+        self.apply_selected_local_file_data_to_lix(
+            local
+                .files
+                .iter()
+                .filter(|path| is_valid_plugin_storage_archive_path(path)),
+            false,
+        )
+        .await
+    }
+
+    async fn apply_selected_local_file_data_to_lix<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a String>,
+        compare_existing: bool,
+    ) -> Result<(), LixError> {
+        let mut file_upserts = Vec::with_capacity(FILESYSTEM_FILE_UPSERT_CHUNK_SIZE);
+        let mut file_transaction = None;
+        let mut file_transaction_bytes = 0usize;
+
+        for path in paths {
+            if is_materialization_ignored_path(path, self.metadata_mode) {
+                continue;
+            }
+            let local_path = lix_path_to_local_path(&self.root, path)?;
+            let data = std::fs::read(&local_path)
+                .map_err(|error| io_error("read resolved filesystem file", &local_path, error))?;
+            if compare_existing && self.lix_file_data_equals(path, &data).await? {
+                continue;
+            }
+            file_upserts.push((path.clone(), data));
+            if file_upserts.len() == FILESYSTEM_FILE_UPSERT_CHUNK_SIZE {
+                self.execute_owned_file_upsert_chunk(
+                    &mut file_transaction,
+                    &mut file_transaction_bytes,
+                    &file_upserts,
+                )
+                .await?;
+                file_upserts.clear();
+            }
+        }
+
+        if !file_upserts.is_empty() {
+            self.execute_owned_file_upsert_chunk(
+                &mut file_transaction,
+                &mut file_transaction_bytes,
+                &file_upserts,
+            )
+            .await?;
+        }
+        if let Some(transaction) = file_transaction {
+            transaction.commit().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn lix_file_data_equals(&self, path: &str, data: &[u8]) -> Result<bool, LixError> {
+        let rows = self
+            .session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(path.to_string())],
+            )
+            .await?;
+        let Some(row) = rows.rows().first() else {
+            return Ok(false);
+        };
+        Ok(row.get::<Vec<u8>>("data")? == data)
+    }
+
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
         let batch = self.session.execute_coherent_read_batch(&[]).await?;
         Ok(LixRevision {
@@ -808,87 +1204,113 @@ where
         previous: Option<&Snapshot>,
     ) -> Result<(), LixError> {
         let lix = self.collect_lix_snapshot_read().await?.snapshot;
+        let mut transaction = self.session.begin_transaction().await?;
 
-        for path in lix.files.keys() {
-            if !local.files.contains_key(path)
-                && self.path_filter.includes_file(path)
-                && !is_plugin_storage_path(path)
-                && !is_materialization_ignored_path(path, self.metadata_mode)
-            {
-                if previous
-                    .as_ref()
-                    .is_some_and(|snapshot| !snapshot.files.contains_key(path))
+        let metadata_result = async {
+            let mut changed = false;
+            for path in lix.files.keys() {
+                if !local.files.contains_key(path)
+                    && self.path_filter.includes_file(path)
+                    && !is_plugin_storage_path(path)
+                    && !is_materialization_ignored_path(path, self.metadata_mode)
                 {
-                    continue;
+                    if previous
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.files.contains_key(path))
+                    {
+                        continue;
+                    }
+                    if lix_path_blocked_by_unmanaged(&self.root, path)?
+                        || snapshot_unmanaged_blocks_lix_path(previous, path)
+                    {
+                        continue;
+                    }
+                    transaction
+                        .execute(
+                            "DELETE FROM lix_file WHERE path = $1",
+                            &[Value::Text(path.clone())],
+                        )
+                        .await?;
+                    changed = true;
                 }
-                if lix_path_blocked_by_unmanaged(&self.root, path)?
-                    || snapshot_unmanaged_blocks_lix_path(previous, path)
-                {
-                    continue;
-                }
-                self.session
-                    .execute(
-                        "DELETE FROM lix_file WHERE path = $1",
-                        &[Value::Text(path.clone())],
-                    )
-                    .await?;
             }
-        }
 
-        if self.path_filter.is_unfiltered() {
-            let mut directories_to_remove = Vec::new();
-            for path in lix.directories.difference(&local.directories) {
-                if path.as_str() == "/"
-                    || is_plugin_storage_path(path)
-                    || is_materialization_ignored_path(path, self.metadata_mode)
-                {
-                    continue;
+            if self.path_filter.is_unfiltered() {
+                let mut directories_to_remove = Vec::new();
+                for path in lix.directories.difference(&local.directories) {
+                    if path.as_str() == "/"
+                        || is_plugin_storage_path(path)
+                        || is_materialization_ignored_path(path, self.metadata_mode)
+                    {
+                        continue;
+                    }
+                    if previous
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.directories.contains(path))
+                    {
+                        continue;
+                    }
+                    if lix_path_blocked_by_unmanaged(&self.root, path)?
+                        || snapshot_unmanaged_blocks_lix_path(previous, path)
+                    {
+                        continue;
+                    }
+                    directories_to_remove.push(path.clone());
                 }
-                if previous
-                    .as_ref()
-                    .is_some_and(|snapshot| !snapshot.directories.contains(path))
-                {
-                    continue;
+                sort_directories_deepest_first(&mut directories_to_remove);
+                for path in directories_to_remove {
+                    transaction
+                        .execute(
+                            "DELETE FROM lix_directory WHERE path = $1",
+                            &[Value::Text(path)],
+                        )
+                        .await?;
+                    changed = true;
                 }
-                if lix_path_blocked_by_unmanaged(&self.root, path)?
-                    || snapshot_unmanaged_blocks_lix_path(previous, path)
-                {
-                    continue;
-                }
-                directories_to_remove.push(path.clone());
             }
-            sort_directories_deepest_first(&mut directories_to_remove);
-            for path in directories_to_remove {
-                self.session
+
+            let mut directories_to_create = local
+                .directories
+                .difference(&lix.directories)
+                .filter(|path| path.as_str() != "/")
+                .filter(|path| {
+                    previous
+                        .as_ref()
+                        .is_none_or(|snapshot| !snapshot.directories.contains(*path))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            sort_directories_shallowest_first(&mut directories_to_create);
+            for path in directories_to_create {
+                transaction
                     .execute(
-                        "DELETE FROM lix_directory WHERE path = $1",
+                        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
                         &[Value::Text(path)],
                     )
                     .await?;
+                changed = true;
+            }
+
+            Ok(changed)
+        }
+        .await;
+
+        match metadata_result {
+            Ok(true) => {
+                transaction.commit().await?;
+            }
+            Ok(false) => {
+                transaction.rollback().await?;
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
             }
         }
 
-        let mut directories_to_create = local
-            .directories
-            .difference(&lix.directories)
-            .filter(|path| path.as_str() != "/")
-            .filter(|path| {
-                previous
-                    .as_ref()
-                    .is_none_or(|snapshot| !snapshot.directories.contains(*path))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        sort_directories_shallowest_first(&mut directories_to_create);
-        for path in directories_to_create {
-            self.session
-                .execute(
-                    "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-                    &[Value::Text(path)],
-                )
-                .await?;
-        }
-
+        let mut file_upserts = Vec::with_capacity(FILESYSTEM_FILE_UPSERT_CHUNK_SIZE);
+        let mut file_transaction = None;
+        let mut file_transaction_bytes = 0usize;
         for (path, data) in local
             .files
             .iter()
@@ -901,16 +1323,115 @@ where
                 continue;
             }
             if lix.files.get(path) != Some(data) {
-                self.session
-                    .execute(
-                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-                        &[Value::Text(path.clone()), Value::Blob(data.clone())],
+                file_upserts.push((path, data));
+                if file_upserts.len() == FILESYSTEM_FILE_UPSERT_CHUNK_SIZE {
+                    self.execute_file_upsert_chunk(
+                        &mut file_transaction,
+                        &mut file_transaction_bytes,
+                        &file_upserts,
                     )
                     .await?;
+                    file_upserts.clear();
+                }
             }
         }
+        if !file_upserts.is_empty() {
+            self.execute_file_upsert_chunk(
+                &mut file_transaction,
+                &mut file_transaction_bytes,
+                &file_upserts,
+            )
+            .await?;
+        }
+        if let Some(transaction) = file_transaction {
+            transaction.commit().await?;
+        }
 
+        Ok(())
+    }
+
+    async fn execute_file_upsert_chunk(
+        &self,
+        current_transaction: &mut Option<SessionTransaction<B>>,
+        current_transaction_bytes: &mut usize,
+        file_upserts: &[(&String, &Vec<u8>)],
+    ) -> Result<(), LixError> {
+        if file_upserts.is_empty() {
+            return Ok(());
+        }
+        if current_transaction.is_none() {
+            *current_transaction = Some(self.session.begin_transaction().await?);
+        }
+        let chunk_bytes = file_upsert_chunk_bytes(file_upserts);
+        let result = {
+            let transaction = current_transaction
+                .as_mut()
+                .expect("file upsert transaction should be open");
+            self.execute_file_upsert_chunk_in_transaction(transaction, file_upserts)
+                .await
+        };
+
+        match result {
+            Ok(()) => {
+                *current_transaction_bytes = current_transaction_bytes.saturating_add(chunk_bytes);
+                if *current_transaction_bytes >= FILESYSTEM_FILE_UPSERT_TRANSACTION_BYTES {
+                    let transaction = current_transaction
+                        .take()
+                        .expect("file upsert transaction should be open");
+                    transaction.commit().await?;
+                    *current_transaction_bytes = 0;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(transaction) = current_transaction.take() {
+                    let _ = transaction.rollback().await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_owned_file_upsert_chunk(
+        &self,
+        current_transaction: &mut Option<SessionTransaction<B>>,
+        current_transaction_bytes: &mut usize,
+        file_upserts: &[(String, Vec<u8>)],
+    ) -> Result<(), LixError> {
+        let file_upserts = file_upserts
+            .iter()
+            .map(|(path, data)| (path, data))
+            .collect::<Vec<_>>();
+        self.execute_file_upsert_chunk(
+            current_transaction,
+            current_transaction_bytes,
+            &file_upserts,
+        )
+        .await
+    }
+
+    async fn execute_file_upsert_chunk_in_transaction(
+        &self,
+        transaction: &mut SessionTransaction<B>,
+        file_upserts: &[(&String, &Vec<u8>)],
+    ) -> Result<(), LixError> {
+        if file_upserts.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from("INSERT INTO lix_file (path, data) VALUES ");
+        let mut params = Vec::with_capacity(file_upserts.len() * 2);
+        for (index, (path, data)) in file_upserts.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            let path_param = index * 2 + 1;
+            let data_param = path_param + 1;
+            sql.push_str(&format!("(${path_param}, ${data_param})"));
+            params.push(Value::Text((*path).clone()));
+            params.push(Value::Blob((*data).clone()));
+        }
+        sql.push_str(" ON CONFLICT (path) DO UPDATE SET data = excluded.data");
+        transaction.execute(&sql, &params).await?;
         Ok(())
     }
 
@@ -924,6 +1445,71 @@ where
         base: &Snapshot,
     ) -> Result<Snapshot, LixError> {
         self.materialize_snapshot_with_base(target, Some(base))
+    }
+
+    fn materialize_inventory_snapshot(
+        &self,
+        target: &Snapshot,
+        target_inventory: &LixInventoryRead,
+    ) -> Result<(), LixError> {
+        ensure_filesystem_root_directory(&self.root)?;
+        let previous = self.last_materialized_inventory();
+
+        if let Some(previous) = previous.as_ref() {
+            for path in previous
+                .files
+                .difference(&target_inventory.files)
+                .filter(|path| {
+                    self.path_filter.includes_file(path)
+                        && !is_materialization_ignored_path(path, self.metadata_mode)
+                })
+            {
+                remove_materialized_file(&self.root, path, self.metadata_mode)?;
+            }
+
+            if self.path_filter.is_unfiltered() {
+                let mut directories_to_remove = previous
+                    .directories
+                    .difference(&target_inventory.directories)
+                    .filter(|path| {
+                        path.as_str() != "/"
+                            && !is_materialization_ignored_path(path, self.metadata_mode)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sort_directories_deepest_first(&mut directories_to_remove);
+                for path in directories_to_remove {
+                    remove_materialized_directory(&self.root, &path, self.metadata_mode)?;
+                }
+            }
+        }
+
+        let mut directories_to_create = target
+            .directories
+            .iter()
+            .filter(|path| {
+                path.as_str() != "/"
+                    && self.path_filter.includes_directory(path)
+                    && !is_materialization_ignored_path(path, self.metadata_mode)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_directories_shallowest_first(&mut directories_to_create);
+        for path in directories_to_create {
+            create_materialized_directory(&self.root, &path, self.metadata_mode)?;
+        }
+
+        for (path, data) in target.files.iter().filter(|(path, _)| {
+            self.path_filter.includes_file(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
+        }) {
+            let local_path = lix_path_to_local_path(&self.root, path)?;
+            if std::fs::read(&local_path).ok().as_deref() != Some(data.as_slice()) {
+                write_materialized_file(&self.root, path, data, self.metadata_mode)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn materialize_snapshot_with_base(
@@ -941,7 +1527,7 @@ where
                 && !is_materialization_ignored_path(path, self.metadata_mode)
                 && previous
                     .as_ref()
-                    .is_none_or(|snapshot| snapshot.files.contains_key(*path))
+                    .is_some_and(|snapshot| snapshot.files.contains_key(*path))
         }) {
             if base.is_some_and(|snapshot| {
                 !snapshot.files.contains_key(path)
@@ -963,7 +1549,7 @@ where
                 .filter(|path| {
                     previous
                         .as_ref()
-                        .is_none_or(|snapshot| snapshot.directories.contains(*path))
+                        .is_some_and(|snapshot| snapshot.directories.contains(*path))
                 })
                 .filter(|path| {
                     base.is_none_or(|snapshot| {
@@ -1028,7 +1614,18 @@ where
             .last_materialized
             .lock()
             .expect("filesystem materialized snapshot lock should not poison") =
-            Some(MaterializedSnapshot { disk, lix_revision });
+            Some(MaterializedState::Bytes(MaterializedSnapshot {
+                disk,
+                lix_revision,
+            }));
+    }
+
+    fn remember_inventory(&self, disk: InventorySnapshot, lix_revision: LixRevision) {
+        *self
+            .last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison") =
+            Some(MaterializedState::Inventory { disk, lix_revision });
     }
 
     fn last_materialized_disk(&self) -> Option<Snapshot> {
@@ -1036,7 +1633,21 @@ where
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
-            .map(|snapshot| snapshot.disk.clone())
+            .and_then(|snapshot| match snapshot {
+                MaterializedState::Bytes(snapshot) => Some(snapshot.disk.clone()),
+                MaterializedState::Inventory { .. } => None,
+            })
+    }
+
+    fn last_materialized_inventory(&self) -> Option<InventorySnapshot> {
+        self.last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison")
+            .as_ref()
+            .and_then(|snapshot| match snapshot {
+                MaterializedState::Inventory { disk, .. } => Some(disk.clone()),
+                MaterializedState::Bytes(_) => None,
+            })
     }
 
     fn is_last_materialized_disk(&self, snapshot: &Snapshot) -> bool {
@@ -1044,7 +1655,39 @@ where
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
-            .is_some_and(|materialized| &materialized.disk == snapshot)
+            .is_some_and(|materialized| match materialized {
+                MaterializedState::Bytes(materialized) => &materialized.disk == snapshot,
+                MaterializedState::Inventory { .. } => false,
+            })
+    }
+
+    fn is_last_materialized_inventory(&self, snapshot: &InventorySnapshot) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| match materialized {
+                MaterializedState::Inventory { disk, .. } => disk == snapshot,
+                MaterializedState::Bytes(_) => false,
+            })
+    }
+
+    fn is_last_materialized_inventory_with_revision(
+        &self,
+        disk: &InventorySnapshot,
+        lix_revision: &LixRevision,
+    ) -> bool {
+        self.last_materialized
+            .lock()
+            .expect("filesystem materialized snapshot lock should not poison")
+            .as_ref()
+            .is_some_and(|materialized| match materialized {
+                MaterializedState::Inventory {
+                    disk: materialized_disk,
+                    lix_revision: materialized_revision,
+                } => materialized_disk == disk && materialized_revision == lix_revision,
+                MaterializedState::Bytes(_) => false,
+            })
     }
 
     fn is_last_materialized_lix_revision(&self, lix_revision: &LixRevision) -> bool {
@@ -1052,7 +1695,15 @@ where
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
-            .is_some_and(|materialized| &materialized.lix_revision == lix_revision)
+            .is_some_and(|materialized| match materialized {
+                MaterializedState::Bytes(materialized) => {
+                    &materialized.lix_revision == lix_revision
+                }
+                MaterializedState::Inventory {
+                    lix_revision: materialized_revision,
+                    ..
+                } => materialized_revision == lix_revision,
+            })
     }
 
     fn is_last_materialized(&self, disk: &Snapshot, lix_revision: &LixRevision) -> bool {
@@ -1061,7 +1712,11 @@ where
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
             .is_some_and(|materialized| {
-                &materialized.disk == disk && &materialized.lix_revision == lix_revision
+                matches!(
+                    materialized,
+                    MaterializedState::Bytes(materialized)
+                        if &materialized.disk == disk && &materialized.lix_revision == lix_revision
+                )
             })
     }
 }
@@ -1153,6 +1808,12 @@ fn sync_from_lix_for_replies<B>(
     }
 }
 
+fn file_upsert_chunk_bytes(file_upserts: &[(&String, &Vec<u8>)]) -> usize {
+    file_upserts.iter().fold(0usize, |total, (path, data)| {
+        total.saturating_add(path.len()).saturating_add(data.len())
+    })
+}
+
 fn collect_local_snapshot(
     root: &Path,
     metadata_mode: FilesystemMetadataMode,
@@ -1168,6 +1829,146 @@ fn collect_local_snapshot(
         collect_filtered_local_snapshot(root, metadata_mode, path_filter, &mut snapshot)?;
     }
     Ok(snapshot)
+}
+
+fn collect_local_inventory(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    path_filter: &FilesystemPathFilter,
+) -> Result<InventorySnapshot, LixError> {
+    validate_filesystem_root_directory(root)?;
+
+    let mut snapshot = InventorySnapshot::default();
+    snapshot.directories.insert("/".to_string());
+    if path_filter.is_unfiltered() {
+        collect_local_inventory_directory(root, root, metadata_mode, &mut snapshot)?;
+    } else {
+        collect_filtered_local_inventory(root, metadata_mode, path_filter, &mut snapshot)?;
+    }
+    Ok(snapshot)
+}
+
+fn collect_local_inventory_directory(
+    root: &Path,
+    directory: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    snapshot: &mut InventorySnapshot,
+) -> Result<(), LixError> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| io_error("read filesystem directory", directory, error))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| io_error("read filesystem directory entry", directory, error))?;
+        let path = entry.path();
+        if is_filesystem_sync_ignored_local_path(root, &path, metadata_mode) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("read filesystem entry type", &path, error)),
+        };
+        if is_unmanaged_file_type(&file_type) {
+            remember_unmanaged_inventory_path(root, directory, &path, snapshot);
+            continue;
+        }
+        if file_type.is_dir() {
+            let Ok(lix_path) = local_path_to_lix_path(root, &path, true) else {
+                remember_unmanaged_inventory_path(root, directory, &path, snapshot);
+                continue;
+            };
+            if is_invalid_plugin_storage_inventory_path(&lix_path, true) {
+                remember_unmanaged_inventory_path(root, directory, &path, snapshot);
+                continue;
+            }
+            snapshot.directories.insert(lix_path);
+            collect_local_inventory_directory(root, &path, metadata_mode, snapshot)?;
+        } else if file_type.is_file() {
+            let Ok(lix_path) = local_path_to_lix_path(root, &path, false) else {
+                remember_unmanaged_inventory_path(root, directory, &path, snapshot);
+                continue;
+            };
+            if is_invalid_plugin_storage_inventory_path(&lix_path, false) {
+                remember_unmanaged_inventory_path(root, directory, &path, snapshot);
+                continue;
+            }
+            snapshot.files.insert(lix_path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_filtered_local_inventory(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    path_filter: &FilesystemPathFilter,
+    snapshot: &mut InventorySnapshot,
+) -> Result<(), LixError> {
+    for lix_path in &path_filter.include_files {
+        if is_filesystem_sync_ignored_lix_path(lix_path, metadata_mode) {
+            continue;
+        }
+        let local_path = lix_path_to_local_path(root, lix_path)?;
+        if path_contains_unmanaged_entry(root, &local_path)? {
+            snapshot.unmanaged_paths.insert(lix_path.clone());
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&local_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io_error(
+                    "read filesystem file metadata",
+                    &local_path,
+                    error,
+                ));
+            }
+        };
+        if is_unmanaged_file_type(&metadata.file_type()) {
+            snapshot.unmanaged_paths.insert(lix_path.clone());
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        if is_invalid_plugin_storage_inventory_path(lix_path, false) {
+            snapshot.unmanaged_paths.insert(lix_path.clone());
+            continue;
+        }
+        insert_parent_inventory_directories(lix_path, snapshot);
+        snapshot.files.insert(lix_path.clone());
+    }
+    Ok(())
+}
+
+fn remember_unmanaged_inventory_path(
+    root: &Path,
+    directory: &Path,
+    path: &Path,
+    snapshot: &mut InventorySnapshot,
+) {
+    if let Ok(lix_path) = local_path_to_lix_path(root, path, false) {
+        snapshot.unmanaged_paths.insert(lix_path);
+    } else if directory != root {
+        if let Ok(parent_path) = local_path_to_lix_path(root, directory, true) {
+            snapshot.unmanaged_paths.insert(parent_path);
+        }
+    }
+}
+
+fn insert_parent_inventory_directories(path: &str, snapshot: &mut InventorySnapshot) {
+    let mut directory = parent_lix_directory_path(path);
+    let mut directories = Vec::new();
+    while directory != "/" {
+        directories.push(directory.clone());
+        let parent = parent_lix_directory_path(directory.trim_end_matches('/'));
+        if parent == directory {
+            break;
+        }
+        directory = parent;
+    }
+    directories.reverse();
+    snapshot.directories.extend(directories);
 }
 
 fn collect_local_directory(
@@ -1610,6 +2411,13 @@ fn snapshot_unmanaged_blocks_lix_path(snapshot: Option<&Snapshot>, path: &str) -
     })
 }
 
+fn inventory_unmanaged_blocks_lix_path(inventory: &InventorySnapshot, path: &str) -> bool {
+    inventory
+        .unmanaged_paths
+        .iter()
+        .any(|unmanaged_path| unmanaged_path_blocks_lix_path(unmanaged_path, path))
+}
+
 fn unmanaged_path_blocks_lix_path(unmanaged_path: &str, path: &str) -> bool {
     let unmanaged_path = unmanaged_path.strip_suffix('/').unwrap_or(unmanaged_path);
     let path = path.strip_suffix('/').unwrap_or(path);
@@ -1649,6 +2457,34 @@ fn path_contains_unmanaged_entry(root: &Path, local_path: &Path) -> Result<bool,
 
 fn is_unmanaged_file_type(file_type: &std::fs::FileType) -> bool {
     file_type.is_symlink() || (!file_type.is_file() && !file_type.is_dir())
+}
+
+fn metadata_is_filesystem_unresolved(metadata: Option<&str>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .is_some_and(|value| json_metadata_is_filesystem_unresolved(&value))
+}
+
+fn metadata_value_is_filesystem_unresolved(value: &Value) -> Result<bool, LixError> {
+    match value {
+        Value::Null => Ok(false),
+        Value::Text(value) => Ok(metadata_is_filesystem_unresolved(Some(value))),
+        Value::Json(value) => Ok(json_metadata_is_filesystem_unresolved(value)),
+        other => Err(LixError::new(
+            "LIX_ERROR_VALUE_TYPE",
+            format!("expected nullable metadata, got {other:?}"),
+        )),
+    }
+}
+
+fn json_metadata_is_filesystem_unresolved(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get(FILESYSTEM_UNRESOLVED_METADATA_KEY))
+        .is_some()
 }
 
 fn local_path_to_lix_path(
@@ -1790,6 +2626,31 @@ fn push_lix_path_segment(local: &mut PathBuf, segment: &str, path: &str) -> Resu
 
 fn is_plugin_storage_path(path: &str) -> bool {
     path == "/.lix/plugins" || path.starts_with("/.lix/plugins/")
+}
+
+fn is_invalid_plugin_storage_inventory_path(path: &str, is_directory: bool) -> bool {
+    if !is_plugin_storage_path(path) {
+        return false;
+    }
+    if path == "/.lix/plugins" || path == "/.lix/plugins/" {
+        return false;
+    }
+    is_directory || !is_valid_plugin_storage_archive_path(path)
+}
+
+fn is_valid_plugin_storage_archive_path(path: &str) -> bool {
+    let Some(file_name) = path.strip_prefix("/.lix/plugins/") else {
+        return false;
+    };
+    let Some(plugin_key) = file_name.strip_suffix(".lixplugin") else {
+        return false;
+    };
+    if plugin_key.is_empty() || plugin_key.len() > 128 || plugin_key.contains('/') {
+        return false;
+    }
+    let mut bytes = plugin_key.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
@@ -2348,5 +3209,23 @@ mod tests {
         );
 
         state.close().await.unwrap();
+    }
+
+    #[test]
+    fn inventory_unmanaged_blocks_lix_path_descendants() {
+        let inventory = InventorySnapshot {
+            unmanaged_paths: BTreeSet::from(["/dir/".to_string()]),
+            ..InventorySnapshot::default()
+        };
+
+        assert!(inventory_unmanaged_blocks_lix_path(
+            &inventory,
+            "/dir/file.txt"
+        ));
+        assert!(inventory_unmanaged_blocks_lix_path(&inventory, "/dir/"));
+        assert!(!inventory_unmanaged_blocks_lix_path(
+            &inventory,
+            "/dir-adjacent/file.txt"
+        ));
     }
 }

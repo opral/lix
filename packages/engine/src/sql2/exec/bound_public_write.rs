@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::Value as JsonValue;
 
 use crate::changelog::CommitId;
@@ -148,19 +150,14 @@ async fn execute_file_path_write(
             "bound lix_file fast write supports VALUES only",
         ));
     };
-    let mut affected = 0u64;
+    let mut writes = Vec::with_capacity(values.rows.len());
     for row in &values.rows {
-        let path = eval_fast_file_text(&row[shape.path_index], params, "path")?;
-        let data = eval_fast_file_blob(&row[shape.data_index], params, "data")?;
-        affected += crate::sql2::providers::execute_fast_lix_file_path_write(
-            ctx,
-            path,
-            data,
-            shape.conflict,
-        )
-        .await?;
+        writes.push((
+            eval_fast_file_text(&row[shape.path_index], params, "path")?,
+            eval_fast_file_blob(&row[shape.data_index], params, "data")?,
+        ));
     }
-    Ok(affected)
+    crate::sql2::providers::execute_fast_lix_file_path_writes(ctx, writes, shape.conflict).await
 }
 
 fn fast_file_path_write_shape(
@@ -173,7 +170,7 @@ fn fast_file_path_write_shape(
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return None;
     };
-    if values.rows.len() != 1 || values.columns.len() != 2 {
+    if values.rows.is_empty() || values.columns.len() != 2 {
         return None;
     }
     let path_index = values.column_index("path")?;
@@ -575,7 +572,7 @@ fn validate_insert_conflict_target(
             }
             Ok(path[0].clone())
         })
-        .collect::<Result<std::collections::BTreeSet<_>, LixError>>()?;
+        .collect::<Result<BTreeSet<_>, LixError>>()?;
     if matches!(
         plan.bound.target,
         BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
@@ -587,7 +584,7 @@ fn validate_insert_conflict_target(
         .target_columns
         .iter()
         .map(|column| column.name.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     if actual != expected {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -654,8 +651,8 @@ async fn scan_entity_conflict_candidates(
     spec: &EntitySurfaceSpec,
     insert_rows: &[TransactionWriteRow],
 ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
-    let mut branch_ids = std::collections::BTreeSet::new();
-    let mut untracked_values = std::collections::BTreeSet::new();
+    let mut branch_ids = BTreeSet::new();
+    let mut untracked_values = BTreeSet::new();
     for row in insert_rows {
         branch_ids.insert(row.branch_id.clone());
         untracked_values.insert(row.untracked);
@@ -723,7 +720,7 @@ enum InsertColumnTarget {
 impl InsertRowLayout {
     fn from_values(spec: &EntitySurfaceSpec, values: &BoundInsertValues) -> Result<Self, LixError> {
         let mut snapshot_capacity = 0;
-        let mut seen_columns = std::collections::BTreeSet::new();
+        let mut seen_columns = BTreeSet::new();
         let columns = values
             .columns
             .iter()

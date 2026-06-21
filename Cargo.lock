@@ -3026,6 +3026,7 @@ dependencies = [
  "lix_engine",
  "notify-debouncer-full",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "wasmtime",

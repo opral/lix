@@ -143,6 +143,15 @@ pub(super) trait UpsertSupport: Send + Sync {
         batch: &RecordBatch,
     ) -> Result<StagedUpsert>;
 
+    /// Validate all proposed rows before scanning existing conflict candidates.
+    fn validate_proposed_batches(
+        &self,
+        _batches: &[RecordBatch],
+        _target: &UpsertConflictTarget,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Scan existing rows whose identity matches a proposed row, returned as a
     /// batch in this table's column schema.
     async fn scan_conflict_candidates(
@@ -189,6 +198,8 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
     let conflict_columns = target.columns();
     let mut staged = StagedUpsert::default();
     let mut affected: u64 = 0;
+
+    spec.validate_proposed_batches(&proposed_batches, target)?;
 
     for batch in &proposed_batches {
         let existing = spec

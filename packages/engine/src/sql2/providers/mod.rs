@@ -29,7 +29,9 @@ use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
 use datafusion::catalog::TableProvider;
 
-pub(crate) use file::{FastLixFilePathWriteConflict, execute_fast_lix_file_path_write};
+pub(crate) use file::{
+    FastLixFilePathWriteConflict, execute_fast_lix_file_path_writes, filesystem_unresolved_metadata,
+};
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
 /// Execute an `INSERT ... ON CONFLICT` against a registered table provider.

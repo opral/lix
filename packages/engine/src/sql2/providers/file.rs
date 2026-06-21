@@ -10,7 +10,7 @@
     clippy::useless_let_if_seq
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,6 +29,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
@@ -66,6 +67,7 @@ use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILESYSTEM_UNRESOLVED_METADATA_KEY: &str = "lix_fs_unresolved";
 
 use crate::filesystem::{
     BlobRefRowInput, DirectoryPathRecord, DirectoryPathResolver, FileDeleteInput,
@@ -358,12 +360,14 @@ impl TableSpec for LixFileSpec {
     ) -> Result<PlannedScan> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let scan_limit = if filters.is_empty() { limit } else { None };
+        let filters = filters.to_vec();
+        let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let mut request = lix_file_scan_request(
             self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
             scan_limit,
+            needs_data,
         );
-        let filters = filters.to_vec();
         if matches!(self.branch_binding, BranchBinding::Explicit) {
             request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
         }
@@ -374,8 +378,8 @@ impl TableSpec for LixFileSpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
+        let target_paths = file_path_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
@@ -393,6 +397,7 @@ impl TableSpec for LixFileSpec {
                     projection.cloned(),
                     request,
                     target_file_ids,
+                    target_paths,
                     physical_filters,
                     needs_data,
                     limit,
@@ -405,6 +410,7 @@ impl TableSpec for LixFileSpec {
                     projection,
                     request,
                     target_file_ids,
+                    target_paths,
                     filters,
                     needs_data,
                     limit,
@@ -418,6 +424,8 @@ impl TableSpec for LixFileSpec {
                     .map_err(|error| {
                         DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                     })?;
+                    let rows = filter_lix_file_live_rows_by_path(rows, &target_paths)
+                        .map_err(lix_error_to_datafusion_error)?;
                     let plugin_render = plugin_render_context_for_lix_file_scan(
                         Arc::clone(&live_state),
                         &blob_reader,
@@ -496,7 +504,8 @@ impl TableSpec for LixFileSpec {
     ) -> Result<PlannedDml> {
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
-        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        let mut request =
+            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -560,7 +569,8 @@ impl TableSpec for LixFileSpec {
                 column_name == "path" || physical_expr_contains_column(expr, "data")
             });
         let target_file_ids = file_id_constraint_from_filters(filters)?;
-        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        let mut request =
+            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -761,6 +771,17 @@ impl UpsertSupport for LixFileSpec {
         ))
     }
 
+    fn validate_proposed_batches(
+        &self,
+        batches: &[RecordBatch],
+        target: &UpsertConflictTarget,
+    ) -> Result<()> {
+        if target.kind() == UpsertConflictKind::Path {
+            reject_duplicate_lix_file_path_conflict_identities(batches, target)?;
+        }
+        Ok(())
+    }
+
     async fn scan_conflict_candidates(
         &self,
         write_ctx: &SqlWriteContext,
@@ -777,7 +798,8 @@ impl UpsertSupport for LixFileSpec {
                 FileIdConstraint::All
             }
         };
-        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        let mut request =
+            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
         if matches!(self.branch_binding, BranchBinding::Explicit) {
             request.filter.branch_ids = match target.kind() {
                 UpsertConflictKind::Id => proposed_branch_ids(proposed)?,
@@ -857,7 +879,8 @@ impl UpsertSupport for LixFileSpec {
         // (needed to tombstone the old blob when `data` is replaced) and any
         // plugins installed for path-move rewrites.
         let target_file_ids = augmented_file_id_constraint(augmented)?;
-        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        let mut request =
+            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
         if matches!(self.branch_binding, BranchBinding::Explicit) {
             request.filter.branch_ids = augmented_branch_ids(augmented)?;
         }
@@ -994,6 +1017,37 @@ fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> 
             return Err(DataFusionError::Execution(format!(
                 "INSERT ON CONFLICT (path) on {table_name} requires non-null path"
             )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_lix_file_path_conflict_identities(
+    batches: &[RecordBatch],
+    target: &UpsertConflictTarget,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for batch in batches {
+        validate_required_paths(batch, "lix_file")?;
+        if target.columns().contains(&"lixcol_branch_id") {
+            let _ = required_proposed_branch_ids(batch, "lix_file")?;
+        }
+        for row_index in 0..batch.num_rows() {
+            let mut key = Vec::with_capacity(target.columns().len());
+            for column_name in target.columns() {
+                let column_index = batch.schema().index_of(column_name)?;
+                key.push(ScalarValue::try_from_array(
+                    batch.column(column_index).as_ref(),
+                    row_index,
+                )?);
+            }
+            if !seen.insert(key) {
+                let path = required_string_value(batch, row_index, "path")?;
+                return Err(lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!("duplicate lix_file VALUES path {path:?}"),
+                )));
+            }
         }
     }
     Ok(())
@@ -1249,16 +1303,17 @@ pub(crate) enum FastLixFilePathWriteConflict {
     UpdateData,
 }
 
-pub(crate) async fn execute_fast_lix_file_path_write(
+pub(crate) async fn execute_fast_lix_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
-    path: String,
-    data: Vec<u8>,
+    writes: Vec<(String, Vec<u8>)>,
     conflict: FastLixFilePathWriteConflict,
 ) -> Result<u64, LixError> {
-    let active_branch_id = ctx.active_branch_id().to_string();
-    let parsed = parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
-        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    if writes.is_empty() {
+        return Ok(0);
+    }
+    reject_duplicate_fast_lix_file_paths(&writes)?;
 
+    let active_branch_id = ctx.active_branch_id().to_string();
     let live_rows = ctx
         .scan_live_state(&LiveStateScanRequest {
             filter: LiveStateFilter {
@@ -1271,89 +1326,121 @@ pub(crate) async fn execute_fast_lix_file_path_write(
         })
         .await?;
     let filesystem = FilesystemIndex::from_live_rows(live_rows.clone())?;
-
-    if let Some(existing) = filesystem.file_entry(&parsed.path).cloned() {
-        if conflict != FastLixFilePathWriteConflict::None {
-            validate_fast_lix_file_path_conflict_pair(existing.scope.untracked, &parsed.path)?;
-        }
-        return match conflict {
-            FastLixFilePathWriteConflict::None => {
-                let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
-                let context = FilesystemRowContext {
-                    branch_id: active_branch_id.clone(),
-                    global: false,
-                    untracked: false,
-                    file_id: None,
-                    metadata: None,
-                };
-                let plan = plan_parsed_file_path_write_with_resolvers(
-                    &mut path_resolvers,
-                    parsed.parsed_path,
-                    Some(
-                        parsed
-                            .plugin_key
-                            .as_deref()
-                            .map(plugin_storage_archive_file_id)
-                            .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
-                    ),
-                    Some(data),
-                    context,
-                    &mut || ctx.functions().call_uuid_v7().to_string(),
-                )?;
-                let mut staged = LixFileStagedBatch::default();
-                staged.extend_filesystem_plan(plan);
-                stage_lix_file_fast_batch(ctx, TransactionWriteMode::Insert, staged).await
-            }
-            FastLixFilePathWriteConflict::DoNothing => Ok(0),
-            FastLixFilePathWriteConflict::UpdateData => {
-                let mut staged = LixFileStagedBatch::default();
-                let mut context = existing.scope.context(Some(existing.id.clone()));
-                if context.global {
-                    context.branch_id = GLOBAL_BRANCH_ID.to_string();
-                }
-                stage_lix_file_data_update_write(
-                    &mut staged,
-                    existing.id.clone(),
-                    Some(parsed.path),
-                    Some(existing.name.clone()),
-                    data,
-                    context,
-                    existing.blob_hash.is_some(),
-                    None,
-                )
-                .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-                staged.count = 1;
-                stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
-            }
-        };
-    }
-
+    let descriptor_contexts = file_descriptor_contexts_from_live_rows(&live_rows)?;
     let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
     let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, false, None);
     path_resolvers.entry(resolver_key).or_default();
-    let context = FilesystemRowContext {
-        branch_id: active_branch_id,
-        global: false,
-        untracked: false,
-        file_id: None,
-        metadata: None,
-    };
-    let file_id = parsed
-        .plugin_key
-        .as_deref()
-        .map(plugin_storage_archive_file_id)
-        .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
-    let mut plan = plan_parsed_file_path_write_with_resolvers(
-        &mut path_resolvers,
-        parsed.parsed_path,
-        Some(file_id.clone()),
-        Some(data),
-        context,
-        &mut || ctx.functions().call_uuid_v7().to_string(),
-    )?;
-    attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
     let mut staged = LixFileStagedBatch::default();
-    staged.extend_filesystem_plan(plan);
+
+    for (path, data) in writes {
+        let parsed = parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+
+        if let Some(existing) = filesystem.file_entry(&parsed.path).cloned() {
+            if conflict != FastLixFilePathWriteConflict::None {
+                validate_fast_lix_file_path_conflict_pair(existing.scope.untracked, &parsed.path)?;
+            }
+            match conflict {
+                FastLixFilePathWriteConflict::None => {
+                    let context = FilesystemRowContext {
+                        branch_id: active_branch_id.clone(),
+                        global: false,
+                        untracked: false,
+                        file_id: None,
+                        metadata: None,
+                    };
+                    let plan = plan_parsed_file_path_write_with_resolvers(
+                        &mut path_resolvers,
+                        parsed.parsed_path,
+                        Some(
+                            parsed
+                                .plugin_key
+                                .as_deref()
+                                .map(plugin_storage_archive_file_id)
+                                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
+                        ),
+                        Some(data),
+                        context,
+                        &mut || ctx.functions().call_uuid_v7().to_string(),
+                    )?;
+                    staged.extend_filesystem_plan(plan);
+                }
+                FastLixFilePathWriteConflict::DoNothing => {}
+                FastLixFilePathWriteConflict::UpdateData => {
+                    let descriptor_context = descriptor_contexts.get(&existing.id);
+                    let mut context = descriptor_context
+                        .map(|descriptor| descriptor.context.clone())
+                        .unwrap_or_else(|| existing.scope.context(None));
+                    if context.global {
+                        context.branch_id = GLOBAL_BRANCH_ID.to_string();
+                    }
+                    if file_metadata_is_filesystem_unresolved(
+                        context.metadata.as_ref().map(TransactionJson::normalized),
+                    ) {
+                        let Some(descriptor_context) = descriptor_context else {
+                            return Err(LixError::new(
+                                LixError::CODE_UNKNOWN,
+                                format!(
+                                    "missing descriptor context for unresolved file {:?}",
+                                    parsed.path
+                                ),
+                            ));
+                        };
+                        context = clear_filesystem_unresolved_metadata(&context);
+                        staged
+                            .state_rows
+                            .push(file_descriptor_row(FileDescriptorRowInput {
+                                id: existing.id.clone(),
+                                directory_id: descriptor_context.directory_id.clone(),
+                                name: descriptor_context.name.clone(),
+                                context: context.clone(),
+                            }));
+                    }
+                    stage_lix_file_data_update_write(
+                        &mut staged,
+                        existing.id.clone(),
+                        Some(parsed.path),
+                        Some(existing.name.clone()),
+                        data,
+                        context,
+                        existing.blob_hash.is_some(),
+                        None,
+                    )
+                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    staged.count = staged.count.checked_add(1).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_UNSUPPORTED_SQL,
+                            "lix_file fast write row count overflow",
+                        )
+                    })?;
+                }
+            }
+        } else {
+            let context = FilesystemRowContext {
+                branch_id: active_branch_id.clone(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: None,
+            };
+            let file_id = parsed
+                .plugin_key
+                .as_deref()
+                .map(plugin_storage_archive_file_id)
+                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
+            let mut plan = plan_parsed_file_path_write_with_resolvers(
+                &mut path_resolvers,
+                parsed.parsed_path,
+                Some(file_id.clone()),
+                Some(data),
+                context,
+                &mut || ctx.functions().call_uuid_v7().to_string(),
+            )?;
+            attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
+            staged.extend_filesystem_plan(plan);
+        }
+    }
+
     let mode = match conflict {
         FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
         FastLixFilePathWriteConflict::DoNothing | FastLixFilePathWriteConflict::UpdateData => {
@@ -1361,6 +1448,70 @@ pub(crate) async fn execute_fast_lix_file_path_write(
         }
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await
+}
+
+fn reject_duplicate_fast_lix_file_paths(writes: &[(String, Vec<u8>)]) -> Result<(), LixError> {
+    let mut seen = BTreeSet::new();
+    for (path, _) in writes {
+        if !seen.insert(path.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!("duplicate lix_file VALUES path {path:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct FileDescriptorContext {
+    directory_id: Option<String>,
+    name: String,
+    context: FilesystemRowContext,
+}
+
+fn file_descriptor_contexts_from_live_rows(
+    rows: &[MaterializedLiveStateRow],
+) -> Result<BTreeMap<String, FileDescriptorContext>, LixError> {
+    let mut descriptors = BTreeMap::new();
+    for row in rows {
+        if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot: FileDescriptorSnapshot =
+            serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("invalid lix_file_descriptor snapshot JSON: {error}"),
+                )
+            })?;
+        let metadata = row
+            .metadata
+            .as_deref()
+            .map(|metadata| {
+                let value = parse_row_metadata_value(metadata, "lix_file")?;
+                TransactionJson::from_value(value, "lix_file metadata")
+            })
+            .transpose()?;
+        descriptors.insert(
+            snapshot.id.clone(),
+            FileDescriptorContext {
+                directory_id: snapshot.directory_id,
+                name: snapshot.name,
+                context: FilesystemRowContext {
+                    branch_id: row.branch_id.clone(),
+                    global: row.global,
+                    untracked: row.untracked,
+                    file_id: row.file_id.clone(),
+                    metadata,
+                },
+            },
+        );
+    }
+    Ok(descriptors)
 }
 
 fn validate_fast_lix_file_path_conflict_pair(
@@ -1426,7 +1577,7 @@ fn lix_file_delete_stage_from_batch(
             parse_normal_write_file_path(&path, TransactionWriteOperation::Delete)?;
         }
         let file_id = required_string_value(batch, row_index, "id")?;
-        let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
+        let context = file_row_context_from_existing_batch(batch, row_index, branch_binding)?;
         staged.extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
             file_id: file_id.clone(),
             has_blob_ref: blob_ref_keys
@@ -1524,6 +1675,11 @@ fn lix_file_existing_update_stage_from_batch(
         let id = required_string_value(batch, row_index, "id")?;
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
+        let data_context = if include_data_writes {
+            clear_filesystem_unresolved_metadata(&context)
+        } else {
+            context.clone()
+        };
         let mut data_path = None;
         let mut data_filename = None;
         if include_descriptor_writes {
@@ -1548,12 +1704,24 @@ fn lix_file_existing_update_stage_from_batch(
                     id: id.clone(),
                     directory_id,
                     name,
-                    context: context.clone(),
+                    context: data_context.clone(),
                 }));
         }
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
+            if !include_descriptor_writes && context.metadata != data_context.metadata {
+                let directory_id = optional_string_value(batch, row_index, "directory_id")?;
+                let name = required_string_value(batch, row_index, "name")?;
+                staged
+                    .state_rows
+                    .push(file_descriptor_row(FileDescriptorRowInput {
+                        id: id.clone(),
+                        directory_id,
+                        name,
+                        context: data_context.clone(),
+                    }));
+            }
             let path = if include_descriptor_writes {
                 data_path
             } else {
@@ -1567,7 +1735,7 @@ fn lix_file_existing_update_stage_from_batch(
                 path,
                 data_filename,
                 data,
-                context,
+                data_context,
                 has_blob_ref,
                 None,
             )?;
@@ -1646,6 +1814,32 @@ fn reject_lix_file_update_plugin_storage_paths(
     Ok(())
 }
 
+fn reject_unresolved_metadata_update_without_data(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    update_columns: LixFileUpdateColumns,
+) -> Result<()> {
+    if update_columns.data || !update_columns.descriptor {
+        return Ok(());
+    }
+    for row_index in 0..batch.num_rows() {
+        if !matches!(
+            assignment_values.assigned_cell(row_index, "lixcol_metadata")?,
+            UpdateCell::Assigned(_)
+        ) {
+            continue;
+        }
+        let metadata = optional_string_value(batch, row_index, "lixcol_metadata")?;
+        if file_metadata_is_filesystem_unresolved(metadata.as_deref()) {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_READ_ONLY,
+                "UPDATE lix_file cannot modify metadata for unresolved filesystem data without also assigning data",
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn lix_file_update_stage_from_batch(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -1657,6 +1851,7 @@ fn lix_file_update_stage_from_batch(
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
     reject_lix_file_update_plugin_storage_paths(batch, assignment_values, update_columns)?;
+    reject_unresolved_metadata_update_without_data(batch, assignment_values, update_columns)?;
 
     if update_columns.path || update_columns.descriptor {
         let Some(path_resolvers) = path_resolvers else {
@@ -1722,6 +1917,11 @@ fn lix_file_path_update_stage_from_batch(
         } = parse_file_upsert_path(&path, TransactionWriteOperation::Update)?;
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
+        let data_context = if update_columns.data {
+            clear_filesystem_unresolved_metadata(&context)
+        } else {
+            context.clone()
+        };
         let assigned_data = if update_columns.data {
             Some(update_required_binary_value(
                 batch,
@@ -1737,7 +1937,7 @@ fn lix_file_path_update_stage_from_batch(
             path_resolvers,
             id.clone(),
             parsed_path,
-            context.clone(),
+            data_context.clone(),
             generate_directory_id,
         )
         .map_err(lix_error_to_datafusion_error)?;
@@ -1752,7 +1952,7 @@ fn lix_file_path_update_stage_from_batch(
                 Some(path),
                 Some(filename),
                 data,
-                context,
+                data_context,
                 has_blob_ref,
                 None,
             )?;
@@ -2139,6 +2339,34 @@ fn file_row_context_from_batch(
     })
 }
 
+fn file_row_context_from_existing_batch(
+    batch: &RecordBatch,
+    row_index: usize,
+    branch_binding: Option<&str>,
+) -> Result<FilesystemRowContext> {
+    let explicit_branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?;
+    let scope = resolve_write_branch_scope(
+        optional_bool_value(batch, row_index, "lixcol_global")?,
+        explicit_branch_id,
+        branch_binding,
+        "lix_file_by_branch",
+        "lix_file",
+    )?;
+
+    Ok(FilesystemRowContext {
+        branch_id: scope.branch_id,
+        global: scope.global,
+        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
+        metadata: optional_existing_metadata_value(
+            batch,
+            row_index,
+            "lixcol_metadata",
+            "lix_file",
+        )?,
+    })
+}
+
 fn file_row_context_from_update(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -2320,6 +2548,15 @@ async fn lix_file_record_batch(
             match blob_rows.get(&FilesystemBlobRefKey::from_context(&context, &file.id)) {
                 Some(blob_ref) => load_single_blob_bytes(blob_reader, &blob_ref.blob_hash).await?,
                 None => {
+                    if file_metadata_is_filesystem_unresolved(file.live.metadata.as_deref()) {
+                        return Err(LixError::new(
+                            "LIX_FILESYSTEM_DATA_UNRESOLVED",
+                            format!("filesystem data for path {path:?} has not been imported yet"),
+                        )
+                        .with_hint(
+                            "Hydrate the filesystem file data before selecting lix_file.data.",
+                        ));
+                    }
                     let rendered = match &plugin_render {
                         Some(plugin_render) => {
                             render_plugin_file_for_sql(plugin_render, &file, &path).await?
@@ -2520,6 +2757,7 @@ fn lix_file_scan_request(
     branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
+    needs_data: bool,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
         filter: LiveStateFilter {
@@ -2533,24 +2771,43 @@ fn lix_file_scan_request(
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
-        projection: lix_file_live_state_projection(projected_schema),
+        projection: lix_file_live_state_projection(projected_schema, needs_data),
         limit,
     }
 }
 
-fn lix_file_live_state_projection(projected_schema: Option<&Schema>) -> LiveStateProjection {
+fn lix_file_live_state_projection(
+    projected_schema: Option<&Schema>,
+    needs_data: bool,
+) -> LiveStateProjection {
     let Some(schema) = projected_schema else {
         return LiveStateProjection::default();
     };
     let mut columns = vec!["snapshot_content".to_string()];
-    if schema
-        .fields()
-        .iter()
-        .any(|field| field.name() == "lixcol_metadata")
+    if needs_data
+        || schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == "lixcol_metadata")
     {
         columns.push("metadata".to_string());
     }
     LiveStateProjection { columns }
+}
+
+fn file_metadata_is_filesystem_unresolved(metadata: Option<&str>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .and_then(|object| object.get(FILESYSTEM_UNRESOLVED_METADATA_KEY))
+                .cloned()
+        })
+        .is_some()
 }
 
 async fn scan_lix_file_live_rows(
@@ -2583,6 +2840,96 @@ async fn scan_lix_file_live_rows(
     rows.extend(live_state.scan_rows(&directory_request).await?);
 
     Ok(rows)
+}
+
+fn filter_lix_file_live_rows_by_path(
+    rows: Vec<MaterializedLiveStateRow>,
+    target_paths: &FileIdConstraint,
+) -> std::result::Result<Vec<MaterializedLiveStateRow>, LixError> {
+    if matches!(target_paths, FileIdConstraint::All) {
+        return Ok(rows);
+    }
+
+    let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
+    let mut file_rows = Vec::<FileDescriptorRecord>::new();
+    for row in &rows {
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        match row.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY => {
+                let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("invalid lix_file_descriptor snapshot JSON: {error}"),
+                        )
+                    })?;
+                file_rows.push(FileDescriptorRecord {
+                    id: snapshot.id.clone(),
+                    directory_id: snapshot.directory_id,
+                    name: snapshot.name,
+                    key: FilesystemDescriptorKey::from_live_row(row, snapshot.id),
+                    live: row.clone(),
+                });
+            }
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
+                        )
+                    })?;
+                directory_rows.push(DirectoryDescriptorRecord {
+                    key: FilesystemDescriptorKey::from_live_row(row, snapshot.id.clone()),
+                    parent_id: snapshot.parent_id,
+                    name: snapshot.name,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let directory_paths =
+        derive_directory_paths(directory_rows.iter().map(|row| (row.key.clone(), row)))?;
+    let mut keep_file_ids = BTreeSet::new();
+    for file in file_rows {
+        let directory_path = match file.directory_id.as_ref() {
+            Some(directory_id) => {
+                let parent_key = file
+                    .directory_parent_keys(directory_id)
+                    .into_iter()
+                    .find(|key| directory_paths.contains_key(key));
+                parent_key
+                    .as_ref()
+                    .and_then(|key| directory_paths.get(key))
+                    .cloned()
+            }
+            None => None,
+        };
+        let path = compose_file_path(directory_path.as_deref(), &file.name)?;
+        if target_paths.matches_value(&path) {
+            keep_file_ids.insert(file.id);
+        }
+    }
+
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            if row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+                return true;
+            }
+            if row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY || row.schema_key == BLOB_REF_SCHEMA_KEY
+            {
+                return row
+                    .entity_pk
+                    .as_single_string()
+                    .is_ok_and(|file_id| keep_file_ids.contains(file_id));
+            }
+            true
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2627,10 +2974,29 @@ impl FileIdConstraint {
             }
         }
     }
+
+    fn matches_value(&self, value: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Ids(values) => values.contains(value),
+        }
+    }
 }
 
 fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
     let analyzer = LixFileIdFilterAnalyzer;
+    let mut constraint = FileIdConstraint::All;
+    for filter in filters {
+        if let Some(filter_constraint) = analyzer.analyze(filter)? {
+            constraint = constraint.intersect(filter_constraint);
+        }
+    }
+    Ok(constraint)
+}
+
+fn file_path_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
+    let analyzer = ExactStringColumnFilterAnalyzer::new("path");
     let mut constraint = FileIdConstraint::All;
     for filter in filters {
         if let Some(filter_constraint) = analyzer.analyze(filter)? {
@@ -2963,14 +3329,32 @@ fn update_optional_metadata_value(
     column_name: &str,
     context: &str,
 ) -> Result<Option<TransactionJson>> {
-    update_optional_string_value(batch, assignment_values, row_index, column_name)?
-        .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+    match assignment_values.assigned_cell(row_index, column_name)? {
+        UpdateCell::Assigned(SqlCell::Null) => Ok(None),
+        UpdateCell::Assigned(SqlCell::Value(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        )) => {
+            let metadata = parse_public_lix_file_metadata(&value, context)?;
             TransactionJson::from_value(metadata, &format!("{context} metadata"))
                 .map_err(crate::sql2::error::lix_error_to_datafusion_error)
-        })
-        .transpose()
+                .map(Some)
+        }
+        UpdateCell::Assigned(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_file expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+        UpdateCell::Unassigned => {
+            update_optional_string_value(batch, assignment_values, row_index, column_name)?
+                .map(|value| {
+                    let metadata = parse_row_metadata_value(&value, context)
+                        .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+                    TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                        .map_err(crate::sql2::error::lix_error_to_datafusion_error)
+                })
+                .transpose()
+        }
+    }
 }
 
 fn update_required_binary_value(
@@ -3054,12 +3438,80 @@ fn optional_metadata_value(
 ) -> Result<Option<TransactionJson>> {
     optional_string_value(batch, row_index, column_name)?
         .map(|value| {
+            let metadata = parse_public_lix_file_metadata(&value, context)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(crate::sql2::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
+}
+
+fn optional_existing_metadata_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<TransactionJson>> {
+    optional_string_value(batch, row_index, column_name)?
+        .map(|value| {
             let metadata = parse_row_metadata_value(&value, context)
                 .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
             TransactionJson::from_value(metadata, &format!("{context} metadata"))
                 .map_err(crate::sql2::error::lix_error_to_datafusion_error)
         })
         .transpose()
+}
+
+fn parse_public_lix_file_metadata(value: &str, context: &str) -> Result<serde_json::Value> {
+    let metadata = parse_row_metadata_value(value, context)
+        .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+    if metadata
+        .as_object()
+        .is_some_and(|object| object.contains_key(FILESYSTEM_UNRESOLVED_METADATA_KEY))
+    {
+        return Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_READ_ONLY,
+            format!(
+                "{context} metadata key {FILESYSTEM_UNRESOLVED_METADATA_KEY:?} is reserved for filesystem backend inventory"
+            ),
+        )));
+    }
+    Ok(metadata)
+}
+
+fn clear_filesystem_unresolved_metadata(context: &FilesystemRowContext) -> FilesystemRowContext {
+    let Some(metadata) = context.metadata.as_ref() else {
+        return context.clone();
+    };
+    let Some(object) = metadata.value().as_object() else {
+        return context.clone();
+    };
+    if !object.contains_key(FILESYSTEM_UNRESOLVED_METADATA_KEY) {
+        return context.clone();
+    }
+
+    let mut value = metadata.value().clone();
+    let Some(object) = value.as_object_mut() else {
+        return context.clone();
+    };
+    object.remove(FILESYSTEM_UNRESOLVED_METADATA_KEY);
+
+    let metadata = if object.is_empty() {
+        None
+    } else {
+        Some(TransactionJson::from_value_unchecked(value))
+    };
+    FilesystemRowContext {
+        metadata,
+        ..context.clone()
+    }
+}
+
+pub(crate) fn filesystem_unresolved_metadata() -> TransactionJson {
+    TransactionJson::from_value_unchecked(json!({
+        FILESYSTEM_UNRESOLVED_METADATA_KEY: {
+            "version": 1
+        }
+    }))
 }
 
 fn optional_bool_value(
@@ -3698,6 +4150,31 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file insert batch")
     }
 
+    fn path_upsert_batch(path: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("path", DataType::Utf8, false)])),
+            vec![string_column(vec![Some(path)])],
+        )
+        .expect("path upsert batch")
+    }
+
+    #[test]
+    fn path_upsert_duplicate_validation_spans_batches() {
+        let target = super::UpsertConflictTarget::path(super::LIX_FILE_PATH_IDENTITY);
+
+        let error = super::reject_duplicate_lix_file_path_conflict_identities(
+            &[path_upsert_batch("/dup.md"), path_upsert_batch("/dup.md")],
+            &target,
+        )
+        .expect_err("duplicate path in a later batch should be rejected");
+
+        assert!(
+            error
+                .strip_backtrace()
+                .contains("duplicate lix_file VALUES path \"/dup.md\"")
+        );
+    }
+
     fn data_insert_batch() -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -3782,6 +4259,30 @@ mod tests {
             ],
         )
         .expect("file data update batch")
+    }
+
+    fn unresolved_data_update_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, false),
+                Field::new("directory_id", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
+                crate::sql2::result_metadata::json_field("lixcol_metadata", true),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("/docs/readme.md")]),
+                string_column(vec![Some("dir-docs")]),
+                string_column(vec![Some("readme.md")]),
+                Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
+                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some(r#"{"lix_fs_unresolved":{"version":1}}"#)]),
+            ],
+        )
+        .expect("file unresolved data update batch")
     }
 
     fn descriptor_data_update_batch() -> RecordBatch {
@@ -4435,6 +4936,37 @@ mod tests {
         assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
         assert_eq!(staged.state_rows.len(), 1);
         assert_eq!(staged.state_rows[0].schema_key, "lix_binary_blob_ref");
+    }
+
+    #[test]
+    fn file_data_update_clears_unresolved_metadata() {
+        let staged = lix_file_update_stage_from_batch_for_test(
+            &unresolved_data_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: false,
+                data: true,
+                descriptor: false,
+            },
+            None,
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect("decode file data update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.file_data_writes.len(), 1);
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("data hydration should restage the descriptor");
+        assert_eq!(descriptor.metadata, None);
+        assert!(
+            staged
+                .state_rows
+                .iter()
+                .any(|row| row.schema_key == "lix_binary_blob_ref")
+        );
     }
 
     #[test]

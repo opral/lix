@@ -14,6 +14,10 @@ use crate::branch::{
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_pk::EntityPk;
+use crate::filesystem::{
+    DirectoryDescriptorWriteIntent, FileDescriptorRowInput, FilesystemRowContext,
+    directory_descriptor_write_row, file_descriptor_row,
+};
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
@@ -393,6 +397,34 @@ where
         self.with_write_transaction_reserved(write_access, f).await
     }
 
+    #[doc(hidden)]
+    pub async fn import_unresolved_filesystem_inventory(
+        &self,
+        existing_directories: &[(String, String)],
+        directories: &[String],
+        files: &[String],
+    ) -> Result<(), LixError> {
+        let existing_directories = existing_directories.to_vec();
+        let directories = directories.to_vec();
+        let files = files.to_vec();
+        self.with_write_transaction(|transaction| {
+            Box::pin(async move {
+                let rows = unresolved_filesystem_inventory_rows(
+                    transaction.active_branch_id(),
+                    transaction.functions(),
+                    &existing_directories,
+                    &directories,
+                    &files,
+                )?;
+                if !rows.is_empty() {
+                    transaction.stage_rows(rows).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     pub(super) async fn with_write_transaction_reserved<T, F>(
         &self,
         write_access: SessionWriteAccess,
@@ -447,6 +479,118 @@ where
     ) -> crate::transaction::TransactionCommitBoundary {
         self.transaction_manager.transaction_commit_boundary()
     }
+}
+
+fn unresolved_filesystem_inventory_rows(
+    active_branch_id: &str,
+    functions: FunctionProviderHandle,
+    existing_directories: &[(String, String)],
+    directories: &[String],
+    files: &[String],
+) -> Result<Vec<crate::transaction::types::TransactionWriteRow>, LixError> {
+    let mut rows = Vec::new();
+    let mut directory_ids = std::collections::BTreeMap::<String, String>::new();
+    directory_ids.insert("/".to_string(), String::new());
+    directory_ids.extend(existing_directories.iter().cloned());
+
+    let mut directories = directories
+        .iter()
+        .filter(|path| path.as_str() != "/")
+        .cloned()
+        .collect::<Vec<_>>();
+    directories.sort_by(|left, right| {
+        filesystem_path_depth(left)
+            .cmp(&filesystem_path_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+
+    for directory in directories {
+        let parent = filesystem_parent_directory_path(directory.trim_end_matches('/'));
+        let id = functions.call_uuid_v7().to_string();
+        let parent_id = directory_ids
+            .get(&parent)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let name = filesystem_leaf_name(&directory)?.to_string();
+        rows.push(directory_descriptor_write_row(
+            DirectoryDescriptorWriteIntent {
+                id: Some(id.clone()),
+                parent_id,
+                name,
+                context: FilesystemRowContext {
+                    branch_id: active_branch_id.to_string(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                },
+            },
+        ));
+        directory_ids.insert(directory, id);
+    }
+
+    for file in files {
+        let directory = filesystem_parent_directory_path(file);
+        let directory_id = if directory == "/" {
+            None
+        } else {
+            Some(
+                directory_ids
+                    .get(&directory)
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            "LIX_FILESYSTEM_ERROR",
+                            format!(
+                                "cannot import unresolved file {file:?}: missing directory {directory:?}"
+                            ),
+                        )
+                    })?,
+            )
+        };
+        let file_id = functions.call_uuid_v7().to_string();
+        rows.push(file_descriptor_row(FileDescriptorRowInput {
+            id: file_id,
+            directory_id,
+            name: filesystem_leaf_name(file)?.to_string(),
+            context: FilesystemRowContext {
+                branch_id: active_branch_id.to_string(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: Some(crate::sql2::filesystem_unresolved_metadata()),
+            },
+        }));
+    }
+
+    Ok(rows)
+}
+
+fn filesystem_parent_directory_path(path: &str) -> String {
+    let path = path.trim_end_matches('/');
+    let Some(index) = path.rfind('/') else {
+        return "/".to_string();
+    };
+    if index == 0 {
+        "/".to_string()
+    } else {
+        format!("{}/", &path[..index])
+    }
+}
+
+fn filesystem_leaf_name(path: &str) -> Result<&str, LixError> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| LixError::new("LIX_FILESYSTEM_ERROR", format!("invalid path {path:?}")))
+}
+
+fn filesystem_path_depth(path: &str) -> usize {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
 }
 
 impl<B> PluginComponentHost for SessionContext<B>
