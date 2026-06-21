@@ -23,6 +23,7 @@ rust-version = "1.93"
 lix_cli = { path = "packages/cli", version = "0.7.0" }
 lix_backends = { path = "packages/backends", version = "0.7.0", default-features = false }
 lix_engine = { path = "packages/engine", version = "0.7.0" }
+lix_fs_backend = { path = "packages/fs-backend", version = "0.7.0", default-features = false }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.7.0" }
 lix_order_key = { path = "plugins/order-key", version = "0.7.0" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.7.0" }

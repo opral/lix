@@ -3000,6 +3000,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lix_fs_backend"
+version = "0.7.0"
+dependencies = [
+ "bytes",
+ "lix_engine",
+ "rocksdb",
+ "tempfile",
+]
+
+[[package]]
 name = "lix_js_sdk"
 version = "0.7.0"
 dependencies = [

@@ -1,0 +1,32 @@
+[package]
+name = "lix_fs_backend"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+rocksdb = ["dep:bytes", "dep:rocksdb", "dep:tempfile"]
+
+[dependencies]
+lix_engine = { workspace = true }
+
+bytes = { version = "1", optional = true }
+rocksdb = { version = "0.22", default-features = false, optional = true }
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+bytes = "1"
+tempfile = "3"
