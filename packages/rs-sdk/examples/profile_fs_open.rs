@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 
 use lix_engine::{
     Backend as _, BackendRead as _, BinaryCasStorageStats, BinaryCasWriteMetrics, ReadOptions,
-    binary_cas_write_metrics_snapshot, collect_binary_cas_storage_stats,
+    Value, binary_cas_write_metrics_snapshot, collect_binary_cas_storage_stats,
     reset_binary_cas_write_metrics,
 };
-use lix_sdk::FsBackend;
+use lix_sdk::{FsBackend, open_lix_with_backend};
 #[cfg(feature = "rocksdb")]
 use lix_sdk::{FsBackendFilter, RocksDbBlobOptions};
 
@@ -38,6 +38,7 @@ struct Args {
     in_place: bool,
     json: bool,
     keep_workspace: bool,
+    read_bench: bool,
     src: String,
 }
 
@@ -66,6 +67,26 @@ struct ProfileStats {
     binary_cas_chunk_rows: u64,
     binary_cas_total_chunk_refs: u64,
     binary_cas_logical_blob_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReadBenchStats {
+    all_files_ms: u128,
+    all_files_count: u64,
+    all_files_bytes: u64,
+    largest_files_ms: u128,
+    largest_files_repeat_ms: u128,
+    largest_files_count: u64,
+    largest_files_bytes: u64,
+    small_sample_ms: u128,
+    small_sample_count: u64,
+    small_sample_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BenchFile {
+    lix_path: String,
+    size_bytes: u64,
 }
 
 impl ProfileBackend {
@@ -136,6 +157,7 @@ fn parse_args() -> Args {
     let mut in_place = false;
     let mut json = false;
     let mut keep_workspace = false;
+    let mut read_bench = false;
     let mut src = None;
 
     while let Some(arg) = raw.next() {
@@ -186,6 +208,7 @@ fn parse_args() -> Args {
             "--in-place" => in_place = true,
             "--json" => json = true,
             "--keep-workspace" => keep_workspace = true,
+            "--read-bench" => read_bench = true,
             _ if arg.starts_with("--") => panic!("unknown option '{arg}'"),
             _ => {
                 if src.replace(arg).is_some() {
@@ -201,8 +224,9 @@ fn parse_args() -> Args {
         in_place,
         json,
         keep_workspace,
+        read_bench,
         src: src.expect(
-            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--backend sqlite|rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
+            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--read-bench] [--backend sqlite|rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
         ),
     }
 }
@@ -275,6 +299,165 @@ fn collect_backend_profile_stats(backend: &FsBackend, stats: &mut ProfileStats) 
         collect_binary_cas_storage_stats(&read).expect("profile binary CAS stats should collect");
     read.close().expect("profile backend read should close");
     apply_binary_cas_stats(stats, binary_cas);
+}
+
+async fn run_read_benchmark(backend: &FsBackend, workspace: &Path) -> ReadBenchStats {
+    let files = collect_bench_files(workspace);
+    let largest = files.iter().take(4).collect::<Vec<_>>();
+    let small_sample = select_small_sample(&files, 16);
+    let lix = open_lix_with_backend(backend.clone())
+        .await
+        .expect("profile read benchmark should open lix");
+
+    let all_started = Instant::now();
+    let all_files = lix
+        .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
+        .await
+        .expect("profile read benchmark should read all files");
+    let all_files_ms = duration_ms(all_started.elapsed());
+    let mut all_files_count = 0u64;
+    let mut all_files_bytes = 0u64;
+    for row in all_files.rows() {
+        let _path = row
+            .get::<String>("path")
+            .expect("profile read benchmark path should decode");
+        let data = row
+            .get::<Vec<u8>>("data")
+            .expect("profile read benchmark data should decode");
+        all_files_count += 1;
+        all_files_bytes += data.len() as u64;
+    }
+
+    let (largest_files_ms, largest_files_bytes) = time_read_paths(&lix, &largest).await;
+    let (largest_files_repeat_ms, repeat_largest_bytes) = time_read_paths(&lix, &largest).await;
+    assert_eq!(
+        largest_files_bytes, repeat_largest_bytes,
+        "profile read benchmark repeated largest reads should return the same bytes"
+    );
+    let (small_sample_ms, small_sample_bytes) = time_read_paths(&lix, &small_sample).await;
+    lix.close()
+        .await
+        .expect("profile read benchmark should close lix");
+
+    ReadBenchStats {
+        all_files_ms,
+        all_files_count,
+        all_files_bytes,
+        largest_files_ms,
+        largest_files_repeat_ms,
+        largest_files_count: largest.len() as u64,
+        largest_files_bytes,
+        small_sample_ms,
+        small_sample_count: small_sample.len() as u64,
+        small_sample_bytes,
+    }
+}
+
+async fn time_read_paths(lix: &lix_sdk::Lix<FsBackend>, files: &[&BenchFile]) -> (u128, u64) {
+    let started = Instant::now();
+    let mut bytes = 0u64;
+    for file in files {
+        let result = lix
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(file.lix_path.clone())],
+            )
+            .await
+            .expect("profile read benchmark should read file");
+        let row = result
+            .rows()
+            .first()
+            .unwrap_or_else(|| panic!("missing lix_file row for {}", file.lix_path));
+        let data = row
+            .get::<Vec<u8>>("data")
+            .expect("profile read benchmark data should decode");
+        assert_eq!(
+            data.len() as u64,
+            file.size_bytes,
+            "profile read benchmark byte count mismatch for {}",
+            file.lix_path
+        );
+        bytes += data.len() as u64;
+    }
+    (duration_ms(started.elapsed()), bytes)
+}
+
+fn collect_bench_files(workspace: &Path) -> Vec<BenchFile> {
+    let mut files = Vec::new();
+    collect_bench_files_recursive(workspace, workspace, &mut files);
+    files.sort_by(|left, right| {
+        right
+            .size_bytes
+            .cmp(&left.size_bytes)
+            .then_with(|| left.lix_path.cmp(&right.lix_path))
+    });
+    files
+}
+
+fn collect_bench_files_recursive(root: &Path, dir: &Path, files: &mut Vec<BenchFile>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.expect("profile read benchmark should read directory entry");
+        if entry.file_name() == ".lix" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .expect("profile read benchmark should read metadata");
+        if metadata.is_dir() {
+            collect_bench_files_recursive(root, &path, files);
+        } else if metadata.is_file() {
+            files.push(BenchFile {
+                lix_path: local_path_to_lix_path(root, &path),
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+}
+
+fn local_path_to_lix_path(root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .expect("profile read benchmark file should be under workspace");
+    let mut lix_path = String::from("/");
+    for (index, component) in relative.components().enumerate() {
+        if index > 0 {
+            lix_path.push('/');
+        }
+        match component {
+            std::path::Component::Normal(segment) => {
+                lix_path.push_str(&segment.to_string_lossy());
+            }
+            _ => panic!("profile read benchmark only supports normal path components"),
+        }
+    }
+    lix_path
+}
+
+fn select_small_sample(files: &[BenchFile], count: usize) -> Vec<&BenchFile> {
+    let mut small = files
+        .iter()
+        .filter(|file| file.size_bytes <= 64 * 1024)
+        .collect::<Vec<_>>();
+    small.sort_by(|left, right| {
+        stable_path_hash(&left.lix_path)
+            .cmp(&stable_path_hash(&right.lix_path))
+            .then_with(|| left.lix_path.cmp(&right.lix_path))
+    });
+    small.truncate(count);
+    small
+}
+
+fn stable_path_hash(path: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn apply_binary_cas_stats(stats: &mut ProfileStats, binary_cas: BinaryCasStorageStats) {
@@ -404,6 +587,7 @@ fn print_result(
     warm_elapsed: Option<Duration>,
     warm_metrics: Option<&BinaryCasWriteMetrics>,
     compact_elapsed: Option<Duration>,
+    read_bench: Option<&ReadBenchStats>,
     stats: &ProfileStats,
     workspace_path: Option<&Path>,
 ) {
@@ -418,6 +602,7 @@ fn print_result(
         let compact_ms_json = compact_elapsed
             .map(|duration| duration_ms(duration).to_string())
             .unwrap_or_else(|| "null".to_string());
+        let read_bench = read_bench.copied().unwrap_or_default();
         match (copy_elapsed, warm_elapsed) {
             (Some(copy_elapsed), Some(warm_elapsed)) => println!(
                 concat!(
@@ -439,6 +624,16 @@ fn print_result(
                     "\"warm_binary_cas_chunk_lookup_miss_count\":{},",
                     "\"warm_binary_cas_chunk_lookup_time_us\":{},",
                     "\"warm_binary_cas_transaction_duplicate_chunk_count\":{},",
+                    "\"read_all_files_ms\":{},",
+                    "\"read_all_files_count\":{},",
+                    "\"read_all_files_bytes\":{},",
+                    "\"read_largest_files_ms\":{},",
+                    "\"read_largest_files_repeat_ms\":{},",
+                    "\"read_largest_files_count\":{},",
+                    "\"read_largest_files_bytes\":{},",
+                    "\"read_small_sample_ms\":{},",
+                    "\"read_small_sample_count\":{},",
+                    "\"read_small_sample_bytes\":{},",
                     "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
@@ -495,6 +690,16 @@ fn print_result(
                 warm_metrics
                     .map(|metrics| metrics.transaction_duplicate_chunk_count)
                     .unwrap_or_default(),
+                read_bench.all_files_ms,
+                read_bench.all_files_count,
+                read_bench.all_files_bytes,
+                read_bench.largest_files_ms,
+                read_bench.largest_files_repeat_ms,
+                read_bench.largest_files_count,
+                read_bench.largest_files_bytes,
+                read_bench.small_sample_ms,
+                read_bench.small_sample_count,
+                read_bench.small_sample_bytes,
                 compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
@@ -533,6 +738,16 @@ fn print_result(
                     "\"open_binary_cas_chunk_lookup_miss_count\":{},",
                     "\"open_binary_cas_chunk_lookup_time_us\":{},",
                     "\"open_binary_cas_transaction_duplicate_chunk_count\":{},",
+                    "\"read_all_files_ms\":{},",
+                    "\"read_all_files_count\":{},",
+                    "\"read_all_files_bytes\":{},",
+                    "\"read_largest_files_ms\":{},",
+                    "\"read_largest_files_repeat_ms\":{},",
+                    "\"read_largest_files_count\":{},",
+                    "\"read_largest_files_bytes\":{},",
+                    "\"read_small_sample_ms\":{},",
+                    "\"read_small_sample_count\":{},",
+                    "\"read_small_sample_bytes\":{},",
                     "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
@@ -569,6 +784,16 @@ fn print_result(
                 open_metrics.chunk_lookup_miss_count,
                 metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
                 open_metrics.transaction_duplicate_chunk_count,
+                read_bench.all_files_ms,
+                read_bench.all_files_count,
+                read_bench.all_files_bytes,
+                read_bench.largest_files_ms,
+                read_bench.largest_files_repeat_ms,
+                read_bench.largest_files_count,
+                read_bench.largest_files_bytes,
+                read_bench.small_sample_ms,
+                read_bench.small_sample_count,
+                read_bench.small_sample_bytes,
                 compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
@@ -602,6 +827,9 @@ fn print_result(
         if let Some(compact_elapsed) = compact_elapsed {
             println!("COMPACT_MS={}", duration_ms(compact_elapsed));
         }
+        if let Some(read_bench) = read_bench {
+            print_read_bench(read_bench);
+        }
         print_text_stats(stats, workspace_path);
     } else {
         println!("COLD_OPEN_MS={}", duration_ms(open_elapsed));
@@ -612,6 +840,9 @@ fn print_result(
         }
         if let Some(compact_elapsed) = compact_elapsed {
             println!("COMPACT_MS={}", duration_ms(compact_elapsed));
+        }
+        if let Some(read_bench) = read_bench {
+            print_read_bench(read_bench);
         }
         print_text_stats(stats, workspace_path);
     }
@@ -642,6 +873,28 @@ fn print_open_metrics(prefix: &str, metrics: &BinaryCasWriteMetrics) {
         "{prefix}_BINARY_CAS_TRANSACTION_DUPLICATE_CHUNK_COUNT={}",
         metrics.transaction_duplicate_chunk_count
     );
+}
+
+fn print_read_bench(read_bench: &ReadBenchStats) {
+    println!("READ_ALL_FILES_MS={}", read_bench.all_files_ms);
+    println!("READ_ALL_FILES_COUNT={}", read_bench.all_files_count);
+    println!("READ_ALL_FILES_BYTES={}", read_bench.all_files_bytes);
+    println!("READ_LARGEST_FILES_MS={}", read_bench.largest_files_ms);
+    println!(
+        "READ_LARGEST_FILES_REPEAT_MS={}",
+        read_bench.largest_files_repeat_ms
+    );
+    println!(
+        "READ_LARGEST_FILES_COUNT={}",
+        read_bench.largest_files_count
+    );
+    println!(
+        "READ_LARGEST_FILES_BYTES={}",
+        read_bench.largest_files_bytes
+    );
+    println!("READ_SMALL_SAMPLE_MS={}", read_bench.small_sample_ms);
+    println!("READ_SMALL_SAMPLE_COUNT={}", read_bench.small_sample_count);
+    println!("READ_SMALL_SAMPLE_BYTES={}", read_bench.small_sample_bytes);
 }
 
 fn print_text_stats(stats: &ProfileStats, workspace_path: Option<&Path>) {
@@ -702,6 +955,11 @@ async fn main() {
     if args.in_place {
         let (backend, open_elapsed, open_metrics) = open_with_metrics(args.backend, src).await;
         eprintln!("{} in-place open: {open_elapsed:?}", args.backend.name());
+        let read_bench = if args.read_bench {
+            Some(run_read_benchmark(&backend, src).await)
+        } else {
+            None
+        };
         let compact_elapsed = compact_backend_if_requested(&args, &backend);
         let mut stats = collect_profile_stats(src);
         collect_backend_profile_stats(&backend, &mut stats);
@@ -714,6 +972,7 @@ async fn main() {
             None,
             None,
             compact_elapsed,
+            read_bench.as_ref(),
             &stats,
             Some(src),
         );
@@ -740,6 +999,11 @@ async fn main() {
     // Warm reopen (now .lix exists).
     let (backend, warm_elapsed, warm_metrics) = open_with_metrics(args.backend, &work).await;
     eprintln!("{} warm reopen: {warm_elapsed:?}", args.backend.name());
+    let read_bench = if args.read_bench {
+        Some(run_read_benchmark(&backend, &work).await)
+    } else {
+        None
+    };
     let compact_elapsed = compact_backend_if_requested(&args, &backend);
     let mut stats = collect_profile_stats(&work);
     collect_backend_profile_stats(&backend, &mut stats);
@@ -771,6 +1035,7 @@ async fn main() {
         Some(warm_elapsed),
         Some(&warm_metrics),
         compact_elapsed,
+        read_bench.as_ref(),
         &stats,
         workspace_path,
     );
