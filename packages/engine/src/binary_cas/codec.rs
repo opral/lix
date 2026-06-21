@@ -11,13 +11,6 @@ pub(crate) enum BinaryChunkCodec {
     Raw,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
-pub(crate) struct EncodedBinaryChunkPayload {
-    pub(crate) codec: BinaryChunkCodec,
-    #[musli(bytes)]
-    pub(crate) data: Vec<u8>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum BinaryCasManifest {
     Empty {
@@ -61,7 +54,7 @@ impl BinaryCasManifest {
 
 #[cfg(test)]
 pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
-    crate::common::stable_content_fingerprint_hex(data)
+    hash_bytes_to_hex(&binary_blob_hash_bytes(data))
 }
 
 pub(crate) fn binary_blob_hash_bytes(data: &[u8]) -> [u8; HASH_BYTES] {
@@ -161,13 +154,6 @@ fn hex_value(byte: u8, label: &str) -> Result<u8, LixError> {
 
 fn codec_error(message: String) -> LixError {
     LixError::new("LIX_ERROR_UNKNOWN", message)
-}
-
-pub(crate) fn encode_binary_chunk_payload(chunk_data: &[u8]) -> EncodedBinaryChunkPayload {
-    EncodedBinaryChunkPayload {
-        codec: BinaryChunkCodec::Raw,
-        data: chunk_data.to_vec(),
-    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,6 @@ mod types;
 
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use types::{
-    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWrite,
+    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobPayload,
     BlobWriteReceipt,
 };

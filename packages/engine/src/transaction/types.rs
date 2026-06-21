@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::LixError;
+use crate::binary_cas::{BlobHash, BlobPayload};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
@@ -181,7 +182,49 @@ pub(crate) struct TransactionFileData {
     pub(crate) branch_id: String,
     pub(crate) global: bool,
     pub(crate) untracked: bool,
-    pub(crate) data: Vec<u8>,
+    payload: BlobPayload,
+}
+
+impl TransactionFileData {
+    pub(crate) fn new(
+        file_id: String,
+        path: Option<String>,
+        filename: Option<String>,
+        branch_id: String,
+        global: bool,
+        untracked: bool,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            file_id,
+            path,
+            filename,
+            branch_id,
+            global,
+            untracked,
+            payload: BlobPayload::from_bytes(data),
+        }
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        self.payload.bytes()
+    }
+
+    pub(crate) fn blob_hash(&self) -> Option<BlobHash> {
+        self.payload.hash()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub(crate) fn payload(&self) -> &BlobPayload {
+        &self.payload
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
 }
 
 /// One decoded write batch accepted by the transaction boundary.

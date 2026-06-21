@@ -32,6 +32,35 @@ impl BlobHash {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlobPayload {
+    bytes: Vec<u8>,
+    hash: Option<BlobHash>,
+}
+
+impl BlobPayload {
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        let hash = (!bytes.is_empty()).then(|| BlobHash::from_content(&bytes));
+        Self { bytes, hash }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn hash(&self) -> Option<BlobHash> {
+        self.hash
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobLayout {
     Empty,
     SingleChunk { chunk_hash: BlobHash },
@@ -73,11 +102,6 @@ impl BlobBytesBatch {
     pub(crate) fn into_vec(self) -> Vec<Option<Vec<u8>>> {
         self.entries
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BlobWrite<'a> {
-    pub(crate) bytes: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

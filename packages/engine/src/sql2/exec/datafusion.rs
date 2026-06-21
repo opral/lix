@@ -1978,7 +1978,7 @@ mod tests {
             snapshot_content: Some(
                 json!({
                     "id": entity_pk,
-                    "blob_hash": crate::common::stable_content_fingerprint_hex(bytes),
+                    "blob_hash": crate::binary_cas::BlobHash::from_content(bytes).to_hex(),
                     "size_bytes": bytes.len()
                 })
                 .to_string(),

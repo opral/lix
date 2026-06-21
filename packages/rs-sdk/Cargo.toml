@@ -63,6 +63,11 @@ path = "benches/profile_merge_10k.rs"
 harness = false
 required-features = ["sqlite"]
 
+[[example]]
+name = "profile_fs_open"
+path = "examples/profile_fs_open.rs"
+required-features = ["sqlite"]
+
 [[bench]]
 name = "sqlite_backend"
 path = "benches/sqlite_backend.rs"

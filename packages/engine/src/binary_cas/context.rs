@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::LixError;
-use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobWrite, BlobWriteReceipt};
+use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobPayload, BlobWriteReceipt};
 use crate::storage::{StorageRead, StorageWriteSet};
 use std::collections::HashSet;
 
@@ -90,12 +90,27 @@ impl<'a> BinaryCasWriter<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stage_bytes(&mut self, bytes: &[u8]) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write(
             self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
-            &BlobWrite { bytes },
+            bytes,
+            None,
+        )
+    }
+
+    pub(crate) fn stage_payload(
+        &mut self,
+        payload: &BlobPayload,
+    ) -> Result<BlobWriteReceipt, LixError> {
+        crate::binary_cas::kv::stage_blob_write(
+            self.writes,
+            &mut self.blob_hashes,
+            &mut self.chunk_keys,
+            payload.bytes(),
+            payload.hash(),
         )
     }
 }

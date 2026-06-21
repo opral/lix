@@ -461,8 +461,7 @@ where
                 let file_data = file_data
                     .into_iter()
                     .filter(|write| {
-                        !file_keys.contains(&PluginFileWriteKey::from(write))
-                            && !write.data.is_empty()
+                        !file_keys.contains(&PluginFileWriteKey::from(write)) && !write.is_empty()
                     })
                     .collect();
                 Ok(TransactionWrite::RowsWithFileData {
@@ -536,7 +535,7 @@ where
                 &active_state,
                 WasmPluginFile {
                     filename,
-                    data: write.data.clone(),
+                    data: write.data().to_vec(),
                 },
             )
             .await?;
@@ -1363,7 +1362,7 @@ fn plugin_archive_schema_rows_for_write(
     }
     Ok(Some(plugin_schema_rows_from_archive_path(
         path,
-        &write.data,
+        write.data(),
         &write.branch_id,
         write.global,
         write.untracked,
