@@ -3034,6 +3034,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "lix_backends",
  "lix_engine",
+ "lix_fs_backend",
  "notify-debouncer-full",
  "rusqlite",
  "tempfile",

@@ -12,7 +12,10 @@ mod lix;
 #[cfg(feature = "sqlite")]
 mod sqlite_backend;
 
-#[cfg(all(not(target_family = "wasm"), feature = "sqlite"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "sqlite", feature = "rocksdb")
+))]
 pub use filesystem::{FsBackend, FsBackendFilter};
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
 pub use lix_engine::wasm::{
@@ -33,6 +36,8 @@ pub use lix_engine::{
     SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
     TryFromValue, Value, WriteOptions, WriteStats, run_backend_conformance,
 };
+#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+pub use lix_fs_backend::{RocksDbBlobOptions, RocksDbFilesystemBackend};
 #[cfg(feature = "sqlite")]
 pub use sqlite_backend::{
     SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory, SqliteBackendFixture,

@@ -17,6 +17,10 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 
 #[cfg(feature = "sqlite")]
 use crate::sqlite_backend::SqliteBackend;
+#[cfg(feature = "rocksdb")]
+use lix_fs_backend::{
+    RocksDbBlobOptions, RocksDbFilesystemBackend, RocksDbFilesystemBackendOptions,
+};
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
@@ -68,36 +72,45 @@ where
     supervisor: FilesystemSupervisor<B>,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct FsBackend {
     inner: FsBackendInner,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 #[derive(Clone)]
 enum FsBackendInner {
-    Persistent(FilesystemSync<SqliteBackend>),
+    #[cfg(feature = "sqlite")]
+    Sqlite(FilesystemSync<SqliteBackend>),
+    #[cfg(feature = "rocksdb")]
+    RocksDb(FilesystemSync<RocksDbFilesystemBackend>),
     Memory(FilesystemSync<InMemoryBackend>),
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 #[expect(missing_debug_implementations)]
 pub enum FsRead<'a> {
-    Persistent(crate::sqlite_backend::SqliteRead),
+    #[cfg(feature = "sqlite")]
+    Sqlite(crate::sqlite_backend::SqliteRead),
+    #[cfg(feature = "rocksdb")]
+    RocksDb(lix_fs_backend::RocksDbFilesystemRead<'a>),
     Memory(<InMemoryBackend as Backend>::Read<'a>),
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 #[expect(missing_debug_implementations)]
 pub struct FsWrite<'a> {
     inner: FsWriteInner<'a>,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 enum FsWriteInner<'a> {
-    Persistent(FilesystemWrite<'a, SqliteBackend>),
+    #[cfg(feature = "sqlite")]
+    Sqlite(FilesystemWrite<'a, SqliteBackend>),
+    #[cfg(feature = "rocksdb")]
+    RocksDb(FilesystemWrite<'a, RocksDbFilesystemBackend>),
     Memory(FilesystemWrite<'a, InMemoryBackend>),
 }
 
@@ -244,8 +257,9 @@ enum FilesystemEvent {
     Shutdown,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 impl FsBackend {
+    #[cfg(feature = "sqlite")]
     pub async fn open<P>(dir: P) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
@@ -267,7 +281,49 @@ impl FsBackend {
         )
         .await?;
         Ok(Self {
-            inner: FsBackendInner::Persistent(inner),
+            inner: FsBackendInner::Sqlite(inner),
+        })
+    }
+
+    #[cfg(feature = "rocksdb")]
+    pub async fn open_rocksdb<P>(dir: P) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::open_rocksdb_with_filter(dir, FsBackendFilter::default()).await
+    }
+
+    #[cfg(feature = "rocksdb")]
+    pub async fn open_rocksdb_with_filter<P>(
+        dir: P,
+        filter: FsBackendFilter,
+    ) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::open_rocksdb_with_blob_options(dir, filter, RocksDbBlobOptions::Disabled).await
+    }
+
+    #[cfg(feature = "rocksdb")]
+    pub async fn open_rocksdb_with_blob_options<P>(
+        dir: P,
+        filter: FsBackendFilter,
+        blob: RocksDbBlobOptions,
+    ) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        FilesystemPathFilter::from_filter(filter.clone())?;
+        let backend = open_filesystem_rocksdb_backend(dir.as_ref(), blob)?;
+        let inner = FilesystemSync::open_with_metadata_mode(
+            backend,
+            dir.as_ref(),
+            FilesystemMetadataMode::Persistent,
+            filter,
+        )
+        .await?;
+        Ok(Self {
+            inner: FsBackendInner::RocksDb(inner),
         })
     }
 
@@ -299,6 +355,7 @@ impl FsBackend {
         })
     }
 
+    #[cfg(feature = "sqlite")]
     pub async fn open_with_wasm_runtime<P>(
         dir: P,
         wasm_runtime: Arc<dyn WasmRuntime>,
@@ -310,12 +367,12 @@ impl FsBackend {
         let inner =
             FilesystemSync::open_with_wasm_runtime(backend, dir.as_ref(), wasm_runtime).await?;
         Ok(Self {
-            inner: FsBackendInner::Persistent(inner),
+            inner: FsBackendInner::Sqlite(inner),
         })
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 impl Backend for FsBackend {
     type Read<'a>
         = FsRead<'a>
@@ -329,15 +386,23 @@ impl Backend for FsBackend {
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         match &self.inner {
-            FsBackendInner::Persistent(inner) => Ok(FsRead::Persistent(inner.begin_read(opts)?)),
+            #[cfg(feature = "sqlite")]
+            FsBackendInner::Sqlite(inner) => Ok(FsRead::Sqlite(inner.begin_read(opts)?)),
+            #[cfg(feature = "rocksdb")]
+            FsBackendInner::RocksDb(inner) => Ok(FsRead::RocksDb(inner.begin_read(opts)?)),
             FsBackendInner::Memory(inner) => Ok(FsRead::Memory(inner.begin_read(opts)?)),
         }
     }
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         match &self.inner {
-            FsBackendInner::Persistent(inner) => Ok(FsWrite {
-                inner: FsWriteInner::Persistent(inner.begin_write(opts)?),
+            #[cfg(feature = "sqlite")]
+            FsBackendInner::Sqlite(inner) => Ok(FsWrite {
+                inner: FsWriteInner::Sqlite(inner.begin_write(opts)?),
+            }),
+            #[cfg(feature = "rocksdb")]
+            FsBackendInner::RocksDb(inner) => Ok(FsWrite {
+                inner: FsWriteInner::RocksDb(inner.begin_write(opts)?),
             }),
             FsBackendInner::Memory(inner) => Ok(FsWrite {
                 inner: FsWriteInner::Memory(inner.begin_write(opts)?),
@@ -346,7 +411,7 @@ impl Backend for FsBackend {
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 impl BackendRead for FsRead<'_> {
     fn visit_keys<V>(
         &self,
@@ -359,7 +424,10 @@ impl BackendRead for FsRead<'_> {
         V: PointVisitor + ?Sized,
     {
         match self {
-            Self::Persistent(read) => read.visit_keys(space, keys, opts, visitor),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(read) => read.visit_keys(space, keys, opts, visitor),
+            #[cfg(feature = "rocksdb")]
+            Self::RocksDb(read) => read.visit_keys(space, keys, opts, visitor),
             Self::Memory(read) => read.visit_keys(space, keys, opts, visitor),
         }
     }
@@ -375,45 +443,63 @@ impl BackendRead for FsRead<'_> {
         V: ScanVisitor + ?Sized,
     {
         match self {
-            Self::Persistent(read) => read.scan(space, range, opts, visitor),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(read) => read.scan(space, range, opts, visitor),
+            #[cfg(feature = "rocksdb")]
+            Self::RocksDb(read) => read.scan(space, range, opts, visitor),
             Self::Memory(read) => read.scan(space, range, opts, visitor),
         }
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
 impl BackendWrite for FsWrite<'_> {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         match &mut self.inner {
-            FsWriteInner::Persistent(write) => write.put_many(space, entries),
+            #[cfg(feature = "sqlite")]
+            FsWriteInner::Sqlite(write) => write.put_many(space, entries),
+            #[cfg(feature = "rocksdb")]
+            FsWriteInner::RocksDb(write) => write.put_many(space, entries),
             FsWriteInner::Memory(write) => write.put_many(space, entries),
         }
     }
 
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         match &mut self.inner {
-            FsWriteInner::Persistent(write) => write.delete_many(space, keys),
+            #[cfg(feature = "sqlite")]
+            FsWriteInner::Sqlite(write) => write.delete_many(space, keys),
+            #[cfg(feature = "rocksdb")]
+            FsWriteInner::RocksDb(write) => write.delete_many(space, keys),
             FsWriteInner::Memory(write) => write.delete_many(space, keys),
         }
     }
 
     fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
         match &mut self.inner {
-            FsWriteInner::Persistent(write) => write.delete_range(space, range),
+            #[cfg(feature = "sqlite")]
+            FsWriteInner::Sqlite(write) => write.delete_range(space, range),
+            #[cfg(feature = "rocksdb")]
+            FsWriteInner::RocksDb(write) => write.delete_range(space, range),
             FsWriteInner::Memory(write) => write.delete_range(space, range),
         }
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
         match self.inner {
-            FsWriteInner::Persistent(write) => write.commit(),
+            #[cfg(feature = "sqlite")]
+            FsWriteInner::Sqlite(write) => write.commit(),
+            #[cfg(feature = "rocksdb")]
+            FsWriteInner::RocksDb(write) => write.commit(),
             FsWriteInner::Memory(write) => write.commit(),
         }
     }
 
     fn rollback(self) -> Result<(), BackendError> {
         match self.inner {
-            FsWriteInner::Persistent(write) => write.rollback(),
+            #[cfg(feature = "sqlite")]
+            FsWriteInner::Sqlite(write) => write.rollback(),
+            #[cfg(feature = "rocksdb")]
+            FsWriteInner::RocksDb(write) => write.rollback(),
             FsWriteInner::Memory(write) => write.rollback(),
         }
     }
@@ -2006,6 +2092,20 @@ fn open_filesystem_sqlite_backend(dir: &Path) -> Result<SqliteBackend, LixError>
     SqliteBackend::open(metadata_dir.join("db.sqlite")).map_err(sqlite_backend_error)
 }
 
+#[cfg(feature = "rocksdb")]
+fn open_filesystem_rocksdb_backend(
+    dir: &Path,
+    blob: RocksDbBlobOptions,
+) -> Result<RocksDbFilesystemBackend, LixError> {
+    ensure_filesystem_root_directory(dir)?;
+    let metadata_dir = ensure_filesystem_rocksdb_metadata_directory(dir)?;
+    RocksDbFilesystemBackend::open_with_options(RocksDbFilesystemBackendOptions {
+        path: metadata_dir,
+        blob,
+    })
+    .map_err(rocksdb_backend_error)
+}
+
 #[cfg(feature = "sqlite")]
 fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
     let lix_dir = ensure_filesystem_lix_directory(dir)?;
@@ -2044,6 +2144,41 @@ fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, Li
 
     move_legacy_filesystem_sqlite_metadata(&lix_dir, &metadata_dir)?;
     Ok(metadata_dir)
+}
+
+#[cfg(feature = "rocksdb")]
+fn ensure_filesystem_rocksdb_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
+    let lix_dir = ensure_filesystem_lix_directory(dir)?;
+    let internal_dir = lix_dir.join(".internal");
+    ensure_metadata_directory(&internal_dir, "filesystem metadata directory")?;
+    let metadata_dir = internal_dir.join("rocksdb");
+    ensure_metadata_directory(&metadata_dir, "filesystem RocksDB metadata directory")?;
+    Ok(metadata_dir)
+}
+
+#[cfg(feature = "rocksdb")]
+fn ensure_metadata_directory(path: &Path, label: &str) -> Result<(), LixError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error(&format!("create {label}"), path, error)),
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_error(&format!("read {label}"), path, error))?;
+    if metadata.file_type().is_symlink() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "{label} {display} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "{label} {display} must be a directory"
+        )));
+    }
+    Ok(())
 }
 
 fn move_legacy_filesystem_sqlite_metadata(
@@ -2117,6 +2252,14 @@ fn sqlite_backend_error(error: BackendError) -> LixError {
     LixError::new(
         LixError::CODE_STORAGE_ERROR,
         format!("failed to open filesystem SQLite backend: {error}"),
+    )
+}
+
+#[cfg(feature = "rocksdb")]
+fn rocksdb_backend_error(error: BackendError) -> LixError {
+    LixError::new(
+        LixError::CODE_STORAGE_ERROR,
+        format!("failed to open filesystem RocksDB backend: {error}"),
     )
 }
 
