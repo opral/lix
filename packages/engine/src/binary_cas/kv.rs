@@ -8,8 +8,7 @@ use crate::binary_cas::codec::{
     encode_binary_cas_manifest_chunk, encode_binary_chunk_payload,
 };
 use crate::binary_cas::{
-    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWrite,
-    BlobWriteReceipt,
+    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWriteReceipt,
 };
 use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
@@ -504,18 +503,32 @@ fn decode_and_verify_chunk(
     Ok(chunk_payload.to_vec())
 }
 
-pub(crate) fn stage_blob_write(
+pub(in crate::binary_cas) fn stage_blob_write(
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
-    write: &BlobWrite<'_>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
 ) -> Result<BlobWriteReceipt, LixError> {
-    let blob_hash = BlobHash::from_content(write.bytes);
-    let chunk_ranges = fastcdc_chunk_ranges(write.bytes);
+    let blob_hash = precomputed_hash.unwrap_or_else(|| BlobHash::from_content(bytes));
+    if cfg!(debug_assertions)
+        && precomputed_hash.is_some()
+        && BlobHash::from_content(bytes) != blob_hash
+    {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "binary CAS blob hash does not match blob contents".to_string(),
+        ));
+    }
+    let chunk_ranges = fastcdc_chunk_ranges(bytes);
     let layout = match chunk_ranges.as_slice() {
         [] => BlobLayout::Empty,
         [(start, end)] => BlobLayout::SingleChunk {
-            chunk_hash: BlobHash::from_content(&write.bytes[*start..*end]),
+            chunk_hash: if *start == 0 && *end == bytes.len() {
+                blob_hash
+            } else {
+                BlobHash::from_content(&bytes[*start..*end])
+            },
         },
         _ => BlobLayout::Chunked {
             chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
@@ -528,7 +541,7 @@ pub(crate) fn stage_blob_write(
     };
     let receipt = BlobWriteReceipt {
         hash: blob_hash,
-        size_bytes: write.bytes.len() as u64,
+        size_bytes: bytes.len() as u64,
         layout: layout.clone(),
     };
     if !blob_hashes.insert(blob_hash.into_bytes()) {
@@ -549,18 +562,18 @@ pub(crate) fn stage_blob_write(
                 writes,
                 blob_hash,
                 &BinaryCasManifest::SingleChunk {
-                    size_bytes: write.bytes.len() as u64,
+                    size_bytes: bytes.len() as u64,
                     chunk_hash: chunk_hash.into_bytes(),
                 },
             );
             if chunk_keys.insert(chunk_key(chunk_hash)) {
-                let encoded_chunk = encode_binary_chunk_payload(write.bytes);
+                let encoded_chunk = encode_binary_chunk_payload(bytes);
                 stage_chunk(
                     writes,
                     chunk_hash,
                     &KvChunk {
                         codec: encoded_chunk.codec,
-                        uncompressed_len: write.bytes.len() as u64,
+                        uncompressed_len: bytes.len() as u64,
                         data: encoded_chunk.data,
                     },
                 );
@@ -571,13 +584,13 @@ pub(crate) fn stage_blob_write(
                 writes,
                 blob_hash,
                 &BinaryCasManifest::Chunked {
-                    size_bytes: write.bytes.len() as u64,
+                    size_bytes: bytes.len() as u64,
                     chunk_count: *chunk_count,
                 },
             );
 
             for (chunk_index, (start, end)) in chunk_ranges.into_iter().enumerate() {
-                let chunk_data = &write.bytes[start..end];
+                let chunk_data = &bytes[start..end];
                 let chunk_hash = BlobHash::from_content(chunk_data);
                 let chunk_key = chunk_key(chunk_hash);
                 if chunk_keys.insert(chunk_key.clone()) {
@@ -670,6 +683,7 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 mod tests {
     use super::*;
     use crate::binary_cas::BinaryCasContext;
+    use crate::binary_cas::BlobPayload;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
@@ -835,6 +849,47 @@ mod tests {
                 .await
                 .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_kv_api_accepts_precomputed_blob_hash() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let data = b"hello precomputed hash";
+        let payload = BlobPayload::from_bytes(data.to_vec());
+        let blob_hash = payload
+            .hash()
+            .expect("non-empty payload should have blob hash");
+
+        {
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer
+                .stage_payload(&payload)
+                .expect("blob write should stage with payload hash");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("blob write should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        assert_eq!(
+            load_bytes_many(&store, &[blob_hash])
+                .await
+                .expect("blob should load")
+                .into_vec(),
+            vec![Some(data.to_vec())]
+        );
+        assert_eq!(
+            load_manifest(&store, blob_hash)
+                .await
+                .expect("manifest should load"),
+            Some(BinaryCasManifest::SingleChunk {
+                size_bytes: data.len() as u64,
+                chunk_hash: blob_hash.into_bytes(),
+            })
         );
     }
 

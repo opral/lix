@@ -8,7 +8,8 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::common::{LixPath, compose_file_path, stable_content_fingerprint_hex};
+use crate::binary_cas::BlobHash;
+use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -192,7 +193,8 @@ pub(crate) struct FileDescriptorWriteIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
-    pub(crate) data: Vec<u8>,
+    pub(crate) blob_hash: BlobHash,
+    pub(crate) size_bytes: usize,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -805,7 +807,7 @@ pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> Tra
 }
 
 pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow, LixError> {
-    let size_bytes = u64::try_from(input.data.len()).map_err(|_| {
+    let size_bytes = u64::try_from(input.size_bytes).map_err(|_| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
@@ -816,7 +818,7 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow
     })?;
     let snapshot = json!({
         "id": input.file_id,
-        "blob_hash": stable_content_fingerprint_hex(&input.data),
+        "blob_hash": input.blob_hash.to_hex(),
         "size_bytes": size_bytes,
     });
 
@@ -912,10 +914,22 @@ fn plan_parsed_file_path_write_with_fallback(
 
     let mut file_data = Vec::new();
     if let Some(data) = data {
-        if !data.is_empty() {
+        let file_payload = TransactionFileData::new(
+            file_id.clone(),
+            Some(file_path),
+            Some(filename),
+            context.branch_id.clone(),
+            context.global,
+            context.untracked,
+            data,
+        );
+        if !file_payload.is_empty() {
             rows.push(blob_ref_row(BlobRefRowInput {
                 file_id: file_id.clone(),
-                data: data.clone(),
+                blob_hash: file_payload
+                    .blob_hash()
+                    .expect("non-empty payload should have blob hash"),
+                size_bytes: file_payload.len(),
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
@@ -923,15 +937,7 @@ fn plan_parsed_file_path_write_with_fallback(
                 },
             })?);
         }
-        file_data.push(TransactionFileData {
-            file_id,
-            path: Some(file_path),
-            filename: Some(filename),
-            branch_id: context.branch_id,
-            global: context.global,
-            untracked: context.untracked,
-            data,
-        });
+        file_data.push(file_payload);
     }
 
     Ok(FilesystemWritePlan {
@@ -963,10 +969,22 @@ pub(crate) fn plan_file_descriptor_write(
 
     let mut file_data = Vec::new();
     if let Some(data) = input.data {
-        if !data.is_empty() {
+        let file_payload = TransactionFileData::new(
+            file_id.clone(),
+            Some(file_path),
+            Some(filename),
+            input.context.branch_id.clone(),
+            input.context.global,
+            input.context.untracked,
+            data,
+        );
+        if !file_payload.is_empty() {
             rows.push(blob_ref_row(BlobRefRowInput {
                 file_id: file_id.clone(),
-                data: data.clone(),
+                blob_hash: file_payload
+                    .blob_hash()
+                    .expect("non-empty payload should have blob hash"),
+                size_bytes: file_payload.len(),
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
@@ -974,15 +992,7 @@ pub(crate) fn plan_file_descriptor_write(
                 },
             })?);
         }
-        file_data.push(TransactionFileData {
-            file_id,
-            path: Some(file_path),
-            filename: Some(filename),
-            branch_id: input.context.branch_id,
-            global: input.context.global,
-            untracked: input.context.untracked,
-            data,
-        });
+        file_data.push(file_payload);
     }
 
     Ok(FilesystemWritePlan {
@@ -1449,6 +1459,7 @@ mod tests {
     use serde_json::{Value as JsonValue, json};
 
     use crate::GLOBAL_BRANCH_ID;
+    use crate::binary_cas::BlobHash;
     use crate::changelog::{ChangeId, CommitId};
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
     use crate::transaction::types::TransactionJson;
@@ -1587,7 +1598,8 @@ mod tests {
     fn blob_ref_row_builds_state_row() {
         let row = blob_ref_row(BlobRefRowInput {
             file_id: "file-readme".to_string(),
-            data: b"Hello".to_vec(),
+            blob_hash: BlobHash::from_content(b"Hello"),
+            size_bytes: 5,
             context: FilesystemRowContext::active_branch("branch-a"),
         })
         .expect("blob ref row should build");
@@ -1601,10 +1613,9 @@ mod tests {
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["size_bytes"], 5);
-        assert!(
-            snapshot["blob_hash"]
-                .as_str()
-                .is_some_and(|hash| !hash.is_empty())
+        assert_eq!(
+            snapshot["blob_hash"].as_str(),
+            Some(BlobHash::from_content(b"Hello").to_hex().as_str())
         );
     }
 
@@ -1787,7 +1798,7 @@ mod tests {
         assert_eq!(plan.file_data.len(), 1);
         assert_eq!(plan.file_data[0].file_id, "file-readme");
         assert_eq!(plan.file_data[0].branch_id, "branch-a");
-        assert_eq!(plan.file_data[0].data, b"hello");
+        assert_eq!(plan.file_data[0].data(), b"hello");
         assert_eq!(plan.rows.len(), 4);
         assert_eq!(
             plan.rows
@@ -1871,7 +1882,7 @@ mod tests {
         assert_eq!(plan.file_data.len(), 1);
         assert_eq!(plan.file_data[0].file_id, "file-readme");
         assert_eq!(plan.file_data[0].path.as_deref(), Some("/docs/readme.md"));
-        assert_eq!(plan.file_data[0].data, b"hello");
+        assert_eq!(plan.file_data[0].data(), b"hello");
         assert_eq!(plan.rows.len(), 2);
         let file_row = plan
             .rows
@@ -2150,7 +2161,7 @@ mod tests {
         assert_eq!(plan.file_data[0].file_id, "file-readme");
         assert_eq!(plan.file_data[0].branch_id, "branch-a");
         assert_eq!(plan.file_data[0].untracked, true);
-        assert_eq!(plan.file_data[0].data, b"hello");
+        assert_eq!(plan.file_data[0].data(), b"hello");
     }
 
     #[test]
@@ -2170,7 +2181,7 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.file_data.len(), 1);
         assert_eq!(plan.file_data[0].file_id, "file-empty");
-        assert!(plan.file_data[0].data.is_empty());
+        assert!(plan.file_data[0].is_empty());
         assert!(
             plan.rows
                 .iter()

@@ -2019,16 +2019,19 @@ fn stage_lix_file_data_insert_write(
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
-    if !data.is_empty() {
-        stage_lix_file_data_blob_ref_write(
-            staged,
-            file_id.clone(),
-            data.clone(),
-            &context,
-            origin,
-        )?;
+    let file_payload = TransactionFileData::new(
+        file_id.clone(),
+        path,
+        filename,
+        context.branch_id.clone(),
+        context.global,
+        context.untracked,
+        data,
+    );
+    if !file_payload.is_empty() {
+        stage_lix_file_data_blob_ref_write(staged, &file_payload, &context, origin)?;
     }
-    stage_lix_file_data_payload_write(staged, file_id, path, filename, data, context);
+    staged.file_data_writes.push(file_payload);
     Ok(())
 }
 
@@ -2042,30 +2045,41 @@ fn stage_lix_file_data_update_write(
     has_blob_ref: bool,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
-    if data.is_empty() {
+    let file_payload = TransactionFileData::new(
+        file_id.clone(),
+        path,
+        filename,
+        context.branch_id.clone(),
+        context.global,
+        context.untracked,
+        data,
+    );
+    if file_payload.is_empty() {
         if has_blob_ref {
             let mut row = blob_ref_tombstone_row(file_id.clone(), context.clone());
             row.origin = origin;
             staged.state_rows.push(row);
         }
-        stage_lix_file_data_payload_write(staged, file_id, path, filename, data, context);
+        staged.file_data_writes.push(file_payload);
         return Ok(());
     }
-    stage_lix_file_data_blob_ref_write(staged, file_id.clone(), data.clone(), &context, origin)?;
-    stage_lix_file_data_payload_write(staged, file_id, path, filename, data, context);
+    stage_lix_file_data_blob_ref_write(staged, &file_payload, &context, origin)?;
+    staged.file_data_writes.push(file_payload);
     Ok(())
 }
 
 fn stage_lix_file_data_blob_ref_write(
     staged: &mut LixFileStagedBatch,
-    file_id: String,
-    data: Vec<u8>,
+    file_data: &TransactionFileData,
     context: &FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let mut row = blob_ref_row(BlobRefRowInput {
-        file_id,
-        data,
+        file_id: file_data.file_id.clone(),
+        blob_hash: file_data
+            .blob_hash()
+            .expect("non-empty payload should have blob hash"),
+        size_bytes: file_data.len(),
         context: FilesystemRowContext {
             file_id: None,
             metadata: None,
@@ -2076,25 +2090,6 @@ fn stage_lix_file_data_blob_ref_write(
     row.origin = origin;
     staged.state_rows.push(row);
     Ok(())
-}
-
-fn stage_lix_file_data_payload_write(
-    staged: &mut LixFileStagedBatch,
-    file_id: String,
-    path: Option<String>,
-    filename: Option<String>,
-    data: Vec<u8>,
-    context: FilesystemRowContext,
-) {
-    staged.file_data_writes.push(TransactionFileData {
-        file_id,
-        path,
-        filename,
-        branch_id: context.branch_id,
-        global: context.global,
-        untracked: context.untracked,
-        data,
-    });
 }
 
 fn attach_lix_file_insert_origin(
@@ -4352,7 +4347,7 @@ mod tests {
         assert_eq!(staged.count, 1);
         assert_eq!(staged.file_data_writes.len(), 1);
         assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
-        assert_eq!(staged.file_data_writes[0].data, b"hello");
+        assert_eq!(staged.file_data_writes[0].data(), b"hello");
         assert!(
             staged
                 .state_rows
@@ -4399,7 +4394,25 @@ mod tests {
             staged.file_data_writes[0].path.as_deref(),
             Some("/docs/readme.md")
         );
-        assert_eq!(staged.file_data_writes[0].data, b"hello");
+        assert_eq!(staged.file_data_writes[0].data(), b"hello");
+        let blob_ref_row = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_binary_blob_ref")
+            .expect("data update should stage blob ref row");
+        let snapshot: serde_json::Value = blob_ref_row
+            .snapshot
+            .as_ref()
+            .expect("blob ref should carry snapshot")
+            .value()
+            .clone();
+        assert_eq!(
+            snapshot["blob_hash"].as_str(),
+            staged.file_data_writes[0]
+                .blob_hash()
+                .map(BlobHash::to_hex)
+                .as_deref()
+        );
     }
 
     #[test]
@@ -4474,7 +4487,20 @@ mod tests {
         assert_eq!(staged.file_data_writes.len(), 1);
         assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
         assert_eq!(staged.file_data_writes[0].branch_id, "branch-b");
-        assert_eq!(staged.file_data_writes[0].data, b"hello");
+        assert_eq!(staged.file_data_writes[0].data(), b"hello");
+        let snapshot: serde_json::Value = blob_ref_row
+            .snapshot
+            .as_ref()
+            .expect("blob ref should carry snapshot")
+            .value()
+            .clone();
+        assert_eq!(
+            snapshot["blob_hash"].as_str(),
+            staged.file_data_writes[0]
+                .blob_hash()
+                .map(BlobHash::to_hex)
+                .as_deref()
+        );
     }
 
     #[test]
@@ -4693,7 +4719,7 @@ mod tests {
                 assert_eq!(file_data.len(), 1);
                 assert_eq!(file_data[0].file_id, "file-readme");
                 assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
-                assert_eq!(file_data[0].data, b"hello");
+                assert_eq!(file_data[0].data(), b"hello");
             }
             other => panic!("expected insert with file data staged write, got {other:?}"),
         }

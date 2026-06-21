@@ -47,7 +47,7 @@ pub(crate) async fn commit_prepared_writes(
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer(&mut writes);
         for write in &prepared_writes.file_data_writes {
-            blob_writer.stage_bytes(&write.data)?;
+            blob_writer.stage_payload(write.payload())?;
         }
     }
 

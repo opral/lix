@@ -424,9 +424,12 @@ impl TransactionWriteBuffer {
         })?;
         let mut bytes_by_hash = BTreeMap::<BlobHash, Vec<u8>>::new();
         for write in file_data_guard.iter() {
+            let hash = write
+                .blob_hash()
+                .unwrap_or_else(|| BlobHash::from_content(write.data()));
             bytes_by_hash
-                .entry(BlobHash::from_content(&write.data))
-                .or_insert_with(|| write.data.clone());
+                .entry(hash)
+                .or_insert_with(|| write.data().to_vec());
         }
         Ok(BlobBytesBatch::new(
             hashes
@@ -1137,15 +1140,15 @@ mod tests {
             .stage_write(PreparedTransactionWrite::RowsWithFileData {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("file-readme", "descriptor")],
-                file_data: vec![TransactionFileData {
-                    file_id: "file-readme".to_string(),
-                    path: Some("/readme.md".to_string()),
-                    filename: Some("readme.md".to_string()),
-                    branch_id: "global".to_string(),
-                    global: true,
-                    untracked: true,
-                    data: b"hello".to_vec(),
-                }],
+                file_data: vec![TransactionFileData::new(
+                    "file-readme".to_string(),
+                    Some("/readme.md".to_string()),
+                    Some("readme.md".to_string()),
+                    "global".to_string(),
+                    true,
+                    true,
+                    b"hello".to_vec(),
+                )],
                 count: 1,
             })
             .expect("staging rows with file data should succeed");
@@ -1155,7 +1158,7 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 1);
         assert_eq!(drained.file_data_writes.len(), 1);
         assert_eq!(drained.file_data_writes[0].file_id, "file-readme");
-        assert_eq!(drained.file_data_writes[0].data, b"hello");
+        assert_eq!(drained.file_data_writes[0].data(), b"hello");
     }
 
     #[tokio::test]
