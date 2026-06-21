@@ -679,9 +679,9 @@ where
             }
         }
         let previous = self.last_materialized_disk();
-        self.apply_local_snapshot_to_lix(&local, previous.as_ref())
+        let lix = self
+            .apply_local_snapshot_to_lix(&local, previous.as_ref())
             .await?;
-        let lix = self.collect_lix_snapshot_read().await?;
         let materialized = self.materialize_snapshot_after_disk_sync(&lix.snapshot, &local)?;
         self.remember_materialized(materialized, lix.revision);
         Ok(())
@@ -809,10 +809,11 @@ where
         &self,
         local: &Snapshot,
         previous: Option<&Snapshot>,
-    ) -> Result<(), LixError> {
-        let lix = self.collect_lix_snapshot_read().await?.snapshot;
+    ) -> Result<LixSnapshotRead, LixError> {
+        let lix = self.collect_lix_snapshot_read().await?;
+        let mut needs_fresh_lix_read = false;
 
-        for path in lix.files.keys() {
+        for path in lix.snapshot.files.keys() {
             if !local.files.contains_key(path)
                 && self.path_filter.includes_file(path)
                 && !is_plugin_storage_path(path)
@@ -829,6 +830,7 @@ where
                 {
                     continue;
                 }
+                needs_fresh_lix_read = true;
                 self.session
                     .execute(
                         "DELETE FROM lix_file WHERE path = $1",
@@ -840,7 +842,7 @@ where
 
         if self.path_filter.is_unfiltered() {
             let mut directories_to_remove = Vec::new();
-            for path in lix.directories.difference(&local.directories) {
+            for path in lix.snapshot.directories.difference(&local.directories) {
                 if path.as_str() == "/"
                     || is_plugin_storage_path(path)
                     || is_materialization_ignored_path(path, self.metadata_mode)
@@ -862,6 +864,7 @@ where
             }
             sort_directories_deepest_first(&mut directories_to_remove);
             for path in directories_to_remove {
+                needs_fresh_lix_read = true;
                 self.session
                     .execute(
                         "DELETE FROM lix_directory WHERE path = $1",
@@ -873,7 +876,7 @@ where
 
         let mut directories_to_create = local
             .directories
-            .difference(&lix.directories)
+            .difference(&lix.snapshot.directories)
             .filter(|path| path.as_str() != "/")
             .filter(|path| {
                 previous
@@ -884,6 +887,7 @@ where
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
         for path in directories_to_create {
+            needs_fresh_lix_read = true;
             self.session
                 .execute(
                     "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
@@ -904,13 +908,19 @@ where
             {
                 continue;
             }
-            if lix.files.get(path) != Some(data) {
+            if lix.snapshot.files.get(path) != Some(data) {
                 files_to_upsert.push((path.as_str(), data.as_slice()));
             }
         }
-        self.upsert_local_files_to_lix(&files_to_upsert).await?;
+        if !files_to_upsert.is_empty() {
+            needs_fresh_lix_read = true;
+            self.upsert_local_files_to_lix(&files_to_upsert).await?;
+        }
 
-        Ok(())
+        if needs_fresh_lix_read || self.collect_lix_revision().await? != lix.revision {
+            return self.collect_lix_snapshot_read().await;
+        }
+        Ok(lix)
     }
 
     async fn upsert_local_files_to_lix(&self, files: &[(&str, &[u8])]) -> Result<(), LixError> {
