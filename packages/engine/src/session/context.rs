@@ -15,12 +15,15 @@ use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    DirectoryDescriptorWriteIntent, FileDescriptorRowInput, FilesystemRowContext,
-    directory_descriptor_write_row, file_descriptor_row,
+    DirectoryDescriptorWriteIntent, FileDescriptorRowInput, FilesystemIndex, FilesystemRowContext,
+    LixFilesystemDirectoryEntry, LixFilesystemFileEntry, LixFilesystemInventory,
+    directory_descriptor_write_row, file_descriptor_row, filesystem_schema_keys,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
-use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
+use crate::live_state::{
+    LiveStateContext, LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
@@ -314,6 +317,69 @@ where
             .storage
             .load_mutation_revision()?
             .map(|revision| revision.to_vec()))
+    }
+
+    #[doc(hidden)]
+    pub async fn read_filesystem_inventory(&self) -> Result<LixFilesystemInventory, LixError> {
+        self.ensure_open()?;
+        let _operation_guard = self.begin_waitable_session_operation().await?;
+        let read_store =
+            SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        let active_branch_commit_id = self
+            .branch_ctx
+            .ref_reader(read_store.clone())
+            .load_head(&active_branch_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::branch_not_found(
+                    active_branch_id.clone(),
+                    "read filesystem inventory",
+                    "active branch",
+                )
+            })?
+            .commit_id
+            .to_string();
+        let storage_mutation_revision =
+            StorageContext::<B>::load_mutation_revision_from_read(&read_store)?
+                .map(|revision| revision.to_vec());
+        let live_state = self.live_state.reader(read_store);
+        let rows = live_state
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: filesystem_schema_keys(),
+                    branch_ids: vec![active_branch_id.clone()],
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await?;
+        let index = FilesystemIndex::from_live_rows(rows)?;
+        let directories = index
+            .directory_entries()
+            .map(|(path, directory)| LixFilesystemDirectoryEntry {
+                path: path.to_string(),
+                id: directory.id.clone(),
+            })
+            .collect();
+        let files = index
+            .file_entries()
+            .map(|(path, file)| LixFilesystemFileEntry {
+                path: path.to_string(),
+                id: file.id.clone(),
+                blob_hash: file.blob_hash.clone(),
+                metadata: file.metadata.clone(),
+                global: file.scope.global,
+                untracked: file.scope.untracked,
+            })
+            .collect();
+        Ok(LixFilesystemInventory {
+            active_branch_id,
+            active_branch_commit_id,
+            storage_mutation_revision,
+            directories,
+            files,
+        })
     }
 
     pub(super) async fn active_branch_id_from_reader<S>(

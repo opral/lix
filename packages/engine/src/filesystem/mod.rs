@@ -18,6 +18,7 @@ pub(crate) use self::planner::{
     plan_parsed_file_path_write_with_resolvers, plan_recursive_directory_delete,
 };
 pub(crate) use self::read::{FilesystemIndex, filesystem_schema_keys};
+pub use self::read::{LixFilesystemDirectoryEntry, LixFilesystemFileEntry, LixFilesystemInventory};
 pub(crate) use self::visibility::VisibleFilesystem;
 
 /// Public identity key for matching filesystem descriptors to their stored

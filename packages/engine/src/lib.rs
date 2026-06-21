@@ -79,7 +79,8 @@ pub use backend::{
 pub use common::LixError;
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use filesystem::{
-    LixFilesystemBlobRefKey, lix_filesystem_blob_ref_key_for_active_file_descriptor,
+    LixFilesystemBlobRefKey, LixFilesystemDirectoryEntry, LixFilesystemFileEntry,
+    LixFilesystemInventory, lix_filesystem_blob_ref_key_for_active_file_descriptor,
     lix_filesystem_blob_ref_key_for_active_state_row, lix_filesystem_blob_ref_key_for_state_row,
 };
 

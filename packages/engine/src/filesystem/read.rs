@@ -16,12 +16,40 @@ pub(crate) struct FilesystemIndex {
     entries_by_path: BTreeMap<String, FilesystemEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct LixFilesystemDirectoryEntry {
+    pub path: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct LixFilesystemFileEntry {
+    pub path: String,
+    pub id: String,
+    pub blob_hash: Option<String>,
+    pub metadata: Option<String>,
+    pub global: bool,
+    pub untracked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct LixFilesystemInventory {
+    pub active_branch_id: String,
+    pub active_branch_commit_id: String,
+    pub storage_mutation_revision: Option<Vec<u8>>,
+    pub directories: Vec<LixFilesystemDirectoryEntry>,
+    pub files: Vec<LixFilesystemFileEntry>,
+}
+
 impl FilesystemIndex {
     pub(crate) fn from_live_rows(
         rows: Vec<crate::live_state::MaterializedLiveStateRow>,
     ) -> Result<Self, LixError> {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectorySnapshot>::new();
-        let mut file_rows = Vec::<(FileSnapshot, RowScope)>::new();
+        let mut file_rows = Vec::<(FileSnapshot, RowScope, Option<String>)>::new();
         let mut blob_hashes_by_key = BTreeMap::<FilesystemBlobRefKey, String>::new();
 
         for row in rows {
@@ -54,7 +82,7 @@ impl FilesystemIndex {
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    file_rows.push((snapshot, scope));
+                    file_rows.push((snapshot, scope, row.metadata.clone()));
                 }
                 BLOB_REF_SCHEMA_KEY => {
                     let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
@@ -90,11 +118,13 @@ impl FilesystemIndex {
             insert_entry(
                 &mut entries_by_path,
                 path.clone(),
-                FilesystemEntry::Directory,
+                FilesystemEntry::Directory(FilesystemDirectoryEntry {
+                    id: snapshot.id.clone(),
+                }),
             )?;
         }
 
-        for (snapshot, scope) in file_rows {
+        for (snapshot, scope, metadata) in file_rows {
             let file_key =
                 FilesystemDescriptorKey::from_context(&scope.context(None), &snapshot.id);
             let path = match snapshot.directory_id.as_ref() {
@@ -127,6 +157,7 @@ impl FilesystemIndex {
                         &snapshot.id,
                     ))
                     .cloned(),
+                metadata,
                 scope,
             };
             insert_entry(
@@ -144,7 +175,18 @@ impl FilesystemIndex {
             .iter()
             .filter_map(|(path, entry)| match entry {
                 FilesystemEntry::File(file) => Some((path.as_str(), file)),
-                FilesystemEntry::Directory => None,
+                FilesystemEntry::Directory(_) => None,
+            })
+    }
+
+    pub(crate) fn directory_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, &FilesystemDirectoryEntry)> {
+        self.entries_by_path
+            .iter()
+            .filter_map(|(path, entry)| match entry {
+                FilesystemEntry::Directory(directory) => Some((path.as_str(), directory)),
+                FilesystemEntry::File(_) => None,
             })
     }
 
@@ -166,8 +208,13 @@ pub(crate) fn filesystem_schema_keys() -> Vec<String> {
 
 #[derive(Debug, Clone)]
 enum FilesystemEntry {
-    Directory,
+    Directory(FilesystemDirectoryEntry),
     File(FilesystemFileEntry),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilesystemDirectoryEntry {
+    pub(crate) id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +222,7 @@ pub(crate) struct FilesystemFileEntry {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) blob_hash: Option<String>,
+    pub(crate) metadata: Option<String>,
     pub(crate) scope: RowScope,
 }
 
@@ -290,7 +338,7 @@ fn insert_entry(
 
 fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> String {
     match entry {
-        FilesystemEntry::Directory => path
+        FilesystemEntry::Directory(_) => path
             .strip_suffix('/')
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| path.to_string()),
@@ -300,7 +348,7 @@ fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> String {
 
 fn entry_label(entry: &FilesystemEntry) -> &'static str {
     match entry {
-        FilesystemEntry::Directory => "directory",
+        FilesystemEntry::Directory(_) => "directory",
         FilesystemEntry::File(_) => "file",
     }
 }
@@ -319,7 +367,7 @@ mod tests {
         BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
         FilesystemIndex, insert_entry,
     };
-    use super::{FilesystemEntry, FilesystemFileEntry, RowScope};
+    use super::{FilesystemDirectoryEntry, FilesystemEntry, FilesystemFileEntry, RowScope};
 
     #[test]
     fn from_live_rows_rejects_file_directory_namespace_conflicts() {
@@ -354,7 +402,7 @@ mod tests {
         insert_entry(
             &mut entries,
             "/foo/".to_string(),
-            FilesystemEntry::Directory,
+            FilesystemEntry::Directory(directory_entry("dir-foo")),
         )
         .expect_err("directory should conflict with file namespace");
 
@@ -362,7 +410,7 @@ mod tests {
         insert_entry(
             &mut entries,
             "/foo/".to_string(),
-            FilesystemEntry::Directory,
+            FilesystemEntry::Directory(directory_entry("dir-foo")),
         )
         .expect("initial directory entry should insert");
         insert_entry(
@@ -493,8 +541,13 @@ mod tests {
             id: id.to_string(),
             name: "foo".to_string(),
             blob_hash: None,
+            metadata: None,
             scope: row_scope(),
         }
+    }
+
+    fn directory_entry(id: &str) -> FilesystemDirectoryEntry {
+        FilesystemDirectoryEntry { id: id.to_string() }
     }
 
     fn row_scope() -> RowScope {

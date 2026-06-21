@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use lix_engine::wasm::WasmRuntime;
@@ -12,8 +12,7 @@ use lix_engine::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
     InMemoryBackend, Key, KeyRange, LixError, PointVisitor, PutBatch, ReadOptions, ScanOptions,
     ScanResult, ScanVisitor, SessionContext, SessionTransaction, SpaceId, Value, WriteOptions,
-    lix_file_data_hash_hex, lix_filesystem_blob_ref_key_for_active_file_descriptor,
-    lix_filesystem_blob_ref_key_for_active_state_row,
+    lix_file_data_hash_hex,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -28,6 +27,9 @@ const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
 // historical 999-parameter floor while reducing per-chunk live-state scans.
 const FILESYSTEM_FILE_UPSERT_CHUNK_SIZE: usize = 400;
 const FILESYSTEM_FILE_UPSERT_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+const FILESYSTEM_PARALLEL_INVENTORY_MIN_DIRS: usize = 8;
+// Bounds blocking filesystem metadata IO during folder open.
+const FILESYSTEM_PARALLEL_INVENTORY_MAX_WORKERS: usize = 8;
 const FILESYSTEM_UNRESOLVED_METADATA_KEY: &str = "lix_fs_unresolved";
 const FILESYSTEM_DISK_OWNED_UNRESOLVED_PATHS: &str = ".lix/.internal/fs_unresolved_disk_owned.json";
 static FILESYSTEM_UNRESOLVED_REGISTRY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -274,6 +276,12 @@ struct LixInventoryRead {
     unresolved_files: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DiskOwnedUnresolvedFileOwners {
+    owners: BTreeMap<String, String>,
+    needs_writeback: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct InventoryReconcileOutcome {
     descriptors_changed: bool,
@@ -289,12 +297,6 @@ struct InventoryMaterializeOutcome {
 #[derive(Debug, Default, Clone, Copy)]
 struct SyncFromLixOutcome {
     needs_disk_sync: bool,
-}
-
-#[derive(Debug)]
-struct InventoryBlobRefSnapshot {
-    id: String,
-    blob_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,7 +675,7 @@ where
         };
         let poll_filesystem = cfg!(target_os = "macos") || debouncer.is_none();
         let worker_state = Arc::clone(&state);
-        let worker = std::thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("lix-sdk-filesystem-sync".to_string())
             .spawn(move || filesystem_worker(worker_state, event_rx, poll_filesystem))
             .map_err(|error| {
@@ -746,7 +748,7 @@ fn start_filesystem_watcher_setup(
     path_filter: FilesystemPathFilter,
     event_tx: mpsc::Sender<FilesystemEvent>,
 ) -> Option<JoinHandle<Option<FilesystemDebouncer>>> {
-    std::thread::Builder::new()
+    thread::Builder::new()
         .name("lix-sdk-filesystem-watch-setup".to_string())
         .spawn(move || create_filesystem_debouncer(&root, metadata_mode, &path_filter, event_tx))
         .ok()
@@ -762,7 +764,7 @@ fn start_filesystem_watcher_install(
     watcher_setup: JoinHandle<Option<FilesystemDebouncer>>,
     supervisor: std::sync::Weak<FilesystemSupervisorInner>,
 ) {
-    let _ = std::thread::Builder::new()
+    let _ = thread::Builder::new()
         .name("lix-sdk-filesystem-watch-install".to_string())
         .spawn(move || {
             let Some(debouncer) = finish_filesystem_watcher_setup(Some(watcher_setup)) else {
@@ -955,14 +957,14 @@ where
     fn read_disk_owned_unresolved_file_owners(
         &self,
         legacy_owner_branch_id: Option<&str>,
-    ) -> Result<BTreeMap<String, String>, LixError> {
+    ) -> Result<DiskOwnedUnresolvedFileOwners, LixError> {
         let Some(path) = disk_owned_unresolved_registry_path(&self.root, self.metadata_mode) else {
-            return Ok(BTreeMap::new());
+            return Ok(DiskOwnedUnresolvedFileOwners::default());
         };
         let data = match std::fs::read(&path) {
             Ok(data) => data,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
+                return Ok(DiskOwnedUnresolvedFileOwners::default());
             }
             Err(error) => {
                 return Err(io_error(
@@ -1188,88 +1190,34 @@ where
     }
 
     async fn collect_lix_inventory_read(&self) -> Result<LixInventoryRead, LixError> {
+        let inventory = self.session.read_filesystem_inventory().await?;
         let mut directories = BTreeSet::from(["/".to_string()]);
         let mut directory_ids = BTreeMap::new();
         let mut files = BTreeSet::new();
-        let mut blob_key_by_path = BTreeMap::new();
-        let mut blob_hash_by_key = BTreeMap::new();
+        let mut blob_data_hash_by_path = BTreeMap::new();
         let mut unresolved_files = BTreeSet::new();
-        let statements: [(&str, &[Value]); 3] = [
-            ("SELECT path, id FROM lix_directory ORDER BY path", &[]),
-            (
-                "SELECT path, id, lixcol_metadata, lixcol_global, lixcol_untracked FROM lix_file ORDER BY path",
-                &[],
-            ),
-            (
-                "SELECT entity_pk, file_id, snapshot_content, global, untracked \
-                 FROM lix_state WHERE schema_key = 'lix_binary_blob_ref'",
-                &[],
-            ),
-        ];
-        let batch = self
-            .session
-            .execute_coherent_read_batch(&statements)
-            .await?;
         let revision = LixRevision {
-            active_branch_id: batch.active_branch_id.clone(),
-            active_branch_commit_id: batch.active_branch_commit_id.clone(),
-            storage_mutation_revision: batch.storage_mutation_revision.clone(),
+            active_branch_id: inventory.active_branch_id.clone(),
+            active_branch_commit_id: inventory.active_branch_commit_id.clone(),
+            storage_mutation_revision: inventory.storage_mutation_revision.clone(),
         };
-        let [directory_rows, file_rows, blob_ref_rows] =
-            batch.results.try_into().map_err(|results: Vec<_>| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "coherent filesystem inventory read returned {} result sets",
-                        results.len()
-                    ),
-                )
-            })?;
-        for row in directory_rows.rows() {
-            let path = row.get::<String>("path")?;
+        for directory in inventory.directories {
+            let path = directory.path;
             if path != "/" {
-                let id = row.get::<String>("id")?;
-                directory_ids.insert(path.clone(), id);
+                directory_ids.insert(path.clone(), directory.id);
             }
             directories.insert(path);
         }
-        for row in blob_ref_rows.rows() {
-            let Some(blob_ref_id) = single_string_entity_pk_value(row.value("entity_pk")?)? else {
-                continue;
-            };
-            let snapshot_content = json_or_text_value_to_string(row.value("snapshot_content")?)?;
-            let snapshot = inventory_blob_ref_snapshot_from_json(&snapshot_content)?;
-            if snapshot.id != blob_ref_id {
-                continue;
-            }
-            let key = lix_filesystem_blob_ref_key_for_active_state_row(
-                &revision.active_branch_id,
-                bool_value_or_false(row.value("global")?)?,
-                bool_value_or_false(row.value("untracked")?)?,
-                optional_text_value(row.value("file_id")?)?,
-                &blob_ref_id,
-            );
-            blob_hash_by_key.insert(key, snapshot.blob_hash);
-        }
-        for row in file_rows.rows() {
-            let path = row.get::<String>("path")?;
-            if metadata_value_is_filesystem_unresolved(row.value("lixcol_metadata")?)? {
+        for file in inventory.files {
+            let path = file.path;
+            if metadata_is_filesystem_unresolved(file.metadata.as_deref()) {
                 unresolved_files.insert(path.clone());
             }
-            let descriptor_id = row.get::<String>("id")?;
-            let key = lix_filesystem_blob_ref_key_for_active_file_descriptor(
-                &revision.active_branch_id,
-                bool_value_or_false(row.value("lixcol_global")?)?,
-                bool_value_or_false(row.value("lixcol_untracked")?)?,
-                &descriptor_id,
-            );
-            blob_key_by_path.insert(path.clone(), key);
+            if let Some(blob_hash) = file.blob_hash {
+                blob_data_hash_by_path.insert(path.clone(), blob_hash);
+            }
             files.insert(path);
         }
-        let blob_data_hash_by_path = blob_key_by_path
-            .into_iter()
-            .filter_map(|(path, key)| blob_hash_by_key.get(&key).map(|hash| (path, hash.clone())))
-            .collect::<BTreeMap<_, _>>();
         Ok(LixInventoryRead {
             active_branch_id: revision.active_branch_id.clone(),
             revision,
@@ -1313,6 +1261,7 @@ where
         let should_sync = !inventory.unresolved_files.is_empty()
             || !self
                 .read_disk_owned_unresolved_file_owners(Some(&inventory.active_branch_id))?
+                .owners
                 .is_empty()
             || (inventory.files.is_empty()
                 && inventory.directories.iter().all(|path| {
@@ -1326,8 +1275,34 @@ where
         lix: &LixInventoryRead,
         local: Option<&InventorySnapshot>,
     ) -> Result<BTreeSet<String>, LixError> {
-        let mut disk_owned =
-            self.read_disk_owned_unresolved_file_owners(Some(&lix.active_branch_id))?;
+        let (disk_owned, needs_writeback) =
+            self.normalized_disk_owned_unresolved_file_owners(lix, local)?;
+        if needs_writeback {
+            self.write_disk_owned_unresolved_file_owners(&disk_owned)?;
+        }
+        Ok(disk_owned.into_keys().collect())
+    }
+
+    fn disk_owned_unresolved_files_for_lix_materialization(
+        &self,
+        lix: &LixInventoryRead,
+    ) -> Result<BTreeSet<String>, LixError> {
+        let (disk_owned, needs_writeback) =
+            self.normalized_disk_owned_unresolved_file_owners(lix, None)?;
+        if needs_writeback {
+            self.write_disk_owned_unresolved_file_owners(&disk_owned)?;
+        }
+        Ok(disk_owned.into_keys().collect())
+    }
+
+    fn normalized_disk_owned_unresolved_file_owners(
+        &self,
+        lix: &LixInventoryRead,
+        local: Option<&InventorySnapshot>,
+    ) -> Result<(BTreeMap<String, String>, bool), LixError> {
+        let read = self.read_disk_owned_unresolved_file_owners(Some(&lix.active_branch_id))?;
+        let original = read.owners.clone();
+        let mut disk_owned = read.owners;
         for path in &lix.unresolved_files {
             disk_owned
                 .entry(path.clone())
@@ -1339,28 +1314,8 @@ where
                 && !is_materialization_ignored_path(path, self.metadata_mode)
                 && local.is_none_or(|inventory| inventory.files.contains(path))
         });
-        self.write_disk_owned_unresolved_file_owners(&disk_owned)?;
-        Ok(disk_owned.into_keys().collect())
-    }
-
-    fn disk_owned_unresolved_files_for_lix_materialization(
-        &self,
-        lix: &LixInventoryRead,
-    ) -> Result<BTreeSet<String>, LixError> {
-        let mut disk_owned =
-            self.read_disk_owned_unresolved_file_owners(Some(&lix.active_branch_id))?;
-        for path in &lix.unresolved_files {
-            disk_owned
-                .entry(path.clone())
-                .or_insert_with(|| lix.active_branch_id.clone());
-        }
-        disk_owned.retain(|path, owner_branch_id| {
-            (lix.unresolved_files.contains(path) || owner_branch_id != &lix.active_branch_id)
-                && self.path_filter.includes_file(path)
-                && !is_materialization_ignored_path(path, self.metadata_mode)
-        });
-        self.write_disk_owned_unresolved_file_owners(&disk_owned)?;
-        Ok(disk_owned.into_keys().collect())
+        let needs_writeback = read.needs_writeback || disk_owned != original;
+        Ok((disk_owned, needs_writeback))
     }
 
     async fn apply_local_inventory_to_lix(
@@ -2423,7 +2378,7 @@ fn collect_local_inventory(
     let mut snapshot = InventorySnapshot::default();
     snapshot.directories.insert("/".to_string());
     if path_filter.is_unfiltered() {
-        collect_local_inventory_directory(root, root, metadata_mode, &mut snapshot)?;
+        collect_local_inventory_unfiltered(root, metadata_mode, &mut snapshot)?;
     } else {
         collect_filtered_local_inventory(root, metadata_mode, path_filter, &mut snapshot)?;
     }
@@ -2436,82 +2391,6 @@ fn snapshot_data_hashes(snapshot: &Snapshot) -> BTreeMap<String, String> {
         .iter()
         .map(|(path, data)| (path.clone(), lix_file_data_hash_hex(data)))
         .collect()
-}
-
-fn optional_text_value(value: &Value) -> Result<Option<String>, LixError> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(value) => Ok(Some(value.clone())),
-        other => Err(LixError::unknown(format!(
-            "expected nullable text value, got {other:?}"
-        ))),
-    }
-}
-
-fn bool_value_or_false(value: &Value) -> Result<bool, LixError> {
-    match value {
-        Value::Null => Ok(false),
-        Value::Boolean(value) => Ok(*value),
-        other => Err(LixError::unknown(format!(
-            "expected nullable boolean value, got {other:?}"
-        ))),
-    }
-}
-
-fn json_or_text_value_to_string(value: &Value) -> Result<String, LixError> {
-    match value {
-        Value::Text(value) => Ok(value.clone()),
-        Value::Json(value) => Ok(value.to_string()),
-        other => Err(LixError::unknown(format!(
-            "expected JSON or text value, got {other:?}"
-        ))),
-    }
-}
-
-fn single_string_entity_pk_value(value: &Value) -> Result<Option<String>, LixError> {
-    let entity_pk = match value {
-        Value::Json(value) => value.clone(),
-        Value::Text(value) => serde_json::from_str(value).map_err(|error| {
-            LixError::unknown(format!(
-                "invalid entity_pk JSON for filesystem blob ref: {error}"
-            ))
-        })?,
-        Value::Null => return Ok(None),
-        other => {
-            return Err(LixError::unknown(format!(
-                "expected entity_pk JSON array, got {other:?}"
-            )));
-        }
-    };
-    let serde_json::Value::Array(values) = entity_pk else {
-        return Ok(None);
-    };
-    let [serde_json::Value::String(value)] = values.as_slice() else {
-        return Ok(None);
-    };
-    Ok(Some(value.clone()))
-}
-
-fn inventory_blob_ref_snapshot_from_json(
-    snapshot_content: &str,
-) -> Result<InventoryBlobRefSnapshot, LixError> {
-    let value = serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-        LixError::unknown(format!(
-            "invalid lix_binary_blob_ref snapshot JSON: {error}"
-        ))
-    })?;
-    let id = value
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LixError::unknown("lix_binary_blob_ref snapshot is missing id"))?;
-    let blob_hash = value
-        .get("blob_hash")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LixError::unknown("lix_binary_blob_ref snapshot is missing blob_hash"))?;
-    Ok(InventoryBlobRefSnapshot {
-        id: id.to_string(),
-        blob_hash: blob_hash.to_string(),
-    })
 }
 
 fn is_lix_file_data_hash_hex(value: &str) -> bool {
@@ -2545,7 +2424,7 @@ fn disk_owned_unresolved_registry_tmp_path(path: &Path) -> PathBuf {
 fn disk_owned_unresolved_owners_from_json(
     value: &serde_json::Value,
     legacy_owner_branch_id: Option<&str>,
-) -> Option<BTreeMap<String, String>> {
+) -> Option<DiskOwnedUnresolvedFileOwners> {
     match value {
         serde_json::Value::Array(paths) => {
             let owner_branch_id = legacy_owner_branch_id?;
@@ -2553,14 +2432,20 @@ fn disk_owned_unresolved_owners_from_json(
             for path in paths {
                 owners.insert(path.as_str()?.to_string(), owner_branch_id.to_string());
             }
-            Some(owners)
+            Some(DiskOwnedUnresolvedFileOwners {
+                owners,
+                needs_writeback: true,
+            })
         }
         serde_json::Value::Object(object) => {
             let mut owners = BTreeMap::new();
             for (path, owner_branch_id) in object {
                 owners.insert(path.clone(), owner_branch_id.as_str()?.to_string());
             }
-            Some(owners)
+            Some(DiskOwnedUnresolvedFileOwners {
+                owners,
+                needs_writeback: false,
+            })
         }
         _ => None,
     }
@@ -2580,6 +2465,95 @@ fn collect_local_inventory_directory(
     metadata_mode: FilesystemMetadataMode,
     snapshot: &mut InventorySnapshot,
 ) -> Result<(), LixError> {
+    let child_dirs =
+        collect_local_inventory_directory_entries(root, directory, metadata_mode, snapshot)?;
+    for child_dir in child_dirs {
+        collect_local_inventory_directory(root, &child_dir, metadata_mode, snapshot)?;
+    }
+    Ok(())
+}
+
+fn collect_local_inventory_unfiltered(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    snapshot: &mut InventorySnapshot,
+) -> Result<(), LixError> {
+    let child_dirs =
+        collect_local_inventory_directory_entries(root, root, metadata_mode, snapshot)?;
+    let child_snapshot =
+        collect_local_inventory_child_directories(root, child_dirs, metadata_mode)?;
+    merge_inventory_snapshot(snapshot, child_snapshot);
+    Ok(())
+}
+
+fn collect_local_inventory_child_directories(
+    root: &Path,
+    child_dirs: Vec<PathBuf>,
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<InventorySnapshot, LixError> {
+    let available_workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(FILESYSTEM_PARALLEL_INVENTORY_MAX_WORKERS)
+        .min(child_dirs.len());
+    if child_dirs.len() < FILESYSTEM_PARALLEL_INVENTORY_MIN_DIRS || available_workers <= 1 {
+        let mut snapshot = InventorySnapshot::default();
+        for child_dir in child_dirs {
+            collect_local_inventory_directory(root, &child_dir, metadata_mode, &mut snapshot)?;
+        }
+        return Ok(snapshot);
+    }
+
+    let chunk_size = child_dirs.len().div_ceil(available_workers);
+    let mut handles = Vec::new();
+    for chunk in child_dirs.chunks(chunk_size) {
+        let root = root.to_path_buf();
+        let child_dirs = chunk.to_vec();
+        handles.push(thread::spawn(move || {
+            let mut snapshot = InventorySnapshot::default();
+            for child_dir in child_dirs {
+                collect_local_inventory_directory(&root, &child_dir, metadata_mode, &mut snapshot)?;
+            }
+            Ok::<_, LixError>(snapshot)
+        }));
+    }
+
+    let mut snapshot = InventorySnapshot::default();
+    let mut first_error = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(child_snapshot)) => merge_inventory_snapshot(&mut snapshot, child_snapshot),
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if first_error.is_none() {
+                    first_error = Some(LixError::unknown("filesystem inventory worker panicked"));
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(snapshot)
+}
+
+fn merge_inventory_snapshot(target: &mut InventorySnapshot, source: InventorySnapshot) {
+    target.directories.extend(source.directories);
+    target.files.extend(source.files);
+    target.unmanaged_paths.extend(source.unmanaged_paths);
+}
+
+fn collect_local_inventory_directory_entries(
+    root: &Path,
+    directory: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    snapshot: &mut InventorySnapshot,
+) -> Result<Vec<PathBuf>, LixError> {
+    let mut child_dirs = Vec::new();
     let entries = std::fs::read_dir(directory)
         .map_err(|error| io_error("read filesystem directory", directory, error))?;
     for entry in entries {
@@ -2608,7 +2582,7 @@ fn collect_local_inventory_directory(
                 continue;
             }
             snapshot.directories.insert(lix_path);
-            collect_local_inventory_directory(root, &path, metadata_mode, snapshot)?;
+            child_dirs.push(path);
         } else if file_type.is_file() {
             let Ok(lix_path) = local_path_to_lix_path(root, &path, false) else {
                 remember_unmanaged_inventory_path(root, directory, &path, snapshot);
@@ -2621,7 +2595,7 @@ fn collect_local_inventory_directory(
             snapshot.files.insert(lix_path);
         }
     }
-    Ok(())
+    Ok(child_dirs)
 }
 
 fn collect_filtered_local_inventory(
@@ -3242,18 +3216,6 @@ fn metadata_is_filesystem_unresolved(metadata: Option<&str>) -> bool {
     serde_json::from_str::<serde_json::Value>(metadata)
         .ok()
         .is_some_and(|value| json_metadata_is_filesystem_unresolved(&value))
-}
-
-fn metadata_value_is_filesystem_unresolved(value: &Value) -> Result<bool, LixError> {
-    match value {
-        Value::Null => Ok(false),
-        Value::Text(value) => Ok(metadata_is_filesystem_unresolved(Some(value))),
-        Value::Json(value) => Ok(json_metadata_is_filesystem_unresolved(value)),
-        other => Err(LixError::new(
-            "LIX_ERROR_VALUE_TYPE",
-            format!("expected nullable metadata, got {other:?}"),
-        )),
-    }
 }
 
 fn json_metadata_is_filesystem_unresolved(value: &serde_json::Value) -> bool {
