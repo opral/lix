@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -25,6 +27,8 @@ const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const FILESYSTEM_FILE_UPSERT_CHUNK_SIZE: usize = 400;
 const FILESYSTEM_FILE_UPSERT_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const FILESYSTEM_UNRESOLVED_METADATA_KEY: &str = "lix_fs_unresolved";
+const FILESYSTEM_DISK_OWNED_UNRESOLVED_PATHS: &str = ".lix/.internal/fs_unresolved_disk_owned.json";
+static FILESYSTEM_UNRESOLVED_REGISTRY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -237,6 +241,7 @@ enum MaterializedState {
     Bytes(MaterializedSnapshot),
     Inventory {
         disk: InventorySnapshot,
+        disk_owned_unresolved_files: BTreeSet<String>,
         lix_revision: LixRevision,
     },
 }
@@ -256,6 +261,7 @@ struct LixSnapshotRead {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LixInventoryRead {
+    active_branch_id: String,
     directories: BTreeSet<String>,
     directory_ids: BTreeMap<String, String>,
     files: BTreeSet<String>,
@@ -716,11 +722,21 @@ where
             let resolved = self
                 .collect_lix_resolved_snapshot_read(&lix_inventory)
                 .await?;
-            self.materialize_inventory_snapshot(&resolved, &lix_inventory)?;
+            let disk_owned_unresolved_files =
+                self.disk_owned_unresolved_files_for_lix_materialization(&lix_inventory)?;
+            self.materialize_inventory_snapshot(
+                &resolved,
+                &lix_inventory,
+                &disk_owned_unresolved_files,
+            )?;
             let lix_revision = self.collect_lix_revision().await?;
             let materialized_inventory =
                 collect_local_inventory(&self.root, self.metadata_mode, &self.path_filter)?;
-            self.remember_inventory(materialized_inventory, lix_revision);
+            self.remember_inventory(
+                materialized_inventory,
+                disk_owned_unresolved_files,
+                lix_revision,
+            );
             return Ok(());
         }
         let lix_revision = self.collect_lix_revision().await?;
@@ -741,9 +757,11 @@ where
         skip_if_last_materialized: bool,
     ) -> Result<DiskSyncOutcome, LixError> {
         let _guard = self.sync_lock.lock().await;
-        if let Some(lix_inventory) = self.lix_inventory_for_inventory_sync().await? {
-            let inventory =
+        if let Some(mut lix_inventory) = self.lix_inventory_for_inventory_sync().await? {
+            let mut inventory =
                 collect_local_inventory(&self.root, self.metadata_mode, &self.path_filter)?;
+            let mut disk_owned_unresolved_files =
+                self.disk_owned_unresolved_files_for_inventory(&lix_inventory, Some(&inventory))?;
             let has_resolved_files = lix_inventory
                 .files
                 .difference(&lix_inventory.unresolved_files)
@@ -766,14 +784,24 @@ where
             self.apply_local_inventory_to_lix(
                 &inventory,
                 &lix_inventory,
+                &disk_owned_unresolved_files,
                 !skip_if_last_materialized,
             )
             .await?;
+            lix_inventory = self.collect_lix_inventory_read().await?;
+            disk_owned_unresolved_files =
+                self.disk_owned_unresolved_files_for_inventory(&lix_inventory, Some(&inventory))?;
             self.apply_plugin_local_file_data_to_lix(&inventory).await?;
-            self.apply_resolved_local_file_data_to_lix(&inventory, &lix_inventory)
+            self.materialize_missing_plugin_archives(&mut inventory, &lix_inventory)
                 .await?;
+            self.apply_resolved_local_file_data_to_lix(
+                &inventory,
+                &lix_inventory,
+                &disk_owned_unresolved_files,
+            )
+            .await?;
             let lix_revision = self.collect_lix_revision().await?;
-            self.remember_inventory(inventory, lix_revision);
+            self.remember_inventory(inventory, disk_owned_unresolved_files, lix_revision);
             return Ok(DiskSyncOutcome::InventoryMaterialized);
         }
         let local = collect_local_snapshot(&self.root, self.metadata_mode, &self.path_filter)?;
@@ -794,6 +822,108 @@ where
 
     async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
+    }
+
+    fn read_disk_owned_unresolved_file_owners(
+        &self,
+        legacy_owner_branch_id: Option<&str>,
+    ) -> Result<BTreeMap<String, String>, LixError> {
+        let Some(path) = disk_owned_unresolved_registry_path(&self.root, self.metadata_mode) else {
+            return Ok(BTreeMap::new());
+        };
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => {
+                return Err(io_error(
+                    "read filesystem unresolved registry",
+                    &path,
+                    error,
+                ));
+            }
+        };
+        let value = serde_json::from_slice::<serde_json::Value>(&data).map_err(|error| {
+            LixError::new(
+                "LIX_FILESYSTEM_ERROR",
+                format!(
+                    "failed to parse filesystem unresolved registry {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        disk_owned_unresolved_owners_from_json(&value, legacy_owner_branch_id).ok_or_else(|| {
+            LixError::new(
+                "LIX_FILESYSTEM_ERROR",
+                format!(
+                    "filesystem unresolved registry {} has an invalid format",
+                    path.display()
+                ),
+            )
+        })
+    }
+
+    fn write_disk_owned_unresolved_file_owners(
+        &self,
+        paths: &BTreeMap<String, String>,
+    ) -> Result<(), LixError> {
+        let Some(path) = disk_owned_unresolved_registry_path(&self.root, self.metadata_mode) else {
+            return Ok(());
+        };
+        if paths.is_empty() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "remove filesystem unresolved registry",
+                        &path,
+                        error,
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                io_error(
+                    "create filesystem unresolved registry parent",
+                    parent,
+                    error,
+                )
+            })?;
+        }
+        let data = serde_json::to_vec(paths).map_err(|error| {
+            LixError::new(
+                "LIX_FILESYSTEM_ERROR",
+                format!("failed to encode filesystem unresolved registry: {error}"),
+            )
+        })?;
+        if std::fs::read(&path).ok().as_deref() == Some(data.as_slice()) {
+            return Ok(());
+        }
+        let tmp_path = disk_owned_unresolved_registry_tmp_path(&path);
+        {
+            let mut file = std::fs::File::create(&tmp_path).map_err(|error| {
+                io_error("create filesystem unresolved registry", &tmp_path, error)
+            })?;
+            file.write_all(&data).map_err(|error| {
+                io_error("write filesystem unresolved registry", &tmp_path, error)
+            })?;
+            file.sync_all().map_err(|error| {
+                io_error("sync filesystem unresolved registry", &tmp_path, error)
+            })?;
+        }
+        std::fs::rename(&tmp_path, &path).map_err(|error| {
+            io_error("replace filesystem unresolved registry", &tmp_path, error)
+        })?;
+        if let Some(parent) = path.parent() {
+            if let Ok(parent_dir) = std::fs::File::open(parent) {
+                let _ = parent_dir.sync_all();
+            }
+        }
+        Ok(())
     }
 
     async fn migrate_legacy_lix_system_paths(&self) -> Result<(), LixError> {
@@ -970,6 +1100,7 @@ where
             files.insert(path);
         }
         Ok(LixInventoryRead {
+            active_branch_id: self.session.active_branch_id().await?,
             directories,
             directory_ids,
             files,
@@ -1007,6 +1138,9 @@ where
     async fn lix_inventory_for_inventory_sync(&self) -> Result<Option<LixInventoryRead>, LixError> {
         let inventory = self.collect_lix_inventory_read().await?;
         let should_sync = !inventory.unresolved_files.is_empty()
+            || !self
+                .read_disk_owned_unresolved_file_owners(Some(&inventory.active_branch_id))?
+                .is_empty()
             || (inventory.files.is_empty()
                 && inventory.directories.iter().all(|path| {
                     path == "/" || is_materialization_ignored_path(path, self.metadata_mode)
@@ -1014,10 +1148,53 @@ where
         Ok(should_sync.then_some(inventory))
     }
 
+    fn disk_owned_unresolved_files_for_inventory(
+        &self,
+        lix: &LixInventoryRead,
+        local: Option<&InventorySnapshot>,
+    ) -> Result<BTreeSet<String>, LixError> {
+        let mut disk_owned =
+            self.read_disk_owned_unresolved_file_owners(Some(&lix.active_branch_id))?;
+        for path in &lix.unresolved_files {
+            disk_owned
+                .entry(path.clone())
+                .or_insert_with(|| lix.active_branch_id.clone());
+        }
+        disk_owned.retain(|path, owner_branch_id| {
+            (lix.unresolved_files.contains(path) || owner_branch_id != &lix.active_branch_id)
+                && self.path_filter.includes_file(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
+                && local.is_none_or(|inventory| inventory.files.contains(path))
+        });
+        self.write_disk_owned_unresolved_file_owners(&disk_owned)?;
+        Ok(disk_owned.into_keys().collect())
+    }
+
+    fn disk_owned_unresolved_files_for_lix_materialization(
+        &self,
+        lix: &LixInventoryRead,
+    ) -> Result<BTreeSet<String>, LixError> {
+        let mut disk_owned =
+            self.read_disk_owned_unresolved_file_owners(Some(&lix.active_branch_id))?;
+        for path in &lix.unresolved_files {
+            disk_owned
+                .entry(path.clone())
+                .or_insert_with(|| lix.active_branch_id.clone());
+        }
+        disk_owned.retain(|path, owner_branch_id| {
+            (lix.unresolved_files.contains(path) || owner_branch_id != &lix.active_branch_id)
+                && self.path_filter.includes_file(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
+        });
+        self.write_disk_owned_unresolved_file_owners(&disk_owned)?;
+        Ok(disk_owned.into_keys().collect())
+    }
+
     async fn apply_local_inventory_to_lix(
         &self,
         local: &InventorySnapshot,
         lix: &LixInventoryRead,
+        disk_owned_unresolved_files: &BTreeSet<String>,
         delete_all_missing: bool,
     ) -> Result<(), LixError> {
         let previous_inventory = self.last_materialized_inventory();
@@ -1025,6 +1202,7 @@ where
             .files
             .difference(&lix.files)
             .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
+            .filter(|path| !disk_owned_unresolved_files.contains(*path))
             .filter(|path| {
                 delete_all_missing
                     || !previous_inventory
@@ -1039,6 +1217,7 @@ where
             .difference(&lix.directories)
             .filter(|path| path.as_str() != "/")
             .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
+            .filter(|path| !directory_contains_path(path, disk_owned_unresolved_files))
             .filter(|path| {
                 delete_all_missing
                     || !previous_inventory
@@ -1075,6 +1254,9 @@ where
             if self.path_filter.includes_file(path)
                 && !is_materialization_ignored_path(path, self.metadata_mode)
             {
+                if is_plugin_storage_path(path) {
+                    continue;
+                }
                 if inventory_unmanaged_blocks_lix_path(local, path)
                     || lix_path_blocked_by_unmanaged(&self.root, path)?
                 {
@@ -1095,6 +1277,7 @@ where
                 .difference(&local.directories)
                 .filter(|path| path.as_str() != "/")
                 .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
+                .filter(|path| !is_plugin_storage_path(path))
                 .filter(|path| {
                     delete_all_missing
                         || previous_inventory
@@ -1126,11 +1309,13 @@ where
         &self,
         local: &InventorySnapshot,
         lix: &LixInventoryRead,
+        disk_owned_unresolved_files: &BTreeSet<String>,
     ) -> Result<(), LixError> {
         self.apply_selected_local_file_data_to_lix(
             local.files.iter().filter(|path| {
                 lix.files.contains(*path)
                     && !lix.unresolved_files.contains(*path)
+                    && !disk_owned_unresolved_files.contains(*path)
                     && !is_plugin_storage_path(path)
             }),
             true,
@@ -1147,9 +1332,42 @@ where
                 .files
                 .iter()
                 .filter(|path| is_valid_plugin_storage_archive_path(path)),
-            false,
+            true,
         )
         .await
+    }
+
+    async fn materialize_missing_plugin_archives(
+        &self,
+        local: &mut InventorySnapshot,
+        lix: &LixInventoryRead,
+    ) -> Result<(), LixError> {
+        let missing_plugin_archives = lix
+            .files
+            .difference(&local.files)
+            .filter(|path| {
+                !lix.unresolved_files.contains(*path) && is_valid_plugin_storage_archive_path(path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for path in missing_plugin_archives {
+            let rows = self
+                .session
+                .execute(
+                    "SELECT data FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.clone())],
+                )
+                .await?;
+            let Some(row) = rows.rows().first() else {
+                continue;
+            };
+            let data = row.get::<Vec<u8>>("data")?;
+            write_materialized_file(&self.root, &path, &data, self.metadata_mode)?;
+            insert_parent_inventory_directories(&path, local);
+            local.files.insert(path);
+        }
+        Ok(())
     }
 
     async fn apply_selected_local_file_data_to_lix<'a>(
@@ -1209,7 +1427,11 @@ where
         let Some(row) = rows.rows().first() else {
             return Ok(false);
         };
-        Ok(row.get::<Vec<u8>>("data")? == data)
+        match row.get::<Vec<u8>>("data") {
+            Ok(existing) => Ok(existing == data),
+            Err(error) if error.code == "LIX_FILESYSTEM_DATA_UNRESOLVED" => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
@@ -1474,6 +1696,7 @@ where
         &self,
         target: &Snapshot,
         target_inventory: &LixInventoryRead,
+        disk_owned_unresolved_files: &BTreeSet<String>,
     ) -> Result<(), LixError> {
         ensure_filesystem_root_directory(&self.root)?;
         let previous = self.last_materialized_inventory();
@@ -1485,6 +1708,7 @@ where
                 .filter(|path| {
                     self.path_filter.includes_file(path)
                         && !is_materialization_ignored_path(path, self.metadata_mode)
+                        && !disk_owned_unresolved_files.contains(*path)
                 })
             {
                 remove_materialized_file(&self.root, path, self.metadata_mode)?;
@@ -1497,6 +1721,7 @@ where
                     .filter(|path| {
                         path.as_str() != "/"
                             && !is_materialization_ignored_path(path, self.metadata_mode)
+                            && !directory_contains_path(path, disk_owned_unresolved_files)
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -1525,6 +1750,7 @@ where
         for (path, data) in target.files.iter().filter(|(path, _)| {
             self.path_filter.includes_file(path)
                 && !is_materialization_ignored_path(path, self.metadata_mode)
+                && !disk_owned_unresolved_files.contains(*path)
         }) {
             let local_path = lix_path_to_local_path(&self.root, path)?;
             if std::fs::read(&local_path).ok().as_deref() != Some(data.as_slice()) {
@@ -1643,12 +1869,21 @@ where
             }));
     }
 
-    fn remember_inventory(&self, disk: InventorySnapshot, lix_revision: LixRevision) {
+    fn remember_inventory(
+        &self,
+        disk: InventorySnapshot,
+        disk_owned_unresolved_files: BTreeSet<String>,
+        lix_revision: LixRevision,
+    ) {
         *self
             .last_materialized
             .lock()
             .expect("filesystem materialized snapshot lock should not poison") =
-            Some(MaterializedState::Inventory { disk, lix_revision });
+            Some(MaterializedState::Inventory {
+                disk,
+                disk_owned_unresolved_files,
+                lix_revision,
+            });
     }
 
     fn last_materialized_disk(&self) -> Option<Snapshot> {
@@ -1708,6 +1943,7 @@ where
                 MaterializedState::Inventory {
                     disk: materialized_disk,
                     lix_revision: materialized_revision,
+                    ..
                 } => materialized_disk == disk && materialized_revision == lix_revision,
                 MaterializedState::Bytes(_) => false,
             })
@@ -1869,6 +2105,55 @@ fn collect_local_inventory(
         collect_filtered_local_inventory(root, metadata_mode, path_filter, &mut snapshot)?;
     }
     Ok(snapshot)
+}
+
+fn disk_owned_unresolved_registry_path(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+) -> Option<PathBuf> {
+    (metadata_mode == FilesystemMetadataMode::Persistent)
+        .then(|| root.join(FILESYSTEM_DISK_OWNED_UNRESOLVED_PATHS))
+}
+
+fn disk_owned_unresolved_registry_tmp_path(path: &Path) -> PathBuf {
+    let next = FILESYSTEM_UNRESOLVED_REGISTRY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fs_unresolved_disk_owned.json");
+    path.with_file_name(format!(".{filename}.{}.{}.tmp", std::process::id(), next))
+}
+
+fn disk_owned_unresolved_owners_from_json(
+    value: &serde_json::Value,
+    legacy_owner_branch_id: Option<&str>,
+) -> Option<BTreeMap<String, String>> {
+    match value {
+        serde_json::Value::Array(paths) => {
+            let owner_branch_id = legacy_owner_branch_id?;
+            let mut owners = BTreeMap::new();
+            for path in paths {
+                owners.insert(path.as_str()?.to_string(), owner_branch_id.to_string());
+            }
+            Some(owners)
+        }
+        serde_json::Value::Object(object) => {
+            let mut owners = BTreeMap::new();
+            for (path, owner_branch_id) in object {
+                owners.insert(path.clone(), owner_branch_id.as_str()?.to_string());
+            }
+            Some(owners)
+        }
+        _ => None,
+    }
+}
+
+fn directory_contains_path(directory: &str, paths: &BTreeSet<String>) -> bool {
+    let directory = directory.strip_suffix('/').unwrap_or(directory);
+    paths.iter().any(|path| {
+        path.strip_prefix(directory)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
 
 fn collect_local_inventory_directory(
@@ -2557,7 +2842,13 @@ fn json_metadata_is_filesystem_unresolved(value: &serde_json::Value) -> bool {
     value
         .as_object()
         .and_then(|object| object.get(FILESYSTEM_UNRESOLVED_METADATA_KEY))
-        .is_some()
+        .is_some_and(filesystem_unresolved_metadata_value_is_marker)
+}
+
+fn filesystem_unresolved_metadata_value_is_marker(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+    })
 }
 
 fn local_path_to_lix_path(

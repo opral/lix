@@ -425,6 +425,7 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::public("directory_id"),
         PublicColumn::public("name"),
         PublicColumn::public("data"),
+        PublicColumn::public_read_only("lixcol_data_hash"),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
     columns

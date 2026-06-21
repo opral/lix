@@ -4,7 +4,8 @@
 //   cargo run --release --example profile_fs_open --features sqlite -- <src_dir>
 //
 // Copies <src_dir> (sans any existing .lix) into a fresh temp dir, then times
-// FsBackend::open on the cold workspace.
+// FsBackend::open on the cold workspace. Pass --in-place to time an existing
+// workspace without copying.
 
 use std::path::Path;
 use std::time::Instant;
@@ -31,10 +32,25 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let src = std::env::args()
-        .nth(1)
-        .expect("usage: profile_fs_open <src_dir>");
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    let in_place = args.first().is_some_and(|arg| arg == "--in-place");
+    if in_place {
+        args.remove(0);
+    }
+    let src = args
+        .first()
+        .expect("usage: profile_fs_open [--in-place] <src_dir>");
     let src = Path::new(&src);
+
+    if in_place {
+        let t_open = Instant::now();
+        let backend = FsBackend::open(src).await.unwrap();
+        let open_elapsed = t_open.elapsed();
+        eprintln!("in-place open: {:?}", open_elapsed);
+        drop(backend);
+        println!("OPEN_MS={}", open_elapsed.as_millis());
+        return;
+    }
 
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("workspace");

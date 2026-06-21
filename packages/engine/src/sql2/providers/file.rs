@@ -280,6 +280,7 @@ impl LixFileSpec {
         request: LiveStateScanRequest,
         target_file_ids: FileIdConstraint,
         needs_data: bool,
+        needs_data_hash: bool,
     ) -> RowSource {
         row_source(
             (
@@ -290,6 +291,7 @@ impl LixFileSpec {
                 request,
                 target_file_ids,
                 needs_data,
+                needs_data_hash,
             ),
             |(
                 write_ctx,
@@ -299,6 +301,7 @@ impl LixFileSpec {
                 request,
                 target_file_ids,
                 needs_data,
+                needs_data_hash,
             )| async move {
                 let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
                 let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
@@ -309,7 +312,7 @@ impl LixFileSpec {
                     &blob_reader,
                     &request,
                     plugin_host,
-                    needs_data,
+                    needs_data || needs_data_hash,
                 )
                 .await
                 .map_err(|error| {
@@ -317,9 +320,16 @@ impl LixFileSpec {
                         "sql2 lix_file plugin discovery failed: {error}"
                     ))
                 })?;
-                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)
+                lix_file_record_batch(
+                    &table_schema,
+                    &blob_reader,
+                    plugin_render,
+                    needs_data,
+                    needs_data_hash,
+                    rows,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)
             },
         )
     }
@@ -362,11 +372,13 @@ impl TableSpec for LixFileSpec {
         let scan_limit = if filters.is_empty() { limit } else { None };
         let filters = filters.to_vec();
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
+        let needs_data_hash = scan_needs_data_hash(&self.schema, projection, &filters);
         let mut request = lix_file_scan_request(
             self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
             scan_limit,
             needs_data,
+            needs_data_hash,
         );
         if matches!(self.branch_binding, BranchBinding::Explicit) {
             request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
@@ -400,6 +412,7 @@ impl TableSpec for LixFileSpec {
                     target_paths,
                     physical_filters,
                     needs_data,
+                    needs_data_hash,
                     limit,
                 ),
                 |(
@@ -413,6 +426,7 @@ impl TableSpec for LixFileSpec {
                     target_paths,
                     filters,
                     needs_data,
+                    needs_data_hash,
                     limit,
                 )| async move {
                     let rows = scan_lix_file_live_rows(
@@ -431,7 +445,7 @@ impl TableSpec for LixFileSpec {
                         &blob_reader,
                         &request,
                         plugin_host,
-                        needs_data,
+                        needs_data || needs_data_hash,
                     )
                     .await
                     .map_err(|error| {
@@ -444,6 +458,7 @@ impl TableSpec for LixFileSpec {
                         &blob_reader,
                         plugin_render,
                         needs_data,
+                        needs_data_hash,
                         rows,
                     )
                     .await
@@ -503,9 +518,17 @@ impl TableSpec for LixFileSpec {
         filters: &[Expr],
     ) -> Result<PlannedDml> {
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"));
+        let needs_data_hash = filters
+            .iter()
+            .any(|filter| contains_column(filter, "lixcol_data_hash"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
-        let mut request =
-            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
+        let mut request = lix_file_scan_request(
+            self.branch_binding.active_branch_id(),
+            None,
+            None,
+            needs_data,
+            needs_data_hash,
+        );
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -520,6 +543,7 @@ impl TableSpec for LixFileSpec {
             request.clone(),
             target_file_ids.clone(),
             needs_data,
+            needs_data_hash,
         );
         let branch_binding = self.branch_binding.clone();
         let apply: DmlApply = Arc::new(move |matched_batch| {
@@ -568,9 +592,20 @@ impl TableSpec for LixFileSpec {
             || assignments.iter().any(|(column_name, expr)| {
                 column_name == "path" || physical_expr_contains_column(expr, "data")
             });
+        let needs_data_hash = filters
+            .iter()
+            .any(|filter| contains_column(filter, "lixcol_data_hash"))
+            || assignments
+                .iter()
+                .any(|(_, expr)| physical_expr_contains_column(expr, "lixcol_data_hash"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
-        let mut request =
-            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
+        let mut request = lix_file_scan_request(
+            self.branch_binding.active_branch_id(),
+            None,
+            None,
+            needs_data,
+            needs_data_hash,
+        );
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -585,6 +620,7 @@ impl TableSpec for LixFileSpec {
             request.clone(),
             target_file_ids.clone(),
             needs_data,
+            needs_data_hash,
         );
         let branch_binding = self.branch_binding.clone();
         let functions = self.functions.clone();
@@ -798,8 +834,13 @@ impl UpsertSupport for LixFileSpec {
                 FileIdConstraint::All
             }
         };
-        let mut request =
-            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
+        let mut request = lix_file_scan_request(
+            self.branch_binding.active_branch_id(),
+            None,
+            None,
+            false,
+            false,
+        );
         if matches!(self.branch_binding, BranchBinding::Explicit) {
             request.filter.branch_ids = match target.kind() {
                 UpsertConflictKind::Id => proposed_branch_ids(proposed)?,
@@ -829,9 +870,16 @@ impl UpsertSupport for LixFileSpec {
         .map_err(|error| {
             DataFusionError::Execution(format!("sql2 lix_file plugin discovery failed: {error}"))
         })?;
-        lix_file_record_batch(&self.schema, &self.blob_reader, plugin_render, true, rows)
-            .await
-            .map_err(lix_error_to_datafusion_error)
+        lix_file_record_batch(
+            &self.schema,
+            &self.blob_reader,
+            plugin_render,
+            true,
+            false,
+            rows,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)
     }
 
     fn validate_conflict_pair(
@@ -879,8 +927,13 @@ impl UpsertSupport for LixFileSpec {
         // (needed to tombstone the old blob when `data` is replaced) and any
         // plugins installed for path-move rewrites.
         let target_file_ids = augmented_file_id_constraint(augmented)?;
-        let mut request =
-            lix_file_scan_request(self.branch_binding.active_branch_id(), None, None, false);
+        let mut request = lix_file_scan_request(
+            self.branch_binding.active_branch_id(),
+            None,
+            None,
+            false,
+            false,
+        );
         if matches!(self.branch_binding, BranchBinding::Explicit) {
             request.filter.branch_ids = augmented_branch_ids(augmented)?;
         }
@@ -2055,6 +2108,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_updated_at")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_commit_id")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_data_hash")?;
         }
 
         let path = optional_string_value(batch, row_index, "path")?;
@@ -2416,6 +2470,7 @@ async fn lix_file_record_batch(
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
     load_data: bool,
+    load_data_hash: bool,
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
@@ -2508,6 +2563,7 @@ async fn lix_file_record_batch(
     let mut created_ats = Vec::new();
     let mut updated_ats = Vec::new();
     let mut commit_ids = Vec::new();
+    let mut data_hashes = Vec::new();
     let mut untracked_values = Vec::new();
     let mut metadata_values = Vec::new();
     let mut branch_ids = Vec::new();
@@ -2537,18 +2593,45 @@ async fn lix_file_record_batch(
             None => None,
         };
         let path = compose_file_path(directory_path.as_deref(), &file.name)?;
-        let data = if needs_data {
-            let context = FilesystemRowContext {
+        let context = if needs_data || load_data_hash {
+            Some(FilesystemRowContext {
                 branch_id: file.live.branch_id.clone(),
                 global: file.live.global,
                 untracked: file.live.untracked,
                 file_id: file.live.file_id.clone(),
                 metadata: None,
-            };
-            match blob_rows.get(&FilesystemBlobRefKey::from_context(&context, &file.id)) {
+            })
+        } else {
+            None
+        };
+        let blob_ref = context.as_ref().and_then(|context| {
+            blob_rows.get(&FilesystemBlobRefKey::from_context(context, &file.id))
+        });
+        let is_unresolved = file_metadata_is_filesystem_unresolved(file.live.metadata.as_deref());
+        let rendered = if blob_ref.is_none() && !is_unresolved && (needs_data || load_data_hash) {
+            match &plugin_render {
+                Some(plugin_render) => {
+                    render_plugin_file_for_sql(plugin_render, &file, &path).await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let data_hash = if load_data_hash {
+            Some(match blob_ref {
+                Some(blob_ref) => blob_ref.blob_hash.clone(),
+                None if is_unresolved => format!("unresolved:{path}"),
+                None => BlobHash::from_content(rendered.as_deref().unwrap_or_default()).to_hex(),
+            })
+        } else {
+            None
+        };
+        let data = if needs_data {
+            match blob_ref {
                 Some(blob_ref) => load_single_blob_bytes(blob_reader, &blob_ref.blob_hash).await?,
                 None => {
-                    if file_metadata_is_filesystem_unresolved(file.live.metadata.as_deref()) {
+                    if is_unresolved {
                         return Err(LixError::new(
                             "LIX_FILESYSTEM_DATA_UNRESOLVED",
                             format!("filesystem data for path {path:?} has not been imported yet"),
@@ -2557,12 +2640,6 @@ async fn lix_file_record_batch(
                             "Hydrate the filesystem file data before selecting lix_file.data.",
                         ));
                     }
-                    let rendered = match &plugin_render {
-                        Some(plugin_render) => {
-                            render_plugin_file_for_sql(plugin_render, &file, &path).await?
-                        }
-                        None => None,
-                    };
                     Some(rendered.unwrap_or_default())
                 }
             }
@@ -2583,6 +2660,7 @@ async fn lix_file_record_batch(
         created_ats.push(file.live.created_at);
         updated_ats.push(file.live.updated_at);
         commit_ids.push(file.live.commit_id.map(|id| id.to_string()));
+        data_hashes.push(data_hash);
         untracked_values.push(Some(file.live.untracked));
         metadata_values.push(file.live.metadata.as_deref().map(serialize_row_metadata));
         branch_ids.push(Some(file.live.branch_id));
@@ -2609,6 +2687,7 @@ async fn lix_file_record_batch(
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
             "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
+            "lixcol_data_hash" => Arc::new(StringArray::from(data_hashes.clone())),
             "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
             "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
             "lixcol_branch_id" => Arc::new(StringArray::from(branch_ids.clone())),
@@ -2753,11 +2832,29 @@ fn scan_needs_data(
     projected_needs_data || filters.iter().any(|filter| contains_column(filter, "data"))
 }
 
+fn scan_needs_data_hash(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projected_needs_data_hash = match projection {
+        Some(indices) => indices
+            .iter()
+            .any(|index| base_schema.field(*index).name() == "lixcol_data_hash"),
+        None => true,
+    };
+    projected_needs_data_hash
+        || filters
+            .iter()
+            .any(|filter| contains_column(filter, "lixcol_data_hash"))
+}
+
 fn lix_file_scan_request(
     branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
     needs_data: bool,
+    needs_data_hash: bool,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
         filter: LiveStateFilter {
@@ -2771,7 +2868,7 @@ fn lix_file_scan_request(
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
-        projection: lix_file_live_state_projection(projected_schema, needs_data),
+        projection: lix_file_live_state_projection(projected_schema, needs_data, needs_data_hash),
         limit,
     }
 }
@@ -2779,12 +2876,14 @@ fn lix_file_scan_request(
 fn lix_file_live_state_projection(
     projected_schema: Option<&Schema>,
     needs_data: bool,
+    needs_data_hash: bool,
 ) -> LiveStateProjection {
     let Some(schema) = projected_schema else {
         return LiveStateProjection::default();
     };
     let mut columns = vec!["snapshot_content".to_string()];
     if needs_data
+        || needs_data_hash
         || schema
             .fields()
             .iter()
@@ -2807,7 +2906,13 @@ fn file_metadata_is_filesystem_unresolved(metadata: Option<&str>) -> bool {
                 .and_then(|object| object.get(FILESYSTEM_UNRESOLVED_METADATA_KEY))
                 .cloned()
         })
-        .is_some()
+        .is_some_and(|value| filesystem_unresolved_metadata_value_is_marker(&value))
+}
+
+fn filesystem_unresolved_metadata_value_is_marker(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+    })
 }
 
 async fn scan_lix_file_live_rows(
@@ -3598,6 +3703,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
+        Field::new("lixcol_data_hash", DataType::Utf8, true),
         Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))

@@ -5,6 +5,8 @@ use lix_sdk::{
 #[cfg(feature = "sqlite")]
 use lix_sdk::{FsBackend, SqliteBackend, open_lix_with_backend};
 #[cfg(feature = "sqlite")]
+use std::io::{Cursor, Write};
+#[cfg(feature = "sqlite")]
 use std::path::Path;
 #[cfg(feature = "sqlite")]
 use std::time::{Duration, Instant};
@@ -340,6 +342,66 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 }
 
 #[tokio::test]
+async fn lix_file_data_hash_filters_work_in_destructive_dml() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    write_file(&lix, "/hash-a.txt", b"alpha".to_vec())
+        .await
+        .unwrap();
+    write_file(&lix, "/hash-b.txt", b"beta".to_vec())
+        .await
+        .unwrap();
+
+    let rows = lix
+        .execute(
+            "SELECT path, lixcol_data_hash FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
+            &[
+                Value::Text("/hash-a.txt".to_string()),
+                Value::Text("/hash-b.txt".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    let hash_a = rows.rows()[0].get::<String>("lixcol_data_hash").unwrap();
+    let hash_b = rows.rows()[1].get::<String>("lixcol_data_hash").unwrap();
+    assert_ne!(hash_a, hash_b);
+
+    let update = lix
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE lixcol_data_hash = $2",
+            &[Value::Blob(b"updated".to_vec()), Value::Text(hash_a)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.rows_affected(), 1);
+    assert_eq!(
+        read_file(&lix, "/hash-a.txt").await.unwrap().as_deref(),
+        Some(b"updated".as_slice())
+    );
+    assert_eq!(
+        read_file(&lix, "/hash-b.txt").await.unwrap().as_deref(),
+        Some(b"beta".as_slice())
+    );
+
+    let delete_null = lix
+        .execute("DELETE FROM lix_file WHERE lixcol_data_hash IS NULL", &[])
+        .await
+        .unwrap();
+    assert_eq!(delete_null.rows_affected(), 0);
+
+    let delete = lix
+        .execute(
+            "DELETE FROM lix_file WHERE lixcol_data_hash = $1",
+            &[Value::Text(hash_b)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.rows_affected(), 1);
+    assert_eq!(read_file(&lix, "/hash-b.txt").await.unwrap(), None);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn transaction_rollback_discards_staged_writes() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     register_crm_task_schema(&lix).await;
@@ -465,6 +527,13 @@ async fn filesystem_initial_import_stages_descriptors_without_file_data() {
     write_file(&lix, "/docs/readme.txt", b"hydrated".to_vec())
         .await
         .unwrap();
+    assert!(
+        !tempdir
+            .path()
+            .join(".lix/.internal/fs_unresolved_disk_owned.json")
+            .exists(),
+        "hydrating the active unresolved file should release disk-owned protection"
+    );
     assert_eq!(
         read_file(&lix, "/docs/readme.txt")
             .await
@@ -472,6 +541,43 @@ async fn filesystem_initial_import_stages_descriptors_without_file_data() {
             .as_deref(),
         Some(b"hydrated".as_slice())
     );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_unresolved_file_exposes_data_hash_without_data() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("docs.md"), b"local").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    let rows = lix
+        .execute(
+            "SELECT lixcol_data_hash FROM lix_file WHERE path = $1",
+            &[Value::Text("/docs.md".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows()[0].get::<String>("lixcol_data_hash").unwrap(),
+        "unresolved:/docs.md"
+    );
+    assert_unresolved_file_data(&lix, "/docs.md").await;
+
+    write_file(&lix, "/docs.md", b"hydrated".to_vec())
+        .await
+        .unwrap();
+    let rows = lix
+        .execute(
+            "SELECT lixcol_data_hash FROM lix_file WHERE path = $1",
+            &[Value::Text("/docs.md".to_string())],
+        )
+        .await
+        .unwrap();
+    let hash = rows.rows()[0].get::<String>("lixcol_data_hash").unwrap();
+    assert!(!hash.is_empty());
+    assert_ne!(hash, "unresolved:/docs.md");
+
     lix.close().await.unwrap();
 }
 
@@ -960,6 +1066,211 @@ async fn filesystem_inventory_mode_syncs_resolved_disk_edits() {
     std::fs::write(tempdir.path().join("resolved.txt"), b"disk-change").unwrap();
     wait_for_lix_file(&lix, "/resolved.txt", Some(b"disk-change")).await;
     assert_unresolved_file_data(&lix, "/still-unresolved.txt").await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_inventory_mode_protects_unresolved_disk_bytes_from_resolved_branch() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("same.md"), b"disk-main").unwrap();
+    std::fs::write(tempdir.path().join("only-main.md"), b"only-main").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+    let main_branch_id = lix.active_branch_id().await.unwrap();
+    assert_unresolved_file_data(&lix, "/same.md").await;
+    assert!(
+        tempdir
+            .path()
+            .join(".lix/.internal/fs_unresolved_disk_owned.json")
+            .exists(),
+        "initial unresolved import should persist disk-owned protection"
+    );
+
+    let branch = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("resolved-branch".to_string()),
+            name: "Resolved".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: branch.id.clone(),
+    })
+    .await
+    .unwrap();
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/only-main.md".to_string())],
+    )
+    .await
+    .unwrap();
+    write_file(&lix, "/same.md", b"branch-data".to_vec())
+        .await
+        .unwrap();
+
+    std::fs::write(tempdir.path().join("disk-trigger.txt"), b"trigger").unwrap();
+    wait_for_lix_unresolved_file(&lix, "/disk-trigger.txt").await;
+    assert_eq!(
+        read_file(&lix, "/same.md").await.unwrap().as_deref(),
+        Some(b"branch-data".as_slice())
+    );
+    assert_eq!(
+        std::fs::read(tempdir.path().join("same.md")).unwrap(),
+        b"disk-main"
+    );
+    assert_eq!(read_file(&lix, "/only-main.md").await.unwrap(), None);
+    assert_eq!(
+        std::fs::read(tempdir.path().join("only-main.md")).unwrap(),
+        b"only-main"
+    );
+
+    lix.close().await.unwrap();
+    let reopened = open_lix_with_filesystem(tempdir.path()).await;
+    reopened
+        .switch_branch(SwitchBranchOptions {
+            branch_id: branch.id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&reopened, "/same.md").await.unwrap().as_deref(),
+        Some(b"branch-data".as_slice())
+    );
+    assert_eq!(
+        std::fs::read(tempdir.path().join("same.md")).unwrap(),
+        b"disk-main"
+    );
+    assert_eq!(read_file(&reopened, "/only-main.md").await.unwrap(), None);
+    assert_eq!(
+        std::fs::read(tempdir.path().join("only-main.md")).unwrap(),
+        b"only-main"
+    );
+    reopened
+        .switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id,
+        })
+        .await
+        .unwrap();
+    assert_unresolved_file_data(&reopened, "/same.md").await;
+    assert_unresolved_file_data(&reopened, "/only-main.md").await;
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_inventory_mode_rematerializes_missing_plugin_archive() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("normal.txt"), b"normal").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+    let plugin_archive = build_runtime_test_plugin_archive();
+    write_file(
+        &lix,
+        "/.lix/plugins/plugin_runtime_test.lixplugin",
+        plugin_archive.clone(),
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(
+        &tempdir
+            .path()
+            .join(".lix/plugins/plugin_runtime_test.lixplugin"),
+        Some(&plugin_archive),
+    );
+    lix.close().await.unwrap();
+
+    std::fs::remove_file(
+        tempdir
+            .path()
+            .join(".lix/plugins/plugin_runtime_test.lixplugin"),
+    )
+    .unwrap();
+    let reopened = open_lix_with_filesystem(tempdir.path()).await;
+    wait_for_disk_file(
+        &tempdir
+            .path()
+            .join(".lix/plugins/plugin_runtime_test.lixplugin"),
+        Some(&plugin_archive),
+    );
+    assert_unresolved_file_data(&reopened, "/normal.txt").await;
+    reopened.close().await.unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+fn build_runtime_test_plugin_archive() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        ("manifest.json", RUNTIME_TEST_PLUGIN_MANIFEST.as_bytes()),
+        (
+            "schema/test_plugin_doc.json",
+            RUNTIME_TEST_PLUGIN_SCHEMA.as_bytes(),
+        ),
+        ("plugin.wasm", b"\0asm\x01\0\0\0".as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[cfg(feature = "sqlite")]
+const RUNTIME_TEST_PLUGIN_MANIFEST: &str = r#"{
+  "key": "plugin_runtime_test",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {
+    "path_glob": "*.runtime",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/test_plugin_doc.json"
+  ]
+}"#;
+
+#[cfg(feature = "sqlite")]
+const RUNTIME_TEST_PLUGIN_SCHEMA: &str = r#"{
+  "x-lix-key": "test_plugin_doc",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "required": [
+    "id",
+    "content"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}"#;
+
+#[tokio::test]
+async fn lix_file_unresolved_metadata_key_stays_reserved() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let error = lix
+        .execute(
+            "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, lix_json($3))",
+            &[
+                Value::Text("/marker-like.txt".to_string()),
+                Value::Blob(b"data".to_vec()),
+                Value::Text(r#"{"lix_fs_unresolved":{"version":2}}"#.to_string()),
+            ],
+        )
+        .await
+        .expect_err("filesystem unresolved metadata key should be reserved");
+    assert!(
+        error.message.contains("reserved for filesystem backend"),
+        "unexpected error: {error:?}"
+    );
 
     lix.close().await.unwrap();
 }

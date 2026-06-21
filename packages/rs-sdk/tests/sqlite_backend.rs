@@ -388,6 +388,20 @@ async fn sqlite_backend_open_lix_options_supplies_plugin_wasm_runtime() {
     );
     assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 1);
 
+    let hash_rows = lix
+        .execute(
+            "SELECT lixcol_data_hash FROM lix_file WHERE path = $1",
+            &[Value::Text("/custom.runtime".to_string())],
+        )
+        .await
+        .expect("plugin file data hash reads");
+    let data_hash = hash_rows.rows()[0]
+        .get::<String>("lixcol_data_hash")
+        .expect("data hash should decode");
+    assert!(!data_hash.is_empty());
+    assert!(!data_hash.starts_with("unresolved:"));
+    assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 2);
+
     lix.close().await.expect("lix closes");
 }
 
