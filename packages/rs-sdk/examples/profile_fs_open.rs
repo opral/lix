@@ -428,11 +428,13 @@ fn print_result(
                     "\"cold_open_ms\":{},",
                     "\"warm_reopen_ms\":{},",
                     "\"cold_binary_cas_chunk_lookup_count\":{},",
+                    "\"cold_binary_cas_chunk_lookup_batch_count\":{},",
                     "\"cold_binary_cas_chunk_lookup_hit_count\":{},",
                     "\"cold_binary_cas_chunk_lookup_miss_count\":{},",
                     "\"cold_binary_cas_chunk_lookup_time_us\":{},",
                     "\"cold_binary_cas_transaction_duplicate_chunk_count\":{},",
                     "\"warm_binary_cas_chunk_lookup_count\":{},",
+                    "\"warm_binary_cas_chunk_lookup_batch_count\":{},",
                     "\"warm_binary_cas_chunk_lookup_hit_count\":{},",
                     "\"warm_binary_cas_chunk_lookup_miss_count\":{},",
                     "\"warm_binary_cas_chunk_lookup_time_us\":{},",
@@ -470,12 +472,16 @@ fn print_result(
                 duration_ms(open_elapsed),
                 duration_ms(warm_elapsed),
                 open_metrics.chunk_lookup_count,
+                open_metrics.chunk_lookup_batch_count,
                 open_metrics.chunk_lookup_hit_count,
                 open_metrics.chunk_lookup_miss_count,
                 metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
                 open_metrics.transaction_duplicate_chunk_count,
                 warm_metrics
                     .map(|metrics| metrics.chunk_lookup_count)
+                    .unwrap_or_default(),
+                warm_metrics
+                    .map(|metrics| metrics.chunk_lookup_batch_count)
                     .unwrap_or_default(),
                 warm_metrics
                     .map(|metrics| metrics.chunk_lookup_hit_count)
@@ -522,6 +528,7 @@ fn print_result(
                     "\"blob_min_size\":{},",
                     "\"open_ms\":{},",
                     "\"open_binary_cas_chunk_lookup_count\":{},",
+                    "\"open_binary_cas_chunk_lookup_batch_count\":{},",
                     "\"open_binary_cas_chunk_lookup_hit_count\":{},",
                     "\"open_binary_cas_chunk_lookup_miss_count\":{},",
                     "\"open_binary_cas_chunk_lookup_time_us\":{},",
@@ -557,6 +564,7 @@ fn print_result(
                 blob_min_json,
                 duration_ms(open_elapsed),
                 open_metrics.chunk_lookup_count,
+                open_metrics.chunk_lookup_batch_count,
                 open_metrics.chunk_lookup_hit_count,
                 open_metrics.chunk_lookup_miss_count,
                 metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
@@ -613,6 +621,10 @@ fn print_open_metrics(prefix: &str, metrics: &BinaryCasWriteMetrics) {
     println!(
         "{prefix}_BINARY_CAS_CHUNK_LOOKUP_COUNT={}",
         metrics.chunk_lookup_count
+    );
+    println!(
+        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_BATCH_COUNT={}",
+        metrics.chunk_lookup_batch_count
     );
     println!(
         "{prefix}_BINARY_CAS_CHUNK_LOOKUP_HIT_COUNT={}",
