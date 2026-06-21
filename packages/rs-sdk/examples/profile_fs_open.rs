@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    Backend as _, BackendRead as _, BinaryCasStorageStats, ReadOptions,
-    collect_binary_cas_storage_stats,
+    Backend as _, BackendRead as _, BinaryCasStorageStats, BinaryCasWriteMetrics, ReadOptions,
+    binary_cas_write_metrics_snapshot, collect_binary_cas_storage_stats,
+    reset_binary_cas_write_metrics,
 };
 use lix_sdk::FsBackend;
 #[cfg(feature = "rocksdb")]
@@ -224,6 +225,22 @@ fn duration_ms(duration: Duration) -> u128 {
     duration.as_micros() / 1000
 }
 
+fn metric_duration_us(ns: u64) -> u64 {
+    ns / 1000
+}
+
+async fn open_with_metrics(
+    backend: ProfileBackend,
+    path: &Path,
+) -> (FsBackend, Duration, BinaryCasWriteMetrics) {
+    reset_binary_cas_write_metrics();
+    let started = Instant::now();
+    let opened = backend.open(path).await;
+    let elapsed = started.elapsed();
+    let metrics = binary_cas_write_metrics_snapshot();
+    (opened, elapsed, metrics)
+}
+
 fn compact_backend_if_requested(args: &Args, backend: &FsBackend) -> Option<Duration> {
     if !args.compact_before_stats {
         return None;
@@ -383,7 +400,9 @@ fn print_result(
     args: &Args,
     copy_elapsed: Option<Duration>,
     open_elapsed: Duration,
+    open_metrics: &BinaryCasWriteMetrics,
     warm_elapsed: Option<Duration>,
+    warm_metrics: Option<&BinaryCasWriteMetrics>,
     compact_elapsed: Option<Duration>,
     stats: &ProfileStats,
     workspace_path: Option<&Path>,
@@ -408,6 +427,16 @@ fn print_result(
                     "\"copy_ms\":{},",
                     "\"cold_open_ms\":{},",
                     "\"warm_reopen_ms\":{},",
+                    "\"cold_binary_cas_chunk_lookup_count\":{},",
+                    "\"cold_binary_cas_chunk_lookup_hit_count\":{},",
+                    "\"cold_binary_cas_chunk_lookup_miss_count\":{},",
+                    "\"cold_binary_cas_chunk_lookup_time_us\":{},",
+                    "\"cold_binary_cas_transaction_duplicate_chunk_count\":{},",
+                    "\"warm_binary_cas_chunk_lookup_count\":{},",
+                    "\"warm_binary_cas_chunk_lookup_hit_count\":{},",
+                    "\"warm_binary_cas_chunk_lookup_miss_count\":{},",
+                    "\"warm_binary_cas_chunk_lookup_time_us\":{},",
+                    "\"warm_binary_cas_transaction_duplicate_chunk_count\":{},",
                     "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
@@ -440,6 +469,26 @@ fn print_result(
                 duration_ms(copy_elapsed),
                 duration_ms(open_elapsed),
                 duration_ms(warm_elapsed),
+                open_metrics.chunk_lookup_count,
+                open_metrics.chunk_lookup_hit_count,
+                open_metrics.chunk_lookup_miss_count,
+                metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
+                open_metrics.transaction_duplicate_chunk_count,
+                warm_metrics
+                    .map(|metrics| metrics.chunk_lookup_count)
+                    .unwrap_or_default(),
+                warm_metrics
+                    .map(|metrics| metrics.chunk_lookup_hit_count)
+                    .unwrap_or_default(),
+                warm_metrics
+                    .map(|metrics| metrics.chunk_lookup_miss_count)
+                    .unwrap_or_default(),
+                warm_metrics
+                    .map(|metrics| metric_duration_us(metrics.chunk_lookup_elapsed_ns))
+                    .unwrap_or_default(),
+                warm_metrics
+                    .map(|metrics| metrics.transaction_duplicate_chunk_count)
+                    .unwrap_or_default(),
                 compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
@@ -472,6 +521,11 @@ fn print_result(
                     "\"backend\":\"{}\",",
                     "\"blob_min_size\":{},",
                     "\"open_ms\":{},",
+                    "\"open_binary_cas_chunk_lookup_count\":{},",
+                    "\"open_binary_cas_chunk_lookup_hit_count\":{},",
+                    "\"open_binary_cas_chunk_lookup_miss_count\":{},",
+                    "\"open_binary_cas_chunk_lookup_time_us\":{},",
+                    "\"open_binary_cas_transaction_duplicate_chunk_count\":{},",
                     "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
@@ -502,6 +556,11 @@ fn print_result(
                 args.backend.name(),
                 blob_min_json,
                 duration_ms(open_elapsed),
+                open_metrics.chunk_lookup_count,
+                open_metrics.chunk_lookup_hit_count,
+                open_metrics.chunk_lookup_miss_count,
+                metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
+                open_metrics.transaction_duplicate_chunk_count,
                 compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
@@ -531,17 +590,46 @@ fn print_result(
         }
     } else if args.in_place {
         println!("OPEN_MS={}", duration_ms(open_elapsed));
+        print_open_metrics("OPEN", open_metrics);
         if let Some(compact_elapsed) = compact_elapsed {
             println!("COMPACT_MS={}", duration_ms(compact_elapsed));
         }
         print_text_stats(stats, workspace_path);
     } else {
         println!("COLD_OPEN_MS={}", duration_ms(open_elapsed));
+        print_open_metrics("COLD", open_metrics);
+        if let (Some(warm_elapsed), Some(warm_metrics)) = (warm_elapsed, warm_metrics) {
+            println!("WARM_REOPEN_MS={}", duration_ms(warm_elapsed));
+            print_open_metrics("WARM", warm_metrics);
+        }
         if let Some(compact_elapsed) = compact_elapsed {
             println!("COMPACT_MS={}", duration_ms(compact_elapsed));
         }
         print_text_stats(stats, workspace_path);
     }
+}
+
+fn print_open_metrics(prefix: &str, metrics: &BinaryCasWriteMetrics) {
+    println!(
+        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_COUNT={}",
+        metrics.chunk_lookup_count
+    );
+    println!(
+        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_HIT_COUNT={}",
+        metrics.chunk_lookup_hit_count
+    );
+    println!(
+        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_MISS_COUNT={}",
+        metrics.chunk_lookup_miss_count
+    );
+    println!(
+        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_TIME_US={}",
+        metric_duration_us(metrics.chunk_lookup_elapsed_ns)
+    );
+    println!(
+        "{prefix}_BINARY_CAS_TRANSACTION_DUPLICATE_CHUNK_COUNT={}",
+        metrics.transaction_duplicate_chunk_count
+    );
 }
 
 fn print_text_stats(stats: &ProfileStats, workspace_path: Option<&Path>) {
@@ -600,9 +688,7 @@ async fn main() {
     let src = Path::new(&args.src);
 
     if args.in_place {
-        let t_open = Instant::now();
-        let backend = args.backend.open(src).await;
-        let open_elapsed = t_open.elapsed();
+        let (backend, open_elapsed, open_metrics) = open_with_metrics(args.backend, src).await;
         eprintln!("{} in-place open: {open_elapsed:?}", args.backend.name());
         let compact_elapsed = compact_backend_if_requested(&args, &backend);
         let mut stats = collect_profile_stats(src);
@@ -612,6 +698,8 @@ async fn main() {
             &args,
             None,
             open_elapsed,
+            &open_metrics,
+            None,
             None,
             compact_elapsed,
             &stats,
@@ -633,16 +721,12 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    let t_open = Instant::now();
-    let backend = args.backend.open(&work).await;
-    let open_elapsed = t_open.elapsed();
+    let (backend, open_elapsed, open_metrics) = open_with_metrics(args.backend, &work).await;
     eprintln!("{} cold open: {open_elapsed:?}", args.backend.name());
     drop(backend);
 
     // Warm reopen (now .lix exists).
-    let t_warm = Instant::now();
-    let backend = args.backend.open(&work).await;
-    let warm_elapsed = t_warm.elapsed();
+    let (backend, warm_elapsed, warm_metrics) = open_with_metrics(args.backend, &work).await;
     eprintln!("{} warm reopen: {warm_elapsed:?}", args.backend.name());
     let compact_elapsed = compact_backend_if_requested(&args, &backend);
     let mut stats = collect_profile_stats(&work);
@@ -671,7 +755,9 @@ async fn main() {
         &args,
         Some(copy_elapsed),
         open_elapsed,
+        &open_metrics,
         Some(warm_elapsed),
+        Some(&warm_metrics),
         compact_elapsed,
         &stats,
         workspace_path,

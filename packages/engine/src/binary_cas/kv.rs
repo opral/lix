@@ -17,6 +17,7 @@ use crate::storage::{
 };
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -533,6 +534,7 @@ where
     stage_blob_write_with_chunk_filter(writes, blob_hashes, bytes, precomputed_hash, |chunk_hash| {
         let key = chunk_key(chunk_hash);
         if !chunk_keys.insert(key.clone()) {
+            crate::binary_cas::metrics::record_binary_cas_transaction_duplicate_chunk();
             return Ok(false);
         }
         Ok(!chunk_key_exists(store, key)?)
@@ -652,6 +654,7 @@ fn stage_blob_write_with_chunk_filter(
 
 fn chunk_key_exists(store: &(impl StorageRead + ?Sized), key: Vec<u8>) -> Result<bool, LixError> {
     let key = StorageKey(Bytes::from(key));
+    let started = Instant::now();
     let result = PointReadPlan::new(BINARY_CAS_CHUNK_SPACE, &[key]).materialize(
         store,
         StorageGetOptions {
@@ -659,7 +662,9 @@ fn chunk_key_exists(store: &(impl StorageRead + ?Sized), key: Vec<u8>) -> Result
             ..StorageGetOptions::default()
         },
     )?;
-    Ok(result.value.into_iter().next().flatten().is_some())
+    let exists = result.value.into_iter().next().flatten().is_some();
+    crate::binary_cas::metrics::record_binary_cas_chunk_lookup(exists, started.elapsed());
+    Ok(exists)
 }
 
 fn metadata_from_manifest(
