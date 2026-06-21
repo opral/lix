@@ -1145,6 +1145,17 @@ impl FileDescriptorRecord {
         }
         keys
     }
+
+    fn blob_ref_key(&self) -> FilesystemBlobRefKey {
+        let context = FilesystemRowContext {
+            branch_id: self.live.branch_id.clone(),
+            global: self.live.global,
+            untracked: self.live.untracked,
+            file_id: self.live.file_id.clone(),
+            metadata: None,
+        };
+        FilesystemBlobRefKey::from_context(&context, &self.id)
+    }
 }
 
 #[derive(Clone)]
@@ -2336,6 +2347,11 @@ async fn lix_file_record_batch(
     let mut untracked_values = Vec::new();
     let mut metadata_values = Vec::new();
     let mut branch_ids = Vec::new();
+    let mut blob_bytes = if needs_data {
+        load_blob_bytes_for_files(blob_reader, &file_rows, &blob_rows).await?
+    } else {
+        LoadedBlobBytes::default()
+    };
 
     for (_, file) in file_rows {
         let directory_path = match file.directory_id.as_ref() {
@@ -2363,15 +2379,9 @@ async fn lix_file_record_batch(
         };
         let path = compose_file_path(directory_path.as_deref(), &file.name)?;
         let data = if needs_data {
-            let context = FilesystemRowContext {
-                branch_id: file.live.branch_id.clone(),
-                global: file.live.global,
-                untracked: file.live.untracked,
-                file_id: file.live.file_id.clone(),
-                metadata: None,
-            };
-            match blob_rows.get(&FilesystemBlobRefKey::from_context(&context, &file.id)) {
-                Some(blob_ref) => load_single_blob_bytes(blob_reader, &blob_ref.blob_hash).await?,
+            let blob_key = file.blob_ref_key();
+            match blob_bytes.take(&blob_key) {
+                Some(data) => data,
                 None => {
                     let rendered = match &plugin_render {
                         Some(plugin_render) => {
@@ -2444,6 +2454,70 @@ async fn lix_file_record_batch(
             "LIX_ERROR_UNKNOWN",
             format!("sql2 failed to build lix_file record batch: {error}"),
         )
+    })
+}
+
+#[derive(Default)]
+struct LoadedBlobBytes {
+    bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<Vec<u8>>>,
+    remaining_by_key: BTreeMap<FilesystemBlobRefKey, usize>,
+}
+
+impl LoadedBlobBytes {
+    fn take(&mut self, key: &FilesystemBlobRefKey) -> Option<Option<Vec<u8>>> {
+        match self.remaining_by_key.get_mut(key) {
+            Some(remaining) if *remaining > 1 => {
+                *remaining -= 1;
+                self.bytes_by_key.get(key).cloned()
+            }
+            Some(_) => {
+                self.remaining_by_key.remove(key);
+                self.bytes_by_key.remove(key)
+            }
+            None => None,
+        }
+    }
+}
+
+async fn load_blob_bytes_for_files(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+) -> Result<LoadedBlobBytes, LixError> {
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let mut keys = Vec::new();
+    let mut hashes = Vec::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key();
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                keys.push(key);
+                hashes.push(BlobHash::from_hex(&row.blob_hash)?);
+            }
+            *remaining += 1;
+        }
+    }
+    if keys.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
+    if values.len() != keys.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "blob reader returned {} values for {} requested hashes",
+                values.len(),
+                keys.len()
+            ),
+        ));
+    }
+    Ok(LoadedBlobBytes {
+        bytes_by_key: keys.into_iter().zip(values).collect(),
+        remaining_by_key,
     })
 }
 
@@ -3977,6 +4051,54 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(values.contains(&None));
         assert!(values.contains(&Some("owner-file".to_string())));
+    }
+
+    #[tokio::test]
+    async fn file_projection_reuses_loaded_blob_for_duplicate_blob_ref_keys() {
+        let data = b"shared data".to_vec();
+        let blob_hash = BlobHash::from_content(&data).to_hex();
+        let blob_reader =
+            Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
+        let mut scoped_file = live_file_row(
+            "file-readme",
+            "branch-b",
+            "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"scoped.md\"}",
+        );
+        scoped_file.file_id = Some("owner-file".to_string());
+        let batch = super::lix_file_record_batch(
+            &super::lix_file_schema(),
+            &blob_reader,
+            None,
+            true,
+            vec![
+                live_file_row(
+                    "file-readme",
+                    "branch-b",
+                    "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"root.md\"}",
+                ),
+                scoped_file,
+                live_blob_ref_row(
+                    "file-readme",
+                    "branch-b",
+                    "file-readme",
+                    &blob_hash,
+                    data.len(),
+                ),
+            ],
+        )
+        .await
+        .expect("duplicate blob-ref keys should project data for every descriptor");
+
+        let data_column = batch
+            .column(batch.schema().index_of("data").unwrap())
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("data should be binary array");
+        assert_eq!(batch.num_rows(), 2);
+        for index in 0..batch.num_rows() {
+            assert!(!data_column.is_null(index));
+            assert_eq!(data_column.value(index), data.as_slice());
+        }
     }
 
     #[tokio::test]
