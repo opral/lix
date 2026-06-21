@@ -590,35 +590,40 @@ where
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         });
-
-        if metadata_mode == FilesystemMetadataMode::Persistent {
-            state.migrate_legacy_lix_system_paths().await?;
-        }
-        if state.sync_disk_to_lix(false).await? == DiskSyncOutcome::NeedsMaterialization {
-            state.sync_from_lix().await?;
-        }
-
         let (event_tx, event_rx) = mpsc::channel();
-        let callback_tx = event_tx.clone();
-        let watcher_config = Config::default().with_follow_symlinks(false);
-        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
-            Duration::from_millis(500),
-            None,
-            move |_result: DebounceEventResult| {
-                let _ = callback_tx.send(FilesystemEvent::DiskChanged);
-            },
-            RecommendedCache::new(),
-            watcher_config,
-        )
-        .ok()
-        .and_then(|mut debouncer| {
-            if watch_filesystem_paths(&mut debouncer, &state.root, &state.path_filter).is_ok() {
-                Some(debouncer)
-            } else {
-                debouncer.stop();
-                None
-            }
+        let watcher_setup = state.path_filter.is_unfiltered().then(|| {
+            start_filesystem_watcher_setup(
+                state.root.clone(),
+                state.metadata_mode,
+                state.path_filter.clone(),
+                event_tx.clone(),
+            )
         });
+
+        let initial_sync_result = async {
+            if metadata_mode == FilesystemMetadataMode::Persistent {
+                state.migrate_legacy_lix_system_paths().await?;
+            }
+            if state.sync_disk_to_lix(false).await? == DiskSyncOutcome::NeedsMaterialization {
+                state.sync_from_lix().await?;
+            }
+            Ok::<(), LixError>(())
+        }
+        .await;
+
+        let debouncer = if let Some(watcher_setup) = watcher_setup.flatten() {
+            let debouncer = finish_filesystem_watcher_setup(Some(watcher_setup));
+            initial_sync_result?;
+            debouncer
+        } else {
+            initial_sync_result?;
+            create_filesystem_debouncer(
+                &state.root,
+                state.metadata_mode,
+                &state.path_filter,
+                event_tx.clone(),
+            )
+        };
         let poll_filesystem = cfg!(target_os = "macos") || debouncer.is_none();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::Builder::new()
@@ -679,6 +684,24 @@ impl FilesystemSupervisorInner {
             }
         }
     }
+}
+
+fn start_filesystem_watcher_setup(
+    root: PathBuf,
+    metadata_mode: FilesystemMetadataMode,
+    path_filter: FilesystemPathFilter,
+    event_tx: mpsc::Sender<FilesystemEvent>,
+) -> Option<JoinHandle<Option<FilesystemDebouncer>>> {
+    std::thread::Builder::new()
+        .name("lix-sdk-filesystem-watch-setup".to_string())
+        .spawn(move || create_filesystem_debouncer(&root, metadata_mode, &path_filter, event_tx))
+        .ok()
+}
+
+fn finish_filesystem_watcher_setup(
+    watcher_setup: Option<JoinHandle<Option<FilesystemDebouncer>>>,
+) -> Option<FilesystemDebouncer> {
+    watcher_setup.and_then(|handle| handle.join().ok().flatten())
 }
 
 impl<B> FilesystemState<B>
@@ -2086,6 +2109,56 @@ fn watch_filesystem_paths(
         debouncer.watch(&path, RecursiveMode::NonRecursive)?;
     }
     Ok(())
+}
+
+fn create_filesystem_debouncer(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    path_filter: &FilesystemPathFilter,
+    event_tx: mpsc::Sender<FilesystemEvent>,
+) -> Option<FilesystemDebouncer> {
+    let watcher_config = Config::default().with_follow_symlinks(false);
+    let callback_root = root.to_path_buf();
+    new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+        Duration::from_millis(500),
+        None,
+        move |result: DebounceEventResult| {
+            if debounce_result_should_sync(&result, &callback_root, metadata_mode) {
+                let _ = event_tx.send(FilesystemEvent::DiskChanged);
+            }
+        },
+        RecommendedCache::new(),
+        watcher_config,
+    )
+    .ok()
+    .and_then(|mut debouncer| {
+        if watch_filesystem_paths(&mut debouncer, root, path_filter).is_ok() {
+            Some(debouncer)
+        } else {
+            debouncer.stop();
+            None
+        }
+    })
+}
+
+fn debounce_result_should_sync(
+    result: &DebounceEventResult,
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+) -> bool {
+    let Ok(events) = result else {
+        return true;
+    };
+    let mut saw_path = false;
+    for event in events {
+        for path in &event.paths {
+            saw_path = true;
+            if !is_filesystem_sync_ignored_local_path(root, path, metadata_mode) {
+                return true;
+            }
+        }
+    }
+    !saw_path
 }
 
 fn ensure_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
