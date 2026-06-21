@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -20,6 +21,8 @@ use crate::sqlite_backend::SqliteBackend;
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const FILE_UPSERT_BATCH_MAX_ROWS: usize = 500;
+const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -889,6 +892,7 @@ where
                 .await?;
         }
 
+        let mut files_to_upsert = Vec::new();
         for (path, data) in local
             .files
             .iter()
@@ -901,16 +905,33 @@ where
                 continue;
             }
             if lix.files.get(path) != Some(data) {
-                self.session
-                    .execute(
-                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-                        &[Value::Text(path.clone()), Value::Blob(data.clone())],
-                    )
-                    .await?;
+                files_to_upsert.push((path.as_str(), data.as_slice()));
             }
         }
+        self.upsert_local_files_to_lix(&files_to_upsert).await?;
 
+        Ok(())
+    }
+
+    async fn upsert_local_files_to_lix(&self, files: &[(&str, &[u8])]) -> Result<(), LixError> {
+        let mut start = 0;
+        while start < files.len() {
+            let end = lix_file_upsert_chunk_end(
+                files,
+                start,
+                FILE_UPSERT_BATCH_MAX_ROWS,
+                FILE_UPSERT_BATCH_MAX_BYTES,
+            );
+            let chunk = &files[start..end];
+            let sql = lix_file_upsert_sql(chunk.len());
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for (path, data) in chunk {
+                params.push(Value::Text((*path).to_string()));
+                params.push(Value::Blob((*data).to_vec()));
+            }
+            self.session.execute(&sql, &params).await?;
+            start = end;
+        }
         Ok(())
     }
 
@@ -1594,6 +1615,41 @@ fn write_materialized_file(
         .map_err(|error| io_error("write filesystem file", &local_path, error))
 }
 
+fn lix_file_upsert_sql(row_count: usize) -> String {
+    debug_assert!(row_count > 0);
+    let mut sql = String::from("INSERT INTO lix_file (path, data) VALUES ");
+    for row in 0..row_count {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "(${}, ${})", row * 2 + 1, row * 2 + 2);
+    }
+    sql.push_str(" ON CONFLICT (path) DO UPDATE SET data = excluded.data");
+    sql
+}
+
+fn lix_file_upsert_chunk_end(
+    files: &[(&str, &[u8])],
+    start: usize,
+    max_rows: usize,
+    max_bytes: usize,
+) -> usize {
+    debug_assert!(start < files.len());
+    let max_rows = max_rows.max(1);
+    let mut end = start;
+    let mut bytes = 0usize;
+    while end < files.len() && end - start < max_rows {
+        let (path, data) = files[end];
+        let file_bytes = path.len().saturating_add(data.len());
+        if end > start && bytes.saturating_add(file_bytes) > max_bytes {
+            break;
+        }
+        bytes = bytes.saturating_add(file_bytes);
+        end += 1;
+    }
+    end
+}
+
 fn lix_path_blocked_by_unmanaged(root: &Path, path: &str) -> Result<bool, LixError> {
     let Some(local_path) = materialization_local_path(root, path) else {
         return Ok(true);
@@ -2167,6 +2223,42 @@ mod tests {
             let error = lix_path_to_local_path(root, path).expect_err("path should fail");
             assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
         }
+    }
+
+    #[test]
+    fn lix_file_upsert_sql_batches_path_data_rows() {
+        assert_eq!(
+            lix_file_upsert_sql(3),
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4), ($5, $6) ON CONFLICT (path) DO UPDATE SET data = excluded.data"
+        );
+    }
+
+    #[test]
+    fn lix_file_upsert_chunk_end_respects_row_and_byte_budgets() {
+        let a = [0u8; 3];
+        let b = [0u8; 4];
+        let c = [0u8; 4];
+        let files = [
+            ("/a", a.as_slice()),
+            ("/b", b.as_slice()),
+            ("/c", c.as_slice()),
+        ];
+
+        assert_eq!(lix_file_upsert_chunk_end(&files, 0, 2, usize::MAX), 2);
+        assert_eq!(lix_file_upsert_chunk_end(&files, 0, 10, 11), 2);
+        assert_eq!(lix_file_upsert_chunk_end(&files, 1, 10, 6), 2);
+    }
+
+    #[test]
+    fn lix_file_upsert_chunk_end_allows_single_file_over_byte_budget() {
+        let large = [0u8; 16];
+        let small = [0u8; 1];
+        let files = [
+            ("/large.bin", large.as_slice()),
+            ("/small.bin", small.as_slice()),
+        ];
+
+        assert_eq!(lix_file_upsert_chunk_end(&files, 0, 10, 8), 1);
     }
 
     #[cfg(feature = "sqlite")]
