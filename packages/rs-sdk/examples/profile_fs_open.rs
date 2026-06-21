@@ -33,6 +33,7 @@ enum ProfileBackend {
 #[derive(Debug)]
 struct Args {
     backend: ProfileBackend,
+    compact_before_stats: bool,
     in_place: bool,
     json: bool,
     keep_workspace: bool,
@@ -130,6 +131,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 fn parse_args() -> Args {
     let mut raw = std::env::args().skip(1);
     let mut backend = ProfileBackend::Sqlite;
+    let mut compact_before_stats = false;
     let mut in_place = false;
     let mut json = false;
     let mut keep_workspace = false;
@@ -179,6 +181,7 @@ fn parse_args() -> Args {
                     panic!("profile_fs_open was built without the rocksdb feature")
                 }
             }
+            "--compact-before-stats" => compact_before_stats = true,
             "--in-place" => in_place = true,
             "--json" => json = true,
             "--keep-workspace" => keep_workspace = true,
@@ -193,6 +196,7 @@ fn parse_args() -> Args {
 
     Args {
         backend,
+        compact_before_stats,
         in_place,
         json,
         keep_workspace,
@@ -218,6 +222,25 @@ fn parse_size(value: &str) -> u64 {
 
 fn duration_ms(duration: Duration) -> u128 {
     duration.as_micros() / 1000
+}
+
+fn compact_backend_if_requested(args: &Args, backend: &FsBackend) -> Option<Duration> {
+    if !args.compact_before_stats {
+        return None;
+    }
+    #[cfg(feature = "rocksdb")]
+    {
+        let t_compact = Instant::now();
+        backend
+            .compact_rocksdb()
+            .expect("profile RocksDB compact should succeed");
+        Some(t_compact.elapsed())
+    }
+    #[cfg(not(feature = "rocksdb"))]
+    {
+        let _ = backend;
+        panic!("profile_fs_open was built without the rocksdb feature")
+    }
 }
 
 fn collect_profile_stats(workspace: &Path) -> ProfileStats {
@@ -361,6 +384,7 @@ fn print_result(
     copy_elapsed: Option<Duration>,
     open_elapsed: Duration,
     warm_elapsed: Option<Duration>,
+    compact_elapsed: Option<Duration>,
     stats: &ProfileStats,
     workspace_path: Option<&Path>,
 ) {
@@ -372,6 +396,9 @@ fn print_result(
         let workspace_json = workspace_path.map_or("null".to_string(), |path| {
             json_string(&path.display().to_string())
         });
+        let compact_ms_json = compact_elapsed
+            .map(|duration| duration_ms(duration).to_string())
+            .unwrap_or_else(|| "null".to_string());
         match (copy_elapsed, warm_elapsed) {
             (Some(copy_elapsed), Some(warm_elapsed)) => println!(
                 concat!(
@@ -381,6 +408,7 @@ fn print_result(
                     "\"copy_ms\":{},",
                     "\"cold_open_ms\":{},",
                     "\"warm_reopen_ms\":{},",
+                    "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
                     "\"corpus_bytes\":{},",
@@ -412,6 +440,7 @@ fn print_result(
                 duration_ms(copy_elapsed),
                 duration_ms(open_elapsed),
                 duration_ms(warm_elapsed),
+                compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
                 stats.corpus_bytes,
@@ -443,6 +472,7 @@ fn print_result(
                     "\"backend\":\"{}\",",
                     "\"blob_min_size\":{},",
                     "\"open_ms\":{},",
+                    "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
                     "\"corpus_bytes\":{},",
@@ -472,6 +502,7 @@ fn print_result(
                 args.backend.name(),
                 blob_min_json,
                 duration_ms(open_elapsed),
+                compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
                 stats.corpus_bytes,
@@ -500,9 +531,15 @@ fn print_result(
         }
     } else if args.in_place {
         println!("OPEN_MS={}", duration_ms(open_elapsed));
+        if let Some(compact_elapsed) = compact_elapsed {
+            println!("COMPACT_MS={}", duration_ms(compact_elapsed));
+        }
         print_text_stats(stats, workspace_path);
     } else {
         println!("COLD_OPEN_MS={}", duration_ms(open_elapsed));
+        if let Some(compact_elapsed) = compact_elapsed {
+            println!("COMPACT_MS={}", duration_ms(compact_elapsed));
+        }
         print_text_stats(stats, workspace_path);
     }
 }
@@ -567,10 +604,19 @@ async fn main() {
         let backend = args.backend.open(src).await;
         let open_elapsed = t_open.elapsed();
         eprintln!("{} in-place open: {open_elapsed:?}", args.backend.name());
+        let compact_elapsed = compact_backend_if_requested(&args, &backend);
         let mut stats = collect_profile_stats(src);
         collect_backend_profile_stats(&backend, &mut stats);
         drop(backend);
-        print_result(&args, None, open_elapsed, None, &stats, Some(src));
+        print_result(
+            &args,
+            None,
+            open_elapsed,
+            None,
+            compact_elapsed,
+            &stats,
+            Some(src),
+        );
         return;
     }
 
@@ -598,6 +644,7 @@ async fn main() {
     let backend = args.backend.open(&work).await;
     let warm_elapsed = t_warm.elapsed();
     eprintln!("{} warm reopen: {warm_elapsed:?}", args.backend.name());
+    let compact_elapsed = compact_backend_if_requested(&args, &backend);
     let mut stats = collect_profile_stats(&work);
     collect_backend_profile_stats(&backend, &mut stats);
     drop(backend);
@@ -625,6 +672,7 @@ async fn main() {
         Some(copy_elapsed),
         open_elapsed,
         Some(warm_elapsed),
+        compact_elapsed,
         &stats,
         workspace_path,
     );

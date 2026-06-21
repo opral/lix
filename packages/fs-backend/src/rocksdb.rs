@@ -91,6 +91,12 @@ impl RocksDbFilesystemBackend {
     pub fn flush(&self) -> Result<(), BackendError> {
         self.db.flush().map_err(rocksdb_error)
     }
+
+    pub fn compact_all(&self) -> Result<(), BackendError> {
+        self.flush()?;
+        self.db.compact_range::<&[u8], &[u8]>(None, None);
+        self.flush()
+    }
 }
 
 impl Backend for RocksDbFilesystemBackend {

@@ -355,6 +355,23 @@ impl FsBackend {
         })
     }
 
+    #[cfg(feature = "rocksdb")]
+    pub fn compact_rocksdb(&self) -> Result<(), LixError> {
+        match &self.inner {
+            FsBackendInner::RocksDb(inner) => {
+                inner.inner.compact_all().map_err(rocksdb_backend_error)
+            }
+            #[cfg(feature = "sqlite")]
+            FsBackendInner::Sqlite(_) | FsBackendInner::Memory(_) => Err(filesystem_error(
+                "compact_rocksdb requires a RocksDB filesystem backend",
+            )),
+            #[cfg(not(feature = "sqlite"))]
+            FsBackendInner::Memory(_) => Err(filesystem_error(
+                "compact_rocksdb requires a RocksDB filesystem backend",
+            )),
+        }
+    }
+
     #[cfg(feature = "sqlite")]
     pub async fn open_with_wasm_runtime<P>(
         dir: P,
