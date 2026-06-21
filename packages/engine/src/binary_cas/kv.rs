@@ -5,7 +5,7 @@ use crate::binary_cas::chunking::fastcdc_chunk_ranges;
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
-    encode_binary_cas_manifest_chunk, encode_binary_chunk_payload,
+    encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
     BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWriteReceipt,
@@ -36,6 +36,7 @@ pub(crate) struct KvBlobManifestChunk {
     pub(crate) chunk_size: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvChunk {
     pub(crate) codec: BinaryChunkCodec,
@@ -120,15 +121,17 @@ async fn load_chunk(
     }))
 }
 
-pub(crate) fn stage_chunk(writes: &mut StorageWriteSet, chunk_hash: BlobHash, chunk: &KvChunk) {
+pub(crate) fn stage_chunk(
+    writes: &mut StorageWriteSet,
+    chunk_hash: BlobHash,
+    codec: BinaryChunkCodec,
+    uncompressed_len: u64,
+    payload: &[u8],
+) {
     writes.put(
         BINARY_CAS_CHUNK_SPACE,
         key(chunk_key(chunk_hash)),
-        value(encode_binary_cas_chunk(
-            chunk.codec,
-            chunk.uncompressed_len,
-            &chunk.data,
-        )),
+        value(encode_binary_cas_chunk(codec, uncompressed_len, payload)),
     );
 }
 
@@ -567,15 +570,12 @@ pub(in crate::binary_cas) fn stage_blob_write(
                 },
             );
             if chunk_keys.insert(chunk_key(chunk_hash)) {
-                let encoded_chunk = encode_binary_chunk_payload(bytes);
                 stage_chunk(
                     writes,
                     chunk_hash,
-                    &KvChunk {
-                        codec: encoded_chunk.codec,
-                        uncompressed_len: bytes.len() as u64,
-                        data: encoded_chunk.data,
-                    },
+                    BinaryChunkCodec::Raw,
+                    bytes.len() as u64,
+                    bytes,
                 );
             }
         }
@@ -594,15 +594,12 @@ pub(in crate::binary_cas) fn stage_blob_write(
                 let chunk_hash = BlobHash::from_content(chunk_data);
                 let chunk_key = chunk_key(chunk_hash);
                 if chunk_keys.insert(chunk_key.clone()) {
-                    let encoded_chunk = encode_binary_chunk_payload(chunk_data);
                     stage_chunk(
                         writes,
                         chunk_hash,
-                        &KvChunk {
-                            codec: encoded_chunk.codec,
-                            uncompressed_len: chunk_data.len() as u64,
-                            data: encoded_chunk.data,
-                        },
+                        BinaryChunkCodec::Raw,
+                        chunk_data.len() as u64,
+                        chunk_data,
                     );
                 }
 
@@ -771,7 +768,13 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            stage_chunk(&mut writes, chunk_hash, &chunk);
+            stage_chunk(
+                &mut writes,
+                chunk_hash,
+                chunk.codec,
+                chunk.uncompressed_len,
+                &chunk.data,
+            );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .expect("chunk should commit");
@@ -969,11 +972,9 @@ mod tests {
             stage_chunk(
                 &mut writes,
                 substituted_chunk_hash,
-                &KvChunk {
-                    codec: BinaryChunkCodec::Raw,
-                    uncompressed_len: substituted.len() as u64,
-                    data: substituted.to_vec(),
-                },
+                BinaryChunkCodec::Raw,
+                substituted.len() as u64,
+                substituted,
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
