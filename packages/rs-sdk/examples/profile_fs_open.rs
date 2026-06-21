@@ -5,9 +5,10 @@
 //     --backend sqlite <src_dir>
 //
 // Copies <src_dir> (sans any existing .lix) into a fresh temp dir, then times
-// FsBackend::open on the cold workspace.
+// FsBackend::open on the cold workspace. Pass --keep-workspace to preserve the
+// copied temp workspace for inspection.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lix_sdk::FsBackend;
@@ -30,7 +31,27 @@ struct Args {
     backend: ProfileBackend,
     in_place: bool,
     json: bool,
+    keep_workspace: bool,
     src: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProfileStats {
+    corpus_file_count: u64,
+    corpus_bytes: u64,
+    lix_total_bytes: u64,
+    sqlite_db_bytes: u64,
+    sqlite_wal_bytes: u64,
+    sqlite_shm_bytes: u64,
+    sqlite_other_bytes: u64,
+    rocksdb_total_bytes: u64,
+    rocksdb_sst_bytes: u64,
+    rocksdb_blob_bytes: u64,
+    rocksdb_wal_bytes: u64,
+    rocksdb_log_bytes: u64,
+    rocksdb_manifest_bytes: u64,
+    rocksdb_options_bytes: u64,
+    rocksdb_other_bytes: u64,
 }
 
 impl ProfileBackend {
@@ -99,6 +120,7 @@ fn parse_args() -> Args {
     let mut backend = ProfileBackend::Sqlite;
     let mut in_place = false;
     let mut json = false;
+    let mut keep_workspace = false;
     let mut src = None;
 
     while let Some(arg) = raw.next() {
@@ -147,6 +169,7 @@ fn parse_args() -> Args {
             }
             "--in-place" => in_place = true,
             "--json" => json = true,
+            "--keep-workspace" => keep_workspace = true,
             _ if arg.starts_with("--") => panic!("unknown option '{arg}'"),
             _ => {
                 if src.replace(arg).is_some() {
@@ -160,8 +183,9 @@ fn parse_args() -> Args {
         backend,
         in_place,
         json,
+        keep_workspace,
         src: src.expect(
-            "usage: profile_fs_open [--json] [--in-place] [--backend sqlite|rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
+            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--backend sqlite|rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
         ),
     }
 }
@@ -184,38 +208,259 @@ fn duration_ms(duration: Duration) -> u128 {
     duration.as_micros() / 1000
 }
 
+fn collect_profile_stats(workspace: &Path) -> ProfileStats {
+    let mut stats = ProfileStats::default();
+    collect_corpus_stats(workspace, &mut stats);
+    collect_lix_stats(workspace, &mut stats);
+    stats
+}
+
+fn collect_corpus_stats(root: &Path, stats: &mut ProfileStats) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if entry.file_name() == ".lix" {
+            continue;
+        }
+        let metadata = entry.metadata().unwrap();
+        if metadata.is_dir() {
+            collect_corpus_stats(&path, stats);
+        } else if metadata.is_file() {
+            stats.corpus_file_count += 1;
+            stats.corpus_bytes += metadata.len();
+        }
+    }
+}
+
+fn collect_lix_stats(workspace: &Path, stats: &mut ProfileStats) {
+    let lix_dir = workspace.join(".lix");
+    if !lix_dir.exists() {
+        return;
+    }
+    let internal_dir = lix_dir.join(".internal");
+    let rocksdb_dir = internal_dir.join("rocksdb");
+    collect_lix_stats_recursive(&lix_dir, &internal_dir, &rocksdb_dir, stats);
+}
+
+fn collect_lix_stats_recursive(
+    dir: &Path,
+    internal_dir: &Path,
+    rocksdb_dir: &Path,
+    stats: &mut ProfileStats,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let metadata = entry.metadata().unwrap();
+        if metadata.is_dir() {
+            collect_lix_stats_recursive(&path, internal_dir, rocksdb_dir, stats);
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let bytes = metadata.len();
+        stats.lix_total_bytes += bytes;
+        if path.strip_prefix(rocksdb_dir).is_ok() {
+            classify_rocksdb_file(&path, bytes, stats);
+        } else if path.strip_prefix(internal_dir).is_ok() {
+            classify_sqlite_file(&path, bytes, stats);
+        }
+    }
+}
+
+fn classify_sqlite_file(path: &Path, bytes: u64, stats: &mut ProfileStats) {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("db.sqlite") => stats.sqlite_db_bytes += bytes,
+        Some("db.sqlite-wal") => stats.sqlite_wal_bytes += bytes,
+        Some("db.sqlite-shm") => stats.sqlite_shm_bytes += bytes,
+        _ => stats.sqlite_other_bytes += bytes,
+    }
+}
+
+fn classify_rocksdb_file(path: &Path, bytes: u64, stats: &mut ProfileStats) {
+    stats.rocksdb_total_bytes += bytes;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("sst") => stats.rocksdb_sst_bytes += bytes,
+        Some("blob") => stats.rocksdb_blob_bytes += bytes,
+        Some("log") => stats.rocksdb_wal_bytes += bytes,
+        _ if file_name.starts_with("LOG") => stats.rocksdb_log_bytes += bytes,
+        _ if file_name.starts_with("MANIFEST") => stats.rocksdb_manifest_bytes += bytes,
+        _ if file_name.starts_with("OPTIONS") => stats.rocksdb_options_bytes += bytes,
+        _ => stats.rocksdb_other_bytes += bytes,
+    }
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                use std::fmt::Write as _;
+                write!(&mut out, "\\u{:04x}", ch as u32).unwrap();
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn print_result(
     args: &Args,
     copy_elapsed: Option<Duration>,
     open_elapsed: Duration,
     warm_elapsed: Option<Duration>,
+    stats: &ProfileStats,
+    workspace_path: Option<&Path>,
 ) {
     if args.json {
         let blob_min_json = args
             .backend
             .blob_min_size()
             .map_or("null".to_string(), |size| size.to_string());
+        let workspace_json = workspace_path.map_or("null".to_string(), |path| {
+            json_string(&path.display().to_string())
+        });
         match (copy_elapsed, warm_elapsed) {
             (Some(copy_elapsed), Some(warm_elapsed)) => println!(
-                "{{\"backend\":\"{}\",\"blob_min_size\":{},\"copy_ms\":{},\"cold_open_ms\":{},\"warm_reopen_ms\":{}}}",
+                concat!(
+                    "{{",
+                    "\"backend\":\"{}\",",
+                    "\"blob_min_size\":{},",
+                    "\"copy_ms\":{},",
+                    "\"cold_open_ms\":{},",
+                    "\"warm_reopen_ms\":{},",
+                    "\"workspace_path\":{},",
+                    "\"corpus_file_count\":{},",
+                    "\"corpus_bytes\":{},",
+                    "\"lix_total_bytes\":{},",
+                    "\"sqlite_db_bytes\":{},",
+                    "\"sqlite_wal_bytes\":{},",
+                    "\"sqlite_shm_bytes\":{},",
+                    "\"sqlite_other_bytes\":{},",
+                    "\"rocksdb_total_bytes\":{},",
+                    "\"rocksdb_sst_bytes\":{},",
+                    "\"rocksdb_blob_bytes\":{},",
+                    "\"rocksdb_wal_bytes\":{},",
+                    "\"rocksdb_log_bytes\":{},",
+                    "\"rocksdb_manifest_bytes\":{},",
+                    "\"rocksdb_options_bytes\":{},",
+                    "\"rocksdb_other_bytes\":{}",
+                    "}}"
+                ),
                 args.backend.name(),
                 blob_min_json,
                 duration_ms(copy_elapsed),
                 duration_ms(open_elapsed),
-                duration_ms(warm_elapsed)
+                duration_ms(warm_elapsed),
+                workspace_json,
+                stats.corpus_file_count,
+                stats.corpus_bytes,
+                stats.lix_total_bytes,
+                stats.sqlite_db_bytes,
+                stats.sqlite_wal_bytes,
+                stats.sqlite_shm_bytes,
+                stats.sqlite_other_bytes,
+                stats.rocksdb_total_bytes,
+                stats.rocksdb_sst_bytes,
+                stats.rocksdb_blob_bytes,
+                stats.rocksdb_wal_bytes,
+                stats.rocksdb_log_bytes,
+                stats.rocksdb_manifest_bytes,
+                stats.rocksdb_options_bytes,
+                stats.rocksdb_other_bytes
             ),
             _ => println!(
-                "{{\"backend\":\"{}\",\"blob_min_size\":{},\"open_ms\":{}}}",
+                concat!(
+                    "{{",
+                    "\"backend\":\"{}\",",
+                    "\"blob_min_size\":{},",
+                    "\"open_ms\":{},",
+                    "\"workspace_path\":{},",
+                    "\"corpus_file_count\":{},",
+                    "\"corpus_bytes\":{},",
+                    "\"lix_total_bytes\":{},",
+                    "\"sqlite_db_bytes\":{},",
+                    "\"sqlite_wal_bytes\":{},",
+                    "\"sqlite_shm_bytes\":{},",
+                    "\"sqlite_other_bytes\":{},",
+                    "\"rocksdb_total_bytes\":{},",
+                    "\"rocksdb_sst_bytes\":{},",
+                    "\"rocksdb_blob_bytes\":{},",
+                    "\"rocksdb_wal_bytes\":{},",
+                    "\"rocksdb_log_bytes\":{},",
+                    "\"rocksdb_manifest_bytes\":{},",
+                    "\"rocksdb_options_bytes\":{},",
+                    "\"rocksdb_other_bytes\":{}",
+                    "}}"
+                ),
                 args.backend.name(),
                 blob_min_json,
-                duration_ms(open_elapsed)
+                duration_ms(open_elapsed),
+                workspace_json,
+                stats.corpus_file_count,
+                stats.corpus_bytes,
+                stats.lix_total_bytes,
+                stats.sqlite_db_bytes,
+                stats.sqlite_wal_bytes,
+                stats.sqlite_shm_bytes,
+                stats.sqlite_other_bytes,
+                stats.rocksdb_total_bytes,
+                stats.rocksdb_sst_bytes,
+                stats.rocksdb_blob_bytes,
+                stats.rocksdb_wal_bytes,
+                stats.rocksdb_log_bytes,
+                stats.rocksdb_manifest_bytes,
+                stats.rocksdb_options_bytes,
+                stats.rocksdb_other_bytes
             ),
         }
     } else if args.in_place {
         println!("OPEN_MS={}", duration_ms(open_elapsed));
+        print_text_stats(stats, workspace_path);
     } else {
         println!("COLD_OPEN_MS={}", duration_ms(open_elapsed));
+        print_text_stats(stats, workspace_path);
     }
+}
+
+fn print_text_stats(stats: &ProfileStats, workspace_path: Option<&Path>) {
+    if let Some(workspace_path) = workspace_path {
+        println!("WORKSPACE_PATH={}", workspace_path.display());
+    }
+    println!("CORPUS_FILE_COUNT={}", stats.corpus_file_count);
+    println!("CORPUS_BYTES={}", stats.corpus_bytes);
+    println!("LIX_TOTAL_BYTES={}", stats.lix_total_bytes);
+    println!("SQLITE_DB_BYTES={}", stats.sqlite_db_bytes);
+    println!("SQLITE_WAL_BYTES={}", stats.sqlite_wal_bytes);
+    println!("SQLITE_SHM_BYTES={}", stats.sqlite_shm_bytes);
+    println!("SQLITE_OTHER_BYTES={}", stats.sqlite_other_bytes);
+    println!("ROCKSDB_TOTAL_BYTES={}", stats.rocksdb_total_bytes);
+    println!("ROCKSDB_SST_BYTES={}", stats.rocksdb_sst_bytes);
+    println!("ROCKSDB_BLOB_BYTES={}", stats.rocksdb_blob_bytes);
+    println!("ROCKSDB_WAL_BYTES={}", stats.rocksdb_wal_bytes);
+    println!("ROCKSDB_LOG_BYTES={}", stats.rocksdb_log_bytes);
+    println!("ROCKSDB_MANIFEST_BYTES={}", stats.rocksdb_manifest_bytes);
+    println!("ROCKSDB_OPTIONS_BYTES={}", stats.rocksdb_options_bytes);
+    println!("ROCKSDB_OTHER_BYTES={}", stats.rocksdb_other_bytes);
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -229,7 +474,8 @@ async fn main() {
         let open_elapsed = t_open.elapsed();
         eprintln!("{} in-place open: {open_elapsed:?}", args.backend.name());
         drop(backend);
-        print_result(&args, None, open_elapsed, None);
+        let stats = collect_profile_stats(src);
+        print_result(&args, None, open_elapsed, None, &stats, Some(src));
         return;
     }
 
@@ -258,6 +504,7 @@ async fn main() {
     let warm_elapsed = t_warm.elapsed();
     eprintln!("{} warm reopen: {warm_elapsed:?}", args.backend.name());
     drop(backend);
+    let stats = collect_profile_stats(&work);
 
     // Repeated cold opens into fresh temp dirs for profiling sample density.
     for i in 0..repeat {
@@ -276,5 +523,17 @@ async fn main() {
         drop(backend);
     }
 
-    print_result(&args, Some(copy_elapsed), open_elapsed, Some(warm_elapsed));
+    let workspace_path = args.keep_workspace.then_some(work.as_path());
+    print_result(
+        &args,
+        Some(copy_elapsed),
+        open_elapsed,
+        Some(warm_elapsed),
+        &stats,
+        workspace_path,
+    );
+    if args.keep_workspace {
+        let _kept_root: PathBuf = tmp.keep();
+        eprintln!("kept workspace: {}", work.display());
+    }
 }
