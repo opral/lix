@@ -156,6 +156,22 @@ impl FilesystemBlobRefKey {
     ) -> Self {
         Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
     }
+
+    pub(crate) fn from_parts(
+        branch_id: impl Into<String>,
+        global: bool,
+        untracked: bool,
+        file_id: Option<String>,
+        blob_ref_id: impl Into<String>,
+    ) -> Self {
+        Self(FilesystemDescriptorKey {
+            branch_id: branch_id.into(),
+            global,
+            untracked,
+            file_id,
+            descriptor_id: blob_ref_id.into(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

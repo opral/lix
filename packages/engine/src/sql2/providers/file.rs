@@ -307,12 +307,15 @@ impl LixFileSpec {
                 let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
+                let needs_plugin_render =
+                    lix_file_rows_need_plugin_render(&rows, needs_data, needs_data_hash)
+                        .map_err(lix_error_to_datafusion_error)?;
                 let plugin_render = plugin_render_context_for_lix_file_scan(
                     live_state,
                     &blob_reader,
                     &request,
                     plugin_host,
-                    needs_data || needs_data_hash,
+                    needs_plugin_render,
                 )
                 .await
                 .map_err(|error| {
@@ -440,12 +443,15 @@ impl TableSpec for LixFileSpec {
                     })?;
                     let rows = filter_lix_file_live_rows_by_path(rows, &target_paths)
                         .map_err(lix_error_to_datafusion_error)?;
+                    let needs_plugin_render =
+                        lix_file_rows_need_plugin_render(&rows, needs_data, needs_data_hash)
+                            .map_err(lix_error_to_datafusion_error)?;
                     let plugin_render = plugin_render_context_for_lix_file_scan(
                         Arc::clone(&live_state),
                         &blob_reader,
                         &request,
                         plugin_host,
-                        needs_data || needs_data_hash,
+                        needs_plugin_render,
                     )
                     .await
                     .map_err(|error| {
@@ -2710,6 +2716,59 @@ async fn lix_file_record_batch(
     })
 }
 
+fn lix_file_rows_need_plugin_render(
+    rows: &[MaterializedLiveStateRow],
+    needs_data: bool,
+    needs_data_hash: bool,
+) -> Result<bool, LixError> {
+    if !needs_data && !needs_data_hash {
+        return Ok(false);
+    }
+
+    let mut blob_keys = BTreeSet::<FilesystemBlobRefKey>::new();
+    for row in rows {
+        if row.schema_key != BLOB_REF_SCHEMA_KEY {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot = match serde_json::from_str::<BlobRefSnapshot>(snapshot_content) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(true),
+        };
+        blob_keys.insert(FilesystemBlobRefKey::from_live_row(row, snapshot.id));
+    }
+
+    for row in rows {
+        if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot = match serde_json::from_str::<FileDescriptorSnapshot>(snapshot_content) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(true),
+        };
+        if file_metadata_is_filesystem_unresolved(row.metadata.as_deref()) {
+            continue;
+        }
+        let context = FilesystemRowContext {
+            branch_id: row.branch_id.clone(),
+            global: row.global,
+            untracked: row.untracked,
+            file_id: row.file_id.clone(),
+            metadata: None,
+        };
+        if !blob_keys.contains(&FilesystemBlobRefKey::from_context(&context, &snapshot.id)) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 async fn render_plugin_file_for_sql(
     plugin_render: &PluginRenderContext,
     file: &FileDescriptorRecord,
@@ -4475,6 +4534,7 @@ mod tests {
             &blob_reader,
             None,
             true,
+            false,
             vec![live_file_row(
                 "file-readme",
                 "branch-b",
@@ -4502,6 +4562,7 @@ mod tests {
             &blob_reader,
             None,
             true,
+            false,
             vec![
                 live_file_row(
                     "file-readme",

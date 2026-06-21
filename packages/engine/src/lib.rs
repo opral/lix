@@ -78,6 +78,15 @@ pub use backend::{
 };
 pub use common::LixError;
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
+pub use filesystem::{
+    LixFilesystemBlobRefKey, lix_filesystem_blob_ref_key_for_active_file_descriptor,
+    lix_filesystem_blob_ref_key_for_active_state_row, lix_filesystem_blob_ref_key_for_state_row,
+};
+
+/// Returns the canonical content hash used by filesystem blob references.
+pub fn lix_file_data_hash_hex(data: &[u8]) -> String {
+    binary_cas::BlobHash::from_content(data).to_hex()
+}
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

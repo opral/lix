@@ -1,3 +1,4 @@
+use lix_engine::lix_file_data_hash_hex;
 use lix_sdk::{
     Backend, CreateBranchOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
@@ -575,8 +576,20 @@ async fn filesystem_unresolved_file_exposes_data_hash_without_data() {
         .await
         .unwrap();
     let hash = rows.rows()[0].get::<String>("lixcol_data_hash").unwrap();
-    assert!(!hash.is_empty());
-    assert_ne!(hash, "unresolved:/docs.md");
+    assert_eq!(hash, lix_file_data_hash_hex(b"hydrated"));
+
+    write_file(&lix, "/empty.md", Vec::new()).await.unwrap();
+    let rows = lix
+        .execute(
+            "SELECT lixcol_data_hash FROM lix_file WHERE path = $1",
+            &[Value::Text("/empty.md".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows()[0].get::<String>("lixcol_data_hash").unwrap(),
+        lix_file_data_hash_hex(b"")
+    );
 
     lix.close().await.unwrap();
 }
@@ -1066,6 +1079,111 @@ async fn filesystem_inventory_mode_syncs_resolved_disk_edits() {
     std::fs::write(tempdir.path().join("resolved.txt"), b"disk-change").unwrap();
     wait_for_lix_file(&lix, "/resolved.txt", Some(b"disk-change")).await;
     assert_unresolved_file_data(&lix, "/still-unresolved.txt").await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_inventory_reopen_uses_blob_hash_and_still_syncs_changed_bytes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("resolved.txt"), b"initial").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    write_file(&lix, "/resolved.txt", b"hydrated".to_vec())
+        .await
+        .unwrap();
+    wait_for_disk_file(&tempdir.path().join("resolved.txt"), Some(b"hydrated"));
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_filesystem(tempdir.path()).await;
+    let rows = reopened
+        .execute(
+            "SELECT lixcol_data_hash FROM lix_file WHERE path = $1",
+            &[Value::Text("/resolved.txt".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows()[0].get::<String>("lixcol_data_hash").unwrap(),
+        lix_file_data_hash_hex(b"hydrated")
+    );
+
+    std::fs::write(tempdir.path().join("resolved.txt"), b"disk-change").unwrap();
+    wait_for_lix_file(&reopened, "/resolved.txt", Some(b"disk-change")).await;
+
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_materialization_preserves_unrelated_dirty_resolved_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("a.txt"), b"a-disk").unwrap();
+    std::fs::write(tempdir.path().join("b.txt"), b"b-disk").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    write_file(&lix, "/a.txt", b"a-lix".to_vec()).await.unwrap();
+    write_file(&lix, "/b.txt", b"b-lix".to_vec()).await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("a.txt"), Some(b"a-lix"));
+    wait_for_disk_file(&tempdir.path().join("b.txt"), Some(b"b-lix"));
+
+    std::fs::write(tempdir.path().join("b.txt"), b"b-local").unwrap();
+    write_file(&lix, "/a.txt", b"a-new".to_vec()).await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("a.txt"), Some(b"a-new"));
+    assert_eq!(
+        std::fs::read(tempdir.path().join("b.txt")).unwrap(),
+        b"b-local"
+    );
+    wait_for_lix_file(&lix, "/b.txt", Some(b"b-local")).await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_materialization_preserves_unrelated_deleted_resolved_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("a.txt"), b"a-disk").unwrap();
+    std::fs::write(tempdir.path().join("b.txt"), b"b-disk").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    write_file(&lix, "/a.txt", b"a-lix".to_vec()).await.unwrap();
+    write_file(&lix, "/b.txt", b"b-lix".to_vec()).await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("a.txt"), Some(b"a-lix"));
+    wait_for_disk_file(&tempdir.path().join("b.txt"), Some(b"b-lix"));
+
+    std::fs::remove_file(tempdir.path().join("b.txt")).unwrap();
+    write_file(&lix, "/a.txt", b"a-new".to_vec()).await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("a.txt"), Some(b"a-new"));
+    wait_for_disk_file(&tempdir.path().join("b.txt"), None);
+    wait_for_lix_file(&lix, "/b.txt", None).await;
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn filesystem_materialization_preserves_unrelated_deleted_resolved_directory() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("a.txt"), b"a-disk").unwrap();
+    std::fs::create_dir_all(tempdir.path().join("dir")).unwrap();
+    std::fs::write(tempdir.path().join("dir/b.txt"), b"b-disk").unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    write_file(&lix, "/a.txt", b"a-lix".to_vec()).await.unwrap();
+    write_file(&lix, "/dir/b.txt", b"b-lix".to_vec())
+        .await
+        .unwrap();
+    wait_for_disk_file(&tempdir.path().join("a.txt"), Some(b"a-lix"));
+    wait_for_disk_file(&tempdir.path().join("dir/b.txt"), Some(b"b-lix"));
+
+    std::fs::remove_dir_all(tempdir.path().join("dir")).unwrap();
+    write_file(&lix, "/a.txt", b"a-new".to_vec()).await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("a.txt"), Some(b"a-new"));
+    wait_for_disk_file(&tempdir.path().join("dir/b.txt"), None);
+    wait_for_lix_file(&lix, "/dir/b.txt", None).await;
+    assert_eq!(readdir(&lix, "/dir/").await.unwrap(), None);
 
     lix.close().await.unwrap();
 }
