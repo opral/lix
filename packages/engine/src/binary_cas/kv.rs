@@ -12,8 +12,8 @@ use crate::binary_cas::{
 };
 use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
-    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions,
-    StorageSpaceId, StorageValue,
+    StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
+    StorageScanOptions, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
@@ -506,12 +506,45 @@ fn decode_and_verify_chunk(
     Ok(chunk_payload.to_vec())
 }
 
+#[allow(dead_code)]
 pub(in crate::binary_cas) fn stage_blob_write(
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
     precomputed_hash: Option<BlobHash>,
+) -> Result<BlobWriteReceipt, LixError> {
+    stage_blob_write_with_chunk_filter(writes, blob_hashes, bytes, precomputed_hash, |chunk_hash| {
+        Ok(chunk_keys.insert(chunk_key(chunk_hash)))
+    })
+}
+
+pub(in crate::binary_cas) fn stage_blob_write_skipping_existing_chunks<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    blob_hashes: &mut HashSet<[u8; 32]>,
+    chunk_keys: &mut HashSet<Vec<u8>>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+) -> Result<BlobWriteReceipt, LixError>
+where
+    S: StorageRead + ?Sized,
+{
+    stage_blob_write_with_chunk_filter(writes, blob_hashes, bytes, precomputed_hash, |chunk_hash| {
+        let key = chunk_key(chunk_hash);
+        if !chunk_keys.insert(key.clone()) {
+            return Ok(false);
+        }
+        Ok(!chunk_key_exists(store, key)?)
+    })
+}
+
+fn stage_blob_write_with_chunk_filter(
+    writes: &mut StorageWriteSet,
+    blob_hashes: &mut HashSet<[u8; 32]>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+    mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
 ) -> Result<BlobWriteReceipt, LixError> {
     let blob_hash = precomputed_hash.unwrap_or_else(|| BlobHash::from_content(bytes));
     if cfg!(debug_assertions)
@@ -569,7 +602,7 @@ pub(in crate::binary_cas) fn stage_blob_write(
                     chunk_hash: chunk_hash.into_bytes(),
                 },
             );
-            if chunk_keys.insert(chunk_key(chunk_hash)) {
+            if should_stage_chunk(chunk_hash)? {
                 stage_chunk(
                     writes,
                     chunk_hash,
@@ -592,8 +625,7 @@ pub(in crate::binary_cas) fn stage_blob_write(
             for (chunk_index, (start, end)) in chunk_ranges.into_iter().enumerate() {
                 let chunk_data = &bytes[start..end];
                 let chunk_hash = BlobHash::from_content(chunk_data);
-                let chunk_key = chunk_key(chunk_hash);
-                if chunk_keys.insert(chunk_key.clone()) {
+                if should_stage_chunk(chunk_hash)? {
                     stage_chunk(
                         writes,
                         chunk_hash,
@@ -616,6 +648,18 @@ pub(in crate::binary_cas) fn stage_blob_write(
         }
     }
     Ok(receipt)
+}
+
+fn chunk_key_exists(store: &(impl StorageRead + ?Sized), key: Vec<u8>) -> Result<bool, LixError> {
+    let key = StorageKey(Bytes::from(key));
+    let result = PointReadPlan::new(BINARY_CAS_CHUNK_SPACE, &[key]).materialize(
+        store,
+        StorageGetOptions {
+            projection: StorageCoreProjection::KeyOnly,
+            ..StorageGetOptions::default()
+        },
+    )?;
+    Ok(result.value.into_iter().next().flatten().is_some())
 }
 
 fn metadata_from_manifest(
@@ -852,6 +896,52 @@ mod tests {
                 .await
                 .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_chunk_aware_writer_skips_persisted_chunk_payloads() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let data = b"hello chunked kv cas";
+        let payload = BlobPayload::from_bytes(data.to_vec());
+        let blob_hash = payload.hash().expect("payload should have a hash");
+
+        {
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer
+                .stage_payload(&payload)
+                .expect("initial blob write should stage");
+            assert_eq!(writes.stats().staged_puts, 2);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("initial blob write should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer =
+            BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
+        writer
+            .stage_payload(&payload)
+            .expect("repeat blob write should stage");
+
+        assert_eq!(writes.stats().staged_puts, 1);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("repeat blob write should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        assert_eq!(
+            load_bytes_many(&store, &[blob_hash])
+                .await
+                .expect("blob should load")
+                .into_vec(),
+            vec![Some(data.to_vec())]
         );
     }
 

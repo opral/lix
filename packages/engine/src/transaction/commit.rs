@@ -45,7 +45,7 @@ pub(crate) async fn commit_prepared_writes(
     let mut json_writer = JsonStoreContext::new().writer();
 
     if !prepared_writes.file_data_writes.is_empty() {
-        let mut blob_writer = binary_cas.writer(&mut writes);
+        let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
         for write in &prepared_writes.file_data_writes {
             blob_writer.stage_payload(write.payload())?;
         }

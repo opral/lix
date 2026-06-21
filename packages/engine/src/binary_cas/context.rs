@@ -35,8 +35,21 @@ impl BinaryCasContext {
     }
 
     #[expect(clippy::unused_self)]
+    #[allow(dead_code)]
     pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> BinaryCasWriter<'a> {
         BinaryCasWriter::new(writes)
+    }
+
+    #[expect(clippy::unused_self)]
+    pub(crate) fn writer_skipping_existing_chunks<'a, S>(
+        &self,
+        store: &'a S,
+        writes: &'a mut StorageWriteSet,
+    ) -> ExistingChunkAwareBinaryCasWriter<'a, S>
+    where
+        S: StorageRead + ?Sized,
+    {
+        ExistingChunkAwareBinaryCasWriter::new(store, writes)
     }
 }
 
@@ -75,12 +88,26 @@ where
 ///
 /// This type does not begin, commit, or roll back transactions. It only writes
 /// CAS data into the transaction supplied by the caller.
+#[allow(dead_code)]
 pub(crate) struct BinaryCasWriter<'a> {
     writes: &'a mut StorageWriteSet,
     blob_hashes: HashSet<[u8; 32]>,
     chunk_keys: HashSet<Vec<u8>>,
 }
 
+/// Binary CAS writer that avoids re-putting chunk payload rows already present
+/// in the backing store.
+pub(crate) struct ExistingChunkAwareBinaryCasWriter<'a, S>
+where
+    S: StorageRead + ?Sized,
+{
+    store: &'a S,
+    writes: &'a mut StorageWriteSet,
+    blob_hashes: HashSet<[u8; 32]>,
+    chunk_keys: HashSet<Vec<u8>>,
+}
+
+#[allow(dead_code)]
 impl<'a> BinaryCasWriter<'a> {
     fn new(writes: &'a mut StorageWriteSet) -> Self {
         Self {
@@ -106,6 +133,34 @@ impl<'a> BinaryCasWriter<'a> {
         payload: &BlobPayload,
     ) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write(
+            self.writes,
+            &mut self.blob_hashes,
+            &mut self.chunk_keys,
+            payload.bytes(),
+            payload.hash(),
+        )
+    }
+}
+
+impl<'a, S> ExistingChunkAwareBinaryCasWriter<'a, S>
+where
+    S: StorageRead + ?Sized,
+{
+    fn new(store: &'a S, writes: &'a mut StorageWriteSet) -> Self {
+        Self {
+            store,
+            writes,
+            blob_hashes: HashSet::new(),
+            chunk_keys: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn stage_payload(
+        &mut self,
+        payload: &BlobPayload,
+    ) -> Result<BlobWriteReceipt, LixError> {
+        crate::binary_cas::kv::stage_blob_write_skipping_existing_chunks(
+            self.store,
             self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
