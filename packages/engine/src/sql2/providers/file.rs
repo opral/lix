@@ -1067,19 +1067,8 @@ impl InsertSink for LixFileInsertSink {
                 );
             }
             if record_batch_has_non_null_column(&batch, "path")? {
-                staged.extend(lix_file_insert_stage_from_batch_with_path_resolvers(
-                    &batch,
-                    self.branch_binding.active_branch_id(),
-                    self.surface_name,
-                    path_resolvers
-                        .as_mut()
-                        .expect("path resolver should be initialized"),
-                    &mut || self.functions.call_uuid_v7().to_string(),
-                    self.include_data_writes,
-                )?);
-            } else {
-                staged.extend(
-                    lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
+                staged
+                    .extend(lix_file_insert_stage_from_batch_with_path_resolvers(
                         &batch,
                         self.branch_binding.active_branch_id(),
                         self.surface_name,
@@ -1088,8 +1077,23 @@ impl InsertSink for LixFileInsertSink {
                             .expect("path resolver should be initialized"),
                         &mut || self.functions.call_uuid_v7().to_string(),
                         self.include_data_writes,
-                    )?,
-                );
+                    )?)
+                    .map_err(lix_error_to_datafusion_error)?;
+            } else {
+                staged
+                    .extend(
+                        lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
+                            &batch,
+                            self.branch_binding.active_branch_id(),
+                            self.surface_name,
+                            path_resolvers
+                                .as_mut()
+                                .expect("path resolver should be initialized"),
+                            &mut || self.functions.call_uuid_v7().to_string(),
+                            self.include_data_writes,
+                        )?,
+                    )
+                    .map_err(lix_error_to_datafusion_error)?;
             }
         }
 
@@ -1224,21 +1228,37 @@ struct LixFileStagedBatch {
 }
 
 impl LixFileStagedBatch {
-    fn extend(&mut self, other: Self) {
+    fn extend(&mut self, other: Self) -> std::result::Result<(), LixError> {
         self.state_rows.extend(other.state_rows);
         self.file_data_writes.extend(other.file_data_writes);
-        self.count += other.count;
+        self.add_count(other.count)
     }
 
-    fn extend_filesystem_plan(&mut self, plan: crate::filesystem::FilesystemWritePlan) {
+    fn extend_filesystem_plan(
+        &mut self,
+        plan: crate::filesystem::FilesystemWritePlan,
+    ) -> std::result::Result<(), LixError> {
         self.state_rows.extend(plan.rows);
         self.file_data_writes.extend(plan.file_data);
-        self.count += plan.count;
+        self.add_count(plan.count)
     }
 
-    fn extend_filesystem_delete_plan(&mut self, plan: FilesystemDeletePlan) {
+    fn extend_filesystem_delete_plan(
+        &mut self,
+        plan: FilesystemDeletePlan,
+    ) -> std::result::Result<(), LixError> {
         self.state_rows.extend(plan.rows);
-        self.count += plan.count;
+        self.add_count(plan.count)
+    }
+
+    fn add_count(&mut self, count: u64) -> std::result::Result<(), LixError> {
+        self.count = self.count.checked_add(count).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "lix_file fast write row count overflow",
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -1249,15 +1269,17 @@ pub(crate) enum FastLixFilePathWriteConflict {
     UpdateData,
 }
 
-pub(crate) async fn execute_fast_lix_file_path_write(
+pub(crate) async fn execute_fast_lix_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
-    path: String,
-    data: Vec<u8>,
+    writes: Vec<(String, Vec<u8>)>,
     conflict: FastLixFilePathWriteConflict,
 ) -> Result<u64, LixError> {
+    if writes.is_empty() {
+        return Ok(0);
+    }
+
     let active_branch_id = ctx.active_branch_id().to_string();
-    let parsed = parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
-        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    let parsed_writes = parse_fast_lix_file_path_writes(writes)?;
 
     let live_rows = ctx
         .scan_live_state(&LiveStateScanRequest {
@@ -1271,89 +1293,92 @@ pub(crate) async fn execute_fast_lix_file_path_write(
         })
         .await?;
     let filesystem = FilesystemIndex::from_live_rows(live_rows.clone())?;
-
-    if let Some(existing) = filesystem.file_entry(&parsed.path).cloned() {
-        if conflict != FastLixFilePathWriteConflict::None {
-            validate_fast_lix_file_path_conflict_pair(existing.scope.untracked, &parsed.path)?;
-        }
-        return match conflict {
-            FastLixFilePathWriteConflict::None => {
-                let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
-                let context = FilesystemRowContext {
-                    branch_id: active_branch_id.clone(),
-                    global: false,
-                    untracked: false,
-                    file_id: None,
-                    metadata: None,
-                };
-                let plan = plan_parsed_file_path_write_with_resolvers(
-                    &mut path_resolvers,
-                    parsed.parsed_path,
-                    Some(
-                        parsed
-                            .plugin_key
-                            .as_deref()
-                            .map(plugin_storage_archive_file_id)
-                            .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
-                    ),
-                    Some(data),
-                    context,
-                    &mut || ctx.functions().call_uuid_v7().to_string(),
-                )?;
-                let mut staged = LixFileStagedBatch::default();
-                staged.extend_filesystem_plan(plan);
-                stage_lix_file_fast_batch(ctx, TransactionWriteMode::Insert, staged).await
-            }
-            FastLixFilePathWriteConflict::DoNothing => Ok(0),
-            FastLixFilePathWriteConflict::UpdateData => {
-                let mut staged = LixFileStagedBatch::default();
-                let mut context = existing.scope.context(Some(existing.id.clone()));
-                if context.global {
-                    context.branch_id = GLOBAL_BRANCH_ID.to_string();
-                }
-                stage_lix_file_data_update_write(
-                    &mut staged,
-                    existing.id.clone(),
-                    Some(parsed.path),
-                    Some(existing.name.clone()),
-                    data,
-                    context,
-                    existing.blob_hash.is_some(),
-                    None,
-                )
-                .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-                staged.count = 1;
-                stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
-            }
-        };
-    }
-
     let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
     let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, false, None);
     path_resolvers.entry(resolver_key).or_default();
-    let context = FilesystemRowContext {
-        branch_id: active_branch_id,
-        global: false,
-        untracked: false,
-        file_id: None,
-        metadata: None,
-    };
-    let file_id = parsed
-        .plugin_key
-        .as_deref()
-        .map(plugin_storage_archive_file_id)
-        .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
-    let mut plan = plan_parsed_file_path_write_with_resolvers(
-        &mut path_resolvers,
-        parsed.parsed_path,
-        Some(file_id.clone()),
-        Some(data),
-        context,
-        &mut || ctx.functions().call_uuid_v7().to_string(),
-    )?;
-    attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
     let mut staged = LixFileStagedBatch::default();
-    staged.extend_filesystem_plan(plan);
+
+    for write in parsed_writes {
+        if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
+            if conflict != FastLixFilePathWriteConflict::None {
+                validate_fast_lix_file_path_conflict_pair(
+                    existing.scope.untracked,
+                    &write.parsed.path,
+                )?;
+            }
+            match conflict {
+                FastLixFilePathWriteConflict::None => {
+                    let context = FilesystemRowContext {
+                        branch_id: active_branch_id.clone(),
+                        global: false,
+                        untracked: false,
+                        file_id: None,
+                        metadata: None,
+                    };
+                    let plan = plan_parsed_file_path_write_with_resolvers(
+                        &mut path_resolvers,
+                        write.parsed.parsed_path,
+                        Some(
+                            write
+                                .parsed
+                                .plugin_key
+                                .as_deref()
+                                .map(plugin_storage_archive_file_id)
+                                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
+                        ),
+                        Some(write.data),
+                        context,
+                        &mut || ctx.functions().call_uuid_v7().to_string(),
+                    )?;
+                    staged.extend_filesystem_plan(plan)?;
+                }
+                FastLixFilePathWriteConflict::DoNothing => {}
+                FastLixFilePathWriteConflict::UpdateData => {
+                    let mut context = existing.scope.context(Some(existing.id.clone()));
+                    if context.global {
+                        context.branch_id = GLOBAL_BRANCH_ID.to_string();
+                    }
+                    stage_lix_file_data_update_write(
+                        &mut staged,
+                        existing.id.clone(),
+                        Some(write.parsed.path),
+                        Some(existing.name.clone()),
+                        write.data,
+                        context,
+                        existing.blob_hash.is_some(),
+                        None,
+                    )
+                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    staged.add_count(1)?;
+                }
+            }
+        } else {
+            let context = FilesystemRowContext {
+                branch_id: active_branch_id.clone(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: None,
+            };
+            let file_id = write
+                .parsed
+                .plugin_key
+                .as_deref()
+                .map(plugin_storage_archive_file_id)
+                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
+            let mut plan = plan_parsed_file_path_write_with_resolvers(
+                &mut path_resolvers,
+                write.parsed.parsed_path,
+                Some(file_id.clone()),
+                Some(write.data),
+                context,
+                &mut || ctx.functions().call_uuid_v7().to_string(),
+            )?;
+            attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
+            staged.extend_filesystem_plan(plan)?;
+        }
+    }
+
     let mode = match conflict {
         FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
         FastLixFilePathWriteConflict::DoNothing | FastLixFilePathWriteConflict::UpdateData => {
@@ -1361,6 +1386,26 @@ pub(crate) async fn execute_fast_lix_file_path_write(
         }
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await
+}
+
+struct FastLixFilePathWrite {
+    parsed: ParsedFileWritePath,
+    data: Vec<u8>,
+}
+
+fn parse_fast_lix_file_path_writes(
+    writes: Vec<(String, Vec<u8>)>,
+) -> std::result::Result<Vec<FastLixFilePathWrite>, LixError> {
+    writes
+        .into_iter()
+        .map(|(path, data)| {
+            Ok(FastLixFilePathWrite {
+                parsed: parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
+                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?,
+                data,
+            })
+        })
+        .collect()
 }
 
 fn validate_fast_lix_file_path_conflict_pair(
@@ -1427,12 +1472,14 @@ fn lix_file_delete_stage_from_batch(
         }
         let file_id = required_string_value(batch, row_index, "id")?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
-        staged.extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
-            file_id: file_id.clone(),
-            has_blob_ref: blob_ref_keys
-                .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
-            context,
-        }));
+        staged
+            .extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
+                file_id: file_id.clone(),
+                has_blob_ref: blob_ref_keys
+                    .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
+                context,
+            }))
+            .map_err(lix_error_to_datafusion_error)?;
     }
     Ok(staged)
 }
@@ -1741,7 +1788,9 @@ fn lix_file_path_update_stage_from_batch(
             generate_directory_id,
         )
         .map_err(lix_error_to_datafusion_error)?;
-        staged.extend_filesystem_plan(plan);
+        staged
+            .extend_filesystem_plan(plan)
+            .map_err(lix_error_to_datafusion_error)?;
 
         if let Some(data) = assigned_data {
             let has_blob_ref =
@@ -1907,7 +1956,9 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
             )
             .map_err(lix_error_to_datafusion_error)?;
             attach_lix_file_insert_origin(&mut plan.rows, surface_name, &file_id);
-            staged.extend_filesystem_plan(plan);
+            staged
+                .extend_filesystem_plan(plan)
+                .map_err(lix_error_to_datafusion_error)?;
             continue;
         }
 
@@ -1951,7 +2002,9 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 )
                 .map_err(lix_error_to_datafusion_error)?;
                 attach_lix_file_insert_origin(&mut plan.rows, surface_name, &file_id);
-                staged.extend_filesystem_plan(plan);
+                staged
+                    .extend_filesystem_plan(plan)
+                    .map_err(lix_error_to_datafusion_error)?;
                 continue;
             }
         }

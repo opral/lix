@@ -148,19 +148,14 @@ async fn execute_file_path_write(
             "bound lix_file fast write supports VALUES only",
         ));
     };
-    let mut affected = 0u64;
+    let mut writes = Vec::with_capacity(values.rows.len());
     for row in &values.rows {
-        let path = eval_fast_file_text(&row[shape.path_index], params, "path")?;
-        let data = eval_fast_file_blob(&row[shape.data_index], params, "data")?;
-        affected += crate::sql2::providers::execute_fast_lix_file_path_write(
-            ctx,
-            path,
-            data,
-            shape.conflict,
-        )
-        .await?;
+        writes.push((
+            eval_fast_file_text(&row[shape.path_index], params, "path")?,
+            eval_fast_file_blob(&row[shape.data_index], params, "data")?,
+        ));
     }
-    Ok(affected)
+    crate::sql2::providers::execute_fast_lix_file_path_writes(ctx, writes, shape.conflict).await
 }
 
 fn fast_file_path_write_shape(
@@ -173,7 +168,7 @@ fn fast_file_path_write_shape(
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return None;
     };
-    if values.rows.len() != 1 || values.columns.len() != 2 {
+    if values.rows.is_empty() || values.columns.len() != 2 {
         return None;
     }
     let path_index = values.column_index("path")?;

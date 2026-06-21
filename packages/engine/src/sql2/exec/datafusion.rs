@@ -1442,7 +1442,10 @@ fn string_scalar_to_lix_value(value: &str, field: Option<&Field>) -> Result<Valu
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
     use serde_json::Value as JsonValue;
@@ -1465,8 +1468,9 @@ mod tests {
         ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
     };
     use crate::sql2::{
-        bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
-        plan_write,
+        WriteExecutorMode, WriteExecutorPath, bind_statement, create_write_logical_plan,
+        execute_write_logical_plan, execute_write_logical_plan_with_mode_and_trace,
+        parse_statement, plan_write,
     };
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, SharedStorageRead, StorageContext,
@@ -1485,6 +1489,10 @@ mod tests {
     struct DummyLiveStateReader;
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
+    }
+    struct CountingRowsLiveStateReader {
+        rows: Vec<MaterializedLiveStateRow>,
+        scans: Arc<AtomicUsize>,
     }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
@@ -1715,6 +1723,25 @@ mod tests {
         })
     }
 
+    async fn execute_write_sql_trace(
+        ctx: &mut dyn SqlWriteExecutionContext,
+        sql: &str,
+        params: &[Value],
+        mode: WriteExecutorMode,
+    ) -> Result<(crate::SqlQueryResult, WriteExecutorPath), LixError> {
+        let plan = create_write_logical_plan(ctx, sql).await?;
+        let (count, path) =
+            execute_write_logical_plan_with_mode_and_trace(ctx, plan, params, mode).await?;
+        Ok((
+            crate::SqlQueryResult {
+                columns: vec!["count".to_string()],
+                rows: vec![vec![Value::Integer(count as i64)]],
+                notices: Vec::new(),
+            },
+            path,
+        ))
+    }
+
     #[async_trait]
     impl BranchRefReader for DummyBranchRefReader {
         async fn load_head(
@@ -1783,48 +1810,72 @@ mod tests {
         }
     }
 
+    fn filter_live_state_rows(
+        rows: &[MaterializedLiveStateRow],
+        request: &LiveStateScanRequest,
+    ) -> Vec<MaterializedLiveStateRow> {
+        if matches!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::None
+        ) {
+            return Vec::new();
+        }
+        let mut rows = rows
+            .iter()
+            .filter(|row| {
+                (request.filter.schema_keys.is_empty()
+                    || request.filter.schema_keys.contains(&row.schema_key))
+                    && (request.filter.entity_pks.is_empty()
+                        || request.filter.entity_pks.contains(&row.entity_pk))
+                    && (request.filter.branch_ids.is_empty()
+                        || request.filter.branch_ids.contains(&row.branch_id))
+                    && request
+                        .filter
+                        .untracked
+                        .is_none_or(|untracked| row.untracked == untracked)
+                    && (request.filter.include_tombstones || !row.deleted)
+                    && (request.filter.file_ids.is_empty()
+                        || request.filter.file_ids.iter().any(|filter| match filter {
+                            NullableKeyFilter::Any => true,
+                            NullableKeyFilter::Null => row.file_id.is_none(),
+                            NullableKeyFilter::Value(file_id) => {
+                                row.file_id.as_ref() == Some(file_id)
+                            }
+                        }))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        rows
+    }
+
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            if matches!(
-                request.filter.rows,
-                crate::live_state::LiveStateRowFilter::None
-            ) {
-                return Ok(Vec::new());
-            }
-            let mut rows = self
-                .rows
-                .iter()
-                .filter(|row| {
-                    (request.filter.schema_keys.is_empty()
-                        || request.filter.schema_keys.contains(&row.schema_key))
-                        && (request.filter.entity_pks.is_empty()
-                            || request.filter.entity_pks.contains(&row.entity_pk))
-                        && (request.filter.branch_ids.is_empty()
-                            || request.filter.branch_ids.contains(&row.branch_id))
-                        && request
-                            .filter
-                            .untracked
-                            .is_none_or(|untracked| row.untracked == untracked)
-                        && (request.filter.include_tombstones || !row.deleted)
-                        && (request.filter.file_ids.is_empty()
-                            || request.filter.file_ids.iter().any(|filter| match filter {
-                                NullableKeyFilter::Any => true,
-                                NullableKeyFilter::Null => row.file_id.is_none(),
-                                NullableKeyFilter::Value(file_id) => {
-                                    row.file_id.as_ref() == Some(file_id)
-                                }
-                            }))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if let Some(limit) = request.limit {
-                rows.truncate(limit);
-            }
-            Ok(rows)
+            Ok(filter_live_state_rows(&self.rows, request))
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl LiveStateReader for CountingRowsLiveStateReader {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            Ok(filter_live_state_rows(&self.rows, request))
         }
 
         async fn load_row(
@@ -1997,6 +2048,52 @@ mod tests {
             created_at: "2026-04-23T00:00:00Z".to_string(),
             updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
+    }
+
+    fn counting_write_context(
+        rows: Vec<MaterializedLiveStateRow>,
+    ) -> (
+        DummySqlWriteExecutionContext<'static>,
+        Arc<Mutex<CapturingStagedWrites>>,
+        Arc<AtomicUsize>,
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let scans = Arc::new(AtomicUsize::new(0));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(CountingRowsLiveStateReader {
+            rows,
+            scans: Arc::clone(&scans),
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        (
+            DummySqlWriteExecutionContext {
+                active_branch_id: "branch-a",
+                blob_reader,
+                live_state,
+                staged_writes: Arc::clone(&staged_writes),
+                schema_definitions: vec![],
+            },
+            staged_writes,
+            scans,
+        )
+    }
+
+    fn mark_untracked(mut row: MaterializedLiveStateRow) -> MaterializedLiveStateRow {
+        row.untracked = true;
+        row
+    }
+
+    fn descriptor_names(rows: &[CapturedStageRow]) -> Vec<String> {
+        let mut names = rows
+            .iter()
+            .map(|row| {
+                let snapshot: JsonValue =
+                    serde_json::from_str(row.snapshot_content.as_deref().unwrap())
+                        .expect("descriptor snapshot JSON");
+                snapshot["name"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     #[tokio::test]
@@ -3994,6 +4091,323 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_data_uses_one_fast_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/multi/a.md', X'61'), ('/multi/b.md', X'62')",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("multi-row path/data insert should use the fast writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_names(&descriptor_rows), vec!["a.md", "b.md"]);
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_ref_rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_data_params_use_fast_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
+            &[
+                Value::Text("/multi/param-a.md".to_string()),
+                Value::Blob(b"param-a".to_vec()),
+                Value::Text("/multi/param-b.md".to_string()),
+                Value::Blob(b"param-b".to_vec()),
+            ],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("parameterized multi-row path/data insert should use the fast writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_do_nothing_validates_and_skips_existing() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
+            live_file_row("file-existing", "branch-a", None, "existing.md"),
+            live_blob_ref_row("file-existing", "branch-a", b"old"),
+        ]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/existing.md', X'6e6577'), ('/fresh.md', X'6672657368') \
+             ON CONFLICT (path) DO NOTHING",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("multi-row DO NOTHING should use the fast writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_names(&descriptor_rows), vec!["fresh.md"]);
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_ref_rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_update_existing_and_insert_fresh() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
+            live_file_row("file-existing", "branch-a", None, "existing.md"),
+            live_blob_ref_row("file-existing", "branch-a", b"old"),
+        ]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/existing.md', X'6e6577'), ('/fresh.md', X'6672657368') \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("multi-row DO UPDATE should use the fast writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_names(&descriptor_rows), vec!["fresh.md"]);
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_ref_rows.len(), 2);
+        assert!(
+            blob_ref_rows
+                .iter()
+                .any(|row| row.entity_pk == "[\"file-existing\"]")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_duplicate_insert_paths_reject_before_staging() {
+        for sql in [
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62')",
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62') \
+             ON CONFLICT (path) DO NOTHING",
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62') \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        ] {
+            let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+            let error = execute_write_sql_trace(&mut ctx, sql, &[], WriteExecutorMode::ForceFast)
+                .await
+                .expect_err("duplicate VALUES paths should fail");
+
+            assert_eq!(error.code, LixError::CODE_UNIQUE, "{sql}");
+            assert_eq!(scans.load(Ordering::SeqCst), 1, "{sql}");
+            assert!(
+                staged_writes
+                    .lock()
+                    .expect("staged writes lock")
+                    .deltas
+                    .is_empty(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_duplicate_existing_do_nothing_skips_all() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
+            live_file_row("file-existing", "branch-a", None, "existing.md"),
+            live_blob_ref_row("file-existing", "branch-a", b"old"),
+        ]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/existing.md', X'61'), ('/existing.md', X'62') \
+             ON CONFLICT (path) DO NOTHING",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("duplicate existing paths should follow DO NOTHING");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_namespace_conflict_leaves_no_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/folder', X'61'), ('/folder/file.md', X'62')",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("batch should reject file/directory namespace conflicts");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_invalid_later_row_leaves_no_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/ok.md', X'6f6b'), ('relative.md', X'626164')",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("invalid later path should fail before staging");
+
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_bad_data_param_leaves_no_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
+            &[
+                Value::Text("/ok.md".to_string()),
+                Value::Blob(b"ok".to_vec()),
+                Value::Text("/bad.md".to_string()),
+                Value::Text("not a blob".to_string()),
+            ],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("wrong data param type should fail before staging");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_do_nothing_rejects_untracked_collision() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![mark_untracked(
+            live_file_row("file-untracked", "branch-a", None, "untracked.md"),
+        )]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/untracked.md', X'6e6577'), ('/fresh.md', X'6672657368') \
+             ON CONFLICT (path) DO NOTHING",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("DO NOTHING should still reject tracked/untracked conflicts");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_id_path_data_is_not_path_data_fast_shape() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-a', '/a.md', X'61'), ('file-b', '/b.md', X'62')",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("id/path/data is outside the narrow path/data fast shape");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
@@ -4799,7 +5213,7 @@ mod tests {
             &mut ctx,
             plan,
             &[],
-            crate::sql2::WriteExecutorMode::ForceDataFusion,
+            WriteExecutorMode::ForceDataFusion,
         )
         .await
         .expect_err("unsupported reference writer target should not become a fast no-op");
@@ -4838,7 +5252,7 @@ mod tests {
             &mut ctx,
             plan,
             &[],
-            crate::sql2::WriteExecutorMode::ForceDataFusion,
+            WriteExecutorMode::ForceDataFusion,
         )
         .await
         .expect_err("unsupported target with empty scope should not become a no-op");
