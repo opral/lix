@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use lix_engine::wasm::WasmRuntime;
@@ -23,6 +23,9 @@ const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const FILE_UPSERT_BATCH_MAX_ROWS: usize = 500;
 const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
+// Avoid paying thread startup cost for tiny directory roots.
+const FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct FilesystemSync<B>
@@ -588,7 +591,7 @@ where
         });
         let poll_filesystem = cfg!(target_os = "macos") || debouncer.is_none();
         let worker_state = Arc::clone(&state);
-        let worker = std::thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("lix-sdk-filesystem-sync".to_string())
             .spawn(move || filesystem_worker(worker_state, event_rx, poll_filesystem))
             .map_err(|error| {
@@ -1194,9 +1197,86 @@ fn collect_local_snapshot(
     let mut snapshot = Snapshot::default();
     snapshot.directories.insert("/".to_string());
     if path_filter.is_unfiltered() {
-        collect_local_directory(root, root, metadata_mode, &mut snapshot)?;
+        let child_dirs = collect_local_directory_shallow(root, root, metadata_mode, &mut snapshot)?;
+        let child_snapshot = collect_local_child_directories(root, child_dirs, metadata_mode)?;
+        merge_snapshot(&mut snapshot, child_snapshot);
     } else {
         collect_filtered_local_snapshot(root, metadata_mode, path_filter, &mut snapshot)?;
+    }
+    Ok(snapshot)
+}
+
+fn collect_local_child_directories(
+    root: &Path,
+    child_dirs: Vec<PathBuf>,
+    metadata_mode: FilesystemMetadataMode,
+) -> Result<Snapshot, LixError> {
+    if child_dirs.is_empty() {
+        return Ok(Snapshot::default());
+    }
+
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS)
+        .min(child_dirs.len());
+    if worker_count <= 1 || child_dirs.len() < FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS {
+        let mut snapshot = Snapshot::default();
+        for child_dir in child_dirs {
+            collect_local_directory(root, &child_dir, metadata_mode, &mut snapshot)?;
+        }
+        return Ok(snapshot);
+    }
+
+    let chunk_size = child_dirs.len().div_ceil(worker_count);
+    let mut handles = Vec::with_capacity(worker_count);
+    let mut first_error = None;
+    for (worker_index, chunk) in child_dirs.chunks(chunk_size).enumerate() {
+        let root = root.to_path_buf();
+        let child_dirs = chunk.to_vec();
+        let worker = thread::Builder::new()
+            .name(format!("lix-sdk-filesystem-snapshot-{worker_index}"))
+            .spawn(move || {
+                let mut snapshot = Snapshot::default();
+                for child_dir in child_dirs {
+                    collect_local_directory(&root, &child_dir, metadata_mode, &mut snapshot)?;
+                }
+                Ok::<_, LixError>(snapshot)
+            });
+        match worker {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                first_error = Some(LixError::new(
+                    "LIX_FILESYSTEM_THREAD_ERROR",
+                    format!("failed to start filesystem snapshot worker: {error}"),
+                ));
+                break;
+            }
+        }
+    }
+
+    let mut snapshot = Snapshot::default();
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(child_snapshot)) => {
+                if first_error.is_none() {
+                    merge_snapshot(&mut snapshot, child_snapshot);
+                }
+            }
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if first_error.is_none() {
+                    first_error = Some(LixError::unknown("filesystem snapshot worker panicked"));
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(snapshot)
 }
@@ -1207,6 +1287,20 @@ fn collect_local_directory(
     metadata_mode: FilesystemMetadataMode,
     snapshot: &mut Snapshot,
 ) -> Result<(), LixError> {
+    let child_dirs = collect_local_directory_shallow(root, directory, metadata_mode, snapshot)?;
+    for child_dir in child_dirs {
+        collect_local_directory(root, &child_dir, metadata_mode, snapshot)?;
+    }
+    Ok(())
+}
+
+fn collect_local_directory_shallow(
+    root: &Path,
+    directory: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    snapshot: &mut Snapshot,
+) -> Result<Vec<PathBuf>, LixError> {
+    let mut child_dirs = Vec::new();
     let entries = std::fs::read_dir(directory)
         .map_err(|error| io_error("read filesystem directory", directory, error))?;
     for entry in entries {
@@ -1231,7 +1325,7 @@ fn collect_local_directory(
                 continue;
             };
             snapshot.directories.insert(lix_path);
-            collect_local_directory(root, &path, metadata_mode, snapshot)?;
+            child_dirs.push(path);
         } else if file_type.is_file() {
             let Ok(lix_path) = local_path_to_lix_path(root, &path, false) else {
                 remember_unmanaged_local_path(root, directory, &path, snapshot);
@@ -1242,7 +1336,13 @@ fn collect_local_directory(
             snapshot.files.insert(lix_path, data);
         }
     }
-    Ok(())
+    Ok(child_dirs)
+}
+
+fn merge_snapshot(target: &mut Snapshot, source: Snapshot) {
+    target.directories.extend(source.directories);
+    target.files.extend(source.files);
+    target.unmanaged_paths.extend(source.unmanaged_paths);
 }
 
 fn collect_filtered_local_snapshot(
@@ -2233,6 +2333,58 @@ mod tests {
             let error = lix_path_to_local_path(root, path).expect_err("path should fail");
             assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
         }
+    }
+
+    #[test]
+    fn collect_local_snapshot_hydrates_top_level_directories() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+
+        std::fs::write(root.join("root.txt"), b"root").unwrap();
+        for index in 0..FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS {
+            let dir = root.join(format!("dir-{index}"));
+            let nested = dir.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(dir.join("file.txt"), format!("file-{index}")).unwrap();
+            std::fs::write(nested.join("deep.txt"), format!("deep-{index}")).unwrap();
+        }
+
+        let snapshot = collect_local_snapshot(
+            root,
+            FilesystemMetadataMode::Ephemeral,
+            &FilesystemPathFilter::default(),
+        )
+        .unwrap();
+
+        assert!(snapshot.directories.contains("/"));
+        assert_eq!(snapshot.files.get("/root.txt").unwrap(), b"root");
+        for index in 0..FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS {
+            assert!(snapshot.directories.contains(&format!("/dir-{index}/")));
+            assert!(
+                snapshot
+                    .directories
+                    .contains(&format!("/dir-{index}/nested/"))
+            );
+            assert_eq!(
+                snapshot
+                    .files
+                    .get(&format!("/dir-{index}/file.txt"))
+                    .unwrap(),
+                format!("file-{index}").as_bytes()
+            );
+            assert_eq!(
+                snapshot
+                    .files
+                    .get(&format!("/dir-{index}/nested/deep.txt"))
+                    .unwrap(),
+                format!("deep-{index}").as_bytes()
+            );
+        }
+        assert_eq!(
+            snapshot.files.len(),
+            1 + (FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS * 2)
+        );
+        assert!(snapshot.unmanaged_paths.is_empty());
     }
 
     #[test]
