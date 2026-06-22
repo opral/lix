@@ -60,7 +60,7 @@ where
     /// Creates a clean DataFusion-first engine over an initialized backend.
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
-    /// instance instead of being hidden behind a legacy boot path.
+    /// instance instead of being hidden behind initialization side effects.
     ///
     /// Deterministic runtime sequencing is serialized within this Engine
     /// context. Independently constructing multiple Engine values over the same

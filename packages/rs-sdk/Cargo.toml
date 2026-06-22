@@ -68,7 +68,7 @@ required-features = ["sqlite"]
 [[example]]
 name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
-required-features = ["sqlite"]
+required-features = ["rocksdb"]
 
 [[bench]]
 name = "sqlite_backend"

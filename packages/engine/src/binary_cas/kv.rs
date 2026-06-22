@@ -1,14 +1,15 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::fastcdc_chunk_ranges;
+use crate::binary_cas::chunking::fastcdc_chunk_ranges_with_chunking;
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWriteReceipt,
+    BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
+    BlobWriteReceipt,
 };
 use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
@@ -517,18 +518,25 @@ fn decode_and_verify_chunk(
 
 #[allow(dead_code)]
 pub(in crate::binary_cas) fn stage_blob_write(
+    chunking: BinaryCasChunking,
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
     precomputed_hash: Option<BlobHash>,
 ) -> Result<BlobWriteReceipt, LixError> {
-    stage_blob_write_with_chunk_filter(writes, blob_hashes, bytes, precomputed_hash, |chunk_hash| {
-        Ok(chunk_keys.insert(chunk_key(chunk_hash)))
-    })
+    stage_blob_write_with_chunk_filter(
+        chunking,
+        writes,
+        blob_hashes,
+        bytes,
+        precomputed_hash,
+        |chunk_hash| Ok(chunk_keys.insert(chunk_key(chunk_hash))),
+    )
 }
 
 pub(in crate::binary_cas) fn stage_blob_write_skipping_existing_chunks<S>(
+    chunking: BinaryCasChunking,
     store: &S,
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
@@ -539,7 +547,7 @@ pub(in crate::binary_cas) fn stage_blob_write_skipping_existing_chunks<S>(
 where
     S: StorageRead + ?Sized,
 {
-    let plan = prepare_blob_write(bytes, precomputed_hash)?;
+    let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
     let receipt = plan.receipt.clone();
     if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
         return Ok(receipt);
@@ -553,13 +561,14 @@ where
 }
 
 fn stage_blob_write_with_chunk_filter(
+    chunking: BinaryCasChunking,
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     bytes: &[u8],
     precomputed_hash: Option<BlobHash>,
     mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
 ) -> Result<BlobWriteReceipt, LixError> {
-    let plan = prepare_blob_write(bytes, precomputed_hash)?;
+    let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
     let receipt = plan.receipt.clone();
     if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
         return Ok(receipt);
@@ -572,6 +581,7 @@ fn stage_blob_write_with_chunk_filter(
 }
 
 fn prepare_blob_write(
+    chunking: BinaryCasChunking,
     bytes: &[u8],
     precomputed_hash: Option<BlobHash>,
 ) -> Result<BlobWritePlan, LixError> {
@@ -585,7 +595,7 @@ fn prepare_blob_write(
             "binary CAS blob hash does not match blob contents".to_string(),
         ));
     }
-    let chunk_ranges = fastcdc_chunk_ranges(bytes);
+    let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
     let layout = match chunk_ranges.as_slice() {
         [] => BlobLayout::Empty,
         [(start, end)] => BlobLayout::SingleChunk {
@@ -827,6 +837,12 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn definitely_multi_chunk_blob_bytes() -> Vec<u8> {
+        (0..5_000_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>()
+    }
     use crate::binary_cas::BinaryCasContext;
     use crate::binary_cas::BlobPayload;
     use crate::storage::StorageContext;
@@ -1054,12 +1070,10 @@ mod tests {
     #[tokio::test]
     async fn existing_chunk_aware_writer_batches_persisted_chunk_checks() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let data = (0..600_000)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
+        let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
         let blob_hash = payload.hash().expect("payload should have a hash");
-        let chunk_ranges = fastcdc_chunk_ranges(&data);
+        let chunk_ranges = crate::binary_cas::chunking::fastcdc_chunk_ranges(&data);
         assert!(chunk_ranges.len() > 1);
         let chunk_hashes = chunk_ranges
             .iter()
@@ -1324,9 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn public_kv_api_roundtrips_multi_chunk_blob() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let data = (0..600_000)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
+        let data = definitely_multi_chunk_blob_bytes();
         let blob_hash = BlobHash::from_content(&data);
 
         {

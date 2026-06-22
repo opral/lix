@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::LixError;
+use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobPayload, BlobWriteReceipt};
 use crate::storage::{StorageRead, StorageWriteSet};
 use std::collections::HashSet;
@@ -15,11 +16,15 @@ pub(crate) trait BlobDataReader: Send + Sync {
 /// The context does not own storage. Callers explicitly provide a KV store via
 /// `reader(...)` or `writer(...)`, keeping backend and transaction ownership at
 /// the execution layer.
-pub(crate) struct BinaryCasContext;
+pub(crate) struct BinaryCasContext {
+    chunking: BinaryCasChunking,
+}
 
 impl BinaryCasContext {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            chunking: BinaryCasChunking::default(),
+        }
     }
 
     /// Creates a Binary CAS reader over any storage reader.
@@ -37,7 +42,7 @@ impl BinaryCasContext {
     #[expect(clippy::unused_self)]
     #[allow(dead_code)]
     pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> BinaryCasWriter<'a> {
-        BinaryCasWriter::new(writes)
+        BinaryCasWriter::new(writes, self.chunking)
     }
 
     #[expect(clippy::unused_self)]
@@ -49,7 +54,7 @@ impl BinaryCasContext {
     where
         S: StorageRead + ?Sized,
     {
-        ExistingChunkAwareBinaryCasWriter::new(store, writes)
+        ExistingChunkAwareBinaryCasWriter::new(store, writes, self.chunking)
     }
 }
 
@@ -91,6 +96,7 @@ where
 #[allow(dead_code)]
 pub(crate) struct BinaryCasWriter<'a> {
     writes: &'a mut StorageWriteSet,
+    chunking: BinaryCasChunking,
     blob_hashes: HashSet<[u8; 32]>,
     chunk_keys: HashSet<Vec<u8>>,
 }
@@ -103,15 +109,17 @@ where
 {
     store: &'a S,
     writes: &'a mut StorageWriteSet,
+    chunking: BinaryCasChunking,
     blob_hashes: HashSet<[u8; 32]>,
     chunk_keys: HashSet<Vec<u8>>,
 }
 
 #[allow(dead_code)]
 impl<'a> BinaryCasWriter<'a> {
-    fn new(writes: &'a mut StorageWriteSet) -> Self {
+    fn new(writes: &'a mut StorageWriteSet, chunking: BinaryCasChunking) -> Self {
         Self {
             writes,
+            chunking,
             blob_hashes: HashSet::new(),
             chunk_keys: HashSet::new(),
         }
@@ -120,6 +128,7 @@ impl<'a> BinaryCasWriter<'a> {
     #[cfg(test)]
     pub(crate) fn stage_bytes(&mut self, bytes: &[u8]) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write(
+            self.chunking,
             self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
@@ -133,6 +142,7 @@ impl<'a> BinaryCasWriter<'a> {
         payload: &BlobPayload,
     ) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write(
+            self.chunking,
             self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
@@ -146,10 +156,11 @@ impl<'a, S> ExistingChunkAwareBinaryCasWriter<'a, S>
 where
     S: StorageRead + ?Sized,
 {
-    fn new(store: &'a S, writes: &'a mut StorageWriteSet) -> Self {
+    fn new(store: &'a S, writes: &'a mut StorageWriteSet, chunking: BinaryCasChunking) -> Self {
         Self {
             store,
             writes,
+            chunking,
             blob_hashes: HashSet::new(),
             chunk_keys: HashSet::new(),
         }
@@ -160,6 +171,7 @@ where
         payload: &BlobPayload,
     ) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write_skipping_existing_chunks(
+            self.chunking,
             self.store,
             self.writes,
             &mut self.blob_hashes,

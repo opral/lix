@@ -1,8 +1,8 @@
 // Cold-open profiling harness for the filesystem backend.
 //
 // Usage:
-//   cargo run --release --example profile_fs_open --features sqlite,rocksdb -- \
-//     --backend sqlite <src_dir>
+//   cargo run --release --example profile_fs_open --features rocksdb -- \
+//     --backend rocksdb-blob <src_dir>
 //
 // Copies <src_dir> (sans any existing .lix) into a fresh temp dir, then times
 // FsBackend::open on the cold workspace. Pass --keep-workspace to preserve the
@@ -16,19 +16,15 @@ use lix_engine::{
     Value, binary_cas_write_metrics_snapshot, collect_binary_cas_storage_stats,
     reset_binary_cas_write_metrics,
 };
-use lix_sdk::{FsBackend, open_lix_with_backend};
-#[cfg(feature = "rocksdb")]
-use lix_sdk::{FsBackendFilter, RocksDbBlobOptions};
+use lix_fs_backend::RocksDbBlobOptions;
+use lix_sdk::{FsBackend, FsBackendFilter, open_lix_with_backend};
+
+const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProfileBackend {
-    Sqlite,
-    #[cfg(feature = "rocksdb")]
     RocksDb,
-    #[cfg(feature = "rocksdb")]
-    RocksDbBlob {
-        min_blob_size: u64,
-    },
+    RocksDbBlob { min_blob_size: u64 },
 }
 
 #[derive(Debug)]
@@ -47,10 +43,6 @@ struct ProfileStats {
     corpus_file_count: u64,
     corpus_bytes: u64,
     lix_total_bytes: u64,
-    sqlite_db_bytes: u64,
-    sqlite_wal_bytes: u64,
-    sqlite_shm_bytes: u64,
-    sqlite_other_bytes: u64,
     rocksdb_total_bytes: u64,
     rocksdb_sst_bytes: u64,
     rocksdb_blob_bytes: u64,
@@ -92,31 +84,31 @@ struct BenchFile {
 impl ProfileBackend {
     fn name(self) -> &'static str {
         match self {
-            Self::Sqlite => "sqlite",
-            #[cfg(feature = "rocksdb")]
             Self::RocksDb => "rocksdb",
-            #[cfg(feature = "rocksdb")]
             Self::RocksDbBlob { .. } => "rocksdb-blob",
         }
     }
 
     fn blob_min_size(self) -> Option<u64> {
         match self {
-            #[cfg(feature = "rocksdb")]
             Self::RocksDbBlob { min_blob_size } => Some(min_blob_size),
-            Self::Sqlite => None,
-            #[cfg(feature = "rocksdb")]
             Self::RocksDb => None,
         }
     }
 
     async fn open(self, path: &Path) -> FsBackend {
         match self {
-            Self::Sqlite => FsBackend::open(path).await.unwrap(),
-            #[cfg(feature = "rocksdb")]
-            Self::RocksDb => FsBackend::open_rocksdb(path).await.unwrap(),
-            #[cfg(feature = "rocksdb")]
-            Self::RocksDbBlob { min_blob_size } => FsBackend::open_rocksdb_with_blob_options(
+            Self::RocksDb => FsBackend::open_with_rocksdb_blob_options(
+                path,
+                FsBackendFilter::default(),
+                RocksDbBlobOptions::Disabled,
+            )
+            .await
+            .unwrap(),
+            Self::RocksDbBlob {
+                min_blob_size: DEFAULT_BLOB_MIN_SIZE,
+            } => FsBackend::open(path).await.unwrap(),
+            Self::RocksDbBlob { min_blob_size } => FsBackend::open_with_rocksdb_blob_options(
                 path,
                 FsBackendFilter::default(),
                 RocksDbBlobOptions::Enabled {
@@ -152,7 +144,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn parse_args() -> Args {
     let mut raw = std::env::args().skip(1);
-    let mut backend = ProfileBackend::Sqlite;
+    let mut backend = ProfileBackend::RocksDbBlob {
+        min_blob_size: DEFAULT_BLOB_MIN_SIZE,
+    };
     let mut compact_before_stats = false;
     let mut in_place = false;
     let mut json = false;
@@ -165,44 +159,17 @@ fn parse_args() -> Args {
             "--backend" => {
                 let value = raw.next().expect("--backend requires a value");
                 backend = match value.as_str() {
-                    "sqlite" => ProfileBackend::Sqlite,
-                    "rocksdb" => {
-                        #[cfg(feature = "rocksdb")]
-                        {
-                            ProfileBackend::RocksDb
-                        }
-                        #[cfg(not(feature = "rocksdb"))]
-                        {
-                            panic!("profile_fs_open was built without the rocksdb feature")
-                        }
-                    }
-                    "rocksdb-blob" => {
-                        #[cfg(feature = "rocksdb")]
-                        {
-                            ProfileBackend::RocksDbBlob {
-                                min_blob_size: 64 * 1024,
-                            }
-                        }
-                        #[cfg(not(feature = "rocksdb"))]
-                        {
-                            panic!("profile_fs_open was built without the rocksdb feature")
-                        }
-                    }
+                    "rocksdb" => ProfileBackend::RocksDb,
+                    "rocksdb-blob" => ProfileBackend::RocksDbBlob {
+                        min_blob_size: DEFAULT_BLOB_MIN_SIZE,
+                    },
                     other => panic!("unknown backend '{other}'"),
                 };
             }
             "--blob-min" => {
                 let value = raw.next().expect("--blob-min requires a value");
                 let min_blob_size = parse_size(&value);
-                #[cfg(feature = "rocksdb")]
-                {
-                    backend = ProfileBackend::RocksDbBlob { min_blob_size };
-                }
-                #[cfg(not(feature = "rocksdb"))]
-                {
-                    let _ = min_blob_size;
-                    panic!("profile_fs_open was built without the rocksdb feature")
-                }
+                backend = ProfileBackend::RocksDbBlob { min_blob_size };
             }
             "--compact-before-stats" => compact_before_stats = true,
             "--in-place" => in_place = true,
@@ -226,7 +193,7 @@ fn parse_args() -> Args {
         keep_workspace,
         read_bench,
         src: src.expect(
-            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--read-bench] [--backend sqlite|rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
+            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--read-bench] [--backend rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
         ),
     }
 }
@@ -496,17 +463,11 @@ fn collect_lix_stats(workspace: &Path, stats: &mut ProfileStats) {
     if !lix_dir.exists() {
         return;
     }
-    let internal_dir = lix_dir.join(".internal");
-    let rocksdb_dir = internal_dir.join("rocksdb");
-    collect_lix_stats_recursive(&lix_dir, &internal_dir, &rocksdb_dir, stats);
+    let rocksdb_dir = lix_dir.join(".internal/rocksdb");
+    collect_lix_stats_recursive(&lix_dir, &rocksdb_dir, stats);
 }
 
-fn collect_lix_stats_recursive(
-    dir: &Path,
-    internal_dir: &Path,
-    rocksdb_dir: &Path,
-    stats: &mut ProfileStats,
-) {
+fn collect_lix_stats_recursive(dir: &Path, rocksdb_dir: &Path, stats: &mut ProfileStats) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -515,7 +476,7 @@ fn collect_lix_stats_recursive(
         let path = entry.path();
         let metadata = entry.metadata().unwrap();
         if metadata.is_dir() {
-            collect_lix_stats_recursive(&path, internal_dir, rocksdb_dir, stats);
+            collect_lix_stats_recursive(&path, rocksdb_dir, stats);
             continue;
         }
         if !metadata.is_file() {
@@ -526,18 +487,7 @@ fn collect_lix_stats_recursive(
         stats.lix_total_bytes += bytes;
         if path.strip_prefix(rocksdb_dir).is_ok() {
             classify_rocksdb_file(&path, bytes, stats);
-        } else if path.strip_prefix(internal_dir).is_ok() {
-            classify_sqlite_file(&path, bytes, stats);
         }
-    }
-}
-
-fn classify_sqlite_file(path: &Path, bytes: u64, stats: &mut ProfileStats) {
-    match path.file_name().and_then(|name| name.to_str()) {
-        Some("db.sqlite") => stats.sqlite_db_bytes += bytes,
-        Some("db.sqlite-wal") => stats.sqlite_wal_bytes += bytes,
-        Some("db.sqlite-shm") => stats.sqlite_shm_bytes += bytes,
-        _ => stats.sqlite_other_bytes += bytes,
     }
 }
 
@@ -639,10 +589,6 @@ fn print_result(
                     "\"corpus_file_count\":{},",
                     "\"corpus_bytes\":{},",
                     "\"lix_total_bytes\":{},",
-                    "\"sqlite_db_bytes\":{},",
-                    "\"sqlite_wal_bytes\":{},",
-                    "\"sqlite_shm_bytes\":{},",
-                    "\"sqlite_other_bytes\":{},",
                     "\"rocksdb_total_bytes\":{},",
                     "\"rocksdb_sst_bytes\":{},",
                     "\"rocksdb_blob_bytes\":{},",
@@ -705,10 +651,6 @@ fn print_result(
                 stats.corpus_file_count,
                 stats.corpus_bytes,
                 stats.lix_total_bytes,
-                stats.sqlite_db_bytes,
-                stats.sqlite_wal_bytes,
-                stats.sqlite_shm_bytes,
-                stats.sqlite_other_bytes,
                 stats.rocksdb_total_bytes,
                 stats.rocksdb_sst_bytes,
                 stats.rocksdb_blob_bytes,
@@ -753,10 +695,6 @@ fn print_result(
                     "\"corpus_file_count\":{},",
                     "\"corpus_bytes\":{},",
                     "\"lix_total_bytes\":{},",
-                    "\"sqlite_db_bytes\":{},",
-                    "\"sqlite_wal_bytes\":{},",
-                    "\"sqlite_shm_bytes\":{},",
-                    "\"sqlite_other_bytes\":{},",
                     "\"rocksdb_total_bytes\":{},",
                     "\"rocksdb_sst_bytes\":{},",
                     "\"rocksdb_blob_bytes\":{},",
@@ -799,10 +737,6 @@ fn print_result(
                 stats.corpus_file_count,
                 stats.corpus_bytes,
                 stats.lix_total_bytes,
-                stats.sqlite_db_bytes,
-                stats.sqlite_wal_bytes,
-                stats.sqlite_shm_bytes,
-                stats.sqlite_other_bytes,
                 stats.rocksdb_total_bytes,
                 stats.rocksdb_sst_bytes,
                 stats.rocksdb_blob_bytes,
@@ -904,10 +838,6 @@ fn print_text_stats(stats: &ProfileStats, workspace_path: Option<&Path>) {
     println!("CORPUS_FILE_COUNT={}", stats.corpus_file_count);
     println!("CORPUS_BYTES={}", stats.corpus_bytes);
     println!("LIX_TOTAL_BYTES={}", stats.lix_total_bytes);
-    println!("SQLITE_DB_BYTES={}", stats.sqlite_db_bytes);
-    println!("SQLITE_WAL_BYTES={}", stats.sqlite_wal_bytes);
-    println!("SQLITE_SHM_BYTES={}", stats.sqlite_shm_bytes);
-    println!("SQLITE_OTHER_BYTES={}", stats.sqlite_other_bytes);
     println!("ROCKSDB_TOTAL_BYTES={}", stats.rocksdb_total_bytes);
     println!("ROCKSDB_SST_BYTES={}", stats.rocksdb_sst_bytes);
     println!("ROCKSDB_BLOB_BYTES={}", stats.rocksdb_blob_bytes);

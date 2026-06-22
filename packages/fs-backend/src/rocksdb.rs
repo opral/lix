@@ -12,6 +12,10 @@ use lix_engine::backend::{
 use rocksdb::Snapshot;
 use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
 
+const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
+const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
+const DEFAULT_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RocksDbFilesystemBackendOptions {
     pub path: PathBuf,
@@ -68,22 +72,40 @@ impl RocksDbFilesystemBackendOptions {
         }
     }
 
+    pub fn default_blob(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            blob: RocksDbBlobOptions::default(),
+        }
+    }
+
     pub fn blob(path: impl Into<PathBuf>, min_blob_size: u64) -> Self {
         Self {
             path: path.into(),
             blob: RocksDbBlobOptions::Enabled {
                 min_blob_size,
-                blob_file_size: 256 * 1024 * 1024,
+                blob_file_size: DEFAULT_BLOB_FILE_SIZE,
                 enable_gc: true,
-                gc_age_cutoff: 0.25,
+                gc_age_cutoff: DEFAULT_BLOB_GC_AGE_CUTOFF,
             },
+        }
+    }
+}
+
+impl Default for RocksDbBlobOptions {
+    fn default() -> Self {
+        Self::Enabled {
+            min_blob_size: DEFAULT_BLOB_MIN_SIZE,
+            blob_file_size: DEFAULT_BLOB_FILE_SIZE,
+            enable_gc: true,
+            gc_age_cutoff: DEFAULT_BLOB_GC_AGE_CUTOFF,
         }
     }
 }
 
 impl RocksDbFilesystemBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
-        Self::open_with_options(RocksDbFilesystemBackendOptions::plain(path))
+        Self::open_with_options(RocksDbFilesystemBackendOptions::default_blob(path))
     }
 
     pub fn open_with_options(
@@ -748,7 +770,8 @@ mod tests {
     fn same_process_open_rejects_different_blob_options_for_open_database() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let path = temp_dir.path().join("fs.rocksdb");
-        let _plain = RocksDbFilesystemBackend::open(&path).expect("open plain backend");
+        let _default_blob =
+            RocksDbFilesystemBackend::open(&path).expect("open default blob backend");
 
         let error = match RocksDbFilesystemBackend::open_with_options(
             RocksDbFilesystemBackendOptions::blob(&path, 16),

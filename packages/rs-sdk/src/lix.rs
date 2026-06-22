@@ -200,6 +200,26 @@ where
     }
 }
 
+#[cfg(feature = "rocksdb")]
+pub(crate) async fn open_or_initialize_filesystem_engine<B>(
+    backend: B,
+    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+) -> Result<Engine<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    match new_engine(backend.clone(), wasm_runtime.clone()).await {
+        Ok(engine) => Ok(engine),
+        Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
+            Engine::initialize(backend.clone()).await?;
+            new_engine(backend, wasm_runtime).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn new_engine<B>(
     backend: B,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
