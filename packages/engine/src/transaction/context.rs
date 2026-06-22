@@ -847,6 +847,7 @@ where
                 staged,
                 staged_writes,
                 plugin_host,
+                mounted_filesystem: self.storage.mounted_filesystem(),
             };
             let result = crate::sql2::execute_transaction_read_statement_from_parsed(
                 &read_ctx, self, sql, statement, params,
@@ -986,6 +987,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageB
     staged: crate::transaction::staging::PreparedStateRowOverlay,
     staged_writes: Arc<TransactionWriteBuffer>,
     plugin_host: PluginRuntimeHost,
+    mounted_filesystem: Option<Arc<dyn crate::backend::BackendMountedFilesystem>>,
 }
 
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
@@ -1043,6 +1045,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::backend::BackendMountedFilesystem>> {
+        self.mounted_filesystem.clone()
     }
 }
 
@@ -1316,6 +1322,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::backend::BackendMountedFilesystem>> {
+        self.storage.mounted_filesystem()
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {

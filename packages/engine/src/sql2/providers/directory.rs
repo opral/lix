@@ -21,6 +21,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
 
+use crate::backend::BackendMountedFilesystem;
 use crate::branch::BranchRefReader;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
@@ -47,8 +48,8 @@ use crate::filesystem::{
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, VisibleFilesystem,
     create_directory_path_with_leaf_id_with_resolvers, derive_directory_paths,
     directory_descriptor_write_row, directory_path_resolvers_from_live_state,
-    filesystem_storage_scope_key, plan_parsed_directory_path_update_with_resolvers,
-    plan_recursive_directory_delete,
+    filesystem_storage_scope_key, mounted_workspace_rows,
+    plan_parsed_directory_path_update_with_resolvers, plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{
@@ -80,6 +81,7 @@ pub(super) async fn register_lix_directory_active_provider(
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
+    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     register_spec_table(
@@ -89,6 +91,7 @@ pub(super) async fn register_lix_directory_active_provider(
             active_branch_id,
             live_state,
             branch_ref,
+            mounted_filesystem,
             functions,
         )),
         WriteAccess::read_only(),
@@ -146,6 +149,7 @@ pub(super) async fn register_active_write_provider(
             active_branch_id,
             live_state,
             branch_ref,
+            None,
             functions,
         )),
         WriteAccess::write(write_ctx),
@@ -158,6 +162,7 @@ struct LixDirectorySpec {
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
+    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
 }
 
 impl LixDirectorySpec {
@@ -165,6 +170,7 @@ impl LixDirectorySpec {
         active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
+        mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -173,6 +179,7 @@ impl LixDirectorySpec {
             branch_ref,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
+            mounted_filesystem,
         }
     }
 
@@ -187,6 +194,7 @@ impl LixDirectorySpec {
             branch_ref,
             functions,
             branch_binding: BranchBinding::explicit(),
+            mounted_filesystem: None,
         }
     }
 
@@ -290,6 +298,7 @@ impl TableSpec for LixDirectorySpec {
                     Arc::clone(&self.live_state),
                     Arc::clone(&self.schema),
                     output_schema,
+                    self.mounted_filesystem.clone(),
                     projection.cloned(),
                     request,
                     physical_filters,
@@ -299,6 +308,7 @@ impl TableSpec for LixDirectorySpec {
                     live_state,
                     batch_schema,
                     _output_schema,
+                    mounted_filesystem,
                     projection,
                     request,
                     physical_filters,
@@ -309,12 +319,27 @@ impl TableSpec for LixDirectorySpec {
                             "sql2 lix_directory scan failed: {error}"
                         ))
                     })?;
-                    let batch =
-                        lix_directory_record_batch(&batch_schema, rows).map_err(|error| {
+                    let mounted_rows = mounted_workspace_rows(
+                        request
+                            .filter
+                            .branch_ids
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                        mounted_filesystem,
+                        &rows,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    let mut visible_rows = rows;
+                    visible_rows.extend(mounted_rows.rows);
+                    let batch = lix_directory_record_batch(&batch_schema, visible_rows).map_err(
+                        |error| {
                             DataFusionError::Execution(format!(
                                 "sql2 lix_directory batch build failed: {error}"
                             ))
-                        })?;
+                        },
+                    )?;
                     finish_scan_batch(
                         batch,
                         &physical_filters,
@@ -1671,6 +1696,7 @@ mod tests {
                 write_ctx.active_branch_id(),
                 live_state,
                 branch_ref,
+                None,
                 test_functions(),
             ),
             BranchBinding::Explicit => {
@@ -2200,6 +2226,7 @@ mod tests {
                 write_ctx.active_branch_id(),
                 live_state,
                 branch_ref,
+                None,
                 test_functions(),
             )),
             WriteAccess::write(write_ctx),

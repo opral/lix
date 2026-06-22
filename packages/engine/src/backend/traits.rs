@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -46,7 +47,20 @@ pub trait Backend {
 
 #[async_trait]
 pub trait BackendMountedFilesystem: Send + Sync {
+    /// Returns one best-effort mounted filesystem inventory snapshot.
+    ///
+    /// Mounted filesystems are external system state. Implementations do not
+    /// promise snapshot isolation between inventory and file-data reads.
+    async fn inventory(&self) -> Result<MountedFilesystemInventory, BackendError>;
+
     async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MountedFilesystemInventory {
+    pub directories: BTreeSet<String>,
+    pub files: BTreeSet<String>,
+    pub revision: u64,
 }
 
 pub trait BackendRead {

@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
+use crate::backend::BackendMountedFilesystem;
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
@@ -57,6 +58,9 @@ pub(crate) trait SqlExecutionContext {
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+        None
+    }
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
@@ -76,6 +80,9 @@ pub(crate) trait SqlWriteExecutionContext {
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
+    }
+    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+        None
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
@@ -140,6 +147,10 @@ impl SqlWriteContext {
 
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
         unsafe { self.ptr.0.as_ref().plugin_host() }
+    }
+
+    pub(crate) fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+        unsafe { self.ptr.0.as_ref().mounted_filesystem() }
     }
 
     pub(crate) async fn scan_live_state(

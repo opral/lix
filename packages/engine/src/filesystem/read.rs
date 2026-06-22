@@ -154,6 +154,10 @@ impl FilesystemIndex {
             _ => None,
         }
     }
+
+    pub(crate) fn contains_path(&self, path: &str) -> bool {
+        self.entries_by_path.contains_key(path)
+    }
 }
 
 pub(crate) fn filesystem_schema_keys() -> Vec<String> {

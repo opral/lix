@@ -30,11 +30,12 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
 
+use crate::backend::BackendMountedFilesystem;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
+use crate::filesystem::{FilesystemIndex, filesystem_schema_keys, mounted_workspace_rows};
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
     LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -102,6 +103,7 @@ pub(super) async fn register_lix_file_active_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
@@ -113,6 +115,7 @@ pub(super) async fn register_lix_file_active_provider(
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
         )),
@@ -186,6 +189,7 @@ struct LixFileSpec {
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
     missing_data_policy: MissingFileDataPolicy,
+    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
     options: SqlWriteSessionOptions,
 }
 
@@ -201,6 +205,7 @@ impl LixFileSpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
@@ -213,6 +218,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             missing_data_policy: MissingFileDataPolicy::RequestHydration,
+            mounted_filesystem,
             options: SqlWriteSessionOptions::default(),
         }
     }
@@ -227,6 +233,7 @@ impl LixFileSpec {
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
+        let mounted_filesystem = write_ctx.mounted_filesystem();
         Self {
             schema: lix_file_schema(),
             live_state,
@@ -236,6 +243,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             missing_data_policy: MissingFileDataPolicy::Unresolved,
+            mounted_filesystem,
             options,
         }
     }
@@ -256,6 +264,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             missing_data_policy: MissingFileDataPolicy::Unresolved,
+            mounted_filesystem: None,
             options: SqlWriteSessionOptions::default(),
         }
     }
@@ -275,6 +284,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             missing_data_policy: MissingFileDataPolicy::Unresolved,
+            mounted_filesystem: None,
             options,
         }
     }
@@ -330,9 +340,11 @@ impl LixFileSpec {
                 lix_file_record_batch(
                     &table_schema,
                     &blob_reader,
+                    None,
                     plugin_render,
                     needs_data,
                     missing_data_policy,
+                    None,
                     None,
                     rows,
                 )
@@ -411,6 +423,7 @@ impl TableSpec for LixFileSpec {
                     self.plugin_host.clone(),
                     Arc::clone(&self.schema),
                     self.missing_data_policy,
+                    self.mounted_filesystem.clone(),
                     projection.cloned(),
                     request,
                     target_file_ids,
@@ -424,6 +437,7 @@ impl TableSpec for LixFileSpec {
                     plugin_host,
                     batch_schema,
                     missing_data_policy,
+                    mounted_filesystem,
                     projection,
                     request,
                     target_file_ids,
@@ -440,6 +454,20 @@ impl TableSpec for LixFileSpec {
                     .map_err(|error| {
                         DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                     })?;
+                    let mounted_rows = mounted_workspace_rows(
+                        request
+                            .filter
+                            .branch_ids
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                        mounted_filesystem.clone(),
+                        &rows,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    let mut visible_rows = rows.clone();
+                    visible_rows.extend(mounted_rows.rows.clone());
                     let can_prefilter_without_data = needs_data
                         && !filters.is_empty()
                         && filters
@@ -450,10 +478,12 @@ impl TableSpec for LixFileSpec {
                             &batch_schema,
                             &blob_reader,
                             None,
+                            None,
                             false,
                             MissingFileDataPolicy::Unresolved,
                             None,
-                            rows.clone(),
+                            None,
+                            visible_rows.clone(),
                         )
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
@@ -485,11 +515,13 @@ impl TableSpec for LixFileSpec {
                     let batch = lix_file_record_batch(
                         &batch_schema,
                         &blob_reader,
+                        mounted_filesystem,
                         plugin_render,
                         needs_data,
                         missing_data_policy,
                         selected_file_keys.as_ref(),
-                        rows,
+                        Some(&mounted_rows.file_paths_by_id),
+                        visible_rows,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -894,9 +926,11 @@ impl UpsertSupport for LixFileSpec {
         lix_file_record_batch(
             &self.schema,
             &self.blob_reader,
+            None,
             plugin_render,
             true,
             MissingFileDataPolicy::Unresolved,
+            None,
             None,
             rows,
         )
@@ -2353,10 +2387,12 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
     plugin_render: Option<PluginRenderContext>,
     load_data: bool,
     missing_data_policy: MissingFileDataPolicy,
     selected_file_keys: Option<&BTreeSet<FilesystemDescriptorKey>>,
+    mounted_file_paths_by_id: Option<&BTreeMap<String, String>>,
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
@@ -2502,6 +2538,34 @@ async fn lix_file_record_batch(
                     match rendered {
                         Some(data) => Some(data),
                         None => match missing_data_policy {
+                            _ if mounted_file_paths_by_id
+                                .and_then(|paths| paths.get(&file.id))
+                                .is_some() =>
+                            {
+                                let mounted_path = mounted_file_paths_by_id
+                                    .and_then(|paths| paths.get(&file.id))
+                                    .expect("mounted file path checked above");
+                                let mounted_filesystem =
+                                    mounted_filesystem.as_ref().ok_or_else(|| {
+                                        crate::sql2::file_data_unresolved_error(mounted_path)
+                                    })?;
+                                Some(
+                                    mounted_filesystem
+                                        .read_file_data(mounted_path)
+                                        .await
+                                        .map_err(|error| {
+                                            LixError::new(
+                                                LixError::CODE_STORAGE_ERROR,
+                                                format!(
+                                                    "mounted filesystem data read failed for path {mounted_path:?}: {error}"
+                                                ),
+                                            )
+                                        })?
+                                        .ok_or_else(|| {
+                                            crate::sql2::file_data_unresolved_error(mounted_path)
+                                        })?,
+                                )
+                            }
                             MissingFileDataPolicy::Unresolved => {
                                 return Err(crate::sql2::file_data_unresolved_error(&path));
                             }
@@ -4165,8 +4229,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::Unresolved,
+            None,
             None,
             vec![live_file_row(
                 "file-readme",
@@ -4199,8 +4265,10 @@ mod tests {
             &schema,
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::Unresolved,
+            None,
             None,
             vec![
                 live_file_row(
@@ -4246,8 +4314,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             false,
             super::MissingFileDataPolicy::Unresolved,
+            None,
             None,
             vec![
                 live_file_row(
@@ -4279,8 +4349,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::RequestHydration,
+            None,
             None,
             vec![scoped_file],
         )
@@ -4306,8 +4378,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::Unresolved,
+            None,
             None,
             vec![
                 live_file_row(
@@ -4348,8 +4422,10 @@ mod tests {
             &schema,
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::RequestHydration,
+            None,
             None,
             vec![live_file_row(
                 "file-note",
@@ -4370,8 +4446,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::RequestHydration,
+            None,
             None,
             vec![live_file_row(
                 "file-note",
@@ -4395,8 +4473,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::RequestHydration,
+            None,
             None,
             vec![
                 live_file_row(
@@ -4425,8 +4505,10 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             super::MissingFileDataPolicy::Unresolved,
+            None,
             None,
             vec![live_file_row(
                 "file-note",

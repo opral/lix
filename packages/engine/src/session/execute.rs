@@ -489,6 +489,7 @@ where
                 visible_schemas,
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
+                mounted_filesystem: self.storage.mounted_filesystem(),
             };
             let mut results = Vec::with_capacity(statements.len());
             for ((sql, params), statement) in statements.iter().zip(parsed) {
@@ -606,6 +607,7 @@ where
             visible_schemas,
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
+            mounted_filesystem: self.storage.mounted_filesystem(),
         };
 
         let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;

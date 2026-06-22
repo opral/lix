@@ -141,6 +141,7 @@ where
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
+                    ctx.mounted_filesystem(),
                     ctx.plugin_host(),
                     ctx.functions(),
                 )
@@ -176,6 +177,7 @@ where
                     ctx.active_branch_id(),
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
+                    ctx.mounted_filesystem(),
                     ctx.functions(),
                 )
                 .await?;
