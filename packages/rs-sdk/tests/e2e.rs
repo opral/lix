@@ -1,9 +1,11 @@
+#[cfg(feature = "sqlite")]
+use lix_sdk::SqliteBackend;
 use lix_sdk::{
     Backend, CreateBranchOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
-#[cfg(feature = "sqlite")]
-use lix_sdk::{FsBackend, SqliteBackend, open_lix_with_backend};
+#[cfg(any(feature = "sqlite", feature = "rocksdb"))]
+use lix_sdk::{FsBackend, open_lix_with_backend};
 #[cfg(feature = "sqlite")]
 use std::path::Path;
 #[cfg(feature = "sqlite")]
@@ -462,6 +464,43 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
 async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     let backend = FsBackend::open(path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
+}
+
+#[tokio::test]
+#[cfg(feature = "rocksdb")]
+async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let backend_a = FsBackend::open_rocksdb(tempdir.path())
+        .await
+        .expect("first rocksdb fs backend opens");
+    let backend_b = FsBackend::open_rocksdb(tempdir.path())
+        .await
+        .expect("second rocksdb fs backend reuses process-local DB");
+    let lix_a = open_lix_with_backend(backend_a)
+        .await
+        .expect("first lix opens");
+    let lix_b = open_lix_with_backend(backend_b)
+        .await
+        .expect("second lix opens");
+
+    write_file(&lix_a, "/from-a.txt", b"a".to_vec())
+        .await
+        .expect("first lix writes");
+    assert_eq!(
+        read_file(&lix_b, "/from-a.txt").await.unwrap().as_deref(),
+        Some(b"a".as_slice())
+    );
+
+    write_file(&lix_b, "/from-b.txt", b"b".to_vec())
+        .await
+        .expect("second lix writes");
+    assert_eq!(
+        read_file(&lix_a, "/from-b.txt").await.unwrap().as_deref(),
+        Some(b"b".as_slice())
+    );
+
+    lix_a.close().await.unwrap();
+    lix_b.close().await.unwrap();
 }
 
 async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>

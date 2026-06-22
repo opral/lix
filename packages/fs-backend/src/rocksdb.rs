@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
 use lix_engine::backend::{
@@ -31,8 +32,15 @@ pub enum RocksDbBlobOptions {
 #[derive(Clone)]
 #[allow(missing_debug_implementations)]
 pub struct RocksDbFilesystemBackend {
+    inner: Arc<RocksDbFilesystemInner>,
+}
+
+#[allow(missing_debug_implementations)]
+struct RocksDbFilesystemInner {
     path: PathBuf,
-    db: Arc<DB>,
+    blob: RocksDbBlobOptions,
+    db: DB,
+    write_gate: WriteGate,
 }
 
 #[allow(missing_debug_implementations)]
@@ -42,11 +50,15 @@ pub struct RocksDbFilesystemRead<'a> {
 
 #[allow(missing_debug_implementations)]
 pub struct RocksDbFilesystemWrite {
-    db: Arc<DB>,
+    inner: Arc<RocksDbFilesystemInner>,
+    _writer_permit: WriterPermit,
     batch: WriteBatch,
     staged_put_keys: Vec<Key>,
     stats: WriteStats,
 }
+
+static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<RocksDbFilesystemInner>>>> =
+    OnceLock::new();
 
 impl RocksDbFilesystemBackendOptions {
     pub fn plain(path: impl Into<PathBuf>) -> Self {
@@ -77,24 +89,22 @@ impl RocksDbFilesystemBackend {
     pub fn open_with_options(
         options: RocksDbFilesystemBackendOptions,
     ) -> Result<Self, BackendError> {
-        let db = Arc::new(open_rocksdb(&options)?);
         Ok(Self {
-            path: options.path,
-            db,
+            inner: open_shared_rocksdb(options)?,
         })
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
     pub fn flush(&self) -> Result<(), BackendError> {
-        self.db.flush().map_err(rocksdb_error)
+        self.inner.db.flush().map_err(rocksdb_error)
     }
 
     pub fn compact_all(&self) -> Result<(), BackendError> {
         self.flush()?;
-        self.db.compact_range::<&[u8], &[u8]>(None, None);
+        self.inner.db.compact_range::<&[u8], &[u8]>(None, None);
         self.flush()
     }
 }
@@ -112,13 +122,15 @@ impl Backend for RocksDbFilesystemBackend {
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(RocksDbFilesystemRead {
-            snapshot: self.db.snapshot(),
+            snapshot: self.inner.db.snapshot(),
         })
     }
 
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        let writer_permit = self.inner.write_gate.acquire()?;
         Ok(RocksDbFilesystemWrite {
-            db: Arc::clone(&self.db),
+            inner: Arc::clone(&self.inner),
+            _writer_permit: writer_permit,
             batch: WriteBatch::default(),
             staged_put_keys: Vec::new(),
             stats: WriteStats::default(),
@@ -249,6 +261,7 @@ impl BackendWrite for RocksDbFilesystemWrite {
         } else {
             let bounds = EncodedBounds::new(range, None);
             for item in self
+                .inner
                 .db
                 .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
             {
@@ -276,7 +289,7 @@ impl BackendWrite for RocksDbFilesystemWrite {
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
-        self.db.write(self.batch).map_err(rocksdb_error)?;
+        self.inner.db.write(self.batch).map_err(rocksdb_error)?;
         Ok(CommitResult {
             commit_id: None,
             stats: self.stats,
@@ -286,6 +299,81 @@ impl BackendWrite for RocksDbFilesystemWrite {
     fn rollback(self) -> Result<(), BackendError> {
         Ok(())
     }
+}
+
+fn open_shared_rocksdb(
+    options: RocksDbFilesystemBackendOptions,
+) -> Result<Arc<RocksDbFilesystemInner>, BackendError> {
+    let path = registry_key(&options.path)?;
+    let registry = OPEN_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut open_databases = registry
+        .lock()
+        .map_err(|error| BackendError::Io(format!("rocksdb registry lock poisoned: {error}")))?;
+
+    if let Some(existing) = open_databases.get(&path) {
+        if let Some(inner) = existing.upgrade() {
+            if inner.blob != options.blob {
+                return Err(BackendError::Io(format!(
+                    "rocksdb filesystem backend at {} is already open with different options",
+                    path.display()
+                )));
+            }
+            return Ok(inner);
+        }
+    }
+
+    let open_options = RocksDbFilesystemBackendOptions {
+        path: path.clone(),
+        blob: options.blob,
+    };
+    let db = open_rocksdb(&open_options)?;
+    let inner = Arc::new(RocksDbFilesystemInner {
+        path: path.clone(),
+        blob: options.blob,
+        db,
+        write_gate: WriteGate::new(),
+    });
+    open_databases.insert(path, Arc::downgrade(&inner));
+    Ok(inner)
+}
+
+fn registry_key(path: &Path) -> Result<PathBuf, BackendError> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| BackendError::Io(format!("read current directory: {error}")))?
+            .join(path)
+    };
+
+    if absolute_path.exists() {
+        return std::fs::canonicalize(&absolute_path).map_err(|error| {
+            BackendError::Io(format!(
+                "canonicalize rocksdb filesystem backend path {}: {error}",
+                absolute_path.display()
+            ))
+        });
+    }
+
+    let parent = absolute_path.parent().ok_or_else(|| {
+        BackendError::Io(format!(
+            "rocksdb filesystem backend path has no parent: {}",
+            absolute_path.display()
+        ))
+    })?;
+    let file_name = absolute_path.file_name().ok_or_else(|| {
+        BackendError::Io(format!(
+            "rocksdb filesystem backend path has no final component: {}",
+            absolute_path.display()
+        ))
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        BackendError::Io(format!(
+            "canonicalize rocksdb filesystem backend parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(canonical_parent.join(file_name))
 }
 
 fn open_rocksdb(options: &RocksDbFilesystemBackendOptions) -> Result<DB, BackendError> {
@@ -308,7 +396,8 @@ fn open_rocksdb(options: &RocksDbFilesystemBackendOptions) -> Result<DB, Backend
             db_options.set_blob_gc_age_cutoff(gc_age_cutoff);
         }
     }
-    DB::open(&db_options, &options.path).map_err(rocksdb_error)
+    DB::open(&db_options, &options.path)
+        .map_err(|error| rocksdb_open_error(error, options.path.as_path()))
 }
 
 fn physical_key(space: SpaceId, key: &Key) -> Key {
@@ -471,6 +560,70 @@ fn rocksdb_error(error: rocksdb::Error) -> BackendError {
     BackendError::Io(format!("rocksdb filesystem backend: {error}"))
 }
 
+fn rocksdb_open_error(error: rocksdb::Error, path: &Path) -> BackendError {
+    let message = error.to_string();
+    if message.to_ascii_lowercase().contains("lock") {
+        BackendError::Io(format!(
+            "rocksdb filesystem backend at {} is already open by another process: {message}",
+            path.display()
+        ))
+    } else {
+        BackendError::Io(format!(
+            "rocksdb filesystem backend failed to open {}: {message}",
+            path.display()
+        ))
+    }
+}
+
+#[derive(Default)]
+#[allow(missing_debug_implementations)]
+struct WriteGate {
+    state: Arc<WriteGateState>,
+}
+
+#[derive(Default)]
+#[allow(missing_debug_implementations)]
+struct WriteGateState {
+    active: Mutex<bool>,
+    available: Condvar,
+}
+
+#[allow(missing_debug_implementations)]
+struct WriterPermit {
+    state: Arc<WriteGateState>,
+}
+
+impl WriteGate {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn acquire(&self) -> Result<WriterPermit, BackendError> {
+        let mut active =
+            self.state.active.lock().map_err(|error| {
+                BackendError::Io(format!("rocksdb writer gate poisoned: {error}"))
+            })?;
+        while *active {
+            active = self.state.available.wait(active).map_err(|error| {
+                BackendError::Io(format!("rocksdb writer gate poisoned: {error}"))
+            })?;
+        }
+        *active = true;
+        Ok(WriterPermit {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+impl Drop for WriterPermit {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active.lock() {
+            *active = false;
+            self.state.available.notify_one();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -478,6 +631,10 @@ mod tests {
         Backend, BackendWrite, Key, PutBatch, PutEntry, ReadOptions, SpaceId, StoredValue,
         WriteOptions, get_many,
     };
+    use std::env;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::{RocksDbFilesystemBackend, RocksDbFilesystemBackendOptions};
 
@@ -526,11 +683,166 @@ mod tests {
     }
 
     #[test]
+    fn same_process_open_reuses_shared_database_handle() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("fs.rocksdb");
+        let key_a = Key(Bytes::from_static(b"from-a"));
+        let key_b = Key(Bytes::from_static(b"from-b"));
+        let space = SpaceId(0x0005_0003);
+
+        let backend_a = RocksDbFilesystemBackend::open(&path).expect("open first backend");
+        let backend_b = RocksDbFilesystemBackend::open(&path).expect("open second backend");
+
+        put_one(&backend_a, space, key_a.clone(), Bytes::from_static(b"a"));
+        assert_eq!(
+            read_one(&backend_b, space, key_a.clone()),
+            Some(Bytes::from_static(b"a"))
+        );
+
+        put_one(&backend_b, space, key_b.clone(), Bytes::from_static(b"b"));
+        assert_eq!(
+            read_one(&backend_a, space, key_b.clone()),
+            Some(Bytes::from_static(b"b"))
+        );
+    }
+
+    #[test]
+    fn same_process_writes_are_serialized_across_reopened_handles() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("fs.rocksdb");
+        let backend_a = RocksDbFilesystemBackend::open(&path).expect("open first backend");
+        let backend_b = RocksDbFilesystemBackend::open(&path).expect("open second backend");
+        let write_a = backend_a
+            .begin_write(WriteOptions::default())
+            .expect("begin first write");
+
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            attempt_tx.send(()).expect("signal write attempt");
+            let write_b = backend_b
+                .begin_write(WriteOptions::default())
+                .expect("begin second write");
+            acquired_tx.send(()).expect("signal write acquired");
+            write_b.rollback().expect("rollback second write");
+        });
+
+        attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second write should be attempted");
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "second write should wait while the first write is active"
+        );
+
+        write_a.rollback().expect("rollback first write");
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second write should acquire after first write closes");
+        waiter.join().expect("writer thread should finish");
+    }
+
+    #[test]
+    fn same_process_open_rejects_different_blob_options_for_open_database() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("fs.rocksdb");
+        let _plain = RocksDbFilesystemBackend::open(&path).expect("open plain backend");
+
+        let error = match RocksDbFilesystemBackend::open_with_options(
+            RocksDbFilesystemBackendOptions::blob(&path, 16),
+        ) {
+            Ok(_) => panic!("second open with different options should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("already open with different options"),
+            "error should explain option mismatch: {error}"
+        );
+    }
+
+    #[test]
+    fn cross_process_open_reports_locked_database() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("fs.rocksdb");
+        let _backend = RocksDbFilesystemBackend::open(&path).expect("open parent backend");
+        let test_binary = env::current_exe().expect("current test binary path should resolve");
+
+        let output = Command::new(test_binary)
+            .arg("--exact")
+            .arg("rocksdb::tests::cross_process_open_helper")
+            .arg("--nocapture")
+            .env("LIX_ROCKSDB_LOCK_HELPER_PATH", &path)
+            .output()
+            .expect("spawn rocksdb lock helper");
+
+        assert!(
+            output.status.success(),
+            "helper should observe locked RocksDB database\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn cross_process_open_helper() {
+        let Some(path) = env::var_os("LIX_ROCKSDB_LOCK_HELPER_PATH") else {
+            return;
+        };
+
+        let error = match RocksDbFilesystemBackend::open(path) {
+            Ok(_) => panic!("child process should not open RocksDB while parent holds the DB lock"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("already open by another process"),
+            "lock error should be mapped clearly: {error}"
+        );
+    }
+
+    #[test]
     fn blob_options_open() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let options = RocksDbFilesystemBackendOptions::blob(temp_dir.path().join("fs.rocksdb"), 16);
         let backend =
             RocksDbFilesystemBackend::open_with_options(options).expect("open blob backend");
         backend.flush().expect("flush blob backend");
+    }
+
+    fn put_one(backend: &RocksDbFilesystemBackend, space: SpaceId, key: Key, value: Bytes) {
+        let mut write = backend
+            .begin_write(WriteOptions::default())
+            .expect("begin write");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key,
+                        value: StoredValue { bytes: value },
+                    }],
+                },
+            )
+            .expect("put one row");
+        write.commit().expect("commit write");
+    }
+
+    fn read_one(backend: &RocksDbFilesystemBackend, space: SpaceId, key: Key) -> Option<Bytes> {
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let result = get_many(&read, space, &[key], Default::default()).expect("read one row");
+        result.values[0].clone().map(|value| match value {
+            lix_engine::backend::ProjectedValue::FullValue(bytes) => bytes,
+            lix_engine::backend::ProjectedValue::KeyOnly => Bytes::new(),
+        })
     }
 }

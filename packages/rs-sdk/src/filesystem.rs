@@ -267,6 +267,7 @@ impl FsBackend {
         Self::open_with_filter(dir, FsBackendFilter::default()).await
     }
 
+    #[cfg(feature = "sqlite")]
     pub async fn open_with_filter<P>(dir: P, filter: FsBackendFilter) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
