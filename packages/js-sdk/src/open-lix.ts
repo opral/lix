@@ -27,21 +27,21 @@ type NativeObserveEvent = {
 type NativeParam = ReturnType<typeof toNativeValue>;
 
 type NativeLix = {
-	execute(sql: string, params: NativeParam[]): NativeExecuteResult;
-	observe(sql: string, params: NativeParam[]): NativeObserveEvents;
-	beginTransaction(): NativeLixTransaction;
-	activeBranchId(): string;
-	createBranch(options: CreateBranchOptions): CreateBranchReceipt;
-	switchBranch(options: SwitchBranchOptions): SwitchBranchReceipt;
-	mergeBranchPreview(options: MergeBranchOptions): MergeBranchPreview;
-	mergeBranch(options: MergeBranchOptions): MergeBranchReceipt;
-	close(): void;
+	execute(sql: string, params: NativeParam[]): Promise<NativeExecuteResult>;
+	observe(sql: string, params: NativeParam[]): Promise<NativeObserveEvents>;
+	beginTransaction(): Promise<NativeLixTransaction>;
+	activeBranchId(): Promise<string>;
+	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
+	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
+	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
+	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
+	close(): Promise<void>;
 };
 
 type NativeLixTransaction = {
-	execute(sql: string, params: NativeParam[]): NativeExecuteResult;
-	commit(): void;
-	rollback(): void;
+	execute(sql: string, params: NativeParam[]): Promise<NativeExecuteResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 };
 
 type NativeObserveEvents = {
@@ -122,10 +122,10 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		throw new TypeError("openLix() options must be an object");
 	}
 	if (options.backend === undefined) {
-		return new Lix(addon.Lix.openMemory());
+		return new Lix(await addon.Lix.openMemory());
 	}
 	if (options.backend instanceof SqliteBackend) {
-		return new Lix(addon.Lix.openSqlite(options.backend.path));
+		return new Lix(await addon.Lix.openSqlite(options.backend.path));
 	}
 	if (options.backend instanceof FsBackend) {
 		return new Lix(
@@ -147,7 +147,7 @@ export class Lix {
 	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
 		assertExecuteArgs("lix", sql, params);
 		return wrapExecuteResult(
-			this.native.execute(
+			await this.native.execute(
 				sql,
 				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
@@ -169,7 +169,7 @@ export class Lix {
 	}
 
 	async beginTransaction(): Promise<LixTransaction> {
-		return new LixTransaction(this.native.beginTransaction());
+		return new LixTransaction(await this.native.beginTransaction());
 	}
 
 	async activeBranchId(): Promise<string> {
@@ -191,11 +191,11 @@ export class Lix {
 	async mergeBranchPreview(
 		options: MergeBranchOptions,
 	): Promise<MergeBranchPreview> {
-		return normalizeOptionals(this.native.mergeBranchPreview(options));
+		return normalizeOptionals(await this.native.mergeBranchPreview(options));
 	}
 
 	async mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt> {
-		const receipt = normalizeOptionals(this.native.mergeBranch(options));
+		const receipt = normalizeOptionals(await this.native.mergeBranch(options));
 		receipt.createdMergeCommitId ??= null;
 		return receipt;
 	}
@@ -206,10 +206,22 @@ export class Lix {
 }
 
 export class ObserveEvents {
-	constructor(private readonly native: NativeObserveEvents) {}
+	private setupError: unknown;
+	private readonly native: Promise<NativeObserveEvents | undefined>;
+
+	constructor(native: Promise<NativeObserveEvents>) {
+		this.native = native.catch((error: unknown) => {
+			this.setupError = error;
+			return undefined;
+		});
+	}
 
 	async next(): Promise<ObserveEvent | undefined> {
-		const event = await this.native.next();
+		const native = await this.native;
+		if (native === undefined) {
+			throw this.setupError;
+		}
+		const event = await native.next();
 		if (event == null) {
 			return undefined;
 		}
@@ -221,7 +233,7 @@ export class ObserveEvents {
 	}
 
 	close(): void {
-		this.native.close();
+		void this.native.then((native) => native?.close());
 	}
 }
 
@@ -231,7 +243,7 @@ export class LixTransaction {
 	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
 		assertExecuteArgs("lixTransaction", sql, params);
 		return wrapExecuteResult(
-			this.native.execute(
+			await this.native.execute(
 				sql,
 				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),

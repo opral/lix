@@ -293,7 +293,78 @@ test("native fs open returns a promise", async () => {
 	const native = addon.Lix.openFs(dir, "memory", undefined);
 	expect(native).toBeInstanceOf(Promise);
 	const lix = await native;
-	lix.close();
+	await lix.close();
+});
+
+test("native awaited APIs return promises", async () => {
+	const opened = addon.Lix.openMemory();
+	expect(opened).toBeInstanceOf(Promise);
+	const lix = await opened;
+
+	const execute = lix.execute("SELECT 1 AS ok", []);
+	expect(execute).toBeInstanceOf(Promise);
+	expect((await execute).rows).toHaveLength(1);
+
+	const activeBranchId = lix.activeBranchId();
+	expect(activeBranchId).toBeInstanceOf(Promise);
+	expect(await activeBranchId).toEqual(expect.any(String));
+
+	const transaction = lix.beginTransaction();
+	expect(transaction).toBeInstanceOf(Promise);
+	const tx = await transaction;
+
+	const txExecute = tx.execute("SELECT 2 AS ok", []);
+	expect(txExecute).toBeInstanceOf(Promise);
+	expect((await txExecute).rows).toHaveLength(1);
+
+	const rollback = tx.rollback();
+	expect(rollback).toBeInstanceOf(Promise);
+	await rollback;
+
+	const close = lix.close();
+	expect(close).toBeInstanceOf(Promise);
+	await close;
+});
+
+test("native actor preserves queued execution order", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const first = lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		["queued-1", "Queued 1", false, "{}"],
+	);
+	const second = lix.execute(
+		"UPDATE crm_task SET title = $1 WHERE id = $2",
+		["Queued 2", "queued-1"],
+	);
+	const third = lix.execute("SELECT title FROM crm_task WHERE id = $1", [
+		"queued-1",
+	]);
+
+	await first;
+	await second;
+	expect(get(await third, "title")).toBe("Queued 2");
+	await lix.close();
+});
+
+test("native actor settles commands queued behind close", async () => {
+	const lix = await openLix();
+
+	const firstClose = lix.close();
+	const readAfterClose = lix.execute("SELECT 1 AS ok");
+	const secondClose = lix.close();
+
+	const settled = await settlesWithin(
+		Promise.allSettled([firstClose, readAfterClose, secondClose]),
+		1000,
+	);
+	expect(settled[0].status).toBe("fulfilled");
+	expect(settled[1]).toMatchObject({
+		status: "rejected",
+		reason: { code: "LIX_ERROR_CLOSED" },
+	});
+	expect(settled[2].status).toBe("fulfilled");
 });
 
 test("fs backend imports local files and materializes lix_file writes", async () => {
@@ -1565,6 +1636,10 @@ async function withTimeout<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
 			clearTimeout(timeout);
 		}
 	}
+}
+
+async function settlesWithin<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
+	return withTimeout(promise, ms);
 }
 
 async function waitFor<T>(
