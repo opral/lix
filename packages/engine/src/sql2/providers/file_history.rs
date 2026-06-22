@@ -1318,7 +1318,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        Field::new("data", DataType::Binary, true),
+        Field::new("data", DataType::LargeBinary, true),
         json_field(HISTORY_COL_ENTITY_PK, false),
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),

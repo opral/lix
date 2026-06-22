@@ -988,7 +988,7 @@ fn scalar_from_bound_literal(literal: &BoundLiteral) -> Result<ScalarValue, LixE
         BoundLiteral::Integer(value) => ScalarValue::Int64(Some(*value)),
         BoundLiteral::Text(value) => ScalarValue::Utf8(Some(value.clone())),
         BoundLiteral::Json(value) => ScalarValue::Utf8(Some(value.to_string())),
-        BoundLiteral::Blob(value) => ScalarValue::Binary(Some(value.clone())),
+        BoundLiteral::Blob(value) => ScalarValue::LargeBinary(Some(value.clone())),
     })
 }
 
@@ -1213,7 +1213,7 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
-        Value::Blob(value) => ScalarValue::Binary(Some(value.clone())).into(),
+        Value::Blob(value) => ScalarValue::LargeBinary(Some(value.clone())).into(),
     }
 }
 

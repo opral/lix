@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, RecordBatchOptions, StringArray,
+    ArrayRef, BooleanArray, LargeBinaryArray, RecordBatchOptions, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -2421,7 +2421,7 @@ async fn lix_file_record_batch(
             "path" => Arc::new(StringArray::from(paths.clone())),
             "directory_id" => Arc::new(StringArray::from(directory_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "data" => Arc::new(BinaryArray::from(
+            "data" => Arc::new(LargeBinaryArray::from(
                 data_values
                     .iter()
                     .map(|value| value.as_deref())
@@ -3264,7 +3264,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, false),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("data", DataType::Binary, false),
+        Field::new("data", DataType::LargeBinary, false),
         json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
@@ -3300,7 +3300,9 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, StringArray};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, BinaryArray, BooleanArray, LargeBinaryArray, StringArray,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::{Column, ScalarValue};
@@ -3484,7 +3486,7 @@ mod tests {
     fn scalar_function_expr(name: &str, args: Vec<Expr>) -> Expr {
         let udf = create_udf(
             name,
-            vec![DataType::Binary],
+            vec![DataType::LargeBinary],
             DataType::Int64,
             Volatility::Immutable,
             Arc::new(|_: &[ColumnarValue]| Ok(ColumnarValue::Scalar(ScalarValue::Null))),
@@ -4092,8 +4094,8 @@ mod tests {
         let data_column = batch
             .column(batch.schema().index_of("data").unwrap())
             .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("data should be binary array");
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("data should be large binary array");
         assert_eq!(batch.num_rows(), 2);
         for index in 0..batch.num_rows() {
             assert!(!data_column.is_null(index));

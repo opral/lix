@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, LargeBinaryArray, StringArray};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -112,7 +112,7 @@ pub(super) fn build_array<R>(col: &Col<R>, rows: &[R]) -> Result<ArrayRef, Colum
         Col::I64(get) => {
             Arc::new(Int64Array::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef
         }
-        Col::Binary(get) => Arc::new(BinaryArray::from(
+        Col::Binary(get) => Arc::new(LargeBinaryArray::from(
             rows.iter()
                 .map(get)
                 .collect::<Vec<_>>()
