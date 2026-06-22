@@ -4145,6 +4145,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_only_do_nothing_uses_fast_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path) \
+             VALUES ('/a.md'), ('/b.md') \
+             ON CONFLICT (path) DO NOTHING",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("path-only DO NOTHING descriptor insert should use the fast writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_names(&descriptor_rows), vec!["a.md", "b.md"]);
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert!(
+            blob_ref_rows.is_empty(),
+            "path-only descriptor insert should not create blob refs"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_lix_file_path_only_do_nothing_rejects_plugin_archive_path() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path) \
+             VALUES ('/.lix/plugins/plugin_sentinel.lixplugin') \
+             ON CONFLICT (path) DO NOTHING",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("path-only plugin archive insert should require data");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("plugin archive paths requires data"));
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            0,
+            "invalid path-only plugin archive write should fail before scanning"
+        );
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn execute_sql_multi_row_lix_file_do_nothing_validates_and_skips_existing() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![
             live_file_row("file-existing", "branch-a", None, "existing.md"),

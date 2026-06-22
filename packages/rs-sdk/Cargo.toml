@@ -70,11 +70,6 @@ name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
 required-features = ["fs_backend"]
 
-[[example]]
-name = "profile_fs_open_in_place"
-path = "examples/profile_fs_open_in_place.rs"
-required-features = ["sqlite"]
-
 [[bench]]
 name = "sqlite_backend"
 path = "benches/sqlite_backend.rs"

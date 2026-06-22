@@ -7,8 +7,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use lix_engine::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
-    InMemoryBackend, Key, KeyRange, LixError, MountedFilesystem, PointVisitor, PutBatch,
+    Backend, BackendError, BackendMountedFilesystem, BackendRead, BackendWrite, CommitResult,
+    Engine, GetOptions, InMemoryBackend, Key, KeyRange, LixError, PointVisitor, PutBatch,
     ReadOptions, ScanOptions, ScanResult, ScanVisitor, SessionContext, SessionTransaction, SpaceId,
     Value, WriteOptions,
 };
@@ -21,7 +21,8 @@ use lix_fs_backend::RocksDbFilesystemBackend;
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
-const DESCRIPTOR_INSERT_BATCH_MAX_ROWS: usize = 500;
+const DESCRIPTOR_INSERT_BATCH_MAX_ROWS: usize = 10_000;
+const STORED_FILE_DATA_READ_BATCH_MAX_ROWS: usize = 10_000;
 const FILE_UPSERT_BATCH_MAX_ROWS: usize = 500;
 const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
@@ -155,25 +156,26 @@ struct Snapshot {
 }
 
 #[async_trait::async_trait]
-impl MountedFilesystem for FsMountedFilesystem {
-    async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+impl BackendMountedFilesystem for FsMountedFilesystem {
+    async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError> {
         if path.ends_with('/')
             || !self.path_filter.includes_file(path)
-            || is_materialization_ignored_path(path, self.metadata_mode)
+            || is_filesystem_sync_ignored_lix_path(path, self.metadata_mode)
         {
             return Ok(None);
         }
-        let local_path = lix_path_to_local_path(&self.root, path)?;
-        if path_contains_unmanaged_entry(&self.root, &local_path)? {
+        let local_path = lix_path_to_local_path(&self.root, path)
+            .map_err(|error| BackendError::Io(error.format()))?;
+        if path_contains_unmanaged_entry(&self.root, &local_path)
+            .map_err(|error| BackendError::Io(error.format()))?
+        {
             return Ok(None);
         }
         match std::fs::read(&local_path) {
             Ok(data) => Ok(Some(data)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io_error(
-                "read filesystem stored file data",
-                &local_path,
-                error,
+            Err(error) => Err(BackendError::Io(
+                io_error("read filesystem stored file data", &local_path, error).format(),
             )),
         }
     }
@@ -376,7 +378,7 @@ impl Backend for FsBackend {
         }
     }
 
-    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
         match &self.inner {
             FsBackendInner::Persistent(inner) => inner.mounted_filesystem(),
             FsBackendInner::Memory(inner) => inner.mounted_filesystem(),
@@ -512,7 +514,7 @@ where
         self.inner.begin_read(opts)
     }
 
-    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
         Some(Arc::new(FsMountedFilesystem {
             root: self.supervisor.root().to_path_buf(),
             metadata_mode: self.supervisor.metadata_mode(),
@@ -735,14 +737,12 @@ where
         snapshot.directories.insert("/".to_string());
         let statements: [(&str, &[Value]); 3] = [
             ("SELECT path FROM lix_directory ORDER BY path", &[]),
-            ("SELECT path FROM lix_file ORDER BY path", &[]),
+            ("SELECT id, path FROM lix_file ORDER BY path", &[]),
             (
-                "SELECT path, data FROM lix_file \
-                 WHERE id IN (\
-                    SELECT file_id FROM lix_state \
-                    WHERE schema_key = 'lix_binary_blob_ref'\
-                 ) \
-                 ORDER BY path",
+                "SELECT lix_json_get_text(entity_pk, 0) AS id \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_binary_blob_ref' \
+                 ORDER BY id",
                 &[],
             ),
         ];
@@ -750,7 +750,7 @@ where
             .session
             .execute_coherent_read_batch(&statements)
             .await?;
-        let [directories, files, stored_file_data] =
+        let [directories, files, stored_file_data_refs] =
             batch.results.try_into().map_err(|results: Vec<_>| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -763,12 +763,31 @@ where
         for row in directories.rows() {
             snapshot.directories.insert(row.get::<String>("path")?);
         }
+        let mut file_paths_by_id = BTreeMap::new();
         for row in files.rows() {
-            snapshot.files.insert(row.get::<String>("path")?);
-        }
-        for row in stored_file_data.rows() {
+            let id = row.get::<String>("id")?;
             let path = row.get::<String>("path")?;
-            let data = row.get::<Vec<u8>>("data")?;
+            snapshot.files.insert(path.clone());
+            file_paths_by_id.insert(id, path);
+        }
+
+        let stored_file_data_ids = stored_file_data_refs
+            .rows()
+            .iter()
+            .filter_map(|row| match row.value("id") {
+                Ok(Value::Text(id)) if file_paths_by_id.contains_key(id) => Some(Ok(id.clone())),
+                Ok(Value::Text(_) | Value::Null) => None,
+                Ok(other) => Some(Err(LixError::new(
+                    "LIX_ERROR_VALUE_TYPE",
+                    format!("expected text or null value for blob ref file id, got {other:?}"),
+                ))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        for (path, data) in self
+            .collect_lix_stored_file_data_by_ids(&stored_file_data_ids)
+            .await?
+        {
             snapshot.stored_file_data.insert(path, data);
         }
 
@@ -780,6 +799,30 @@ where
                 storage_mutation_revision: batch.storage_mutation_revision,
             },
         })
+    }
+
+    async fn collect_lix_stored_file_data_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<BTreeMap<String, Vec<u8>>, LixError> {
+        let mut stored_file_data = BTreeMap::new();
+        for chunk in ids.chunks(STORED_FILE_DATA_READ_BATCH_MAX_ROWS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = lix_file_data_by_id_sql(chunk.len());
+            let params = chunk
+                .iter()
+                .map(|id| Value::Text(id.clone()))
+                .collect::<Vec<_>>();
+            let rows = self.session.execute(&sql, &params).await?;
+            for row in rows.rows() {
+                let path = row.get::<String>("path")?;
+                let data = row.get::<Vec<u8>>("data")?;
+                stored_file_data.insert(path, data);
+            }
+        }
+        Ok(stored_file_data)
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
@@ -883,6 +926,12 @@ where
             .iter()
             .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
         {
+            if is_plugin_storage_path(path) && !lix.snapshot.files.contains(path) {
+                stored_file_data_to_upsert
+                    .push((path.as_str(), read_local_file_data(&self.root, path)?));
+                continue;
+            }
+
             if !lix.snapshot.files.contains(path) {
                 if previous
                     .as_ref()
@@ -1706,6 +1755,19 @@ fn descriptor_insert_sql(table_name: &str, row_count: usize) -> String {
         let _ = write!(sql, "(${})", row + 1);
     }
     sql.push_str(" ON CONFLICT (path) DO NOTHING");
+    sql
+}
+
+fn lix_file_data_by_id_sql(row_count: usize) -> String {
+    debug_assert!(row_count > 0);
+    let mut sql = String::from("SELECT path, data FROM lix_file WHERE id IN (");
+    for row in 0..row_count {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "${}", row + 1);
+    }
+    sql.push_str(") ORDER BY path");
     sql
 }
 
@@ -2721,8 +2783,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             blob_refs.rows()[0].get::<i64>("count").unwrap(),
-            0,
-            "lazy reads should not import filesystem bytes into BCAS"
+            1,
+            "lazy reads should hydrate filesystem bytes into BCAS"
         );
 
         session
@@ -2741,6 +2803,26 @@ mod tests {
             b"from lix",
             "Lix writes should still materialize back to disk"
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_by_branch_descriptor_only_data_is_unresolved() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "SELECT data FROM lix_file_by_branch WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .expect_err("by-branch descriptor-only data should be unresolved");
+        assert_eq!(error.code, "LIX_FILESYSTEM_DATA_UNRESOLVED");
     }
 
     #[cfg(feature = "sqlite")]
@@ -2799,12 +2881,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(blob_refs.rows()[0].get::<i64>("count").unwrap(), 0);
+        assert_eq!(blob_refs.rows()[0].get::<i64>("count").unwrap(), 1);
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn fs_backend_rejects_update_where_data_for_descriptor_only_files() {
+    async fn fs_backend_update_where_data_rejects_descriptor_only_files() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
 
@@ -2821,18 +2903,87 @@ mod tests {
                 ],
             )
             .await
-            .expect_err("UPDATE WHERE data should be rejected");
-        assert!(
-            error
-                .message
-                .contains("UPDATE lix_file WHERE data is not supported"),
-            "{error:?}"
+            .expect_err("UPDATE WHERE data should not auto-hydrate");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(tempdir.path().join("note.md").exists());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_update_assignment_reading_data_rejects_descriptor_only_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET data = data WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .expect_err("UPDATE assignment reading data should not auto-hydrate");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(
+            std::fs::read(tempdir.path().join("note.md")).unwrap(),
+            b"from disk"
         );
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn fs_backend_rejects_path_only_rename_for_descriptor_only_files() {
+    async fn fs_backend_delete_where_data_rejects_descriptor_only_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "DELETE FROM lix_file WHERE data = $1",
+                &[Value::Blob(b"from disk".to_vec())],
+            )
+            .await
+            .expect_err("DELETE WHERE data should not auto-hydrate");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(tempdir.path().join("note.md").exists());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_conflict_update_reading_existing_data_rejects_descriptor_only_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET data = data",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Blob(b"from sql".to_vec()),
+                ],
+            )
+            .await
+            .expect_err("conflict update reading existing data should not auto-hydrate");
+        assert_eq!(error.code, "LIX_FILESYSTEM_DATA_UNRESOLVED");
+        assert_eq!(
+            std::fs::read(tempdir.path().join("note.md")).unwrap(),
+            b"from disk"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_path_only_rename_rejects_descriptor_only_files() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("old.md"), b"from disk").unwrap();
 
@@ -2849,17 +3000,9 @@ mod tests {
                 ],
             )
             .await
-            .expect_err("path-only rename should be rejected");
-        assert!(
-            error.message.contains(
-                "UPDATE lix_file path without data is not supported for descriptor-only files"
-            ),
-            "{error:?}"
-        );
-        assert_eq!(
-            std::fs::read(tempdir.path().join("old.md")).unwrap(),
-            b"from disk"
-        );
+            .expect_err("path-only rename should not auto-hydrate descriptor-only data");
+        assert_eq!(error.code, "LIX_FILESYSTEM_DATA_UNRESOLVED");
+        assert!(tempdir.path().join("old.md").exists());
         assert!(!tempdir.path().join("new.md").exists());
     }
 

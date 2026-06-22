@@ -417,7 +417,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-foo', '/foo')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-foo', '/foo', X'66')",
                 &[],
             )
             .await
@@ -617,7 +617,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, data \
+                "SELECT id, path, name \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -627,28 +627,21 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [
-            Value::Text(id),
-            Value::Text(path),
-            Value::Text(name),
-            Value::Blob(data),
-        ] = values
-        else {
+        let [Value::Text(id), Value::Text(path), Value::Text(name)] = values else {
             panic!("expected generated file path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
         assert_eq!(name, "readme.md");
-        assert_eq!(data, b"");
 
-        let null_result = session
+        let error = session
             .execute(
-                "SELECT id FROM lix_file WHERE path = '/docs/readme.md' AND data IS NULL",
+                "SELECT data FROM lix_file WHERE path = '/docs/readme.md'",
                 &[],
             )
             .await
-            .expect("file null predicate should succeed");
-        assert_eq!(null_result.len(), 0);
+            .expect_err("path-only file data should be unresolved without a mounted filesystem");
+        assert_eq!(error.code, "LIX_FILESYSTEM_DATA_UNRESOLVED");
     }
 );
 
@@ -994,7 +987,7 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
         )
         .await
         .expect("blob ref state read should succeed");
-    assert_eq!(blob_ref_result.len(), 0);
+    assert_eq!(blob_ref_result.len(), 1);
 });
 
 simulation_test!(
@@ -1325,7 +1318,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-foo', '/foo')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-foo', '/foo', X'66')",
                 &[],
             )
             .await
@@ -1840,7 +1833,7 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
         )
         .await
         .expect("blob ref state read should succeed");
-    assert_eq!(blob_ref_result.len(), 0);
+    assert_eq!(blob_ref_result.len(), 1);
 });
 
 simulation_test!(
@@ -1890,7 +1883,7 @@ simulation_test!(
             )
             .await
             .expect("blob ref history read should succeed");
-        assert_eq!(blob_ref_history.len(), 0);
+        assert_eq!(blob_ref_history.len(), 1);
     }
 );
 

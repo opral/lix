@@ -39,7 +39,7 @@ pub(crate) struct BlobPayload {
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
-        let hash = (!bytes.is_empty()).then(|| BlobHash::from_content(&bytes));
+        let hash = Some(BlobHash::from_content(&bytes));
         Self { bytes, hash }
     }
 
@@ -53,10 +53,6 @@ impl BlobPayload {
 
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
     }
 }
 

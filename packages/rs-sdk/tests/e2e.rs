@@ -1226,7 +1226,18 @@ fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout
 async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let actual = read_file(lix, path).await.unwrap();
+        let actual = match read_file(lix, path).await {
+            Ok(actual) => actual,
+            Err(error) if is_unresolved_file_data_error(&error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for Lix file {path} to be {expected:?}, got unresolved file data error: {error:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => panic!("failed reading Lix file {path}: {error:?}"),
+        };
         if actual.as_deref() == expected {
             return;
         }
@@ -1236,6 +1247,12 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(feature = "fs_backend")]
+fn is_unresolved_file_data_error(error: &LixError) -> bool {
+    error.message.contains("LIX_FILESYSTEM_DATA_UNRESOLVED")
+        || error.message.contains("filesystem data for path")
 }
 
 #[cfg(feature = "fs_backend")]

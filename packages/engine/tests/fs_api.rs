@@ -53,7 +53,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    sql_path_only_file_reads_as_empty_without_blob_ref,
+    sql_path_only_file_data_is_unresolved_without_blob_ref,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -69,12 +69,10 @@ simulation_test!(
             .await
             .expect("path-only file insert should succeed");
 
-        assert_eq!(
-            read_file(&session, "/empty.txt")
-                .await
-                .expect("file read should succeed"),
-            Some(Vec::new())
-        );
+        let error = read_file(&session, "/empty.txt")
+            .await
+            .expect_err("path-only file data should be unresolved");
+        assert_unresolved_file_data_error(&error);
 
         let file_result = session
             .execute("SELECT id FROM lix_file WHERE path = '/empty.txt'", &[])
@@ -102,6 +100,14 @@ simulation_test!(
         assert_eq!(blob_ref_result.len(), 0);
     }
 );
+
+fn assert_unresolved_file_data_error(error: &LixError) {
+    assert!(
+        error.message.contains("LIX_FILESYSTEM_DATA_UNRESOLVED")
+            || error.message.contains("filesystem data for path"),
+        "{error:?}"
+    );
+}
 
 #[tokio::test]
 async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {

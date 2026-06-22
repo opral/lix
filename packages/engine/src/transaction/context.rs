@@ -460,9 +460,7 @@ where
                 rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
                 let file_data = file_data
                     .into_iter()
-                    .filter(|write| {
-                        !file_keys.contains(&PluginFileWriteKey::from(write)) && !write.is_empty()
-                    })
+                    .filter(|write| !file_keys.contains(&PluginFileWriteKey::from(write)))
                     .collect();
                 Ok(TransactionWrite::RowsWithFileData {
                     mode,
@@ -837,7 +835,6 @@ where
         let staged = self.staged_writes.staging_overlay()?;
         let staged_writes = Arc::clone(&self.staged_writes);
         let plugin_host = self.plugin_host.clone();
-
         with_static_transaction_sql_read::<B, _, _>(read, |read_store| async move {
             let read_ctx = TransactionSqlReadExecutionContext {
                 active_branch_id,
@@ -859,6 +856,44 @@ where
             result
         })
         .await
+    }
+
+    pub(crate) async fn hydrate_file_data_paths(
+        &mut self,
+        paths: &[String],
+    ) -> Result<(), LixError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if paths.len() > crate::sql2::FILE_DATA_HYDRATION_LIMIT {
+            return Err(crate::sql2::file_data_hydration_limit_error(paths));
+        }
+        let mounted_filesystem = self
+            .storage
+            .mounted_filesystem()
+            .ok_or_else(|| crate::sql2::file_data_unresolved_error(&paths[0]))?;
+        self.prepare_sql_visible_schemas().await?;
+        for path in paths {
+            let data = mounted_filesystem
+                .read_file_data(path)
+                .await
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("filesystem hydration failed for path {path:?}: {error}"),
+                    )
+                })?
+                .ok_or_else(|| crate::sql2::file_data_unresolved_error(path))?;
+            let statement =
+                crate::sql2::parse_statement("UPDATE lix_file SET data = $1 WHERE path = $2")?;
+            let plan = crate::sql2::create_write_logical_plan_from_parsed(self, statement).await?;
+            let params = [Value::Blob(data), Value::Text(path.clone())];
+            let affected = crate::sql2::execute_write_logical_plan(self, plan, &params).await?;
+            if affected == 0 {
+                return Err(crate::sql2::file_data_unresolved_error(path));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn prepare_sql_visible_schemas(&mut self) -> Result<(), LixError> {
