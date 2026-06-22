@@ -9,8 +9,8 @@ use std::time::Duration;
 use lix_engine::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
     InMemoryBackend, Key, KeyRange, LixError, MountedFilesystem, PointVisitor, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SessionContext, SpaceId, Value,
-    WriteOptions,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SessionContext, SessionTransaction, SpaceId,
+    Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -874,8 +874,6 @@ where
         sort_directories_shallowest_first(&mut directories_to_create);
         if !directories_to_create.is_empty() {
             needs_fresh_lix_read = true;
-            self.insert_local_directories_to_lix(&directories_to_create)
-                .await?;
         }
 
         let mut file_descriptors_to_insert = Vec::new();
@@ -912,75 +910,47 @@ where
         }
         if !file_descriptors_to_insert.is_empty() {
             needs_fresh_lix_read = true;
-            self.insert_local_file_descriptors_to_lix(&file_descriptors_to_insert)
-                .await?;
         }
         if !stored_file_data_to_upsert.is_empty() {
             needs_fresh_lix_read = true;
-            let stored_file_data_to_upsert = stored_file_data_to_upsert
-                .iter()
-                .map(|(path, data)| (*path, data.as_slice()))
-                .collect::<Vec<_>>();
-            self.upsert_local_stored_file_data_to_lix(&stored_file_data_to_upsert)
+        }
+        if !directories_to_create.is_empty()
+            || !file_descriptors_to_insert.is_empty()
+            || !stored_file_data_to_upsert.is_empty()
+        {
+            let mut transaction = self.session.begin_transaction().await?;
+            if !directories_to_create.is_empty() {
+                insert_local_directories_to_lix_in_transaction(
+                    &mut transaction,
+                    &directories_to_create,
+                )
                 .await?;
+            }
+            if !file_descriptors_to_insert.is_empty() {
+                insert_local_file_descriptors_to_lix_in_transaction(
+                    &mut transaction,
+                    &file_descriptors_to_insert,
+                )
+                .await?;
+            }
+            if !stored_file_data_to_upsert.is_empty() {
+                let stored_file_data_to_upsert = stored_file_data_to_upsert
+                    .iter()
+                    .map(|(path, data)| (*path, data.as_slice()))
+                    .collect::<Vec<_>>();
+                upsert_local_stored_file_data_to_lix_in_transaction(
+                    &mut transaction,
+                    &stored_file_data_to_upsert,
+                )
+                .await?;
+            }
+            transaction.commit().await?;
         }
 
         if needs_fresh_lix_read || self.collect_lix_revision().await? != lix.revision {
             return self.collect_lix_snapshot_read().await;
         }
         Ok(lix)
-    }
-
-    async fn insert_local_directories_to_lix(
-        &self,
-        directories: &[String],
-    ) -> Result<(), LixError> {
-        for chunk in directories.chunks(DESCRIPTOR_INSERT_BATCH_MAX_ROWS) {
-            let sql = descriptor_insert_sql("lix_directory", chunk.len());
-            let params = chunk
-                .iter()
-                .map(|path| Value::Text(path.clone()))
-                .collect::<Vec<_>>();
-            self.session.execute(&sql, &params).await?;
-        }
-        Ok(())
-    }
-
-    async fn insert_local_file_descriptors_to_lix(&self, files: &[&str]) -> Result<(), LixError> {
-        for chunk in files.chunks(DESCRIPTOR_INSERT_BATCH_MAX_ROWS) {
-            let sql = descriptor_insert_sql("lix_file", chunk.len());
-            let params = chunk
-                .iter()
-                .map(|path| Value::Text((*path).to_string()))
-                .collect::<Vec<_>>();
-            self.session.execute(&sql, &params).await?;
-        }
-        Ok(())
-    }
-
-    async fn upsert_local_stored_file_data_to_lix(
-        &self,
-        files: &[(&str, &[u8])],
-    ) -> Result<(), LixError> {
-        let mut start = 0;
-        while start < files.len() {
-            let end = lix_file_upsert_chunk_end(
-                files,
-                start,
-                FILE_UPSERT_BATCH_MAX_ROWS,
-                FILE_UPSERT_BATCH_MAX_BYTES,
-            );
-            let chunk = &files[start..end];
-            let sql = lix_file_upsert_sql(chunk.len());
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for (path, data) in chunk {
-                params.push(Value::Text((*path).to_string()));
-                params.push(Value::Blob((*data).to_vec()));
-            }
-            self.session.execute(&sql, &params).await?;
-            start = end;
-        }
-        Ok(())
     }
 
     fn materialize_snapshot(&self, target: &Snapshot) -> Result<Snapshot, LixError> {
@@ -1641,6 +1611,76 @@ fn write_materialized_file(
     }
     std::fs::write(&local_path, data)
         .map_err(|error| io_error("write filesystem file", &local_path, error))
+}
+
+async fn insert_local_directories_to_lix_in_transaction<B>(
+    transaction: &mut SessionTransaction<B>,
+    directories: &[String],
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    for chunk in directories.chunks(DESCRIPTOR_INSERT_BATCH_MAX_ROWS) {
+        let sql = descriptor_insert_sql("lix_directory", chunk.len());
+        let params = chunk
+            .iter()
+            .map(|path| Value::Text(path.clone()))
+            .collect::<Vec<_>>();
+        transaction.execute(&sql, &params).await?;
+    }
+    Ok(())
+}
+
+async fn insert_local_file_descriptors_to_lix_in_transaction<B>(
+    transaction: &mut SessionTransaction<B>,
+    files: &[&str],
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    for chunk in files.chunks(DESCRIPTOR_INSERT_BATCH_MAX_ROWS) {
+        let sql = descriptor_insert_sql("lix_file", chunk.len());
+        let params = chunk
+            .iter()
+            .map(|path| Value::Text((*path).to_string()))
+            .collect::<Vec<_>>();
+        transaction.execute(&sql, &params).await?;
+    }
+    Ok(())
+}
+
+async fn upsert_local_stored_file_data_to_lix_in_transaction<B>(
+    transaction: &mut SessionTransaction<B>,
+    files: &[(&str, &[u8])],
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let mut start = 0;
+    while start < files.len() {
+        let end = lix_file_upsert_chunk_end(
+            files,
+            start,
+            FILE_UPSERT_BATCH_MAX_ROWS,
+            FILE_UPSERT_BATCH_MAX_BYTES,
+        );
+        let chunk = &files[start..end];
+        let sql = lix_file_upsert_sql(chunk.len());
+        let mut params = Vec::with_capacity(chunk.len() * 2);
+        for (path, data) in chunk {
+            params.push(Value::Text((*path).to_string()));
+            params.push(Value::Blob((*data).to_vec()));
+        }
+        transaction.execute(&sql, &params).await?;
+        start = end;
+    }
+    Ok(())
 }
 
 fn lix_file_upsert_sql(row_count: usize) -> String {
