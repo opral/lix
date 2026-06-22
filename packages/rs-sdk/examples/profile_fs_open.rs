@@ -1,8 +1,8 @@
 // Cold-open profiling harness for the filesystem backend.
 //
 // Usage:
-//   cargo run --release --example profile_fs_open --features rocksdb -- \
-//     --backend rocksdb-blob <src_dir>
+//   cargo run --release --example profile_fs_open --features fs_backend -- \
+//     <src_dir>
 //
 // Copies <src_dir> (sans any existing .lix) into a fresh temp dir, then times
 // FsBackend::open on the cold workspace. Pass --keep-workspace to preserve the
@@ -11,26 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lix_engine::{
-    Backend as _, BackendRead as _, BinaryCasStorageStats, BinaryCasWriteMetrics, ReadOptions,
-    Value, binary_cas_write_metrics_snapshot, collect_binary_cas_storage_stats,
-    reset_binary_cas_write_metrics,
-};
-use lix_fs_backend::RocksDbBlobOptions;
-use lix_sdk::{FsBackend, FsBackendFilter, open_lix_with_backend};
-
-const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProfileBackend {
-    RocksDb,
-    RocksDbBlob { min_blob_size: u64 },
-}
+use lix_engine::Value;
+use lix_sdk::{FsBackend, open_lix_with_backend};
 
 #[derive(Debug)]
 struct Args {
-    backend: ProfileBackend,
-    compact_before_stats: bool,
     in_place: bool,
     json: bool,
     keep_workspace: bool,
@@ -51,14 +36,6 @@ struct ProfileStats {
     rocksdb_manifest_bytes: u64,
     rocksdb_options_bytes: u64,
     rocksdb_other_bytes: u64,
-    binary_cas_manifest_rows: u64,
-    binary_cas_empty_blob_rows: u64,
-    binary_cas_single_chunk_blob_rows: u64,
-    binary_cas_chunked_blob_rows: u64,
-    binary_cas_manifest_chunk_rows: u64,
-    binary_cas_chunk_rows: u64,
-    binary_cas_total_chunk_refs: u64,
-    binary_cas_logical_blob_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,49 +58,6 @@ struct BenchFile {
     size_bytes: u64,
 }
 
-impl ProfileBackend {
-    fn name(self) -> &'static str {
-        match self {
-            Self::RocksDb => "rocksdb",
-            Self::RocksDbBlob { .. } => "rocksdb-blob",
-        }
-    }
-
-    fn blob_min_size(self) -> Option<u64> {
-        match self {
-            Self::RocksDbBlob { min_blob_size } => Some(min_blob_size),
-            Self::RocksDb => None,
-        }
-    }
-
-    async fn open(self, path: &Path) -> FsBackend {
-        match self {
-            Self::RocksDb => FsBackend::open_with_rocksdb_blob_options(
-                path,
-                FsBackendFilter::default(),
-                RocksDbBlobOptions::Disabled,
-            )
-            .await
-            .unwrap(),
-            Self::RocksDbBlob {
-                min_blob_size: DEFAULT_BLOB_MIN_SIZE,
-            } => FsBackend::open(path).await.unwrap(),
-            Self::RocksDbBlob { min_blob_size } => FsBackend::open_with_rocksdb_blob_options(
-                path,
-                FsBackendFilter::default(),
-                RocksDbBlobOptions::Enabled {
-                    min_blob_size,
-                    blob_file_size: 256 * 1024 * 1024,
-                    enable_gc: true,
-                    gc_age_cutoff: 0.25,
-                },
-            )
-            .await
-            .unwrap(),
-        }
-    }
-}
-
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -144,10 +78,6 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn parse_args() -> Args {
     let mut raw = std::env::args().skip(1);
-    let mut backend = ProfileBackend::RocksDbBlob {
-        min_blob_size: DEFAULT_BLOB_MIN_SIZE,
-    };
-    let mut compact_before_stats = false;
     let mut in_place = false;
     let mut json = false;
     let mut keep_workspace = false;
@@ -156,22 +86,6 @@ fn parse_args() -> Args {
 
     while let Some(arg) = raw.next() {
         match arg.as_str() {
-            "--backend" => {
-                let value = raw.next().expect("--backend requires a value");
-                backend = match value.as_str() {
-                    "rocksdb" => ProfileBackend::RocksDb,
-                    "rocksdb-blob" => ProfileBackend::RocksDbBlob {
-                        min_blob_size: DEFAULT_BLOB_MIN_SIZE,
-                    },
-                    other => panic!("unknown backend '{other}'"),
-                };
-            }
-            "--blob-min" => {
-                let value = raw.next().expect("--blob-min requires a value");
-                let min_blob_size = parse_size(&value);
-                backend = ProfileBackend::RocksDbBlob { min_blob_size };
-            }
-            "--compact-before-stats" => compact_before_stats = true,
             "--in-place" => in_place = true,
             "--json" => json = true,
             "--keep-workspace" => keep_workspace = true,
@@ -186,29 +100,13 @@ fn parse_args() -> Args {
     }
 
     Args {
-        backend,
-        compact_before_stats,
         in_place,
         json,
         keep_workspace,
         read_bench,
         src: src.expect(
-            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--read-bench] [--backend rocksdb|rocksdb-blob] [--blob-min bytes] <src_dir>",
+            "usage: profile_fs_open [--json] [--in-place] [--keep-workspace] [--read-bench] <src_dir>",
         ),
-    }
-}
-
-fn parse_size(value: &str) -> u64 {
-    let Some(last_digit) = value.rfind(|ch: char| ch.is_ascii_digit()) else {
-        panic!("size must include digits");
-    };
-    let (digits, suffix) = value.split_at(last_digit + 1);
-    let base = digits.parse::<u64>().expect("size digits must parse");
-    match suffix.to_ascii_lowercase().as_str() {
-        "" => base,
-        "k" | "kb" | "kib" => base * 1024,
-        "m" | "mb" | "mib" => base * 1024 * 1024,
-        other => panic!("unknown size suffix '{other}'"),
     }
 }
 
@@ -216,39 +114,11 @@ fn duration_ms(duration: Duration) -> u128 {
     duration.as_micros() / 1000
 }
 
-fn metric_duration_us(ns: u64) -> u64 {
-    ns / 1000
-}
-
-async fn open_with_metrics(
-    backend: ProfileBackend,
-    path: &Path,
-) -> (FsBackend, Duration, BinaryCasWriteMetrics) {
-    reset_binary_cas_write_metrics();
+async fn open_with_timing(path: &Path) -> (FsBackend, Duration) {
     let started = Instant::now();
-    let opened = backend.open(path).await;
+    let opened = FsBackend::open(path).await.unwrap();
     let elapsed = started.elapsed();
-    let metrics = binary_cas_write_metrics_snapshot();
-    (opened, elapsed, metrics)
-}
-
-fn compact_backend_if_requested(args: &Args, backend: &FsBackend) -> Option<Duration> {
-    if !args.compact_before_stats {
-        return None;
-    }
-    #[cfg(feature = "rocksdb")]
-    {
-        let t_compact = Instant::now();
-        backend
-            .compact_rocksdb()
-            .expect("profile RocksDB compact should succeed");
-        Some(t_compact.elapsed())
-    }
-    #[cfg(not(feature = "rocksdb"))]
-    {
-        let _ = backend;
-        panic!("profile_fs_open was built without the rocksdb feature")
-    }
+    (opened, elapsed)
 }
 
 fn collect_profile_stats(workspace: &Path) -> ProfileStats {
@@ -256,16 +126,6 @@ fn collect_profile_stats(workspace: &Path) -> ProfileStats {
     collect_corpus_stats(workspace, &mut stats);
     collect_lix_stats(workspace, &mut stats);
     stats
-}
-
-fn collect_backend_profile_stats(backend: &FsBackend, stats: &mut ProfileStats) {
-    let read = backend
-        .begin_read(ReadOptions::default())
-        .expect("profile backend read should open");
-    let binary_cas =
-        collect_binary_cas_storage_stats(&read).expect("profile binary CAS stats should collect");
-    read.close().expect("profile backend read should close");
-    apply_binary_cas_stats(stats, binary_cas);
 }
 
 async fn run_read_benchmark(backend: &FsBackend, workspace: &Path) -> ReadBenchStats {
@@ -427,17 +287,6 @@ fn stable_path_hash(path: &str) -> u64 {
     hash
 }
 
-fn apply_binary_cas_stats(stats: &mut ProfileStats, binary_cas: BinaryCasStorageStats) {
-    stats.binary_cas_manifest_rows = binary_cas.manifest_rows;
-    stats.binary_cas_empty_blob_rows = binary_cas.empty_blob_rows;
-    stats.binary_cas_single_chunk_blob_rows = binary_cas.single_chunk_blob_rows;
-    stats.binary_cas_chunked_blob_rows = binary_cas.chunked_blob_rows;
-    stats.binary_cas_manifest_chunk_rows = binary_cas.manifest_chunk_rows;
-    stats.binary_cas_chunk_rows = binary_cas.chunk_rows;
-    stats.binary_cas_total_chunk_refs = binary_cas.total_chunk_refs;
-    stats.binary_cas_logical_blob_bytes = binary_cas.logical_blob_bytes;
-}
-
 fn collect_corpus_stats(root: &Path, stats: &mut ProfileStats) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -533,47 +382,23 @@ fn print_result(
     args: &Args,
     copy_elapsed: Option<Duration>,
     open_elapsed: Duration,
-    open_metrics: &BinaryCasWriteMetrics,
     warm_elapsed: Option<Duration>,
-    warm_metrics: Option<&BinaryCasWriteMetrics>,
-    compact_elapsed: Option<Duration>,
     read_bench: Option<&ReadBenchStats>,
     stats: &ProfileStats,
     workspace_path: Option<&Path>,
 ) {
     if args.json {
-        let blob_min_json = args
-            .backend
-            .blob_min_size()
-            .map_or("null".to_string(), |size| size.to_string());
         let workspace_json = workspace_path.map_or("null".to_string(), |path| {
             json_string(&path.display().to_string())
         });
-        let compact_ms_json = compact_elapsed
-            .map(|duration| duration_ms(duration).to_string())
-            .unwrap_or_else(|| "null".to_string());
         let read_bench = read_bench.copied().unwrap_or_default();
         match (copy_elapsed, warm_elapsed) {
             (Some(copy_elapsed), Some(warm_elapsed)) => println!(
                 concat!(
                     "{{",
-                    "\"backend\":\"{}\",",
-                    "\"blob_min_size\":{},",
                     "\"copy_ms\":{},",
                     "\"cold_open_ms\":{},",
                     "\"warm_reopen_ms\":{},",
-                    "\"cold_binary_cas_chunk_lookup_count\":{},",
-                    "\"cold_binary_cas_chunk_lookup_batch_count\":{},",
-                    "\"cold_binary_cas_chunk_lookup_hit_count\":{},",
-                    "\"cold_binary_cas_chunk_lookup_miss_count\":{},",
-                    "\"cold_binary_cas_chunk_lookup_time_us\":{},",
-                    "\"cold_binary_cas_transaction_duplicate_chunk_count\":{},",
-                    "\"warm_binary_cas_chunk_lookup_count\":{},",
-                    "\"warm_binary_cas_chunk_lookup_batch_count\":{},",
-                    "\"warm_binary_cas_chunk_lookup_hit_count\":{},",
-                    "\"warm_binary_cas_chunk_lookup_miss_count\":{},",
-                    "\"warm_binary_cas_chunk_lookup_time_us\":{},",
-                    "\"warm_binary_cas_transaction_duplicate_chunk_count\":{},",
                     "\"read_all_files_ms\":{},",
                     "\"read_all_files_count\":{},",
                     "\"read_all_files_bytes\":{},",
@@ -584,7 +409,6 @@ fn print_result(
                     "\"read_small_sample_ms\":{},",
                     "\"read_small_sample_count\":{},",
                     "\"read_small_sample_bytes\":{},",
-                    "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
                     "\"corpus_bytes\":{},",
@@ -596,46 +420,12 @@ fn print_result(
                     "\"rocksdb_log_bytes\":{},",
                     "\"rocksdb_manifest_bytes\":{},",
                     "\"rocksdb_options_bytes\":{},",
-                    "\"rocksdb_other_bytes\":{},",
-                    "\"binary_cas_manifest_rows\":{},",
-                    "\"binary_cas_empty_blob_rows\":{},",
-                    "\"binary_cas_single_chunk_blob_rows\":{},",
-                    "\"binary_cas_chunked_blob_rows\":{},",
-                    "\"binary_cas_manifest_chunk_rows\":{},",
-                    "\"binary_cas_chunk_rows\":{},",
-                    "\"binary_cas_total_chunk_refs\":{},",
-                    "\"binary_cas_logical_blob_bytes\":{}",
+                    "\"rocksdb_other_bytes\":{}",
                     "}}"
                 ),
-                args.backend.name(),
-                blob_min_json,
                 duration_ms(copy_elapsed),
                 duration_ms(open_elapsed),
                 duration_ms(warm_elapsed),
-                open_metrics.chunk_lookup_count,
-                open_metrics.chunk_lookup_batch_count,
-                open_metrics.chunk_lookup_hit_count,
-                open_metrics.chunk_lookup_miss_count,
-                metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
-                open_metrics.transaction_duplicate_chunk_count,
-                warm_metrics
-                    .map(|metrics| metrics.chunk_lookup_count)
-                    .unwrap_or_default(),
-                warm_metrics
-                    .map(|metrics| metrics.chunk_lookup_batch_count)
-                    .unwrap_or_default(),
-                warm_metrics
-                    .map(|metrics| metrics.chunk_lookup_hit_count)
-                    .unwrap_or_default(),
-                warm_metrics
-                    .map(|metrics| metrics.chunk_lookup_miss_count)
-                    .unwrap_or_default(),
-                warm_metrics
-                    .map(|metrics| metric_duration_us(metrics.chunk_lookup_elapsed_ns))
-                    .unwrap_or_default(),
-                warm_metrics
-                    .map(|metrics| metrics.transaction_duplicate_chunk_count)
-                    .unwrap_or_default(),
                 read_bench.all_files_ms,
                 read_bench.all_files_count,
                 read_bench.all_files_bytes,
@@ -646,7 +436,6 @@ fn print_result(
                 read_bench.small_sample_ms,
                 read_bench.small_sample_count,
                 read_bench.small_sample_bytes,
-                compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
                 stats.corpus_bytes,
@@ -658,28 +447,12 @@ fn print_result(
                 stats.rocksdb_log_bytes,
                 stats.rocksdb_manifest_bytes,
                 stats.rocksdb_options_bytes,
-                stats.rocksdb_other_bytes,
-                stats.binary_cas_manifest_rows,
-                stats.binary_cas_empty_blob_rows,
-                stats.binary_cas_single_chunk_blob_rows,
-                stats.binary_cas_chunked_blob_rows,
-                stats.binary_cas_manifest_chunk_rows,
-                stats.binary_cas_chunk_rows,
-                stats.binary_cas_total_chunk_refs,
-                stats.binary_cas_logical_blob_bytes
+                stats.rocksdb_other_bytes
             ),
             _ => println!(
                 concat!(
                     "{{",
-                    "\"backend\":\"{}\",",
-                    "\"blob_min_size\":{},",
                     "\"open_ms\":{},",
-                    "\"open_binary_cas_chunk_lookup_count\":{},",
-                    "\"open_binary_cas_chunk_lookup_batch_count\":{},",
-                    "\"open_binary_cas_chunk_lookup_hit_count\":{},",
-                    "\"open_binary_cas_chunk_lookup_miss_count\":{},",
-                    "\"open_binary_cas_chunk_lookup_time_us\":{},",
-                    "\"open_binary_cas_transaction_duplicate_chunk_count\":{},",
                     "\"read_all_files_ms\":{},",
                     "\"read_all_files_count\":{},",
                     "\"read_all_files_bytes\":{},",
@@ -690,7 +463,6 @@ fn print_result(
                     "\"read_small_sample_ms\":{},",
                     "\"read_small_sample_count\":{},",
                     "\"read_small_sample_bytes\":{},",
-                    "\"compact_ms\":{},",
                     "\"workspace_path\":{},",
                     "\"corpus_file_count\":{},",
                     "\"corpus_bytes\":{},",
@@ -702,26 +474,10 @@ fn print_result(
                     "\"rocksdb_log_bytes\":{},",
                     "\"rocksdb_manifest_bytes\":{},",
                     "\"rocksdb_options_bytes\":{},",
-                    "\"rocksdb_other_bytes\":{},",
-                    "\"binary_cas_manifest_rows\":{},",
-                    "\"binary_cas_empty_blob_rows\":{},",
-                    "\"binary_cas_single_chunk_blob_rows\":{},",
-                    "\"binary_cas_chunked_blob_rows\":{},",
-                    "\"binary_cas_manifest_chunk_rows\":{},",
-                    "\"binary_cas_chunk_rows\":{},",
-                    "\"binary_cas_total_chunk_refs\":{},",
-                    "\"binary_cas_logical_blob_bytes\":{}",
+                    "\"rocksdb_other_bytes\":{}",
                     "}}"
                 ),
-                args.backend.name(),
-                blob_min_json,
                 duration_ms(open_elapsed),
-                open_metrics.chunk_lookup_count,
-                open_metrics.chunk_lookup_batch_count,
-                open_metrics.chunk_lookup_hit_count,
-                open_metrics.chunk_lookup_miss_count,
-                metric_duration_us(open_metrics.chunk_lookup_elapsed_ns),
-                open_metrics.transaction_duplicate_chunk_count,
                 read_bench.all_files_ms,
                 read_bench.all_files_count,
                 read_bench.all_files_bytes,
@@ -732,7 +488,6 @@ fn print_result(
                 read_bench.small_sample_ms,
                 read_bench.small_sample_count,
                 read_bench.small_sample_bytes,
-                compact_ms_json,
                 workspace_json,
                 stats.corpus_file_count,
                 stats.corpus_bytes,
@@ -744,69 +499,25 @@ fn print_result(
                 stats.rocksdb_log_bytes,
                 stats.rocksdb_manifest_bytes,
                 stats.rocksdb_options_bytes,
-                stats.rocksdb_other_bytes,
-                stats.binary_cas_manifest_rows,
-                stats.binary_cas_empty_blob_rows,
-                stats.binary_cas_single_chunk_blob_rows,
-                stats.binary_cas_chunked_blob_rows,
-                stats.binary_cas_manifest_chunk_rows,
-                stats.binary_cas_chunk_rows,
-                stats.binary_cas_total_chunk_refs,
-                stats.binary_cas_logical_blob_bytes
+                stats.rocksdb_other_bytes
             ),
         }
     } else if args.in_place {
         println!("OPEN_MS={}", duration_ms(open_elapsed));
-        print_open_metrics("OPEN", open_metrics);
-        if let Some(compact_elapsed) = compact_elapsed {
-            println!("COMPACT_MS={}", duration_ms(compact_elapsed));
-        }
         if let Some(read_bench) = read_bench {
             print_read_bench(read_bench);
         }
         print_text_stats(stats, workspace_path);
     } else {
         println!("COLD_OPEN_MS={}", duration_ms(open_elapsed));
-        print_open_metrics("COLD", open_metrics);
-        if let (Some(warm_elapsed), Some(warm_metrics)) = (warm_elapsed, warm_metrics) {
+        if let Some(warm_elapsed) = warm_elapsed {
             println!("WARM_REOPEN_MS={}", duration_ms(warm_elapsed));
-            print_open_metrics("WARM", warm_metrics);
-        }
-        if let Some(compact_elapsed) = compact_elapsed {
-            println!("COMPACT_MS={}", duration_ms(compact_elapsed));
         }
         if let Some(read_bench) = read_bench {
             print_read_bench(read_bench);
         }
         print_text_stats(stats, workspace_path);
     }
-}
-
-fn print_open_metrics(prefix: &str, metrics: &BinaryCasWriteMetrics) {
-    println!(
-        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_COUNT={}",
-        metrics.chunk_lookup_count
-    );
-    println!(
-        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_BATCH_COUNT={}",
-        metrics.chunk_lookup_batch_count
-    );
-    println!(
-        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_HIT_COUNT={}",
-        metrics.chunk_lookup_hit_count
-    );
-    println!(
-        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_MISS_COUNT={}",
-        metrics.chunk_lookup_miss_count
-    );
-    println!(
-        "{prefix}_BINARY_CAS_CHUNK_LOOKUP_TIME_US={}",
-        metric_duration_us(metrics.chunk_lookup_elapsed_ns)
-    );
-    println!(
-        "{prefix}_BINARY_CAS_TRANSACTION_DUPLICATE_CHUNK_COUNT={}",
-        metrics.transaction_duplicate_chunk_count
-    );
 }
 
 fn print_read_bench(read_bench: &ReadBenchStats) {
@@ -846,35 +557,6 @@ fn print_text_stats(stats: &ProfileStats, workspace_path: Option<&Path>) {
     println!("ROCKSDB_MANIFEST_BYTES={}", stats.rocksdb_manifest_bytes);
     println!("ROCKSDB_OPTIONS_BYTES={}", stats.rocksdb_options_bytes);
     println!("ROCKSDB_OTHER_BYTES={}", stats.rocksdb_other_bytes);
-    println!(
-        "BINARY_CAS_MANIFEST_ROWS={}",
-        stats.binary_cas_manifest_rows
-    );
-    println!(
-        "BINARY_CAS_EMPTY_BLOB_ROWS={}",
-        stats.binary_cas_empty_blob_rows
-    );
-    println!(
-        "BINARY_CAS_SINGLE_CHUNK_BLOB_ROWS={}",
-        stats.binary_cas_single_chunk_blob_rows
-    );
-    println!(
-        "BINARY_CAS_CHUNKED_BLOB_ROWS={}",
-        stats.binary_cas_chunked_blob_rows
-    );
-    println!(
-        "BINARY_CAS_MANIFEST_CHUNK_ROWS={}",
-        stats.binary_cas_manifest_chunk_rows
-    );
-    println!("BINARY_CAS_CHUNK_ROWS={}", stats.binary_cas_chunk_rows);
-    println!(
-        "BINARY_CAS_TOTAL_CHUNK_REFS={}",
-        stats.binary_cas_total_chunk_refs
-    );
-    println!(
-        "BINARY_CAS_LOGICAL_BLOB_BYTES={}",
-        stats.binary_cas_logical_blob_bytes
-    );
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -883,25 +565,20 @@ async fn main() {
     let src = Path::new(&args.src);
 
     if args.in_place {
-        let (backend, open_elapsed, open_metrics) = open_with_metrics(args.backend, src).await;
-        eprintln!("{} in-place open: {open_elapsed:?}", args.backend.name());
+        let (backend, open_elapsed) = open_with_timing(src).await;
+        eprintln!("in-place open: {open_elapsed:?}");
         let read_bench = if args.read_bench {
             Some(run_read_benchmark(&backend, src).await)
         } else {
             None
         };
-        let compact_elapsed = compact_backend_if_requested(&args, &backend);
-        let mut stats = collect_profile_stats(src);
-        collect_backend_profile_stats(&backend, &mut stats);
+        let stats = collect_profile_stats(src);
         drop(backend);
         print_result(
             &args,
             None,
             open_elapsed,
-            &open_metrics,
             None,
-            None,
-            compact_elapsed,
             read_bench.as_ref(),
             &stats,
             Some(src),
@@ -922,21 +599,19 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    let (backend, open_elapsed, open_metrics) = open_with_metrics(args.backend, &work).await;
-    eprintln!("{} cold open: {open_elapsed:?}", args.backend.name());
+    let (backend, open_elapsed) = open_with_timing(&work).await;
+    eprintln!("cold open: {open_elapsed:?}");
     drop(backend);
 
     // Warm reopen (now .lix exists).
-    let (backend, warm_elapsed, warm_metrics) = open_with_metrics(args.backend, &work).await;
-    eprintln!("{} warm reopen: {warm_elapsed:?}", args.backend.name());
+    let (backend, warm_elapsed) = open_with_timing(&work).await;
+    eprintln!("warm reopen: {warm_elapsed:?}");
     let read_bench = if args.read_bench {
         Some(run_read_benchmark(&backend, &work).await)
     } else {
         None
     };
-    let compact_elapsed = compact_backend_if_requested(&args, &backend);
-    let mut stats = collect_profile_stats(&work);
-    collect_backend_profile_stats(&backend, &mut stats);
+    let stats = collect_profile_stats(&work);
     drop(backend);
 
     // Repeated cold opens into fresh temp dirs for profiling sample density.
@@ -945,13 +620,10 @@ async fn main() {
         let work_i = tmp_i.path().join("workspace");
         copy_dir(src, &work_i);
         let t = Instant::now();
-        let backend = args.backend.open(&work_i).await;
+        let backend = FsBackend::open(&work_i).await.unwrap();
         if i == repeat - 1 {
             let elapsed = t.elapsed();
-            eprintln!(
-                "{} cold open (repeat {repeat}): {elapsed:?}",
-                args.backend.name()
-            );
+            eprintln!("cold open (repeat {repeat}): {elapsed:?}");
         }
         drop(backend);
     }
@@ -961,10 +633,7 @@ async fn main() {
         &args,
         Some(copy_elapsed),
         open_elapsed,
-        &open_metrics,
         Some(warm_elapsed),
-        Some(&warm_metrics),
-        compact_elapsed,
         read_bench.as_ref(),
         &stats,
         workspace_path,

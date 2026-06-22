@@ -55,3 +55,43 @@ pub(crate) fn fastcdc_chunk_ranges_with_chunking(
     })
     .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_chunking_is_fixed_fastcdc_1m_profile() {
+        let chunking = BinaryCasChunking::default();
+
+        assert_eq!(chunking.min_chunk_bytes, 256 * 1024);
+        assert_eq!(chunking.avg_chunk_bytes, 1024 * 1024);
+        assert_eq!(chunking.max_chunk_bytes, 4096 * 1024);
+        assert_eq!(chunking.single_chunk_fast_path_max_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn single_chunk_fast_path_applies_through_64kib() {
+        let at_boundary = vec![0; 64 * 1024];
+        assert_eq!(
+            fastcdc_chunk_ranges(&at_boundary),
+            vec![(0, at_boundary.len())]
+        );
+    }
+
+    #[test]
+    fn single_chunk_fast_path_does_not_apply_above_64kib() {
+        let above_boundary = vec![0; 64 * 1024 + 1];
+        let chunking = BinaryCasChunking {
+            min_chunk_bytes: 16 * 1024,
+            avg_chunk_bytes: 32 * 1024,
+            max_chunk_bytes: 64 * 1024,
+            single_chunk_fast_path_max_bytes: 64 * 1024,
+        };
+
+        assert_ne!(
+            fastcdc_chunk_ranges_with_chunking(&above_boundary, chunking),
+            vec![(0, above_boundary.len())]
+        );
+    }
+}

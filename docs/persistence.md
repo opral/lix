@@ -35,7 +35,29 @@ const lix = await openLix({
 await lix.close();
 ```
 
-Reopening the same path resumes existing state. Lix stores its private repository data in `<workspace>/.lix/.internal/db.sqlite` and syncs workspace files through Lix.
+Reopening the same path resumes existing RocksDB filesystem backend state. Lix stores its private repository data in `<workspace>/.lix/.internal/rocksdb` and syncs workspace files through Lix.
+
+Older SQLite filesystem backend metadata is not migrated. If Lix detects the
+old SQLite metadata files in `<workspace>/.lix/.internal` before a RocksDB store
+exists, it clears `.lix/.internal` and initializes a fresh RocksDB backend.
+
+## Filesystem workspace (memory storage)
+
+Use `storage: "memory"` when you want filesystem sync without persisting the
+Lix repository metadata:
+
+```ts
+const lix = await openLix({
+	backend: new FsBackend({
+		path: "/var/data/workspace",
+		storage: "memory",
+	}),
+});
+```
+
+This imports, watches, and materializes workspace files, but the Lix repository
+state is kept in memory and no `.lix` directory is written. Reopening the same
+path reimports the files from disk instead of resuming prior Lix metadata.
 
 For tests, point at a temp directory so each run is isolated:
 
@@ -50,20 +72,6 @@ const lix = await openLix({
 });
 ```
 
-## Filesystem sync without writing .lix metadata
-
-Use `storage: "memory"` when the directory should be read and synced through the filesystem backend, but the Lix repository itself should stay in memory:
-
-```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-	backend: new FsBackend({ path: "/Users/me/Downloads", storage: "memory" }),
-});
-```
-
-This is useful for temporary workspaces, previews, and opening user folders that should not get a `.lix` folder.
-
 Add a filter when only specific files should participate in filesystem sync.
 `includePaths` entries are exact workspace-relative file paths, not directories
 or globs. They may be written with or without a leading slash, for example
@@ -74,7 +82,6 @@ watching, and materialization; it does not filter unrelated Lix SQL state.
 const lix = await openLix({
 	backend: new FsBackend({
 		path: "/Users/me/Downloads",
-		storage: "memory",
 		filter: { includePaths: ["notes/today.md"] },
 	}),
 });
@@ -100,6 +107,6 @@ Always `await lix.close()` in scripts and tests. Long-lived servers can hold a s
 
 ## Other storage targets
 
-Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, RocksDB (anything transactional and key-value-shaped) are not shipped by the Lix team.
+Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, and other transactional key-value storage targets beyond the shipped backends are not shipped by the Lix team.
 
 The storage interface is public and small enough to implement yourself. The [Backends](./backend.md) page documents the full contract.

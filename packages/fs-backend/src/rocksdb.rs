@@ -16,23 +16,6 @@ const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const DEFAULT_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RocksDbFilesystemBackendOptions {
-    pub path: PathBuf,
-    pub blob: RocksDbBlobOptions,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RocksDbBlobOptions {
-    Disabled,
-    Enabled {
-        min_blob_size: u64,
-        blob_file_size: u64,
-        enable_gc: bool,
-        gc_age_cutoff: f64,
-    },
-}
-
 #[derive(Clone)]
 #[allow(missing_debug_implementations)]
 pub struct RocksDbFilesystemBackend {
@@ -41,8 +24,6 @@ pub struct RocksDbFilesystemBackend {
 
 #[allow(missing_debug_implementations)]
 struct RocksDbFilesystemInner {
-    path: PathBuf,
-    blob: RocksDbBlobOptions,
     db: DB,
     write_gate: WriteGate,
 }
@@ -64,70 +45,16 @@ pub struct RocksDbFilesystemWrite {
 static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<RocksDbFilesystemInner>>>> =
     OnceLock::new();
 
-impl RocksDbFilesystemBackendOptions {
-    pub fn plain(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            blob: RocksDbBlobOptions::Disabled,
-        }
-    }
-
-    pub fn default_blob(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            blob: RocksDbBlobOptions::default(),
-        }
-    }
-
-    pub fn blob(path: impl Into<PathBuf>, min_blob_size: u64) -> Self {
-        Self {
-            path: path.into(),
-            blob: RocksDbBlobOptions::Enabled {
-                min_blob_size,
-                blob_file_size: DEFAULT_BLOB_FILE_SIZE,
-                enable_gc: true,
-                gc_age_cutoff: DEFAULT_BLOB_GC_AGE_CUTOFF,
-            },
-        }
-    }
-}
-
-impl Default for RocksDbBlobOptions {
-    fn default() -> Self {
-        Self::Enabled {
-            min_blob_size: DEFAULT_BLOB_MIN_SIZE,
-            blob_file_size: DEFAULT_BLOB_FILE_SIZE,
-            enable_gc: true,
-            gc_age_cutoff: DEFAULT_BLOB_GC_AGE_CUTOFF,
-        }
-    }
-}
-
 impl RocksDbFilesystemBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
-        Self::open_with_options(RocksDbFilesystemBackendOptions::default_blob(path))
-    }
-
-    pub fn open_with_options(
-        options: RocksDbFilesystemBackendOptions,
-    ) -> Result<Self, BackendError> {
         Ok(Self {
-            inner: open_shared_rocksdb(options)?,
+            inner: open_shared_rocksdb(path.into())?,
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.inner.path
-    }
-
-    pub fn flush(&self) -> Result<(), BackendError> {
+    #[cfg(test)]
+    fn flush(&self) -> Result<(), BackendError> {
         self.inner.db.flush().map_err(rocksdb_error)
-    }
-
-    pub fn compact_all(&self) -> Result<(), BackendError> {
-        self.flush()?;
-        self.inner.db.compact_range::<&[u8], &[u8]>(None, None);
-        self.flush()
     }
 }
 
@@ -323,10 +250,8 @@ impl BackendWrite for RocksDbFilesystemWrite {
     }
 }
 
-fn open_shared_rocksdb(
-    options: RocksDbFilesystemBackendOptions,
-) -> Result<Arc<RocksDbFilesystemInner>, BackendError> {
-    let path = registry_key(&options.path)?;
+fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDbFilesystemInner>, BackendError> {
+    let path = registry_key(&path)?;
     let registry = OPEN_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut open_databases = registry
         .lock()
@@ -334,24 +259,12 @@ fn open_shared_rocksdb(
 
     if let Some(existing) = open_databases.get(&path) {
         if let Some(inner) = existing.upgrade() {
-            if inner.blob != options.blob {
-                return Err(BackendError::Io(format!(
-                    "rocksdb filesystem backend at {} is already open with different options",
-                    path.display()
-                )));
-            }
             return Ok(inner);
         }
     }
 
-    let open_options = RocksDbFilesystemBackendOptions {
-        path: path.clone(),
-        blob: options.blob,
-    };
-    let db = open_rocksdb(&open_options)?;
+    let db = open_rocksdb(&path)?;
     let inner = Arc::new(RocksDbFilesystemInner {
-        path: path.clone(),
-        blob: options.blob,
         db,
         write_gate: WriteGate::new(),
     });
@@ -398,28 +311,17 @@ fn registry_key(path: &Path) -> Result<PathBuf, BackendError> {
     Ok(canonical_parent.join(file_name))
 }
 
-fn open_rocksdb(options: &RocksDbFilesystemBackendOptions) -> Result<DB, BackendError> {
+fn open_rocksdb(path: &Path) -> Result<DB, BackendError> {
     let mut db_options = Options::default();
     db_options.create_if_missing(true);
     db_options.set_use_fsync(false);
     db_options.set_write_buffer_size(64 * 1024 * 1024);
-    match options.blob {
-        RocksDbBlobOptions::Disabled => {}
-        RocksDbBlobOptions::Enabled {
-            min_blob_size,
-            blob_file_size,
-            enable_gc,
-            gc_age_cutoff,
-        } => {
-            db_options.set_enable_blob_files(true);
-            db_options.set_min_blob_size(min_blob_size);
-            db_options.set_blob_file_size(blob_file_size);
-            db_options.set_enable_blob_gc(enable_gc);
-            db_options.set_blob_gc_age_cutoff(gc_age_cutoff);
-        }
-    }
-    DB::open(&db_options, &options.path)
-        .map_err(|error| rocksdb_open_error(error, options.path.as_path()))
+    db_options.set_enable_blob_files(true);
+    db_options.set_min_blob_size(DEFAULT_BLOB_MIN_SIZE);
+    db_options.set_blob_file_size(DEFAULT_BLOB_FILE_SIZE);
+    db_options.set_enable_blob_gc(true);
+    db_options.set_blob_gc_age_cutoff(DEFAULT_BLOB_GC_AGE_CUTOFF);
+    DB::open(&db_options, path).map_err(|error| rocksdb_open_error(error, path))
 }
 
 fn physical_key(space: SpaceId, key: &Key) -> Key {
@@ -653,15 +555,74 @@ mod tests {
         Backend, BackendWrite, Key, PutBatch, PutEntry, ReadOptions, SpaceId, StoredValue,
         WriteOptions, get_many,
     };
+    use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig, run_backend_conformance};
     use std::env;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+    use tempfile::TempDir;
 
-    use super::{RocksDbFilesystemBackend, RocksDbFilesystemBackendOptions};
+    use super::RocksDbFilesystemBackend;
+
+    #[derive(Debug)]
+    struct RocksDbFilesystemBackendFactory {
+        temp_dir: TempDir,
+        next_database_id: AtomicU64,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RocksDbFilesystemBackendFixture {
+        path: std::path::PathBuf,
+    }
+
+    impl RocksDbFilesystemBackendFactory {
+        fn new() -> Self {
+            Self {
+                temp_dir: tempfile::tempdir().expect("create rocksdb fs backend temp dir"),
+                next_database_id: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl BackendFactory for RocksDbFilesystemBackendFactory {
+        type Backend = RocksDbFilesystemBackend;
+        type Fixture = RocksDbFilesystemBackendFixture;
+
+        fn create_fixture(&self) -> Self::Fixture {
+            let database_id = self.next_database_id.fetch_add(1, Ordering::Relaxed);
+            RocksDbFilesystemBackendFixture {
+                path: self
+                    .temp_dir
+                    .path()
+                    .join(format!("fs-backend-{database_id}.rocksdb")),
+            }
+        }
+
+        fn config(&self) -> BackendTestConfig {
+            BackendTestConfig {
+                supports_concurrent_writers: false,
+                ..BackendTestConfig::default()
+            }
+        }
+    }
+
+    impl BackendFixture for RocksDbFilesystemBackendFixture {
+        type Backend = RocksDbFilesystemBackend;
+
+        fn open(&self) -> Self::Backend {
+            RocksDbFilesystemBackend::open(&self.path).expect("open rocksdb fs backend")
+        }
+    }
 
     #[test]
-    fn plain_backend_roundtrips_point_read_after_reopen() {
+    fn passes_backend_conformance() {
+        let report = run_backend_conformance(&RocksDbFilesystemBackendFactory::new());
+        report.assert_no_failures();
+    }
+
+    #[test]
+    fn blobdb_backend_roundtrips_point_read_after_reopen() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let path = temp_dir.path().join("fs.rocksdb");
         let key = Key(Bytes::from_static(b"file-chunk"));
@@ -767,24 +728,22 @@ mod tests {
     }
 
     #[test]
-    fn same_process_open_rejects_different_blob_options_for_open_database() {
+    fn writes_large_values_to_blob_files() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let path = temp_dir.path().join("fs.rocksdb");
-        let _default_blob =
-            RocksDbFilesystemBackend::open(&path).expect("open default blob backend");
-
-        let error = match RocksDbFilesystemBackend::open_with_options(
-            RocksDbFilesystemBackendOptions::blob(&path, 16),
-        ) {
-            Ok(_) => panic!("second open with different options should fail"),
-            Err(error) => error,
-        };
+        let backend = RocksDbFilesystemBackend::open(&path).expect("open blob backend");
+        put_one(
+            &backend,
+            SpaceId(0x0005_0003),
+            Key(Bytes::from_static(b"large-value")),
+            Bytes::from(vec![7; 128 * 1024]),
+        );
+        backend.flush().expect("flush blob backend");
+        drop(backend);
 
         assert!(
-            error
-                .to_string()
-                .contains("already open with different options"),
-            "error should explain option mismatch: {error}"
+            rocksdb_blob_file_count(&path) > 0,
+            "large values should be stored in RocksDB blob files"
         );
     }
 
@@ -831,15 +790,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blob_options_open() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let options = RocksDbFilesystemBackendOptions::blob(temp_dir.path().join("fs.rocksdb"), 16);
-        let backend =
-            RocksDbFilesystemBackend::open_with_options(options).expect("open blob backend");
-        backend.flush().expect("flush blob backend");
-    }
-
     fn put_one(backend: &RocksDbFilesystemBackend, space: SpaceId, key: Key, value: Bytes) {
         let mut write = backend
             .begin_write(WriteOptions::default())
@@ -867,5 +817,18 @@ mod tests {
             lix_engine::backend::ProjectedValue::FullValue(bytes) => bytes,
             lix_engine::backend::ProjectedValue::KeyOnly => Bytes::new(),
         })
+    }
+
+    fn rocksdb_blob_file_count(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path)
+            .expect("read rocksdb directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "blob")
+            })
+            .count()
     }
 }

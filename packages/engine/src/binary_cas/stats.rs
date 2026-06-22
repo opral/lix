@@ -11,7 +11,7 @@ use crate::binary_cas::kv::{
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BinaryCasStorageStats {
+pub(crate) struct BinaryCasStorageStats {
     pub manifest_rows: u64,
     pub empty_blob_rows: u64,
     pub single_chunk_blob_rows: u64,
@@ -22,7 +22,9 @@ pub struct BinaryCasStorageStats {
     pub logical_blob_bytes: u64,
 }
 
-pub fn collect_binary_cas_storage_stats<R>(read: &R) -> Result<BinaryCasStorageStats, LixError>
+pub(crate) fn collect_binary_cas_storage_stats<R>(
+    read: &R,
+) -> Result<BinaryCasStorageStats, LixError>
 where
     R: BackendRead + ?Sized,
 {

@@ -41,7 +41,7 @@ zip = { version = "8", default-features = false }
 [features]
 default = ["default_wasm_runtime"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
-rocksdb = ["dep:lix_fs_backend", "lix_fs_backend/rocksdb"]
+fs_backend = ["dep:lix_fs_backend", "lix_fs_backend/rocksdb"]
 sqlite = ["dep:lix_backends", "lix_backends/sqlite", "dep:rusqlite", "dep:tempfile"]
 
 [[example]]
@@ -68,7 +68,7 @@ required-features = ["sqlite"]
 [[example]]
 name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
-required-features = ["rocksdb"]
+required-features = ["fs_backend"]
 
 [[bench]]
 name = "sqlite_backend"

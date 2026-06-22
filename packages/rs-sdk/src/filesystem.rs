@@ -7,16 +7,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lix_engine::{
-    Backend, BackendError, BackendWrite, CommitResult, Engine, Key, KeyRange, LixError, PutBatch,
-    ReadOptions, SessionContext, SpaceId, Value, WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
+    InMemoryBackend, Key, KeyRange, LixError, PointVisitor, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, SessionContext, SpaceId, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 
-#[cfg(feature = "rocksdb")]
-use lix_fs_backend::{
-    RocksDbBlobOptions, RocksDbFilesystemBackend, RocksDbFilesystemBackendOptions,
-};
+#[cfg(feature = "fs_backend")]
+use lix_fs_backend::RocksDbFilesystemBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
@@ -38,6 +37,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilesystemMetadataMode {
     Persistent,
+    Ephemeral,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -67,17 +67,37 @@ where
     supervisor: FilesystemSupervisor<B>,
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct FsBackend {
-    inner: FilesystemSync<RocksDbFilesystemBackend>,
+    inner: FsBackendInner,
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
+#[derive(Clone)]
+enum FsBackendInner {
+    Persistent(FilesystemSync<RocksDbFilesystemBackend>),
+    Memory(FilesystemSync<InMemoryBackend>),
+}
+
+#[cfg(feature = "fs_backend")]
+#[expect(missing_debug_implementations)]
+pub enum FsRead<'a> {
+    Persistent(lix_fs_backend::RocksDbFilesystemRead<'a>),
+    Memory(<InMemoryBackend as Backend>::Read<'a>),
+}
+
+#[cfg(feature = "fs_backend")]
 #[expect(missing_debug_implementations)]
 pub struct FsWrite<'a> {
-    inner: FilesystemWrite<'a, RocksDbFilesystemBackend>,
+    inner: FsWriteInner<'a>,
+}
+
+#[cfg(feature = "fs_backend")]
+enum FsWriteInner<'a> {
+    Persistent(FilesystemWrite<'a, RocksDbFilesystemBackend>),
+    Memory(FilesystemWrite<'a, InMemoryBackend>),
 }
 
 #[derive(Clone)]
@@ -223,7 +243,7 @@ enum FilesystemEvent {
     Shutdown,
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 impl FsBackend {
     pub async fn open<P>(dir: P) -> Result<Self, LixError>
     where
@@ -236,20 +256,8 @@ impl FsBackend {
     where
         P: AsRef<Path>,
     {
-        Self::open_with_rocksdb_blob_options(dir, filter, default_rocksdb_blob_options()).await
-    }
-
-    #[doc(hidden)]
-    pub async fn open_with_rocksdb_blob_options<P>(
-        dir: P,
-        filter: FsBackendFilter,
-        blob: RocksDbBlobOptions,
-    ) -> Result<Self, LixError>
-    where
-        P: AsRef<Path>,
-    {
         FilesystemPathFilter::from_filter(filter.clone())?;
-        let backend = open_filesystem_rocksdb_backend(dir.as_ref(), blob)?;
+        let backend = open_filesystem_rocksdb_backend(dir.as_ref())?;
         let inner = FilesystemSync::open_filesystem(
             backend,
             dir.as_ref(),
@@ -257,21 +265,44 @@ impl FsBackend {
             filter,
         )
         .await?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: FsBackendInner::Persistent(inner),
+        })
     }
 
-    pub fn compact_rocksdb(&self) -> Result<(), LixError> {
-        self.inner
-            .inner
-            .compact_all()
-            .map_err(rocksdb_backend_error)
+    pub async fn open_memory<P>(dir: P) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::open_memory_with_filter(dir, FsBackendFilter::default()).await
+    }
+
+    pub async fn open_memory_with_filter<P>(
+        dir: P,
+        filter: FsBackendFilter,
+    ) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        FilesystemPathFilter::from_filter(filter.clone())?;
+        let backend = InMemoryBackend::new();
+        let inner = FilesystemSync::open_filesystem(
+            backend,
+            dir.as_ref(),
+            FilesystemMetadataMode::Ephemeral,
+            filter,
+        )
+        .await?;
+        Ok(Self {
+            inner: FsBackendInner::Memory(inner),
+        })
     }
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 impl Backend for FsBackend {
     type Read<'a>
-        = lix_fs_backend::RocksDbFilesystemRead<'a>
+        = FsRead<'a>
     where
         Self: 'a;
 
@@ -281,36 +312,94 @@ impl Backend for FsBackend {
         Self: 'a;
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        self.inner.begin_read(opts)
+        match &self.inner {
+            FsBackendInner::Persistent(inner) => Ok(FsRead::Persistent(inner.begin_read(opts)?)),
+            FsBackendInner::Memory(inner) => Ok(FsRead::Memory(inner.begin_read(opts)?)),
+        }
     }
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(FsWrite {
-            inner: self.inner.begin_write(opts)?,
-        })
+        match &self.inner {
+            FsBackendInner::Persistent(inner) => Ok(FsWrite {
+                inner: FsWriteInner::Persistent(inner.begin_write(opts)?),
+            }),
+            FsBackendInner::Memory(inner) => Ok(FsWrite {
+                inner: FsWriteInner::Memory(inner.begin_write(opts)?),
+            }),
+        }
     }
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
+impl BackendRead for FsRead<'_> {
+    fn visit_keys<V>(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        match self {
+            Self::Persistent(read) => read.visit_keys(space, keys, opts, visitor),
+            Self::Memory(read) => read.visit_keys(space, keys, opts, visitor),
+        }
+    }
+
+    fn scan<V>(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        match self {
+            Self::Persistent(read) => read.scan(space, range, opts, visitor),
+            Self::Memory(read) => read.scan(space, range, opts, visitor),
+        }
+    }
+}
+
+#[cfg(feature = "fs_backend")]
 impl BackendWrite for FsWrite<'_> {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        self.inner.put_many(space, entries)
+        match &mut self.inner {
+            FsWriteInner::Persistent(write) => write.put_many(space, entries),
+            FsWriteInner::Memory(write) => write.put_many(space, entries),
+        }
     }
 
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(space, keys)
+        match &mut self.inner {
+            FsWriteInner::Persistent(write) => write.delete_many(space, keys),
+            FsWriteInner::Memory(write) => write.delete_many(space, keys),
+        }
     }
 
     fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(space, range)
+        match &mut self.inner {
+            FsWriteInner::Persistent(write) => write.delete_range(space, range),
+            FsWriteInner::Memory(write) => write.delete_range(space, range),
+        }
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
-        self.inner.commit()
+        match self.inner {
+            FsWriteInner::Persistent(write) => write.commit(),
+            FsWriteInner::Memory(write) => write.commit(),
+        }
     }
 
     fn rollback(self) -> Result<(), BackendError> {
-        self.inner.rollback()
+        match self.inner {
+            FsWriteInner::Persistent(write) => write.rollback(),
+            FsWriteInner::Memory(write) => write.rollback(),
+        }
     }
 }
 
@@ -320,7 +409,7 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     async fn open_filesystem<P>(
         backend: B,
         root: P,
@@ -422,7 +511,9 @@ where
         let root = std::fs::canonicalize(root)
             .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
         let path_filter = FilesystemPathFilter::from_filter(filter)?;
-        ensure_filesystem_lix_directory(&root)?;
+        if metadata_mode == FilesystemMetadataMode::Persistent {
+            ensure_filesystem_lix_directory(&root)?;
+        }
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
             session,
@@ -621,7 +712,7 @@ where
             if !local.files.contains_key(path)
                 && self.path_filter.includes_file(path)
                 && !is_plugin_storage_path(path)
-                && !is_materialization_ignored_path(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
             {
                 if previous
                     .as_ref()
@@ -648,7 +739,7 @@ where
             for path in lix.directories.difference(&local.directories) {
                 if path.as_str() == "/"
                     || is_plugin_storage_path(path)
-                    || is_materialization_ignored_path(path)
+                    || is_materialization_ignored_path(path, self.metadata_mode)
                 {
                     continue;
                 }
@@ -701,7 +792,7 @@ where
         for (path, data) in local
             .files
             .iter()
-            .filter(|(path, _)| !is_materialization_ignored_path(path))
+            .filter(|(path, _)| !is_materialization_ignored_path(path, self.metadata_mode))
         {
             if previous
                 .as_ref()
@@ -764,7 +855,7 @@ where
         for path in local.files.keys().filter(|path| {
             self.path_filter.includes_file(path)
                 && !target.files.contains_key(*path)
-                && !is_materialization_ignored_path(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
                 && previous
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.files.contains_key(*path))
@@ -782,7 +873,10 @@ where
             let mut directories_to_remove = local
                 .directories
                 .difference(&target.directories)
-                .filter(|path| path.as_str() != "/" && !is_materialization_ignored_path(path))
+                .filter(|path| {
+                    path.as_str() != "/"
+                        && !is_materialization_ignored_path(path, self.metadata_mode)
+                })
                 .filter(|path| {
                     previous
                         .as_ref()
@@ -809,7 +903,7 @@ where
             .filter(|path| {
                 path.as_str() != "/"
                     && self.path_filter.includes_directory(path)
-                    && !is_materialization_ignored_path(path)
+                    && !is_materialization_ignored_path(path, self.metadata_mode)
             })
             .filter(|path| base.is_none_or(|snapshot| !snapshot.directories.contains(*path)))
             .filter(|path| {
@@ -825,7 +919,8 @@ where
         }
 
         for (path, data) in target.files.iter().filter(|(path, _)| {
-            self.path_filter.includes_file(path) && !is_materialization_ignored_path(path)
+            self.path_filter.includes_file(path)
+                && !is_materialization_ignored_path(path, self.metadata_mode)
         }) {
             if base.is_some_and(|snapshot| snapshot.files.get(path) == Some(data)) {
                 continue;
@@ -1527,7 +1622,7 @@ fn is_filesystem_internal_path(path: &str) -> bool {
 fn is_filesystem_sync_ignored_local_path(
     root: &Path,
     path: &Path,
-    _metadata_mode: FilesystemMetadataMode,
+    metadata_mode: FilesystemMetadataMode,
 ) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
@@ -1543,6 +1638,12 @@ fn is_filesystem_sync_ignored_local_path(
         if segment == Some(".git") {
             return true;
         }
+        if metadata_mode == FilesystemMetadataMode::Ephemeral
+            && depth == 1
+            && segment == Some(".lix")
+        {
+            return true;
+        }
         if depth == 1 && segment == Some(".lix") {
             first_segment_is_lix = true;
         }
@@ -1556,12 +1657,20 @@ fn is_filesystem_sync_ignored_local_path(
     false
 }
 
-fn is_materialization_ignored_path(path: &str) -> bool {
-    is_filesystem_metadata_path(path)
+fn is_materialization_ignored_path(path: &str, metadata_mode: FilesystemMetadataMode) -> bool {
+    match metadata_mode {
+        FilesystemMetadataMode::Persistent => is_filesystem_metadata_path(path),
+        FilesystemMetadataMode::Ephemeral => is_lix_storage_path(path),
+    }
 }
 
-fn is_filesystem_sync_ignored_lix_path(path: &str, _metadata_mode: FilesystemMetadataMode) -> bool {
-    lix_path_contains_segment(path, ".git") || is_materialization_ignored_path(path)
+fn is_filesystem_sync_ignored_lix_path(path: &str, metadata_mode: FilesystemMetadataMode) -> bool {
+    lix_path_contains_segment(path, ".git") || is_materialization_ignored_path(path, metadata_mode)
+}
+
+fn is_lix_storage_path(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path == "/.lix" || path.starts_with("/.lix/")
 }
 
 fn lix_path_contains_segment(path: &str, segment: &str) -> bool {
@@ -1610,36 +1719,75 @@ fn filesystem_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_FILESYSTEM_ERROR", message)
 }
 
-#[cfg(feature = "rocksdb")]
-fn open_filesystem_rocksdb_backend(
-    dir: &Path,
-    blob: RocksDbBlobOptions,
-) -> Result<RocksDbFilesystemBackend, LixError> {
+#[cfg(feature = "fs_backend")]
+fn open_filesystem_rocksdb_backend(dir: &Path) -> Result<RocksDbFilesystemBackend, LixError> {
     ensure_filesystem_root_directory(dir)?;
     let metadata_dir = ensure_filesystem_rocksdb_metadata_directory(dir)?;
-    RocksDbFilesystemBackend::open_with_options(RocksDbFilesystemBackendOptions {
-        path: metadata_dir,
-        blob,
-    })
-    .map_err(rocksdb_backend_error)
+    RocksDbFilesystemBackend::open(metadata_dir).map_err(rocksdb_backend_error)
 }
 
-#[cfg(feature = "rocksdb")]
-fn default_rocksdb_blob_options() -> RocksDbBlobOptions {
-    RocksDbBlobOptions::default()
-}
-
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 fn ensure_filesystem_rocksdb_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
     let lix_dir = ensure_filesystem_lix_directory(dir)?;
     let internal_dir = lix_dir.join(".internal");
+    reset_legacy_filesystem_internal_directory(&internal_dir)?;
     ensure_metadata_directory(&internal_dir, "filesystem metadata directory")?;
     let metadata_dir = internal_dir.join("rocksdb");
     ensure_metadata_directory(&metadata_dir, "filesystem RocksDB metadata directory")?;
     Ok(metadata_dir)
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
+fn reset_legacy_filesystem_internal_directory(internal_dir: &Path) -> Result<(), LixError> {
+    if internal_dir.join("rocksdb").exists() {
+        return Ok(());
+    }
+    if !legacy_filesystem_sqlite_metadata_exists(internal_dir) {
+        return Ok(());
+    }
+
+    let metadata = std::fs::symlink_metadata(internal_dir).map_err(|error| {
+        io_error(
+            "read legacy filesystem metadata directory",
+            internal_dir,
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        let display = internal_dir.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata directory {display} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let display = internal_dir.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata path {display} must be a directory"
+        )));
+    }
+
+    std::fs::remove_dir_all(internal_dir).map_err(|error| {
+        io_error(
+            "remove legacy filesystem metadata directory",
+            internal_dir,
+            error,
+        )
+    })
+}
+
+#[cfg(feature = "fs_backend")]
+fn legacy_filesystem_sqlite_metadata_exists(internal_dir: &Path) -> bool {
+    [
+        "db.sqlite",
+        "db.sqlite-wal",
+        "db.sqlite-shm",
+        "db.sqlite-journal",
+    ]
+    .iter()
+    .any(|name| internal_dir.join(name).exists())
+}
+
+#[cfg(feature = "fs_backend")]
 fn ensure_metadata_directory(path: &Path, label: &str) -> Result<(), LixError> {
     match std::fs::create_dir(path) {
         Ok(()) => {}
@@ -1678,7 +1826,7 @@ fn ensure_gitignore(directory: &Path, content: &[u8]) -> Result<(), LixError> {
         .map_err(|error| io_error("write filesystem .gitignore", &gitignore, error))
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 fn rocksdb_backend_error(error: BackendError) -> LixError {
     LixError::new(
         LixError::CODE_STORAGE_ERROR,
@@ -1689,10 +1837,10 @@ fn rocksdb_backend_error(error: BackendError) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     use lix_engine::Value;
 
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     async fn lix_read_file<B>(
         session: &SessionContext<B>,
         path: &str,
@@ -1715,7 +1863,7 @@ mod tests {
             .transpose()
     }
 
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     async fn lix_write_file<B>(
         session: &SessionContext<B>,
         path: &str,
@@ -1829,13 +1977,11 @@ mod tests {
         assert_eq!(lix_file_upsert_chunk_end(&files, 0, 10, 8), 1);
     }
 
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_remembers_canonical_snapshot_for_idle_skip() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend =
-            open_filesystem_rocksdb_backend(tempdir.path(), default_rocksdb_blob_options())
-                .unwrap();
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
         let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
@@ -1862,13 +2008,11 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_does_not_reimport_unchanged_materialized_file_deleted_in_lix() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend =
-            open_filesystem_rocksdb_backend(tempdir.path(), default_rocksdb_blob_options())
-                .unwrap();
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
         let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
@@ -1916,13 +2060,11 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_does_not_skip_lix_side_file_data_change() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend =
-            open_filesystem_rocksdb_backend(tempdir.path(), default_rocksdb_blob_options())
-                .unwrap();
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
         let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
@@ -1959,13 +2101,11 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "rocksdb")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_materialization_preserves_file_changed_after_import() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend =
-            open_filesystem_rocksdb_backend(tempdir.path(), default_rocksdb_blob_options())
-                .unwrap();
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
         let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();

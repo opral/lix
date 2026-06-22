@@ -1,16 +1,12 @@
-#[cfg(feature = "rocksdb")]
-use lix_fs_backend::{
-    RocksDbBlobOptions, RocksDbFilesystemBackend, RocksDbFilesystemBackendOptions,
-};
 use lix_sdk::{
     Backend, CreateBranchOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 use lix_sdk::{FsBackend, open_lix_with_backend};
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 use std::path::Path;
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -438,7 +434,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
@@ -462,25 +458,43 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     lix.close().await.unwrap();
 }
 
-#[cfg(feature = "rocksdb")]
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filesystem_initialization_wipes_legacy_sqlite_internal_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let internal_dir = tempdir.path().join(".lix/.internal");
+    std::fs::create_dir_all(&internal_dir).unwrap();
+    std::fs::write(internal_dir.join("db.sqlite"), b"legacy sqlite metadata").unwrap();
+    std::fs::write(internal_dir.join("old-cache"), b"legacy internal data").unwrap();
+    std::fs::write(tempdir.path().join("note.txt"), b"workspace").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert!(!internal_dir.join("db.sqlite").exists());
+    assert!(!internal_dir.join("old-cache").exists());
+    assert!(internal_dir.join("rocksdb").is_dir());
+    assert_eq!(
+        read_file(&lix, "/.lix/.internal/db.sqlite")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/note.txt").await.unwrap().as_deref(),
+        Some(b"workspace".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
+#[cfg(feature = "fs_backend")]
 async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     let backend = FsBackend::open(path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
 }
 
-#[cfg(feature = "rocksdb")]
-async fn open_lix_with_seeded_filesystem_metadata(path: &Path) -> Lix<RocksDbFilesystemBackend> {
-    let metadata_dir = path.join(".lix/.internal/rocksdb");
-    std::fs::create_dir_all(&metadata_dir).unwrap();
-    let backend = RocksDbFilesystemBackend::open_with_options(
-        RocksDbFilesystemBackendOptions::blob(metadata_dir, 32 * 1024),
-    )
-    .unwrap();
-    open_lix_with_backend(backend).await.unwrap()
-}
-
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
     let tempdir = tempfile::tempdir().unwrap();
     let backend_a = FsBackend::open(tempdir.path())
@@ -514,46 +528,6 @@ async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
 
     lix_a.close().await.unwrap();
     lix_b.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "rocksdb")]
-async fn fs_backend_open_uses_blobdb_32kib_by_default() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let default = FsBackend::open(tempdir.path())
-        .await
-        .expect("default fs backend opens");
-
-    let same_options = FsBackend::open_with_rocksdb_blob_options(
-        tempdir.path(),
-        Default::default(),
-        RocksDbBlobOptions::Enabled {
-            min_blob_size: 32 * 1024,
-            blob_file_size: 256 * 1024 * 1024,
-            enable_gc: true,
-            gc_age_cutoff: 0.25,
-        },
-    )
-    .await
-    .expect("explicit default BlobDB options should match FsBackend::open");
-    drop(same_options);
-
-    let Err(error) = FsBackend::open_with_rocksdb_blob_options(
-        tempdir.path(),
-        Default::default(),
-        RocksDbBlobOptions::Disabled,
-    )
-    .await
-    else {
-        panic!("plain RocksDB options should not match FsBackend::open");
-    };
-    assert!(
-        error
-            .message
-            .contains("already open with different options"),
-        "error should explain option mismatch: {error:?}"
-    );
-    drop(default);
 }
 
 async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
@@ -672,7 +646,7 @@ where
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_creates_gitignore_files_for_lix_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
 
@@ -692,7 +666,7 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_initial_import_ignores_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
@@ -724,10 +698,10 @@ async fn filesystem_initial_import_ignores_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
-    let seed = open_lix_with_seeded_filesystem_metadata(tempdir.path()).await;
+    let seed = open_lix_with_filesystem(tempdir.path()).await;
     write_file(&seed, "/.git/config", b"old".to_vec())
         .await
         .unwrap();
@@ -746,15 +720,17 @@ async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let tempdir = tempfile::tempdir().unwrap();
-    let seed = open_lix_with_seeded_filesystem_metadata(tempdir.path()).await;
+    let seed = open_lix_with_filesystem(tempdir.path()).await;
     write_file(&seed, "/old.txt", b"old".to_vec())
         .await
         .unwrap();
     mkdir(&seed, "/old-empty/").await.unwrap();
     seed.close().await.unwrap();
+    std::fs::remove_file(tempdir.path().join("old.txt")).unwrap();
+    std::fs::remove_dir(tempdir.path().join("old-empty")).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
@@ -766,7 +742,7 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -833,7 +809,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_materializes_untracked_sdk_sql_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -868,7 +844,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -891,7 +867,7 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_watcher_ignores_git_entries_created_after_open() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -910,7 +886,7 @@ async fn filesystem_watcher_ignores_git_entries_created_after_open() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_materialization_skips_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -936,7 +912,7 @@ async fn filesystem_materialization_skips_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_imports_opaque_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
@@ -960,7 +936,7 @@ async fn filesystem_imports_opaque_lix_path_names() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "rocksdb"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_rejects_symlink_root() {
     use std::os::unix::fs::symlink;
 
@@ -976,7 +952,7 @@ async fn filesystem_rejects_symlink_root() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "rocksdb"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_ignores_symlinks_on_initial_import() {
     use std::os::unix::fs::symlink;
 
@@ -1019,7 +995,7 @@ async fn filesystem_ignores_symlinks_on_initial_import() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "rocksdb"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_ignores_special_and_invalid_utf8_entries() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -1057,7 +1033,7 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "rocksdb"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_watcher_ignores_symlinks_created_after_open() {
     use std::os::unix::fs::symlink;
 
@@ -1079,7 +1055,7 @@ async fn filesystem_watcher_ignores_symlinks_created_after_open() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "rocksdb"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_materialization_skips_symlink_collisions() {
     use std::os::unix::fs::symlink;
 
@@ -1146,7 +1122,7 @@ async fn filesystem_materialization_skips_symlink_collisions() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "rocksdb"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_materialization_skips_special_file_collisions() {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
@@ -1179,13 +1155,13 @@ async fn filesystem_materialization_skips_special_file_collisions() {
     lix.close().await.unwrap();
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 #[track_caller]
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 #[track_caller]
 fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -1203,7 +1179,7 @@ fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout
     }
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1219,7 +1195,7 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
     }
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

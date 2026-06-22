@@ -1,13 +1,10 @@
 //! Filesystem-specialized persistence backends for Lix.
 //!
-//! This crate intentionally owns filesystem backend experiments directly
-//! instead of routing RocksDB through the generic `lix_backends` crate.
+//! This internal crate owns the RocksDB implementation behind
+//! `lix_sdk::FsBackend`.
 
 #[cfg(feature = "rocksdb")]
 mod rocksdb;
 
 #[cfg(feature = "rocksdb")]
-pub use rocksdb::{
-    RocksDbBlobOptions, RocksDbFilesystemBackend, RocksDbFilesystemBackendOptions,
-    RocksDbFilesystemRead, RocksDbFilesystemWrite,
-};
+pub use rocksdb::{RocksDbFilesystemBackend, RocksDbFilesystemRead, RocksDbFilesystemWrite};

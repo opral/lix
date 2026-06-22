@@ -200,7 +200,7 @@ where
     }
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "fs_backend")]
 pub(crate) async fn open_or_initialize_filesystem_engine<B>(
     backend: B,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,

@@ -1091,7 +1091,7 @@ mod tests {
                 .expect("initial blob write should commit");
         }
 
-        crate::binary_cas::reset_binary_cas_write_metrics();
+        crate::binary_cas::metrics::reset_binary_cas_write_metrics();
         let store = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
@@ -1106,7 +1106,7 @@ mod tests {
             writes.stats().staged_puts,
             1 + u64::try_from(chunk_ranges.len()).expect("chunk count should fit in u64")
         );
-        let metrics = crate::binary_cas::binary_cas_write_metrics_snapshot();
+        let metrics = crate::binary_cas::metrics::binary_cas_write_metrics_snapshot();
         assert_eq!(metrics.chunk_lookup_count, chunk_hashes.len() as u64);
         assert_eq!(metrics.chunk_lookup_batch_count, 1);
         assert_eq!(metrics.chunk_lookup_hit_count, chunk_hashes.len() as u64);

@@ -26,8 +26,8 @@ Options:
 | --------- | ---------------------------- | -------------------------------------------------------------------- |
 | `backend` | `FsBackend \| SqliteBackend` | Optional storage backend. Omit it for the default in-memory backend. |
 
-Use `FsBackend` for a filesystem workspace directory backed by
-`<workspace>/.lix/.internal/db.sqlite`:
+Use `FsBackend` for a filesystem workspace directory backed by RocksDB at
+`<workspace>/.lix/.internal/rocksdb`:
 
 ```ts
 import { FsBackend, openLix } from "@lix-js/sdk";
@@ -37,12 +37,15 @@ const lix = await openLix({
 });
 ```
 
-Pass `storage: "memory"` to sync files from a directory without writing `.lix`
-repository metadata into that directory:
+Pass `storage: "memory"` for filesystem sync with an in-memory Lix repository.
+This does not write `<workspace>/.lix`:
 
 ```ts
 const lix = await openLix({
-	backend: new FsBackend({ path: "./workspace", storage: "memory" }),
+	backend: new FsBackend({
+		path: "./workspace",
+		storage: "memory",
+	}),
 });
 ```
 
@@ -56,7 +59,6 @@ watching, and materialization; it does not filter unrelated Lix SQL state.
 const lix = await openLix({
 	backend: new FsBackend({
 		path: "./workspace",
-		storage: "memory",
 		filter: { includePaths: ["notes/today.md"] },
 	}),
 });
