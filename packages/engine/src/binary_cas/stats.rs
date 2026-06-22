@@ -1,13 +1,13 @@
 use std::ops::Bound;
 
 use crate::LixError;
-use crate::backend::{
-    BackendError, BackendRead, CoreProjection, KeyRange, KeyRef, ProjectedValueRef, ScanOptions,
-    SpaceId,
-};
 use crate::binary_cas::codec::{BinaryCasManifest, decode_binary_cas_manifest};
 use crate::binary_cas::kv::{
     BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
+};
+use crate::storage::{
+    StorageBackendError, StorageBackendRead, StorageCoreProjection, StorageKeyRange, StorageKeyRef,
+    StorageProjectedValueRef, StorageRead, StorageScanOptions, StorageSpaceId,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,60 +26,62 @@ pub(crate) fn collect_binary_cas_storage_stats<R>(
     read: &R,
 ) -> Result<BinaryCasStorageStats, LixError>
 where
-    R: BackendRead + ?Sized,
+    R: StorageRead + ?Sized,
 {
-    let mut stats = BinaryCasStorageStats::default();
-    stats.manifest_rows = scan_space(
-        read,
-        BINARY_CAS_MANIFEST_SPACE.id,
-        CoreProjection::FullValue,
-        |value| {
-            let ProjectedValueRef::FullValue(bytes) = value else {
-                return Err(BackendError::Corruption(
-                    "binary CAS manifest scan returned key-only value".to_string(),
-                ));
-            };
-            let manifest = decode_binary_cas_manifest(bytes).map_err(|error| {
-                BackendError::Corruption(format!("invalid binary CAS manifest: {error}"))
-            })?;
-            stats.logical_blob_bytes += manifest.size_bytes();
-            match manifest {
-                BinaryCasManifest::Empty { .. } => stats.empty_blob_rows += 1,
-                BinaryCasManifest::SingleChunk { .. } => {
-                    stats.single_chunk_blob_rows += 1;
-                    stats.total_chunk_refs += 1;
+    Ok(read.with_backend(|backend_read| {
+        let mut stats = BinaryCasStorageStats::default();
+        stats.manifest_rows = scan_space(
+            backend_read,
+            BINARY_CAS_MANIFEST_SPACE.id,
+            StorageCoreProjection::FullValue,
+            |value| {
+                let StorageProjectedValueRef::FullValue(bytes) = value else {
+                    return Err(StorageBackendError::Corruption(
+                        "binary CAS manifest scan returned key-only value".to_string(),
+                    ));
+                };
+                let manifest = decode_binary_cas_manifest(bytes).map_err(|error| {
+                    StorageBackendError::Corruption(format!("invalid binary CAS manifest: {error}"))
+                })?;
+                stats.logical_blob_bytes += manifest.size_bytes();
+                match manifest {
+                    BinaryCasManifest::Empty { .. } => stats.empty_blob_rows += 1,
+                    BinaryCasManifest::SingleChunk { .. } => {
+                        stats.single_chunk_blob_rows += 1;
+                        stats.total_chunk_refs += 1;
+                    }
+                    BinaryCasManifest::Chunked { chunk_count, .. } => {
+                        stats.chunked_blob_rows += 1;
+                        stats.total_chunk_refs += u64::from(chunk_count);
+                    }
                 }
-                BinaryCasManifest::Chunked { chunk_count, .. } => {
-                    stats.chunked_blob_rows += 1;
-                    stats.total_chunk_refs += u64::from(chunk_count);
-                }
-            }
-            Ok(())
-        },
-    )?;
-    stats.manifest_chunk_rows = count_space(read, BINARY_CAS_MANIFEST_CHUNK_SPACE.id)?;
-    stats.chunk_rows = count_space(read, BINARY_CAS_CHUNK_SPACE.id)?;
-    Ok(stats)
+                Ok(())
+            },
+        )?;
+        stats.manifest_chunk_rows = count_space(backend_read, BINARY_CAS_MANIFEST_CHUNK_SPACE.id)?;
+        stats.chunk_rows = count_space(backend_read, BINARY_CAS_CHUNK_SPACE.id)?;
+        Ok(stats)
+    })?)
 }
 
-fn count_space<R>(read: &R, space: SpaceId) -> Result<u64, LixError>
+fn count_space<R>(read: &R, space: StorageSpaceId) -> Result<u64, StorageBackendError>
 where
-    R: BackendRead + ?Sized,
+    R: StorageBackendRead + ?Sized,
 {
-    scan_space(read, space, CoreProjection::KeyOnly, |_| Ok(()))
+    scan_space(read, space, StorageCoreProjection::KeyOnly, |_| Ok(()))
 }
 
 fn scan_space<R, F>(
     read: &R,
-    space: SpaceId,
-    projection: CoreProjection,
+    space: StorageSpaceId,
+    projection: StorageCoreProjection,
     mut visit: F,
-) -> Result<u64, LixError>
+) -> Result<u64, StorageBackendError>
 where
-    R: BackendRead + ?Sized,
-    F: for<'a> FnMut(ProjectedValueRef<'a>) -> Result<(), BackendError>,
+    R: StorageBackendRead + ?Sized,
+    F: for<'a> FnMut(StorageProjectedValueRef<'a>) -> Result<(), StorageBackendError>,
 {
-    let range = KeyRange {
+    let range = StorageKeyRange {
         lower: Bound::Unbounded,
         upper: Bound::Unbounded,
     };
@@ -92,12 +94,12 @@ where
         let result = read.scan(
             space,
             range.clone(),
-            ScanOptions {
+            StorageScanOptions {
                 projection,
                 limit_rows: 4096,
                 resume_after: resume_after.as_ref(),
             },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            &mut |key: StorageKeyRef<'_>, value: StorageProjectedValueRef<'_>| {
                 emitted += 1;
                 last_key = Some(key.to_owned_key());
                 visit(value)
@@ -116,17 +118,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{Backend, InMemoryBackend, ReadOptions, WriteOptions};
     use crate::binary_cas::BlobHash;
     use crate::binary_cas::codec::BinaryChunkCodec;
     use crate::binary_cas::kv::{
         KvBlobManifestChunk, stage_chunk, stage_manifest, stage_manifest_chunk,
     };
-    use crate::storage::StorageContext;
+    use crate::storage::{
+        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
+    };
 
     #[test]
     fn counts_binary_cas_storage_rows() {
-        let backend = InMemoryBackend::new();
+        let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend.clone());
         let mut writes = storage.new_write_set();
 
@@ -188,10 +191,10 @@ mod tests {
         }
 
         storage
-            .commit_write_set(writes, WriteOptions::default())
+            .commit_write_set(writes, StorageWriteOptions::default())
             .expect("CAS test rows should commit");
-        let read = backend
-            .begin_read(ReadOptions::default())
+        let read = storage
+            .begin_read(StorageReadOptions::default())
             .expect("CAS test read should open");
 
         let stats = collect_binary_cas_storage_stats(&read).expect("stats should collect");

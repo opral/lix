@@ -31,7 +31,8 @@ pub use crate::backend::{
     BackendError as StorageBackendError, CoreProjection as StorageCoreProjection,
     GetOptions as StorageGetOptions, InMemoryBackend as InMemoryStorageBackend,
     InMemoryRead as InMemoryStorageRead, InMemoryWrite as InMemoryStorageWrite, Key as StorageKey,
-    KeyRange as StorageKeyRange, Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
+    KeyRange as StorageKeyRange, KeyRef as StorageKeyRef, Prefix as StoragePrefix,
+    ProjectedValue as StorageProjectedValue, ProjectedValueRef as StorageProjectedValueRef,
     ReadOptions as StorageReadOptions, ScanOptions as StorageScanOptions,
     SpaceId as StorageSpaceId, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
 };
