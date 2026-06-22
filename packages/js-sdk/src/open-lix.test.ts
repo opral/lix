@@ -19,6 +19,7 @@ import {
 	type ExecuteResult,
 	type Lix,
 } from "./index.js";
+import { addon } from "./native.js";
 
 test("openLix exposes the lix-sdk e2e flow", async () => {
 	const lix = await openLix();
@@ -282,6 +283,17 @@ test.each([
 	expect(get(blob, "bytes")).toEqual(bytes);
 
 	await lix.close();
+});
+
+test("native fs open returns a promise", async () => {
+	const dir = tempFsDir();
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "note.md"), "local");
+
+	const native = addon.Lix.openFs(dir, "memory", undefined);
+	expect(native).toBeInstanceOf(Promise);
+	const lix = await native;
+	lix.close();
 });
 
 test("fs backend imports local files and materializes lix_file writes", async () => {

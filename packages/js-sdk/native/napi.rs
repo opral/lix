@@ -194,9 +194,17 @@ impl NativeObserveEventsInner {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 enum NativeFsBackendStorage {
     Persistent,
     Memory,
+}
+
+#[derive(Debug)]
+pub struct OpenFsTask {
+    path: String,
+    storage: NativeFsBackendStorage,
+    filter: FsBackendFilter,
 }
 
 fn parse_fs_backend_storage(env: &Env, storage: Option<String>) -> Result<NativeFsBackendStorage> {
@@ -230,6 +238,47 @@ fn parse_fs_backend_filter(
         ));
     }
     Ok(FsBackendFilter::include_paths(include_paths))
+}
+
+impl Task for OpenFsTask {
+    type Output = std::result::Result<NativeLix, LixError>;
+    type JsValue = NativeLix;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(open_fs_native(
+            std::mem::take(&mut self.path),
+            self.storage,
+            std::mem::take(&mut self.filter),
+        ))
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+
+fn open_fs_native(
+    path: String,
+    storage: NativeFsBackendStorage,
+    filter: FsBackendFilter,
+) -> std::result::Result<NativeLix, LixError> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
+    let backend = rt.block_on(async {
+        match storage {
+            NativeFsBackendStorage::Persistent => FsBackend::open_with_filter(path, filter).await,
+            NativeFsBackendStorage::Memory => {
+                FsBackend::open_memory_with_filter(path, filter).await
+            }
+        }
+    })?;
+    let lix = rt.block_on(open_lix_with_backend(backend))?;
+    Ok(NativeLix {
+        rt,
+        lix: Some(NativeLixInner::Fs(lix)),
+    })
 }
 
 #[napi]
@@ -266,38 +315,20 @@ impl NativeLix {
         })
     }
 
-    #[napi(factory, js_name = "openFs")]
+    #[napi(js_name = "openFs")]
     pub fn open_fs(
         env: Env,
         path: String,
         storage: Option<String>,
         include_paths: Option<Vec<String>>,
-    ) -> Result<Self> {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(to_napi_error)?;
+    ) -> Result<AsyncTask<OpenFsTask>> {
         let storage = parse_fs_backend_storage(&env, storage)?;
         let filter = parse_fs_backend_filter(&env, include_paths)?;
-        let backend = rt
-            .block_on(async {
-                match storage {
-                    NativeFsBackendStorage::Persistent => {
-                        FsBackend::open_with_filter(path, filter).await
-                    }
-                    NativeFsBackendStorage::Memory => {
-                        FsBackend::open_memory_with_filter(path, filter).await
-                    }
-                }
-            })
-            .map_err(|error| throw_lix_error(&env, error))?;
-        let lix = rt
-            .block_on(open_lix_with_backend(backend))
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(Self {
-            rt,
-            lix: Some(NativeLixInner::Fs(lix)),
-        })
+        Ok(AsyncTask::new(OpenFsTask {
+            path,
+            storage,
+            filter,
+        }))
     }
 
     #[napi]

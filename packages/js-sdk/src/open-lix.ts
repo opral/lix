@@ -129,7 +129,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	}
 	if (options.backend instanceof FsBackend) {
 		return new Lix(
-			addon.Lix.openFs(
+			await addon.Lix.openFs(
 				options.backend.path,
 				options.backend.storage,
 				options.backend.filter?.includePaths,
