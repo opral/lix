@@ -59,5 +59,5 @@ pub(crate) fn record_binary_cas_transaction_duplicate_chunk() {
 }
 
 fn duration_ns(duration: Duration) -> u64 {
-    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+    u64::try_from(duration.as_nanos().min(u128::from(u64::MAX))).unwrap()
 }

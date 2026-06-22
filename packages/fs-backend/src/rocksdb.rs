@@ -552,8 +552,8 @@ impl Drop for WriterPermit {
 mod tests {
     use bytes::Bytes;
     use lix_engine::backend::{
-        Backend, BackendWrite, Key, PutBatch, PutEntry, ReadOptions, SpaceId, StoredValue,
-        WriteOptions, get_many,
+        Backend, BackendWrite, GetOptions, Key, PutBatch, PutEntry, ReadOptions, SpaceId,
+        StoredValue, WriteOptions, get_many,
     };
     use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig, run_backend_conformance};
     use std::env;
@@ -654,8 +654,8 @@ mod tests {
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
-        let result =
-            get_many(&read, SpaceId(0x0005_0003), &[key], Default::default()).expect("read chunk");
+        let result = get_many(&read, SpaceId(0x0005_0003), &[key], GetOptions::default())
+            .expect("read chunk");
         assert_eq!(result.values.len(), 1);
         assert_eq!(
             result.values[0].as_ref().map(|value| value.as_ref()),
@@ -678,13 +678,13 @@ mod tests {
 
         put_one(&backend_a, space, key_a.clone(), Bytes::from_static(b"a"));
         assert_eq!(
-            read_one(&backend_b, space, key_a.clone()),
+            read_one(&backend_b, space, key_a),
             Some(Bytes::from_static(b"a"))
         );
 
         put_one(&backend_b, space, key_b.clone(), Bytes::from_static(b"b"));
         assert_eq!(
-            read_one(&backend_a, space, key_b.clone()),
+            read_one(&backend_a, space, key_b),
             Some(Bytes::from_static(b"b"))
         );
     }
@@ -777,9 +777,8 @@ mod tests {
             return;
         };
 
-        let error = match RocksDbFilesystemBackend::open(path) {
-            Ok(_) => panic!("child process should not open RocksDB while parent holds the DB lock"),
-            Err(error) => error,
+        let Err(error) = RocksDbFilesystemBackend::open(path) else {
+            panic!("child process should not open RocksDB while parent holds the DB lock");
         };
 
         assert!(
@@ -812,7 +811,7 @@ mod tests {
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
-        let result = get_many(&read, space, &[key], Default::default()).expect("read one row");
+        let result = get_many(&read, space, &[key], GetOptions::default()).expect("read one row");
         result.values[0].clone().map(|value| match value {
             lix_engine::backend::ProjectedValue::FullValue(bytes) => bytes,
             lix_engine::backend::ProjectedValue::KeyOnly => Bytes::new(),

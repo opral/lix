@@ -39,13 +39,11 @@ impl BinaryCasContext {
         BinaryCasStoreReader { store }
     }
 
-    #[expect(clippy::unused_self)]
     #[allow(dead_code)]
     pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> BinaryCasWriter<'a> {
         BinaryCasWriter::new(writes, self.chunking)
     }
 
-    #[expect(clippy::unused_self)]
     pub(crate) fn writer_skipping_existing_chunks<'a, S>(
         &self,
         store: &'a S,

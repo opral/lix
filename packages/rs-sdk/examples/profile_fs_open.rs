@@ -15,6 +15,7 @@ use lix_engine::Value;
 use lix_sdk::{FsBackend, open_lix_with_backend};
 
 #[derive(Debug)]
+#[expect(clippy::struct_excessive_bools)]
 struct Args {
     in_place: bool,
     json: bool,
@@ -77,14 +78,14 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn parse_args() -> Args {
-    let mut raw = std::env::args().skip(1);
+    let raw = std::env::args().skip(1);
     let mut in_place = false;
     let mut json = false;
     let mut keep_workspace = false;
     let mut read_bench = false;
     let mut src = None;
 
-    while let Some(arg) = raw.next() {
+    for arg in raw {
         match arg.as_str() {
             "--in-place" => in_place = true,
             "--json" => json = true,
@@ -92,9 +93,10 @@ fn parse_args() -> Args {
             "--read-bench" => read_bench = true,
             _ if arg.starts_with("--") => panic!("unknown option '{arg}'"),
             _ => {
-                if src.replace(arg).is_some() {
-                    panic!("profile_fs_open accepts exactly one source directory");
-                }
+                assert!(
+                    src.replace(arg).is_none(),
+                    "profile_fs_open accepts exactly one source directory"
+                );
             }
         }
     }

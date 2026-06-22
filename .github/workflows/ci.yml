@@ -58,6 +58,11 @@ jobs:
           BINSTALL_NO_CONFIRM=true
           EOF
 
+      - name: Install LLVM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -76,6 +81,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install LLVM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
