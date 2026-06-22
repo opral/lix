@@ -1612,11 +1612,27 @@ fn is_plugin_storage_path(path: &str) -> bool {
 }
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
-    path == "/.lix/.gitignore" || path == "/.lix/.gitignore/" || is_filesystem_internal_path(path)
+    path == "/.lix/.gitignore"
+        || path == "/.lix/.gitignore/"
+        || is_filesystem_internal_path(path)
+        || is_legacy_filesystem_metadata_path(path)
 }
 
 fn is_filesystem_internal_path(path: &str) -> bool {
     path == "/.lix/.internal" || path.starts_with("/.lix/.internal/")
+}
+
+fn is_legacy_filesystem_metadata_path(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path == "/.lix_system"
+        || path.starts_with("/.lix_system/")
+        || path
+            .strip_prefix("/.lix/")
+            .is_some_and(is_legacy_filesystem_sqlite_metadata_name)
+}
+
+fn is_legacy_filesystem_sqlite_metadata_name(name: &str) -> bool {
+    LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES.contains(&name)
 }
 
 fn is_filesystem_sync_ignored_local_path(
@@ -1644,6 +1660,12 @@ fn is_filesystem_sync_ignored_local_path(
         {
             return true;
         }
+        if metadata_mode == FilesystemMetadataMode::Persistent
+            && depth == 1
+            && segment == Some(".lix_system")
+        {
+            return true;
+        }
         if depth == 1 && segment == Some(".lix") {
             first_segment_is_lix = true;
         }
@@ -1651,6 +1673,13 @@ fn is_filesystem_sync_ignored_local_path(
             return true;
         }
         if depth == 2 && first_segment_is_lix && segment == Some(".internal") {
+            return true;
+        }
+        if metadata_mode == FilesystemMetadataMode::Persistent
+            && depth == 2
+            && first_segment_is_lix
+            && segment.is_some_and(is_legacy_filesystem_sqlite_metadata_name)
+        {
             return true;
         }
     }
@@ -1729,12 +1758,21 @@ fn open_filesystem_rocksdb_backend(dir: &Path) -> Result<RocksDbFilesystemBacken
 #[cfg(feature = "fs_backend")]
 fn ensure_filesystem_rocksdb_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
     let lix_dir = ensure_filesystem_lix_directory(dir)?;
+    remove_legacy_filesystem_root_metadata(dir, &lix_dir)?;
     let internal_dir = lix_dir.join(".internal");
     reset_legacy_filesystem_internal_directory(&internal_dir)?;
     ensure_metadata_directory(&internal_dir, "filesystem metadata directory")?;
     let metadata_dir = internal_dir.join("rocksdb");
     ensure_metadata_directory(&metadata_dir, "filesystem RocksDB metadata directory")?;
     Ok(metadata_dir)
+}
+
+#[cfg(feature = "fs_backend")]
+fn remove_legacy_filesystem_root_metadata(root: &Path, lix_dir: &Path) -> Result<(), LixError> {
+    for name in LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES {
+        remove_legacy_metadata_file(&lix_dir.join(name))?;
+    }
+    remove_legacy_metadata_path(&root.join(".lix_system"))
 }
 
 #[cfg(feature = "fs_backend")]
@@ -1777,14 +1815,71 @@ fn reset_legacy_filesystem_internal_directory(internal_dir: &Path) -> Result<(),
 
 #[cfg(feature = "fs_backend")]
 fn legacy_filesystem_sqlite_metadata_exists(internal_dir: &Path) -> bool {
-    [
-        "db.sqlite",
-        "db.sqlite-wal",
-        "db.sqlite-shm",
-        "db.sqlite-journal",
-    ]
-    .iter()
-    .any(|name| internal_dir.join(name).exists())
+    LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES
+        .iter()
+        .any(|name| internal_dir.join(name).exists())
+}
+
+#[cfg(feature = "fs_backend")]
+fn remove_legacy_metadata_file(path: &Path) -> Result<(), LixError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read legacy filesystem metadata file",
+                path,
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata file {display} must not be a symlink"
+        )));
+    }
+    if !metadata.is_file() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata path {display} must be a file"
+        )));
+    }
+    std::fs::remove_file(path)
+        .map_err(|error| io_error("remove legacy filesystem metadata file", path, error))
+}
+
+#[cfg(feature = "fs_backend")]
+fn remove_legacy_metadata_path(path: &Path) -> Result<(), LixError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read legacy filesystem metadata path",
+                path,
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata path {display} must not be a symlink"
+        )));
+    }
+    if metadata.is_dir() {
+        return std::fs::remove_dir_all(path)
+            .map_err(|error| io_error("remove legacy filesystem metadata directory", path, error));
+    }
+    if metadata.is_file() {
+        return std::fs::remove_file(path)
+            .map_err(|error| io_error("remove legacy filesystem metadata file", path, error));
+    }
+    let display = path.display();
+    Err(filesystem_error(format!(
+        "legacy filesystem metadata path {display} must be a file or directory"
+    )))
 }
 
 #[cfg(feature = "fs_backend")]
@@ -1825,6 +1920,13 @@ fn ensure_gitignore(directory: &Path, content: &[u8]) -> Result<(), LixError> {
     std::fs::write(&gitignore, content)
         .map_err(|error| io_error("write filesystem .gitignore", &gitignore, error))
 }
+
+const LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES: &[&str] = &[
+    "db.sqlite",
+    "db.sqlite-wal",
+    "db.sqlite-shm",
+    "db.sqlite-journal",
+];
 
 #[cfg(feature = "fs_backend")]
 fn rocksdb_backend_error(error: BackendError) -> LixError {

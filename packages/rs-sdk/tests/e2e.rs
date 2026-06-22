@@ -487,6 +487,49 @@ async fn filesystem_initialization_wipes_legacy_sqlite_internal_metadata() {
     lix.close().await.unwrap();
 }
 
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix_dir = tempdir.path().join(".lix");
+    let system_dir = tempdir.path().join(".lix_system");
+    std::fs::create_dir_all(&lix_dir).unwrap();
+    std::fs::create_dir_all(&system_dir).unwrap();
+    std::fs::write(lix_dir.join("db.sqlite"), b"legacy sqlite metadata").unwrap();
+    std::fs::write(lix_dir.join("db.sqlite-wal"), b"legacy sqlite wal").unwrap();
+    std::fs::write(system_dir.join("cache"), b"legacy system data").unwrap();
+    std::fs::write(tempdir.path().join("note.txt"), b"workspace").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert!(!lix_dir.join("db.sqlite").exists());
+    assert!(!lix_dir.join("db.sqlite-wal").exists());
+    assert!(!system_dir.exists());
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite").await.unwrap().as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite-wal")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix_system/cache")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/note.txt").await.unwrap().as_deref(),
+        Some(b"workspace".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
 #[cfg(feature = "fs_backend")]
 async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     let backend = FsBackend::open(path).await.unwrap();
