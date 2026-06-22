@@ -30,6 +30,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
 
+use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
@@ -103,6 +104,7 @@ pub(super) async fn register_lix_file_active_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
@@ -114,6 +116,7 @@ pub(super) async fn register_lix_file_active_provider(
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
         )),
@@ -127,6 +130,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
@@ -137,6 +141,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
         )),
@@ -183,6 +188,7 @@ struct LixFileSpec {
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
@@ -195,6 +201,7 @@ impl LixFileSpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
@@ -203,6 +210,7 @@ impl LixFileSpec {
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -219,12 +227,14 @@ impl LixFileSpec {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
+        let mounted_filesystem = None;
         let plugin_host = write_ctx.plugin_host();
         Self {
             schema: lix_file_schema(),
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -236,6 +246,7 @@ impl LixFileSpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
@@ -244,6 +255,7 @@ impl LixFileSpec {
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -256,12 +268,14 @@ impl LixFileSpec {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
+        let mounted_filesystem = None;
         let plugin_host = write_ctx.plugin_host();
         Self {
             schema: lix_file_by_branch_schema(),
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -283,6 +297,7 @@ impl LixFileSpec {
             (
                 write_ctx.clone(),
                 Arc::clone(&self.blob_reader),
+                self.mounted_filesystem.clone(),
                 self.plugin_host.clone(),
                 Arc::clone(&self.schema),
                 request,
@@ -292,6 +307,7 @@ impl LixFileSpec {
             |(
                 write_ctx,
                 blob_reader,
+                mounted_filesystem,
                 plugin_host,
                 table_schema,
                 request,
@@ -315,9 +331,16 @@ impl LixFileSpec {
                         "sql2 lix_file plugin discovery failed: {error}"
                     ))
                 })?;
-                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)
+                lix_file_record_batch(
+                    &table_schema,
+                    &blob_reader,
+                    mounted_filesystem,
+                    plugin_render,
+                    needs_data,
+                    rows,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)
             },
         )
     }
@@ -388,6 +411,7 @@ impl TableSpec for LixFileSpec {
                 (
                     Arc::clone(&self.live_state),
                     Arc::clone(&self.blob_reader),
+                    self.mounted_filesystem.clone(),
                     self.plugin_host.clone(),
                     Arc::clone(&self.schema),
                     projection.cloned(),
@@ -400,6 +424,7 @@ impl TableSpec for LixFileSpec {
                 |(
                     live_state,
                     blob_reader,
+                    mounted_filesystem,
                     plugin_host,
                     batch_schema,
                     projection,
@@ -434,6 +459,7 @@ impl TableSpec for LixFileSpec {
                     let batch = lix_file_record_batch(
                         &batch_schema,
                         &blob_reader,
+                        mounted_filesystem,
                         plugin_render,
                         needs_data,
                         rows,
@@ -555,10 +581,21 @@ impl TableSpec for LixFileSpec {
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
-        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
-            || assignments.iter().any(|(column_name, expr)| {
-                column_name == "path" || physical_expr_contains_column(expr, "data")
-            });
+        let filters_need_data = filters.iter().any(|filter| contains_column(filter, "data"));
+        if filters_need_data {
+            return Err(lix_error_to_datafusion_error(
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "UPDATE lix_file WHERE data is not supported",
+                )
+                .with_hint(
+                    "Select lix_file.data first, then issue an UPDATE using id or path predicates.",
+                ),
+            ));
+        }
+        let needs_data = assignments.iter().any(|(column_name, expr)| {
+            column_name == "path" || physical_expr_contains_column(expr, "data")
+        });
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
@@ -807,9 +844,16 @@ impl UpsertSupport for LixFileSpec {
         .map_err(|error| {
             DataFusionError::Execution(format!("sql2 lix_file plugin discovery failed: {error}"))
         })?;
-        lix_file_record_batch(&self.schema, &self.blob_reader, plugin_render, true, rows)
-            .await
-            .map_err(lix_error_to_datafusion_error)
+        lix_file_record_batch(
+            &self.schema,
+            &self.blob_reader,
+            self.mounted_filesystem.clone(),
+            plugin_render,
+            true,
+            rows,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)
     }
 
     fn validate_conflict_pair(
@@ -1830,6 +1874,14 @@ fn lix_file_path_update_stage_from_batch(
                 has_blob_ref,
                 None,
             )?;
+        } else if !blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id)) {
+            return Err(lix_error_to_datafusion_error(
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "UPDATE lix_file path without data is not supported for descriptor-only files",
+                )
+                .with_hint("Assign data in the same UPDATE so Lix can materialize the moved file."),
+            ));
         }
     }
 
@@ -2250,6 +2302,7 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_render: Option<PluginRenderContext>,
     load_data: bool,
     rows: Vec<MaterializedLiveStateRow>,
@@ -2389,7 +2442,18 @@ async fn lix_file_record_batch(
                         }
                         None => None,
                     };
-                    Some(rendered.unwrap_or_default())
+                    match rendered {
+                        Some(data) => Some(data),
+                        None => match &mounted_filesystem {
+                            Some(mounted_filesystem) => Some(
+                                mounted_filesystem
+                                    .read_file_data(&path)
+                                    .await?
+                                    .unwrap_or_default(),
+                            ),
+                            None => Some(Vec::new()),
+                        },
+                    }
                 }
             }
         } else {
@@ -3297,7 +3361,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, StringArray};
@@ -3313,6 +3377,7 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use crate::LixError;
+    use crate::backend::MountedFilesystem;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
     use crate::changelog::{ChangeId, CommitId};
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
@@ -3568,6 +3633,12 @@ mod tests {
         bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
     }
 
+    #[derive(Default)]
+    struct TestMountedFilesystem {
+        bytes_by_path: BTreeMap<String, Vec<u8>>,
+        calls: Mutex<Vec<String>>,
+    }
+
     impl StaticBlobReader {
         fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
             Self {
@@ -3576,6 +3647,25 @@ mod tests {
                     .map(|bytes| (BlobHash::from_content(&bytes), bytes))
                     .collect(),
             }
+        }
+    }
+
+    impl TestMountedFilesystem {
+        fn from_files(files: impl IntoIterator<Item = (impl Into<String>, Vec<u8>)>) -> Self {
+            Self {
+                bytes_by_path: files
+                    .into_iter()
+                    .map(|(path, bytes)| (path.into(), bytes))
+                    .collect(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("resolver calls lock should not poison")
+                .clone()
         }
     }
 
@@ -3595,6 +3685,17 @@ mod tests {
                     .map(|hash| self.bytes_by_hash.get(hash).cloned())
                     .collect(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl MountedFilesystem for TestMountedFilesystem {
+        async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+            self.calls
+                .lock()
+                .expect("resolver calls lock should not poison")
+                .push(path.to_string());
+            Ok(self.bytes_by_path.get(path).cloned())
         }
     }
 
@@ -3994,6 +4095,7 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             vec![live_file_row(
                 "file-readme",
@@ -4020,6 +4122,7 @@ mod tests {
         let batch = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
+            None,
             None,
             true,
             vec![
@@ -4069,6 +4172,7 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            None,
             true,
             vec![
                 live_file_row(
@@ -4099,6 +4203,129 @@ mod tests {
             assert!(!data_column.is_null(index));
             assert_eq!(data_column.value(index), data.as_slice());
         }
+    }
+
+    #[tokio::test]
+    async fn file_projection_without_data_does_not_call_mounted_filesystem() {
+        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
+        let resolver = Arc::new(TestMountedFilesystem::from_files([(
+            "/note.md",
+            b"from disk".to_vec(),
+        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("path", DataType::Utf8, true)]));
+        let batch = super::lix_file_record_batch(
+            &schema,
+            &blob_reader,
+            Some(resolver.clone() as Arc<dyn MountedFilesystem>),
+            None,
+            true,
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                "{\"id\":\"file-note\",\"directory_id\":null,\"name\":\"note.md\"}",
+            )],
+        )
+        .await
+        .expect("path-only projection should not need file bytes");
+
+        assert_eq!(batch.num_rows(), 1);
+        assert!(resolver.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_projection_reads_unresolved_data_from_mounted_filesystem() {
+        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
+        let resolver = Arc::new(TestMountedFilesystem::from_files([(
+            "/note.md",
+            b"from disk".to_vec(),
+        )]));
+        let batch = super::lix_file_record_batch(
+            &super::lix_file_schema(),
+            &blob_reader,
+            Some(resolver.clone() as Arc<dyn MountedFilesystem>),
+            None,
+            true,
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                "{\"id\":\"file-note\",\"directory_id\":null,\"name\":\"note.md\"}",
+            )],
+        )
+        .await
+        .expect("unresolved descriptor should read through resolver");
+
+        let data_column = batch
+            .column(batch.schema().index_of("data").unwrap())
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("data should be binary array");
+        assert_eq!(data_column.value(0), b"from disk");
+        assert_eq!(resolver.calls(), vec!["/note.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn file_projection_prefers_blob_ref_over_mounted_filesystem() {
+        let data = b"from bcas".to_vec();
+        let blob_hash = BlobHash::from_content(&data).to_hex();
+        let blob_reader =
+            Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
+        let resolver = Arc::new(TestMountedFilesystem::from_files([(
+            "/note.md",
+            b"from disk".to_vec(),
+        )]));
+        let batch = super::lix_file_record_batch(
+            &super::lix_file_schema(),
+            &blob_reader,
+            Some(resolver.clone() as Arc<dyn MountedFilesystem>),
+            None,
+            true,
+            vec![
+                live_file_row(
+                    "file-note",
+                    "branch-b",
+                    "{\"id\":\"file-note\",\"directory_id\":null,\"name\":\"note.md\"}",
+                ),
+                live_blob_ref_row("file-note", "branch-b", "file-note", &blob_hash, data.len()),
+            ],
+        )
+        .await
+        .expect("blob ref data should take priority over resolver data");
+
+        let data_column = batch
+            .column(batch.schema().index_of("data").unwrap())
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("data should be binary array");
+        assert_eq!(data_column.value(0), b"from bcas");
+        assert!(resolver.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_projection_falls_back_when_mounted_filesystem_returns_none() {
+        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
+        let resolver = Arc::new(TestMountedFilesystem::default());
+        let batch = super::lix_file_record_batch(
+            &super::lix_file_schema(),
+            &blob_reader,
+            Some(resolver.clone() as Arc<dyn MountedFilesystem>),
+            None,
+            true,
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                "{\"id\":\"file-note\",\"directory_id\":null,\"name\":\"note.md\"}",
+            )],
+        )
+        .await
+        .expect("resolver miss should preserve existing fallback");
+
+        let data_column = batch
+            .column(batch.schema().index_of("data").unwrap())
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("data should be binary array");
+        assert_eq!(data_column.value(0), b"");
+        assert_eq!(resolver.calls(), vec!["/note.md".to_string()]);
     }
 
     #[tokio::test]

@@ -1,3 +1,8 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::LixError;
 use crate::backend::{
     BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId, WriteOptions,
@@ -34,6 +39,28 @@ pub trait Backend {
     /// Lix sessions intentionally do not add a generic per-backend write lock
     /// above this method.
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError>;
+
+    /// Returns an optional filesystem mounted by this backend.
+    ///
+    /// Backends that expose an external workspace can use this capability to
+    /// provide file bytes for descriptor-only `lix_file` rows. Plain storage
+    /// backends should keep the default `None`.
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        None
+    }
+}
+
+/// Optional backend capability for a mounted filesystem workspace.
+///
+/// Paths are canonical Lix paths such as `/docs/readme.md`, not host paths.
+/// Implementations own host path mapping, filters, ignored paths, and safety
+/// checks. Returning `Ok(None)` means the mounted filesystem cannot provide
+/// bytes for that Lix path; callers may fall back according to their surface
+/// semantics. Reads observe the live mounted filesystem, not the coherent Lix
+/// storage snapshot.
+#[async_trait]
+pub trait MountedFilesystem: Send + Sync {
+    async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, LixError>;
 }
 
 pub trait BackendRead {

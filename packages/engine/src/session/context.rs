@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
+use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
@@ -487,6 +488,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBacke
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
+    pub(super) mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
 }
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
@@ -532,6 +534,10 @@ where
     #[expect(trivial_casts)]
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
         Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
+    }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        self.mounted_filesystem.clone()
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {

@@ -4,8 +4,8 @@ use bytes::Bytes;
 
 use crate::backend::{
     Backend, BackendError, BackendWrite, CommitResult, CoreProjection, GetOptions, InMemoryBackend,
-    Key, KeyRange, Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, StoredValue,
-    WriteOptions, get_many,
+    Key, KeyRange, MountedFilesystem, Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions,
+    StoredValue, WriteOptions, get_many,
 };
 use crate::storage::{
     StorageRead, StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError,
@@ -43,6 +43,10 @@ where
         opts: ReadOptions,
     ) -> Result<StorageReadScope<B::Read<'_>>, BackendError> {
         self.backend.begin_read(opts).map(StorageReadScope::new)
+    }
+
+    pub fn mounted_filesystem(&self) -> Option<std::sync::Arc<dyn MountedFilesystem>> {
+        self.backend.mounted_filesystem()
     }
 
     pub fn new_write_set(&self) -> StorageWriteSet {

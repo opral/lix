@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use lix_engine::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
-    InMemoryBackend, Key, KeyRange, LixError, PointVisitor, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SessionContext, SpaceId, Value, WriteOptions,
+    InMemoryBackend, Key, KeyRange, LixError, MountedFilesystem, PointVisitor, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SessionContext, SpaceId, Value,
+    WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -20,6 +21,7 @@ use lix_fs_backend::RocksDbFilesystemBackend;
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const DESCRIPTOR_INSERT_BATCH_MAX_ROWS: usize = 500;
 const FILE_UPSERT_BATCH_MAX_ROWS: usize = 500;
 const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
@@ -115,6 +117,9 @@ where
 }
 
 struct FilesystemSupervisorInner {
+    root: PathBuf,
+    metadata_mode: FilesystemMetadataMode,
+    path_filter: FilesystemPathFilter,
     event_tx: mpsc::Sender<FilesystemEvent>,
     debouncer: Mutex<Option<FilesystemDebouncer>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -134,11 +139,44 @@ where
     last_materialized: Mutex<Option<MaterializedSnapshot>>,
 }
 
+#[derive(Clone)]
+struct FsMountedFilesystem {
+    root: PathBuf,
+    metadata_mode: FilesystemMetadataMode,
+    path_filter: FilesystemPathFilter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Snapshot {
     directories: BTreeSet<String>,
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeSet<String>,
+    stored_file_data: BTreeMap<String, Vec<u8>>,
     unmanaged_paths: BTreeSet<String>,
+}
+
+#[async_trait::async_trait]
+impl MountedFilesystem for FsMountedFilesystem {
+    async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+        if path.ends_with('/')
+            || !self.path_filter.includes_file(path)
+            || is_materialization_ignored_path(path, self.metadata_mode)
+        {
+            return Ok(None);
+        }
+        let local_path = lix_path_to_local_path(&self.root, path)?;
+        if path_contains_unmanaged_entry(&self.root, &local_path)? {
+            return Ok(None);
+        }
+        match std::fs::read(&local_path) {
+            Ok(data) => Ok(Some(data)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_error(
+                "read filesystem stored file data",
+                &local_path,
+                error,
+            )),
+        }
+    }
 }
 
 impl Snapshot {
@@ -155,6 +193,12 @@ impl Snapshot {
                 .collect(),
             files: self
                 .files
+                .iter()
+                .filter(|path| path_filter.includes_file(path))
+                .cloned()
+                .collect(),
+            stored_file_data: self
+                .stored_file_data
                 .iter()
                 .filter(|(path, _)| path_filter.includes_file(path))
                 .map(|(path, data)| (path.clone(), data.clone()))
@@ -331,6 +375,13 @@ impl Backend for FsBackend {
             }),
         }
     }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        match &self.inner {
+            FsBackendInner::Persistent(inner) => inner.mounted_filesystem(),
+            FsBackendInner::Memory(inner) => inner.mounted_filesystem(),
+        }
+    }
 }
 
 #[cfg(feature = "fs_backend")]
@@ -461,6 +512,14 @@ where
         self.inner.begin_read(opts)
     }
 
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        Some(Arc::new(FsMountedFilesystem {
+            root: self.supervisor.root().to_path_buf(),
+            metadata_mode: self.supervisor.metadata_mode(),
+            path_filter: self.supervisor.path_filter().clone(),
+        }))
+    }
+
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         Ok(FilesystemWrite {
             inner: self.inner.begin_write(opts)?,
@@ -520,9 +579,9 @@ where
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
             session,
-            root,
+            root: root.clone(),
             metadata_mode,
-            path_filter,
+            path_filter: path_filter.clone(),
             sync_lock: tokio::sync::Mutex::new(()),
             last_materialized: Mutex::new(None),
         });
@@ -565,6 +624,9 @@ where
 
         Ok(Self {
             inner: Arc::new(FilesystemSupervisorInner {
+                root,
+                metadata_mode,
+                path_filter,
                 event_tx,
                 debouncer: Mutex::new(debouncer),
                 worker: Mutex::new(Some(worker)),
@@ -590,6 +652,18 @@ where
                 "filesystem sync failed: filesystem worker stopped: {error}"
             ))),
         }
+    }
+
+    fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    fn metadata_mode(&self) -> FilesystemMetadataMode {
+        self.inner.metadata_mode
+    }
+
+    fn path_filter(&self) -> &FilesystemPathFilter {
+        &self.inner.path_filter
     }
 }
 
@@ -659,30 +733,43 @@ where
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
         let mut snapshot = Snapshot::default();
         snapshot.directories.insert("/".to_string());
-        let statements: [(&str, &[Value]); 2] = [
+        let statements: [(&str, &[Value]); 3] = [
             ("SELECT path FROM lix_directory ORDER BY path", &[]),
-            ("SELECT path, data FROM lix_file ORDER BY path", &[]),
+            ("SELECT path FROM lix_file ORDER BY path", &[]),
+            (
+                "SELECT path, data FROM lix_file \
+                 WHERE id IN (\
+                    SELECT file_id FROM lix_state \
+                    WHERE schema_key = 'lix_binary_blob_ref'\
+                 ) \
+                 ORDER BY path",
+                &[],
+            ),
         ];
         let batch = self
             .session
             .execute_coherent_read_batch(&statements)
             .await?;
-        let [directories, files] = batch.results.try_into().map_err(|results: Vec<_>| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "coherent filesystem snapshot read returned {} result sets",
-                    results.len()
-                ),
-            )
-        })?;
+        let [directories, files, stored_file_data] =
+            batch.results.try_into().map_err(|results: Vec<_>| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "coherent filesystem snapshot read returned {} result sets",
+                        results.len()
+                    ),
+                )
+            })?;
         for row in directories.rows() {
             snapshot.directories.insert(row.get::<String>("path")?);
         }
         for row in files.rows() {
+            snapshot.files.insert(row.get::<String>("path")?);
+        }
+        for row in stored_file_data.rows() {
             let path = row.get::<String>("path")?;
             let data = row.get::<Vec<u8>>("data")?;
-            snapshot.files.insert(path, data);
+            snapshot.stored_file_data.insert(path, data);
         }
 
         Ok(LixSnapshotRead {
@@ -712,15 +799,15 @@ where
         let lix = self.collect_lix_snapshot_read().await?;
         let mut needs_fresh_lix_read = false;
 
-        for path in lix.snapshot.files.keys() {
-            if !local.files.contains_key(path)
+        for path in &lix.snapshot.files {
+            if !local.files.contains(path)
                 && self.path_filter.includes_file(path)
                 && !is_plugin_storage_path(path)
                 && !is_materialization_ignored_path(path, self.metadata_mode)
             {
                 if previous
                     .as_ref()
-                    .is_some_and(|snapshot| !snapshot.files.contains_key(path))
+                    .is_some_and(|snapshot| !snapshot.files.contains(path))
                 {
                     continue;
                 }
@@ -785,35 +872,57 @@ where
             .cloned()
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
-        for path in directories_to_create {
+        if !directories_to_create.is_empty() {
             needs_fresh_lix_read = true;
-            self.session
-                .execute(
-                    "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-                    &[Value::Text(path)],
-                )
+            self.insert_local_directories_to_lix(&directories_to_create)
                 .await?;
         }
 
-        let mut files_to_upsert = Vec::new();
-        for (path, data) in local
+        let mut file_descriptors_to_insert = Vec::new();
+        let mut stored_file_data_to_upsert = Vec::new();
+        for path in local
             .files
             .iter()
-            .filter(|(path, _)| !is_materialization_ignored_path(path, self.metadata_mode))
+            .filter(|path| !is_materialization_ignored_path(path, self.metadata_mode))
         {
+            if !lix.snapshot.files.contains(path) {
+                if previous
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.files.contains(path))
+                {
+                    continue;
+                }
+                file_descriptors_to_insert.push(path.as_str());
+                continue;
+            }
+
+            if !lix.snapshot.stored_file_data.contains_key(path) {
+                continue;
+            }
+            let data = read_local_file_data(&self.root, path)?;
             if previous
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.files.get(path) == Some(data))
+                .is_some_and(|snapshot| snapshot.stored_file_data.get(path) == Some(&data))
             {
                 continue;
             }
-            if lix.snapshot.files.get(path) != Some(data) {
-                files_to_upsert.push((path.as_str(), data.as_slice()));
+            if lix.snapshot.stored_file_data.get(path) != Some(&data) {
+                stored_file_data_to_upsert.push((path.as_str(), data));
             }
         }
-        if !files_to_upsert.is_empty() {
+        if !file_descriptors_to_insert.is_empty() {
             needs_fresh_lix_read = true;
-            self.upsert_local_files_to_lix(&files_to_upsert).await?;
+            self.insert_local_file_descriptors_to_lix(&file_descriptors_to_insert)
+                .await?;
+        }
+        if !stored_file_data_to_upsert.is_empty() {
+            needs_fresh_lix_read = true;
+            let stored_file_data_to_upsert = stored_file_data_to_upsert
+                .iter()
+                .map(|(path, data)| (*path, data.as_slice()))
+                .collect::<Vec<_>>();
+            self.upsert_local_stored_file_data_to_lix(&stored_file_data_to_upsert)
+                .await?;
         }
 
         if needs_fresh_lix_read || self.collect_lix_revision().await? != lix.revision {
@@ -822,7 +931,37 @@ where
         Ok(lix)
     }
 
-    async fn upsert_local_files_to_lix(&self, files: &[(&str, &[u8])]) -> Result<(), LixError> {
+    async fn insert_local_directories_to_lix(
+        &self,
+        directories: &[String],
+    ) -> Result<(), LixError> {
+        for chunk in directories.chunks(DESCRIPTOR_INSERT_BATCH_MAX_ROWS) {
+            let sql = descriptor_insert_sql("lix_directory", chunk.len());
+            let params = chunk
+                .iter()
+                .map(|path| Value::Text(path.clone()))
+                .collect::<Vec<_>>();
+            self.session.execute(&sql, &params).await?;
+        }
+        Ok(())
+    }
+
+    async fn insert_local_file_descriptors_to_lix(&self, files: &[&str]) -> Result<(), LixError> {
+        for chunk in files.chunks(DESCRIPTOR_INSERT_BATCH_MAX_ROWS) {
+            let sql = descriptor_insert_sql("lix_file", chunk.len());
+            let params = chunk
+                .iter()
+                .map(|path| Value::Text((*path).to_string()))
+                .collect::<Vec<_>>();
+            self.session.execute(&sql, &params).await?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_local_stored_file_data_to_lix(
+        &self,
+        files: &[(&str, &[u8])],
+    ) -> Result<(), LixError> {
         let mut start = 0;
         while start < files.len() {
             let end = lix_file_upsert_chunk_end(
@@ -865,17 +1004,17 @@ where
         let local = collect_local_snapshot(&self.root, self.metadata_mode, &self.path_filter)?;
         let previous = self.last_materialized_disk();
 
-        for path in local.files.keys().filter(|path| {
+        for path in local.files.iter().filter(|path| {
             self.path_filter.includes_file(path)
-                && !target.files.contains_key(*path)
+                && !target.files.contains(*path)
                 && !is_materialization_ignored_path(path, self.metadata_mode)
                 && previous
                     .as_ref()
-                    .is_none_or(|snapshot| snapshot.files.contains_key(*path))
+                    .is_none_or(|snapshot| snapshot.files.contains(*path))
         }) {
             if base.is_some_and(|snapshot| {
-                !snapshot.files.contains_key(path)
-                    || snapshot.files.get(path) != local.files.get(path)
+                !snapshot.files.contains(path)
+                    || snapshot.stored_file_data.get(path) != local.stored_file_data.get(path)
             }) {
                 continue;
             }
@@ -931,17 +1070,31 @@ where
             create_materialized_directory(&self.root, &path, self.metadata_mode)?;
         }
 
-        for (path, data) in target.files.iter().filter(|(path, _)| {
+        for (path, data) in target.stored_file_data.iter().filter(|(path, _)| {
             self.path_filter.includes_file(path)
                 && !is_materialization_ignored_path(path, self.metadata_mode)
         }) {
-            if base.is_some_and(|snapshot| snapshot.files.get(path) == Some(data)) {
+            if base.is_some_and(|snapshot| snapshot.stored_file_data.get(path) == Some(data)) {
                 continue;
             }
-            if base.is_some_and(|snapshot| snapshot.files.get(path) != local.files.get(path)) {
-                continue;
+            let local_data = if local.files.contains(path) {
+                Some(read_local_file_data(&self.root, path)?)
+            } else {
+                None
+            };
+            if base.is_some() && local_data.is_some() && local_data.as_ref() != Some(data) {
+                let base_matches_local = base
+                    .and_then(|snapshot| snapshot.stored_file_data.get(path))
+                    .is_some_and(|base_data| Some(base_data) == local_data.as_ref());
+                let previous_matches_local = previous
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.stored_file_data.get(path))
+                    .is_some_and(|previous_data| Some(previous_data) == local_data.as_ref());
+                if !base_matches_local && !previous_matches_local {
+                    continue;
+                }
             }
-            if local.files.get(path) != Some(data) {
+            if local_data.as_ref() != Some(data) {
                 write_materialized_file(&self.root, path, data, self.metadata_mode)?;
             }
         }
@@ -1227,9 +1380,7 @@ fn collect_local_directory_shallow(
                 remember_unmanaged_local_path(root, directory, &path, snapshot);
                 continue;
             };
-            let data = std::fs::read(&path)
-                .map_err(|error| io_error("read filesystem file", &path, error))?;
-            snapshot.files.insert(lix_path, data);
+            snapshot.files.insert(lix_path);
         }
     }
     Ok(child_dirs)
@@ -1238,7 +1389,13 @@ fn collect_local_directory_shallow(
 fn merge_snapshot(target: &mut Snapshot, source: Snapshot) {
     target.directories.extend(source.directories);
     target.files.extend(source.files);
+    target.stored_file_data.extend(source.stored_file_data);
     target.unmanaged_paths.extend(source.unmanaged_paths);
+}
+
+fn read_local_file_data(root: &Path, path: &str) -> Result<Vec<u8>, LixError> {
+    let local_path = lix_path_to_local_path(root, path)?;
+    std::fs::read(&local_path).map_err(|error| io_error("read filesystem file", &local_path, error))
 }
 
 fn collect_filtered_local_snapshot(
@@ -1275,9 +1432,7 @@ fn collect_filtered_local_snapshot(
             continue;
         }
         insert_parent_lix_directories(lix_path, snapshot);
-        let data = std::fs::read(&local_path)
-            .map_err(|error| io_error("read filesystem file", &local_path, error))?;
-        snapshot.files.insert(lix_path.clone(), data);
+        snapshot.files.insert(lix_path.clone());
     }
     Ok(())
 }
@@ -1498,6 +1653,19 @@ fn lix_file_upsert_sql(row_count: usize) -> String {
         let _ = write!(sql, "(${}, ${})", row * 2 + 1, row * 2 + 2);
     }
     sql.push_str(" ON CONFLICT (path) DO UPDATE SET data = excluded.data");
+    sql
+}
+
+fn descriptor_insert_sql(table_name: &str, row_count: usize) -> String {
+    debug_assert!(row_count > 0);
+    let mut sql = format!("INSERT INTO {table_name} (path) VALUES ");
+    for row in 0..row_count {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "(${})", row + 1);
+    }
+    sql.push_str(" ON CONFLICT (path) DO NOTHING");
     sql
 }
 
@@ -2154,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_local_snapshot_hydrates_top_level_directories() {
+    fn collect_local_snapshot_records_descriptors_without_file_data() {
         let tempdir = tempfile::tempdir().unwrap();
         let root = tempdir.path();
 
@@ -2175,7 +2343,7 @@ mod tests {
         .unwrap();
 
         assert!(snapshot.directories.contains("/"));
-        assert_eq!(snapshot.files.get("/root.txt").unwrap(), b"root");
+        assert!(snapshot.files.contains("/root.txt"));
         for index in 0..FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS {
             assert!(snapshot.directories.contains(&format!("/dir-{index}/")));
             assert!(
@@ -2183,25 +2351,18 @@ mod tests {
                     .directories
                     .contains(&format!("/dir-{index}/nested/"))
             );
-            assert_eq!(
+            assert!(snapshot.files.contains(&format!("/dir-{index}/file.txt")));
+            assert!(
                 snapshot
                     .files
-                    .get(&format!("/dir-{index}/file.txt"))
-                    .unwrap(),
-                format!("file-{index}").as_bytes()
-            );
-            assert_eq!(
-                snapshot
-                    .files
-                    .get(&format!("/dir-{index}/nested/deep.txt"))
-                    .unwrap(),
-                format!("deep-{index}").as_bytes()
+                    .contains(&format!("/dir-{index}/nested/deep.txt"))
             );
         }
         assert_eq!(
             snapshot.files.len(),
             1 + (FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS * 2)
         );
+        assert!(snapshot.stored_file_data.is_empty());
         assert!(snapshot.unmanaged_paths.is_empty());
     }
 
@@ -2393,14 +2554,9 @@ mod tests {
             .apply_local_snapshot_to_lix(&local, previous.as_ref())
             .await
             .unwrap();
-
-        assert_eq!(
-            lix_read_file(&state.session, "/disk.txt")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(b"disk".as_slice())
-        );
+        lix_write_file(&state.session, "/disk.txt", b"disk".to_vec())
+            .await
+            .unwrap();
         std::fs::write(&disk_path, b"changed").unwrap();
 
         let target = state.collect_lix_snapshot_read().await.unwrap();
@@ -2420,5 +2576,279 @@ mod tests {
         );
 
         state.close().await.unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_mounted_filesystem_reads_disk_file_data() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let resolver = backend
+            .mounted_filesystem()
+            .expect("FsBackend should expose mounted filesystem");
+
+        let data = resolver
+            .read_file_data("/note.md")
+            .await
+            .expect("mounted filesystem read should succeed")
+            .expect("mounted filesystem should find included file");
+        assert_eq!(data, b"from disk");
+
+        let missing = resolver
+            .read_file_data("/missing.md")
+            .await
+            .expect("missing mounted filesystem read should not fail");
+        assert_eq!(missing, None);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_mounted_filesystem_respects_include_filter() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("included.md"), b"included").unwrap();
+        std::fs::write(tempdir.path().join("excluded.md"), b"excluded").unwrap();
+
+        let backend = FsBackend::open_memory_with_filter(
+            tempdir.path(),
+            FsBackendFilter::include_paths(vec!["included.md".to_string()]),
+        )
+        .await
+        .unwrap();
+        let resolver = backend
+            .mounted_filesystem()
+            .expect("FsBackend should expose mounted filesystem");
+
+        assert_eq!(
+            resolver
+                .read_file_data("/included.md")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"included".as_slice())
+        );
+        assert_eq!(resolver.read_file_data("/excluded.md").await.unwrap(), None);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_memory_opens_descriptor_only_and_lazy_reads_data() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let files = session
+            .execute(
+                "SELECT path FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(files.rows()[0].get::<String>("path").unwrap(), "/note.md");
+
+        let blob_refs = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key = $1",
+                &[Value::Text("lix_binary_blob_ref".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            blob_refs.rows()[0].get::<i64>("count").unwrap(),
+            0,
+            "opening an ephemeral filesystem workspace should sync descriptors without importing stored file data"
+        );
+
+        let data = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.rows()[0].get::<Vec<u8>>("data").unwrap(), b"from disk");
+
+        let blob_refs = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key = $1",
+                &[Value::Text("lix_binary_blob_ref".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            blob_refs.rows()[0].get::<i64>("count").unwrap(),
+            0,
+            "lazy reads should not import filesystem bytes into BCAS"
+        );
+
+        session
+            .execute(
+                "UPDATE lix_file SET data = $1 WHERE path = $2",
+                &[
+                    Value::Blob(b"from lix".to_vec()),
+                    Value::Text("/note.md".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(tempdir.path().join("note.md")).unwrap(),
+            b"from lix",
+            "Lix writes should still materialize back to disk"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_memory_opens_large_folder_descriptor_only_and_lazy_reads_one_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("root.txt"), b"root").unwrap();
+        for index in 0..FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS {
+            let nested = tempdir.path().join(format!("dir-{index}/nested"));
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(
+                tempdir.path().join(format!("dir-{index}/file.txt")),
+                format!("file-{index}"),
+            )
+            .unwrap();
+            std::fs::write(nested.join("deep.txt"), format!("deep-{index}")).unwrap();
+        }
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let file_count = session
+            .execute("SELECT COUNT(*) AS count FROM lix_file", &[])
+            .await
+            .unwrap();
+        let expected_file_count =
+            i64::try_from(1 + (FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS * 2)).unwrap();
+        assert_eq!(
+            file_count.rows()[0].get::<i64>("count").unwrap(),
+            expected_file_count
+        );
+
+        let blob_refs = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key = $1",
+                &[Value::Text("lix_binary_blob_ref".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_refs.rows()[0].get::<i64>("count").unwrap(), 0);
+
+        let data = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/dir-2/nested/deep.txt".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.rows()[0].get::<Vec<u8>>("data").unwrap(), b"deep-2");
+
+        let blob_refs = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key = $1",
+                &[Value::Text("lix_binary_blob_ref".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_refs.rows()[0].get::<i64>("count").unwrap(), 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_rejects_update_where_data_for_descriptor_only_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET name = $1 WHERE data = $2",
+                &[
+                    Value::Text("renamed.md".to_string()),
+                    Value::Blob(b"from disk".to_vec()),
+                ],
+            )
+            .await
+            .expect_err("UPDATE WHERE data should be rejected");
+        assert!(
+            error
+                .message
+                .contains("UPDATE lix_file WHERE data is not supported"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_rejects_path_only_rename_for_descriptor_only_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("old.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET path = $1 WHERE path = $2",
+                &[
+                    Value::Text("/new.md".to_string()),
+                    Value::Text("/old.md".to_string()),
+                ],
+            )
+            .await
+            .expect_err("path-only rename should be rejected");
+        assert!(
+            error.message.contains(
+                "UPDATE lix_file path without data is not supported for descriptor-only files"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(tempdir.path().join("old.md")).unwrap(),
+            b"from disk"
+        );
+        assert!(!tempdir.path().join("new.md").exists());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fs_backend_persistent_opens_descriptor_only_and_lazy_reads_data() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let blob_refs = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key = $1",
+                &[Value::Text("lix_binary_blob_ref".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_refs.rows()[0].get::<i64>("count").unwrap(), 0);
+
+        let data = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.rows()[0].get::<Vec<u8>>("data").unwrap(), b"from disk");
     }
 }

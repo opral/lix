@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
+use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
@@ -56,6 +57,9 @@ pub(crate) trait SqlExecutionContext {
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        None
+    }
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 
     fn plugin_host(&self) -> PluginRuntimeHost {
