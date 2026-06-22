@@ -6,13 +6,13 @@
 
 #[cfg(feature = "default_wasm_runtime")]
 mod default_wasm_runtime;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
 mod filesystem;
 mod lix;
 #[cfg(feature = "sqlite")]
 mod sqlite_backend;
 
-#[cfg(all(not(target_family = "wasm"), feature = "sqlite"))]
+#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
 pub use filesystem::{FsBackend, FsBackendFilter};
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
 pub use lix_engine::wasm::{

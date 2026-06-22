@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlite")]
 use lix_engine::run_backend_conformance;
 use lix_sdk::{
-    Backend, FsBackend, Lix, LixError, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend,
+    Backend, Lix, LixError, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend,
     SqliteBackendFactory, Value, WasmComponentInstance, WasmLimits, WasmPluginDetectedChange,
     WasmPluginEntityState, WasmPluginFile, WasmRuntime, open_lix, open_lix_with_backend,
 };
@@ -9,7 +9,6 @@ use rusqlite::Connection;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 #[test]
 fn sqlite_backend_passes_backend_conformance() {
@@ -103,255 +102,6 @@ async fn sqlite_backend_persists_lix_data_across_reopen() {
 }
 
 #[tokio::test]
-async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
-    let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let filesystem_path = tempdir.path().join("filesystem");
-
-    {
-        let backend = FsBackend::open(&filesystem_path)
-            .await
-            .expect("fs backend opens");
-        let lix = open_lix_with_backend(backend)
-            .await
-            .expect("lix opens on fs backend");
-        let sqlite_dir = filesystem_path.join(".lix/.internal");
-        let sqlite_path = sqlite_dir.join("db.sqlite");
-        assert!(
-            sqlite_dir.is_dir(),
-            "fs backend should store SQLite in dir/.lix/.internal"
-        );
-        assert!(
-            sqlite_path.is_file(),
-            "fs backend should store SQLite at dir/.lix/.internal/db.sqlite"
-        );
-        assert_eq!(
-            read_file(&lix, "/.lix")
-                .await
-                .expect(".lix file path reads"),
-            None,
-            "dir/.lix should not be imported into Lix as a file"
-        );
-        assert_eq!(
-            readdir(&lix, "/.lix/")
-                .await
-                .expect(".lix directory path reads"),
-            Some(Vec::new()),
-            "dir/.lix should be visible but private children should not"
-        );
-        assert_eq!(
-            readdir(&lix, "/.lix/.internal/")
-                .await
-                .expect(".lix/.internal directory path reads"),
-            None,
-            "dir/.lix/.internal should not be visible as a synced Lix directory"
-        );
-        write_file(&lix, "/persisted.txt", b"persisted".to_vec())
-            .await
-            .expect("file write succeeds");
-        wait_for_disk_file(
-            &filesystem_path.join("persisted.txt"),
-            Some(b"persisted".as_slice()),
-        );
-        lix.close().await.expect("lix closes");
-    }
-
-    {
-        let plain = open_lix_with_backend(
-            SqliteBackend::open(filesystem_path.join(".lix/.internal").join("db.sqlite"))
-                .expect("sqlite backend reopens"),
-        )
-        .await
-        .expect("plain lix opens on sqlite backend");
-        assert_eq!(
-            read_file(&plain, "/persisted.txt")
-                .await
-                .expect("persisted file reads")
-                .as_deref(),
-            Some(b"persisted".as_slice())
-        );
-        plain.close().await.expect("plain lix closes");
-    }
-
-    let backend = FsBackend::open(&filesystem_path)
-        .await
-        .expect("fs backend reopens");
-    let lix = open_lix_with_backend(backend)
-        .await
-        .expect("lix reopens on fs backend");
-    assert_eq!(
-        read_file(&lix, "/persisted.txt")
-            .await
-            .expect("persisted file reads after reopen")
-            .as_deref(),
-        Some(b"persisted".as_slice())
-    );
-    write_file(&lix, "/second.txt", b"second".to_vec())
-        .await
-        .expect("second file write succeeds");
-    wait_for_disk_file(
-        &filesystem_path.join("second.txt"),
-        Some(b"second".as_slice()),
-    );
-    lix.close().await.expect("lix closes");
-}
-
-#[tokio::test]
-async fn fs_backend_moves_legacy_root_sqlite_metadata_into_internal_dir() {
-    let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let filesystem_path = tempdir.path().join("filesystem");
-    let legacy_sqlite_dir = filesystem_path.join(".lix");
-    let legacy_sqlite_path = legacy_sqlite_dir.join("db.sqlite");
-    std::fs::create_dir_all(&legacy_sqlite_dir).expect("legacy sqlite dir creates");
-
-    {
-        let lix = open_lix_with_backend(
-            SqliteBackend::open(&legacy_sqlite_path).expect("legacy sqlite backend opens"),
-        )
-        .await
-        .expect("legacy lix opens");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('legacy-key', 'legacy-value')",
-            &[],
-        )
-        .await
-        .expect("legacy key value write succeeds");
-        lix.close().await.expect("legacy lix closes");
-    }
-    for name in ["db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
-        std::fs::write(legacy_sqlite_dir.join(name), b"legacy-sidecar")
-            .expect("legacy sidecar writes");
-    }
-
-    let lix = open_lix_with_backend(
-        FsBackend::open(&filesystem_path)
-            .await
-            .expect("fs backend opens"),
-    )
-    .await
-    .expect("lix opens on fs backend");
-
-    assert!(
-        !legacy_sqlite_path.exists(),
-        "legacy SQLite path should move"
-    );
-    for name in ["db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
-        assert!(
-            !legacy_sqlite_dir.join(name).exists(),
-            "legacy {name} should move"
-        );
-    }
-    for name in ["db.sqlite-wal", "db.sqlite-shm"] {
-        assert!(
-            filesystem_path.join(".lix/.internal").join(name).is_file(),
-            "{name} should move into .lix/.internal"
-        );
-    }
-    assert!(
-        filesystem_path.join(".lix/.internal/db.sqlite").is_file(),
-        "SQLite file should move into .lix/.internal"
-    );
-    let rows = lix
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key = 'legacy-key' AND value = lix_json('\"legacy-value\"')",
-            &[],
-        )
-        .await
-        .expect("legacy key value reads");
-    assert_eq!(rows.len(), 1, "moved SQLite database should be reused");
-    assert_eq!(
-        read_file(&lix, "/.lix/db.sqlite")
-            .await
-            .expect("legacy metadata file path reads"),
-        None,
-        "legacy SQLite file should not be imported as a Lix file"
-    );
-
-    lix.close().await.expect("lix closes");
-}
-
-#[tokio::test]
-async fn fs_backend_legacy_sqlite_metadata_conflict_does_not_partially_move() {
-    let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let filesystem_path = tempdir.path().join("filesystem");
-    let legacy_sqlite_dir = filesystem_path.join(".lix");
-    let internal_sqlite_dir = filesystem_path.join(".lix/.internal");
-    std::fs::create_dir_all(&legacy_sqlite_dir).expect("legacy sqlite dir creates");
-    std::fs::create_dir_all(&internal_sqlite_dir).expect("internal sqlite dir creates");
-    std::fs::write(legacy_sqlite_dir.join("db.sqlite"), b"legacy").expect("legacy sqlite writes");
-    std::fs::write(legacy_sqlite_dir.join("db.sqlite-wal"), b"legacy-wal")
-        .expect("legacy wal writes");
-    std::fs::write(internal_sqlite_dir.join("db.sqlite-wal"), b"target-wal")
-        .expect("target wal writes");
-
-    let Err(error) = FsBackend::open(&filesystem_path).await else {
-        panic!("conflicting legacy metadata should fail");
-    };
-
-    assert!(
-        error.message.contains("target already exists"),
-        "error should explain metadata conflict: {error:?}"
-    );
-    assert!(
-        legacy_sqlite_dir.join("db.sqlite").is_file(),
-        "legacy db.sqlite should remain in place after preflight failure"
-    );
-    assert!(
-        legacy_sqlite_dir.join("db.sqlite-wal").is_file(),
-        "legacy db.sqlite-wal should remain in place after preflight failure"
-    );
-}
-
-#[tokio::test]
-async fn fs_backend_ignores_sqlite_sidecar_paths() {
-    let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let filesystem_path = tempdir.path().join("filesystem");
-    std::fs::create_dir_all(filesystem_path.join(".lix")).expect("legacy .lix dir creates");
-    for name in ["db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
-        std::fs::write(filesystem_path.join(".lix").join(name), b"legacy")
-            .expect("legacy sqlite sidecar writes");
-    }
-    let lix = open_lix_with_backend(
-        FsBackend::open(&filesystem_path)
-            .await
-            .expect("fs backend opens"),
-    )
-    .await
-    .expect("lix opens on fs backend");
-
-    for path in [
-        "/.lix/.internal",
-        "/.lix/.internal/db.sqlite",
-        "/.lix/.internal/db.sqlite-wal",
-        "/.lix/.internal/db.sqlite-shm",
-        "/.lix/.internal/db.sqlite-journal",
-        "/.lix/db.sqlite",
-        "/.lix/db.sqlite-wal",
-        "/.lix/db.sqlite-shm",
-        "/.lix/db.sqlite-journal",
-    ] {
-        assert_eq!(
-            read_file(&lix, path).await.expect("metadata path reads"),
-            None,
-            "{path} should not be visible as a synced Lix file"
-        );
-    }
-    assert_eq!(
-        readdir(&lix, "/.lix/.internal/")
-            .await
-            .expect("internal directory reads"),
-        None,
-        "/.lix/.internal should not be visible as a synced Lix directory"
-    );
-    assert_eq!(
-        readdir(&lix, "/.lix/").await.expect(".lix directory reads"),
-        Some(Vec::new()),
-        "legacy root SQLite sidecars should not appear in /.lix/"
-    );
-
-    lix.close().await.expect("lix closes");
-}
-
-#[tokio::test]
 async fn sqlite_backend_open_lix_options_supplies_plugin_wasm_runtime() {
     let tempdir = tempfile::tempdir().expect("tempdir should create");
     let path = tempdir.path().join("workspace.lix");
@@ -395,22 +145,6 @@ fn sqlite_journal_mode(path: &std::path::Path) -> String {
     let conn = Connection::open(path).expect("sqlite file should open");
     conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
         .expect("journal_mode should read")
-}
-
-fn wait_for_disk_file(path: &std::path::Path, expected: Option<&[u8]>) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let path_display = path.display();
-    loop {
-        let actual = std::fs::read(path).ok();
-        if actual.as_deref() == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for disk file {path_display} to be {expected:?}, got {actual:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 async fn install_plugin<B>(lix: &Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
@@ -459,40 +193,6 @@ where
         .first()
         .map(|row| row.get::<Vec<u8>>("data"))
         .transpose()
-}
-
-async fn readdir<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<String>>, LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let directory = lix
-        .execute(
-            "SELECT id FROM lix_directory WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
-        .await?;
-    let Some(directory) = directory.rows().first() else {
-        return Ok(None);
-    };
-    let directory_id = directory.get::<String>("id")?;
-    let entries = lix
-        .execute(
-            "SELECT name FROM lix_directory WHERE parent_id = $1 \
-             UNION ALL \
-             SELECT name FROM lix_file WHERE directory_id = $1 \
-             ORDER BY name",
-            &[Value::Text(directory_id)],
-        )
-        .await?;
-    Ok(Some(
-        entries
-            .rows()
-            .iter()
-            .map(|row| row.get::<String>("name"))
-            .collect::<Result<Vec<_>, _>>()?,
-    ))
 }
 
 #[derive(Default)]

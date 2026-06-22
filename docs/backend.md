@@ -43,20 +43,17 @@ const lix = await openLix({
 
 Use `FsBackend` when the Lix should sync a local directory. This is the
 recommended persistent backend for filesystem workspaces. The backend stores
-its private SQLite database at `<workspace>/.lix/.internal/db.sqlite` and syncs
-workspace files, including user-editable files under `.lix/` such as plugin
-archives, through Lix.
+its private RocksDB data at `<workspace>/.lix/.internal/rocksdb` and syncs
+workspace files through Lix. The `.lix/.internal` directory is owned by Lix and
+is not materialized as a workspace file.
 
-```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+Older SQLite filesystem backend metadata is not migrated. When old SQLite
+metadata files are present in `.lix/.internal` and no RocksDB store exists, Lix
+clears `.lix/.internal` and initializes a fresh RocksDB store.
 
-const lix = await openLix({
-	backend: new FsBackend({ path: "/Users/me/Downloads", storage: "memory" }),
-});
-```
-
-Pass `storage: "memory"` when the filesystem should be synced but Lix should not
-write `.lix` repository metadata into that folder.
+For ephemeral filesystem sync, pass `storage: "memory"`. Workspace files are
+still imported, watched, and materialized, but the Lix repository itself stays
+in memory and no `.lix` directory is written.
 
 Use `SqliteBackend` when the `.lix` SQLite file is the application document
 itself. This is useful when defining a new file format and using Lix as the

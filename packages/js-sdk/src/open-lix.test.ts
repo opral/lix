@@ -374,7 +374,7 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 
 	const lix = await openLix({ backend: new FsBackend({ path: dir }) });
 	expect(statSync(join(dir, ".lix")).isDirectory()).toBe(true);
-	expect(statSync(join(dir, ".lix", ".internal", "db.sqlite")).isFile()).toBe(
+	expect(statSync(join(dir, ".lix", ".internal", "rocksdb")).isDirectory()).toBe(
 		true,
 	);
 
@@ -429,7 +429,6 @@ test("fs backend with memory storage imports the directory and writes normal fil
 		"local",
 	);
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
-	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
 	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
 		new TextEncoder().encode("updated"),
@@ -444,7 +443,6 @@ test("fs backend with memory storage imports the directory and writes normal fil
 	]);
 	expect(readFileSync(join(dir, "generated.md"), "utf8")).toBe("generated");
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
-	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
 	writeFileSync(filePath, "external");
 	await waitFor(async () => {
@@ -670,7 +668,6 @@ test("fs backend with memory storage keeps lix storage paths in memory only", as
 		new TextEncoder().encode("ephemeral"),
 	]);
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
-	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
 	await lix.close();
 });
@@ -701,7 +698,6 @@ test("fs backend with memory storage reimports disk state on reopen without pers
 	const ephemeral = await readFile(reopened, "/.lix/ephemeral.txt");
 	expect(ephemeral).toBeUndefined();
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
-	expect(existsSync(join(dir, ".lix_system"))).toBe(false);
 
 	await reopened.close();
 });

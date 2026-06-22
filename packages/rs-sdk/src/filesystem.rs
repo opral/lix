@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
     InMemoryBackend, Key, KeyRange, LixError, PointVisitor, PutBatch, ReadOptions, ScanOptions,
@@ -15,8 +14,8 @@ use lix_engine::{
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 
-#[cfg(feature = "sqlite")]
-use crate::sqlite_backend::SqliteBackend;
+#[cfg(feature = "fs_backend")]
+use lix_fs_backend::RocksDbFilesystemBackend;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
@@ -71,36 +70,36 @@ where
     supervisor: FilesystemSupervisor<B>,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct FsBackend {
     inner: FsBackendInner,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 #[derive(Clone)]
 enum FsBackendInner {
-    Persistent(FilesystemSync<SqliteBackend>),
+    Persistent(FilesystemSync<RocksDbFilesystemBackend>),
     Memory(FilesystemSync<InMemoryBackend>),
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 #[expect(missing_debug_implementations)]
 pub enum FsRead<'a> {
-    Persistent(crate::sqlite_backend::SqliteRead),
+    Persistent(lix_fs_backend::RocksDbFilesystemRead<'a>),
     Memory(<InMemoryBackend as Backend>::Read<'a>),
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 #[expect(missing_debug_implementations)]
 pub struct FsWrite<'a> {
     inner: FsWriteInner<'a>,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 enum FsWriteInner<'a> {
-    Persistent(FilesystemWrite<'a, SqliteBackend>),
+    Persistent(FilesystemWrite<'a, RocksDbFilesystemBackend>),
     Memory(FilesystemWrite<'a, InMemoryBackend>),
 }
 
@@ -247,7 +246,7 @@ enum FilesystemEvent {
     Shutdown,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 impl FsBackend {
     pub async fn open<P>(dir: P) -> Result<Self, LixError>
     where
@@ -261,8 +260,8 @@ impl FsBackend {
         P: AsRef<Path>,
     {
         FilesystemPathFilter::from_filter(filter.clone())?;
-        let backend = open_filesystem_sqlite_backend(dir.as_ref())?;
-        let inner = FilesystemSync::open_with_metadata_mode(
+        let backend = open_filesystem_rocksdb_backend(dir.as_ref())?;
+        let inner = FilesystemSync::open_filesystem(
             backend,
             dir.as_ref(),
             FilesystemMetadataMode::Persistent,
@@ -290,7 +289,7 @@ impl FsBackend {
     {
         FilesystemPathFilter::from_filter(filter.clone())?;
         let backend = InMemoryBackend::new();
-        let inner = FilesystemSync::open_with_metadata_mode(
+        let inner = FilesystemSync::open_filesystem(
             backend,
             dir.as_ref(),
             FilesystemMetadataMode::Ephemeral,
@@ -301,24 +300,9 @@ impl FsBackend {
             inner: FsBackendInner::Memory(inner),
         })
     }
-
-    pub async fn open_with_wasm_runtime<P>(
-        dir: P,
-        wasm_runtime: Arc<dyn WasmRuntime>,
-    ) -> Result<Self, LixError>
-    where
-        P: AsRef<Path>,
-    {
-        let backend = open_filesystem_sqlite_backend(dir.as_ref())?;
-        let inner =
-            FilesystemSync::open_with_wasm_runtime(backend, dir.as_ref(), wasm_runtime).await?;
-        Ok(Self {
-            inner: FsBackendInner::Persistent(inner),
-        })
-    }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 impl Backend for FsBackend {
     type Read<'a>
         = FsRead<'a>
@@ -349,7 +333,7 @@ impl Backend for FsBackend {
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 impl BackendRead for FsRead<'_> {
     fn visit_keys<V>(
         &self,
@@ -384,7 +368,7 @@ impl BackendRead for FsRead<'_> {
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 impl BackendWrite for FsWrite<'_> {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         match &mut self.inner {
@@ -428,27 +412,8 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    pub async fn open_with_wasm_runtime<P>(
-        backend: B,
-        root: P,
-        wasm_runtime: Arc<dyn WasmRuntime>,
-    ) -> Result<Self, LixError>
-    where
-        P: AsRef<Path>,
-    {
-        let engine =
-            crate::lix::open_or_initialize_engine(backend.clone(), Some(wasm_runtime)).await?;
-        Self::open_with_engine(
-            backend,
-            engine,
-            root.as_ref(),
-            FilesystemMetadataMode::Persistent,
-            FsBackendFilter::default(),
-        )
-        .await
-    }
-
-    async fn open_with_metadata_mode<P>(
+    #[cfg(feature = "fs_backend")]
+    async fn open_filesystem<P>(
         backend: B,
         root: P,
         metadata_mode: FilesystemMetadataMode,
@@ -457,7 +422,8 @@ where
     where
         P: AsRef<Path>,
     {
-        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
+        let engine =
+            crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None).await?;
         Self::open_with_engine(backend, engine, root.as_ref(), metadata_mode, filter).await
     }
 
@@ -550,7 +516,6 @@ where
         let path_filter = FilesystemPathFilter::from_filter(filter)?;
         if metadata_mode == FilesystemMetadataMode::Persistent {
             ensure_filesystem_lix_directory(&root)?;
-            migrate_legacy_filesystem_system_directory(&root)?;
         }
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
@@ -562,9 +527,6 @@ where
             last_materialized: Mutex::new(None),
         });
 
-        if metadata_mode == FilesystemMetadataMode::Persistent {
-            state.migrate_legacy_lix_system_paths().await?;
-        }
         state.sync_disk_to_lix(false).await?;
         state.sync_from_lix().await?;
 
@@ -692,72 +654,6 @@ where
 
     async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
-    }
-
-    async fn migrate_legacy_lix_system_paths(&self) -> Result<(), LixError> {
-        let files = self
-            .session
-            .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
-            .await?;
-        let legacy_files = files
-            .rows()
-            .iter()
-            .map(|row| Ok((row.get::<String>("path")?, row.get::<Vec<u8>>("data")?)))
-            .collect::<Result<Vec<_>, LixError>>()?;
-        for (path, data) in legacy_files
-            .iter()
-            .filter(|(path, _)| is_legacy_lix_system_path(path))
-        {
-            if let Some(new_path) = migrate_legacy_lix_system_path(path) {
-                self.session
-                    .execute(
-                        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-                        &[Value::Text(new_path.clone()), Value::Blob(data.clone())],
-                    )
-                    .await?;
-                write_materialized_file(&self.root, &new_path, data, self.metadata_mode)?;
-            }
-            self.session
-                .execute(
-                    "DELETE FROM lix_file WHERE path = $1",
-                    &[Value::Text(path.clone())],
-                )
-                .await?;
-        }
-
-        let directories = self
-            .session
-            .execute("SELECT path FROM lix_directory ORDER BY path", &[])
-            .await?;
-        let mut directory_paths = directories
-            .rows()
-            .iter()
-            .map(|row| row.get::<String>("path"))
-            .collect::<Result<Vec<_>, _>>()?;
-        directory_paths.retain(|path| is_legacy_lix_system_path(path));
-        sort_directories_shallowest_first(&mut directory_paths);
-        for path in &directory_paths {
-            if let Some(new_path) = migrate_legacy_lix_system_path(path) {
-                self.session
-                    .execute(
-                        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-                        &[Value::Text(new_path.clone())],
-                    )
-                    .await?;
-                create_materialized_directory(&self.root, &new_path, self.metadata_mode)?;
-            }
-        }
-        sort_directories_deepest_first(&mut directory_paths);
-        for path in directory_paths {
-            self.session
-                .execute(
-                    "DELETE FROM lix_directory WHERE path = $1",
-                    &[Value::Text(path)],
-                )
-                .await?;
-        }
-        Ok(())
     }
 
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
@@ -1475,139 +1371,6 @@ fn ensure_filesystem_lix_directory(root: &Path) -> Result<PathBuf, LixError> {
     Ok(lix_dir)
 }
 
-fn migrate_legacy_filesystem_system_directory(root: &Path) -> Result<(), LixError> {
-    let legacy_dir = root.join(".lix_system");
-    let metadata = match std::fs::symlink_metadata(&legacy_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(io_error(
-                "read legacy filesystem system directory",
-                &legacy_dir,
-                error,
-            ));
-        }
-    };
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        merge_legacy_directory_contents(root, &legacy_dir, &root.join(".lix"))?;
-        std::fs::remove_dir_all(&legacy_dir).map_err(|error| {
-            io_error(
-                "remove legacy filesystem system directory",
-                &legacy_dir,
-                error,
-            )
-        })
-    } else {
-        std::fs::remove_file(&legacy_dir)
-            .map_err(|error| io_error("remove legacy filesystem system path", &legacy_dir, error))
-    }
-}
-
-fn merge_legacy_directory_contents(
-    root: &Path,
-    source: &Path,
-    target: &Path,
-) -> Result<(), LixError> {
-    let entries = std::fs::read_dir(source)
-        .map_err(|error| io_error("read legacy filesystem system directory", source, error))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            io_error(
-                "read legacy filesystem system directory entry",
-                source,
-                error,
-            )
-        })?;
-        let source_path = entry.path();
-        let file_name = entry.file_name();
-        if is_discarded_legacy_system_entry_name(&file_name) {
-            remove_legacy_system_entry(&source_path)?;
-            continue;
-        }
-        let target_path = target.join(&file_name);
-        let Ok(target_lix_path) = local_path_to_lix_path(root, &target_path, false) else {
-            remove_legacy_system_entry(&source_path)?;
-            continue;
-        };
-        if is_filesystem_metadata_path(&target_lix_path) {
-            remove_legacy_system_entry(&source_path)?;
-            continue;
-        }
-        let file_type = entry.file_type().map_err(|error| {
-            io_error(
-                "read legacy filesystem system entry type",
-                &source_path,
-                error,
-            )
-        })?;
-        if file_type.is_dir() {
-            match std::fs::symlink_metadata(&target_path) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    merge_legacy_directory_contents(root, &source_path, &target_path)?;
-                    std::fs::remove_dir(&source_path).map_err(|error| {
-                        io_error(
-                            "remove migrated legacy filesystem system directory",
-                            &source_path,
-                            error,
-                        )
-                    })?;
-                }
-                Ok(_) => {
-                    return Err(filesystem_error(format!(
-                        "cannot migrate legacy filesystem system directory {} to {} because the target exists",
-                        source_path.display(),
-                        target_path.display()
-                    )));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::rename(&source_path, &target_path).map_err(|error| {
-                        io_error(
-                            "move legacy filesystem system directory",
-                            &source_path,
-                            error,
-                        )
-                    })?;
-                }
-                Err(error) => {
-                    return Err(io_error(
-                        "read legacy filesystem system target",
-                        &target_path,
-                        error,
-                    ));
-                }
-            }
-        } else {
-            if target_path.exists() {
-                return Err(filesystem_error(format!(
-                    "cannot migrate legacy filesystem system file {} to {} because the target exists",
-                    source_path.display(),
-                    target_path.display()
-                )));
-            }
-            std::fs::rename(&source_path, &target_path).map_err(|error| {
-                io_error("move legacy filesystem system file", &source_path, error)
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn is_discarded_legacy_system_entry_name(name: &std::ffi::OsStr) -> bool {
-    matches!(name.to_str(), Some(".gitignore" | ".DS_Store"))
-}
-
-fn remove_legacy_system_entry(path: &Path) -> Result<(), LixError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| io_error("read legacy filesystem system entry", path, error))?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        std::fs::remove_dir_all(path)
-            .map_err(|error| io_error("remove legacy filesystem system entry", path, error))
-    } else {
-        std::fs::remove_file(path)
-            .map_err(|error| io_error("remove legacy filesystem system entry", path, error))
-    }
-}
-
 fn remove_materialized_file(
     root: &Path,
     path: &str,
@@ -1962,40 +1725,24 @@ fn is_filesystem_metadata_path(path: &str) -> bool {
     path == "/.lix/.gitignore"
         || path == "/.lix/.gitignore/"
         || is_filesystem_internal_path(path)
-        || is_legacy_filesystem_sqlite_metadata_path(path)
+        || is_legacy_filesystem_metadata_path(path)
 }
 
 fn is_filesystem_internal_path(path: &str) -> bool {
     path == "/.lix/.internal" || path.starts_with("/.lix/.internal/")
 }
 
-fn is_legacy_lix_system_path(path: &str) -> bool {
+fn is_legacy_filesystem_metadata_path(path: &str) -> bool {
     let path = path.strip_suffix('/').unwrap_or(path);
-    path == "/.lix_system" || path.starts_with("/.lix_system/")
+    path == "/.lix_system"
+        || path.starts_with("/.lix_system/")
+        || path
+            .strip_prefix("/.lix/")
+            .is_some_and(is_legacy_filesystem_sqlite_metadata_name)
 }
 
-fn migrate_legacy_lix_system_path(path: &str) -> Option<String> {
-    if path == "/.lix_system" {
-        return Some("/.lix".to_string());
-    }
-    if path == "/.lix_system/" {
-        return Some("/.lix/".to_string());
-    }
-    let new_path = path
-        .strip_prefix("/.lix_system/")
-        .map(|suffix| format!("/.lix/{suffix}"))?;
-    if is_filesystem_metadata_path(&new_path) {
-        None
-    } else {
-        Some(new_path)
-    }
-}
-
-fn is_legacy_filesystem_sqlite_metadata_path(path: &str) -> bool {
-    matches!(
-        path.strip_prefix("/.lix/"),
-        Some("db.sqlite" | "db.sqlite-wal" | "db.sqlite-shm" | "db.sqlite-journal")
-    )
+fn is_legacy_filesystem_sqlite_metadata_name(name: &str) -> bool {
+    LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES.contains(&name)
 }
 
 fn is_filesystem_sync_ignored_local_path(
@@ -2019,7 +1766,13 @@ fn is_filesystem_sync_ignored_local_path(
         }
         if metadata_mode == FilesystemMetadataMode::Ephemeral
             && depth == 1
-            && matches!(segment, Some(".lix" | ".lix_system"))
+            && segment == Some(".lix")
+        {
+            return true;
+        }
+        if metadata_mode == FilesystemMetadataMode::Persistent
+            && depth == 1
+            && segment == Some(".lix_system")
         {
             return true;
         }
@@ -2032,12 +1785,10 @@ fn is_filesystem_sync_ignored_local_path(
         if depth == 2 && first_segment_is_lix && segment == Some(".internal") {
             return true;
         }
-        if depth == 2
+        if metadata_mode == FilesystemMetadataMode::Persistent
+            && depth == 2
             && first_segment_is_lix
-            && matches!(
-                segment,
-                Some("db.sqlite" | "db.sqlite-wal" | "db.sqlite-shm" | "db.sqlite-journal")
-            )
+            && segment.is_some_and(is_legacy_filesystem_sqlite_metadata_name)
         {
             return true;
         }
@@ -2048,9 +1799,7 @@ fn is_filesystem_sync_ignored_local_path(
 fn is_materialization_ignored_path(path: &str, metadata_mode: FilesystemMetadataMode) -> bool {
     match metadata_mode {
         FilesystemMetadataMode::Persistent => is_filesystem_metadata_path(path),
-        FilesystemMetadataMode::Ephemeral => {
-            is_lix_storage_path(path) || is_legacy_lix_system_path(path)
-        }
+        FilesystemMetadataMode::Ephemeral => is_lix_storage_path(path),
     }
 }
 
@@ -2109,101 +1858,161 @@ fn filesystem_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_FILESYSTEM_ERROR", message)
 }
 
-#[cfg(feature = "sqlite")]
-fn open_filesystem_sqlite_backend(dir: &Path) -> Result<SqliteBackend, LixError> {
+#[cfg(feature = "fs_backend")]
+fn open_filesystem_rocksdb_backend(dir: &Path) -> Result<RocksDbFilesystemBackend, LixError> {
     ensure_filesystem_root_directory(dir)?;
-    let metadata_dir = ensure_filesystem_sqlite_metadata_directory(dir)?;
-    SqliteBackend::open(metadata_dir.join("db.sqlite")).map_err(sqlite_backend_error)
+    let metadata_dir = ensure_filesystem_rocksdb_metadata_directory(dir)?;
+    RocksDbFilesystemBackend::open(metadata_dir).map_err(rocksdb_backend_error)
 }
 
-#[cfg(feature = "sqlite")]
-fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
+#[cfg(feature = "fs_backend")]
+fn ensure_filesystem_rocksdb_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
     let lix_dir = ensure_filesystem_lix_directory(dir)?;
-    let metadata_dir = lix_dir.join(".internal");
-    match std::fs::create_dir(&metadata_dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(io_error(
-                "create filesystem SQLite metadata directory",
-                &metadata_dir,
-                error,
-            ));
-        }
+    remove_legacy_filesystem_root_metadata(dir, &lix_dir)?;
+    let internal_dir = lix_dir.join(".internal");
+    reset_legacy_filesystem_internal_directory(&internal_dir)?;
+    ensure_metadata_directory(&internal_dir, "filesystem metadata directory")?;
+    let metadata_dir = internal_dir.join("rocksdb");
+    ensure_metadata_directory(&metadata_dir, "filesystem RocksDB metadata directory")?;
+    Ok(metadata_dir)
+}
+
+#[cfg(feature = "fs_backend")]
+fn remove_legacy_filesystem_root_metadata(root: &Path, lix_dir: &Path) -> Result<(), LixError> {
+    for name in LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES {
+        remove_legacy_metadata_file(&lix_dir.join(name))?;
+    }
+    remove_legacy_metadata_path(&root.join(".lix_system"))
+}
+
+#[cfg(feature = "fs_backend")]
+fn reset_legacy_filesystem_internal_directory(internal_dir: &Path) -> Result<(), LixError> {
+    if internal_dir.join("rocksdb").exists() {
+        return Ok(());
+    }
+    if !legacy_filesystem_sqlite_metadata_exists(internal_dir) {
+        return Ok(());
     }
 
-    let metadata = std::fs::symlink_metadata(&metadata_dir).map_err(|error| {
+    let metadata = std::fs::symlink_metadata(internal_dir).map_err(|error| {
         io_error(
-            "read filesystem SQLite metadata directory",
-            &metadata_dir,
+            "read legacy filesystem metadata directory",
+            internal_dir,
             error,
         )
     })?;
     if metadata.file_type().is_symlink() {
-        let path = metadata_dir.display();
+        let display = internal_dir.display();
         return Err(filesystem_error(format!(
-            "filesystem SQLite metadata path {path} must not be a symlink"
+            "legacy filesystem metadata directory {display} must not be a symlink"
         )));
     }
     if !metadata.is_dir() {
-        let path = metadata_dir.display();
+        let display = internal_dir.display();
         return Err(filesystem_error(format!(
-            "filesystem SQLite metadata path {path} must be a directory"
+            "legacy filesystem metadata path {display} must be a directory"
         )));
     }
 
-    move_legacy_filesystem_sqlite_metadata(&lix_dir, &metadata_dir)?;
-    Ok(metadata_dir)
+    std::fs::remove_dir_all(internal_dir).map_err(|error| {
+        io_error(
+            "remove legacy filesystem metadata directory",
+            internal_dir,
+            error,
+        )
+    })
 }
 
-fn move_legacy_filesystem_sqlite_metadata(
-    lix_dir: &Path,
-    metadata_dir: &Path,
-) -> Result<(), LixError> {
-    let mut files_to_move = Vec::new();
-    for file_name in [
-        "db.sqlite",
-        "db.sqlite-wal",
-        "db.sqlite-shm",
-        "db.sqlite-journal",
-    ] {
-        let legacy_path = lix_dir.join(file_name);
-        let target_path = metadata_dir.join(file_name);
-        let legacy_metadata = match std::fs::symlink_metadata(&legacy_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(io_error(
-                    "read legacy filesystem SQLite metadata",
-                    &legacy_path,
-                    error,
-                ));
-            }
-        };
-        if !legacy_metadata.is_file() {
-            return Err(filesystem_error(format!(
-                "legacy filesystem SQLite metadata {} must be a regular file",
-                legacy_path.display()
-            )));
+#[cfg(feature = "fs_backend")]
+fn legacy_filesystem_sqlite_metadata_exists(internal_dir: &Path) -> bool {
+    LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES
+        .iter()
+        .any(|name| internal_dir.join(name).exists())
+}
+
+#[cfg(feature = "fs_backend")]
+fn remove_legacy_metadata_file(path: &Path) -> Result<(), LixError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read legacy filesystem metadata file",
+                path,
+                error,
+            ));
         }
-        if target_path.exists() {
-            return Err(filesystem_error(format!(
-                "cannot move legacy filesystem SQLite metadata {} to {} because the target already exists",
-                legacy_path.display(),
-                target_path.display()
-            )));
+    };
+    if metadata.file_type().is_symlink() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata file {display} must not be a symlink"
+        )));
+    }
+    if !metadata.is_file() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata path {display} must be a file"
+        )));
+    }
+    std::fs::remove_file(path)
+        .map_err(|error| io_error("remove legacy filesystem metadata file", path, error))
+}
+
+#[cfg(feature = "fs_backend")]
+fn remove_legacy_metadata_path(path: &Path) -> Result<(), LixError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read legacy filesystem metadata path",
+                path,
+                error,
+            ));
         }
-        files_to_move.push((legacy_path, target_path));
+    };
+    if metadata.file_type().is_symlink() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "legacy filesystem metadata path {display} must not be a symlink"
+        )));
+    }
+    if metadata.is_dir() {
+        return std::fs::remove_dir_all(path)
+            .map_err(|error| io_error("remove legacy filesystem metadata directory", path, error));
+    }
+    if metadata.is_file() {
+        return std::fs::remove_file(path)
+            .map_err(|error| io_error("remove legacy filesystem metadata file", path, error));
+    }
+    let display = path.display();
+    Err(filesystem_error(format!(
+        "legacy filesystem metadata path {display} must be a file or directory"
+    )))
+}
+
+#[cfg(feature = "fs_backend")]
+fn ensure_metadata_directory(path: &Path, label: &str) -> Result<(), LixError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error(&format!("create {label}"), path, error)),
     }
 
-    for (legacy_path, target_path) in files_to_move {
-        std::fs::rename(&legacy_path, &target_path).map_err(|error| {
-            io_error(
-                "move legacy filesystem SQLite metadata",
-                &legacy_path,
-                error,
-            )
-        })?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_error(&format!("read {label}"), path, error))?;
+    if metadata.file_type().is_symlink() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "{label} {display} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let display = path.display();
+        return Err(filesystem_error(format!(
+            "{label} {display} must be a directory"
+        )));
     }
     Ok(())
 }
@@ -2222,20 +2031,28 @@ fn ensure_gitignore(directory: &Path, content: &[u8]) -> Result<(), LixError> {
         .map_err(|error| io_error("write filesystem .gitignore", &gitignore, error))
 }
 
-#[cfg(feature = "sqlite")]
-fn sqlite_backend_error(error: BackendError) -> LixError {
+const LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES: &[&str] = &[
+    "db.sqlite",
+    "db.sqlite-wal",
+    "db.sqlite-shm",
+    "db.sqlite-journal",
+];
+
+#[cfg(feature = "fs_backend")]
+fn rocksdb_backend_error(error: BackendError) -> LixError {
     LixError::new(
         LixError::CODE_STORAGE_ERROR,
-        format!("failed to open filesystem SQLite backend: {error}"),
+        format!("failed to open filesystem RocksDB backend: {error}"),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "fs_backend")]
     use lix_engine::Value;
 
+    #[cfg(feature = "fs_backend")]
     async fn lix_read_file<B>(
         session: &SessionContext<B>,
         path: &str,
@@ -2258,6 +2075,7 @@ mod tests {
             .transpose()
     }
 
+    #[cfg(feature = "fs_backend")]
     async fn lix_write_file<B>(
         session: &SessionContext<B>,
         path: &str,
@@ -2423,12 +2241,12 @@ mod tests {
         assert_eq!(lix_file_upsert_chunk_end(&files, 0, 10, 8), 1);
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_remembers_canonical_snapshot_for_idle_skip() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
-        let engine = crate::lix::open_or_initialize_engine(backend, None)
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
         let root = std::fs::canonicalize(tempdir.path()).unwrap();
@@ -2454,12 +2272,12 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_does_not_reimport_unchanged_materialized_file_deleted_in_lix() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
-        let engine = crate::lix::open_or_initialize_engine(backend, None)
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
         let root = std::fs::canonicalize(tempdir.path()).unwrap();
@@ -2506,12 +2324,12 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_does_not_skip_lix_side_file_data_change() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
-        let engine = crate::lix::open_or_initialize_engine(backend, None)
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
         let root = std::fs::canonicalize(tempdir.path()).unwrap();
@@ -2547,12 +2365,12 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn disk_sync_materialization_preserves_file_changed_after_import() {
         let tempdir = tempfile::tempdir().unwrap();
-        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
-        let engine = crate::lix::open_or_initialize_engine(backend, None)
+        let backend = open_filesystem_rocksdb_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
             .await
             .unwrap();
         let root = std::fs::canonicalize(tempdir.path()).unwrap();

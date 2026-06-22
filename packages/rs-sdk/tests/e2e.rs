@@ -2,11 +2,11 @@ use lix_sdk::{
     Backend, CreateBranchOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
-#[cfg(feature = "sqlite")]
-use lix_sdk::{FsBackend, SqliteBackend, open_lix_with_backend};
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
+use lix_sdk::{FsBackend, open_lix_with_backend};
+#[cfg(feature = "fs_backend")]
 use std::path::Path;
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -434,7 +434,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
@@ -458,10 +458,119 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     lix.close().await.unwrap();
 }
 
-#[cfg(feature = "sqlite")]
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filesystem_initialization_wipes_legacy_sqlite_internal_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let internal_dir = tempdir.path().join(".lix/.internal");
+    std::fs::create_dir_all(&internal_dir).unwrap();
+    std::fs::write(internal_dir.join("db.sqlite"), b"legacy sqlite metadata").unwrap();
+    std::fs::write(internal_dir.join("old-cache"), b"legacy internal data").unwrap();
+    std::fs::write(tempdir.path().join("note.txt"), b"workspace").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert!(!internal_dir.join("db.sqlite").exists());
+    assert!(!internal_dir.join("old-cache").exists());
+    assert!(internal_dir.join("rocksdb").is_dir());
+    assert_eq!(
+        read_file(&lix, "/.lix/.internal/db.sqlite")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/note.txt").await.unwrap().as_deref(),
+        Some(b"workspace".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix_dir = tempdir.path().join(".lix");
+    let system_dir = tempdir.path().join(".lix_system");
+    std::fs::create_dir_all(&lix_dir).unwrap();
+    std::fs::create_dir_all(&system_dir).unwrap();
+    std::fs::write(lix_dir.join("db.sqlite"), b"legacy sqlite metadata").unwrap();
+    std::fs::write(lix_dir.join("db.sqlite-wal"), b"legacy sqlite wal").unwrap();
+    std::fs::write(system_dir.join("cache"), b"legacy system data").unwrap();
+    std::fs::write(tempdir.path().join("note.txt"), b"workspace").unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert!(!lix_dir.join("db.sqlite").exists());
+    assert!(!lix_dir.join("db.sqlite-wal").exists());
+    assert!(!system_dir.exists());
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite").await.unwrap().as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/db.sqlite-wal")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix_system/cache")
+            .await
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/note.txt").await.unwrap().as_deref(),
+        Some(b"workspace".as_slice())
+    );
+    lix.close().await.unwrap();
+}
+
+#[cfg(feature = "fs_backend")]
 async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     let backend = FsBackend::open(path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let backend_a = FsBackend::open(tempdir.path())
+        .await
+        .expect("first rocksdb fs backend opens");
+    let backend_b = FsBackend::open(tempdir.path())
+        .await
+        .expect("second rocksdb fs backend reuses process-local DB");
+    let lix_a = open_lix_with_backend(backend_a)
+        .await
+        .expect("first lix opens");
+    let lix_b = open_lix_with_backend(backend_b)
+        .await
+        .expect("second lix opens");
+
+    write_file(&lix_a, "/from-a.txt", b"a".to_vec())
+        .await
+        .expect("first lix writes");
+    assert_eq!(
+        read_file(&lix_b, "/from-a.txt").await.unwrap().as_deref(),
+        Some(b"a".as_slice())
+    );
+
+    write_file(&lix_b, "/from-b.txt", b"b".to_vec())
+        .await
+        .expect("second lix writes");
+    assert_eq!(
+        read_file(&lix_a, "/from-b.txt").await.unwrap().as_deref(),
+        Some(b"b".as_slice())
+    );
+
+    lix_a.close().await.unwrap();
+    lix_b.close().await.unwrap();
 }
 
 async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
@@ -580,7 +689,7 @@ where
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_creates_gitignore_files_for_lix_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
 
@@ -600,102 +709,7 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
-async fn filesystem_removes_legacy_lix_system_directory() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let metadata_dir = tempdir.path().join(".lix/.internal");
-    std::fs::create_dir_all(&metadata_dir).unwrap();
-    let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
-        .await
-        .unwrap();
-    write_file(
-        &seed,
-        "/.lix_system/settings.json",
-        b"stored legacy".to_vec(),
-    )
-    .await
-    .unwrap();
-    write_file(&seed, "/.lix_system/db.sqlite", b"legacy db".to_vec())
-        .await
-        .unwrap();
-    write_file(
-        &seed,
-        "/.lix_system/.internal/private",
-        b"legacy private".to_vec(),
-    )
-    .await
-    .unwrap();
-    seed.close().await.unwrap();
-
-    std::fs::create_dir_all(tempdir.path().join(".lix_system/app_data")).unwrap();
-    std::fs::write(
-        tempdir.path().join(".lix_system/app_data/legacy.txt"),
-        b"disk legacy",
-    )
-    .unwrap();
-    std::fs::write(tempdir.path().join(".lix_system/.gitignore"), b"*\n").unwrap();
-    std::fs::write(tempdir.path().join(".lix_system/.DS_Store"), b"ds-store").unwrap();
-    std::fs::write(
-        tempdir.path().join(".lix_system/db.sqlite"),
-        b"disk legacy db",
-    )
-    .unwrap();
-    std::fs::create_dir_all(tempdir.path().join(".lix_system/.internal")).unwrap();
-    std::fs::write(
-        tempdir.path().join(".lix_system/.internal/private"),
-        b"disk private",
-    )
-    .unwrap();
-
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-
-    assert!(!tempdir.path().join(".lix_system").exists());
-    assert_eq!(
-        std::fs::read(tempdir.path().join(".lix/app_data/legacy.txt")).unwrap(),
-        b"disk legacy"
-    );
-    assert!(!tempdir.path().join(".lix/.DS_Store").exists());
-    assert_eq!(readdir(&lix, "/.lix_system/").await.unwrap(), None);
-    assert_eq!(
-        read_file(&lix, "/.lix_system/settings.json").await.unwrap(),
-        None
-    );
-    assert_eq!(
-        read_file(&lix, "/.lix_system/db.sqlite").await.unwrap(),
-        None
-    );
-    assert_eq!(read_file(&lix, "/.lix/db.sqlite").await.unwrap(), None);
-    assert!(!tempdir.path().join(".lix/db.sqlite").exists());
-    assert_eq!(
-        read_file(&lix, "/.lix_system/.internal/private")
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        read_file(&lix, "/.lix/.internal/private").await.unwrap(),
-        None
-    );
-    assert!(!tempdir.path().join(".lix/.internal/private").exists());
-    assert_eq!(
-        read_file(&lix, "/.lix/settings.json")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(b"stored legacy".as_slice())
-    );
-    assert_eq!(
-        read_file(&lix, "/.lix/app_data/legacy.txt")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(b"disk legacy".as_slice())
-    );
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_initial_import_ignores_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
@@ -727,14 +741,10 @@ async fn filesystem_initial_import_ignores_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
-    let metadata_dir = tempdir.path().join(".lix/.internal");
-    std::fs::create_dir_all(&metadata_dir).unwrap();
-    let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
-        .await
-        .unwrap();
+    let seed = open_lix_with_filesystem(tempdir.path()).await;
     write_file(&seed, "/.git/config", b"old".to_vec())
         .await
         .unwrap();
@@ -753,19 +763,17 @@ async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let tempdir = tempfile::tempdir().unwrap();
-    let metadata_dir = tempdir.path().join(".lix/.internal");
-    std::fs::create_dir_all(&metadata_dir).unwrap();
-    let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
-        .await
-        .unwrap();
+    let seed = open_lix_with_filesystem(tempdir.path()).await;
     write_file(&seed, "/old.txt", b"old".to_vec())
         .await
         .unwrap();
     mkdir(&seed, "/old-empty/").await.unwrap();
     seed.close().await.unwrap();
+    std::fs::remove_file(tempdir.path().join("old.txt")).unwrap();
+    std::fs::remove_dir(tempdir.path().join("old-empty")).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
@@ -777,7 +785,7 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -844,7 +852,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_materializes_untracked_sdk_sql_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -879,7 +887,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -902,7 +910,7 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_watcher_ignores_git_entries_created_after_open() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -921,7 +929,7 @@ async fn filesystem_watcher_ignores_git_entries_created_after_open() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_materialization_skips_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -947,7 +955,7 @@ async fn filesystem_materialization_skips_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn filesystem_imports_opaque_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
@@ -971,7 +979,7 @@ async fn filesystem_imports_opaque_lix_path_names() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "sqlite"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_rejects_symlink_root() {
     use std::os::unix::fs::symlink;
 
@@ -987,7 +995,7 @@ async fn filesystem_rejects_symlink_root() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "sqlite"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_ignores_symlinks_on_initial_import() {
     use std::os::unix::fs::symlink;
 
@@ -1030,7 +1038,7 @@ async fn filesystem_ignores_symlinks_on_initial_import() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "sqlite"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_ignores_special_and_invalid_utf8_entries() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -1068,7 +1076,7 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "sqlite"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_watcher_ignores_symlinks_created_after_open() {
     use std::os::unix::fs::symlink;
 
@@ -1090,7 +1098,7 @@ async fn filesystem_watcher_ignores_symlinks_created_after_open() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "sqlite"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_materialization_skips_symlink_collisions() {
     use std::os::unix::fs::symlink;
 
@@ -1157,7 +1165,7 @@ async fn filesystem_materialization_skips_symlink_collisions() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "sqlite"))]
+#[cfg(all(unix, feature = "fs_backend"))]
 async fn filesystem_materialization_skips_special_file_collisions() {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
@@ -1190,13 +1198,13 @@ async fn filesystem_materialization_skips_special_file_collisions() {
     lix.close().await.unwrap();
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 #[track_caller]
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 #[track_caller]
 fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -1214,7 +1222,7 @@ fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1230,7 +1238,7 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
     }
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "fs_backend")]
 async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

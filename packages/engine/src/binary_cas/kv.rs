@@ -1,22 +1,24 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::fastcdc_chunk_ranges;
+use crate::binary_cas::chunking::fastcdc_chunk_ranges_with_chunking;
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWriteReceipt,
+    BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
+    BlobWriteReceipt,
 };
 use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
-    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions,
-    StorageSpaceId, StorageValue,
+    StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
+    StorageScanOptions, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -29,6 +31,14 @@ pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::n
 );
 pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
+
+#[derive(Debug)]
+struct BlobWritePlan {
+    blob_hash: BlobHash,
+    chunk_ranges: Vec<(usize, usize)>,
+    layout: BlobLayout,
+    receipt: BlobWriteReceipt,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvBlobManifestChunk {
@@ -506,13 +516,75 @@ fn decode_and_verify_chunk(
     Ok(chunk_payload.to_vec())
 }
 
+#[allow(dead_code)]
 pub(in crate::binary_cas) fn stage_blob_write(
+    chunking: BinaryCasChunking,
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
     precomputed_hash: Option<BlobHash>,
 ) -> Result<BlobWriteReceipt, LixError> {
+    stage_blob_write_with_chunk_filter(
+        chunking,
+        writes,
+        blob_hashes,
+        bytes,
+        precomputed_hash,
+        |chunk_hash| Ok(chunk_keys.insert(chunk_key(chunk_hash))),
+    )
+}
+
+pub(in crate::binary_cas) fn stage_blob_write_skipping_existing_chunks<S>(
+    chunking: BinaryCasChunking,
+    store: &S,
+    writes: &mut StorageWriteSet,
+    blob_hashes: &mut HashSet<[u8; 32]>,
+    chunk_keys: &mut HashSet<Vec<u8>>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+) -> Result<BlobWriteReceipt, LixError>
+where
+    S: StorageRead + ?Sized,
+{
+    let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
+    let receipt = plan.receipt.clone();
+    if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
+        return Ok(receipt);
+    }
+
+    let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, bytes, &plan)?;
+    stage_prepared_blob_write(writes, bytes, &plan, |chunk_hash| {
+        Ok(chunk_hashes_to_stage.remove(&chunk_hash))
+    })?;
+    Ok(receipt)
+}
+
+fn stage_blob_write_with_chunk_filter(
+    chunking: BinaryCasChunking,
+    writes: &mut StorageWriteSet,
+    blob_hashes: &mut HashSet<[u8; 32]>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+    mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
+) -> Result<BlobWriteReceipt, LixError> {
+    let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
+    let receipt = plan.receipt.clone();
+    if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
+        return Ok(receipt);
+    }
+
+    stage_prepared_blob_write(writes, bytes, &plan, |chunk_hash| {
+        should_stage_chunk(chunk_hash)
+    })?;
+    Ok(receipt)
+}
+
+fn prepare_blob_write(
+    chunking: BinaryCasChunking,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+) -> Result<BlobWritePlan, LixError> {
     let blob_hash = precomputed_hash.unwrap_or_else(|| BlobHash::from_content(bytes));
     if cfg!(debug_assertions)
         && precomputed_hash.is_some()
@@ -523,7 +595,7 @@ pub(in crate::binary_cas) fn stage_blob_write(
             "binary CAS blob hash does not match blob contents".to_string(),
         ));
     }
-    let chunk_ranges = fastcdc_chunk_ranges(bytes);
+    let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
     let layout = match chunk_ranges.as_slice() {
         [] => BlobLayout::Empty,
         [(start, end)] => BlobLayout::SingleChunk {
@@ -547,15 +619,26 @@ pub(in crate::binary_cas) fn stage_blob_write(
         size_bytes: bytes.len() as u64,
         layout: layout.clone(),
     };
-    if !blob_hashes.insert(blob_hash.into_bytes()) {
-        return Ok(receipt);
-    }
 
-    match &layout {
+    Ok(BlobWritePlan {
+        blob_hash,
+        chunk_ranges,
+        layout,
+        receipt,
+    })
+}
+
+fn stage_prepared_blob_write(
+    writes: &mut StorageWriteSet,
+    bytes: &[u8],
+    plan: &BlobWritePlan,
+    mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
+) -> Result<(), LixError> {
+    match &plan.layout {
         BlobLayout::Empty => {
             stage_manifest(
                 writes,
-                blob_hash,
+                plan.blob_hash,
                 &BinaryCasManifest::Empty { size_bytes: 0 },
             );
         }
@@ -563,13 +646,13 @@ pub(in crate::binary_cas) fn stage_blob_write(
             let chunk_hash = *chunk_hash;
             stage_manifest(
                 writes,
-                blob_hash,
+                plan.blob_hash,
                 &BinaryCasManifest::SingleChunk {
                     size_bytes: bytes.len() as u64,
                     chunk_hash: chunk_hash.into_bytes(),
                 },
             );
-            if chunk_keys.insert(chunk_key(chunk_hash)) {
+            if should_stage_chunk(chunk_hash)? {
                 stage_chunk(
                     writes,
                     chunk_hash,
@@ -582,18 +665,17 @@ pub(in crate::binary_cas) fn stage_blob_write(
         BlobLayout::Chunked { chunk_count } => {
             stage_manifest(
                 writes,
-                blob_hash,
+                plan.blob_hash,
                 &BinaryCasManifest::Chunked {
                     size_bytes: bytes.len() as u64,
                     chunk_count: *chunk_count,
                 },
             );
 
-            for (chunk_index, (start, end)) in chunk_ranges.into_iter().enumerate() {
+            for (chunk_index, (start, end)) in plan.chunk_ranges.iter().copied().enumerate() {
                 let chunk_data = &bytes[start..end];
                 let chunk_hash = BlobHash::from_content(chunk_data);
-                let chunk_key = chunk_key(chunk_hash);
-                if chunk_keys.insert(chunk_key.clone()) {
+                if should_stage_chunk(chunk_hash)? {
                     stage_chunk(
                         writes,
                         chunk_hash,
@@ -605,7 +687,7 @@ pub(in crate::binary_cas) fn stage_blob_write(
 
                 stage_manifest_chunk(
                     writes,
-                    blob_hash,
+                    plan.blob_hash,
                     chunk_index as u64,
                     &KvBlobManifestChunk {
                         chunk_hash: *chunk_hash.as_bytes(),
@@ -615,7 +697,83 @@ pub(in crate::binary_cas) fn stage_blob_write(
             }
         }
     }
-    Ok(receipt)
+    Ok(())
+}
+
+fn missing_chunk_hashes(
+    store: &(impl StorageRead + ?Sized),
+    transaction_chunk_keys: &mut HashSet<Vec<u8>>,
+    bytes: &[u8],
+    plan: &BlobWritePlan,
+) -> Result<HashSet<BlobHash>, LixError> {
+    let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
+    match &plan.layout {
+        BlobLayout::Empty => {}
+        BlobLayout::SingleChunk { chunk_hash } => {
+            collect_chunk_lookup_candidate(*chunk_hash, transaction_chunk_keys, &mut candidates);
+        }
+        BlobLayout::Chunked { .. } => {
+            for (start, end) in plan.chunk_ranges.iter().copied() {
+                let chunk_hash = BlobHash::from_content(&bytes[start..end]);
+                collect_chunk_lookup_candidate(chunk_hash, transaction_chunk_keys, &mut candidates);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let keys = candidates
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    let existing = chunk_keys_exist(store, keys)?;
+    Ok(candidates
+        .into_iter()
+        .zip(existing)
+        .filter_map(|((chunk_hash, _), exists)| (!exists).then_some(chunk_hash))
+        .collect())
+}
+
+fn collect_chunk_lookup_candidate(
+    chunk_hash: BlobHash,
+    transaction_chunk_keys: &mut HashSet<Vec<u8>>,
+    candidates: &mut Vec<(BlobHash, StorageKey)>,
+) {
+    let key = chunk_key(chunk_hash);
+    if !transaction_chunk_keys.insert(key.clone()) {
+        crate::binary_cas::metrics::record_binary_cas_transaction_duplicate_chunk();
+        return;
+    }
+    candidates.push((chunk_hash, StorageKey(Bytes::from(key))));
+}
+
+fn chunk_keys_exist(
+    store: &(impl StorageRead + ?Sized),
+    keys: Vec<StorageKey>,
+) -> Result<Vec<bool>, LixError> {
+    let started = Instant::now();
+    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_SPACE, keys).materialize(
+        store,
+        StorageGetOptions {
+            projection: StorageCoreProjection::KeyOnly,
+            ..StorageGetOptions::default()
+        },
+    )?;
+    let exists = result
+        .value
+        .into_iter()
+        .map(|value| value.is_some())
+        .collect::<Vec<_>>();
+    let hit_count = exists.iter().filter(|&&exists| exists).count() as u64;
+    let miss_count = exists.len() as u64 - hit_count;
+    crate::binary_cas::metrics::record_binary_cas_chunk_lookup_batch(
+        hit_count,
+        miss_count,
+        started.elapsed(),
+    );
+    Ok(exists)
 }
 
 fn metadata_from_manifest(
@@ -679,10 +837,18 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn definitely_multi_chunk_blob_bytes() -> Vec<u8> {
+        (0..5_000_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>()
+    }
     use crate::binary_cas::BinaryCasContext;
     use crate::binary_cas::BlobPayload;
     use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage::{
+        InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    };
 
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
@@ -853,6 +1019,145 @@ mod tests {
                 .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn existing_chunk_aware_writer_skips_persisted_chunk_payloads() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let data = b"hello chunked kv cas";
+        let payload = BlobPayload::from_bytes(data.to_vec());
+        let blob_hash = payload.hash().expect("payload should have a hash");
+
+        {
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer
+                .stage_payload(&payload)
+                .expect("initial blob write should stage");
+            assert_eq!(writes.stats().staged_puts, 2);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("initial blob write should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer =
+            BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
+        writer
+            .stage_payload(&payload)
+            .expect("repeat blob write should stage");
+
+        assert_eq!(writes.stats().staged_puts, 1);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("repeat blob write should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        assert_eq!(
+            load_bytes_many(&store, &[blob_hash])
+                .await
+                .expect("blob should load")
+                .into_vec(),
+            vec![Some(data.to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let data = definitely_multi_chunk_blob_bytes();
+        let payload = BlobPayload::from_bytes(data.clone());
+        let blob_hash = payload.hash().expect("payload should have a hash");
+        let chunk_ranges = crate::binary_cas::chunking::fastcdc_chunk_ranges(&data);
+        assert!(chunk_ranges.len() > 1);
+        let chunk_hashes = chunk_ranges
+            .iter()
+            .map(|(start, end)| BlobHash::from_content(&data[*start..*end]))
+            .collect::<HashSet<_>>();
+
+        {
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer
+                .stage_payload(&payload)
+                .expect("initial blob write should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("initial blob write should commit");
+        }
+
+        crate::binary_cas::metrics::reset_binary_cas_write_metrics();
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer =
+            BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
+        writer
+            .stage_payload(&payload)
+            .expect("repeat blob write should stage");
+
+        assert_eq!(
+            writes.stats().staged_puts,
+            1 + u64::try_from(chunk_ranges.len()).expect("chunk count should fit in u64")
+        );
+        let metrics = crate::binary_cas::metrics::binary_cas_write_metrics_snapshot();
+        assert_eq!(metrics.chunk_lookup_count, chunk_hashes.len() as u64);
+        assert_eq!(metrics.chunk_lookup_batch_count, 1);
+        assert_eq!(metrics.chunk_lookup_hit_count, chunk_hashes.len() as u64);
+        assert_eq!(metrics.chunk_lookup_miss_count, 0);
+        assert_eq!(
+            metrics.transaction_duplicate_chunk_count,
+            (chunk_ranges.len() - chunk_hashes.len()) as u64
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("repeat blob write should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        assert_eq!(
+            load_bytes_many(&store, &[blob_hash])
+                .await
+                .expect("blob should load")
+                .into_vec(),
+            vec![Some(data)]
+        );
+    }
+
+    #[test]
+    fn prepared_blob_write_stages_duplicate_chunk_payload_once() {
+        let data = b"abcabc";
+        let blob_hash = BlobHash::from_content(data);
+        let chunk_hash = BlobHash::from_content(b"abc");
+        let plan = BlobWritePlan {
+            blob_hash,
+            chunk_ranges: vec![(0, 3), (3, 6)],
+            layout: BlobLayout::Chunked { chunk_count: 2 },
+            receipt: BlobWriteReceipt {
+                hash: blob_hash,
+                size_bytes: data.len() as u64,
+                layout: BlobLayout::Chunked { chunk_count: 2 },
+            },
+        };
+        let mut writes = StorageWriteSet::new();
+        let mut chunk_hashes_to_stage = HashSet::from([chunk_hash]);
+
+        stage_prepared_blob_write(&mut writes, data, &plan, |chunk_hash| {
+            Ok(chunk_hashes_to_stage.remove(&chunk_hash))
+        })
+        .expect("duplicate chunk payload write should stage");
+
+        assert_eq!(writes.stats().staged_puts, 4);
+        writes
+            .validate()
+            .expect("duplicate chunk payload should be staged only once");
     }
 
     #[tokio::test]
@@ -1033,9 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn public_kv_api_roundtrips_multi_chunk_blob() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let data = (0..600_000)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
+        let data = definitely_multi_chunk_blob_bytes();
         let blob_hash = BlobHash::from_content(&data);
 
         {

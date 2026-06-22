@@ -94,6 +94,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install LLVM build dependencies
+        if: startsWith(matrix.suffix, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -167,6 +173,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2

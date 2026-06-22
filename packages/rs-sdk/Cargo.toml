@@ -19,6 +19,7 @@ workspace = true
 [dependencies]
 lix_backends = { workspace = true, optional = true }
 lix_engine = { workspace = true }
+lix_fs_backend = { workspace = true, optional = true }
 
 async-trait = "0.1"
 bytes = "1"
@@ -40,6 +41,7 @@ zip = { version = "8", default-features = false }
 [features]
 default = ["default_wasm_runtime"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+fs_backend = ["dep:lix_fs_backend", "lix_fs_backend/rocksdb"]
 sqlite = ["dep:lix_backends", "lix_backends/sqlite", "dep:rusqlite", "dep:tempfile"]
 
 [[example]]
@@ -66,7 +68,7 @@ required-features = ["sqlite"]
 [[example]]
 name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
-required-features = ["sqlite"]
+required-features = ["fs_backend"]
 
 [[bench]]
 name = "sqlite_backend"
