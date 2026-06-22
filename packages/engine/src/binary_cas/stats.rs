@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn counts_binary_cas_storage_rows() {
         let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(backend);
         let mut writes = storage.new_write_set();
 
         let empty_hash = BlobHash::from_content(b"empty");
