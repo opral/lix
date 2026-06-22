@@ -12,10 +12,11 @@ use lix_sdk::{
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use tokio::runtime::{Builder, Runtime};
@@ -24,8 +25,7 @@ use tokio::sync::watch;
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "Lix")]
 pub struct NativeLix {
-    rt: Runtime,
-    lix: Option<NativeLixInner>,
+    actor: NativeLixActor,
 }
 
 enum NativeLixInner {
@@ -44,6 +44,400 @@ enum NativeObserveEventsInner {
     Memory(RsObserveEvents<InMemoryBackend>),
     Sqlite(RsObserveEvents<SqliteBackend>),
     Fs(RsObserveEvents<FsBackend>),
+}
+
+#[derive(Clone)]
+struct NativeLixActor {
+    commands: Sender<LixCommand>,
+    closed: Arc<AtomicBool>,
+    send_lock: Arc<Mutex<()>>,
+    next_transaction_id: Arc<AtomicU64>,
+}
+
+struct NativeLixActorState {
+    lix: NativeLixInner,
+    transactions: HashMap<u64, NativeLixTransactionInner>,
+}
+
+type NativeResult<T> = std::result::Result<T, LixError>;
+type NativeResolver<T> = Box<dyn FnOnce(Env) -> Result<T> + Send>;
+type NativeDeferred<T> = JsDeferred<T, NativeResolver<T>>;
+type NativeExecuteDeferred = NativeDeferred<ExecuteResult>;
+type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
+type NativeStringDeferred = NativeDeferred<String>;
+type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
+type NativeSwitchBranchDeferred = NativeDeferred<SwitchBranchReceiptDto>;
+type NativeMergePreviewDeferred = NativeDeferred<MergeBranchPreviewDto>;
+type NativeMergeReceiptDeferred = NativeDeferred<MergeBranchReceiptDto>;
+type NativeUnitDeferred = NativeDeferred<()>;
+
+enum LixCommand {
+    Execute {
+        sql: String,
+        params: Vec<Value>,
+        deferred: NativeExecuteDeferred,
+    },
+    BeginTransaction {
+        transaction_id: u64,
+        actor: NativeLixActor,
+        deferred: NativeTransactionDeferred,
+    },
+    ActiveBranchId(NativeStringDeferred),
+    CreateBranch {
+        options: RsCreateBranchOptions,
+        deferred: NativeCreateBranchDeferred,
+    },
+    SwitchBranch {
+        options: RsSwitchBranchOptions,
+        deferred: NativeSwitchBranchDeferred,
+    },
+    MergeBranchPreview {
+        options: MergeBranchPreviewOptions,
+        deferred: NativeMergePreviewDeferred,
+    },
+    MergeBranch {
+        options: RsMergeBranchOptions,
+        deferred: NativeMergeReceiptDeferred,
+    },
+    Close(NativeUnitDeferred),
+    Observe {
+        sql: String,
+        params: Vec<Value>,
+        deferred: NativeDeferred<NativeObserveEvents>,
+    },
+    TransactionExecute {
+        transaction_id: u64,
+        sql: String,
+        params: Vec<Value>,
+        deferred: NativeExecuteDeferred,
+    },
+    TransactionCommit {
+        transaction_id: u64,
+        deferred: NativeUnitDeferred,
+    },
+    TransactionRollback {
+        transaction_id: u64,
+        deferred: NativeUnitDeferred,
+    },
+    TransactionAbandon {
+        transaction_id: u64,
+    },
+}
+
+impl NativeLixActor {
+    fn start(lix: NativeLixInner) -> Result<Self> {
+        let (commands, receiver) = mpsc::channel();
+        let actor = Self {
+            commands,
+            closed: Arc::new(AtomicBool::new(false)),
+            send_lock: Arc::new(Mutex::new(())),
+            next_transaction_id: Arc::new(AtomicU64::new(1)),
+        };
+        let actor_closed = Arc::clone(&actor.closed);
+        let actor_send_lock = Arc::clone(&actor.send_lock);
+        thread::Builder::new()
+            .name("lix-native".to_string())
+            .spawn(move || run_lix_actor(lix, receiver, actor_closed, actor_send_lock))
+            .map_err(to_napi_error)?;
+        Ok(actor)
+    }
+
+    fn next_transaction_id(&self) -> u64 {
+        self.next_transaction_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn send_with_deferred<T>(
+        &self,
+        deferred: NativeDeferred<T>,
+        command: impl FnOnce(NativeDeferred<T>) -> LixCommand,
+    ) where
+        T: ToNapiValue + Send + 'static,
+    {
+        let Ok(_send_guard) = self.send_lock.lock() else {
+            settle_deferred(deferred, Err(lix_closed_error()));
+            return;
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            settle_deferred(deferred, Err(lix_closed_error()));
+            return;
+        }
+        let command = command(deferred);
+        match self.commands.send(command) {
+            Ok(()) => {}
+            Err(error) => {
+                settle_command_after_close(error.0);
+            }
+        }
+    }
+}
+
+impl NativeLixActor {
+    fn abandon_transaction(&self, transaction_id: u64) {
+        let _ = self
+            .commands
+            .send(LixCommand::TransactionAbandon { transaction_id });
+    }
+}
+
+fn settle_deferred<T>(deferred: NativeDeferred<T>, result: NativeResult<T>)
+where
+    T: ToNapiValue + Send + 'static,
+{
+    deferred.resolve(Box::new(move |env| {
+        result.map_err(|error| lix_error_to_napi_error(&env, error))
+    }));
+}
+
+fn run_lix_actor(
+    lix: NativeLixInner,
+    receiver: mpsc::Receiver<LixCommand>,
+    closed: Arc<AtomicBool>,
+    send_lock: Arc<Mutex<()>>,
+) {
+    let rt = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(error) => {
+            closed.store(true, Ordering::SeqCst);
+            reject_pending_lix_commands(receiver, error);
+            return;
+        }
+    };
+    let mut state = Some(NativeLixActorState {
+        lix,
+        transactions: HashMap::new(),
+    });
+
+    while let Ok(command) = receiver.recv() {
+        let Some(open_state) = state.as_mut() else {
+            settle_command_after_close(command);
+            continue;
+        };
+        if closed.load(Ordering::SeqCst) {
+            drop(state.take());
+            settle_command_after_close(command);
+            drain_commands_after_close(&receiver, &send_lock);
+            break;
+        }
+        if handle_lix_command(&rt, open_state, &closed, command) {
+            drop(state.take());
+            drain_commands_after_close(&receiver, &send_lock);
+            break;
+        }
+    }
+    closed.store(true, Ordering::SeqCst);
+}
+
+fn drain_commands_after_close(receiver: &mpsc::Receiver<LixCommand>, send_lock: &Mutex<()>) {
+    let Ok(_send_guard) = send_lock.lock() else {
+        return;
+    };
+    for command in receiver.try_iter() {
+        settle_command_after_close(command);
+    }
+}
+
+fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std::io::Error) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::SwitchBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::MergeBranchPreview { deferred, .. } => {
+                deferred.reject(to_napi_error(&error));
+            }
+            LixCommand::MergeBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::Close(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::Observe { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::TransactionExecute { deferred, .. } => {
+                deferred.reject(to_napi_error(&error));
+            }
+            LixCommand::TransactionCommit { deferred, .. }
+            | LixCommand::TransactionRollback { deferred, .. } => {
+                deferred.reject(to_napi_error(&error));
+            }
+            LixCommand::TransactionAbandon { .. } => {}
+        }
+    }
+}
+
+fn handle_lix_command(
+    rt: &Runtime,
+    state: &mut NativeLixActorState,
+    closed: &AtomicBool,
+    command: LixCommand,
+) -> bool {
+    match command {
+        LixCommand::Execute {
+            sql,
+            params,
+            deferred,
+        } => {
+            let result = rt
+                .block_on(state.lix.execute(&sql, &params))
+                .and_then(ExecuteResult::try_from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::BeginTransaction {
+            transaction_id,
+            actor,
+            deferred,
+        } => {
+            let result = rt
+                .block_on(state.lix.begin_transaction())
+                .map(|transaction| {
+                    state.transactions.insert(transaction_id, transaction);
+                    NativeLixTransaction::new(actor, transaction_id)
+                });
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::ActiveBranchId(deferred) => {
+            let result = rt.block_on(state.lix.active_branch_id());
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::CreateBranch { options, deferred } => {
+            let result = rt
+                .block_on(state.lix.create_branch(options))
+                .map(CreateBranchReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::SwitchBranch { options, deferred } => {
+            let result = rt
+                .block_on(state.lix.switch_branch(options))
+                .map(SwitchBranchReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::MergeBranchPreview { options, deferred } => {
+            let result = rt
+                .block_on(state.lix.merge_branch_preview(options))
+                .map(MergeBranchPreviewDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::MergeBranch { options, deferred } => {
+            let result = rt
+                .block_on(state.lix.merge_branch(options))
+                .map(MergeBranchReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::Close(deferred) => {
+            let result = rt.block_on(state.lix.close());
+            let should_drop_state = result.is_ok();
+            if result.is_ok() {
+                closed.store(true, Ordering::SeqCst);
+            }
+            settle_deferred(deferred, result);
+            should_drop_state
+        }
+        LixCommand::Observe {
+            sql,
+            params,
+            deferred,
+        } => {
+            let result = state.lix.observe(&sql, &params).and_then(|events| {
+                NativeObserveEvents::new(events).map_err(|error| {
+                    LixError::unknown(format!("failed to start observe actor: {error}"))
+                })
+            });
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::TransactionExecute {
+            transaction_id,
+            sql,
+            params,
+            deferred,
+        } => {
+            let result = state.transactions.get_mut(&transaction_id).map_or_else(
+                || Err(transaction_closed_error()),
+                |transaction| {
+                    rt.block_on(transaction.execute(&sql, &params))
+                        .and_then(ExecuteResult::try_from)
+                },
+            );
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::TransactionCommit {
+            transaction_id,
+            deferred,
+        } => {
+            let result = state.transactions.remove(&transaction_id).map_or_else(
+                || Err(transaction_closed_error()),
+                |transaction| rt.block_on(transaction.commit()),
+            );
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::TransactionRollback {
+            transaction_id,
+            deferred,
+        } => {
+            let result = state.transactions.remove(&transaction_id).map_or_else(
+                || Err(transaction_closed_error()),
+                |transaction| rt.block_on(transaction.rollback()),
+            );
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::TransactionAbandon { transaction_id } => {
+            if let Some(transaction) = state.transactions.remove(&transaction_id) {
+                let _ = rt.block_on(transaction.rollback());
+            }
+            false
+        }
+    }
+}
+
+fn settle_command_after_close(command: LixCommand) {
+    match command {
+        LixCommand::Close(deferred) => settle_deferred(deferred, Ok(())),
+        LixCommand::Execute { deferred, .. } | LixCommand::TransactionExecute { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::BeginTransaction { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::ActiveBranchId(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::CreateBranch { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::SwitchBranch { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::MergeBranchPreview { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::MergeBranch { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::Observe { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::TransactionCommit { deferred, .. }
+        | LixCommand::TransactionRollback { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::TransactionAbandon { .. } => {}
+    }
+}
+
+fn lix_closed_error() -> LixError {
+    LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
+        .with_hint("Open a new Lix handle before calling this method.")
+}
+
+fn transaction_closed_error() -> LixError {
+    LixError::new("LIX_INVALID_TRANSACTION_STATE", "Lix transaction is closed")
 }
 
 impl NativeLixInner {
@@ -207,6 +601,14 @@ pub struct OpenFsTask {
     filter: FsBackendFilter,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OpenMemoryTask;
+
+#[derive(Debug)]
+pub struct OpenSqliteTask {
+    path: String,
+}
+
 fn parse_fs_backend_storage(env: &Env, storage: Option<String>) -> Result<NativeFsBackendStorage> {
     match storage.as_deref().unwrap_or("persistent") {
         "persistent" => Ok(NativeFsBackendStorage::Persistent),
@@ -257,6 +659,51 @@ impl Task for OpenFsTask {
     }
 }
 
+impl Task for OpenMemoryTask {
+    type Output = std::result::Result<NativeLix, LixError>;
+    type JsValue = NativeLix;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(open_memory_native())
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+
+impl Task for OpenSqliteTask {
+    type Output = std::result::Result<NativeLix, LixError>;
+    type JsValue = NativeLix;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(open_sqlite_native(std::mem::take(&mut self.path)))
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+
+fn open_memory_native() -> std::result::Result<NativeLix, LixError> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
+    let lix = rt.block_on(open_lix(RsOpenLixOptions::default()))?;
+    NativeLix::new(NativeLixInner::Memory(lix))
+}
+
+fn open_sqlite_native(path: String) -> std::result::Result<NativeLix, LixError> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
+    let backend = SqliteBackend::new(SqliteBackendOptions { path: path.into() })?;
+    let lix = rt.block_on(open_lix_with_backend(backend))?;
+    NativeLix::new(NativeLixInner::Sqlite(lix))
+}
+
 fn open_fs_native(
     path: String,
     storage: NativeFsBackendStorage,
@@ -275,44 +722,19 @@ fn open_fs_native(
         }
     })?;
     let lix = rt.block_on(open_lix_with_backend(backend))?;
-    Ok(NativeLix {
-        rt,
-        lix: Some(NativeLixInner::Fs(lix)),
-    })
+    NativeLix::new(NativeLixInner::Fs(lix))
 }
 
 #[napi]
 impl NativeLix {
-    #[napi(factory, js_name = "openMemory")]
-    pub fn open_memory(env: Env) -> Result<Self> {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(to_napi_error)?;
-        let lix = rt
-            .block_on(open_lix(RsOpenLixOptions::default()))
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(Self {
-            rt,
-            lix: Some(NativeLixInner::Memory(lix)),
-        })
+    #[napi(js_name = "openMemory")]
+    pub fn open_memory() -> AsyncTask<OpenMemoryTask> {
+        AsyncTask::new(OpenMemoryTask)
     }
 
-    #[napi(factory, js_name = "openSqlite")]
-    pub fn open_sqlite(env: Env, path: String) -> Result<Self> {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(to_napi_error)?;
-        let backend = SqliteBackend::new(SqliteBackendOptions { path: path.into() })
-            .map_err(|error| throw_lix_error(&env, error.into()))?;
-        let lix = rt
-            .block_on(open_lix_with_backend(backend))
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(Self {
-            rt,
-            lix: Some(NativeLixInner::Sqlite(lix)),
-        })
+    #[napi(js_name = "openSqlite")]
+    pub fn open_sqlite(path: String) -> AsyncTask<OpenSqliteTask> {
+        AsyncTask::new(OpenSqliteTask { path })
     }
 
     #[napi(js_name = "openFs")]
@@ -332,156 +754,152 @@ impl NativeLix {
     }
 
     #[napi]
-    pub fn execute(
+    pub fn execute<'env>(
         &self,
-        env: Env,
+        env: &'env Env,
         sql: String,
         params: Option<Vec<LixValue>>,
-    ) -> Result<ExecuteResult> {
+    ) -> Result<Object<'env>> {
         let params = match params {
             Some(params) => params
                 .into_iter()
                 .map(Value::try_from)
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| throw_lix_error(&env, error))?,
+                .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let result = self
-            .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .execute(&sql, &params),
-            )
-            .map_err(|error| throw_lix_error(&env, error))?;
-        ExecuteResult::try_from(result).map_err(|error| throw_lix_error(&env, error))
+        let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::Execute {
+                sql,
+                params,
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi]
-    pub fn observe(
+    pub fn observe<'env>(
         &self,
-        env: Env,
+        env: &'env Env,
         sql: String,
         params: Option<Vec<LixValue>>,
-    ) -> Result<NativeObserveEvents> {
+    ) -> Result<Object<'env>> {
         let params = match params {
             Some(params) => params
                 .into_iter()
                 .map(Value::try_from)
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| throw_lix_error(&env, error))?,
+                .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let events = self
-            .lix()
-            .map_err(|error| throw_lix_error(&env, error))?
-            .observe(&sql, &params)
-            .map_err(|error| throw_lix_error(&env, error))?;
-        NativeObserveEvents::new(events)
+        let (deferred, promise): (NativeDeferred<NativeObserveEvents>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::Observe {
+                sql,
+                params,
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi(js_name = "beginTransaction")]
-    pub fn begin_transaction(&self, env: Env) -> Result<NativeLixTransaction> {
-        let transaction = self
-            .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .begin_transaction(),
-            )
-            .map_err(|error| throw_lix_error(&env, error))?;
-        NativeLixTransaction::new(transaction)
+    pub fn begin_transaction<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let transaction_id = self.actor.next_transaction_id();
+        let (deferred, promise): (NativeTransactionDeferred, Object<'env>) =
+            env.create_deferred()?;
+        let actor = self.actor.clone();
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::BeginTransaction {
+                transaction_id,
+                actor,
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi(js_name = "activeBranchId")]
-    pub fn active_branch_id(&self, env: Env) -> Result<String> {
-        self.rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .active_branch_id(),
-            )
-            .map_err(|error| throw_lix_error(&env, error))
+    pub fn active_branch_id<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeStringDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::ActiveBranchId);
+        Ok(promise)
     }
 
     #[napi(js_name = "createBranch")]
-    pub fn create_branch(
+    pub fn create_branch<'env>(
         &self,
-        env: Env,
+        env: &'env Env,
         options: CreateBranchOptions,
-    ) -> Result<CreateBranchReceiptDto> {
-        let receipt = self
-            .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .create_branch(options.into()),
-            )
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(CreateBranchReceiptDto::from(receipt))
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeCreateBranchDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::CreateBranch {
+                options: options.into(),
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi(js_name = "switchBranch")]
-    pub fn switch_branch(
+    pub fn switch_branch<'env>(
         &self,
-        env: Env,
+        env: &'env Env,
         options: SwitchBranchOptions,
-    ) -> Result<SwitchBranchReceiptDto> {
-        let receipt = self
-            .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .switch_branch(options.into()),
-            )
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(SwitchBranchReceiptDto::from(receipt))
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeSwitchBranchDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::SwitchBranch {
+                options: options.into(),
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi(js_name = "mergeBranchPreview")]
-    pub fn merge_branch_preview(
+    pub fn merge_branch_preview<'env>(
         &self,
-        env: Env,
+        env: &'env Env,
         options: MergeBranchOptions,
-    ) -> Result<MergeBranchPreviewDto> {
-        let preview = self
-            .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .merge_branch_preview(options.into_preview()),
-            )
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(MergeBranchPreviewDto::from(preview))
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeMergePreviewDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::MergeBranchPreview {
+                options: options.into_preview(),
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi(js_name = "mergeBranch")]
-    pub fn merge_branch(
+    pub fn merge_branch<'env>(
         &self,
-        env: Env,
+        env: &'env Env,
         options: MergeBranchOptions,
-    ) -> Result<MergeBranchReceiptDto> {
-        let receipt = self
-            .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .merge_branch(options.into()),
-            )
-            .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(MergeBranchReceiptDto::from(receipt))
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeMergeReceiptDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::MergeBranch {
+                options: options.into(),
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi]
-    pub fn close(&mut self, env: Env) -> Result<()> {
-        let Some(lix) = self.lix.as_ref() else {
-            return Ok(());
-        };
-        self.rt
-            .block_on(lix.close())
-            .map_err(|error| throw_lix_error(&env, error))?;
-        self.lix = None;
-        Ok(())
+    pub fn close<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        if self.actor.closed.load(Ordering::SeqCst) {
+            settle_deferred(deferred, Ok(()));
+            return Ok(promise);
+        }
+        self.actor.send_with_deferred(deferred, LixCommand::Close);
+        Ok(promise)
     }
 }
 
@@ -727,88 +1145,104 @@ fn close_observe_events(
 }
 
 impl NativeLix {
-    fn lix(&self) -> std::result::Result<&NativeLixInner, LixError> {
-        self.lix.as_ref().ok_or_else(|| {
-            LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
-                .with_hint("Open a new Lix handle before calling this method.")
-        })
+    fn new(lix: NativeLixInner) -> std::result::Result<Self, LixError> {
+        let actor = NativeLixActor::start(lix)
+            .map_err(|error| LixError::unknown(format!("failed to start native actor: {error}")))?;
+        Ok(Self { actor })
     }
 }
 
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "LixTransaction")]
 pub struct NativeLixTransaction {
-    rt: Runtime,
-    transaction: Option<NativeLixTransactionInner>,
+    actor: NativeLixActor,
+    transaction_id: u64,
+    closed: Arc<AtomicBool>,
 }
 
 #[napi]
 impl NativeLixTransaction {
-    fn new(transaction: NativeLixTransactionInner) -> Result<Self> {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(to_napi_error)?;
-        Ok(Self {
-            rt,
-            transaction: Some(transaction),
-        })
+    fn new(actor: NativeLixActor, transaction_id: u64) -> Self {
+        Self {
+            actor,
+            transaction_id,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[napi]
-    pub fn execute(
-        &mut self,
-        env: Env,
+    pub fn execute<'env>(
+        &self,
+        env: &'env Env,
         sql: String,
         params: Option<Vec<LixValue>>,
-    ) -> Result<ExecuteResult> {
+    ) -> Result<Object<'env>> {
         let params = match params {
             Some(params) => params
                 .into_iter()
                 .map(Value::try_from)
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| throw_lix_error(&env, error))?,
+                .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let mut transaction = self
-            .take_transaction()
-            .map_err(|error| throw_lix_error(&env, error))?;
-        let result = self.rt.block_on(transaction.execute(&sql, &params));
-        self.transaction = Some(transaction);
-        let result = result.map_err(|error| throw_lix_error(&env, error))?;
-        ExecuteResult::try_from(result).map_err(|error| throw_lix_error(&env, error))
+        let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
+        if self.closed.load(Ordering::SeqCst) {
+            settle_deferred(deferred, Err(transaction_closed_error()));
+            return Ok(promise);
+        }
+        let transaction_id = self.transaction_id;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::TransactionExecute {
+                transaction_id,
+                sql,
+                params,
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi]
-    pub fn commit(&mut self, env: Env) -> Result<()> {
-        let transaction = self
-            .take_transaction()
-            .map_err(|error| throw_lix_error(&env, error))?;
-        self.rt
-            .block_on(transaction.commit())
-            .map_err(|error| throw_lix_error(&env, error))
+    pub fn commit<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        if self.closed.swap(true, Ordering::SeqCst) {
+            settle_deferred(deferred, Err(transaction_closed_error()));
+            return Ok(promise);
+        }
+        let transaction_id = self.transaction_id;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::TransactionCommit {
+                transaction_id,
+                deferred,
+            });
+        Ok(promise)
     }
 
     #[napi]
-    pub fn rollback(&mut self, env: Env) -> Result<()> {
-        let transaction = self
-            .take_transaction()
-            .map_err(|error| throw_lix_error(&env, error))?;
-        self.rt
-            .block_on(transaction.rollback())
-            .map_err(|error| throw_lix_error(&env, error))
+    pub fn rollback<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        if self.closed.swap(true, Ordering::SeqCst) {
+            settle_deferred(deferred, Err(transaction_closed_error()));
+            return Ok(promise);
+        }
+        let transaction_id = self.transaction_id;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::TransactionRollback {
+                transaction_id,
+                deferred,
+            });
+        Ok(promise)
     }
 }
 
-impl NativeLixTransaction {
-    fn take_transaction(&mut self) -> std::result::Result<NativeLixTransactionInner, LixError> {
-        self.transaction.take().ok_or_else(|| {
-            LixError::new("LIX_INVALID_TRANSACTION_STATE", "Lix transaction is closed")
-        })
+impl Drop for NativeLixTransaction {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.actor.abandon_transaction(self.transaction_id);
+        }
     }
 }
 
-#[expect(missing_debug_implementations)]
+#[derive(Debug)]
 #[napi(object)]
 pub struct CreateBranchOptions {
     pub id: Option<String>,
@@ -826,7 +1260,6 @@ impl From<CreateBranchOptions> for RsCreateBranchOptions {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct CreateBranchReceiptDto {
     pub id: String,
@@ -846,7 +1279,7 @@ impl From<CreateBranchReceipt> for CreateBranchReceiptDto {
     }
 }
 
-#[expect(missing_debug_implementations)]
+#[derive(Debug)]
 #[napi(object)]
 pub struct SwitchBranchOptions {
     pub branch_id: String,
@@ -860,7 +1293,6 @@ impl From<SwitchBranchOptions> for RsSwitchBranchOptions {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct SwitchBranchReceiptDto {
     pub branch_id: String,
@@ -896,7 +1328,6 @@ impl From<MergeBranchOptions> for RsMergeBranchOptions {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeBranchReceiptDto {
     pub outcome: String,
@@ -926,7 +1357,6 @@ impl From<MergeBranchReceipt> for MergeBranchReceiptDto {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeBranchPreviewDto {
     pub outcome: String,
@@ -963,7 +1393,6 @@ fn merge_branch_outcome_to_string(outcome: MergeBranchOutcome) -> String {
     .to_string()
 }
 
-#[expect(missing_copy_implementations, missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeChangeStatsDto {
     pub total: u32,
@@ -984,7 +1413,6 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeConflictDto {
     pub kind: String,
@@ -1015,7 +1443,6 @@ fn merge_conflict_kind_to_string(kind: MergeConflictKind) -> String {
     .to_string()
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeConflictSideDto {
     pub kind: String,
@@ -1162,7 +1589,6 @@ impl TryFrom<&Value> for LixValue {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct ExecuteResult {
     pub columns: Vec<String>,
@@ -1221,7 +1647,6 @@ impl TryFrom<RsObserveEvent> for ObserveEventDto {
     }
 }
 
-#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct LixNotice {
     pub code: String,
