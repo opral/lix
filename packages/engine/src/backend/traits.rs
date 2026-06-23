@@ -8,8 +8,15 @@ use crate::backend::{
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId, WriteOptions,
 };
 
-/// An ordered byte-key entry backend with coherent read views, batched point
-/// access, space-scoped scans, and atomic batched writes.
+/// Lix's host-system adapter.
+///
+/// Every backend provides the ordered key/value storage used by the engine.
+/// Storage may be persistent or ephemeral depending on the implementation. A
+/// backend may also expose optional host capabilities, such as a mounted
+/// workspace filesystem.
+///
+/// The ordered storage surface has coherent read views, batched point access,
+/// space-scoped scans, and atomic batched writes.
 ///
 /// Storage is organized into spaces: engine-defined namespaces identified by
 /// [`SpaceId`]. Every operation addresses exactly one space, keys are logical
@@ -28,6 +35,11 @@ pub trait Backend {
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError>;
 
+    /// Returns an optional filesystem mount projected into Lix workspace paths.
+    ///
+    /// Backends without an external workspace return `None`. Mounted filesystems
+    /// are external host state; they are not part of the backend's atomic storage
+    /// commit.
     fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
         None
     }

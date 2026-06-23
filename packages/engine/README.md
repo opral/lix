@@ -13,8 +13,8 @@ The engine owns:
 - binary CAS data after bytes have been imported into Lix
 - the storage backend contract for ordered key/value reads and writes
 
-System APIs are out of scope for the engine. In particular, engine code should
-not depend on:
+Direct host system access is out of scope for engine logic. In particular,
+engine code should not depend on:
 
 - host filesystem paths for user files
 - directory walking or file materialization
@@ -24,9 +24,9 @@ not depend on:
 
 Those responsibilities belong in backend or SDK adapters, such as `FsBackend`.
 Adapters may map host resources into logical Lix paths, hydrate bytes on demand,
-watch external changes, and materialize writes. The engine should only see the
-logical Lix data and any narrow adapter capability needed to retrieve external
-payloads.
+watch external changes, and materialize writes. Host resources enter the engine
+through narrow backend capabilities, such as `MountedFilesystem`, rather than
+through direct filesystem or platform API calls.
 
 Keeping this boundary lets the engine stay deterministic, portable, and easy to
 test with simulated or in-memory backends.
