@@ -876,7 +876,7 @@ where
         self.prepare_sql_visible_schemas().await?;
         for path in paths {
             let data = mounted_filesystem
-                .read_file_data(path)
+                .read_file(path)
                 .await
                 .map_err(|error| {
                     LixError::new(
@@ -987,7 +987,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageB
     staged: crate::transaction::staging::PreparedStateRowOverlay,
     staged_writes: Arc<TransactionWriteBuffer>,
     plugin_host: PluginRuntimeHost,
-    mounted_filesystem: Option<Arc<dyn crate::backend::BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn crate::backend::MountedFilesystem>>,
 }
 
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
@@ -1047,7 +1047,7 @@ where
         self.plugin_host.clone()
     }
 
-    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::backend::BackendMountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::backend::MountedFilesystem>> {
         self.mounted_filesystem.clone()
     }
 }
@@ -1324,7 +1324,7 @@ where
         self.plugin_host.clone()
     }
 
-    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::backend::BackendMountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::backend::MountedFilesystem>> {
         self.storage.mounted_filesystem()
     }
 

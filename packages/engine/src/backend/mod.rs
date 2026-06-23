@@ -23,8 +23,8 @@ pub use predicate::{
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
 };
 pub use traits::{
-    Backend, BackendMountedFilesystem, BackendRead, BackendWrite, MountedFilesystemInventory,
-    PointVisitor, ScanVisitor, get_many,
+    Backend, BackendRead, BackendWrite, MountedFilesystem, MountedFilesystemListing, PointVisitor,
+    ScanVisitor, get_many,
 };
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,

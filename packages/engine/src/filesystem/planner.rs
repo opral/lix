@@ -128,6 +128,16 @@ impl FilesystemDescriptorKey {
     pub(crate) fn is_untracked(&self) -> bool {
         self.untracked
     }
+
+    pub(crate) fn context(&self) -> FilesystemRowContext {
+        FilesystemRowContext {
+            branch_id: self.branch_id.clone(),
+            global: self.global,
+            untracked: self.untracked,
+            file_id: self.file_id.clone(),
+            metadata: None,
+        }
+    }
 }
 
 /// Storage identity of a `lix_binary_blob_ref` row for a filesystem file.

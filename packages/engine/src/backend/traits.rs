@@ -28,7 +28,7 @@ pub trait Backend {
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError>;
 
-    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
         None
     }
 
@@ -46,21 +46,27 @@ pub trait Backend {
 }
 
 #[async_trait]
-pub trait BackendMountedFilesystem: Send + Sync {
-    /// Returns one best-effort mounted filesystem inventory snapshot.
+pub trait MountedFilesystem: Send + Sync {
+    /// Returns one best-effort listing of mounted filesystem paths.
     ///
     /// Mounted filesystems are external system state. Implementations do not
-    /// promise snapshot isolation between inventory and file-data reads.
-    async fn inventory(&self) -> Result<MountedFilesystemInventory, BackendError>;
+    /// promise snapshot isolation between listing and file reads.
+    ///
+    /// Listing paths are normalized Lix workspace paths:
+    /// - directories are absolute and slash-terminated, for example `/docs/`
+    /// - files are absolute and not slash-terminated, for example `/docs/a.md`
+    /// - `/` may be omitted from directories because it is implicit
+    async fn list(&self) -> Result<MountedFilesystemListing, BackendError>;
 
-    async fn read_file_data(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError>;
+    /// Reads bytes for a normalized file path previously exposed by `list`.
+    /// Returning `Ok(None)` means the mounted file is no longer available.
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MountedFilesystemInventory {
+pub struct MountedFilesystemListing {
     pub directories: BTreeSet<String>,
     pub files: BTreeSet<String>,
-    pub revision: u64,
 }
 
 pub trait BackendRead {

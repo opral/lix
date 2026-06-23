@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::backend::BackendMountedFilesystem;
+use crate::backend::MountedFilesystem;
 use crate::binary_cas::BlobHash;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::{LixError, MountedFilesystemInventory};
+use crate::{LixError, MountedFilesystemListing};
 
 use super::FilesystemIndex;
 use super::keys::{DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY};
+use super::planner::{FilesystemDescriptorKey, FilesystemRowContext};
 
 const MOUNTED_FILE_ID_PREFIX: &str = "mounted:file:";
 const MOUNTED_DIRECTORY_ID_PREFIX: &str = "mounted:dir:";
@@ -17,58 +18,91 @@ const MOUNTED_ROW_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MountedWorkspaceRows {
     pub(crate) rows: Vec<MaterializedLiveStateRow>,
-    pub(crate) file_paths_by_id: BTreeMap<String, String>,
+    pub(crate) file_paths_by_key: BTreeMap<FilesystemDescriptorKey, String>,
 }
 
 pub(crate) async fn mounted_workspace_rows(
     active_branch_id: &str,
-    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     owned_rows: &[MaterializedLiveStateRow],
 ) -> Result<MountedWorkspaceRows, LixError> {
     let Some(mounted_filesystem) = mounted_filesystem else {
         return Ok(MountedWorkspaceRows::default());
     };
-    let inventory = mounted_filesystem.inventory().await.map_err(|error| {
+    let listing = mounted_filesystem.list().await.map_err(|error| {
         LixError::new(
             LixError::CODE_STORAGE_ERROR,
-            format!("mounted filesystem inventory failed: {error}"),
+            format!("mounted filesystem listing failed: {error}"),
         )
     })?;
     let owned = FilesystemIndex::from_live_rows(owned_rows.to_vec())?;
-    Ok(rows_from_inventory(active_branch_id, inventory, &owned))
+    rows_from_listing(active_branch_id, listing, &owned, owned_rows)
 }
 
-fn rows_from_inventory(
+pub(crate) fn is_mounted_directory_id(id: &str) -> bool {
+    id.starts_with(MOUNTED_DIRECTORY_ID_PREFIX)
+}
+
+fn rows_from_listing(
     active_branch_id: &str,
-    inventory: MountedFilesystemInventory,
+    listing: MountedFilesystemListing,
     owned: &FilesystemIndex,
-) -> MountedWorkspaceRows {
+    owned_rows: &[MaterializedLiveStateRow],
+) -> Result<MountedWorkspaceRows, LixError> {
     let mut rows = Vec::new();
-    let mut file_paths_by_id = BTreeMap::new();
-    let mut directories = inventory
+    let mut file_paths_by_key = BTreeMap::new();
+    let owned_descriptor_keys = owned_descriptor_keys(owned_rows)?;
+    let mounted_context = mounted_row_context(active_branch_id);
+    let mut directories = listing
         .directories
         .into_iter()
         .filter(|path| path != "/")
         .collect::<BTreeSet<_>>();
-    for file_path in &inventory.files {
+    for file_path in &listing.files {
         for directory in ancestor_directories(file_path) {
             directories.insert(directory);
         }
     }
 
+    let mut mounted_directories_by_path = BTreeMap::<String, MountedDirectory>::new();
     for directory_path in directories {
         if owned.contains_path(&directory_path)
             || owned.contains_path(directory_path.trim_end_matches('/'))
+            || owned.is_shadowed_by_file_ancestor(&directory_path)
         {
             continue;
         }
         let id = mounted_directory_id(&directory_path);
-        let parent_id = parent_directory_path(&directory_path)
-            .filter(|path| path != "/")
-            .map(|path| mounted_directory_id(&path));
+        let mut context = mounted_context.clone();
+        let parent_id = match parent_directory_path(&directory_path).filter(|path| path != "/") {
+            Some(parent_path) => {
+                if let Some(id) = owned.directory_id_for_path(&parent_path) {
+                    context = owned
+                        .directory_context_for_path(&parent_path)
+                        .unwrap_or_else(|| mounted_context.clone());
+                    Some(id.to_string())
+                } else if let Some(parent) = mounted_directories_by_path.get(&parent_path) {
+                    context = parent.context.clone();
+                    Some(parent.id.clone())
+                } else {
+                    continue;
+                }
+            }
+            None => None,
+        };
+        if owned_descriptor_keys.contains(&FilesystemDescriptorKey::from_context(&context, &id)) {
+            continue;
+        }
         let name = path_leaf_name(&directory_path);
+        mounted_directories_by_path.insert(
+            directory_path.clone(),
+            MountedDirectory {
+                id: id.clone(),
+                context: context.clone(),
+            },
+        );
         rows.push(mounted_row(
-            active_branch_id,
+            &context,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             &id,
             serde_json::json!({
@@ -80,18 +114,39 @@ fn rows_from_inventory(
         ));
     }
 
-    for file_path in inventory.files {
-        if owned.contains_path(&file_path) || owned.contains_path(&format!("{file_path}/")) {
+    for file_path in listing.files {
+        if owned.contains_path(&file_path)
+            || owned.contains_path(&format!("{file_path}/"))
+            || owned.is_shadowed_by_file_ancestor(&file_path)
+        {
             continue;
         }
         let id = mounted_file_id(&file_path);
-        let directory_id = parent_directory_path(&file_path)
-            .filter(|path| path != "/")
-            .map(|path| mounted_directory_id(&path));
+        let mut context = mounted_context.clone();
+        let directory_id = match parent_directory_path(&file_path).filter(|path| path != "/") {
+            Some(parent_path) => {
+                if let Some(id) = owned.directory_id_for_path(&parent_path) {
+                    context = owned
+                        .directory_context_for_path(&parent_path)
+                        .unwrap_or_else(|| mounted_context.clone());
+                    Some(id.to_string())
+                } else if let Some(parent) = mounted_directories_by_path.get(&parent_path) {
+                    context = parent.context.clone();
+                    Some(parent.id.clone())
+                } else {
+                    continue;
+                }
+            }
+            None => None,
+        };
+        let file_key = FilesystemDescriptorKey::from_context(&context, &id);
+        if owned_descriptor_keys.contains(&file_key) {
+            continue;
+        }
         let name = path_leaf_name(&file_path);
-        file_paths_by_id.insert(id.clone(), file_path);
+        file_paths_by_key.insert(file_key, file_path);
         rows.push(mounted_row(
-            active_branch_id,
+            &context,
             FILE_DESCRIPTOR_SCHEMA_KEY,
             &id,
             serde_json::json!({
@@ -103,14 +158,59 @@ fn rows_from_inventory(
         ));
     }
 
-    MountedWorkspaceRows {
+    Ok(MountedWorkspaceRows {
         rows,
-        file_paths_by_id,
+        file_paths_by_key,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct MountedDirectory {
+    id: String,
+    context: FilesystemRowContext,
+}
+
+fn owned_descriptor_keys(
+    owned_rows: &[MaterializedLiveStateRow],
+) -> Result<BTreeSet<FilesystemDescriptorKey>, LixError> {
+    let mut keys = BTreeSet::new();
+    for row in owned_rows {
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        match row.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                let snapshot: DescriptorSnapshot =
+                    serde_json::from_str(snapshot_content).map_err(|error| {
+                        LixError::unknown(format!(
+                            "invalid filesystem descriptor snapshot JSON: {error}"
+                        ))
+                    })?;
+                keys.insert(FilesystemDescriptorKey::from_live_row(row, snapshot.id));
+            }
+            _ => {}
+        }
+    }
+    Ok(keys)
+}
+
+#[derive(serde::Deserialize)]
+struct DescriptorSnapshot {
+    id: String,
+}
+
+fn mounted_row_context(active_branch_id: &str) -> FilesystemRowContext {
+    FilesystemRowContext {
+        branch_id: active_branch_id.to_string(),
+        global: false,
+        untracked: false,
+        file_id: None,
+        metadata: None,
     }
 }
 
 fn mounted_row(
-    branch_id: &str,
+    context: &FilesystemRowContext,
     schema_key: &str,
     id: &str,
     snapshot_content: String,
@@ -118,15 +218,15 @@ fn mounted_row(
     MaterializedLiveStateRow {
         entity_pk: EntityPk::single(id.to_string()),
         schema_key: schema_key.to_string(),
-        file_id: None,
+        file_id: context.file_id.clone(),
         snapshot_content: Some(snapshot_content),
         metadata: None,
         deleted: false,
-        branch_id: branch_id.to_string(),
+        branch_id: context.branch_id.clone(),
         change_id: None,
         commit_id: None,
-        global: false,
-        untracked: false,
+        global: context.global,
+        untracked: context.untracked,
         created_at: MOUNTED_ROW_TIMESTAMP.to_string(),
         updated_at: MOUNTED_ROW_TIMESTAMP.to_string(),
     }
@@ -176,4 +276,169 @@ fn path_leaf_name(path: &str) -> String {
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mounted_file_under_owned_directory_uses_owned_parent_id() {
+        let owned_rows = vec![descriptor_row(
+            "branch-a",
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+            "dir-src",
+            r#"{"id":"dir-src","parent_id":null,"name":"src"}"#,
+        )];
+        let owned = FilesystemIndex::from_live_rows(owned_rows.clone()).unwrap();
+        let mounted = rows_from_listing(
+            "branch-a",
+            MountedFilesystemListing {
+                directories: BTreeSet::new(),
+                files: BTreeSet::from(["/src/local.txt".to_string()]),
+            },
+            &owned,
+            &owned_rows,
+        )
+        .unwrap();
+
+        let file_row = mounted
+            .rows
+            .iter()
+            .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("mounted child file should be visible");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["directory_id"], "dir-src");
+    }
+
+    #[test]
+    fn mounted_file_under_global_owned_directory_inherits_parent_scope() {
+        let owned_rows = vec![descriptor_row_with_scope(
+            "branch-a",
+            true,
+            false,
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+            "dir-src",
+            r#"{"id":"dir-src","parent_id":null,"name":"src"}"#,
+        )];
+        let owned = FilesystemIndex::from_live_rows(owned_rows.clone()).unwrap();
+        let mounted = rows_from_listing(
+            "branch-a",
+            MountedFilesystemListing {
+                directories: BTreeSet::new(),
+                files: BTreeSet::from(["/src/local.txt".to_string()]),
+            },
+            &owned,
+            &owned_rows,
+        )
+        .unwrap();
+
+        let file_row = mounted
+            .rows
+            .iter()
+            .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("mounted child file should be visible");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["directory_id"], "dir-src");
+        assert!(file_row.global);
+    }
+
+    #[test]
+    fn owned_file_shadows_mounted_descendants() {
+        let owned_rows = vec![descriptor_row(
+            "branch-a",
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            "file-foo",
+            r#"{"id":"file-foo","directory_id":null,"name":"foo"}"#,
+        )];
+        let owned = FilesystemIndex::from_live_rows(owned_rows.clone()).unwrap();
+        let mounted = rows_from_listing(
+            "branch-a",
+            MountedFilesystemListing {
+                directories: BTreeSet::from(["/foo/".to_string()]),
+                files: BTreeSet::from(["/foo/local.txt".to_string()]),
+            },
+            &owned,
+            &owned_rows,
+        )
+        .unwrap();
+
+        assert!(
+            mounted.rows.is_empty(),
+            "owned file path should shadow lower-layer directory subtree"
+        );
+    }
+
+    #[test]
+    fn mounted_file_provenance_is_keyed_by_descriptor_scope() {
+        let owned_rows = Vec::new();
+        let owned = FilesystemIndex::from_live_rows(owned_rows.clone()).unwrap();
+        let mounted = rows_from_listing(
+            "branch-a",
+            MountedFilesystemListing {
+                directories: BTreeSet::new(),
+                files: BTreeSet::from(["/note.md".to_string()]),
+            },
+            &owned,
+            &owned_rows,
+        )
+        .unwrap();
+
+        let file_row = mounted
+            .rows
+            .iter()
+            .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("mounted file should be visible");
+        let snapshot: DescriptorSnapshot =
+            serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
+        let key =
+            FilesystemDescriptorKey::from_context(&mounted_row_context("branch-a"), &snapshot.id);
+        assert_eq!(
+            mounted.file_paths_by_key.get(&key).map(String::as_str),
+            Some("/note.md")
+        );
+    }
+
+    fn descriptor_row(
+        branch_id: &str,
+        schema_key: &str,
+        descriptor_id: &str,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
+        descriptor_row_with_scope(
+            branch_id,
+            false,
+            false,
+            schema_key,
+            descriptor_id,
+            snapshot_content,
+        )
+    }
+
+    fn descriptor_row_with_scope(
+        branch_id: &str,
+        global: bool,
+        untracked: bool,
+        schema_key: &str,
+        descriptor_id: &str,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
+            entity_pk: EntityPk::single(descriptor_id.to_string()),
+            schema_key: schema_key.to_string(),
+            file_id: None,
+            snapshot_content: Some(snapshot_content.to_string()),
+            metadata: None,
+            deleted: false,
+            branch_id: branch_id.to_string(),
+            change_id: None,
+            commit_id: None,
+            global,
+            untracked,
+            created_at: MOUNTED_ROW_TIMESTAMP.to_string(),
+            updated_at: MOUNTED_ROW_TIMESTAMP.to_string(),
+        }
+    }
 }

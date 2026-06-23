@@ -30,7 +30,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
 
-use crate::backend::BackendMountedFilesystem;
+use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
@@ -103,7 +103,7 @@ pub(super) async fn register_lix_file_active_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
-    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
@@ -189,7 +189,7 @@ struct LixFileSpec {
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
     missing_data_policy: MissingFileDataPolicy,
-    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     options: SqlWriteSessionOptions,
 }
 
@@ -205,7 +205,7 @@ impl LixFileSpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
-        mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+        mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
@@ -389,11 +389,10 @@ impl TableSpec for LixFileSpec {
         props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let projected_schema = projected_schema(&self.schema, projection)?;
-        let scan_limit = if filters.is_empty() { limit } else { None };
         let mut request = lix_file_scan_request(
             self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
-            scan_limit,
+            None,
         );
         let filters = filters.to_vec();
         if matches!(self.branch_binding, BranchBinding::Explicit) {
@@ -520,7 +519,7 @@ impl TableSpec for LixFileSpec {
                         needs_data,
                         missing_data_policy,
                         selected_file_keys.as_ref(),
-                        Some(&mounted_rows.file_paths_by_id),
+                        Some(&mounted_rows.file_paths_by_key),
                         visible_rows,
                     )
                     .await
@@ -2387,12 +2386,12 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
-    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_render: Option<PluginRenderContext>,
     load_data: bool,
     missing_data_policy: MissingFileDataPolicy,
     selected_file_keys: Option<&BTreeSet<FilesystemDescriptorKey>>,
-    mounted_file_paths_by_id: Option<&BTreeMap<String, String>>,
+    mounted_file_paths_by_key: Option<&BTreeMap<FilesystemDescriptorKey, String>>,
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
@@ -2538,12 +2537,12 @@ async fn lix_file_record_batch(
                     match rendered {
                         Some(data) => Some(data),
                         None => match missing_data_policy {
-                            _ if mounted_file_paths_by_id
-                                .and_then(|paths| paths.get(&file.id))
+                            _ if mounted_file_paths_by_key
+                                .and_then(|paths| paths.get(&file.key))
                                 .is_some() =>
                             {
-                                let mounted_path = mounted_file_paths_by_id
-                                    .and_then(|paths| paths.get(&file.id))
+                                let mounted_path = mounted_file_paths_by_key
+                                    .and_then(|paths| paths.get(&file.key))
                                     .expect("mounted file path checked above");
                                 let mounted_filesystem =
                                     mounted_filesystem.as_ref().ok_or_else(|| {
@@ -2551,7 +2550,7 @@ async fn lix_file_record_batch(
                                     })?;
                                 Some(
                                     mounted_filesystem
-                                        .read_file_data(mounted_path)
+                                        .read_file(mounted_path)
                                         .await
                                         .map_err(|error| {
                                             LixError::new(

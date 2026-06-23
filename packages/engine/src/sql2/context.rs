@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::backend::BackendMountedFilesystem;
+use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
@@ -58,7 +58,7 @@ pub(crate) trait SqlExecutionContext {
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
-    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
         None
     }
 
@@ -81,7 +81,7 @@ pub(crate) trait SqlWriteExecutionContext {
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
     }
-    fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
         None
     }
 
@@ -149,7 +149,7 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().plugin_host() }
     }
 
-    pub(crate) fn mounted_filesystem(&self) -> Option<Arc<dyn BackendMountedFilesystem>> {
+    pub(crate) fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
         unsafe { self.ptr.0.as_ref().mounted_filesystem() }
     }
 

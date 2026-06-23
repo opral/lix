@@ -21,7 +21,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
 
-use crate::backend::BackendMountedFilesystem;
+use crate::backend::MountedFilesystem;
 use crate::branch::BranchRefReader;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
@@ -48,7 +48,7 @@ use crate::filesystem::{
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, VisibleFilesystem,
     create_directory_path_with_leaf_id_with_resolvers, derive_directory_paths,
     directory_descriptor_write_row, directory_path_resolvers_from_live_state,
-    filesystem_storage_scope_key, mounted_workspace_rows,
+    filesystem_storage_scope_key, is_mounted_directory_id, mounted_workspace_rows,
     plan_parsed_directory_path_update_with_resolvers, plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
@@ -67,6 +67,7 @@ use super::upsert::{
 use crate::entity_pk::EntityPk;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Physical-identity column the upsert driver matches conflicting rows on.
 /// A directory's identity is its `id`; the underlying live state keys on the
@@ -81,7 +82,7 @@ pub(super) async fn register_lix_directory_active_provider(
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     register_spec_table(
@@ -149,7 +150,7 @@ pub(super) async fn register_active_write_provider(
             active_branch_id,
             live_state,
             branch_ref,
-            None,
+            write_ctx.mounted_filesystem(),
             functions,
         )),
         WriteAccess::write(write_ctx),
@@ -162,7 +163,7 @@ struct LixDirectorySpec {
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
-    mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
 }
 
 impl LixDirectorySpec {
@@ -170,7 +171,7 @@ impl LixDirectorySpec {
         active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
-        mounted_filesystem: Option<Arc<dyn BackendMountedFilesystem>>,
+        mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -228,14 +229,29 @@ impl LixDirectorySpec {
                 write_ctx.clone(),
                 request,
                 Arc::clone(&self.schema),
+                self.mounted_filesystem.clone(),
                 captured,
             ),
-            |(write_ctx, request, table_schema, captured)| async move {
+            |(write_ctx, request, table_schema, mounted_filesystem, captured)| async move {
                 let rows = write_ctx
                     .scan_live_state(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let source_batch = lix_directory_record_batch(&table_schema, rows)
+                let mounted_rows = mounted_workspace_rows(
+                    request
+                        .filter
+                        .branch_ids
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                    mounted_filesystem,
+                    &rows,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+                let mut visible_rows = rows;
+                visible_rows.extend(mounted_rows.rows);
+                let source_batch = lix_directory_record_batch(&table_schema, visible_rows)
                     .map_err(lix_error_to_datafusion_error)?;
                 *captured.lock().expect("dml source mutex poisoned") = Some(source_batch.clone());
                 Ok(source_batch)
@@ -270,11 +286,10 @@ impl TableSpec for LixDirectorySpec {
         props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let output_schema = projected_schema(&self.schema, projection);
-        let scan_limit = if filters.is_empty() { limit } else { None };
         let mut request = lix_directory_scan_request(
             self.branch_binding.active_branch_id(),
             Some(output_schema.as_ref()),
-            scan_limit,
+            None,
         );
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -450,6 +465,8 @@ impl TableSpec for LixDirectorySpec {
                         })?;
                     reject_lix_directory_delete_plugin_storage_paths(&matched_batch, &source_batch)
                         .map_err(lix_error_to_datafusion_error)?;
+                    reject_mounted_directory_mutation(&matched_batch)
+                        .map_err(lix_error_to_datafusion_error)?;
                     let branch_ids = directory_branch_ids_from_batch(
                         &matched_batch,
                         branch_binding.active_branch_id(),
@@ -507,6 +524,8 @@ impl TableSpec for LixDirectorySpec {
                 let functions = functions.clone();
                 let assignments = assignments.clone();
                 async move {
+                    reject_mounted_directory_mutation(&matched_batch)
+                        .map_err(lix_error_to_datafusion_error)?;
                     let mut path_resolvers = directory_path_resolvers_from_live_state(
                         Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
                         branch_binding.active_branch_id(),
@@ -980,6 +999,20 @@ fn reject_lix_directory_delete_plugin_storage_paths(
     Ok(())
 }
 
+fn reject_mounted_directory_mutation(batch: &RecordBatch) -> std::result::Result<(), LixError> {
+    for row_index in 0..batch.num_rows() {
+        let id = required_string_value(batch, row_index, "id")
+            .map_err(|error| LixError::unknown(error.to_string()))?;
+        if is_mounted_directory_id(&id) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "mutating mounted filesystem directories requires copy-up support",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn path_is_inside_directory(path: &str, directory_path: &str) -> bool {
     directory_path == "/" || path.starts_with(directory_path)
 }
@@ -1378,7 +1411,10 @@ fn lix_directory_scan_request(
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
         filter: LiveStateFilter {
-            schema_keys: vec![DIRECTORY_SCHEMA_KEY.to_string()],
+            schema_keys: vec![
+                DIRECTORY_SCHEMA_KEY.to_string(),
+                FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            ],
             branch_ids: branch_binding
                 .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
