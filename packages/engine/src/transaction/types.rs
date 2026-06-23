@@ -221,10 +221,6 @@ impl TransactionFileData {
     pub(crate) fn payload(&self) -> &BlobPayload {
         &self.payload
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.payload.is_empty()
-    }
 }
 
 /// One decoded write batch accepted by the transaction boundary.

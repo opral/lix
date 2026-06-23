@@ -90,7 +90,10 @@ impl FilesystemIndex {
             insert_entry(
                 &mut entries_by_path,
                 path.clone(),
-                FilesystemEntry::Directory,
+                FilesystemEntry::Directory {
+                    id: snapshot.id.clone(),
+                    key: directory_id.clone(),
+                },
             )?;
         }
 
@@ -144,7 +147,7 @@ impl FilesystemIndex {
             .iter()
             .filter_map(|(path, entry)| match entry {
                 FilesystemEntry::File(file) => Some((path.as_str(), file)),
-                FilesystemEntry::Directory => None,
+                FilesystemEntry::Directory { .. } => None,
             })
     }
 
@@ -153,6 +156,44 @@ impl FilesystemIndex {
             Some(FilesystemEntry::File(file)) => Some(file),
             _ => None,
         }
+    }
+
+    pub(crate) fn contains_path(&self, path: &str) -> bool {
+        self.entries_by_path.contains_key(path)
+    }
+
+    pub(crate) fn directory_id_for_path(&self, path: &str) -> Option<&str> {
+        match self.entries_by_path.get(path) {
+            Some(FilesystemEntry::Directory { id, .. }) => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn directory_context_for_path(&self, path: &str) -> Option<FilesystemRowContext> {
+        match self.entries_by_path.get(path) {
+            Some(FilesystemEntry::Directory { key, .. }) => Some(key.context()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_shadowed_by_file_ancestor(&self, path: &str) -> bool {
+        let mut current = path.trim_end_matches('/');
+        while let Some(slash) = current.rfind('/') {
+            if slash == 0 {
+                return matches!(
+                    self.entries_by_path.get(&current[..1]),
+                    Some(FilesystemEntry::File(_))
+                );
+            }
+            current = &current[..slash];
+            if matches!(
+                self.entries_by_path.get(current),
+                Some(FilesystemEntry::File(_))
+            ) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -166,7 +207,10 @@ pub(crate) fn filesystem_schema_keys() -> Vec<String> {
 
 #[derive(Debug, Clone)]
 enum FilesystemEntry {
-    Directory,
+    Directory {
+        id: String,
+        key: FilesystemDescriptorKey,
+    },
     File(FilesystemFileEntry),
 }
 
@@ -290,7 +334,7 @@ fn insert_entry(
 
 fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> String {
     match entry {
-        FilesystemEntry::Directory => path
+        FilesystemEntry::Directory { .. } => path
             .strip_suffix('/')
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| path.to_string()),
@@ -300,7 +344,7 @@ fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> String {
 
 fn entry_label(entry: &FilesystemEntry) -> &'static str {
     match entry {
-        FilesystemEntry::Directory => "directory",
+        FilesystemEntry::Directory { .. } => "directory",
         FilesystemEntry::File(_) => "file",
     }
 }
@@ -313,13 +357,14 @@ fn filesystem_conflict_error(message: String) -> LixError {
 mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
+    use crate::filesystem::FilesystemDescriptorKey;
     use crate::live_state::MaterializedLiveStateRow;
 
     use super::{
         BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
         FilesystemIndex, insert_entry,
     };
-    use super::{FilesystemEntry, FilesystemFileEntry, RowScope};
+    use super::{FilesystemEntry, FilesystemFileEntry, FilesystemRowContext, RowScope};
 
     #[test]
     fn from_live_rows_rejects_file_directory_namespace_conflicts() {
@@ -354,7 +399,10 @@ mod tests {
         insert_entry(
             &mut entries,
             "/foo/".to_string(),
-            FilesystemEntry::Directory,
+            FilesystemEntry::Directory {
+                id: "dir-foo".to_string(),
+                key: descriptor_key("branch-a", "dir-foo"),
+            },
         )
         .expect_err("directory should conflict with file namespace");
 
@@ -362,7 +410,10 @@ mod tests {
         insert_entry(
             &mut entries,
             "/foo/".to_string(),
-            FilesystemEntry::Directory,
+            FilesystemEntry::Directory {
+                id: "dir-foo".to_string(),
+                key: descriptor_key("branch-a", "dir-foo"),
+            },
         )
         .expect("initial directory entry should insert");
         insert_entry(
@@ -504,5 +555,18 @@ mod tests {
             untracked: false,
             file_id: None,
         }
+    }
+
+    fn descriptor_key(branch_id: &str, descriptor_id: &str) -> FilesystemDescriptorKey {
+        FilesystemDescriptorKey::from_context(
+            &FilesystemRowContext {
+                branch_id: branch_id.to_string(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: None,
+            },
+            descriptor_id,
+        )
     }
 }

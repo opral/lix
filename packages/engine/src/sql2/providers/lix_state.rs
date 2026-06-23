@@ -1394,6 +1394,13 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             Ok(TransactionWriteOutcome { count: 0 })
         }
+
+        async fn stage_mounted_filesystem_op(
+            &mut self,
+            _write: crate::storage::MountedFilesystemOp,
+        ) -> Result<(), LixError> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1442,6 +1449,13 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
             Ok(TransactionWriteOutcome { count: 0 })
+        }
+
+        async fn stage_mounted_filesystem_op(
+            &mut self,
+            _write: crate::storage::MountedFilesystemOp,
+        ) -> Result<(), LixError> {
+            Ok(())
         }
     }
 

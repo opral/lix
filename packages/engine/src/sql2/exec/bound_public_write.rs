@@ -132,7 +132,7 @@ async fn load_active_branch_commit_id(
 #[derive(Clone, Copy)]
 struct FastFilePathWriteShape {
     path_index: usize,
-    data_index: usize,
+    data_index: Option<usize>,
     conflict: crate::sql2::providers::FastLixFilePathWriteConflict,
 }
 
@@ -152,7 +152,10 @@ async fn execute_file_path_write(
     for row in &values.rows {
         writes.push((
             eval_fast_file_text(&row[shape.path_index], params, "path")?,
-            eval_fast_file_blob(&row[shape.data_index], params, "data")?,
+            shape
+                .data_index
+                .map(|index| eval_fast_file_blob(&row[index], params, "data"))
+                .transpose()?,
         ));
     }
     crate::sql2::providers::execute_fast_lix_file_path_writes(ctx, writes, shape.conflict).await
@@ -168,22 +171,31 @@ fn fast_file_path_write_shape(
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return None;
     };
-    if values.rows.is_empty() || values.columns.len() != 2 {
+    if values.rows.is_empty() {
         return None;
     }
     let path_index = values.column_index("path")?;
-    let data_index = values.column_index("data")?;
-    if values.rows.iter().any(|row| {
-        row.len() != values.columns.len()
-            || !fast_file_value_expr_supported(&row[path_index])
-            || !fast_file_value_expr_supported(&row[data_index])
-    }) {
-        return None;
-    }
+    let data_index = values.column_index("data");
     let conflict = match &plan.bound.conflict {
         None => crate::sql2::providers::FastLixFilePathWriteConflict::None,
         Some(conflict) => fast_file_path_conflict_shape(conflict)?,
     };
+    let expected_columns = if data_index.is_some() { 2 } else { 1 };
+    if values.columns.len() != expected_columns {
+        return None;
+    }
+    if data_index.is_none()
+        && conflict != crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing
+    {
+        return None;
+    }
+    if values.rows.iter().any(|row| {
+        row.len() != values.columns.len()
+            || !fast_file_value_expr_supported(&row[path_index])
+            || data_index.is_some_and(|index| !fast_file_value_expr_supported(&row[index]))
+    }) {
+        return None;
+    }
     Some(FastFilePathWriteShape {
         path_index,
         data_index,

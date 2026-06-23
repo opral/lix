@@ -1,23 +1,31 @@
 ---
-description: Backends are Lix's system interface for durable storage. Implement the LixBackend interface (a transactional, namespaced key-value store) and Lix runs on top of it.
+description: Backends are Lix's host-system adapters: required ordered key/value storage, persistent or ephemeral depending on implementation, plus optional mounted workspace filesystem capability.
 ---
 
 # Backends
 
-Lix's engine is independent of where the bytes live. Storage is exposed through a single interface, `LixBackend`, that any transactional key-value store can implement. Open a Lix with a different backend and the rest of the API (`openLix`, `execute`, `createVersion`, `mergeVersion`, …) is unchanged.
+Lix's engine is independent of where repository state and workspace bytes live.
+A backend is the host adapter passed to `openLix({ backend })`: it provides the
+ordered key/value storage Lix needs, and may optionally expose a mounted
+filesystem that Lix projects into `lix_file` and `lix_directory`. Open a Lix with
+a different backend and the rest of the API (`execute`, `createVersion`,
+`mergeVersion`, …) is unchanged.
 
-Lix stops at the storage boundary. The engine writes semantic rows and chunks
+Lix stops at the backend boundary. The engine writes semantic rows and chunks
 such as changelog commits, changelog changes, commit change-ref chunks, JSON
 payload rows, and tracked-state tree chunks. The backend is responsible for the
 physical layout underneath those rows: pages, B-trees, LSM/SST files, WALs,
-checksums, caches, locks, compaction, and file/object placement. In other
-words, Lix defines _what facts exist_; the backend decides _how bytes are stored_.
+checksums, caches, locks, compaction, and file/object placement. When a backend
+exposes a mounted filesystem, it is also responsible for mapping host files into
+logical Lix workspace paths. In other words, Lix defines _what facts exist_; the
+backend decides _how bytes are stored_ and, optionally, _where workspace bytes
+come from_.
 
 ## The system interface
 
 The backend is where Lix crosses from the engine into the host system. Local
-files, SQLite, OPFS, object storage, locks, caches, and durability belong behind
-`LixBackend`.
+files, SQLite, OPFS, object storage, locks, caches, and persistence policy belong
+behind the backend.
 
 Plugins are different: they run as sandboxed WebAssembly components. A plugin
 receives engine-provided file/state inputs and returns semantic changes or
@@ -41,19 +49,22 @@ const lix = await openLix({
 });
 ```
 
-Use `FsBackend` when the Lix should sync a local directory. This is the
-recommended persistent backend for filesystem workspaces. The backend stores
-its private RocksDB data at `<workspace>/.lix/.internal/rocksdb` and syncs
-workspace files through Lix. The `.lix/.internal` directory is owned by Lix and
-is not materialized as a workspace file.
+Use `FsBackend` when the Lix should project a local directory as its workspace
+filesystem. This is the recommended persistent backend for filesystem
+workspaces. The backend stores its private RocksDB data at
+`<workspace>/.lix/.internal/rocksdb` and reads or writes workspace files through
+the mounted filesystem. The `.lix/.internal` directory is owned by Lix and is not
+materialized as a workspace file.
 
 Older SQLite filesystem backend metadata is not migrated. When old SQLite
 metadata files are present in `.lix/.internal` and no RocksDB store exists, Lix
 clears `.lix/.internal` and initializes a fresh RocksDB store.
 
-For ephemeral filesystem sync, pass `storage: "memory"`. Workspace files are
-still imported, watched, and materialized, but the Lix repository itself stays
-in memory and no `.lix` directory is written.
+For ephemeral filesystem workspaces, pass `storage: "memory"`. For `FsBackend`,
+`storage` controls where Lix metadata/state is stored. It does not control
+whether mounted workspace files persist; those files remain the host filesystem
+source of truth. With `storage: "memory"`, the Lix repository itself stays in
+memory and no `.lix` directory is written.
 
 Use `SqliteBackend` when the `.lix` SQLite file is the application document
 itself. This is useful when defining a new file format and using Lix as the
@@ -76,13 +87,13 @@ contract.
 
 A backend may use local files, a native database binding, an async service, or
 another host-side runtime. It must preserve Lix's transaction, scan, ordering,
-and durability semantics while hiding the physical storage details from the
-engine.
+and implementation-specific persistence semantics while hiding host details from
+the engine.
 
 ## Contract shape
 
 At a high level, a backend provides transactions over namespaced key-value
-storage:
+storage, plus optional host capabilities such as a mounted filesystem:
 
 ```ts
 type LixBackend = {

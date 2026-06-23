@@ -325,16 +325,7 @@ where
             return self
                 .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
-                        // Re-plan against the transaction-backed write
-                        // session so provider hooks read and stage through the
-                        // transaction-owned SQL write context.
-                        transaction.prepare_sql_visible_schemas().await?;
-                        let tx_plan =
-                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
-                                .await?;
-                        let affected_rows =
-                            sql2::execute_write_logical_plan(transaction, tx_plan, &params).await?;
-                        Ok(ExecuteResult::from_rows_affected(affected_rows))
+                        execute_transaction_write_auto(transaction, statement, &params).await
                     })
                 })
                 .await
@@ -348,7 +339,7 @@ where
         } else {
             None
         };
-        let _operation_guard = if runtime_write_access.is_some() {
+        let operation_guard = if runtime_write_access.is_some() {
             None
         } else {
             Some(self.begin_waitable_session_operation().await?)
@@ -357,7 +348,7 @@ where
         // snapshot below is where FunctionContext observes deterministic mode;
         // checking mode before this point can race with another session
         // enabling deterministic mode.
-        let _deterministic_runtime_guard = if has_durable_runtime_function {
+        let deterministic_runtime_guard = if has_durable_runtime_function {
             Some(self.lock_deterministic_runtime().await)
         } else {
             None
@@ -371,6 +362,35 @@ where
         let read_result = match read_result.await {
             Ok(result) => result,
             Err(error) => {
+                if let Some(paths) = sql2::file_data_hydration_paths(&error) {
+                    if has_durable_runtime_function {
+                        return Err(LixError::new(
+                            LixError::CODE_UNSUPPORTED_SQL,
+                            "filesystem file data hydration is not supported for reads with durable runtime functions",
+                        ));
+                    }
+                    drop(operation_guard);
+                    drop(deterministic_runtime_guard);
+                    drop(runtime_write_access);
+                    self.hydrate_file_data_for_read(&paths).await?;
+                    let retry_statement = sql2::parse_statement(sql)?;
+                    let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
+                    let retry_result = with_static_session_sql_read::<B, _, _, _>(
+                        read_scope,
+                        |read_store| async move {
+                            self.execute_read_statement_with_store(
+                                read_store,
+                                sql,
+                                retry_statement,
+                                params,
+                            )
+                            .await
+                        },
+                    )
+                    .await
+                    .map_err(|retry_error| normalize_sql_surface_error(retry_error, sql))?;
+                    return Ok(ExecuteResult::from_sql_query_result(retry_result.query));
+                }
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
@@ -385,6 +405,18 @@ where
             self.observe_invalidation.bump_if_storage_changed(&stats);
         }
         Ok(ExecuteResult::from_sql_query_result(read_result.query))
+    }
+
+    async fn hydrate_file_data_for_read(&self, paths: &[String]) -> Result<(), LixError> {
+        let write_access = self.begin_session_write_access().await?;
+        let paths = paths.to_vec();
+        self.with_write_transaction_reserved(write_access, |transaction| {
+            Box::pin(async move {
+                transaction.hydrate_file_data_paths(&paths).await?;
+                Ok(())
+            })
+        })
+        .await
     }
 
     #[doc(hidden)]
@@ -457,6 +489,7 @@ where
                 visible_schemas,
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
+                mounted_filesystem: self.storage.mounted_filesystem(),
             };
             let mut results = Vec::with_capacity(statements.len());
             for ((sql, params), statement) in statements.iter().zip(parsed) {
@@ -574,6 +607,7 @@ where
             visible_schemas,
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
+            mounted_filesystem: self.storage.mounted_filesystem(),
         };
 
         let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
@@ -662,8 +696,21 @@ where
             sql2::BoundStatementRoute::Read => {
                 let result = transaction
                     .execute_read_sql_statement(sql, statement, params)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                    .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let Some(paths) = sql2::file_data_hydration_paths(&error) else {
+                            return Err(normalize_sql_surface_error(error, sql));
+                        };
+                        transaction.hydrate_file_data_paths(&paths).await?;
+                        let retry_statement = sql2::parse_statement(sql)?;
+                        transaction
+                            .execute_read_sql_statement(sql, retry_statement, params)
+                            .await
+                            .map_err(|error| normalize_sql_surface_error(error, sql))?
+                    }
+                };
                 Ok(ExecuteResult::from_sql_query_result(result))
             }
         }

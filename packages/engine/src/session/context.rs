@@ -24,6 +24,7 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
+use crate::storage::MountedFilesystem;
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
 use crate::tracked_state::TrackedStateContext;
@@ -487,6 +488,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBacke
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
+    pub(super) mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
 }
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
@@ -540,6 +542,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        self.mounted_filesystem.clone()
     }
 }
 

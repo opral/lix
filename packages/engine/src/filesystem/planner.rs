@@ -128,6 +128,16 @@ impl FilesystemDescriptorKey {
     pub(crate) fn is_untracked(&self) -> bool {
         self.untracked
     }
+
+    pub(crate) fn context(&self) -> FilesystemRowContext {
+        FilesystemRowContext {
+            branch_id: self.branch_id.clone(),
+            global: self.global,
+            untracked: self.untracked,
+            file_id: self.file_id.clone(),
+            metadata: None,
+        }
+    }
 }
 
 /// Storage identity of a `lix_binary_blob_ref` row for a filesystem file.
@@ -923,12 +933,10 @@ fn plan_parsed_file_path_write_with_fallback(
             context.untracked,
             data,
         );
-        if !file_payload.is_empty() {
+        if let Some(blob_hash) = file_payload.blob_hash() {
             rows.push(blob_ref_row(BlobRefRowInput {
                 file_id,
-                blob_hash: file_payload
-                    .blob_hash()
-                    .expect("non-empty payload should have blob hash"),
+                blob_hash,
                 size_bytes: file_payload.len(),
                 context: FilesystemRowContext {
                     file_id: None,
@@ -978,12 +986,10 @@ pub(crate) fn plan_file_descriptor_write(
             input.context.untracked,
             data,
         );
-        if !file_payload.is_empty() {
+        if let Some(blob_hash) = file_payload.blob_hash() {
             rows.push(blob_ref_row(BlobRefRowInput {
                 file_id,
-                blob_hash: file_payload
-                    .blob_hash()
-                    .expect("non-empty payload should have blob hash"),
+                blob_hash,
                 size_bytes: file_payload.len(),
                 context: FilesystemRowContext {
                     file_id: None,
@@ -2181,15 +2187,14 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.file_data.len(), 1);
         assert_eq!(plan.file_data[0].file_id, "file-empty");
-        assert!(plan.file_data[0].is_empty());
+        assert_eq!(plan.file_data[0].data(), b"");
         assert!(
             plan.rows
                 .iter()
                 .any(|row| row.schema_key == "lix_file_descriptor")
         );
         assert!(
-            !plan
-                .rows
+            plan.rows
                 .iter()
                 .any(|row| row.schema_key == "lix_binary_blob_ref")
         );

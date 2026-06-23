@@ -43,6 +43,7 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
+use crate::storage::MountedFilesystemOp;
 use crate::storage::{
     InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
     StorageWriteSetStats,
@@ -86,6 +87,7 @@ pub(crate) struct TransactionCommitOutcome {
 /// helpers.
 pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     active_branch_id: String,
+    is_workspace_session: bool,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -236,6 +238,30 @@ fn check_commit_boundary(boundary: Option<&TransactionCommitBoundary>) -> Result
     Ok(())
 }
 
+async fn apply_mounted_filesystem_ops(
+    mounted_filesystem: Option<Arc<dyn crate::storage::MountedFilesystem>>,
+    ops: Vec<MountedFilesystemOp>,
+) -> Result<(), LixError> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let mounted_filesystem = mounted_filesystem.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "mounted filesystem ops were staged without a mounted filesystem",
+        )
+    })?;
+    // MVP boundary: mounted filesystem ops are applied before the storage
+    // commit. Rollback never reaches this point, but a later storage commit
+    // failure can leave disk state ahead of Lix state.
+    mounted_filesystem.apply(ops).await.map_err(|error| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("mounted filesystem apply failed: {error}"),
+        )
+    })
+}
+
 pub(crate) fn commit_at_boundary<T>(
     boundary: Option<&TransactionCommitBoundary>,
     commit: impl FnOnce() -> Result<T, LixError>,
@@ -268,6 +294,7 @@ where
             let active_branch_id =
                 resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
                     .await?;
+            let is_workspace_session = matches!(mode, SessionMode::Workspace);
             let runtime_functions = {
                 let runtime_live_state = live_state.reader(&read);
                 FunctionContext::prepare(&runtime_live_state).await?
@@ -284,18 +311,20 @@ where
             };
             Ok::<_, LixError>((
                 active_branch_id,
+                is_workspace_session,
                 runtime_functions,
                 functions,
                 schema_catalog,
             ))
         }
         .await;
-        let (active_branch_id, runtime_functions, functions, schema_catalog) = match setup_result {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(error);
-            }
-        };
+        let (active_branch_id, is_workspace_session, runtime_functions, functions, schema_catalog) =
+            match setup_result {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
         drop(read);
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_compiled_catalog(
@@ -306,6 +335,7 @@ where
         Ok(OpenTransaction {
             transaction: Self {
                 active_branch_id,
+                is_workspace_session,
                 live_state,
                 tracked_state,
                 binary_cas,
@@ -346,6 +376,7 @@ where
         transaction
             .validate_prepared_writes_by_branch(&prepared_writes)
             .await?;
+        let mounted_filesystem_ops = prepared_writes.mounted_filesystem_ops.clone();
         let mut read = SharedStorageRead::new(
             transaction
                 .storage
@@ -367,6 +398,11 @@ where
         let prepared_commit = transaction
             .storage
             .prepare_write_set(writes, StorageWriteOptions::default())?;
+        apply_mounted_filesystem_ops(
+            transaction.storage.mounted_filesystem(),
+            mounted_filesystem_ops,
+        )
+        .await?;
         let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || {
             let (_commit, stats) = prepared_commit.commit()?;
             Ok(stats)
@@ -415,6 +451,14 @@ where
         self.staged_writes.stage_write(write)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn stage_mounted_filesystem_op(
+        &mut self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError> {
+        self.staged_writes.stage_mounted_filesystem_op(write)
+    }
+
     async fn scan_visible_live_state(
         &mut self,
         request: &LiveStateScanRequest,
@@ -460,9 +504,7 @@ where
                 rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
                 let file_data = file_data
                     .into_iter()
-                    .filter(|write| {
-                        !file_keys.contains(&PluginFileWriteKey::from(write)) && !write.is_empty()
-                    })
+                    .filter(|write| !file_keys.contains(&PluginFileWriteKey::from(write)))
                     .collect();
                 Ok(TransactionWrite::RowsWithFileData {
                     mode,
@@ -522,6 +564,21 @@ where
                     &write.file_id,
                     &context,
                 ));
+            }
+            if write.data().is_empty() {
+                if let Some(existing_plugin) = existing_plugin
+                    && selected_plugin.is_some_and(|plugin| plugin.key == existing_plugin.key)
+                {
+                    let existing_state = self
+                        .active_plugin_state_rows(&write.branch_id, &write.file_id, existing_plugin)
+                        .await?;
+                    reconciliation.rows.extend(plugin_state_tombstone_rows(
+                        &existing_state,
+                        &write.file_id,
+                        &context,
+                    ));
+                }
+                continue;
             }
             let Some(plugin) = selected_plugin else {
                 continue;
@@ -837,7 +894,6 @@ where
         let staged = self.staged_writes.staging_overlay()?;
         let staged_writes = Arc::clone(&self.staged_writes);
         let plugin_host = self.plugin_host.clone();
-
         with_static_transaction_sql_read::<B, _, _>(read, |read_store| async move {
             let read_ctx = TransactionSqlReadExecutionContext {
                 active_branch_id,
@@ -850,6 +906,7 @@ where
                 staged,
                 staged_writes,
                 plugin_host,
+                mounted_filesystem: self.storage.mounted_filesystem(),
             };
             let result = crate::sql2::execute_transaction_read_statement_from_parsed(
                 &read_ctx, self, sql, statement, params,
@@ -859,6 +916,44 @@ where
             result
         })
         .await
+    }
+
+    pub(crate) async fn hydrate_file_data_paths(
+        &mut self,
+        paths: &[String],
+    ) -> Result<(), LixError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if paths.len() > crate::sql2::FILE_DATA_HYDRATION_LIMIT {
+            return Err(crate::sql2::file_data_hydration_limit_error(paths));
+        }
+        let mounted_filesystem = self
+            .storage
+            .mounted_filesystem()
+            .ok_or_else(|| crate::sql2::file_data_unresolved_error(&paths[0]))?;
+        self.prepare_sql_visible_schemas().await?;
+        for path in paths {
+            let data = mounted_filesystem
+                .read_file(path)
+                .await
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("filesystem hydration failed for path {path:?}: {error}"),
+                    )
+                })?
+                .ok_or_else(|| crate::sql2::file_data_unresolved_error(path))?;
+            let statement =
+                crate::sql2::parse_statement("UPDATE lix_file SET data = $1 WHERE path = $2")?;
+            let plan = crate::sql2::create_write_logical_plan_from_parsed(self, statement).await?;
+            let params = [Value::Blob(data), Value::Text(path.clone())];
+            let affected = crate::sql2::execute_write_logical_plan(self, plan, &params).await?;
+            if affected == 0 {
+                return Err(crate::sql2::file_data_unresolved_error(path));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn prepare_sql_visible_schemas(&mut self) -> Result<(), LixError> {
@@ -951,6 +1046,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageB
     staged: crate::transaction::staging::PreparedStateRowOverlay,
     staged_writes: Arc<TransactionWriteBuffer>,
     plugin_host: PluginRuntimeHost,
+    mounted_filesystem: Option<Arc<dyn crate::storage::MountedFilesystem>>,
 }
 
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
@@ -1008,6 +1104,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::storage::MountedFilesystem>> {
+        self.mounted_filesystem.clone()
     }
 }
 
@@ -1271,6 +1371,10 @@ where
         &self.active_branch_id
     }
 
+    fn is_workspace_session(&self) -> bool {
+        self.is_workspace_session
+    }
+
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
@@ -1281,6 +1385,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn mounted_filesystem(&self) -> Option<Arc<dyn crate::storage::MountedFilesystem>> {
+        self.storage.mounted_filesystem()
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
@@ -1310,6 +1418,13 @@ where
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
+    }
+
+    async fn stage_mounted_filesystem_op(
+        &mut self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError> {
+        Self::stage_mounted_filesystem_op(self, write)
     }
 }
 

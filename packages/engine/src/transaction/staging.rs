@@ -23,6 +23,7 @@ use crate::functions::FunctionProviderHandle;
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::storage::MountedFilesystemOp;
 use crate::transaction::types::{
     LogicalPrimaryKey, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
     TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
@@ -47,6 +48,7 @@ pub(crate) struct TransactionWriteBuffer {
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
+    mounted_filesystem_ops: Mutex<Vec<MountedFilesystemOp>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,7 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
+    pub(crate) mounted_filesystem_ops: Vec<MountedFilesystemOp>,
 }
 
 pub(crate) struct PreparedWriteValidationSet<'a> {
@@ -289,6 +292,7 @@ impl TransactionWriteBuffer {
             commit_change_refs_by_branch: Mutex::new(BTreeMap::new()),
             extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
+            mounted_filesystem_ops: Mutex::new(Vec::new()),
         }
     }
 
@@ -310,6 +314,12 @@ impl TransactionWriteBuffer {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let mut mounted_filesystem_guard = self.mounted_filesystem_ops.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged mounted filesystem ops lock",
             )
         })?;
         let mut insert_identities_guard = self.insert_identities.lock().map_err(|_| {
@@ -340,9 +350,27 @@ impl TransactionWriteBuffer {
             commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
+            mounted_filesystem_ops: std::mem::take(&mut *mounted_filesystem_guard),
         });
         by_identity_guard.clear();
         result
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stage_mounted_filesystem_op(
+        &self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError> {
+        self.mounted_filesystem_ops
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged mounted filesystem ops lock",
+                )
+            })?
+            .push(write);
+        Ok(())
     }
 
     /// Records an additional parent for the commit generated for `branch_id`.

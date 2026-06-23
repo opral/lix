@@ -5,9 +5,6 @@ export type SqliteBackendOptions = {
 export type FsBackendOptions = {
 	path: string;
 	storage?: "persistent" | "memory";
-	filter?: {
-		includePaths: readonly string[];
-	};
 };
 
 export type OpenLixOptions = {

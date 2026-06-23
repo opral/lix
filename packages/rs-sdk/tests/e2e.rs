@@ -6,8 +6,6 @@ use lix_sdk::{
 use lix_sdk::{FsBackend, open_lix_with_backend};
 #[cfg(feature = "fs_backend")]
 use std::path::Path;
-#[cfg(feature = "fs_backend")]
-use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
@@ -293,12 +291,8 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
     let updated = b"updated bytes before commit".to_vec();
     let update = tx
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
-            &[
-                Value::Blob(updated.clone()),
-                Value::Text(path.clone()),
-                Value::Blob(original),
-            ],
+            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            &[Value::Blob(updated.clone()), Value::Text(path.clone())],
         )
         .await
         .unwrap();
@@ -319,8 +313,8 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 
     let delete = tx
         .execute(
-            "DELETE FROM lix_file WHERE path = $1 AND data = $2",
-            &[Value::Text(path.clone()), Value::Blob(updated)],
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(path.clone())],
         )
         .await
         .unwrap();
@@ -435,7 +429,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
+async fn filesystem_mounted_reads_use_local_files_as_source_of_truth() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
     std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
@@ -607,34 +601,6 @@ where
     Ok(())
 }
 
-async fn mkdir<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    lix.execute(
-        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-        &[Value::Text(path.to_string())],
-    )
-    .await?;
-    Ok(())
-}
-
-async fn rm<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    lix.execute(
-        "DELETE FROM lix_directory WHERE path = $1",
-        &[Value::Text(path.to_string())],
-    )
-    .await?;
-    Ok(())
-}
-
 async fn readdir<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<String>>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -710,7 +676,66 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filesystem_initial_import_ignores_git_entries() {
+async fn filesystem_removes_legacy_lix_system_directory() {
+    let tempdir = tempfile::tempdir().unwrap();
+
+    std::fs::create_dir_all(tempdir.path().join(".lix_system/app_data")).unwrap();
+    std::fs::write(
+        tempdir.path().join(".lix_system/app_data/legacy.txt"),
+        b"disk legacy",
+    )
+    .unwrap();
+    std::fs::write(tempdir.path().join(".lix_system/.gitignore"), b"*\n").unwrap();
+    std::fs::write(tempdir.path().join(".lix_system/.DS_Store"), b"ds-store").unwrap();
+    std::fs::write(
+        tempdir.path().join(".lix_system/db.sqlite"),
+        b"disk legacy db",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tempdir.path().join(".lix_system/.internal")).unwrap();
+    std::fs::write(
+        tempdir.path().join(".lix_system/.internal/private"),
+        b"disk private",
+    )
+    .unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert!(!tempdir.path().join(".lix_system").exists());
+    assert!(!tempdir.path().join(".lix/app_data/legacy.txt").exists());
+    assert!(!tempdir.path().join(".lix/.DS_Store").exists());
+    assert_eq!(readdir(&lix, "/.lix_system/").await.unwrap(), None);
+    assert_eq!(
+        read_file(&lix, "/.lix_system/settings.json").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix_system/db.sqlite").await.unwrap(),
+        None
+    );
+    assert_eq!(read_file(&lix, "/.lix/db.sqlite").await.unwrap(), None);
+    assert!(!tempdir.path().join(".lix/db.sqlite").exists());
+    assert_eq!(
+        read_file(&lix, "/.lix_system/.internal/private")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        read_file(&lix, "/.lix/.internal/private").await.unwrap(),
+        None
+    );
+    assert!(!tempdir.path().join(".lix/.internal/private").exists());
+    assert_eq!(
+        read_file(&lix, "/.lix/app_data/legacy.txt").await.unwrap(),
+        None
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filesystem_mounted_reads_ignore_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
     std::fs::write(tempdir.path().join(".git/config"), b"git").unwrap();
@@ -742,65 +767,20 @@ async fn filesystem_initial_import_ignores_git_entries() {
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let seed = open_lix_with_filesystem(tempdir.path()).await;
-    write_file(&seed, "/.git/config", b"old".to_vec())
-        .await
-        .unwrap();
-    write_file(&seed, "/docs/.git", b"old".to_vec())
-        .await
-        .unwrap();
-    seed.close().await.unwrap();
-
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-
-    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
-    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
-    assert!(!tempdir.path().join(".git").exists());
-    assert!(!tempdir.path().join("docs/.git").exists());
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "fs_backend")]
-async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let seed = open_lix_with_filesystem(tempdir.path()).await;
-    write_file(&seed, "/old.txt", b"old".to_vec())
-        .await
-        .unwrap();
-    mkdir(&seed, "/old-empty/").await.unwrap();
-    seed.close().await.unwrap();
-    std::fs::remove_file(tempdir.path().join("old.txt")).unwrap();
-    std::fs::remove_dir(tempdir.path().join("old-empty")).unwrap();
-
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-
-    assert_eq!(read_file(&lix, "/old.txt").await.unwrap(), None);
-    assert_eq!(readdir(&lix, "/old-empty/").await.unwrap(), None);
-    assert!(!tempdir.path().join("old.txt").exists());
-    assert!(!tempdir.path().join("old-empty").exists());
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "fs_backend")]
-async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
+async fn filesystem_lix_writes_materialize_workspace_disk_on_commit() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
+    std::fs::write(tempdir.path().join("sdk.txt"), b"disk").unwrap();
     write_file(&lix, "/sdk.txt", b"sdk".to_vec()).await.unwrap();
-    wait_for_disk_file(&tempdir.path().join("sdk.txt"), Some(b"sdk"));
     assert_eq!(
-        std::fs::read(tempdir.path().join("pending-local.txt")).unwrap(),
-        b"pending"
+        read_file(&lix, "/sdk.txt").await.unwrap().as_deref(),
+        Some(b"sdk".as_slice())
     );
-    wait_for_lix_file(&lix, "/pending-local.txt", Some(b"pending")).await;
-
-    mkdir(&lix, "/empty-sdk/").await.unwrap();
-    assert!(tempdir.path().join("empty-sdk").is_dir());
+    assert_eq!(
+        std::fs::read(tempdir.path().join("sdk.txt")).unwrap(),
+        b"sdk"
+    );
 
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
@@ -811,7 +791,14 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     )
     .await
     .unwrap();
-    wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"sql"));
+    assert_eq!(
+        read_file(&lix, "/sql.txt").await.unwrap().as_deref(),
+        Some(b"sql".as_slice())
+    );
+    assert_eq!(
+        std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+        b"sql"
+    );
 
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE path = $2",
@@ -822,7 +809,14 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     )
     .await
     .unwrap();
-    wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"updated"));
+    assert_eq!(
+        read_file(&lix, "/sql.txt").await.unwrap().as_deref(),
+        Some(b"updated".as_slice())
+    );
+    assert_eq!(
+        std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+        b"updated"
+    );
 
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
@@ -836,7 +830,11 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     .unwrap();
     assert!(!tempdir.path().join("tx.txt").exists());
     tx.commit().await.unwrap();
-    wait_for_disk_file(&tempdir.path().join("tx.txt"), Some(b"tx"));
+    assert_eq!(
+        read_file(&lix, "/tx.txt").await.unwrap().as_deref(),
+        Some(b"tx".as_slice())
+    );
+    assert_eq!(std::fs::read(tempdir.path().join("tx.txt")).unwrap(), b"tx");
 
     lix.execute(
         "DELETE FROM lix_file WHERE path = $1",
@@ -844,16 +842,14 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     )
     .await
     .unwrap();
-    wait_for_disk_file(&tempdir.path().join("sql.txt"), None);
-
-    rm(&lix, "/empty-sdk/").await.unwrap();
-    assert!(!tempdir.path().join("empty-sdk").exists());
+    assert_eq!(read_file(&lix, "/sql.txt").await.unwrap(), None);
+    assert!(!tempdir.path().join("sql.txt").exists());
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filesystem_materializes_untracked_sdk_sql_writes() {
+async fn filesystem_untracked_lix_writes_do_not_materialize() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
@@ -868,9 +864,10 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
     .await
     .unwrap();
     assert_eq!(
-        std::fs::read(tempdir.path().join("untracked.txt")).unwrap(),
-        b"untracked"
+        read_file(&lix, "/untracked.txt").await.unwrap().as_deref(),
+        Some(b"untracked".as_slice())
     );
+    assert!(!tempdir.path().join("untracked.txt").exists());
 
     lix.execute(
         "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
@@ -881,56 +878,18 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
     )
     .await
     .unwrap();
-    assert!(tempdir.path().join("untracked-dir").is_dir());
+    assert_eq!(
+        readdir(&lix, "/untracked-dir/").await.unwrap(),
+        Some(vec![])
+    );
+    assert!(!tempdir.path().join("untracked-dir").exists());
 
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filesystem_watcher_syncs_disk_changes_to_lix() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-
-    std::fs::write(tempdir.path().join("disk.txt"), b"disk").unwrap();
-    wait_for_lix_file(&lix, "/disk.txt", Some(b"disk")).await;
-
-    std::fs::write(tempdir.path().join("disk.txt"), b"changed").unwrap();
-    wait_for_lix_file(&lix, "/disk.txt", Some(b"changed")).await;
-
-    std::fs::create_dir(tempdir.path().join("empty-disk")).unwrap();
-    wait_for_lix_directory(&lix, "/empty-disk/", true).await;
-
-    std::fs::remove_file(tempdir.path().join("disk.txt")).unwrap();
-    wait_for_lix_file(&lix, "/disk.txt", None).await;
-
-    std::fs::remove_dir(tempdir.path().join("empty-disk")).unwrap();
-    wait_for_lix_directory(&lix, "/empty-disk/", false).await;
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "fs_backend")]
-async fn filesystem_watcher_ignores_git_entries_created_after_open() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-
-    std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
-    std::fs::write(tempdir.path().join(".git/config"), b"git").unwrap();
-    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
-    std::fs::write(tempdir.path().join("docs/.git"), b"git-file").unwrap();
-    std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
-
-    wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
-    assert_eq!(readdir(&lix, "/.git/").await.unwrap(), None);
-    assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
-    assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(feature = "fs_backend")]
-async fn filesystem_materialization_skips_git_entries() {
+async fn filesystem_lix_writes_to_git_paths_do_not_materialize() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
@@ -974,7 +933,14 @@ async fn filesystem_imports_opaque_lix_path_names() {
     write_file(&lix, "/written%23.txt", b"written".to_vec())
         .await
         .unwrap();
-    wait_for_disk_file(&tempdir.path().join("written%23.txt"), Some(b"written"));
+    assert_eq!(
+        read_file(&lix, "/written%23.txt").await.unwrap().as_deref(),
+        Some(b"written".as_slice())
+    );
+    assert_eq!(
+        std::fs::read(tempdir.path().join("written%23.txt")).unwrap(),
+        b"written"
+    );
     lix.close().await.unwrap();
 }
 
@@ -996,7 +962,7 @@ async fn filesystem_rejects_symlink_root() {
 
 #[tokio::test]
 #[cfg(all(unix, feature = "fs_backend"))]
-async fn filesystem_ignores_symlinks_on_initial_import() {
+async fn filesystem_mounted_reads_ignore_symlinks() {
     use std::os::unix::fs::symlink;
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -1077,29 +1043,7 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
 
 #[tokio::test]
 #[cfg(all(unix, feature = "fs_backend"))]
-async fn filesystem_watcher_ignores_symlinks_created_after_open() {
-    use std::os::unix::fs::symlink;
-
-    let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-
-    std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
-    std::fs::create_dir(tempdir.path().join("real-dir")).unwrap();
-    std::fs::write(tempdir.path().join("real-dir/file.txt"), b"nested").unwrap();
-    symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
-    symlink("real-dir", tempdir.path().join("linked-dir")).unwrap();
-    std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
-
-    wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
-    assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
-    assert_eq!(readdir(&lix, "/linked-dir/").await.unwrap(), None);
-    assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
-async fn filesystem_materialization_skips_symlink_collisions() {
+async fn filesystem_lix_writes_do_not_follow_symlink_collisions() {
     use std::os::unix::fs::symlink;
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -1148,31 +1092,18 @@ async fn filesystem_materialization_skips_symlink_collisions() {
         b"outside"
     );
     assert!(!outside.path().join("file.txt").exists());
-
-    std::fs::remove_file(tempdir.path().join("blocked.txt")).unwrap();
-    std::fs::remove_file(tempdir.path().join("blocked-dir")).unwrap();
-    wait_for_disk_file(&tempdir.path().join("blocked.txt"), Some(b"lix"));
-    wait_for_disk_file(
-        &tempdir.path().join("blocked-dir/file.txt"),
-        Some(b"nested"),
-    );
-    assert_eq!(
-        std::fs::read(outside.path().join("outside.txt")).unwrap(),
-        b"outside"
-    );
-    assert!(!outside.path().join("file.txt").exists());
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
 #[cfg(all(unix, feature = "fs_backend"))]
-async fn filesystem_materialization_skips_special_file_collisions() {
+async fn filesystem_lix_writes_do_not_replace_special_file_collisions() {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
 
     let tempdir = tempfile::tempdir().unwrap();
     let socket_path = tempdir.path().join("socket");
-    let listener = UnixListener::bind(&socket_path).unwrap();
+    let _listener = UnixListener::bind(&socket_path).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
     write_file(&lix, "/socket", b"lix".to_vec()).await.unwrap();
@@ -1187,71 +1118,7 @@ async fn filesystem_materialization_skips_special_file_collisions() {
             .file_type()
             .is_socket()
     );
-
-    drop(listener);
-    std::fs::remove_file(tempdir.path().join("socket")).unwrap();
-    wait_for_disk_file_with_timeout(
-        &tempdir.path().join("socket"),
-        Some(b"lix"),
-        Duration::from_secs(20),
-    );
     lix.close().await.unwrap();
-}
-
-#[cfg(feature = "fs_backend")]
-#[track_caller]
-fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
-    wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
-}
-
-#[cfg(feature = "fs_backend")]
-#[track_caller]
-fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    let path_display = path.display();
-    loop {
-        let actual = std::fs::read(path).ok();
-        if actual.as_deref() == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for disk file {path_display} to be {expected:?}, got {actual:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(feature = "fs_backend")]
-async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let actual = read_file(lix, path).await.unwrap();
-        if actual.as_deref() == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for Lix file {path} to be {expected:?}, got {actual:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(feature = "fs_backend")]
-async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let actual = readdir(lix, path).await.unwrap().is_some();
-        if actual == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for Lix directory {path} existence to be {expected}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 async fn register_crm_task_schema(lix: &Lix) {

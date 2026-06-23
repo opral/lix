@@ -1,10 +1,22 @@
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
 use crate::backend::{
     BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId, WriteOptions,
 };
 
-/// An ordered byte-key entry backend with coherent read views, batched point
-/// access, space-scoped scans, and atomic batched writes.
+/// Lix's host-system adapter.
+///
+/// Every backend provides the ordered key/value storage used by the engine.
+/// Storage may be persistent or ephemeral depending on the implementation. A
+/// backend may also expose optional host capabilities, such as a mounted
+/// workspace filesystem.
+///
+/// The ordered storage surface has coherent read views, batched point access,
+/// space-scoped scans, and atomic batched writes.
 ///
 /// Storage is organized into spaces: engine-defined namespaces identified by
 /// [`SpaceId`]. Every operation addresses exactly one space, keys are logical
@@ -23,6 +35,15 @@ pub trait Backend {
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError>;
 
+    /// Returns an optional filesystem mount projected into Lix workspace paths.
+    ///
+    /// Backends without an external workspace return `None`. Mounted filesystems
+    /// are external host state; they are not part of the backend's atomic storage
+    /// commit.
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        None
+    }
+
     /// Opens one backend-owned write transaction.
     ///
     /// The backend is the concurrency boundary. Implementations are responsible
@@ -34,6 +55,44 @@ pub trait Backend {
     /// Lix sessions intentionally do not add a generic per-backend write lock
     /// above this method.
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError>;
+}
+
+#[async_trait]
+pub trait MountedFilesystem: Send + Sync {
+    /// Returns one best-effort listing of mounted filesystem paths.
+    ///
+    /// Mounted filesystems are external system state. Implementations do not
+    /// promise snapshot isolation between listing and file reads.
+    ///
+    /// Listing paths are normalized Lix workspace paths:
+    /// - directories are absolute and slash-terminated, for example `/docs/`
+    /// - files are absolute and not slash-terminated, for example `/docs/a.md`
+    /// - `/` may be omitted from directories because it is implicit
+    async fn list(&self) -> Result<MountedFilesystemListing, BackendError>;
+
+    /// Reads bytes for a normalized file path previously exposed by `list`.
+    /// Returning `Ok(None)` means the mounted file is no longer available.
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError>;
+
+    /// Applies mounted filesystem mutations in order.
+    ///
+    /// MVP semantics are best-effort ordered application. This batch API does
+    /// not imply atomic filesystem mutation.
+    async fn apply(&self, ops: Vec<MountedFilesystemOp>) -> Result<(), BackendError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountedFilesystemOp {
+    WriteFile { path: String, data: Vec<u8> },
+    DeleteFile { path: String },
+    DeleteDirectory { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MountedFilesystemListing {
+    pub directories: BTreeSet<String>,
+    pub files: BTreeSet<String>,
+    pub unmanaged_paths: BTreeSet<String>,
 }
 
 pub trait BackendRead {

@@ -18,6 +18,7 @@ use crate::live_state::{
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage::StorageRead;
+use crate::storage::{MountedFilesystem, MountedFilesystemOp};
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::wasm::UnsupportedWasmRuntime;
 
@@ -57,6 +58,9 @@ pub(crate) trait SqlExecutionContext {
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        None
+    }
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
@@ -72,10 +76,16 @@ pub(crate) trait SqlExecutionContext {
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext {
     fn active_branch_id(&self) -> &str;
+    fn is_workspace_session(&self) -> bool {
+        false
+    }
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
+    }
+    fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        None
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
@@ -91,6 +101,12 @@ pub(crate) trait SqlWriteExecutionContext {
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError>;
+
+    #[allow(dead_code)]
+    async fn stage_mounted_filesystem_op(
+        &mut self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError>;
 }
 
 #[derive(Clone)]
@@ -138,8 +154,16 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
     }
 
+    pub(crate) fn is_workspace_session(&self) -> bool {
+        unsafe { self.ptr.0.as_ref().is_workspace_session() }
+    }
+
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
         unsafe { self.ptr.0.as_ref().plugin_host() }
+    }
+
+    pub(crate) fn mounted_filesystem(&self) -> Option<Arc<dyn MountedFilesystem>> {
+        unsafe { self.ptr.0.as_ref().mounted_filesystem() }
     }
 
     pub(crate) async fn scan_live_state(
@@ -202,6 +226,23 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .stage_write(write)
+                .await
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn stage_mounted_filesystem_op(
+        &self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .stage_mounted_filesystem_op(write)
                 .await
         }
     }
