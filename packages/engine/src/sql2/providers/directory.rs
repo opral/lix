@@ -36,7 +36,7 @@ use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
-use crate::storage::{MountedFilesystem, MountedFilesystemOp};
+use crate::storage::MountedFilesystem;
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
@@ -44,11 +44,12 @@ use crate::transaction::types::{
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
 
 use crate::filesystem::{
-    DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
-    FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, VisibleFilesystem,
-    create_directory_path_with_leaf_id_with_resolvers, derive_directory_paths,
-    directory_descriptor_write_row, directory_path_resolvers_from_live_state,
-    filesystem_storage_scope_key, is_mounted_directory_id, mounted_workspace_rows_by_branch,
+    DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver, FilesystemContext,
+    FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, MountedEntryKind,
+    MountedWorkspaceTarget, VisibleFilesystem, create_directory_path_with_leaf_id_with_resolvers,
+    derive_directory_paths, directory_descriptor_write_row,
+    directory_path_resolvers_from_live_state, filesystem_storage_scope_key,
+    is_mounted_directory_id, mounted_workspace_rows_by_branch,
     plan_parsed_directory_path_update_with_resolvers, plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
@@ -57,6 +58,9 @@ use crate::sql2::{
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
+use super::filesystem_write::{
+    mounted_workspace_target_from_batch, stage_filesystem_write_outcome,
+};
 use super::spec::{
     PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema,
     register_spec_table, row_source,
@@ -472,11 +476,12 @@ impl TableSpec for LixDirectorySpec {
                         })?;
                     reject_lix_directory_delete_plugin_storage_paths(&matched_batch, &source_batch)
                         .map_err(lix_error_to_datafusion_error)?;
-                    let mounted_filesystem_ops = mounted_directory_delete_intents_from_batch(
-                        &matched_batch,
+                    let filesystem_context = FilesystemContext::for_workspace_write(
                         &active_branch_id,
                         is_workspace_session,
-                    )?;
+                    );
+                    let mounted_targets =
+                        mounted_directory_targets_from_batch(&matched_batch, &active_branch_id)?;
                     let branch_ids = directory_branch_ids_from_batch(
                         &matched_batch,
                         branch_binding.active_branch_id(),
@@ -498,33 +503,16 @@ impl TableSpec for LixDirectorySpec {
                         branch_binding.active_branch_id(),
                         &visible_filesystems,
                     )?;
-                    let write_rows = if is_workspace_session {
-                        remove_workspace_mounted_directory_state_writes(
-                            write_rows,
-                            &active_branch_id,
-                        )
-                        .map_err(lix_error_to_datafusion_error)?
-                    } else {
-                        write_rows
-                    };
-
-                    if !write_rows.is_empty() {
-                        write_ctx
-                            .stage_write(TransactionWrite::Rows {
-                                mode: TransactionWriteMode::Replace,
-                                rows: write_rows,
-                            })
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
-                    }
-                    for write in mounted_filesystem_ops {
-                        write_ctx
-                            .stage_mounted_filesystem_op(write)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
-                    }
-
-                    Ok(count)
+                    let outcome = filesystem_context
+                        .plan_directory_delete(write_rows, count, mounted_targets)
+                        .map_err(lix_error_to_datafusion_error)?;
+                    stage_filesystem_write_outcome(
+                        &write_ctx,
+                        TransactionWriteMode::Replace,
+                        outcome,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)
                 }
                 .boxed()
             }),
@@ -1024,78 +1012,22 @@ fn reject_lix_directory_delete_plugin_storage_paths(
     Ok(())
 }
 
-fn mounted_filesystem_row_branch_id(
-    batch: &RecordBatch,
-    row_index: usize,
-    active_branch_id: &str,
-) -> Result<String> {
-    Ok(optional_string_value(batch, row_index, "lixcol_branch_id")?
-        .unwrap_or_else(|| active_branch_id.to_string()))
-}
-
-fn row_targets_workspace_mounted_directory(
-    batch: &RecordBatch,
-    row_index: usize,
-    active_branch_id: &str,
-    is_workspace_session: bool,
-) -> Result<Option<String>> {
-    if !is_workspace_session {
-        return Ok(None);
-    }
-    let id = required_string_value(batch, row_index, "id")?;
-    if !is_mounted_directory_id(&id) {
-        return Ok(None);
-    }
-    let branch_id = mounted_filesystem_row_branch_id(batch, row_index, active_branch_id)?;
-    if branch_id != active_branch_id {
-        return Ok(None);
-    }
-    optional_string_value(batch, row_index, "path")
-}
-
-fn mounted_directory_delete_intents_from_batch(
+fn mounted_directory_targets_from_batch(
     batch: &RecordBatch,
     active_branch_id: &str,
-    is_workspace_session: bool,
-) -> Result<Vec<MountedFilesystemOp>> {
-    let mut writes = Vec::new();
+) -> Result<Vec<MountedWorkspaceTarget>> {
+    let mut targets = Vec::new();
     for row_index in 0..batch.num_rows() {
-        if let Some(path) = row_targets_workspace_mounted_directory(
+        if let Some(target) = mounted_workspace_target_from_batch(
             batch,
             row_index,
             active_branch_id,
-            is_workspace_session,
+            MountedEntryKind::Directory,
         )? {
-            writes.push(MountedFilesystemOp::DeleteDirectory { path });
+            targets.push(target);
         }
     }
-    Ok(writes)
-}
-
-fn row_is_workspace_mounted_directory_state_write(
-    row: &TransactionWriteRow,
-    active_branch_id: &str,
-) -> std::result::Result<bool, LixError> {
-    if row.global || row.branch_id != active_branch_id {
-        return Ok(false);
-    }
-    let Some(entity_pk) = row.entity_pk.as_ref() else {
-        return Ok(false);
-    };
-    Ok(is_mounted_directory_id(entity_pk.as_single_string()?))
-}
-
-fn remove_workspace_mounted_directory_state_writes(
-    rows: Vec<TransactionWriteRow>,
-    active_branch_id: &str,
-) -> std::result::Result<Vec<TransactionWriteRow>, LixError> {
-    let mut retained = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !row_is_workspace_mounted_directory_state_write(&row, active_branch_id)? {
-            retained.push(row);
-        }
-    }
-    Ok(retained)
+    Ok(targets)
 }
 
 fn reject_mounted_directory_mutation(batch: &RecordBatch) -> std::result::Result<(), LixError> {

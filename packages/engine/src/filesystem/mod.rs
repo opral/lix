@@ -1,3 +1,4 @@
+mod context;
 mod descriptor_path;
 mod keys;
 mod overlay;
@@ -5,6 +6,10 @@ mod planner;
 mod read;
 mod visibility;
 
+pub(crate) use self::context::{
+    FilesystemContext, FilesystemWriteOutcome, FilesystemWriteTarget, MountedEntryKind,
+    MountedFileDataUpdateTarget, MountedWorkspaceTarget, mounted_id_matches,
+};
 pub(crate) use self::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
 pub(crate) use self::overlay::{
     is_mounted_directory_id, is_mounted_file_id, mounted_workspace_rows_by_branch,

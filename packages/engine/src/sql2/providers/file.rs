@@ -35,7 +35,9 @@ use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    FilesystemIndex, filesystem_schema_keys, is_mounted_file_id, mounted_workspace_rows_by_branch,
+    FilesystemContext, FilesystemIndex, FilesystemWriteTarget, MountedEntryKind,
+    MountedFileDataUpdateTarget, MountedWorkspaceTarget, filesystem_schema_keys,
+    mounted_workspace_rows_by_branch,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
@@ -62,7 +64,7 @@ use crate::sql2::write_normalization::{
     lix_file_data_type_error, lix_file_data_type_error_with_value, logical_expr_is_binary_or_null,
     reject_non_binary_casts_for_insert_column, scalar_is_binary_or_null,
 };
-use crate::storage::{MountedFilesystem, MountedFilesystemListing, MountedFilesystemOp};
+use crate::storage::MountedFilesystem;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
 
@@ -90,6 +92,9 @@ use crate::transaction::types::{
     TransactionWriteOperation, TransactionWriteOrigin,
 };
 
+use super::filesystem_write::{
+    mounted_workspace_target_from_batch, stage_filesystem_write_outcome,
+};
 use super::spec::{
     DmlApply, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, filter_batch,
     finish_scan_batch, register_spec_table, row_source,
@@ -637,39 +642,25 @@ impl TableSpec for LixFileSpec {
                     .map_err(lix_error_to_datafusion_error)?;
                 let blob_ref_keys =
                     blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-                let mounted_filesystem_ops = mounted_file_delete_intents_from_batch(
-                    &matched_batch,
-                    &active_branch_id,
-                    is_workspace_session,
-                )?;
+                let filesystem_context =
+                    FilesystemContext::for_workspace_write(&active_branch_id, is_workspace_session);
                 let mut staged = lix_file_delete_stage_from_batch(
                     &matched_batch,
                     branch_binding.active_branch_id(),
                     &blob_ref_keys,
                 )?;
-                if is_workspace_session {
-                    remove_workspace_mounted_file_state_writes(&mut staged, &active_branch_id)
-                        .map_err(lix_error_to_datafusion_error)?;
-                }
-                let count = staged.count;
-
-                if !staged.state_rows.is_empty() {
-                    write_ctx
-                        .stage_write(TransactionWrite::Rows {
-                            mode: TransactionWriteMode::Replace,
-                            rows: staged.state_rows,
-                        })
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                }
-                for write in mounted_filesystem_ops {
-                    write_ctx
-                        .stage_mounted_filesystem_op(write)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                }
-
-                Ok(count)
+                let targets = mounted_file_targets_from_batch(&matched_batch, &active_branch_id)?;
+                let outcome = filesystem_context
+                    .plan_file_delete(
+                        std::mem::take(&mut staged.state_rows),
+                        std::mem::take(&mut staged.file_data_writes),
+                        staged.count,
+                        targets,
+                    )
+                    .map_err(lix_error_to_datafusion_error)?;
+                stage_filesystem_write_outcome(&write_ctx, TransactionWriteMode::Replace, outcome)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)
             }
             .boxed()
         });
@@ -762,13 +753,17 @@ impl TableSpec for LixFileSpec {
                 })?;
                 let assignment_values =
                     UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
-                let mounted_filesystem_ops = mounted_file_data_update_intents_from_batch(
+                let filesystem_context =
+                    FilesystemContext::for_workspace_write(&active_branch_id, is_workspace_session);
+                let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
+                let mounted_file_targets =
+                    mounted_file_targets_from_batch(&matched_batch, &active_branch_id)?;
+                reject_unsupported_mounted_file_update(&mounted_file_targets, update_columns)?;
+                let mounted_targets = mounted_file_data_update_targets_from_batch(
                     &matched_batch,
                     &assignment_values,
                     &active_branch_id,
-                    is_workspace_session,
                 )?;
-                let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
                 let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
                     path_update_plugin_rewrite_file_ids(
                         plugin_render.as_ref(),
@@ -800,39 +795,17 @@ impl TableSpec for LixFileSpec {
                     path_resolvers.as_mut(),
                     &mut || functions.call_uuid_v7().to_string(),
                 )?;
-                if is_workspace_session {
-                    remove_workspace_mounted_file_state_writes(&mut staged, &active_branch_id)
-                        .map_err(lix_error_to_datafusion_error)?;
-                }
-                let count = staged.count;
-
-                if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
-                    let intent = if staged.file_data_writes.is_empty() {
-                        TransactionWrite::Rows {
-                            mode: TransactionWriteMode::Replace,
-                            rows: staged.state_rows,
-                        }
-                    } else {
-                        TransactionWrite::RowsWithFileData {
-                            mode: TransactionWriteMode::Replace,
-                            rows: staged.state_rows,
-                            file_data: staged.file_data_writes,
-                            count,
-                        }
-                    };
-                    write_ctx
-                        .stage_write(intent)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                }
-                for write in mounted_filesystem_ops {
-                    write_ctx
-                        .stage_mounted_filesystem_op(write)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                }
-
-                Ok(count)
+                let outcome = filesystem_context
+                    .plan_file_data_update(
+                        std::mem::take(&mut staged.state_rows),
+                        std::mem::take(&mut staged.file_data_writes),
+                        staged.count,
+                        mounted_targets,
+                    )
+                    .map_err(lix_error_to_datafusion_error)?;
+                stage_filesystem_write_outcome(&write_ctx, TransactionWriteMode::Replace, outcome)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)
             }
             .boxed()
         });
@@ -1462,38 +1435,6 @@ impl LixFileStagedBatch {
     }
 }
 
-fn staged_row_targets_workspace_mounted_file(
-    row: &TransactionWriteRow,
-    active_branch_id: &str,
-) -> std::result::Result<bool, LixError> {
-    if row.global || row.branch_id != active_branch_id {
-        return Ok(false);
-    }
-    let Some(entity_pk) = row.entity_pk.as_ref() else {
-        return Ok(false);
-    };
-    Ok(is_mounted_file_id(entity_pk.as_single_string()?))
-}
-
-fn remove_workspace_mounted_file_state_writes(
-    staged: &mut LixFileStagedBatch,
-    active_branch_id: &str,
-) -> std::result::Result<(), LixError> {
-    let mut retained_rows = Vec::with_capacity(staged.state_rows.len());
-    for row in staged.state_rows.drain(..) {
-        if !staged_row_targets_workspace_mounted_file(&row, active_branch_id)? {
-            retained_rows.push(row);
-        }
-    }
-    staged.state_rows = retained_rows;
-    staged.file_data_writes.retain(|write| {
-        !(write.branch_id == active_branch_id
-            && !write.global
-            && is_mounted_file_id(&write.file_id))
-    });
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FastLixFilePathWriteConflict {
     None,
@@ -1539,57 +1480,29 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     path_resolvers.entry(resolver_key).or_default();
     let mut staged = LixFileStagedBatch::default();
     let mut mounted_filesystem_write_count = 0_u64;
-    let mounted_filesystem = ctx.mounted_filesystem();
-    let write_active_files_to_mounted_filesystem =
-        ctx.is_workspace_session() && mounted_filesystem.is_some();
-    let mounted_listing = if write_active_files_to_mounted_filesystem {
-        Some(
-            mounted_filesystem
-                .as_ref()
-                .expect("mounted filesystem checked above")
-                .list()
-                .await
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        format!("mounted filesystem listing failed: {error}"),
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
+    let filesystem_context = FilesystemContext::for_mounted_path_write(
+        &active_branch_id,
+        ctx.is_workspace_session(),
+        ctx.mounted_filesystem(),
+    )
+    .await?;
 
     for write in parsed_writes {
-        let path_is_mounted_directory = mounted_listing.as_ref().is_some_and(|listing| {
-            listing
-                .directories
-                .contains(&format!("{}/", write.parsed.path.trim_end_matches('/')))
-        });
-        let path_is_mounted_writable = mounted_listing
-            .as_ref()
-            .is_some_and(|listing| mounted_write_path_is_managed(&write.parsed.path, listing));
-        if write_active_files_to_mounted_filesystem
-            && write.parsed.plugin_key.is_none()
-            && !path_is_mounted_directory
-            && path_is_mounted_writable
-        {
-            if let Some(data) = write.data {
-                ctx.stage_mounted_filesystem_op(MountedFilesystemOp::WriteFile {
-                    path: write.parsed.path,
-                    data,
-                })
-                .await?;
-                mounted_filesystem_write_count = mounted_filesystem_write_count
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_UNSUPPORTED_SQL,
-                            "lix_file fast write row count overflow",
-                        )
-                    })?;
-                continue;
-            }
+        if let FilesystemWriteTarget::Mounted(op) = filesystem_context.plan_file_write(
+            &write.parsed.path,
+            write.parsed.plugin_key.is_some(),
+            write.data.clone(),
+        ) {
+            ctx.stage_mounted_filesystem_op(op).await?;
+            mounted_filesystem_write_count = mounted_filesystem_write_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "lix_file fast write row count overflow",
+                    )
+                })?;
+            continue;
         }
         if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
             if conflict != FastLixFilePathWriteConflict::None {
@@ -1695,41 +1608,6 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
 struct FastLixFilePathWrite {
     parsed: ParsedFileWritePath,
     data: Option<Vec<u8>>,
-}
-
-fn mounted_write_path_is_managed(path: &str, listing: &MountedFilesystemListing) -> bool {
-    if mounted_write_path_is_protected(path) || mounted_write_path_hits_unmanaged(path, listing) {
-        return false;
-    }
-    listing.files.contains(path) || mounted_write_parent_directory_is_listed(path, listing)
-}
-
-fn mounted_write_path_is_protected(path: &str) -> bool {
-    path.trim_matches('/')
-        .split('/')
-        .any(|segment| matches!(segment, ".git" | ".lix"))
-}
-
-fn mounted_write_path_hits_unmanaged(path: &str, listing: &MountedFilesystemListing) -> bool {
-    listing.unmanaged_paths.iter().any(|unmanaged| {
-        let unmanaged = unmanaged.trim_end_matches('/');
-        path == unmanaged || path.starts_with(&format!("{unmanaged}/"))
-    })
-}
-
-fn mounted_write_parent_directory_is_listed(
-    path: &str,
-    listing: &MountedFilesystemListing,
-) -> bool {
-    let Some((parent, _name)) = path.rsplit_once('/') else {
-        return false;
-    };
-    let parent_directory = if parent.is_empty() {
-        "/".to_string()
-    } else {
-        format!("{}/", parent.trim_end_matches('/'))
-    };
-    listing.directories.contains(&parent_directory)
 }
 
 fn parse_fast_lix_file_path_writes(
@@ -3561,67 +3439,50 @@ fn required_binary_value(
     }
 }
 
-fn mounted_filesystem_row_branch_id(
-    batch: &RecordBatch,
-    row_index: usize,
-    active_branch_id: &str,
-) -> Result<String> {
-    Ok(optional_string_value(batch, row_index, "lixcol_branch_id")?
-        .unwrap_or_else(|| active_branch_id.to_string()))
-}
-
-fn row_targets_workspace_mounted_file(
-    batch: &RecordBatch,
-    row_index: usize,
-    active_branch_id: &str,
-    is_workspace_session: bool,
-) -> Result<Option<String>> {
-    if !is_workspace_session {
-        return Ok(None);
-    }
-    let id = required_string_value(batch, row_index, "id")?;
-    if !is_mounted_file_id(&id) {
-        return Ok(None);
-    }
-    let branch_id = mounted_filesystem_row_branch_id(batch, row_index, active_branch_id)?;
-    if branch_id != active_branch_id {
-        return Ok(None);
-    }
-    optional_string_value(batch, row_index, "path")
-}
-
-fn mounted_file_delete_intents_from_batch(
+fn mounted_file_targets_from_batch(
     batch: &RecordBatch,
     active_branch_id: &str,
-    is_workspace_session: bool,
-) -> Result<Vec<MountedFilesystemOp>> {
-    let mut writes = Vec::new();
+) -> Result<Vec<MountedWorkspaceTarget>> {
+    let mut targets = Vec::new();
     for row_index in 0..batch.num_rows() {
-        if let Some(path) = row_targets_workspace_mounted_file(
+        if let Some(target) = mounted_workspace_target_from_batch(
             batch,
             row_index,
             active_branch_id,
-            is_workspace_session,
+            MountedEntryKind::File,
         )? {
-            writes.push(MountedFilesystemOp::DeleteFile { path });
+            targets.push(target);
         }
     }
-    Ok(writes)
+    Ok(targets)
 }
 
-fn mounted_file_data_update_intents_from_batch(
+fn reject_unsupported_mounted_file_update(
+    targets: &[MountedWorkspaceTarget],
+    update_columns: LixFileUpdateColumns,
+) -> Result<()> {
+    if targets.is_empty()
+        || (update_columns.data && !update_columns.path && !update_columns.descriptor)
+    {
+        return Ok(());
+    }
+    Err(DataFusionError::Execution(
+        "UPDATE lix_file for mounted filesystem files only supports data writes".to_string(),
+    ))
+}
+
+fn mounted_file_data_update_targets_from_batch(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
     active_branch_id: &str,
-    is_workspace_session: bool,
-) -> Result<Vec<MountedFilesystemOp>> {
-    let mut writes = Vec::new();
+) -> Result<Vec<MountedFileDataUpdateTarget>> {
+    let mut targets = Vec::new();
     for row_index in 0..batch.num_rows() {
-        let Some(path) = row_targets_workspace_mounted_file(
+        let Some(target) = mounted_workspace_target_from_batch(
             batch,
             row_index,
             active_branch_id,
-            is_workspace_session,
+            MountedEntryKind::File,
         )?
         else {
             continue;
@@ -3631,11 +3492,14 @@ fn mounted_file_data_update_intents_from_batch(
             UpdateCell::Assigned(_) => {
                 let data =
                     update_required_binary_value(batch, assignment_values, row_index, "data")?;
-                writes.push(MountedFilesystemOp::WriteFile { path, data });
+                targets.push(MountedFileDataUpdateTarget {
+                    target,
+                    data: Some(data),
+                });
             }
         }
     }
-    Ok(writes)
+    Ok(targets)
 }
 
 fn optional_string_value(
@@ -3804,7 +3668,10 @@ mod tests {
     use crate::LixError;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
     use crate::changelog::{ChangeId, CommitId};
-    use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
+    use crate::filesystem::{
+        FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext, MountedEntryKind,
+        MountedWorkspaceTarget,
+    };
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
@@ -4961,6 +4828,41 @@ mod tests {
             error.to_string().contains("plugin archive paths"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn mounted_file_update_rejects_non_data_assignments() {
+        let mounted_targets = vec![MountedWorkspaceTarget {
+            id: "mounted:file:/docs/a.md".to_string(),
+            path: Some("/docs/a.md".to_string()),
+            branch_id: "workspace".to_string(),
+            kind: MountedEntryKind::File,
+        }];
+
+        let error = super::reject_unsupported_mounted_file_update(
+            &mounted_targets,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+        )
+        .expect_err("mounted file path update should be rejected");
+
+        assert!(
+            error.to_string().contains("only supports data writes"),
+            "unexpected error: {error}"
+        );
+
+        super::reject_unsupported_mounted_file_update(
+            &mounted_targets,
+            super::LixFileUpdateColumns {
+                path: false,
+                data: true,
+                descriptor: false,
+            },
+        )
+        .expect("mounted file data update should be accepted");
     }
 
     #[test]
