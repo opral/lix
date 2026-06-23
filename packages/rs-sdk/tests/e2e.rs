@@ -767,7 +767,7 @@ async fn filesystem_mounted_reads_ignore_git_entries() {
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filesystem_lix_writes_overlay_disk_without_materializing() {
+async fn filesystem_lix_writes_materialize_workspace_disk_on_commit() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
@@ -779,7 +779,7 @@ async fn filesystem_lix_writes_overlay_disk_without_materializing() {
     );
     assert_eq!(
         std::fs::read(tempdir.path().join("sdk.txt")).unwrap(),
-        b"disk"
+        b"sdk"
     );
 
     lix.execute(
@@ -795,7 +795,10 @@ async fn filesystem_lix_writes_overlay_disk_without_materializing() {
         read_file(&lix, "/sql.txt").await.unwrap().as_deref(),
         Some(b"sql".as_slice())
     );
-    assert!(!tempdir.path().join("sql.txt").exists());
+    assert_eq!(
+        std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+        b"sql"
+    );
 
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE path = $2",
@@ -810,7 +813,10 @@ async fn filesystem_lix_writes_overlay_disk_without_materializing() {
         read_file(&lix, "/sql.txt").await.unwrap().as_deref(),
         Some(b"updated".as_slice())
     );
-    assert!(!tempdir.path().join("sql.txt").exists());
+    assert_eq!(
+        std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+        b"updated"
+    );
 
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
@@ -828,7 +834,7 @@ async fn filesystem_lix_writes_overlay_disk_without_materializing() {
         read_file(&lix, "/tx.txt").await.unwrap().as_deref(),
         Some(b"tx".as_slice())
     );
-    assert!(!tempdir.path().join("tx.txt").exists());
+    assert_eq!(std::fs::read(tempdir.path().join("tx.txt")).unwrap(), b"tx");
 
     lix.execute(
         "DELETE FROM lix_file WHERE path = $1",
@@ -931,7 +937,10 @@ async fn filesystem_imports_opaque_lix_path_names() {
         read_file(&lix, "/written%23.txt").await.unwrap().as_deref(),
         Some(b"written".as_slice())
     );
-    assert!(!tempdir.path().join("written%23.txt").exists());
+    assert_eq!(
+        std::fs::read(tempdir.path().join("written%23.txt")).unwrap(),
+        b"written"
+    );
     lix.close().await.unwrap();
 }
 

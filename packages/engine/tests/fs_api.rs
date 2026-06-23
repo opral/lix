@@ -587,7 +587,7 @@ simulation_test!(sql_write_file_upserts_existing_data, |sim| async move {
         )
         .await
         .expect("blob ref query should succeed");
-    assert_eq!(blob_ref_rows.len(), 0);
+    assert_eq!(blob_ref_rows.len(), 1);
 });
 
 simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {

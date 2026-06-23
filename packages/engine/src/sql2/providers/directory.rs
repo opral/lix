@@ -21,7 +21,6 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde::Deserialize;
 
-use crate::backend::MountedFilesystem;
 use crate::branch::BranchRefReader;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
@@ -37,6 +36,7 @@ use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
+use crate::storage::{MountedFilesystem, MountedFilesystemOp};
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
@@ -451,11 +451,14 @@ impl TableSpec for LixDirectorySpec {
         let request = self.dml_scan_request(filters).await?;
         let captured: Arc<Mutex<Option<RecordBatch>>> = Arc::new(Mutex::new(None));
         let branch_binding = self.branch_binding.clone();
+        let active_branch_id = write_ctx.active_branch_id();
+        let is_workspace_session = write_ctx.is_workspace_session();
         Ok(PlannedDml {
             source: self.dml_source(&write_ctx, request, Arc::clone(&captured)),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let branch_binding = branch_binding.clone();
+                let active_branch_id = active_branch_id.clone();
                 let captured = Arc::clone(&captured);
                 async move {
                     let source_batch = captured
@@ -469,8 +472,11 @@ impl TableSpec for LixDirectorySpec {
                         })?;
                     reject_lix_directory_delete_plugin_storage_paths(&matched_batch, &source_batch)
                         .map_err(lix_error_to_datafusion_error)?;
-                    reject_mounted_directory_mutation(&matched_batch)
-                        .map_err(lix_error_to_datafusion_error)?;
+                    let mounted_filesystem_ops = mounted_directory_delete_intents_from_batch(
+                        &matched_batch,
+                        &active_branch_id,
+                        is_workspace_session,
+                    )?;
                     let branch_ids = directory_branch_ids_from_batch(
                         &matched_batch,
                         branch_binding.active_branch_id(),
@@ -492,13 +498,28 @@ impl TableSpec for LixDirectorySpec {
                         branch_binding.active_branch_id(),
                         &visible_filesystems,
                     )?;
+                    let write_rows = if is_workspace_session {
+                        remove_workspace_mounted_directory_state_writes(
+                            write_rows,
+                            &active_branch_id,
+                        )
+                        .map_err(lix_error_to_datafusion_error)?
+                    } else {
+                        write_rows
+                    };
 
-                    if count > 0 {
+                    if !write_rows.is_empty() {
                         write_ctx
                             .stage_write(TransactionWrite::Rows {
                                 mode: TransactionWriteMode::Replace,
                                 rows: write_rows,
                             })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+                    for write in mounted_filesystem_ops {
+                        write_ctx
+                            .stage_mounted_filesystem_op(write)
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     }
@@ -1001,6 +1022,80 @@ fn reject_lix_directory_delete_plugin_storage_paths(
         }
     }
     Ok(())
+}
+
+fn mounted_filesystem_row_branch_id(
+    batch: &RecordBatch,
+    row_index: usize,
+    active_branch_id: &str,
+) -> Result<String> {
+    Ok(optional_string_value(batch, row_index, "lixcol_branch_id")?
+        .unwrap_or_else(|| active_branch_id.to_string()))
+}
+
+fn row_targets_workspace_mounted_directory(
+    batch: &RecordBatch,
+    row_index: usize,
+    active_branch_id: &str,
+    is_workspace_session: bool,
+) -> Result<Option<String>> {
+    if !is_workspace_session {
+        return Ok(None);
+    }
+    let id = required_string_value(batch, row_index, "id")?;
+    if !is_mounted_directory_id(&id) {
+        return Ok(None);
+    }
+    let branch_id = mounted_filesystem_row_branch_id(batch, row_index, active_branch_id)?;
+    if branch_id != active_branch_id {
+        return Ok(None);
+    }
+    optional_string_value(batch, row_index, "path")
+}
+
+fn mounted_directory_delete_intents_from_batch(
+    batch: &RecordBatch,
+    active_branch_id: &str,
+    is_workspace_session: bool,
+) -> Result<Vec<MountedFilesystemOp>> {
+    let mut writes = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        if let Some(path) = row_targets_workspace_mounted_directory(
+            batch,
+            row_index,
+            active_branch_id,
+            is_workspace_session,
+        )? {
+            writes.push(MountedFilesystemOp::DeleteDirectory { path });
+        }
+    }
+    Ok(writes)
+}
+
+fn row_is_workspace_mounted_directory_state_write(
+    row: &TransactionWriteRow,
+    active_branch_id: &str,
+) -> std::result::Result<bool, LixError> {
+    if row.global || row.branch_id != active_branch_id {
+        return Ok(false);
+    }
+    let Some(entity_pk) = row.entity_pk.as_ref() else {
+        return Ok(false);
+    };
+    Ok(is_mounted_directory_id(entity_pk.as_single_string()?))
+}
+
+fn remove_workspace_mounted_directory_state_writes(
+    rows: Vec<TransactionWriteRow>,
+    active_branch_id: &str,
+) -> std::result::Result<Vec<TransactionWriteRow>, LixError> {
+    let mut retained = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !row_is_workspace_mounted_directory_state_write(&row, active_branch_id)? {
+            retained.push(row);
+        }
+    }
+    Ok(retained)
 }
 
 fn reject_mounted_directory_mutation(batch: &RecordBatch) -> std::result::Result<(), LixError> {
@@ -1811,6 +1906,13 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
             Ok(TransactionWriteOutcome { count: 0 })
+        }
+
+        async fn stage_mounted_filesystem_op(
+            &mut self,
+            _write: crate::storage::MountedFilesystemOp,
+        ) -> Result<(), LixError> {
+            Ok(())
         }
     }
 

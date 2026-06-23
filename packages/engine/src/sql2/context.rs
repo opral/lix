@@ -6,7 +6,6 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
@@ -19,6 +18,7 @@ use crate::live_state::{
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage::StorageRead;
+use crate::storage::{MountedFilesystem, MountedFilesystemOp};
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::wasm::UnsupportedWasmRuntime;
 
@@ -76,6 +76,9 @@ pub(crate) trait SqlExecutionContext {
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext {
     fn active_branch_id(&self) -> &str;
+    fn is_workspace_session(&self) -> bool {
+        false
+    }
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
     fn plugin_host(&self) -> PluginRuntimeHost {
@@ -98,6 +101,12 @@ pub(crate) trait SqlWriteExecutionContext {
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError>;
+
+    #[allow(dead_code)]
+    async fn stage_mounted_filesystem_op(
+        &mut self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError>;
 }
 
 #[derive(Clone)]
@@ -143,6 +152,10 @@ impl SqlWriteContext {
 
     pub(crate) fn active_branch_id(&self) -> String {
         unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
+    }
+
+    pub(crate) fn is_workspace_session(&self) -> bool {
+        unsafe { self.ptr.0.as_ref().is_workspace_session() }
     }
 
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
@@ -213,6 +226,23 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .stage_write(write)
+                .await
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn stage_mounted_filesystem_op(
+        &self,
+        write: MountedFilesystemOp,
+    ) -> Result<(), LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .stage_mounted_filesystem_op(write)
                 .await
         }
     }

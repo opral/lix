@@ -1289,6 +1289,13 @@ mod tests {
         ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
             panic!("raw DataFusion entity INSERT must never stage writes");
         }
+
+        async fn stage_mounted_filesystem_op(
+            &mut self,
+            _write: crate::storage::MountedFilesystemOp,
+        ) -> Result<(), LixError> {
+            panic!("raw DataFusion entity INSERT must never stage writes");
+        }
     }
 
     // Guards the plan-time phase of the entity INSERT rejection: validate-only

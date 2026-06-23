@@ -1707,6 +1707,13 @@ mod tests {
                 .push(CapturedStageWrite { rows });
             Ok(TransactionWriteOutcome { count })
         }
+
+        async fn stage_mounted_filesystem_op(
+            &mut self,
+            _write: crate::storage::MountedFilesystemOp,
+        ) -> Result<(), LixError> {
+            Ok(())
+        }
     }
 
     async fn execute_write_sql(
@@ -4531,6 +4538,7 @@ mod tests {
             rows: vec![
                 live_directory_row("dir-docs", "branch-a", None, "docs"),
                 live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
+                live_blob_ref_row("file-readme", "branch-a", b"old"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -4580,6 +4588,7 @@ mod tests {
             rows: vec![
                 live_directory_row("dir-docs", "branch-a", None, "docs"),
                 live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
+                live_blob_ref_row("file-readme", "branch-a", b"old"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));

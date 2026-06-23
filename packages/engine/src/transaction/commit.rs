@@ -739,6 +739,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                mounted_filesystem_ops: Vec::new(),
             },
         )
         .await
@@ -912,6 +913,7 @@ mod tests {
                 commit_change_refs_by_branch: BTreeMap::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                mounted_filesystem_ops: Vec::new(),
             },
         )
         .await
@@ -984,6 +986,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                mounted_filesystem_ops: Vec::new(),
             },
         )
         .await
@@ -1125,6 +1128,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                mounted_filesystem_ops: Vec::new(),
             },
         )
         .await
@@ -1251,6 +1255,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                mounted_filesystem_ops: Vec::new(),
             },
         )
         .await

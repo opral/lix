@@ -61,12 +61,26 @@ pub trait MountedFilesystem: Send + Sync {
     /// Reads bytes for a normalized file path previously exposed by `list`.
     /// Returning `Ok(None)` means the mounted file is no longer available.
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError>;
+
+    /// Applies mounted filesystem mutations in order.
+    ///
+    /// MVP semantics are best-effort ordered application. This batch API does
+    /// not imply atomic filesystem mutation.
+    async fn apply(&self, ops: Vec<MountedFilesystemOp>) -> Result<(), BackendError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountedFilesystemOp {
+    WriteFile { path: String, data: Vec<u8> },
+    DeleteFile { path: String },
+    DeleteDirectory { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MountedFilesystemListing {
     pub directories: BTreeSet<String>,
     pub files: BTreeSet<String>,
+    pub unmanaged_paths: BTreeSet<String>,
 }
 
 pub trait BackendRead {

@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::backend::MountedFilesystem;
 use crate::binary_cas::BlobHash;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::{GLOBAL_BRANCH_ID, LixError, MountedFilesystemListing};
+use crate::storage::{MountedFilesystem, MountedFilesystemListing};
+use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use super::FilesystemIndex;
 use super::keys::{DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY};
@@ -73,6 +73,10 @@ pub(crate) async fn mounted_workspace_rows_by_branch(
 
 pub(crate) fn is_mounted_directory_id(id: &str) -> bool {
     id.starts_with(MOUNTED_DIRECTORY_ID_PREFIX)
+}
+
+pub(crate) fn is_mounted_file_id(id: &str) -> bool {
+    id.starts_with(MOUNTED_FILE_ID_PREFIX)
 }
 
 fn rows_from_listing(
@@ -335,6 +339,7 @@ mod tests {
             MountedFilesystemListing {
                 directories: BTreeSet::new(),
                 files: BTreeSet::from(["/src/local.txt".to_string()]),
+                unmanaged_paths: BTreeSet::new(),
             },
             &owned,
             &owned_rows,
@@ -367,6 +372,7 @@ mod tests {
             MountedFilesystemListing {
                 directories: BTreeSet::new(),
                 files: BTreeSet::from(["/src/local.txt".to_string()]),
+                unmanaged_paths: BTreeSet::new(),
             },
             &owned,
             &owned_rows,
@@ -398,6 +404,7 @@ mod tests {
             MountedFilesystemListing {
                 directories: BTreeSet::from(["/foo/".to_string()]),
                 files: BTreeSet::from(["/foo/local.txt".to_string()]),
+                unmanaged_paths: BTreeSet::new(),
             },
             &owned,
             &owned_rows,
@@ -419,6 +426,7 @@ mod tests {
             MountedFilesystemListing {
                 directories: BTreeSet::new(),
                 files: BTreeSet::from(["/note.md".to_string()]),
+                unmanaged_paths: BTreeSet::new(),
             },
             &owned,
             &owned_rows,

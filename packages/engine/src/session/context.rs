@@ -7,7 +7,6 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::backend::MountedFilesystem;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
@@ -25,6 +24,7 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
+use crate::storage::MountedFilesystem;
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
 use crate::tracked_state::TrackedStateContext;

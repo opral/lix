@@ -81,5 +81,12 @@ mod tests {
         ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
             panic!("fast no-match execution should not inspect context")
         }
+
+        async fn stage_mounted_filesystem_op(
+            &mut self,
+            _write: crate::storage::MountedFilesystemOp,
+        ) -> Result<(), LixError> {
+            panic!("fast no-match execution should not inspect context")
+        }
     }
 }
