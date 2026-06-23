@@ -250,13 +250,13 @@ test.each([
 	],
 	["fs", () => openLix({ backend: new FsBackend({ path: tempFsDir() }) })],
 	[
-		"fs-memory",
+		"fs-external-lix",
 		() => {
 			const dir = tempFsDir();
 			mkdirSync(dir, { recursive: true });
 			writeFileSync(join(dir, "matrix.md"), "matrix");
 			return openLix({
-				backend: new FsBackend({ path: dir, storage: "memory" }),
+				backend: new FsBackend({ path: dir, lixDir: tempExternalLixDir() }),
 			});
 		},
 	],
@@ -290,7 +290,7 @@ test("native fs open returns a promise", async () => {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "local");
 
-	const native = addon.Lix.openFs(dir, "memory", undefined);
+	const native = addon.Lix.openFs(dir, undefined, undefined);
 	expect(native).toBeInstanceOf(Promise);
 	const lix = await native;
 	await lix.close();
@@ -334,10 +334,10 @@ test("native actor preserves queued execution order", async () => {
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
 		["queued-1", "Queued 1", false, "{}"],
 	);
-	const second = lix.execute(
-		"UPDATE crm_task SET title = $1 WHERE id = $2",
-		["Queued 2", "queued-1"],
-	);
+	const second = lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
+		"Queued 2",
+		"queued-1",
+	]);
 	const third = lix.execute("SELECT title FROM crm_task WHERE id = $1", [
 		"queued-1",
 	]);
@@ -374,9 +374,9 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 
 	const lix = await openLix({ backend: new FsBackend({ path: dir }) });
 	expect(statSync(join(dir, ".lix")).isDirectory()).toBe(true);
-	expect(statSync(join(dir, ".lix", ".internal", "rocksdb")).isDirectory()).toBe(
-		true,
-	);
+	expect(
+		statSync(join(dir, ".lix", ".internal", "rocksdb")).isDirectory(),
+	).toBe(true);
 
 	const imported = await lix.execute(
 		"SELECT path, data FROM lix_file WHERE name = $1",
@@ -405,7 +405,7 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	await reopened.close();
 });
 
-test("fs backend with memory storage imports the directory and writes normal files back", async () => {
+test("fs backend with external lixDir imports the directory and writes normal files back", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
 	const siblingPath = join(dir, "sibling.md");
@@ -414,7 +414,7 @@ test("fs backend with memory storage imports the directory and writes normal fil
 	writeFileSync(siblingPath, "sibling");
 
 	const lix = await openLix({
-		backend: new FsBackend({ path: dir, storage: "memory" }),
+		backend: new FsBackend({ path: dir, lixDir: tempExternalLixDir() }),
 	});
 
 	const files = await lix.execute(
@@ -465,7 +465,7 @@ test("fs backend filter only syncs included paths", async () => {
 	const lix = await openLix({
 		backend: new FsBackend({
 			path: dir,
-			storage: "memory",
+			lixDir: tempExternalLixDir(),
 			filter: { includePaths: ["docs/note.md"] },
 		}),
 	});
@@ -507,6 +507,13 @@ test("fs backend filter requires explicit include paths", () => {
 
 	expect(
 		() =>
+			new FsBackend({
+				path: dir,
+				storage: "memory",
+			} as never),
+	).toThrow("FsBackend storage is no longer supported");
+	expect(
+		() =>
 			new FsBackend({ path: dir, filter: {} as { includePaths: string[] } }),
 	).toThrow("FsBackend filter.includePaths must be an array");
 	expect(
@@ -539,7 +546,7 @@ test("fs backend filter treats paths as exact filenames", async () => {
 	const lix = await openLix({
 		backend: new FsBackend({
 			path: dir,
-			storage: "memory",
+			lixDir: tempExternalLixDir(),
 			filter: { includePaths: [" spaced.md"] },
 		}),
 	});
@@ -559,7 +566,7 @@ test("fs backend filter does not create directories for missing includes", async
 	const lix = await openLix({
 		backend: new FsBackend({
 			path: dir,
-			storage: "memory",
+			lixDir: tempExternalLixDir(),
 			filter: { includePaths: ["missing/note.md"] },
 		}),
 	});
@@ -583,7 +590,7 @@ test("fs backend filter propagates deletion of included files", async () => {
 	const lix = await openLix({
 		backend: new FsBackend({
 			path: dir,
-			storage: "memory",
+			lixDir: tempExternalLixDir(),
 			filter: { includePaths: ["note.md"] },
 		}),
 	});
@@ -605,7 +612,7 @@ test("fs backend filter does not delete excluded files through parent directorie
 	const lix = await openLix({
 		backend: new FsBackend({
 			path: dir,
-			storage: "memory",
+			lixDir: tempExternalLixDir(),
 			filter: { includePaths: ["docs/note.md"] },
 		}),
 	});
@@ -637,7 +644,7 @@ test("fs backend filter matches directory paths by segment boundaries", async ()
 	const lix = await openLix({
 		backend: new FsBackend({
 			path: dir,
-			storage: "memory",
+			lixDir: tempExternalLixDir(),
 			filter: { includePaths: ["foo-bar/note.md"] },
 		}),
 	});
@@ -654,48 +661,85 @@ test("fs backend filter matches directory paths by segment boundaries", async ()
 	await lix.close();
 });
 
-test("fs backend with memory storage keeps lix storage paths in memory only", async () => {
+test("fs backend with external lixDir materializes lix storage outside the workspace", async () => {
 	const dir = tempFsDir();
+	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "note");
 
 	const lix = await openLix({
-		backend: new FsBackend({ path: dir, storage: "memory" }),
+		backend: new FsBackend({ path: dir, lixDir }),
 	});
 
 	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-		"/.lix/ephemeral.txt",
-		new TextEncoder().encode("ephemeral"),
+		"/.lix/app_data/ephemeral.txt",
+		new TextEncoder().encode("external"),
 	]);
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
+	expect(readFileSync(join(lixDir, "app_data", "ephemeral.txt"), "utf8")).toBe(
+		"external",
+	);
 
 	await lix.close();
 });
 
-test("fs backend with memory storage reimports disk state on reopen without persisting lix storage", async () => {
+test("fs backend with external lixDir persists lix storage when reused", async () => {
 	const dir = tempFsDir();
+	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "first");
 
 	const lix = await openLix({
-		backend: new FsBackend({ path: dir, storage: "memory" }),
+		backend: new FsBackend({ path: dir, lixDir }),
 	});
 	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
 		new TextEncoder().encode("second"),
 		"/note.md",
 	]);
 	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-		"/.lix/ephemeral.txt",
+		"/.lix/app_data/ephemeral.txt",
 		new TextEncoder().encode("ephemeral"),
 	]);
 	await lix.close();
 
 	const reopened = await openLix({
-		backend: new FsBackend({ path: dir, storage: "memory" }),
+		backend: new FsBackend({ path: dir, lixDir }),
 	});
 	const bytes = await readFile(reopened, "/note.md");
 	expect(bytes ? new TextDecoder().decode(bytes) : undefined).toBe("second");
-	const ephemeral = await readFile(reopened, "/.lix/ephemeral.txt");
+	const ephemeral = await readFile(reopened, "/.lix/app_data/ephemeral.txt");
+	expect(ephemeral ? new TextDecoder().decode(ephemeral) : undefined).toBe(
+		"ephemeral",
+	);
+	expect(existsSync(join(dir, ".lix"))).toBe(false);
+
+	await reopened.close();
+});
+
+test("fs backend with a fresh external lixDir reimports disk state without old lix storage", async () => {
+	const dir = tempFsDir();
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "note.md"), "first");
+
+	const lix = await openLix({
+		backend: new FsBackend({ path: dir, lixDir: tempExternalLixDir() }),
+	});
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+		new TextEncoder().encode("second"),
+		"/note.md",
+	]);
+	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+		"/.lix/app_data/ephemeral.txt",
+		new TextEncoder().encode("ephemeral"),
+	]);
+	await lix.close();
+
+	const reopened = await openLix({
+		backend: new FsBackend({ path: dir, lixDir: tempExternalLixDir() }),
+	});
+	const bytes = await readFile(reopened, "/note.md");
+	expect(bytes ? new TextDecoder().decode(bytes) : undefined).toBe("second");
+	const ephemeral = await readFile(reopened, "/.lix/app_data/ephemeral.txt");
 	expect(ephemeral).toBeUndefined();
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
 
@@ -1671,4 +1715,10 @@ function tempFsDir(): string {
 		dir,
 		`lix-fs-test-${Date.now()}-${Math.random().toString(16).slice(2)}`,
 	);
+}
+
+function tempExternalLixDir(): string {
+	const parent = tempFsDir();
+	mkdirSync(parent, { recursive: true });
+	return join(parent, ".lix");
 }

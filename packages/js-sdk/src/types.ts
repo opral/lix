@@ -4,7 +4,7 @@ export type SqliteBackendOptions = {
 
 export type FsBackendOptions = {
 	path: string;
-	storage?: "persistent" | "memory";
+	lixDir?: string;
 	filter?: {
 		includePaths: readonly string[];
 	};

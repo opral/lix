@@ -37,14 +37,14 @@ const lix = await openLix({
 });
 ```
 
-Pass `storage: "memory"` for filesystem sync with an in-memory Lix repository.
-This does not write `<workspace>/.lix`:
+Pass `lixDir` for filesystem sync with repository metadata in an external
+`.lix` directory. This does not write `<workspace>/.lix`:
 
 ```ts
 const lix = await openLix({
 	backend: new FsBackend({
 		path: "./workspace",
-		storage: "memory",
+		lixDir: "/tmp/session/.lix",
 	}),
 });
 ```
