@@ -1,7 +1,7 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, FsBackend, FsBackendFilter, InMemoryBackend, Lix as RsLix,
-    LixError, LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
+    ExecuteResult as RsExecuteResult, FsBackend, InMemoryBackend, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
@@ -598,7 +598,6 @@ enum NativeFsBackendStorage {
 pub struct OpenFsTask {
     path: String,
     storage: NativeFsBackendStorage,
-    filter: FsBackendFilter,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -623,35 +622,12 @@ fn parse_fs_backend_storage(env: &Env, storage: Option<String>) -> Result<Native
     }
 }
 
-fn parse_fs_backend_filter(
-    env: &Env,
-    include_paths: Option<Vec<String>>,
-) -> Result<FsBackendFilter> {
-    let Some(include_paths) = include_paths else {
-        return Ok(FsBackendFilter::default());
-    };
-    if include_paths.is_empty() {
-        return Err(throw_lix_error(
-            env,
-            LixError::new(
-                "LIX_INVALID_ARGUMENT",
-                "filesystem backend filter.includePaths must contain at least one path",
-            ),
-        ));
-    }
-    Ok(FsBackendFilter::include_paths(include_paths))
-}
-
 impl Task for OpenFsTask {
     type Output = std::result::Result<NativeLix, LixError>;
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        Ok(open_fs_native(
-            std::mem::take(&mut self.path),
-            self.storage,
-            std::mem::take(&mut self.filter),
-        ))
+        Ok(open_fs_native(std::mem::take(&mut self.path), self.storage))
     }
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -707,7 +683,6 @@ fn open_sqlite_native(path: String) -> std::result::Result<NativeLix, LixError> 
 fn open_fs_native(
     path: String,
     storage: NativeFsBackendStorage,
-    filter: FsBackendFilter,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -715,10 +690,8 @@ fn open_fs_native(
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
     let backend = rt.block_on(async {
         match storage {
-            NativeFsBackendStorage::Persistent => FsBackend::open_with_filter(path, filter).await,
-            NativeFsBackendStorage::Memory => {
-                FsBackend::open_memory_with_filter(path, filter).await
-            }
+            NativeFsBackendStorage::Persistent => FsBackend::open(path).await,
+            NativeFsBackendStorage::Memory => FsBackend::open_memory(path).await,
         }
     })?;
     let lix = rt.block_on(open_lix_with_backend(backend))?;
@@ -742,15 +715,9 @@ impl NativeLix {
         env: Env,
         path: String,
         storage: Option<String>,
-        include_paths: Option<Vec<String>>,
     ) -> Result<AsyncTask<OpenFsTask>> {
         let storage = parse_fs_backend_storage(&env, storage)?;
-        let filter = parse_fs_backend_filter(&env, include_paths)?;
-        Ok(AsyncTask::new(OpenFsTask {
-            path,
-            storage,
-            filter,
-        }))
+        Ok(AsyncTask::new(OpenFsTask { path, storage }))
     }
 
     #[napi]

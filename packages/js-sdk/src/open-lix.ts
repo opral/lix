@@ -67,7 +67,6 @@ export class SqliteBackend {
 export class FsBackend {
 	readonly path: string;
 	readonly storage: "persistent" | "memory";
-	readonly filter: { includePaths: readonly string[] } | undefined;
 
 	constructor(options: FsBackendOptions) {
 		if (
@@ -84,36 +83,8 @@ export class FsBackend {
 		) {
 			throw new TypeError('FsBackend storage must be "persistent" or "memory"');
 		}
-		if (options.filter !== undefined) {
-			if (!options.filter || typeof options.filter !== "object") {
-				throw new TypeError("FsBackend filter must be an object");
-			}
-			if (!Array.isArray(options.filter.includePaths)) {
-				throw new TypeError("FsBackend filter.includePaths must be an array");
-			}
-			if (options.filter.includePaths.length === 0) {
-				throw new TypeError(
-					"FsBackend filter.includePaths must contain at least one path",
-				);
-			}
-			for (const includePath of options.filter.includePaths) {
-				if (typeof includePath !== "string" || includePath.length === 0) {
-					throw new TypeError(
-						"FsBackend filter.includePaths must contain non-empty strings",
-					);
-				}
-				if (includePath.endsWith("/")) {
-					throw new TypeError(
-						"FsBackend filter.includePaths must contain file paths, not directory paths",
-					);
-				}
-			}
-		}
 		this.path = options.path;
 		this.storage = options.storage ?? "persistent";
-		this.filter = options.filter
-			? { includePaths: [...options.filter.includePaths] }
-			: undefined;
 	}
 }
 
@@ -129,11 +100,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	}
 	if (options.backend instanceof FsBackend) {
 		return new Lix(
-			await addon.Lix.openFs(
-				options.backend.path,
-				options.backend.storage,
-				options.backend.filter?.includePaths,
-			),
+			await addon.Lix.openFs(options.backend.path, options.backend.storage),
 		);
 	}
 	throw new TypeError(

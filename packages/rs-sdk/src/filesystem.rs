@@ -1,19 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use lix_engine::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, Engine, GetOptions,
     InMemoryBackend, Key, KeyRange, LixError, MountedFilesystem, MountedFilesystemListing,
     MountedFilesystemOp, PointVisitor, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    SpaceId, WriteOptions,
+    SessionContext, SpaceId, Value, WriteOptions,
 };
 
 #[cfg(feature = "fs_backend")]
 use lix_fs_backend::RocksDbFilesystemBackend;
+#[cfg(not(target_family = "wasm"))]
+use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
+#[cfg(not(target_family = "wasm"))]
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 
+#[cfg(not(target_family = "wasm"))]
+type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
 // Avoid paying thread startup cost for tiny directory roots.
@@ -37,21 +45,7 @@ enum FilesystemMetadataMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub struct FsBackendFilter {
-    pub include_paths: Vec<String>,
-}
-
-impl FsBackendFilter {
-    pub fn include_paths(include_paths: Vec<String>) -> Self {
-        Self { include_paths }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct FilesystemPathFilter {
-    include_files: BTreeSet<String>,
-}
+struct FilesystemPathPolicy;
 
 pub(crate) struct FilesystemWrite<'a, B>
 where
@@ -109,14 +103,34 @@ where
 struct FilesystemSupervisorInner {
     root: PathBuf,
     metadata_mode: FilesystemMetadataMode,
-    path_filter: FilesystemPathFilter,
+    path_policy: FilesystemPathPolicy,
+    recent_lix_writes: Arc<Mutex<BTreeSet<String>>>,
+    event_tx: mpsc::Sender<FilesystemEvent>,
+    #[cfg(not(target_family = "wasm"))]
+    debouncer: Mutex<Option<FilesystemDebouncer>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct FilesystemState<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    session: SessionContext<B>,
+    root: PathBuf,
+    metadata_mode: FilesystemMetadataMode,
+    path_policy: FilesystemPathPolicy,
+    recent_lix_writes: Arc<Mutex<BTreeSet<String>>>,
+    sync_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
 struct FsMountedFilesystem {
     root: PathBuf,
     metadata_mode: FilesystemMetadataMode,
-    path_filter: FilesystemPathFilter,
+    path_policy: FilesystemPathPolicy,
+    recent_lix_writes: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -127,10 +141,16 @@ struct Snapshot {
     unmanaged_paths: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilesystemEvent {
+    DiskChanged(Vec<PathBuf>),
+    Shutdown,
+}
+
 #[async_trait::async_trait]
 impl MountedFilesystem for FsMountedFilesystem {
     async fn list(&self) -> Result<MountedFilesystemListing, BackendError> {
-        let snapshot = collect_local_snapshot(&self.root, self.metadata_mode, &self.path_filter)
+        let snapshot = collect_local_snapshot(&self.root, self.metadata_mode, &self.path_policy)
             .map_err(|error| BackendError::Io(error.format()))?;
         Ok(MountedFilesystemListing {
             directories: snapshot.directories,
@@ -141,7 +161,7 @@ impl MountedFilesystem for FsMountedFilesystem {
 
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, BackendError> {
         if path.ends_with('/')
-            || !self.path_filter.includes_file(path)
+            || !self.path_policy.includes_file(path)
             || is_filesystem_sync_ignored_lix_path(path, self.metadata_mode)
         {
             return Ok(None);
@@ -163,18 +183,25 @@ impl MountedFilesystem for FsMountedFilesystem {
     }
 
     async fn apply(&self, ops: Vec<MountedFilesystemOp>) -> Result<(), BackendError> {
+        let mut applied_paths = Vec::new();
         for op in ops {
             match op {
                 MountedFilesystemOp::WriteFile { path, data } => {
                     self.write_file(&path, &data).await?;
+                    applied_paths.push(path);
                 }
                 MountedFilesystemOp::DeleteFile { path } => {
                     self.delete_file(&path).await?;
+                    applied_paths.push(path);
                 }
                 MountedFilesystemOp::DeleteDirectory { path } => {
                     self.delete_directory(&path).await?;
+                    applied_paths.push(path);
                 }
             }
+        }
+        if let Ok(mut recent_lix_writes) = self.recent_lix_writes.lock() {
+            recent_lix_writes.extend(applied_paths);
         }
         Ok(())
     }
@@ -183,11 +210,11 @@ impl MountedFilesystem for FsMountedFilesystem {
 impl FsMountedFilesystem {
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), BackendError> {
         if path.ends_with('/')
-            || !self.path_filter.includes_file(path)
+            || !self.path_policy.includes_file(path)
             || is_filesystem_sync_ignored_lix_path(path, self.metadata_mode)
         {
             return Err(BackendError::Io(format!(
-                "mounted filesystem write rejected for protected or filtered path {path:?}"
+                "mounted filesystem write rejected for protected or unsupported path {path:?}"
             )));
         }
         let local_path = lix_path_to_local_path(&self.root, path)
@@ -223,11 +250,11 @@ impl FsMountedFilesystem {
 
     async fn delete_file(&self, path: &str) -> Result<(), BackendError> {
         if path.ends_with('/')
-            || !self.path_filter.includes_file(path)
+            || !self.path_policy.includes_file(path)
             || is_filesystem_sync_ignored_lix_path(path, self.metadata_mode)
         {
             return Err(BackendError::Io(format!(
-                "mounted filesystem delete rejected for protected or filtered path {path:?}"
+                "mounted filesystem delete rejected for protected or unsupported path {path:?}"
             )));
         }
         let local_path = lix_path_to_local_path(&self.root, path)
@@ -255,11 +282,11 @@ impl FsMountedFilesystem {
     async fn delete_directory(&self, path: &str) -> Result<(), BackendError> {
         if !path.ends_with('/')
             || path == "/"
-            || !self.path_filter.allows_directory_mutation(path)
+            || !self.path_policy.allows_directory_mutation(path)
             || is_filesystem_sync_ignored_lix_path(path, self.metadata_mode)
         {
             return Err(BackendError::Io(format!(
-                "mounted filesystem directory delete rejected for protected or filtered path {path:?}"
+                "mounted filesystem directory delete rejected for protected or unsupported path {path:?}"
             )));
         }
         let local_path = lix_path_to_local_path(&self.root, path)
@@ -292,29 +319,13 @@ impl FsMountedFilesystem {
     }
 }
 
-impl FilesystemPathFilter {
-    fn from_filter(filter: FsBackendFilter) -> Result<Self, LixError> {
-        let mut include_files = BTreeSet::new();
-        for path in filter.include_paths {
-            include_files.insert(normalize_filter_file_path(&path)?);
-        }
-        Ok(Self { include_files })
-    }
-
-    fn is_unfiltered(&self) -> bool {
-        self.include_files.is_empty()
-    }
-
+impl FilesystemPathPolicy {
     fn includes_file(&self, path: &str) -> bool {
-        self.is_unfiltered() || self.include_files.contains(path)
+        !path.ends_with('/')
     }
 
     fn allows_directory_mutation(&self, path: &str) -> bool {
-        self.is_unfiltered()
-            || self
-                .include_files
-                .iter()
-                .any(|included_path| included_path.starts_with(path))
+        path.ends_with('/')
     }
 }
 
@@ -324,20 +335,11 @@ impl FsBackend {
     where
         P: AsRef<Path>,
     {
-        Self::open_with_filter(dir, FsBackendFilter::default()).await
-    }
-
-    pub async fn open_with_filter<P>(dir: P, filter: FsBackendFilter) -> Result<Self, LixError>
-    where
-        P: AsRef<Path>,
-    {
-        FilesystemPathFilter::from_filter(filter.clone())?;
         let backend = open_filesystem_rocksdb_backend(dir.as_ref())?;
         let inner = FilesystemSync::open_filesystem(
             backend,
             dir.as_ref(),
             FilesystemMetadataMode::Persistent,
-            filter,
         )
         .await?;
         Ok(Self {
@@ -349,23 +351,11 @@ impl FsBackend {
     where
         P: AsRef<Path>,
     {
-        Self::open_memory_with_filter(dir, FsBackendFilter::default()).await
-    }
-
-    pub async fn open_memory_with_filter<P>(
-        dir: P,
-        filter: FsBackendFilter,
-    ) -> Result<Self, LixError>
-    where
-        P: AsRef<Path>,
-    {
-        FilesystemPathFilter::from_filter(filter.clone())?;
         let backend = InMemoryBackend::new();
         let inner = FilesystemSync::open_filesystem(
             backend,
             dir.as_ref(),
             FilesystemMetadataMode::Ephemeral,
-            filter,
         )
         .await?;
         Ok(Self {
@@ -496,26 +486,24 @@ where
         backend: B,
         root: P,
         metadata_mode: FilesystemMetadataMode,
-        filter: FsBackendFilter,
     ) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
     {
         let engine =
             crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None).await?;
-        Self::open_with_engine(backend, engine, root.as_ref(), metadata_mode, filter).await
+        Self::open_with_engine(backend, engine, root.as_ref(), metadata_mode).await
     }
 
     async fn open_with_engine(
         backend: B,
-        _engine: Engine<B>,
+        engine: Engine<B>,
         root: &Path,
         metadata_mode: FilesystemMetadataMode,
-        filter: FsBackendFilter,
     ) -> Result<Self, LixError> {
         Ok(Self {
             inner: backend,
-            supervisor: FilesystemSupervisor::open(root, metadata_mode, filter).await?,
+            supervisor: FilesystemSupervisor::open(engine, root, metadata_mode).await?,
         })
     }
 }
@@ -544,7 +532,8 @@ where
         Some(Arc::new(FsMountedFilesystem {
             root: self.supervisor.root().to_path_buf(),
             metadata_mode: self.supervisor.metadata_mode(),
-            path_filter: self.supervisor.path_filter().clone(),
+            path_policy: self.supervisor.path_policy().clone(),
+            recent_lix_writes: Arc::clone(&self.supervisor.inner.recent_lix_writes),
         }))
     }
 
@@ -589,23 +578,51 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     async fn open(
+        engine: Engine<B>,
         root: &Path,
         metadata_mode: FilesystemMetadataMode,
-        filter: FsBackendFilter,
     ) -> Result<Self, LixError> {
         ensure_filesystem_root_directory(root)?;
         let root = std::fs::canonicalize(root)
             .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
-        let path_filter = FilesystemPathFilter::from_filter(filter)?;
+        let path_policy = FilesystemPathPolicy;
         if metadata_mode == FilesystemMetadataMode::Persistent {
             migrate_legacy_filesystem_system_directory(&root)?;
             ensure_filesystem_lix_directory(&root)?;
         }
+        let (event_tx, event_rx) = mpsc::channel();
+        let debouncer = start_filesystem_debouncer(&root, &path_policy, event_tx.clone())?;
+        let session = engine.open_workspace_session().await?;
+        let recent_lix_writes = Arc::new(Mutex::new(BTreeSet::new()));
+        let state = Arc::new(FilesystemState {
+            session,
+            root: root.clone(),
+            metadata_mode,
+            path_policy: path_policy.clone(),
+            recent_lix_writes: Arc::clone(&recent_lix_writes),
+            sync_lock: tokio::sync::Mutex::new(()),
+        });
+        sync_tracked_files_from_disk(state.as_ref()).await?;
+        let worker_state = Arc::clone(&state);
+        let worker = thread::Builder::new()
+            .name("lix-sdk-filesystem-sync".to_string())
+            .spawn(move || filesystem_worker(worker_state, event_rx))
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_FILESYSTEM_THREAD_ERROR",
+                    format!("failed to start filesystem sync worker: {error}"),
+                )
+            })?;
         Ok(Self {
             inner: Arc::new(FilesystemSupervisorInner {
                 root,
                 metadata_mode,
-                path_filter,
+                path_policy,
+                recent_lix_writes,
+                event_tx,
+                #[cfg(not(target_family = "wasm"))]
+                debouncer: Mutex::new(debouncer),
+                worker: Mutex::new(Some(worker)),
             }),
             _marker: PhantomData,
         })
@@ -619,27 +636,279 @@ where
         self.inner.metadata_mode
     }
 
-    fn path_filter(&self) -> &FilesystemPathFilter {
-        &self.inner.path_filter
+    fn path_policy(&self) -> &FilesystemPathPolicy {
+        &self.inner.path_policy
     }
+}
+
+impl Drop for FilesystemSupervisorInner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl FilesystemSupervisorInner {
+    fn shutdown(&self) {
+        #[cfg(not(target_family = "wasm"))]
+        if let Ok(mut debouncer) = self.debouncer.lock() {
+            let _ = debouncer.take().map(FilesystemDebouncer::stop);
+        }
+        let _ = self.event_tx.send(FilesystemEvent::Shutdown);
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn start_filesystem_debouncer(
+    root: &Path,
+    path_policy: &FilesystemPathPolicy,
+    event_tx: mpsc::Sender<FilesystemEvent>,
+) -> Result<Option<FilesystemDebouncer>, LixError> {
+    let watcher_config = Config::default().with_follow_symlinks(false);
+    let callback_tx = event_tx.clone();
+    let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+        Duration::from_millis(500),
+        None,
+        move |result: DebounceEventResult| {
+            let Ok(events) = result else {
+                return;
+            };
+            let paths = events
+                .into_iter()
+                .flat_map(|event| event.event.paths)
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                let _ = callback_tx.send(FilesystemEvent::DiskChanged(paths));
+            }
+        },
+        RecommendedCache::new(),
+        watcher_config,
+    )
+    .ok()
+    .and_then(|mut debouncer| {
+        if watch_filesystem_paths(&mut debouncer, root, path_policy).is_ok() {
+            Some(debouncer)
+        } else {
+            debouncer.stop();
+            None
+        }
+    });
+    Ok(debouncer)
+}
+
+#[cfg(target_family = "wasm")]
+fn start_filesystem_debouncer(
+    _root: &Path,
+    _path_policy: &FilesystemPathPolicy,
+    _event_tx: mpsc::Sender<FilesystemEvent>,
+) -> Result<Option<()>, LixError> {
+    Ok(None)
+}
+
+fn filesystem_worker<B>(state: Arc<FilesystemState<B>>, event_rx: mpsc::Receiver<FilesystemEvent>)
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
+        return;
+    };
+    loop {
+        match event_rx.recv() {
+            Ok(FilesystemEvent::DiskChanged(paths)) => {
+                let changed_paths = drain_filesystem_events(&event_rx, paths);
+                let _ = runtime.block_on(sync_changed_file_paths(&state, changed_paths));
+            }
+            Ok(FilesystemEvent::Shutdown) | Err(mpsc::RecvError) => {
+                let _ = runtime.block_on(state.session.close());
+                return;
+            }
+        }
+    }
+}
+
+fn drain_filesystem_events(
+    event_rx: &mpsc::Receiver<FilesystemEvent>,
+    initial_paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut paths = initial_paths.into_iter().collect::<BTreeSet<_>>();
+    loop {
+        match event_rx.try_recv() {
+            Ok(FilesystemEvent::DiskChanged(changed_paths)) => {
+                paths.extend(changed_paths);
+            }
+            Ok(FilesystemEvent::Shutdown)
+            | Err(mpsc::TryRecvError::Disconnected)
+            | Err(mpsc::TryRecvError::Empty) => return paths.into_iter().collect(),
+        }
+    }
+}
+
+async fn sync_changed_file_paths<B>(
+    state: &FilesystemState<B>,
+    paths: Vec<PathBuf>,
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let _guard = state.sync_lock.lock().await;
+    let changed_file_paths =
+        normalize_changed_file_paths(&state.root, state.metadata_mode, &state.path_policy, paths);
+    let changed_file_paths = consume_recent_lix_write_echoes(state, changed_file_paths);
+    for path in changed_file_paths {
+        sync_changed_file_path(state, &path).await?;
+    }
+    Ok(())
+}
+
+fn consume_recent_lix_write_echoes<B>(state: &FilesystemState<B>, paths: Vec<String>) -> Vec<String>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let Ok(mut recent_lix_writes) = state.recent_lix_writes.lock() else {
+        return paths;
+    };
+    paths
+        .into_iter()
+        .filter(|path| {
+            if recent_lix_writes.remove(path) {
+                return false;
+            }
+            let directory_echo = recent_lix_writes
+                .iter()
+                .find(|candidate| {
+                    candidate.ends_with('/')
+                        && path
+                            .strip_prefix(candidate.as_str())
+                            .is_some_and(|suffix| !suffix.is_empty())
+                })
+                .cloned();
+            if let Some(directory_echo) = directory_echo {
+                recent_lix_writes.remove(&directory_echo);
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+async fn sync_tracked_files_from_disk<B>(state: &FilesystemState<B>) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let rows = state
+        .session
+        .execute("SELECT path FROM lix_file ORDER BY path", &[])
+        .await?;
+    let paths = rows
+        .rows()
+        .iter()
+        .filter_map(|row| {
+            let path = row.get::<String>("path").ok()?;
+            if path.ends_with('/')
+                || !state.path_policy.includes_file(&path)
+                || is_filesystem_sync_ignored_lix_path(&path, state.metadata_mode)
+            {
+                return None;
+            }
+            lix_path_to_local_path(&state.root, &path).ok()
+        })
+        .collect::<Vec<_>>();
+    sync_changed_file_paths(state, paths).await
+}
+
+async fn sync_changed_file_path<B>(state: &FilesystemState<B>, path: &str) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let local_path = lix_path_to_local_path(&state.root, path)?;
+    match std::fs::read(&local_path) {
+        Ok(data) => {
+            state
+                .session
+                .execute(
+                    "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+                     ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                    &[Value::Text(path.to_string()), Value::Blob(data)],
+                )
+                .await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            state
+                .session
+                .execute(
+                    "DELETE FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.to_string())],
+                )
+                .await?;
+        }
+        Err(error) => return Err(io_error("read changed filesystem file", &local_path, error)),
+    }
+    Ok(())
+}
+
+fn normalize_changed_file_paths(
+    root: &Path,
+    metadata_mode: FilesystemMetadataMode,
+    path_policy: &FilesystemPathPolicy,
+    paths: Vec<PathBuf>,
+) -> Vec<String> {
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        if is_filesystem_sync_ignored_local_path(root, &path, metadata_mode) {
+            continue;
+        }
+        let Ok(lix_path) = local_path_to_lix_path(root, &path, false) else {
+            continue;
+        };
+        if !path_policy.includes_file(&lix_path)
+            || is_filesystem_sync_ignored_lix_path(&lix_path, metadata_mode)
+        {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        if let Some(metadata) = metadata {
+            if is_unmanaged_file_type(&metadata.file_type()) || !metadata.is_file() {
+                continue;
+            }
+        }
+        if path_contains_unmanaged_entry(root, &path).unwrap_or(true) {
+            continue;
+        }
+        normalized.insert(lix_path);
+    }
+    normalized.into_iter().collect()
 }
 
 fn collect_local_snapshot(
     root: &Path,
     metadata_mode: FilesystemMetadataMode,
-    path_filter: &FilesystemPathFilter,
+    _path_policy: &FilesystemPathPolicy,
 ) -> Result<Snapshot, LixError> {
     validate_filesystem_root_directory(root)?;
 
     let mut snapshot = Snapshot::default();
     snapshot.directories.insert("/".to_string());
-    if path_filter.is_unfiltered() {
-        let child_dirs = collect_local_directory_shallow(root, root, metadata_mode, &mut snapshot)?;
-        let child_snapshot = collect_local_child_directories(root, child_dirs, metadata_mode)?;
-        merge_snapshot(&mut snapshot, child_snapshot);
-    } else {
-        collect_filtered_local_snapshot(root, metadata_mode, path_filter, &mut snapshot)?;
-    }
+    let child_dirs = collect_local_directory_shallow(root, root, metadata_mode, &mut snapshot)?;
+    let child_snapshot = collect_local_child_directories(root, child_dirs, metadata_mode)?;
+    merge_snapshot(&mut snapshot, child_snapshot);
     Ok(snapshot)
 }
 
@@ -781,45 +1050,6 @@ fn merge_snapshot(target: &mut Snapshot, source: Snapshot) {
     target.unmanaged_paths.extend(source.unmanaged_paths);
 }
 
-fn collect_filtered_local_snapshot(
-    root: &Path,
-    metadata_mode: FilesystemMetadataMode,
-    path_filter: &FilesystemPathFilter,
-    snapshot: &mut Snapshot,
-) -> Result<(), LixError> {
-    for lix_path in &path_filter.include_files {
-        if is_filesystem_sync_ignored_lix_path(lix_path, metadata_mode) {
-            continue;
-        }
-        let local_path = lix_path_to_local_path(root, lix_path)?;
-        if path_contains_unmanaged_entry(root, &local_path)? {
-            snapshot.unmanaged_paths.insert(lix_path.clone());
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(&local_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(io_error(
-                    "read filesystem file metadata",
-                    &local_path,
-                    error,
-                ));
-            }
-        };
-        if is_unmanaged_file_type(&metadata.file_type()) {
-            snapshot.unmanaged_paths.insert(lix_path.clone());
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        insert_parent_lix_directories(lix_path, snapshot);
-        snapshot.files.insert(lix_path.clone());
-    }
-    Ok(())
-}
-
 fn remember_unmanaged_local_path(
     root: &Path,
     directory: &Path,
@@ -833,6 +1063,15 @@ fn remember_unmanaged_local_path(
             snapshot.unmanaged_paths.insert(parent_path);
         }
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn watch_filesystem_paths(
+    debouncer: &mut FilesystemDebouncer,
+    root: &Path,
+    _path_policy: &FilesystemPathPolicy,
+) -> Result<(), notify_debouncer_full::notify::Error> {
+    debouncer.watch(root, RecursiveMode::Recursive)
 }
 
 fn ensure_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
@@ -1147,55 +1386,6 @@ fn local_path_to_lix_path(
         lix_path.push('/');
     }
     Ok(lix_path)
-}
-
-fn normalize_filter_file_path(path: &str) -> Result<String, LixError> {
-    if path.is_empty() {
-        return Err(filesystem_error("filesystem filter path must not be empty"));
-    }
-    let normalized = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-    if normalized.ends_with('/') {
-        return Err(filesystem_error(format!(
-            "filesystem filter path {path:?} must refer to a file"
-        )));
-    }
-    validate_lix_path(&normalized)?;
-    Ok(normalized)
-}
-
-fn validate_lix_path(path: &str) -> Result<(), LixError> {
-    let _ = lix_path_to_local_path(Path::new("/"), path)?;
-    Ok(())
-}
-
-fn parent_lix_directory_path(path: &str) -> String {
-    let Some(index) = path.rfind('/') else {
-        return "/".to_string();
-    };
-    if index == 0 {
-        "/".to_string()
-    } else {
-        format!("{}/", &path[..index])
-    }
-}
-
-fn insert_parent_lix_directories(path: &str, snapshot: &mut Snapshot) {
-    let mut directory = parent_lix_directory_path(path);
-    let mut directories = Vec::new();
-    while directory != "/" {
-        directories.push(directory.clone());
-        let parent = parent_lix_directory_path(directory.trim_end_matches('/'));
-        if parent == directory {
-            break;
-        }
-        directory = parent;
-    }
-    directories.reverse();
-    snapshot.directories.extend(directories);
 }
 
 fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> {
@@ -1618,7 +1808,7 @@ mod tests {
         let snapshot = collect_local_snapshot(
             root,
             FilesystemMetadataMode::Ephemeral,
-            &FilesystemPathFilter::default(),
+            &FilesystemPathPolicy::default(),
         )
         .unwrap();
 
@@ -1646,6 +1836,270 @@ mod tests {
         assert!(snapshot.unmanaged_paths.is_empty());
     }
 
+    #[test]
+    fn filesystem_event_drain_coalesces_changed_paths() {
+        let (event_tx, event_rx) = mpsc::channel();
+        event_tx
+            .send(FilesystemEvent::DiskChanged(vec![
+                PathBuf::from("/workspace/b.md"),
+                PathBuf::from("/workspace/a.md"),
+            ]))
+            .unwrap();
+        event_tx
+            .send(FilesystemEvent::DiskChanged(vec![PathBuf::from(
+                "/workspace/a.md",
+            )]))
+            .unwrap();
+
+        let paths = drain_filesystem_events(&event_rx, vec![PathBuf::from("/workspace/c.md")]);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/workspace/a.md"),
+                PathBuf::from("/workspace/b.md"),
+                PathBuf::from("/workspace/c.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn filesystem_changed_paths_normalize_to_lix_file_paths() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs").join("note.md"), b"note").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("config"), b"git").unwrap();
+        std::fs::create_dir_all(root.join(".lix").join(".internal")).unwrap();
+        std::fs::write(root.join(".lix").join(".internal").join("data"), b"lix").unwrap();
+
+        let paths = normalize_changed_file_paths(
+            root,
+            FilesystemMetadataMode::Persistent,
+            &FilesystemPathPolicy::default(),
+            vec![
+                root.join("docs").join("note.md"),
+                root.join("docs"),
+                root.join("docs").join("missing.md"),
+                root.join(".git").join("config"),
+                root.join(".lix").join(".internal").join("data"),
+                tempdir.path().parent().unwrap().join("outside.md"),
+            ],
+        );
+
+        assert_eq!(paths, vec!["/docs/missing.md", "/docs/note.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_changed_paths_ignore_symlinks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        std::fs::write(root.join("target.md"), b"target").unwrap();
+        std::os::unix::fs::symlink("target.md", root.join("link.md")).unwrap();
+
+        let paths = normalize_changed_file_paths(
+            root,
+            FilesystemMetadataMode::Ephemeral,
+            &FilesystemPathPolicy::default(),
+            vec![root.join("target.md"), root.join("link.md")],
+        );
+
+        assert_eq!(paths, vec!["/target.md"]);
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_opens_backend_owned_filesystem_supervisor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        match &backend.inner {
+            FsBackendInner::Persistent(inner) => {
+                assert!(inner.supervisor.inner.worker.lock().unwrap().is_some());
+                inner
+                    .supervisor
+                    .inner
+                    .event_tx
+                    .send(FilesystemEvent::DiskChanged(vec![
+                        tempdir.path().join("note.md"),
+                    ]))
+                    .unwrap();
+            }
+            FsBackendInner::Memory(inner) => {
+                assert!(inner.supervisor.inner.worker.lock().unwrap().is_some());
+                inner
+                    .supervisor
+                    .inner
+                    .event_tx
+                    .send(FilesystemEvent::DiskChanged(vec![
+                        tempdir.path().join("note.md"),
+                    ]))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn filesystem_worker_syncs_changed_file_into_lix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.md"), b"external").unwrap();
+
+        let backend = InMemoryBackend::new();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend, None)
+            .await
+            .unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let state = FilesystemState {
+            session: session.clone(),
+            root: root.clone(),
+            metadata_mode: FilesystemMetadataMode::Ephemeral,
+            path_policy: FilesystemPathPolicy::default(),
+            recent_lix_writes: Arc::new(Mutex::new(BTreeSet::new())),
+            sync_lock: tokio::sync::Mutex::new(()),
+        };
+
+        sync_changed_file_paths(&state, vec![root.join("note.md")])
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<Vec<u8>>("data").unwrap(), b"external");
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn filesystem_worker_syncs_missing_file_delete_into_lix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+
+        let backend = InMemoryBackend::new();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend, None)
+            .await
+            .unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Blob(b"before".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        let state = FilesystemState {
+            session: session.clone(),
+            root: root.clone(),
+            metadata_mode: FilesystemMetadataMode::Ephemeral,
+            path_policy: FilesystemPathPolicy::default(),
+            recent_lix_writes: Arc::new(Mutex::new(BTreeSet::new())),
+            sync_lock: tokio::sync::Mutex::new(()),
+        };
+
+        sync_changed_file_paths(&state, vec![root.join("note.md")])
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT path FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 0);
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn filesystem_worker_consumes_lix_write_echo_once() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        let recent_lix_writes = Arc::new(Mutex::new(BTreeSet::from(["/note.md".to_string()])));
+        let backend = InMemoryBackend::new();
+        let engine = crate::lix::open_or_initialize_filesystem_engine(backend, None)
+            .await
+            .unwrap();
+        let state = FilesystemState {
+            session: engine.open_workspace_session().await.unwrap(),
+            root,
+            metadata_mode: FilesystemMetadataMode::Ephemeral,
+            path_policy: FilesystemPathPolicy::default(),
+            recent_lix_writes: Arc::clone(&recent_lix_writes),
+            sync_lock: tokio::sync::Mutex::new(()),
+        };
+
+        assert_eq!(
+            consume_recent_lix_write_echoes(&state, vec!["/note.md".to_string()]),
+            Vec::<String>::new()
+        );
+        assert_eq!(recent_lix_writes.lock().unwrap().len(), 0);
+        assert_eq!(
+            consume_recent_lix_write_echoes(&state, vec!["/note.md".to_string()]),
+            vec!["/note.md".to_string()]
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_watcher_syncs_external_edit_while_open() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let disk_path = tempdir.path().join("note.md");
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Blob(b"initial".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&disk_path).unwrap(), b"initial");
+
+        std::fs::write(&disk_path, b"external").unwrap();
+
+        wait_for_lix_file_data(&session, "/note.md", Some(b"external")).await;
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_watcher_syncs_external_delete_while_open() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let disk_path = tempdir.path().join("note.md");
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Blob(b"initial".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&disk_path).unwrap(), b"initial");
+
+        std::fs::remove_file(&disk_path).unwrap();
+
+        wait_for_lix_file_data(&session, "/note.md", None).await;
+    }
+
     #[cfg(feature = "fs_backend")]
     #[tokio::test]
     async fn fs_backend_mounted_filesystem_reads_disk_file_data() {
@@ -1669,30 +2123,6 @@ mod tests {
             .await
             .expect("missing mounted filesystem read should not fail");
         assert_eq!(missing, None);
-    }
-
-    #[cfg(feature = "fs_backend")]
-    #[tokio::test]
-    async fn fs_backend_mounted_filesystem_respects_include_filter() {
-        let tempdir = tempfile::tempdir().unwrap();
-        std::fs::write(tempdir.path().join("included.md"), b"included").unwrap();
-        std::fs::write(tempdir.path().join("excluded.md"), b"excluded").unwrap();
-
-        let backend = FsBackend::open_memory_with_filter(
-            tempdir.path(),
-            FsBackendFilter::include_paths(vec!["included.md".to_string()]),
-        )
-        .await
-        .unwrap();
-        let resolver = backend
-            .mounted_filesystem()
-            .expect("FsBackend should expose mounted filesystem");
-
-        assert_eq!(
-            resolver.read_file("/included.md").await.unwrap().as_deref(),
-            Some(b"included".as_slice())
-        );
-        assert_eq!(resolver.read_file("/excluded.md").await.unwrap(), None);
     }
 
     #[cfg(feature = "fs_backend")]
@@ -2765,6 +3195,136 @@ mod tests {
 
     #[cfg(feature = "fs_backend")]
     #[tokio::test]
+    async fn fs_backend_reopen_catches_tracked_file_edit_from_disk() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let disk_path = tempdir.path().join("note.md");
+
+        {
+            let backend = FsBackend::open(tempdir.path()).await.unwrap();
+            let engine = Engine::new(backend).await.unwrap();
+            let session = engine.open_workspace_session().await.unwrap();
+            session
+                .execute(
+                    "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                    &[
+                        Value::Text("/note.md".to_string()),
+                        Value::Blob(b"initial".to_vec()),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&disk_path).unwrap(), b"initial");
+        }
+
+        std::fs::write(&disk_path, b"external while closed").unwrap();
+
+        let reopened = FsBackend::open(tempdir.path()).await.unwrap();
+        let engine = Engine::new(reopened).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let rows = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows()[0].get::<Vec<u8>>("data").unwrap(),
+            b"external while closed"
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_reopen_catches_tracked_file_delete_from_disk() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let disk_path = tempdir.path().join("note.md");
+
+        {
+            let backend = FsBackend::open(tempdir.path()).await.unwrap();
+            let engine = Engine::new(backend).await.unwrap();
+            let session = engine.open_workspace_session().await.unwrap();
+            session
+                .execute(
+                    "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                    &[
+                        Value::Text("/note.md".to_string()),
+                        Value::Blob(b"initial".to_vec()),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&disk_path).unwrap(), b"initial");
+        }
+
+        std::fs::remove_file(&disk_path).unwrap();
+
+        let reopened = FsBackend::open(tempdir.path()).await.unwrap();
+        let engine = Engine::new(reopened).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let rows = session
+            .execute(
+                "SELECT path FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 0);
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_reopen_does_not_copy_untracked_new_disk_file_into_lix() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        {
+            let backend = FsBackend::open(tempdir.path()).await.unwrap();
+            let engine = Engine::new(backend).await.unwrap();
+            let session = engine.open_workspace_session().await.unwrap();
+            let descriptors = session
+                .execute(
+                    "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key IN ($1, $2)",
+                    &[
+                        Value::Text("lix_file_descriptor".to_string()),
+                        Value::Text("lix_directory_descriptor".to_string()),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(descriptors.rows()[0].get::<i64>("count").unwrap(), 0);
+        }
+
+        std::fs::write(tempdir.path().join("new.md"), b"new while closed").unwrap();
+
+        let reopened = FsBackend::open(tempdir.path()).await.unwrap();
+        let engine = Engine::new(reopened).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let rows = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/new.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows()[0].get::<Vec<u8>>("data").unwrap(),
+            b"new while closed"
+        );
+        let descriptors = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_state WHERE schema_key IN ($1, $2)",
+                &[
+                    Value::Text("lix_file_descriptor".to_string()),
+                    Value::Text("lix_directory_descriptor".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(descriptors.rows()[0].get::<i64>("count").unwrap(), 0);
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
     async fn fs_backend_update_where_data_rejects_descriptor_only_files() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
@@ -2870,5 +3430,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data.rows()[0].get::<Vec<u8>>("data").unwrap(), b"from disk");
+    }
+
+    #[cfg(feature = "fs_backend")]
+    async fn wait_for_lix_file_data<B>(
+        session: &SessionContext<B>,
+        path: &str,
+        expected: Option<&[u8]>,
+    ) where
+        B: Backend + Clone + Send + Sync + 'static,
+        for<'backend> B::Read<'backend>: Send,
+        for<'backend> B::Write<'backend>: Send,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut last = None;
+        while std::time::Instant::now() < deadline {
+            let rows = session
+                .execute(
+                    "SELECT data FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.to_string())],
+                )
+                .await
+                .unwrap();
+            last = rows
+                .rows()
+                .first()
+                .map(|row| row.get::<Vec<u8>>("data").unwrap());
+            if last.as_deref() == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for {path} to have data {:?}, last seen {:?}",
+            expected, last
+        );
     }
 }

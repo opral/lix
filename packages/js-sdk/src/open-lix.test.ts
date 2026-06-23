@@ -290,7 +290,7 @@ test("native fs open returns a promise", async () => {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "local");
 
-	const native = addon.Lix.openFs(dir, "memory", undefined);
+	const native = addon.Lix.openFs(dir, "memory");
 	expect(native).toBeInstanceOf(Promise);
 	const lix = await native;
 	await lix.close();
@@ -388,8 +388,8 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	);
 
 	await lix.execute(
-		"INSERT INTO lix_file (directory_id, name, data) VALUES ($1, $2, $3)",
-		[null, "generated.md", new TextEncoder().encode("generated")],
+		"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+		["/generated.md", new TextEncoder().encode("generated")],
 	);
 	expect(readFileSync(join(dir, "generated.md"), "utf8")).toBe("generated");
 	await lix.close();
@@ -449,207 +449,6 @@ test("fs backend with memory storage imports the directory and writes normal fil
 		const bytes = await readFile(lix, "/note.md");
 		return bytes ? new TextDecoder().decode(bytes) : undefined;
 	}, "external");
-
-	await lix.close();
-});
-
-test("fs backend filter only syncs included paths", async () => {
-	const dir = tempFsDir();
-	const includedPath = join(dir, "docs", "note.md");
-	const excludedPath = join(dir, "docs", "sibling.md");
-	const generatedPath = join(dir, "generated.md");
-	mkdirSync(join(dir, "docs"), { recursive: true });
-	writeFileSync(includedPath, "included");
-	writeFileSync(excludedPath, "excluded");
-
-	const lix = await openLix({
-		backend: new FsBackend({
-			path: dir,
-			storage: "memory",
-			filter: { includePaths: ["docs/note.md"] },
-		}),
-	});
-
-	const files = await lix.execute(
-		"SELECT path FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
-		["/docs/note.md", "/docs/sibling.md"],
-	);
-	expect(files.rows.map((row) => row.get("path"))).toEqual(["/docs/note.md"]);
-
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
-		new TextEncoder().encode("updated"),
-		"/docs/note.md",
-	]);
-	expect(readFileSync(includedPath, "utf8")).toBe("updated");
-	expect(readFileSync(excludedPath, "utf8")).toBe("excluded");
-
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-		"/generated.md",
-		new TextEncoder().encode("generated"),
-	]);
-	expect(existsSync(generatedPath)).toBe(false);
-
-	writeFileSync(includedPath, "external");
-	await waitFor(async () => {
-		const bytes = await readFile(lix, "/docs/note.md");
-		return bytes ? new TextDecoder().decode(bytes) : undefined;
-	}, "external");
-
-	writeFileSync(excludedPath, "changed outside filter");
-	expect(await readFile(lix, "/docs/sibling.md")).toBeUndefined();
-
-	await lix.close();
-});
-
-test("fs backend filter requires explicit include paths", () => {
-	const dir = tempFsDir();
-	mkdirSync(dir, { recursive: true });
-
-	expect(
-		() =>
-			new FsBackend({ path: dir, filter: {} as { includePaths: string[] } }),
-	).toThrow("FsBackend filter.includePaths must be an array");
-	expect(
-		() => new FsBackend({ path: dir, filter: { includePaths: [] } }),
-	).toThrow("FsBackend filter.includePaths must contain at least one path");
-	expect(
-		() =>
-			new FsBackend({
-				path: dir,
-				filter: { includePaths: [""] },
-			}),
-	).toThrow("FsBackend filter.includePaths must contain non-empty strings");
-	expect(
-		() =>
-			new FsBackend({
-				path: dir,
-				filter: { includePaths: ["docs/"] },
-			}),
-	).toThrow(
-		"FsBackend filter.includePaths must contain file paths, not directory paths",
-	);
-});
-
-test("fs backend filter treats paths as exact filenames", async () => {
-	const dir = tempFsDir();
-	const filePath = join(dir, " spaced.md");
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(filePath, "literal whitespace");
-
-	const lix = await openLix({
-		backend: new FsBackend({
-			path: dir,
-			storage: "memory",
-			filter: { includePaths: [" spaced.md"] },
-		}),
-	});
-
-	const bytes = await readFile(lix, "/ spaced.md");
-	expect(bytes ? new TextDecoder().decode(bytes) : undefined).toBe(
-		"literal whitespace",
-	);
-
-	await lix.close();
-});
-
-test("fs backend filter does not create directories for missing includes", async () => {
-	const dir = tempFsDir();
-	mkdirSync(dir, { recursive: true });
-
-	const lix = await openLix({
-		backend: new FsBackend({
-			path: dir,
-			storage: "memory",
-			filter: { includePaths: ["missing/note.md"] },
-		}),
-	});
-
-	const directories = await lix.execute(
-		"SELECT path FROM lix_directory WHERE path = $1",
-		["/missing/"],
-	);
-	expect(directories.rows).toHaveLength(0);
-	expect(existsSync(join(dir, "missing"))).toBe(false);
-
-	await lix.close();
-});
-
-test("fs backend filter propagates deletion of included files", async () => {
-	const dir = tempFsDir();
-	const filePath = join(dir, "note.md");
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(filePath, "local");
-
-	const lix = await openLix({
-		backend: new FsBackend({
-			path: dir,
-			storage: "memory",
-			filter: { includePaths: ["note.md"] },
-		}),
-	});
-
-	expect(await readFile(lix, "/note.md")).toBeDefined();
-
-	unlinkSync(filePath);
-	await waitFor(async () => await readFile(lix, "/note.md"), undefined);
-
-	await lix.close();
-});
-
-test("fs backend filter does not delete excluded files through parent directories", async () => {
-	const dir = tempFsDir();
-	const includedPath = join(dir, "docs", "note.md");
-	mkdirSync(join(dir, "docs"), { recursive: true });
-	writeFileSync(includedPath, "local");
-
-	const lix = await openLix({
-		backend: new FsBackend({
-			path: dir,
-			storage: "memory",
-			filter: { includePaths: ["docs/note.md"] },
-		}),
-	});
-
-	await writeFile(
-		lix,
-		"/docs/sibling.md",
-		new TextEncoder().encode("outside filter"),
-	);
-	expect(await readFile(lix, "/docs/sibling.md")).toBeDefined();
-
-	unlinkSync(includedPath);
-	await waitFor(async () => await readFile(lix, "/docs/note.md"), undefined);
-
-	const sibling = await readFile(lix, "/docs/sibling.md");
-	expect(sibling ? new TextDecoder().decode(sibling) : undefined).toBe(
-		"outside filter",
-	);
-
-	await lix.close();
-});
-
-test("fs backend filter matches directory paths by segment boundaries", async () => {
-	const dir = tempFsDir();
-	const includedPath = join(dir, "foo-bar", "note.md");
-	mkdirSync(join(dir, "foo-bar"), { recursive: true });
-	writeFileSync(includedPath, "local");
-
-	const lix = await openLix({
-		backend: new FsBackend({
-			path: dir,
-			storage: "memory",
-			filter: { includePaths: ["foo-bar/note.md"] },
-		}),
-	});
-
-	await writeFile(
-		lix,
-		"/foo/file.md",
-		new TextEncoder().encode("outside filter"),
-	);
-
-	expect(existsSync(join(dir, "foo"))).toBe(false);
-	expect(readFileSync(includedPath, "utf8")).toBe("local");
 
 	await lix.close();
 });
