@@ -268,4 +268,4 @@ SQL is the query interface on top. Products, scripts, and agents can ask what ch
 
 ## License
 
-[MIT](https://github.com/opral/lix/blob/main/packages/lix-sdk/LICENSE)
+[MIT](./LICENSE)
