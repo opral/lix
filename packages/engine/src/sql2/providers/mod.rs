@@ -325,7 +325,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::arrow::datatypes::{DataType, SchemaRef};
     use datafusion::prelude::SessionContext;
 
     use crate::LixError;
@@ -410,6 +410,26 @@ mod tests {
             "lix_directory_history",
             directory_history::lix_directory_history_schema(),
         );
+    }
+
+    #[test]
+    fn file_data_surfaces_use_large_binary() {
+        let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
+
+        for surface_name in ["lix_file", "lix_file_by_branch", "lix_file_history"] {
+            let schema = catalog
+                .surface_schema(surface_name)
+                .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
+            let data_field = schema
+                .field_with_name("data")
+                .unwrap_or_else(|_| panic!("{surface_name}.data should exist"));
+
+            assert_eq!(
+                data_field.data_type(),
+                &DataType::LargeBinary,
+                "{surface_name}.data should avoid Arrow Binary's 32-bit offset limit",
+            );
+        }
     }
 
     #[tokio::test]
