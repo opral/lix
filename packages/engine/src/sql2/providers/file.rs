@@ -36,7 +36,7 @@ use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    FilesystemIndex, MountedWorkspaceRows, filesystem_schema_keys, mounted_workspace_rows,
+    FilesystemIndex, filesystem_schema_keys, mounted_workspace_rows_by_branch,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
@@ -312,6 +312,7 @@ impl LixFileSpec {
                 self.plugin_host.clone(),
                 Arc::clone(&self.schema),
                 self.missing_data_policy,
+                self.mounted_filesystem.clone(),
                 request,
                 target_file_ids,
                 needs_data,
@@ -322,6 +323,7 @@ impl LixFileSpec {
                 plugin_host,
                 table_schema,
                 missing_data_policy,
+                mounted_filesystem,
                 request,
                 target_file_ids,
                 needs_data,
@@ -330,6 +332,15 @@ impl LixFileSpec {
                 let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
+                let mounted_rows = mounted_workspace_rows_by_branch(
+                    mounted_filesystem,
+                    &request.filter.branch_ids,
+                    &rows,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+                let mut rows = rows;
+                rows.extend(mounted_rows.rows);
                 let plugin_render = plugin_render_context_for_lix_file_scan(
                     live_state,
                     &blob_reader,
@@ -359,38 +370,6 @@ impl LixFileSpec {
             },
         )
     }
-}
-
-async fn mounted_by_branch_workspace_rows(
-    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
-    branch_ids: &[String],
-    rows: &[MaterializedLiveStateRow],
-) -> std::result::Result<MountedWorkspaceRows, LixError> {
-    let Some(mounted_filesystem) = mounted_filesystem else {
-        return Ok(MountedWorkspaceRows::default());
-    };
-    let mut combined = MountedWorkspaceRows::default();
-    for branch_id in branch_ids
-        .iter()
-        .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
-    {
-        let owned_rows_for_branch = rows
-            .iter()
-            .filter(|row| row.branch_id == *branch_id || row.global)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mounted_rows = mounted_workspace_rows(
-            branch_id,
-            Some(Arc::clone(&mounted_filesystem)),
-            &owned_rows_for_branch,
-        )
-        .await?;
-        combined.rows.extend(mounted_rows.rows);
-        combined
-            .file_paths_by_key
-            .extend(mounted_rows.file_paths_by_key);
-    }
-    Ok(combined)
 }
 
 #[async_trait]
@@ -443,6 +422,7 @@ impl TableSpec for LixFileSpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
+        request.filter.include_tombstones = true;
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
@@ -491,14 +471,18 @@ impl TableSpec for LixFileSpec {
                     .map_err(|error| {
                         DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                     })?;
-                    let mounted_rows = mounted_by_branch_workspace_rows(
+                    let mounted_rows = mounted_workspace_rows_by_branch(
                         mounted_filesystem.clone(),
                         &request.filter.branch_ids,
                         &rows,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let mut visible_rows = rows.clone();
+                    let mut visible_rows = rows
+                        .iter()
+                        .filter(|row| !row.deleted)
+                        .cloned()
+                        .collect::<Vec<_>>();
                     visible_rows.extend(mounted_rows.rows.clone());
                     let can_prefilter_without_data = needs_data
                         && !filters.is_empty()

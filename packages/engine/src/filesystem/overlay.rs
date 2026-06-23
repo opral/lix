@@ -5,7 +5,7 @@ use crate::backend::MountedFilesystem;
 use crate::binary_cas::BlobHash;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::{LixError, MountedFilesystemListing};
+use crate::{GLOBAL_BRANCH_ID, LixError, MountedFilesystemListing};
 
 use super::FilesystemIndex;
 use super::keys::{DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY};
@@ -37,6 +37,38 @@ pub(crate) async fn mounted_workspace_rows(
     })?;
     let owned = FilesystemIndex::from_live_rows(owned_rows.to_vec())?;
     rows_from_listing(active_branch_id, listing, &owned, owned_rows)
+}
+
+pub(crate) async fn mounted_workspace_rows_by_branch(
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
+    branch_ids: &[String],
+    rows: &[MaterializedLiveStateRow],
+) -> Result<MountedWorkspaceRows, LixError> {
+    let Some(mounted_filesystem) = mounted_filesystem else {
+        return Ok(MountedWorkspaceRows::default());
+    };
+    let mut combined = MountedWorkspaceRows::default();
+    for branch_id in branch_ids
+        .iter()
+        .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
+    {
+        let owned_rows_for_branch = rows
+            .iter()
+            .filter(|row| row.branch_id == *branch_id || row.global)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mounted_rows = mounted_workspace_rows(
+            branch_id,
+            Some(Arc::clone(&mounted_filesystem)),
+            &owned_rows_for_branch,
+        )
+        .await?;
+        combined.rows.extend(mounted_rows.rows);
+        combined
+            .file_paths_by_key
+            .extend(mounted_rows.file_paths_by_key);
+    }
+    Ok(combined)
 }
 
 pub(crate) fn is_mounted_directory_id(id: &str) -> bool {
@@ -175,11 +207,18 @@ fn owned_descriptor_keys(
 ) -> Result<BTreeSet<FilesystemDescriptorKey>, LixError> {
     let mut keys = BTreeSet::new();
     for row in owned_rows {
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-            continue;
-        };
         match row.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                if row.deleted {
+                    keys.insert(FilesystemDescriptorKey::from_live_row(
+                        row,
+                        row.entity_pk.as_single_string_owned()?,
+                    ));
+                    continue;
+                }
+                let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+                    continue;
+                };
                 let snapshot: DescriptorSnapshot =
                     serde_json::from_str(snapshot_content).map_err(|error| {
                         LixError::unknown(format!(

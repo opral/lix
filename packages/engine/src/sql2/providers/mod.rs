@@ -189,6 +189,7 @@ where
                     &surface.name,
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
+                    ctx.mounted_filesystem(),
                     ctx.functions(),
                 )
                 .await?;

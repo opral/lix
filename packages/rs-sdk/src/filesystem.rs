@@ -1645,6 +1645,301 @@ mod tests {
 
     #[cfg(feature = "fs_backend")]
     #[tokio::test]
+    async fn fs_backend_active_file_surface_uses_mounted_overlay_semantics() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(rows.rows()[0].get::<Vec<u8>>("data").unwrap(), b"from disk");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Blob(b"from lix active branch".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(
+            rows.rows()[0].get::<Vec<u8>>("data").unwrap(),
+            b"from lix active branch"
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_active_file_delete_tombstone_hides_mounted_overlay() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT path FROM lix_file WHERE path = $1",
+                &[Value::Text("/note.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 0);
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_directory_by_branch_expands_mounted_overlay_per_branch() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+        std::fs::write(tempdir.path().join("docs/readme.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let active_branch_id = session.active_branch_id().await.unwrap();
+        let feature = session
+            .create_branch(CreateBranchOptions {
+                id: Some("feature-branch".to_string()),
+                name: "Feature".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT lixcol_branch_id, path FROM lix_directory_by_branch \
+                 WHERE path = $1 AND lixcol_branch_id IN ($2, $3) \
+                 ORDER BY lixcol_branch_id",
+                &[
+                    Value::Text("/docs/".to_string()),
+                    Value::Text(active_branch_id.clone()),
+                    Value::Text(feature.id.clone()),
+                ],
+            )
+            .await
+            .expect(
+                "directory by-branch should include mounted overlay rows for each queried branch",
+            );
+        assert_eq!(rows.rows().len(), 2);
+
+        session
+            .execute(
+                "INSERT INTO lix_file_by_branch (path, data, lixcol_branch_id) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text("/docs".to_string()),
+                    Value::Blob(b"branch file shadows disk directory".to_vec()),
+                    Value::Text(feature.id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT lixcol_branch_id, path FROM lix_directory_by_branch \
+                 WHERE path = $1 AND lixcol_branch_id IN ($2, $3) \
+                 ORDER BY lixcol_branch_id",
+                &[
+                    Value::Text("/docs/".to_string()),
+                    Value::Text(active_branch_id.clone()),
+                    Value::Text(feature.id),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(
+            rows.rows()[0].get::<String>("lixcol_branch_id").unwrap(),
+            active_branch_id
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_active_directory_surface_uses_mounted_overlay_semantics() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+        std::fs::write(tempdir.path().join("docs/readme.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT path FROM lix_directory WHERE path = $1",
+                &[Value::Text("/docs/".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/docs/");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/docs".to_string()),
+                    Value::Blob(b"active file shadows disk directory".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT path FROM lix_directory WHERE path = $1",
+                &[Value::Text("/docs/".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 0);
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_file_delete_tombstone_hides_mounted_overlay_for_branch() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let active_branch_id = session.active_branch_id().await.unwrap();
+        let feature = session
+            .create_branch(CreateBranchOptions {
+                id: Some("feature-delete".to_string()),
+                name: "Feature Delete".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+
+        session
+            .execute(
+                "DELETE FROM lix_file_by_branch WHERE path = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Text(feature.id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT lixcol_branch_id, path FROM lix_file_by_branch \
+                 WHERE path = $1 AND lixcol_branch_id IN ($2, $3) \
+                 ORDER BY lixcol_branch_id",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Text(active_branch_id.clone()),
+                    Value::Text(feature.id),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(
+            rows.rows()[0].get::<String>("lixcol_branch_id").unwrap(),
+            active_branch_id
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_active_directory_delete_of_mounted_overlay_requires_copy_up_support() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+        std::fs::write(tempdir.path().join("docs/readme.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+
+        let error = session
+            .execute(
+                "DELETE FROM lix_directory WHERE path = $1",
+                &[Value::Text("/docs/".to_string())],
+            )
+            .await
+            .expect_err("mounted directory deletes need copy-up support before they can tombstone");
+        assert!(
+            error
+                .to_string()
+                .contains("mutating mounted filesystem directories requires copy-up support")
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_directory_delete_of_mounted_overlay_requires_copy_up_support() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+        std::fs::write(tempdir.path().join("docs/readme.md"), b"from disk").unwrap();
+
+        let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
+        let engine = Engine::new(backend).await.unwrap();
+        let session = engine.open_workspace_session().await.unwrap();
+        let feature = session
+            .create_branch(CreateBranchOptions {
+                id: Some("feature-directory-delete".to_string()),
+                name: "Feature Directory Delete".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+
+        let error = session
+            .execute(
+                "DELETE FROM lix_directory_by_branch WHERE path = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text("/docs/".to_string()),
+                    Value::Text(feature.id.clone()),
+                ],
+            )
+            .await
+            .expect_err("mounted directory deletes need copy-up support before they can tombstone");
+        assert!(
+            error
+                .to_string()
+                .contains("mutating mounted filesystem directories requires copy-up support")
+        );
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
     async fn fs_backend_memory_opens_large_folder_overlay_only_and_reads_one_file() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("root.txt"), b"root").unwrap();
