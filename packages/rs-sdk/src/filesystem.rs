@@ -1344,7 +1344,7 @@ fn rocksdb_backend_error(error: BackendError) -> LixError {
 mod tests {
     use super::*;
     #[cfg(feature = "fs_backend")]
-    use lix_engine::Value;
+    use lix_engine::{CreateBranchOptions, Value};
 
     #[test]
     fn local_paths_render_opaque_segments() {
@@ -1569,22 +1569,78 @@ mod tests {
 
     #[cfg(feature = "fs_backend")]
     #[tokio::test]
-    async fn fs_backend_by_branch_does_not_show_mounted_overlay_files() {
+    async fn fs_backend_by_branch_expands_mounted_overlay_per_branch() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("note.md"), b"from disk").unwrap();
 
         let backend = FsBackend::open_memory(tempdir.path()).await.unwrap();
         let engine = Engine::new(backend).await.unwrap();
         let session = engine.open_workspace_session().await.unwrap();
+        let active_branch_id = session.active_branch_id().await.unwrap();
+        let feature = session
+            .create_branch(CreateBranchOptions {
+                id: Some("feature-branch".to_string()),
+                name: "Feature".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
 
         let rows = session
             .execute(
-                "SELECT data FROM lix_file_by_branch WHERE path = $1",
-                &[Value::Text("/note.md".to_string())],
+                "SELECT lixcol_branch_id, data FROM lix_file_by_branch \
+                 WHERE path = $1 AND lixcol_branch_id IN ($2, $3) \
+                 ORDER BY lixcol_branch_id",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Text(active_branch_id.clone()),
+                    Value::Text(feature.id.clone()),
+                ],
             )
             .await
-            .expect("by-branch should not include mounted overlay rows");
-        assert_eq!(rows.rows().len(), 0);
+            .expect("by-branch should include mounted overlay rows for each queried branch");
+        assert_eq!(rows.rows().len(), 2);
+        assert_eq!(rows.rows()[0].get::<Vec<u8>>("data").unwrap(), b"from disk");
+        assert_eq!(rows.rows()[1].get::<Vec<u8>>("data").unwrap(), b"from disk");
+
+        session
+            .execute(
+                "INSERT INTO lix_file_by_branch (path, data, lixcol_branch_id) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Blob(b"from lix branch".to_vec()),
+                    Value::Text(feature.id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT lixcol_branch_id, data FROM lix_file_by_branch \
+                 WHERE path = $1 AND lixcol_branch_id IN ($2, $3) \
+                 ORDER BY lixcol_branch_id",
+                &[
+                    Value::Text("/note.md".to_string()),
+                    Value::Text(active_branch_id.clone()),
+                    Value::Text(feature.id),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 2);
+        let by_branch = rows
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("lixcol_branch_id").unwrap(),
+                    row.get::<Vec<u8>>("data").unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_branch.get("feature-branch").unwrap(), b"from lix branch");
+        assert_eq!(by_branch.get(&active_branch_id).unwrap(), b"from disk");
     }
 
     #[cfg(feature = "fs_backend")]

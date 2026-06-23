@@ -154,6 +154,7 @@ where
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
+                    ctx.mounted_filesystem(),
                     ctx.plugin_host(),
                     ctx.functions(),
                 )

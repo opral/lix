@@ -35,7 +35,9 @@ use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::filesystem::{FilesystemIndex, filesystem_schema_keys, mounted_workspace_rows};
+use crate::filesystem::{
+    FilesystemIndex, MountedWorkspaceRows, filesystem_schema_keys, mounted_workspace_rows,
+};
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
     LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -129,6 +131,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
@@ -139,6 +142,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
             live_state,
             branch_ref,
             blob_reader,
+            mounted_filesystem,
             plugin_host,
             functions,
         )),
@@ -252,6 +256,7 @@ impl LixFileSpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
@@ -264,7 +269,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             missing_data_policy: MissingFileDataPolicy::Unresolved,
-            mounted_filesystem: None,
+            mounted_filesystem,
             options: SqlWriteSessionOptions::default(),
         }
     }
@@ -275,6 +280,7 @@ impl LixFileSpec {
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
+        let mounted_filesystem = write_ctx.mounted_filesystem();
         Self {
             schema: lix_file_by_branch_schema(),
             live_state,
@@ -284,7 +290,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             missing_data_policy: MissingFileDataPolicy::Unresolved,
-            mounted_filesystem: None,
+            mounted_filesystem,
             options,
         }
     }
@@ -353,6 +359,38 @@ impl LixFileSpec {
             },
         )
     }
+}
+
+async fn mounted_by_branch_workspace_rows(
+    mounted_filesystem: Option<Arc<dyn MountedFilesystem>>,
+    branch_ids: &[String],
+    rows: &[MaterializedLiveStateRow],
+) -> std::result::Result<MountedWorkspaceRows, LixError> {
+    let Some(mounted_filesystem) = mounted_filesystem else {
+        return Ok(MountedWorkspaceRows::default());
+    };
+    let mut combined = MountedWorkspaceRows::default();
+    for branch_id in branch_ids
+        .iter()
+        .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
+    {
+        let owned_rows_for_branch = rows
+            .iter()
+            .filter(|row| row.branch_id == *branch_id || row.global)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mounted_rows = mounted_workspace_rows(
+            branch_id,
+            Some(Arc::clone(&mounted_filesystem)),
+            &owned_rows_for_branch,
+        )
+        .await?;
+        combined.rows.extend(mounted_rows.rows);
+        combined
+            .file_paths_by_key
+            .extend(mounted_rows.file_paths_by_key);
+    }
+    Ok(combined)
 }
 
 #[async_trait]
@@ -453,14 +491,9 @@ impl TableSpec for LixFileSpec {
                     .map_err(|error| {
                         DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                     })?;
-                    let mounted_rows = mounted_workspace_rows(
-                        request
-                            .filter
-                            .branch_ids
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or_default(),
+                    let mounted_rows = mounted_by_branch_workspace_rows(
                         mounted_filesystem.clone(),
+                        &request.filter.branch_ids,
                         &rows,
                     )
                     .await
