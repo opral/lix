@@ -453,7 +453,7 @@ test("fs backend with external lixDir imports the directory and writes normal fi
 	await lix.close();
 });
 
-test("fs backend filter only syncs included paths", async () => {
+test("fs backend filter syncs included paths and lix-created files", async () => {
 	const dir = tempFsDir();
 	const includedPath = join(dir, "docs", "note.md");
 	const excludedPath = join(dir, "docs", "sibling.md");
@@ -487,7 +487,7 @@ test("fs backend filter only syncs included paths", async () => {
 		"/generated.md",
 		new TextEncoder().encode("generated"),
 	]);
-	expect(existsSync(generatedPath)).toBe(false);
+	expect(readFileSync(generatedPath, "utf8")).toBe("generated");
 
 	writeFileSync(includedPath, "external");
 	await waitFor(async () => {
@@ -665,8 +665,11 @@ test("fs backend filter does not delete excluded files through parent directorie
 
 test("fs backend filter matches directory paths by segment boundaries", async () => {
 	const dir = tempFsDir();
+	const excludedPath = join(dir, "foo", "file.md");
 	const includedPath = join(dir, "foo-bar", "note.md");
+	mkdirSync(join(dir, "foo"), { recursive: true });
 	mkdirSync(join(dir, "foo-bar"), { recursive: true });
+	writeFileSync(excludedPath, "outside filter");
 	writeFileSync(includedPath, "local");
 
 	const lix = await openLix({
@@ -677,13 +680,8 @@ test("fs backend filter matches directory paths by segment boundaries", async ()
 		}),
 	});
 
-	await writeFile(
-		lix,
-		"/foo/file.md",
-		new TextEncoder().encode("outside filter"),
-	);
-
-	expect(existsSync(join(dir, "foo"))).toBe(false);
+	expect(await readFile(lix, "/foo/file.md")).toBeUndefined();
+	expect(readFileSync(excludedPath, "utf8")).toBe("outside filter");
 	expect(readFileSync(includedPath, "utf8")).toBe("local");
 
 	await lix.close();
