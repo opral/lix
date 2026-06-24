@@ -41,23 +41,24 @@ Older SQLite filesystem backend metadata is not migrated. If Lix detects the
 old SQLite metadata files in `<workspace>/.lix/.internal` before a RocksDB store
 exists, it clears `.lix/.internal` and initializes a fresh RocksDB backend.
 
-## Filesystem workspace (memory storage)
+## Filesystem workspace (external `.lix` directory)
 
-Use `storage: "memory"` when you want filesystem sync without persisting the
-Lix repository metadata:
+Use `lixDir` when you want filesystem sync with Lix repository metadata outside
+the workspace directory:
 
 ```ts
 const lix = await openLix({
 	backend: new FsBackend({
 		path: "/var/data/workspace",
-		storage: "memory",
+		lixDir: "/tmp/session/.lix",
 	}),
 });
 ```
 
 This imports, watches, and materializes workspace files, but the Lix repository
-state is kept in memory and no `.lix` directory is written. Reopening the same
-path reimports the files from disk instead of resuming prior Lix metadata.
+state is stored under `lixDir` and no `.lix` directory is written in the
+workspace. Reusing the same `lixDir` resumes that metadata; using a fresh temp
+`.lix` directory reimports the files from disk.
 
 For tests, point at a temp directory so each run is isolated:
 

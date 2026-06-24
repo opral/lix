@@ -51,9 +51,10 @@ Older SQLite filesystem backend metadata is not migrated. When old SQLite
 metadata files are present in `.lix/.internal` and no RocksDB store exists, Lix
 clears `.lix/.internal` and initializes a fresh RocksDB store.
 
-For ephemeral filesystem sync, pass `storage: "memory"`. Workspace files are
-still imported, watched, and materialized, but the Lix repository itself stays
-in memory and no `.lix` directory is written.
+For ephemeral filesystem sync, pass `lixDir` pointing at a temporary external
+`.lix` directory. Workspace files are still imported, watched, and materialized,
+but repository metadata is stored outside the workspace and no workspace `.lix`
+directory is written.
 
 Use `SqliteBackend` when the `.lix` SQLite file is the application document
 itself. This is useful when defining a new file format and using Lix as the

@@ -66,7 +66,7 @@ export class SqliteBackend {
 
 export class FsBackend {
 	readonly path: string;
-	readonly storage: "persistent" | "memory";
+	readonly lixDir: string | undefined;
 	readonly filter: { includePaths: readonly string[] } | undefined;
 
 	constructor(options: FsBackendOptions) {
@@ -77,12 +77,14 @@ export class FsBackend {
 		) {
 			throw new TypeError("FsBackend requires a non-empty path");
 		}
+		if ("storage" in options) {
+			throw new TypeError("FsBackend storage is no longer supported");
+		}
 		if (
-			options.storage !== undefined &&
-			options.storage !== "persistent" &&
-			options.storage !== "memory"
+			options.lixDir !== undefined &&
+			(typeof options.lixDir !== "string" || options.lixDir.length === 0)
 		) {
-			throw new TypeError('FsBackend storage must be "persistent" or "memory"');
+			throw new TypeError("FsBackend lixDir must be a non-empty string");
 		}
 		if (options.filter !== undefined) {
 			if (!options.filter || typeof options.filter !== "object") {
@@ -90,11 +92,6 @@ export class FsBackend {
 			}
 			if (!Array.isArray(options.filter.includePaths)) {
 				throw new TypeError("FsBackend filter.includePaths must be an array");
-			}
-			if (options.filter.includePaths.length === 0) {
-				throw new TypeError(
-					"FsBackend filter.includePaths must contain at least one path",
-				);
 			}
 			for (const includePath of options.filter.includePaths) {
 				if (typeof includePath !== "string" || includePath.length === 0) {
@@ -110,7 +107,7 @@ export class FsBackend {
 			}
 		}
 		this.path = options.path;
-		this.storage = options.storage ?? "persistent";
+		this.lixDir = options.lixDir;
 		this.filter = options.filter
 			? { includePaths: [...options.filter.includePaths] }
 			: undefined;
@@ -131,7 +128,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		return new Lix(
 			await addon.Lix.openFs(
 				options.backend.path,
-				options.backend.storage,
+				options.backend.lixDir,
 				options.backend.filter?.includePaths,
 			),
 		);
