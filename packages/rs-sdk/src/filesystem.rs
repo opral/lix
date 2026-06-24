@@ -76,7 +76,7 @@ impl FilesystemLayout {
                     "/.lix".to_string()
                 });
             }
-            return Ok(format!("/.lix{}", path));
+            return Ok(format!("/.lix{path}"));
         }
         local_path_to_lix_path(&self.root, path, is_directory)
     }
@@ -1296,15 +1296,11 @@ fn validate_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
 
 fn ensure_filesystem_lix_directory(lix_dir: &Path) -> Result<(), LixError> {
     validate_lix_directory_name(lix_dir)?;
-    match std::fs::create_dir(&lix_dir) {
+    match std::fs::create_dir(lix_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
-            return Err(io_error(
-                "create filesystem .lix directory",
-                &lix_dir,
-                error,
-            ));
+            return Err(io_error("create filesystem .lix directory", lix_dir, error));
         }
     }
 
