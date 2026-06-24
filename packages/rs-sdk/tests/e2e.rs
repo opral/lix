@@ -3,7 +3,7 @@ use lix_sdk::{
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 #[cfg(feature = "fs_backend")]
-use lix_sdk::{FsBackend, open_lix_with_backend};
+use lix_sdk::{FsBackend, FsBackendFilter, FsBackendOpenOptions, open_lix_with_backend};
 #[cfg(feature = "fs_backend")]
 use std::path::Path;
 #[cfg(feature = "fs_backend")]
@@ -536,6 +536,19 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
     open_lix_with_backend(backend).await.unwrap()
 }
 
+#[cfg(feature = "fs_backend")]
+async fn open_lix_with_filtered_filesystem(path: &Path, include_paths: &[&str]) -> Lix<FsBackend> {
+    let mut options = FsBackendOpenOptions::new(path.to_path_buf());
+    options.filter = FsBackendFilter::new(Some(
+        include_paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+    ));
+    let backend = FsBackend::open_with_options(options).await.unwrap();
+    open_lix_with_backend(backend).await.unwrap()
+}
+
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
 async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
@@ -848,6 +861,96 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 
     rm(&lix, "/empty-sdk/").await.unwrap();
     assert!(!tempdir.path().join("empty-sdk").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filtered_filesystem_materializes_lix_created_file_outside_initial_filter() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["initial.md"]).await;
+
+    write_file(&lix, "/new-file.md", b"new".to_vec())
+        .await
+        .unwrap();
+
+    wait_for_disk_file(&tempdir.path().join("new-file.md"), Some(b"new"));
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filtered_filesystem_watches_nested_lix_created_file_after_materialization() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["initial.md"]).await;
+
+    write_file(&lix, "/nested/new-file.md", b"new".to_vec())
+        .await
+        .unwrap();
+    let disk_path = tempdir.path().join("nested/new-file.md");
+    wait_for_disk_file(&disk_path, Some(b"new"));
+
+    std::fs::write(&disk_path, b"edited").unwrap();
+    wait_for_lix_file(&lix, "/nested/new-file.md", Some(b"edited")).await;
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filtered_filesystem_lix_delete_removes_path_from_active_filter() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["initial.md"]).await;
+
+    write_file(&lix, "/new-file.md", b"new".to_vec())
+        .await
+        .unwrap();
+    let deleted_path = tempdir.path().join("new-file.md");
+    wait_for_disk_file(&deleted_path, Some(b"new"));
+
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/new-file.md".to_string())],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&deleted_path, None);
+
+    std::fs::write(&deleted_path, b"recreated").unwrap();
+    std::fs::write(tempdir.path().join("initial.md"), b"changed").unwrap();
+    wait_for_lix_file(&lix, "/initial.md", Some(b"changed")).await;
+    assert_eq!(read_file(&lix, "/new-file.md").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "fs_backend")]
+async fn filtered_filesystem_lix_rename_replaces_tracked_path() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("old.md"), b"old").unwrap();
+    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["old.md"]).await;
+
+    lix.execute(
+        "UPDATE lix_file SET path = $1 WHERE path = $2",
+        &[
+            Value::Text("/nested/renamed.md".to_string()),
+            Value::Text("/old.md".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let old_path = tempdir.path().join("old.md");
+    let renamed_path = tempdir.path().join("nested/renamed.md");
+    wait_for_disk_file(&old_path, None);
+    wait_for_disk_file(&renamed_path, Some(b"old"));
+
+    std::fs::write(&old_path, b"recreated").unwrap();
+    std::fs::write(&renamed_path, b"edited").unwrap();
+    wait_for_lix_file(&lix, "/nested/renamed.md", Some(b"edited")).await;
+    assert_eq!(read_file(&lix, "/old.md").await.unwrap(), None);
     lix.close().await.unwrap();
 }
 
