@@ -501,7 +501,7 @@ test("fs backend filter only syncs included paths", async () => {
 	await lix.close();
 });
 
-test("fs backend filter requires explicit include paths", () => {
+test("fs backend filter validates include paths", () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 
@@ -518,7 +518,7 @@ test("fs backend filter requires explicit include paths", () => {
 	).toThrow("FsBackend filter.includePaths must be an array");
 	expect(
 		() => new FsBackend({ path: dir, filter: { includePaths: [] } }),
-	).toThrow("FsBackend filter.includePaths must contain at least one path");
+	).not.toThrow();
 	expect(
 		() =>
 			new FsBackend({
@@ -535,6 +535,34 @@ test("fs backend filter requires explicit include paths", () => {
 	).toThrow(
 		"FsBackend filter.includePaths must contain file paths, not directory paths",
 	);
+});
+
+test("fs backend empty filter imports no regular workspace files", async () => {
+	const dir = tempFsDir();
+	const lixDir = tempExternalLixDir();
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "note.md"), "excluded");
+
+	const lix = await openLix({
+		backend: new FsBackend({
+			path: dir,
+			lixDir,
+			filter: { includePaths: [] },
+		}),
+	});
+
+	expect(await readFile(lix, "/note.md")).toBeUndefined();
+	await writeFile(
+		lix,
+		"/.lix/app_data/test.bin",
+		new TextEncoder().encode("internal"),
+	);
+	expect(readFileSync(join(lixDir, "app_data", "test.bin"), "utf8")).toBe(
+		"internal",
+	);
+	expect(existsSync(join(dir, "note.md"))).toBe(true);
+
+	await lix.close();
 });
 
 test("fs backend filter treats paths as exact filenames", async () => {

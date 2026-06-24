@@ -93,11 +93,6 @@ export class FsBackend {
 			if (!Array.isArray(options.filter.includePaths)) {
 				throw new TypeError("FsBackend filter.includePaths must be an array");
 			}
-			if (options.filter.includePaths.length === 0) {
-				throw new TypeError(
-					"FsBackend filter.includePaths must contain at least one path",
-				);
-			}
 			for (const includePath of options.filter.includePaths) {
 				if (typeof includePath !== "string" || includePath.length === 0) {
 					throw new TypeError(

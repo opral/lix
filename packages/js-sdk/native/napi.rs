@@ -603,25 +603,6 @@ pub struct OpenSqliteTask {
     path: String,
 }
 
-fn parse_fs_backend_filter(
-    env: &Env,
-    include_paths: Option<Vec<String>>,
-) -> Result<FsBackendFilter> {
-    let Some(include_paths) = include_paths else {
-        return Ok(FsBackendFilter::default());
-    };
-    if include_paths.is_empty() {
-        return Err(throw_lix_error(
-            env,
-            LixError::new(
-                "LIX_INVALID_ARGUMENT",
-                "filesystem backend filter.includePaths must contain at least one path",
-            ),
-        ));
-    }
-    Ok(FsBackendFilter::include_paths(include_paths))
-}
-
 impl Task for OpenFsTask {
     type Output = std::result::Result<NativeLix, LixError>;
     type JsValue = NativeLix;
@@ -715,17 +696,15 @@ impl NativeLix {
 
     #[napi(js_name = "openFs")]
     pub fn open_fs(
-        env: Env,
         path: String,
         lix_dir: Option<String>,
         include_paths: Option<Vec<String>>,
-    ) -> Result<AsyncTask<OpenFsTask>> {
-        let filter = parse_fs_backend_filter(&env, include_paths)?;
-        Ok(AsyncTask::new(OpenFsTask {
+    ) -> AsyncTask<OpenFsTask> {
+        AsyncTask::new(OpenFsTask {
             path,
             lix_dir,
-            filter,
-        }))
+            filter: FsBackendFilter::new(include_paths),
+        })
     }
 
     #[napi]

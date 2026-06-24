@@ -46,11 +46,11 @@ struct FilesystemLayout {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct FsBackendFilter {
-    pub include_paths: Vec<String>,
+    pub include_paths: Option<Vec<String>>,
 }
 
 impl FsBackendFilter {
-    pub fn include_paths(include_paths: Vec<String>) -> Self {
+    pub fn new(include_paths: Option<Vec<String>>) -> Self {
         Self { include_paths }
     }
 }
@@ -121,7 +121,7 @@ impl FsBackendOpenOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct FilesystemPathFilter {
-    include_files: BTreeSet<String>,
+    include_files: Option<BTreeSet<String>>,
 }
 
 pub(crate) struct FilesystemWrite<'a, B>
@@ -217,29 +217,41 @@ impl Snapshot {
 
 impl FilesystemPathFilter {
     fn from_filter(filter: FsBackendFilter) -> Result<Self, LixError> {
-        let mut include_files = BTreeSet::new();
-        for path in filter.include_paths {
-            include_files.insert(normalize_filter_file_path(&path)?);
-        }
+        let include_files = filter
+            .include_paths
+            .map(|include_paths| {
+                include_paths
+                    .into_iter()
+                    .map(|path| normalize_filter_file_path(&path))
+                    .collect::<Result<BTreeSet<_>, LixError>>()
+            })
+            .transpose()?;
         Ok(Self { include_files })
     }
 
     fn is_unfiltered(&self) -> bool {
-        self.include_files.is_empty()
+        self.include_files.is_none()
     }
 
     fn includes_file(&self, path: &str) -> bool {
-        is_lix_storage_path(path) || self.is_unfiltered() || self.include_files.contains(path)
+        is_lix_storage_path(path)
+            || self
+                .include_files
+                .as_ref()
+                .is_none_or(|include_files| include_files.contains(path))
     }
 
     fn includes_directory(&self, path: &str) -> bool {
         if is_lix_storage_path(path) {
             return true;
         }
-        if self.is_unfiltered() || path == "/" {
+        if path == "/" {
             return true;
         }
-        self.include_files.iter().any(|file_path| {
+        let Some(include_files) = self.include_files.as_ref() else {
+            return true;
+        };
+        include_files.iter().any(|file_path| {
             let directory = parent_lix_directory_path(file_path);
             lix_directory_contains_directory(path, &directory)
         })
@@ -255,7 +267,10 @@ impl FilesystemPathFilter {
 
     fn local_watch_paths(&self, layout: &FilesystemLayout) -> Result<Vec<PathBuf>, LixError> {
         let mut paths = BTreeSet::new();
-        for path in &self.include_files {
+        let Some(include_files) = self.include_files.as_ref() else {
+            return Ok(paths.into_iter().collect());
+        };
+        for path in include_files {
             let local_path = layout.lix_path_to_local_path(path)?;
             if local_path.exists() {
                 paths.insert(local_path.clone());
@@ -1187,7 +1202,10 @@ fn collect_filtered_local_snapshot(
     path_filter: &FilesystemPathFilter,
     snapshot: &mut Snapshot,
 ) -> Result<(), LixError> {
-    for lix_path in &path_filter.include_files {
+    let Some(include_files) = path_filter.include_files.as_ref() else {
+        return Ok(());
+    };
+    for lix_path in include_files {
         if is_lix_storage_path(lix_path) || is_filesystem_sync_ignored_lix_path(lix_path) {
             continue;
         }
@@ -2227,6 +2245,39 @@ mod tests {
             1 + (FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS * 2)
         );
         assert!(snapshot.unmanaged_paths.is_empty());
+    }
+
+    #[test]
+    fn collect_local_snapshot_with_empty_filter_keeps_lix_storage_only() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        std::fs::write(root.join("root.md"), b"root").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs").join("note.markdown"), b"note").unwrap();
+
+        let layout = prepare_filesystem_layout(root, None).unwrap();
+        std::fs::create_dir_all(layout.lix_dir.join("app_data")).unwrap();
+        std::fs::write(
+            layout.lix_dir.join("app_data").join("test.bin"),
+            b"internal",
+        )
+        .unwrap();
+        let path_filter =
+            FilesystemPathFilter::from_filter(FsBackendFilter::new(Some(vec![]))).unwrap();
+
+        let snapshot = collect_local_snapshot(&layout, &path_filter).unwrap();
+
+        assert!(!path_filter.is_unfiltered());
+        assert!(snapshot.directories.contains("/"));
+        assert!(!snapshot.directories.contains("/docs/"));
+        assert!(!snapshot.files.contains_key("/root.md"));
+        assert!(!snapshot.files.contains_key("/docs/note.markdown"));
+        assert!(snapshot.directories.contains("/.lix/"));
+        assert!(snapshot.directories.contains("/.lix/app_data/"));
+        assert_eq!(
+            snapshot.files.get("/.lix/app_data/test.bin").unwrap(),
+            b"internal"
+        );
     }
 
     #[test]
