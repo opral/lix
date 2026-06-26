@@ -43,18 +43,6 @@ struct FilesystemLayout {
     lix_dir_is_default: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub struct FsBackendFilter {
-    pub include_paths: Option<Vec<String>>,
-}
-
-impl FsBackendFilter {
-    pub fn new(include_paths: Option<Vec<String>>) -> Self {
-        Self { include_paths }
-    }
-}
-
 impl FilesystemLayout {
     fn lix_path_to_local_path(&self, path: &str) -> Result<PathBuf, LixError> {
         if path == "/.lix" {
@@ -102,19 +90,19 @@ impl FilesystemLayout {
 pub struct FsBackendOpenOptions {
     pub root: PathBuf,
     pub lix_dir: Option<PathBuf>,
-    pub filter: FsBackendFilter,
+    pub sync_all_files: bool,
 }
 
 #[cfg(feature = "fs_backend")]
 impl FsBackendOpenOptions {
-    pub fn new<P>(root: P) -> Self
+    pub fn new<P>(root: P, sync_all_files: bool) -> Self
     where
         P: Into<PathBuf>,
     {
         Self {
             root: root.into(),
             lix_dir: None,
-            filter: FsBackendFilter::default(),
+            sync_all_files,
         }
     }
 }
@@ -226,17 +214,13 @@ impl Snapshot {
 }
 
 impl FilesystemPathFilter {
-    fn from_filter(filter: FsBackendFilter) -> Result<Self, LixError> {
-        let include_files = filter
-            .include_paths
-            .map(|include_paths| {
-                include_paths
-                    .into_iter()
-                    .map(|path| normalize_filter_file_path(&path))
-                    .collect::<Result<BTreeSet<_>, LixError>>()
-            })
-            .transpose()?;
-        Ok(Self { include_files })
+    fn from_sync_all_files(sync_all_files: bool) -> Self {
+        let include_files = if sync_all_files {
+            None
+        } else {
+            Some(BTreeSet::new())
+        };
+        Self { include_files }
     }
 
     fn is_unfiltered(&self) -> bool {
@@ -338,6 +322,10 @@ enum FilesystemEvent {
     SyncFromLix {
         reply_tx: mpsc::SyncSender<Result<(), LixError>>,
     },
+    ImportPaths {
+        paths: Vec<String>,
+        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+    },
     Shutdown,
 }
 
@@ -350,17 +338,25 @@ impl FsBackend {
         Self::open_with_options(FsBackendOpenOptions {
             root: dir.as_ref().to_path_buf(),
             lix_dir: None,
-            filter: FsBackendFilter::default(),
+            sync_all_files: true,
         })
         .await
     }
 
     pub async fn open_with_options(options: FsBackendOpenOptions) -> Result<Self, LixError> {
-        FilesystemPathFilter::from_filter(options.filter.clone())?;
         let layout = prepare_filesystem_layout(&options.root, options.lix_dir.as_deref())?;
         let backend = open_filesystem_rocksdb_backend(&layout)?;
-        let inner = FilesystemSync::open_filesystem(backend, layout, options.filter).await?;
+        let inner =
+            FilesystemSync::open_filesystem(backend, layout, options.sync_all_files).await?;
         Ok(Self { inner })
+    }
+
+    pub async fn import_paths<I, S>(&self, paths: I) -> Result<(), LixError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.inner.import_paths(paths).await
     }
 }
 
@@ -420,23 +416,36 @@ where
     async fn open_filesystem(
         backend: B,
         layout: FilesystemLayout,
-        filter: FsBackendFilter,
+        sync_all_files: bool,
     ) -> Result<Self, LixError> {
         let engine =
             crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None).await?;
-        Self::open_with_engine(backend, engine, layout, filter).await
+        Self::open_with_engine(backend, engine, layout, sync_all_files).await
     }
 
     async fn open_with_engine(
         backend: B,
         engine: Engine<B>,
         layout: FilesystemLayout,
-        filter: FsBackendFilter,
+        sync_all_files: bool,
     ) -> Result<Self, LixError> {
         Ok(Self {
             inner: backend,
-            supervisor: FilesystemSupervisor::open(engine, layout, filter).await?,
+            supervisor: FilesystemSupervisor::open(engine, layout, sync_all_files).await?,
         })
+    }
+
+    async fn import_paths<I, S>(&self, paths: I) -> Result<(), LixError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.supervisor.import_paths_blocking(
+            paths
+                .into_iter()
+                .map(|path| path.as_ref().to_string())
+                .collect(),
+        )
     }
 }
 
@@ -506,11 +515,11 @@ where
     async fn open(
         engine: Engine<B>,
         layout: FilesystemLayout,
-        filter: FsBackendFilter,
+        sync_all_files: bool,
     ) -> Result<Self, LixError> {
         validate_filesystem_root_directory(&layout.root)?;
         validate_filesystem_lix_directory(&layout.lix_dir)?;
-        let path_filter = FilesystemPathFilter::from_filter(filter)?;
+        let path_filter = FilesystemPathFilter::from_sync_all_files(sync_all_files);
         let session = engine.open_workspace_session().await?;
         let state = Arc::new(FilesystemState {
             session,
@@ -585,6 +594,24 @@ where
             Ok(Err(error)) => Err(filesystem_sync_backend_error(error)),
             Err(error) => Err(BackendError::Io(format!(
                 "filesystem sync failed: filesystem worker stopped: {error}"
+            ))),
+        }
+    }
+
+    fn import_paths_blocking(&self, paths: Vec<String>) -> Result<(), LixError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.inner
+            .event_tx
+            .send(FilesystemEvent::ImportPaths { paths, reply_tx })
+            .map_err(|error| {
+                filesystem_error(format!(
+                    "filesystem import failed: filesystem worker stopped: {error}"
+                ))
+            })?;
+        match reply_rx.recv() {
+            Ok(result) => result,
+            Err(error) => Err(filesystem_error(format!(
+                "filesystem import failed: filesystem worker stopped: {error}"
             ))),
         }
     }
@@ -706,6 +733,26 @@ where
             self.materialize_snapshot_with_filter(&lix.snapshot, Some(&local), &path_filter)?;
         self.remember_materialized(materialized, lix.revision, lix_file_paths(&lix.snapshot));
         Ok(())
+    }
+
+    async fn import_paths(&self, paths: Vec<String>) -> Result<(), LixError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let normalized_paths = paths
+            .into_iter()
+            .map(|path| normalize_filter_file_path(&path))
+            .collect::<Result<Vec<_>, LixError>>()?;
+        {
+            let mut path_filter = self
+                .path_filter
+                .lock()
+                .expect("filesystem path filter lock should not poison");
+            for path in normalized_paths {
+                path_filter.add_file(&path);
+            }
+        }
+        self.sync_disk_to_lix(true).await
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -1116,6 +1163,25 @@ fn filesystem_worker<B>(
                     return;
                 }
             }
+            Ok(FilesystemEvent::ImportPaths { paths, reply_tx }) => {
+                let _ = import_paths_for_replies(
+                    &runtime,
+                    &state,
+                    vec![(paths, reply_tx)],
+                    &mut debouncer,
+                    &mut poll_filesystem,
+                );
+                if drain_filesystem_events(
+                    &runtime,
+                    &state,
+                    &event_rx,
+                    false,
+                    &mut debouncer,
+                    &mut poll_filesystem,
+                ) {
+                    return;
+                }
+            }
             Ok(FilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.block_on(state.close());
                 return;
@@ -1138,10 +1204,14 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     let mut sync_replies = Vec::new();
+    let mut import_replies = Vec::new();
     loop {
         match event_rx.try_recv() {
             Ok(FilesystemEvent::DiskChanged) => sync_disk = true,
             Ok(FilesystemEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
+            Ok(FilesystemEvent::ImportPaths { paths, reply_tx }) => {
+                import_replies.push((paths, reply_tx));
+            }
             Ok(FilesystemEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
                 let _ = runtime.block_on(state.close());
                 return true;
@@ -1157,7 +1227,36 @@ where
     if !sync_replies.is_empty() {
         let _ = sync_from_lix_for_replies(runtime, state, sync_replies, debouncer, poll_filesystem);
     }
+    if !import_replies.is_empty() {
+        let _ =
+            import_paths_for_replies(runtime, state, import_replies, debouncer, poll_filesystem);
+    }
     false
+}
+
+fn import_paths_for_replies<B>(
+    runtime: &tokio::runtime::Runtime,
+    state: &Arc<FilesystemState<B>>,
+    replies: Vec<(Vec<String>, mpsc::SyncSender<Result<(), LixError>>)>,
+    debouncer: &mut Option<FilesystemWatcher>,
+    poll_filesystem: &mut bool,
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let mut first_error = None;
+    for (paths, reply) in replies {
+        let result = runtime.block_on(state.import_paths(paths));
+        if result.is_ok() {
+            refresh_filesystem_watcher(state, debouncer, poll_filesystem);
+        } else if first_error.is_none() {
+            first_error = result.clone().err();
+        }
+        let _ = reply.send(result);
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn sync_from_lix_for_replies<B>(
@@ -2502,8 +2601,7 @@ mod tests {
             b"internal",
         )
         .unwrap();
-        let path_filter =
-            FilesystemPathFilter::from_filter(FsBackendFilter::new(Some(vec![]))).unwrap();
+        let path_filter = FilesystemPathFilter::from_sync_all_files(false);
 
         let snapshot = collect_local_snapshot(&layout, &path_filter).unwrap();
 
@@ -2707,7 +2805,7 @@ mod tests {
         let backend = FsBackend::open_with_options(FsBackendOpenOptions {
             root: root.path().to_path_buf(),
             lix_dir: Some(lix_dir.clone()),
-            filter: FsBackendFilter::default(),
+            sync_all_files: true,
         })
         .await
         .unwrap();

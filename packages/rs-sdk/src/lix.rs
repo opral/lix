@@ -46,6 +46,7 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     _engine: Engine<B>,
+    backend: B,
     session: SessionContext<B>,
 }
 
@@ -60,10 +61,12 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    let engine = open_or_initialize_engine(options.backend, options.wasm_runtime).await?;
+    let backend = options.backend;
+    let engine = open_or_initialize_engine(backend.clone(), options.wasm_runtime).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
+        backend,
         session,
     })
 }
@@ -141,6 +144,17 @@ where
 
     pub async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
+impl Lix<crate::FsBackend> {
+    pub async fn import_filesystem_paths<I, S>(&self, paths: I) -> Result<(), LixError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.backend.import_paths(paths).await
     }
 }
 

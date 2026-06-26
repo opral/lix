@@ -1,7 +1,7 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, FsBackend, FsBackendFilter, FsBackendOpenOptions,
-    InMemoryBackend, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    ExecuteResult as RsExecuteResult, FsBackend, FsBackendOpenOptions, InMemoryBackend,
+    Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
@@ -90,6 +90,10 @@ enum LixCommand {
     SwitchBranch {
         options: RsSwitchBranchOptions,
         deferred: NativeSwitchBranchDeferred,
+    },
+    ImportFilesystemPaths {
+        paths: Vec<String>,
+        deferred: NativeUnitDeferred,
     },
     MergeBranchPreview {
         options: MergeBranchPreviewOptions,
@@ -253,7 +257,8 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
             LixCommand::TransactionExecute { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
             }
-            LixCommand::TransactionCommit { deferred, .. }
+            LixCommand::ImportFilesystemPaths { deferred, .. }
+            | LixCommand::TransactionCommit { deferred, .. }
             | LixCommand::TransactionRollback { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
             }
@@ -310,6 +315,11 @@ fn handle_lix_command(
             let result = rt
                 .block_on(state.lix.switch_branch(options))
                 .map(SwitchBranchReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::ImportFilesystemPaths { paths, deferred } => {
+            let result = rt.block_on(state.lix.import_filesystem_paths(paths));
             settle_deferred(deferred, result);
             false
         }
@@ -423,7 +433,8 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::Observe { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
-        LixCommand::TransactionCommit { deferred, .. }
+        LixCommand::ImportFilesystemPaths { deferred, .. }
+        | LixCommand::TransactionCommit { deferred, .. }
         | LixCommand::TransactionRollback { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -506,6 +517,19 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.switch_branch(options).await,
             Self::Sqlite(lix) => lix.switch_branch(options).await,
             Self::Fs(lix) => lix.switch_branch(options).await,
+        }
+    }
+
+    async fn import_filesystem_paths(
+        &self,
+        paths: Vec<String>,
+    ) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Fs(lix) => lix.import_filesystem_paths(paths).await,
+            Self::Memory(_) | Self::Sqlite(_) => Err(LixError::new(
+                "LIX_UNSUPPORTED_BACKEND",
+                "importFilesystemPaths requires a filesystem backend",
+            )),
         }
     }
 
@@ -592,7 +616,7 @@ impl NativeObserveEventsInner {
 pub struct OpenFsTask {
     path: String,
     lix_dir: Option<String>,
-    filter: FsBackendFilter,
+    sync_all_files: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -611,7 +635,7 @@ impl Task for OpenFsTask {
         Ok(open_fs_native(
             std::mem::take(&mut self.path),
             self.lix_dir.take(),
-            std::mem::take(&mut self.filter),
+            std::mem::take(&mut self.sync_all_files),
         ))
     }
 
@@ -668,15 +692,14 @@ fn open_sqlite_native(path: String) -> std::result::Result<NativeLix, LixError> 
 fn open_fs_native(
     path: String,
     lix_dir: Option<String>,
-    filter: FsBackendFilter,
+    sync_all_files: bool,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let mut options = FsBackendOpenOptions::new(path);
+    let mut options = FsBackendOpenOptions::new(path, sync_all_files);
     options.lix_dir = lix_dir.map(Into::into);
-    options.filter = filter;
     let backend = rt.block_on(FsBackend::open_with_options(options))?;
     let lix = rt.block_on(open_lix_with_backend(backend))?;
     NativeLix::new(NativeLixInner::Fs(lix))
@@ -698,12 +721,12 @@ impl NativeLix {
     pub fn open_fs(
         path: String,
         lix_dir: Option<String>,
-        include_paths: Option<Vec<String>>,
+        sync_all_files: bool,
     ) -> AsyncTask<OpenFsTask> {
         AsyncTask::new(OpenFsTask {
             path,
             lix_dir,
-            filter: FsBackendFilter::new(include_paths),
+            sync_all_files,
         })
     }
 
@@ -808,6 +831,21 @@ impl NativeLix {
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::SwitchBranch {
                 options: options.into(),
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "importFilesystemPaths")]
+    pub fn import_filesystem_paths<'env>(
+        &self,
+        env: &'env Env,
+        paths: Vec<String>,
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::ImportFilesystemPaths {
+                paths,
                 deferred,
             });
         Ok(promise)
