@@ -72,8 +72,6 @@ const cargoArgs = [
 	"plugin_md_v2",
 	"--target",
 	targetTriple,
-	"--target-dir",
-	cargoTargetRoot,
 ];
 cargoArgs.push("--profile", profile);
 await run("cargo", cargoArgs);
