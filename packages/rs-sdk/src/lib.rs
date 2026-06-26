@@ -13,7 +13,7 @@ mod lix;
 mod sqlite_backend;
 
 #[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
-pub use filesystem::{FsBackend, FsBackendFilter, FsBackendOpenOptions};
+pub use filesystem::{FsBackend, FsBackendOpenOptions};
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
 pub use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,

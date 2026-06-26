@@ -14,7 +14,10 @@ npm install @lix-js/sdk
 import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "./workspace" }),
+	backend: new FsBackend({
+		path: "./workspace",
+		syncAllFiles: true,
+	}),
 });
 
 await lix.execute(
@@ -72,9 +75,9 @@ try {
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new FsBackend({ path })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
-- Pass `new FsBackend({ path, lixDir })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
-- Add `filter: { includePaths: ["notes/today.md"] }` to sync only selected files from a filesystem backend. `includePaths` entries are exact workspace-relative file paths, not directories or globs. They may be written with or without a leading slash, and only affect filesystem sync.
+- `openLix()` opens a fresh in-memory Lix. Pass `new FsBackend({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
+- Pass `new FsBackend({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
+- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `lix.importFilesystemPaths(["notes/today.md"])` to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
 - Use `new SqliteBackend({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 - The SDK is Node/native only right now; it is not browser-compatible.
 - The package is ESM-only.

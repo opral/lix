@@ -26,7 +26,10 @@ const lix = await openLix();
 import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "./workspace" }),
+	backend: new FsBackend({
+		path: "./workspace",
+		syncAllFiles: true,
+	}),
 });
 ```
 

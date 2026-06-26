@@ -37,7 +37,10 @@ talks to the outside system where Lix data lives, it is a backend.
 import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "/var/data/workspace" }),
+	backend: new FsBackend({
+		path: "/var/data/workspace",
+		syncAllFiles: true,
+	}),
 });
 ```
 

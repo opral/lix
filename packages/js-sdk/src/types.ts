@@ -5,9 +5,7 @@ export type SqliteBackendOptions = {
 export type FsBackendOptions = {
 	path: string;
 	lixDir?: string;
-	filter?: {
-		includePaths: readonly string[];
-	};
+	syncAllFiles: boolean;
 };
 
 export type OpenLixOptions = {

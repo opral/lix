@@ -28,7 +28,10 @@ npm install @lix-js/sdk
 import { FsBackend, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "/var/data/workspace" }),
+	backend: new FsBackend({
+		path: "/var/data/workspace",
+		syncAllFiles: true,
+	}),
 });
 
 // ... use it ...
@@ -51,6 +54,7 @@ const lix = await openLix({
 	backend: new FsBackend({
 		path: "/var/data/workspace",
 		lixDir: "/tmp/session/.lix",
+		syncAllFiles: true,
 	}),
 });
 ```
@@ -69,23 +73,28 @@ import path from "node:path";
 
 const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-	backend: new FsBackend({ path: path.join(dir, "workspace") }),
+	backend: new FsBackend({
+		path: path.join(dir, "workspace"),
+		syncAllFiles: true,
+	}),
 });
 ```
 
-Add a filter when only specific files should participate in filesystem sync.
-`includePaths` entries are exact workspace-relative file paths, not directories
-or globs. They may be written with or without a leading slash, for example
-`"notes/today.md"` or `"/notes/today.md"`. The filter scopes disk import, file
-watching, and materialization; it does not filter unrelated Lix SQL state.
+Set `syncAllFiles: false` when filesystem sync should start with no regular
+workspace files, then import selected files with `importFilesystemPaths()`. Imported paths
+are exact workspace-relative file paths, not directories or globs. They may be
+written with or without a leading slash, for example `"notes/today.md"` or
+`"/notes/today.md"`. This scopes disk import, file watching, and
+materialization; it does not filter unrelated Lix SQL state.
 
 ```ts
 const lix = await openLix({
 	backend: new FsBackend({
 		path: "/Users/me/Downloads",
-		filter: { includePaths: ["notes/today.md"] },
+		syncAllFiles: false,
 	}),
 });
+await lix.importFilesystemPaths(["notes/today.md"]);
 ```
 
 ## Single .lix application file

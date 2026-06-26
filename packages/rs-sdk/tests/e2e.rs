@@ -3,7 +3,7 @@ use lix_sdk::{
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 #[cfg(feature = "fs_backend")]
-use lix_sdk::{FsBackend, FsBackendFilter, FsBackendOpenOptions, open_lix_with_backend};
+use lix_sdk::{FsBackend, FsBackendOpenOptions, open_lix_with_backend};
 #[cfg(feature = "fs_backend")]
 use std::path::Path;
 #[cfg(feature = "fs_backend")]
@@ -537,16 +537,14 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
 }
 
 #[cfg(feature = "fs_backend")]
-async fn open_lix_with_filtered_filesystem(path: &Path, include_paths: &[&str]) -> Lix<FsBackend> {
-    let mut options = FsBackendOpenOptions::new(path.to_path_buf());
-    options.filter = FsBackendFilter::new(Some(
-        include_paths
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect(),
-    ));
+async fn open_lix_with_on_demand_filesystem(path: &Path, file_paths: &[&str]) -> Lix<FsBackend> {
+    let options = FsBackendOpenOptions::new(path.to_path_buf(), false);
     let backend = FsBackend::open_with_options(options).await.unwrap();
-    open_lix_with_backend(backend).await.unwrap()
+    let lix = open_lix_with_backend(backend).await.unwrap();
+    lix.import_filesystem_paths(file_paths.iter().copied())
+        .await
+        .unwrap();
+    lix
 }
 
 #[tokio::test]
@@ -866,10 +864,10 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filtered_filesystem_materializes_lix_created_file_outside_initial_filter() {
+async fn on_demand_filesystem_materializes_lix_created_file_outside_initial_imports() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
-    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["initial.md"]).await;
+    let lix = open_lix_with_on_demand_filesystem(tempdir.path(), &["initial.md"]).await;
 
     write_file(&lix, "/new-file.md", b"new".to_vec())
         .await
@@ -881,10 +879,10 @@ async fn filtered_filesystem_materializes_lix_created_file_outside_initial_filte
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filtered_filesystem_watches_nested_lix_created_file_after_materialization() {
+async fn on_demand_filesystem_watches_nested_lix_created_file_after_materialization() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
-    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["initial.md"]).await;
+    let lix = open_lix_with_on_demand_filesystem(tempdir.path(), &["initial.md"]).await;
 
     write_file(&lix, "/nested/new-file.md", b"new".to_vec())
         .await
@@ -899,10 +897,10 @@ async fn filtered_filesystem_watches_nested_lix_created_file_after_materializati
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filtered_filesystem_lix_delete_removes_path_from_active_filter() {
+async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
-    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["initial.md"]).await;
+    let lix = open_lix_with_on_demand_filesystem(tempdir.path(), &["initial.md"]).await;
 
     write_file(&lix, "/new-file.md", b"new".to_vec())
         .await
@@ -927,10 +925,10 @@ async fn filtered_filesystem_lix_delete_removes_path_from_active_filter() {
 
 #[tokio::test]
 #[cfg(feature = "fs_backend")]
-async fn filtered_filesystem_lix_rename_replaces_tracked_path() {
+async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("old.md"), b"old").unwrap();
-    let lix = open_lix_with_filtered_filesystem(tempdir.path(), &["old.md"]).await;
+    let lix = open_lix_with_on_demand_filesystem(tempdir.path(), &["old.md"]).await;
 
     lix.execute(
         "UPDATE lix_file SET path = $1 WHERE path = $2",

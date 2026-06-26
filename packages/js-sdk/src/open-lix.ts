@@ -33,6 +33,7 @@ type NativeLix = {
 	activeBranchId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
+	importFilesystemPaths(paths: string[]): Promise<void>;
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	close(): Promise<void>;
@@ -67,7 +68,7 @@ export class SqliteBackend {
 export class FsBackend {
 	readonly path: string;
 	readonly lixDir: string | undefined;
-	readonly filter: { includePaths: readonly string[] } | undefined;
+	readonly syncAllFiles: boolean;
 
 	constructor(options: FsBackendOptions) {
 		if (
@@ -86,31 +87,12 @@ export class FsBackend {
 		) {
 			throw new TypeError("FsBackend lixDir must be a non-empty string");
 		}
-		if (options.filter !== undefined) {
-			if (!options.filter || typeof options.filter !== "object") {
-				throw new TypeError("FsBackend filter must be an object");
-			}
-			if (!Array.isArray(options.filter.includePaths)) {
-				throw new TypeError("FsBackend filter.includePaths must be an array");
-			}
-			for (const includePath of options.filter.includePaths) {
-				if (typeof includePath !== "string" || includePath.length === 0) {
-					throw new TypeError(
-						"FsBackend filter.includePaths must contain non-empty strings",
-					);
-				}
-				if (includePath.endsWith("/")) {
-					throw new TypeError(
-						"FsBackend filter.includePaths must contain file paths, not directory paths",
-					);
-				}
-			}
+		if (typeof options.syncAllFiles !== "boolean") {
+			throw new TypeError("FsBackend syncAllFiles must be a boolean");
 		}
 		this.path = options.path;
 		this.lixDir = options.lixDir;
-		this.filter = options.filter
-			? { includePaths: [...options.filter.includePaths] }
-			: undefined;
+		this.syncAllFiles = options.syncAllFiles;
 	}
 }
 
@@ -129,7 +111,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			await addon.Lix.openFs(
 				options.backend.path,
 				options.backend.lixDir,
-				options.backend.filter?.includePaths,
+				options.backend.syncAllFiles,
 			),
 		);
 	}
@@ -183,6 +165,25 @@ export class Lix {
 		options: SwitchBranchOptions,
 	): Promise<SwitchBranchReceipt> {
 		return this.native.switchBranch(options);
+	}
+
+	async importFilesystemPaths(paths: readonly string[]): Promise<void> {
+		if (!Array.isArray(paths)) {
+			throw new TypeError("importFilesystemPaths() paths must be an array");
+		}
+		for (const path of paths) {
+			if (typeof path !== "string" || path.length === 0) {
+				throw new TypeError(
+					"importFilesystemPaths() paths must contain non-empty strings",
+				);
+			}
+			if (path.endsWith("/")) {
+				throw new TypeError(
+					"importFilesystemPaths() paths must contain file paths, not directory paths",
+				);
+			}
+		}
+		await this.native.importFilesystemPaths([...paths]);
 	}
 
 	async mergeBranchPreview(
