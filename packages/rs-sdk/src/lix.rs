@@ -154,8 +154,27 @@ impl Lix<crate::FsBackend> {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.ensure_open()?;
         self.backend.import_paths(paths).await
     }
+
+    pub async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
+        self.ensure_open()?;
+        self.backend.sync_disk_to_lix().await
+    }
+
+    fn ensure_open(&self) -> Result<(), LixError> {
+        if self.session.is_closed() {
+            return Err(lix_closed_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
+fn lix_closed_error() -> LixError {
+    LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
+        .with_hint("Open a new Lix handle before calling this method.")
 }
 
 #[expect(missing_debug_implementations)]

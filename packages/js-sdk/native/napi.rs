@@ -103,6 +103,7 @@ enum LixCommand {
         options: RsMergeBranchOptions,
         deferred: NativeMergeReceiptDeferred,
     },
+    SyncDiskToLix(NativeUnitDeferred),
     Close(NativeUnitDeferred),
     Observe {
         sql: String,
@@ -252,14 +253,15 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
                 deferred.reject(to_napi_error(&error));
             }
             LixCommand::MergeBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
-            LixCommand::Close(deferred) => deferred.reject(to_napi_error(&error)),
-            LixCommand::Observe { deferred, .. } => deferred.reject(to_napi_error(&error)),
-            LixCommand::TransactionExecute { deferred, .. } => {
-                deferred.reject(to_napi_error(&error));
-            }
-            LixCommand::ImportFilesystemPaths { deferred, .. }
+            LixCommand::SyncDiskToLix(deferred)
+            | LixCommand::Close(deferred)
+            | LixCommand::ImportFilesystemPaths { deferred, .. }
             | LixCommand::TransactionCommit { deferred, .. }
             | LixCommand::TransactionRollback { deferred, .. } => {
+                deferred.reject(to_napi_error(&error));
+            }
+            LixCommand::Observe { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::TransactionExecute { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
             }
             LixCommand::TransactionAbandon { .. } => {}
@@ -334,6 +336,11 @@ fn handle_lix_command(
             let result = rt
                 .block_on(state.lix.merge_branch(options))
                 .map(MergeBranchReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::SyncDiskToLix(deferred) => {
+            let result = rt.block_on(state.lix.sync_disk_to_lix());
             settle_deferred(deferred, result);
             false
         }
@@ -434,6 +441,7 @@ fn settle_command_after_close(command: LixCommand) {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
         LixCommand::ImportFilesystemPaths { deferred, .. }
+        | LixCommand::SyncDiskToLix(deferred)
         | LixCommand::TransactionCommit { deferred, .. }
         | LixCommand::TransactionRollback { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
@@ -552,6 +560,16 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.merge_branch(options).await,
             Self::Sqlite(lix) => lix.merge_branch(options).await,
             Self::Fs(lix) => lix.merge_branch(options).await,
+        }
+    }
+
+    async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Fs(lix) => lix.sync_disk_to_lix().await,
+            Self::Memory(_) | Self::Sqlite(_) => Err(LixError::new(
+                "LIX_UNSUPPORTED_BACKEND",
+                "syncDiskToLix requires a filesystem backend",
+            )),
         }
     }
 
@@ -880,6 +898,14 @@ impl NativeLix {
                 options: options.into(),
                 deferred,
             });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "syncDiskToLix")]
+    pub fn sync_disk_to_lix<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::SyncDiskToLix);
         Ok(promise)
     }
 

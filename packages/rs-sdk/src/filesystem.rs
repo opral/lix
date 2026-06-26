@@ -319,6 +319,9 @@ struct LixSnapshotRead {
 
 enum FilesystemEvent {
     DiskChanged,
+    SyncDiskToLix {
+        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+    },
     SyncFromLix {
         reply_tx: mpsc::SyncSender<Result<(), LixError>>,
     },
@@ -357,6 +360,10 @@ impl FsBackend {
         S: AsRef<str>,
     {
         self.inner.import_paths(paths).await
+    }
+
+    pub async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
+        self.inner.sync_disk_to_lix().await
     }
 }
 
@@ -446,6 +453,10 @@ where
                 .map(|path| path.as_ref().to_string())
                 .collect(),
         )
+    }
+
+    async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
+        self.supervisor.sync_disk_to_lix_blocking()
     }
 }
 
@@ -577,6 +588,24 @@ where
             }),
             _marker: PhantomData,
         })
+    }
+
+    fn sync_disk_to_lix_blocking(&self) -> Result<(), LixError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.inner
+            .event_tx
+            .send(FilesystemEvent::SyncDiskToLix { reply_tx })
+            .map_err(|error| {
+                filesystem_error(format!(
+                    "filesystem sync failed: filesystem worker stopped: {error}"
+                ))
+            })?;
+        match reply_rx.recv() {
+            Ok(result) => result,
+            Err(error) => Err(filesystem_error(format!(
+                "filesystem sync failed: filesystem worker stopped: {error}"
+            ))),
+        }
     }
 
     fn sync_from_lix_blocking(&self) -> Result<(), BackendError> {
@@ -1144,6 +1173,25 @@ fn filesystem_worker<B>(
                     return;
                 }
             }
+            Ok(FilesystemEvent::SyncDiskToLix { reply_tx }) => {
+                let _ = sync_disk_to_lix_for_replies(
+                    &runtime,
+                    &state,
+                    vec![reply_tx],
+                    &mut debouncer,
+                    &mut poll_filesystem,
+                );
+                if drain_filesystem_events(
+                    &runtime,
+                    &state,
+                    &event_rx,
+                    false,
+                    &mut debouncer,
+                    &mut poll_filesystem,
+                ) {
+                    return;
+                }
+            }
             Ok(FilesystemEvent::SyncFromLix { reply_tx }) => {
                 let _ = sync_from_lix_for_replies(
                     &runtime,
@@ -1203,11 +1251,13 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
+    let mut sync_disk_replies = Vec::new();
     let mut sync_replies = Vec::new();
     let mut import_replies = Vec::new();
     loop {
         match event_rx.try_recv() {
             Ok(FilesystemEvent::DiskChanged) => sync_disk = true,
+            Ok(FilesystemEvent::SyncDiskToLix { reply_tx }) => sync_disk_replies.push(reply_tx),
             Ok(FilesystemEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
             Ok(FilesystemEvent::ImportPaths { paths, reply_tx }) => {
                 import_replies.push((paths, reply_tx));
@@ -1219,10 +1269,14 @@ where
             Err(mpsc::TryRecvError::Empty) => break,
         }
     }
-    if sync_disk {
-        if runtime.block_on(state.sync_disk_to_lix(true)).is_ok() {
-            refresh_filesystem_watcher(state, debouncer, poll_filesystem);
-        }
+    if sync_disk || !sync_disk_replies.is_empty() {
+        let _ = sync_disk_to_lix_for_replies(
+            runtime,
+            state,
+            sync_disk_replies,
+            debouncer,
+            poll_filesystem,
+        );
     }
     if !sync_replies.is_empty() {
         let _ = sync_from_lix_for_replies(runtime, state, sync_replies, debouncer, poll_filesystem);
@@ -1232,6 +1286,28 @@ where
             import_paths_for_replies(runtime, state, import_replies, debouncer, poll_filesystem);
     }
     false
+}
+
+fn sync_disk_to_lix_for_replies<B>(
+    runtime: &tokio::runtime::Runtime,
+    state: &Arc<FilesystemState<B>>,
+    replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
+    debouncer: &mut Option<FilesystemWatcher>,
+    poll_filesystem: &mut bool,
+) -> Result<(), LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = runtime.block_on(state.sync_disk_to_lix(true));
+    if result.is_ok() {
+        refresh_filesystem_watcher(state, debouncer, poll_filesystem);
+    }
+    for reply in replies {
+        let _ = reply.send(result.clone());
+    }
+    result
 }
 
 fn import_paths_for_replies<B>(
@@ -2793,6 +2869,82 @@ mod tests {
         );
 
         state.close().await.unwrap();
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_sync_disk_to_lix_respects_include_paths() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
+        std::fs::write(tempdir.path().join("ignored.md"), b"ignored").unwrap();
+
+        let backend = FsBackend::open_with_options(FsBackendOpenOptions {
+            root: tempdir.path().to_path_buf(),
+            lix_dir: None,
+            sync_all_files: false,
+        })
+        .await
+        .unwrap();
+        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
+        lix.import_filesystem_paths(["tracked.md"]).await.unwrap();
+
+        std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
+        std::fs::write(tempdir.path().join("ignored.md"), b"changed").unwrap();
+
+        lix.sync_disk_to_lix().await.unwrap();
+
+        let tracked = lix
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/tracked.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tracked
+                .rows()
+                .first()
+                .unwrap()
+                .get::<Vec<u8>>("data")
+                .unwrap(),
+            b"changed"
+        );
+
+        let ignored = lix
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/ignored.md".to_string())],
+            )
+            .await
+            .unwrap();
+        assert!(ignored.rows().is_empty());
+
+        lix.close().await.unwrap();
+    }
+
+    #[cfg(feature = "fs_backend")]
+    #[tokio::test]
+    async fn fs_backend_sync_disk_to_lix_after_close_returns_closed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
+
+        let backend = FsBackend::open_with_options(FsBackendOpenOptions {
+            root: tempdir.path().to_path_buf(),
+            lix_dir: None,
+            sync_all_files: true,
+        })
+        .await
+        .unwrap();
+        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
+
+        lix.close().await.unwrap();
+        std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
+
+        let error = lix
+            .sync_disk_to_lix()
+            .await
+            .expect_err("sync after close should fail closed");
+        assert_eq!(error.code, LixError::CODE_CLOSED);
     }
 
     #[cfg(feature = "fs_backend")]

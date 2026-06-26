@@ -36,6 +36,7 @@ type NativeLix = {
 	importFilesystemPaths(paths: string[]): Promise<void>;
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
+	syncDiskToLix(): Promise<void>;
 	close(): Promise<void>;
 };
 
@@ -196,6 +197,10 @@ export class Lix {
 		const receipt = normalizeOptionals(await this.native.mergeBranch(options));
 		receipt.createdMergeCommitId ??= null;
 		return receipt;
+	}
+
+	async syncDiskToLix(): Promise<void> {
+		return this.native.syncDiskToLix();
 	}
 
 	async close(): Promise<void> {
