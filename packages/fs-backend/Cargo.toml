@@ -25,7 +25,7 @@ rocksdb = ["dep:bytes", "dep:rocksdb", "dep:tempfile"]
 lix_engine = { workspace = true }
 
 bytes = { version = "1", optional = true }
-rocksdb = { version = "0.24", default-features = false, optional = true }
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"], optional = true }
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
