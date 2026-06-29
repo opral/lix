@@ -21,7 +21,7 @@ use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
-use crate::{LixError, Value, parse_row_metadata_value};
+use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 
 #[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
@@ -650,11 +650,19 @@ async fn scan_entity_conflict_candidates(
     insert_rows: &[TransactionWriteRow],
 ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
     let mut branch_ids = std::collections::BTreeSet::new();
+    let mut entity_pks = std::collections::BTreeSet::new();
+    let mut file_ids = std::collections::BTreeSet::new();
     let mut untracked_values = std::collections::BTreeSet::new();
     for row in insert_rows {
         branch_ids.insert(row.branch_id.clone());
+        entity_pks.insert(insert_row_entity_pk(row, spec)?);
+        file_ids.insert(row.file_id.clone());
         untracked_values.insert(row.untracked);
     }
+    let file_ids = file_ids
+        .into_iter()
+        .map(|file_id| file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value))
+        .collect::<Vec<_>>();
 
     let mut candidates = Vec::new();
     for untracked in untracked_values {
@@ -662,7 +670,9 @@ async fn scan_entity_conflict_candidates(
             .scan_live_state(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![spec.schema_key.clone()],
+                    entity_pks: entity_pks.iter().cloned().collect(),
                     branch_ids: branch_ids.iter().cloned().collect(),
+                    file_ids: file_ids.clone(),
                     untracked: Some(untracked),
                     include_tombstones: false,
                     ..LiveStateFilter::default()

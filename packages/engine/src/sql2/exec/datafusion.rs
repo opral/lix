@@ -1490,6 +1490,10 @@ mod tests {
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
     }
+    struct CapturingRowsLiveStateReader {
+        rows: Vec<MaterializedLiveStateRow>,
+        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+    }
     struct CountingRowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
         scans: Arc<AtomicUsize>,
@@ -1869,6 +1873,27 @@ mod tests {
     }
 
     #[async_trait]
+    impl LiveStateReader for CapturingRowsLiveStateReader {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.requests
+                .lock()
+                .expect("captured live-state requests lock")
+                .push(request.clone());
+            Ok(filter_live_state_rows(&self.rows, request))
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
     impl LiveStateReader for CountingRowsLiveStateReader {
         async fn scan_rows(
             &self,
@@ -1955,6 +1980,18 @@ mod tests {
             created_at: "2026-04-23T00:00:00Z".to_string(),
             updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
+    }
+
+    fn live_test_state_row(
+        entity_pk: &str,
+        branch_id: &str,
+        value: &str,
+        untracked: bool,
+    ) -> MaterializedLiveStateRow {
+        let mut row = live_entity_row(entity_pk, branch_id, value);
+        row.snapshot_content = Some(json!({ "id": entity_pk, "value": value }).to_string());
+        row.untracked = untracked;
+        row
     }
 
     fn live_directory_row(
@@ -3737,6 +3774,77 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[tokio::test]
+    async fn execute_sql_entity_upsert_conflict_scan_is_narrowed_to_inserted_identity() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(CapturingRowsLiveStateReader {
+            rows: vec![
+                live_test_state_row("target", "branch-b", "old", true),
+                live_test_state_row("other", "branch-b", "skip", true),
+            ],
+            requests: Arc::clone(&requests),
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["id", "value"],
+                "additionalProperties": false
+            })],
+        };
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO test_state_schema_by_branch \
+             (id, value, lixcol_branch_id, lixcol_untracked) \
+             VALUES ('target', 'new', 'branch-b', true) \
+             ON CONFLICT(id, lixcol_branch_id) DO UPDATE SET value = excluded.value",
+            &[],
+            WriteExecutorMode::Auto,
+        )
+        .await
+        .expect("entity upsert should update the matching row");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        let requests = requests.lock().expect("captured requests lock");
+        assert_eq!(requests.len(), 1);
+        let filter = &requests[0].filter;
+        assert_eq!(filter.schema_keys, vec!["test_state_schema"]);
+        assert_eq!(
+            filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single("target")]
+        );
+        assert_eq!(filter.branch_ids, vec!["branch-b"]);
+        assert_eq!(filter.file_ids, vec![NullableKeyFilter::Null]);
+        assert_eq!(filter.untracked, Some(true));
+        assert!(!filter.include_tombstones);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, "[\"target\"]");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"id\":\"target\",\"value\":\"new\"}")
+        );
     }
 
     #[tokio::test]
