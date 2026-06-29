@@ -661,10 +661,7 @@ async fn scan_entity_conflict_candidates(
     }
     let file_ids = file_ids
         .into_iter()
-        .map(|file_id| match file_id {
-            Some(file_id) => NullableKeyFilter::Value(file_id),
-            None => NullableKeyFilter::Null,
-        })
+        .map(|file_id| file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value))
         .collect::<Vec<_>>();
 
     let mut candidates = Vec::new();
