@@ -12,15 +12,17 @@ use lix_sdk::{
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::watch;
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "Lix")]
@@ -924,7 +926,8 @@ impl NativeLix {
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "ObserveEvents")]
 pub struct NativeObserveEvents {
-    commands: Sender<ObserveCommand>,
+    runtime: ObserveRuntime,
+    observe_id: u64,
     closed: Arc<AtomicBool>,
     close_signal: watch::Sender<bool>,
     next_in_flight: Arc<AtomicBool>,
@@ -933,28 +936,15 @@ pub struct NativeObserveEvents {
 #[napi]
 impl NativeObserveEvents {
     fn new(events: NativeObserveEventsInner) -> Result<Self> {
-        let (commands, receiver) = mpsc::channel();
+        let runtime = observe_runtime().map_err(to_napi_error)?.clone();
+        let observe_id = runtime.register(events).map_err(to_napi_error)?;
         let closed = Arc::new(AtomicBool::new(false));
-        let (close_signal, actor_close_signal) = watch::channel(false);
+        let (close_signal, _) = watch::channel(false);
         let next_in_flight = Arc::new(AtomicBool::new(false));
 
-        let actor_closed = Arc::clone(&closed);
-        let actor_next_in_flight = Arc::clone(&next_in_flight);
-        thread::Builder::new()
-            .name("lix-observe-events".to_string())
-            .spawn(move || {
-                run_observe_actor(
-                    events,
-                    receiver,
-                    actor_closed,
-                    actor_close_signal,
-                    actor_next_in_flight,
-                );
-            })
-            .map_err(to_napi_error)?;
-
         Ok(Self {
-            commands,
+            runtime,
+            observe_id,
             closed,
             close_signal,
             next_in_flight,
@@ -991,115 +981,198 @@ impl NativeObserveEvents {
                 return Err(error);
             }
         };
-        match self.commands.send(ObserveCommand::Next(deferred)) {
-            Ok(()) => Ok(promise),
-            Err(error) => {
-                self.closed.store(true, Ordering::SeqCst);
-                let ObserveCommand::Next(deferred) = error.0 else {
-                    unreachable!("next() only sends ObserveCommand::Next");
-                };
-                resolve_observe_deferred(deferred, Ok(None), Arc::clone(&self.next_in_flight));
-                Ok(promise)
-            }
-        }
+        self.runtime.next(
+            self.observe_id,
+            deferred,
+            Arc::clone(&self.closed),
+            self.close_signal.subscribe(),
+            Arc::clone(&self.next_in_flight),
+        );
+        Ok(promise)
     }
 
     #[napi]
     pub fn close(&self) {
-        close_observe_events(&self.commands, &self.closed, &self.close_signal);
+        close_observe_events(
+            &self.runtime,
+            self.observe_id,
+            &self.closed,
+            &self.close_signal,
+        );
     }
 }
 
 impl Drop for NativeObserveEvents {
     fn drop(&mut self) {
-        close_observe_events(&self.commands, &self.closed, &self.close_signal);
+        close_observe_events(
+            &self.runtime,
+            self.observe_id,
+            &self.closed,
+            &self.close_signal,
+        );
     }
 }
 
 type ObserveNextResult = std::result::Result<Option<RsObserveEvent>, LixError>;
 type ObserveNextResolver = Box<dyn FnOnce(Env) -> Result<Option<ObserveEventDto>> + Send>;
 type ObserveNextDeferred = JsDeferred<Option<ObserveEventDto>, ObserveNextResolver>;
+type LocalObserveEvents = Rc<tokio::sync::Mutex<NativeObserveEventsInner>>;
 
-enum ObserveCommand {
-    Next(ObserveNextDeferred),
-    Close,
+#[derive(Clone)]
+struct ObserveRuntime {
+    commands: tokio_mpsc::UnboundedSender<ObserveRuntimeCommand>,
+    next_observe_id: Arc<AtomicU64>,
 }
 
-fn run_observe_actor(
-    mut events: NativeObserveEventsInner,
-    receiver: mpsc::Receiver<ObserveCommand>,
-    closed: Arc<AtomicBool>,
-    mut close_signal: watch::Receiver<bool>,
-    next_in_flight: Arc<AtomicBool>,
-) {
-    let rt = match Builder::new_current_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(error) => {
-            closed.store(true, Ordering::SeqCst);
-            while let Ok(command) = receiver.recv() {
-                match command {
-                    ObserveCommand::Next(deferred) => {
-                        next_in_flight.store(false, Ordering::SeqCst);
-                        deferred.reject(to_napi_error(&error));
-                    }
-                    ObserveCommand::Close => break,
-                }
-            }
-            return;
-        }
-    };
+#[derive(Clone)]
+struct LocalObserveState {
+    events: LocalObserveEvents,
+}
 
-    while let Ok(command) = receiver.recv() {
+enum ObserveRuntimeCommand {
+    Register {
+        observe_id: u64,
+        events: NativeObserveEventsInner,
+    },
+    Next {
+        observe_id: u64,
+        deferred: ObserveNextDeferred,
+        closed: Arc<AtomicBool>,
+        close_signal: watch::Receiver<bool>,
+        next_in_flight: Arc<AtomicBool>,
+    },
+    Close {
+        observe_id: u64,
+    },
+}
+
+impl ObserveRuntime {
+    fn register(&self, events: NativeObserveEventsInner) -> NativeResult<u64> {
+        let observe_id = self.next_observe_id.fetch_add(1, Ordering::SeqCst);
+        self.commands
+            .send(ObserveRuntimeCommand::Register { observe_id, events })
+            .map_err(|_| LixError::unknown("observe runtime is closed"))?;
+        Ok(observe_id)
+    }
+
+    fn next(
+        &self,
+        observe_id: u64,
+        deferred: ObserveNextDeferred,
+        closed: Arc<AtomicBool>,
+        close_signal: watch::Receiver<bool>,
+        next_in_flight: Arc<AtomicBool>,
+    ) {
+        let command = ObserveRuntimeCommand::Next {
+            observe_id,
+            deferred,
+            closed,
+            close_signal,
+            next_in_flight,
+        };
+        if let Err(error) = self.commands.send(command) {
+            let ObserveRuntimeCommand::Next {
+                deferred,
+                next_in_flight,
+                ..
+            } = error.0
+            else {
+                unreachable!("observe runtime next only sends Next commands");
+            };
+            resolve_observe_deferred(
+                deferred,
+                Err(LixError::unknown("observe runtime is closed")),
+                next_in_flight,
+            );
+        }
+    }
+
+    fn close(&self, observe_id: u64) {
+        let _ = self
+            .commands
+            .send(ObserveRuntimeCommand::Close { observe_id });
+    }
+}
+
+async fn run_observe_runtime(mut commands: tokio_mpsc::UnboundedReceiver<ObserveRuntimeCommand>) {
+    let states = Rc::new(RefCell::new(HashMap::<u64, LocalObserveState>::new()));
+    while let Some(command) = commands.recv().await {
         match command {
-            ObserveCommand::Next(deferred) => {
-                let result = rt.block_on(observe_next(&mut events, &closed, &mut close_signal));
-                let result = match result {
-                    Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) => Ok(None),
-                    Err(error) if error.code == LixError::CODE_CLOSED => Ok(None),
-                    other => other,
-                };
-                let result = match result {
-                    Ok(Some(_)) | Err(_)
-                        if closed.load(Ordering::SeqCst) || *close_signal.borrow() =>
-                    {
-                        Ok(None)
-                    }
-                    other => other,
-                };
-                let terminal = observe_result_is_terminal(&result);
-                if terminal {
-                    closed.store(true, Ordering::SeqCst);
-                }
-                resolve_observe_deferred(deferred, result, Arc::clone(&next_in_flight));
-                if terminal {
-                    events.close();
-                    break;
-                }
+            ObserveRuntimeCommand::Register { observe_id, events } => {
+                states.borrow_mut().insert(
+                    observe_id,
+                    LocalObserveState {
+                        events: Rc::new(tokio::sync::Mutex::new(events)),
+                    },
+                );
             }
-            ObserveCommand::Close => {
-                closed.store(true, Ordering::SeqCst);
-                events.close();
-                break;
+            ObserveRuntimeCommand::Next {
+                observe_id,
+                deferred,
+                closed,
+                mut close_signal,
+                next_in_flight,
+            } => {
+                let state = states.borrow().get(&observe_id).cloned();
+                let Some(state) = state else {
+                    closed.store(true, Ordering::SeqCst);
+                    resolve_observe_deferred(deferred, Ok(None), next_in_flight);
+                    continue;
+                };
+                let states = Rc::clone(&states);
+                tokio::task::spawn_local(async move {
+                    let result = observe_next(&state.events, &closed, &mut close_signal).await;
+                    let result = match result {
+                        Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) => Ok(None),
+                        Err(error) if error.code == LixError::CODE_CLOSED => Ok(None),
+                        other => other,
+                    };
+                    let result = match result {
+                        Ok(Some(_)) | Err(_)
+                            if closed.load(Ordering::SeqCst) || *close_signal.borrow() =>
+                        {
+                            Ok(None)
+                        }
+                        other => other,
+                    };
+                    let terminal = observe_result_is_terminal(&result);
+                    if terminal {
+                        closed.store(true, Ordering::SeqCst);
+                        close_observe_events_inner(&state.events).await;
+                        states.borrow_mut().remove(&observe_id);
+                    }
+                    resolve_observe_deferred(deferred, result, next_in_flight);
+                });
+            }
+            ObserveRuntimeCommand::Close { observe_id } => {
+                let state = states.borrow_mut().remove(&observe_id);
+                if let Some(state) = state {
+                    tokio::task::spawn_local(async move {
+                        close_observe_events_inner(&state.events).await;
+                    });
+                }
             }
         }
     }
-    closed.store(true, Ordering::SeqCst);
 }
 
 async fn observe_next(
-    events: &mut NativeObserveEventsInner,
+    events: &LocalObserveEvents,
     closed: &AtomicBool,
     close_signal: &mut watch::Receiver<bool>,
 ) -> ObserveNextResult {
     if closed.load(Ordering::SeqCst) || *close_signal.borrow() {
-        events.close();
+        close_observe_events_inner(events).await;
         return Ok(None);
     }
 
     let result = tokio::select! {
-        result = events.next() => result,
+        result = async {
+            let mut events = events.lock().await;
+            events.next().await
+        } => result,
         changed = close_signal.changed() => {
-            events.close();
+            close_observe_events_inner(events).await;
             match changed {
                 Ok(()) | Err(_) => Ok(None),
             }
@@ -1108,7 +1181,7 @@ async fn observe_next(
 
     match result {
         Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) || *close_signal.borrow() => {
-            events.close();
+            close_observe_events_inner(events).await;
             Ok(None)
         }
         Ok(Some(event)) => Ok(Some(event)),
@@ -1151,7 +1224,8 @@ fn observe_next_to_js(env: &Env, result: ObserveNextResult) -> Result<Option<Obs
 }
 
 fn close_observe_events(
-    commands: &Sender<ObserveCommand>,
+    runtime: &ObserveRuntime,
+    observe_id: u64,
     closed: &AtomicBool,
     close_signal: &watch::Sender<bool>,
 ) {
@@ -1159,7 +1233,47 @@ fn close_observe_events(
         return;
     }
     let _ = close_signal.send(true);
-    let _ = commands.send(ObserveCommand::Close);
+    runtime.close(observe_id);
+}
+
+async fn close_observe_events_inner(events: &LocalObserveEvents) {
+    let mut events = events.lock().await;
+    events.close();
+}
+
+fn observe_runtime() -> NativeResult<&'static ObserveRuntime> {
+    static OBSERVE_RUNTIME: OnceLock<ObserveRuntime> = OnceLock::new();
+    if let Some(runtime) = OBSERVE_RUNTIME.get() {
+        return Ok(runtime);
+    }
+    match start_observe_runtime() {
+        Ok(runtime) => {
+            let _ = OBSERVE_RUNTIME.set(runtime);
+            OBSERVE_RUNTIME
+                .get()
+                .ok_or_else(|| LixError::unknown("observe runtime failed to initialize"))
+        }
+        Err(error) => OBSERVE_RUNTIME.get().map(Ok).unwrap_or(Err(error)),
+    }
+}
+
+fn start_observe_runtime() -> NativeResult<ObserveRuntime> {
+    let (commands, receiver) = tokio_mpsc::unbounded_channel();
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| LixError::unknown(format!("failed to create observe runtime: {error}")))?;
+    thread::Builder::new()
+        .name("lix-observe-runtime".to_string())
+        .spawn(move || {
+            let local_set = tokio::task::LocalSet::new();
+            local_set.block_on(&runtime, run_observe_runtime(receiver));
+        })
+        .map_err(|error| LixError::unknown(format!("failed to create observe runtime: {error}")))?;
+    Ok(ObserveRuntime {
+        commands,
+        next_observe_id: Arc::new(AtomicU64::new(1)),
+    })
 }
 
 impl NativeLix {
