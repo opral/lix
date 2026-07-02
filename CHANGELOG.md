@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0 - 2026-07-02
+
+### Minor
+
+- Simplified filesystem-backed Lix storage around `FsBackend`.
+
+  Use `new FsBackend({ path: "./workspace" })` for persistent filesystem-backed storage, or `new FsBackend({ path: "./workspace", storage: "memory" })` when the workspace should be synced into an in-memory Lix without writing `.lix` state back to disk. Filesystem sync can now be limited to exact workspace-relative paths with `filter.includePaths`.
+
+### Patch
+
+- Improved large `lix_file` write performance for simple SQL file inserts and upserts.
+
 ## 0.7.0 - 2026-06-18
 
 ### Minor
