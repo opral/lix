@@ -1526,6 +1526,7 @@ mod tests {
             snapshot: Some(snapshot),
             metadata: None,
             origin: None,
+            origin_key: None,
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-01-01T00:00:00.000Z",

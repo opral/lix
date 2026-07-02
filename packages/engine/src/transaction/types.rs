@@ -337,6 +337,7 @@ pub(crate) struct PreparedStateRow {
     pub(crate) snapshot: Option<StageJson>,
     pub(crate) metadata: Option<StageJson>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,

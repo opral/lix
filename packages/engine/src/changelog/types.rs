@@ -391,6 +391,7 @@ pub(crate) struct ChangeRecord {
     pub(crate) snapshot: JsonSlot,
     pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
+    pub(crate) origin_key: Option<String>,
 }
 
 #[derive(musli::Encode)]
@@ -407,11 +408,31 @@ pub(crate) struct ChangeRecordRef<'a> {
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
     pub(crate) created_at: LixTimestamp,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) origin_key: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
+    pub(crate) format_version: u32,
+    pub(crate) schema_key: &'a str,
+    #[musli(with = crate::storage_codec::id_string_seq)]
+    pub(crate) entity_pk: Vec<String>,
+    #[musli(with = crate::storage_codec::option_id_string)]
+    pub(crate) file_id: Option<String>,
+    #[musli(with = crate::json_store::json_slot_storage)]
+    pub(crate) snapshot: JsonSlot,
+    #[musli(with = crate::json_store::json_slot_storage)]
+    pub(crate) metadata: JsonSlot,
+    pub(crate) created_at: LixTimestamp,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) origin_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct ChangeRecordViewV1<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
     #[musli(with = crate::storage_codec::id_string_seq)]

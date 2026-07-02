@@ -44,6 +44,13 @@
       ],
       "description": "ISO-8601 timestamp at which the change was recorded (set via `lix_timestamp()` at write time)."
     },
+    "origin_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional caller-provided origin key for the write that produced this change; NULL when the writer did not provide one."
+    },
     "snapshot_content": {
       "type": [
         "object",

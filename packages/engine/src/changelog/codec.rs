@@ -1,6 +1,7 @@
 use super::types::{
-    ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRefChunk,
-    CommitChangeRefChunkWire, CommitChangeRefChunkWireRef, CommitId, CommitRecord,
+    ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, ChangeRecordViewV1,
+    CommitChangeRefChunk, CommitChangeRefChunkWire, CommitChangeRefChunkWireRef, CommitId,
+    CommitRecord,
 };
 use crate::common::LixError;
 use crate::entity_pk::EntityPk;
@@ -22,6 +23,7 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
             snapshot: record.snapshot.as_ref_slot(),
             metadata: record.metadata.as_ref_slot(),
             created_at: record.created_at,
+            origin_key: record.origin_key.as_deref(),
         },
     )
 }
@@ -30,7 +32,24 @@ pub(crate) fn decode_change_record(
     bytes: &[u8],
     change_id: ChangeId,
 ) -> Result<ChangeRecord, LixError> {
-    let view: ChangeRecordView<'_> = storage_codec::decode("change record", bytes)?;
+    let view: ChangeRecordView<'_> = match storage_codec::decode("change record", bytes) {
+        Ok(view) => view,
+        Err(new_format_error) => {
+            let legacy: ChangeRecordViewV1<'_> =
+                storage_codec::decode("change record", bytes).map_err(|_| new_format_error)?;
+            return Ok(ChangeRecord {
+                format_version: legacy.format_version,
+                change_id,
+                schema_key: legacy.schema_key.to_string(),
+                entity_pk: entity_pk_from_parts(legacy.entity_pk)?,
+                file_id: legacy.file_id,
+                snapshot: legacy.snapshot,
+                metadata: legacy.metadata,
+                created_at: legacy.created_at,
+                origin_key: None,
+            });
+        }
+    };
     Ok(ChangeRecord {
         format_version: view.format_version,
         change_id,
@@ -40,6 +59,7 @@ pub(crate) fn decode_change_record(
         snapshot: view.snapshot,
         metadata: view.metadata,
         created_at: view.created_at,
+        origin_key: view.origin_key,
     })
 }
 
@@ -180,6 +200,7 @@ mod tests {
             snapshot: JsonSlot::Ref(JsonRef::for_content(b"snapshot")),
             metadata: JsonSlot::Ref(JsonRef::for_content(b"metadata")),
             created_at: LixTimestamp::expect_parse("created_at", "2026-06-10T00:00:00.000Z"),
+            origin_key: Some("codec-test-origin".to_string()),
         }
     }
 
@@ -214,6 +235,7 @@ mod tests {
             file_id: None,
             snapshot: JsonSlot::None,
             metadata: JsonSlot::None,
+            origin_key: None,
             ..full_record()
         };
         let encoded = encode_change_record(&record).expect("record should encode");

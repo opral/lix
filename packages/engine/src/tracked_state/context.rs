@@ -1115,6 +1115,7 @@ fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecor
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
+        origin_key: None,
     })
 }
 

@@ -422,6 +422,71 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	await reopened.close();
 });
 
+test("execute originKey is exposed on change and history surfaces without metadata", async () => {
+	const lix = await openLix();
+	const fileId = "origin-key-file";
+	const metadata = { purpose: "metadata-only" };
+
+	await lix.execute(
+		"INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES ($1, $2, $3, $4)",
+		[fileId, "/origin-key.md", new TextEncoder().encode("one\n"), metadata],
+		{ originKey: "test-origin" },
+	);
+	const inserted = await currentFileChange(lix, fileId);
+	const insertedHeadCommitId = await activeHeadCommitId(lix);
+	expect(get(inserted, "origin_key")).toBe("test-origin");
+	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
+	expect(
+		get(
+			await lix.execute(
+				"SELECT lixcol_origin_key FROM lix_file_history WHERE id = $1 AND lixcol_start_commit_id = $2",
+				[fileId, insertedHeadCommitId],
+			),
+			"lixcol_origin_key",
+		),
+	).toBe("test-origin");
+	expect(
+		get(
+			await lix.execute(
+				"SELECT origin_key FROM lix_state_history WHERE change_id = $1 AND start_commit_id = $2",
+				[get(inserted, "lixcol_change_id"), insertedHeadCommitId],
+			),
+			"origin_key",
+		),
+	).toBe("test-origin");
+
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
+		new TextEncoder().encode("two\n"),
+		fileId,
+	]);
+	const unstamped = await currentFileChange(lix, fileId);
+	expect(get(unstamped, "origin_key")).toBeNull();
+	expect(get(unstamped, "lixcol_metadata")).toEqual(metadata);
+
+	const transaction = await lix.beginTransaction();
+	await transaction.execute(
+		"UPDATE lix_file SET data = $1 WHERE id = $2",
+		[new TextEncoder().encode("three\n"), fileId],
+		{ originKey: "tx-origin" },
+	);
+	await transaction.commit();
+	const txStamped = await currentFileChange(lix, fileId);
+	const txHeadCommitId = await activeHeadCommitId(lix);
+	expect(get(txStamped, "origin_key")).toBe("tx-origin");
+	expect(
+		get(
+			await lix.execute(
+				"SELECT origin_key FROM lix_state_history WHERE change_id = $1 AND start_commit_id = $2",
+				[get(txStamped, "lixcol_change_id"), txHeadCommitId],
+			),
+			"origin_key",
+		),
+	).toBe("tx-origin");
+	expect(get(txStamped, "lixcol_metadata")).toEqual(metadata);
+
+	await lix.close();
+});
+
 test("fs backend with external lixDir imports the directory and writes normal files back", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
@@ -1759,6 +1824,26 @@ async function readFile(
 		return undefined;
 	}
 	return result.rows[0]?.value("data").asBytes() ?? new Uint8Array();
+}
+
+async function currentFileChange(
+	lix: Lix,
+	fileId: string,
+): Promise<ExecuteResult> {
+	return await lix.execute(
+		`
+			SELECT f.lixcol_change_id, f.lixcol_metadata, c.origin_key
+			FROM lix_file AS f
+			LEFT JOIN lix_change AS c ON c.id = f.lixcol_change_id
+			WHERE f.id = $1
+		`,
+		[fileId],
+	);
+}
+
+async function activeHeadCommitId(lix: Lix): Promise<string> {
+	const result = await lix.execute("SELECT lix_active_branch_commit_id()");
+	return String(get(result, "lix_active_branch_commit_id()"));
 }
 
 function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {

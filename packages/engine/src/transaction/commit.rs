@@ -303,7 +303,7 @@ fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, 
         ));
     };
     Ok(ChangeRecord {
-        format_version: 1,
+        format_version: 2,
         change_id: *change_id,
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
@@ -321,6 +321,7 @@ fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, 
                 metadata.slot()
             }),
         created_at: row.updated_at,
+        origin_key: row.origin_key.clone(),
     })
 }
 
@@ -1458,6 +1459,7 @@ mod tests {
             ),
             metadata: None,
             origin: None,
+            origin_key: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             global: branch_id == GLOBAL_BRANCH_ID,

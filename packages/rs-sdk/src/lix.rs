@@ -1,7 +1,7 @@
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InMemoryBackend,
-    LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
+    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteOptions, ExecuteResult,
+    InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, ObserveEvents, SessionContext, SwitchBranchOptions, SwitchBranchReceipt,
     Value,
 };
@@ -97,6 +97,17 @@ where
     /// handle instead.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.session.execute(sql, params).await
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
+        self.session
+            .execute_with_options(sql, params, options)
+            .await
     }
 
     pub fn observe(&self, sql: &str, params: &[Value]) -> Result<ObserveEvents<B>, LixError> {
@@ -203,6 +214,15 @@ where
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
         self.inner.execute(sql, params).await
+    }
+
+    pub async fn execute_with_options(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
+        self.inner.execute_with_options(sql, params, options).await
     }
 
     pub async fn commit(self) -> Result<(), LixError> {

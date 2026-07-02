@@ -12,6 +12,7 @@ pub(crate) struct CommitGraphChange {
     pub(crate) snapshot: crate::json_store::JsonSlot,
     pub(crate) metadata: crate::json_store::JsonSlot,
     pub(crate) created_at: LixTimestamp,
+    pub(crate) origin_key: Option<String>,
 }
 
 /// Parsed `lix_commit` entity from the changelog.

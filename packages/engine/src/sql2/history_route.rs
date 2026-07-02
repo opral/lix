@@ -148,6 +148,7 @@ pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
 pub(crate) const HISTORY_COL_CHANGE_ID: &str = "lixcol_change_id";
+pub(crate) const HISTORY_COL_ORIGIN_KEY: &str = "lixcol_origin_key";
 pub(crate) const HISTORY_COL_OBSERVED_COMMIT_ID: &str = "lixcol_observed_commit_id";
 pub(crate) const HISTORY_COL_COMMIT_CREATED_AT: &str = "lixcol_commit_created_at";
 pub(crate) const HISTORY_COL_START_COMMIT_ID: &str = "lixcol_start_commit_id";

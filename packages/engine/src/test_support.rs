@@ -480,6 +480,7 @@ pub(crate) fn tracked_change_from_materialized(
                 crate::json_store::JsonSlot::from_json(&serialized)
             }),
         created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.updated_at),
+        origin_key: None,
     })
 }
 
