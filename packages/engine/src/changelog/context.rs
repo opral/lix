@@ -1263,6 +1263,7 @@ mod tests {
             snapshot: JsonSlot::None,
             metadata: JsonSlot::None,
             created_at: ts("2026-05-12T00:00:00Z"),
+            origin_key: None,
         });
         append.commit_change_refs[0]
             .entries
@@ -1440,6 +1441,7 @@ mod tests {
                 snapshot: JsonSlot::None,
                 metadata: JsonSlot::None,
                 created_at: ts("2026-05-20T00:00:00Z"),
+                origin_key: None,
             })
             .collect::<Vec<_>>();
         let mut expected_ids = changes

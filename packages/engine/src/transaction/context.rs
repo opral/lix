@@ -99,6 +99,7 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     sql_schema_cache: SqlSchemaCache,
     functions: FunctionProviderHandle,
     commit_boundary: Option<TransactionCommitBoundary>,
+    origin_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -319,6 +320,7 @@ where
                 sql_schema_cache: SqlSchemaCache::default(),
                 functions,
                 commit_boundary: None,
+                origin_key: None,
             },
             runtime_functions,
         })
@@ -738,7 +740,8 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for (index, row) in normalized_rows {
-                prepared_rows[index] = Some(prepare_state_row(row, &functions)?);
+                prepared_rows[index] =
+                    Some(prepare_state_row(row, &functions, self.origin_key.clone())?);
             }
         }
         Ok(prepared_rows
@@ -817,6 +820,10 @@ where
     /// Returns this transaction's prepared runtime functions.
     pub(crate) fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
+    }
+
+    pub(crate) fn replace_origin_key(&mut self, origin_key: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.origin_key, origin_key)
     }
 
     pub(crate) async fn execute_read_sql_statement(
@@ -1157,6 +1164,7 @@ where
 fn prepare_state_row(
     normalized: NormalizedTransactionWriteRow,
     functions: &FunctionProviderHandle,
+    origin_key: Option<String>,
 ) -> Result<PreparedStateRow, LixError> {
     let NormalizedTransactionWriteRow {
         row,
@@ -1193,6 +1201,7 @@ fn prepare_state_row(
         snapshot,
         metadata,
         origin: row.origin,
+        origin_key,
         created_at,
         updated_at,
         global: row.global,

@@ -214,6 +214,10 @@ static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<EntityHistoryRow> = ColumnTable {
             Col::Utf8(|row| Some(row.change.id.as_str())),
         ),
         (
+            "lixcol_origin_key",
+            Col::Utf8(|row| row.change.origin_key.as_deref()),
+        ),
+        (
             "lixcol_observed_commit_id",
             Col::Utf8(|row| Some(row.observed_commit_id.as_str())),
         ),

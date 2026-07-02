@@ -256,6 +256,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: change.created_at,
+        origin_key: None,
     }
 }
 
@@ -270,6 +271,7 @@ fn seed_commit_row_change_record(commit: &InitSeedCommit) -> Result<ChangeRecord
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
+        origin_key: None,
     })
 }
 

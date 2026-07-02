@@ -19,6 +19,7 @@ pub(crate) struct MaterializedChange {
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) created_at: String,
+    pub(crate) origin_key: Option<String>,
 }
 
 pub(crate) async fn materialize_located_history_change<S>(
@@ -48,6 +49,7 @@ where
             snapshot: change.snapshot,
             metadata: change.metadata,
             created_at: change.created_at,
+            origin_key: change.origin_key,
         },
     )
     .await
@@ -75,6 +77,7 @@ where
         snapshot_content,
         metadata,
         created_at: change.created_at.to_string(),
+        origin_key: change.origin_key,
     })
 }
 

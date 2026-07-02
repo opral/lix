@@ -15,6 +15,7 @@ export { Value } from "./value.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
+	ExecuteOptions,
 	ExecuteResult,
 	FsBackendOptions,
 	JsonValue,

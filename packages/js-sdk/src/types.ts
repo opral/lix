@@ -33,6 +33,10 @@ export type JsonValue =
 
 export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
+export type ExecuteOptions = {
+	originKey?: string;
+};
+
 export type ExecuteResult = {
 	columns: string[];
 	rows: RowLike[];

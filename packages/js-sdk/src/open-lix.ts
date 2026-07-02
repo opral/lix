@@ -5,6 +5,7 @@ import { normalizeParam, toNativeValue } from "./value.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
+	ExecuteOptions,
 	ExecuteResult,
 	FsBackendOptions,
 	MergeBranchOptions,
@@ -27,7 +28,11 @@ type NativeObserveEvent = {
 type NativeParam = ReturnType<typeof toNativeValue>;
 
 type NativeLix = {
-	execute(sql: string, params: NativeParam[]): Promise<NativeExecuteResult>;
+	execute(
+		sql: string,
+		params: NativeParam[],
+		options?: ExecuteOptions,
+	): Promise<NativeExecuteResult>;
 	observe(sql: string, params: NativeParam[]): Promise<NativeObserveEvents>;
 	beginTransaction(): Promise<NativeLixTransaction>;
 	activeBranchId(): Promise<string>;
@@ -41,7 +46,11 @@ type NativeLix = {
 };
 
 type NativeLixTransaction = {
-	execute(sql: string, params: NativeParam[]): Promise<NativeExecuteResult>;
+	execute(
+		sql: string,
+		params: NativeParam[],
+		options?: ExecuteOptions,
+	): Promise<NativeExecuteResult>;
 	commit(): Promise<void>;
 	rollback(): Promise<void>;
 };
@@ -124,14 +133,19 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 export class Lix {
 	constructor(private readonly native: NativeLix) {}
 
-	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
-		assertExecuteArgs("lix", sql, params);
+	async execute(
+		sql: string,
+		params: SqlParam[] = [],
+		options?: ExecuteOptions,
+	): Promise<ExecuteResult> {
+		assertExecuteArgs("lix", sql, params, options);
 		return wrapExecuteResult(
 			await this.native.execute(
 				sql,
 				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
+				normalizeExecuteOptions(options),
 			),
 		);
 	}
@@ -243,14 +257,19 @@ export class ObserveEvents {
 export class LixTransaction {
 	constructor(private readonly native: NativeLixTransaction) {}
 
-	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
-		assertExecuteArgs("lixTransaction", sql, params);
+	async execute(
+		sql: string,
+		params: SqlParam[] = [],
+		options?: ExecuteOptions,
+	): Promise<ExecuteResult> {
+		assertExecuteArgs("lixTransaction", sql, params, options);
 		return wrapExecuteResult(
 			await this.native.execute(
 				sql,
 				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
+				normalizeExecuteOptions(options),
 			),
 		);
 	}
@@ -264,8 +283,46 @@ export class LixTransaction {
 	}
 }
 
-function assertExecuteArgs(receiver: string, sql: string, params: SqlParam[]) {
+function assertExecuteArgs(
+	receiver: string,
+	sql: string,
+	params: SqlParam[],
+	options?: ExecuteOptions,
+) {
 	assertSqlArgs("execute", receiver, sql, params);
+	if (options === undefined) {
+		return;
+	}
+	if (!options || typeof options !== "object" || Array.isArray(options)) {
+		throw invalidArgument(
+			"execute",
+			"options",
+			"object",
+			typeof options,
+			receiver,
+		);
+	}
+	if (
+		options.originKey !== undefined &&
+		typeof options.originKey !== "string"
+	) {
+		throw invalidArgument(
+			"execute",
+			"options.originKey",
+			"string",
+			typeof options.originKey,
+			receiver,
+		);
+	}
+}
+
+function normalizeExecuteOptions(
+	options: ExecuteOptions | undefined,
+): ExecuteOptions | undefined {
+	if (options?.originKey === undefined) {
+		return undefined;
+	}
+	return { originKey: options.originKey };
 }
 
 function assertSqlArgs(

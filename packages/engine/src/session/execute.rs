@@ -302,6 +302,11 @@ impl RowRef<'_> {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecuteOptions {
+    pub origin_key: Option<String>,
+}
+
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
@@ -316,6 +321,16 @@ where
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
@@ -325,16 +340,24 @@ where
             return self
                 .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
+                        let previous_origin_key =
+                            transaction.replace_origin_key(options.origin_key);
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
                         // transaction-owned SQL write context.
-                        transaction.prepare_sql_visible_schemas().await?;
-                        let tx_plan =
-                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
-                                .await?;
-                        let affected_rows =
-                            sql2::execute_write_logical_plan(transaction, tx_plan, &params).await?;
-                        Ok(ExecuteResult::from_rows_affected(affected_rows))
+                        let result = async {
+                            transaction.prepare_sql_visible_schemas().await?;
+                            let tx_plan =
+                                sql2::create_write_logical_plan_from_parsed(transaction, statement)
+                                    .await?;
+                            let affected_rows =
+                                sql2::execute_write_logical_plan(transaction, tx_plan, &params)
+                                    .await?;
+                            Ok(ExecuteResult::from_rows_affected(affected_rows))
+                        }
+                        .await;
+                        transaction.replace_origin_key(previous_origin_key);
+                        result
                     })
                 })
                 .await
@@ -650,12 +673,22 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
         let _operation_guard = self.begin_session_operation()?;
         let statement = sql2::parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
             sql2::BoundStatementRoute::Write => {
-                execute_transaction_write_auto(transaction, statement, params)
+                execute_transaction_write_auto(transaction, statement, params, options)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
@@ -730,16 +763,23 @@ async fn execute_transaction_write_auto<B>(
     transaction: &mut crate::transaction::Transaction<B>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
+    options: ExecuteOptions,
 ) -> Result<ExecuteResult, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    transaction.prepare_sql_visible_schemas().await?;
-    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
-    let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
-    Ok(ExecuteResult::from_rows_affected(affected_rows))
+    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
+    let result = async {
+        transaction.prepare_sql_visible_schemas().await?;
+        let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+        let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
+        Ok(ExecuteResult::from_rows_affected(affected_rows))
+    }
+    .await;
+    transaction.replace_origin_key(previous_origin_key);
+    result
 }
 
 #[cfg(test)]

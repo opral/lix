@@ -32,9 +32,10 @@ use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_ident
 use crate::sql2::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
-    HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor,
-    history_descriptor_event_matches, load_history_entries, parse_history_filter,
+    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
+    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryRoute,
+    HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
+    parse_history_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
     HistoryDirectoryPathRecord, resolve_history_directory_path,
@@ -1265,6 +1266,10 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
             Col::Utf8(|row| Some(row.event.change.id.as_str())),
         ),
         (
+            HISTORY_COL_ORIGIN_KEY,
+            Col::Utf8(|row| row.event.change.origin_key.as_deref()),
+        ),
+        (
             HISTORY_COL_SNAPSHOT_CONTENT,
             Col::Utf8(|row| row.descriptor_change.snapshot_content.as_deref()),
         ),
@@ -1324,6 +1329,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
         json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
         Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
         json_field(HISTORY_COL_METADATA, true),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),

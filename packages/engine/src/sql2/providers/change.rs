@@ -188,6 +188,7 @@ fn commit_record_canonical_change(
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
+        origin_key: None,
     }
 }
 
@@ -199,6 +200,7 @@ pub(super) fn lix_change_schema() -> SchemaRef {
         Field::new("file_id", DataType::Utf8, true),
         json_field("metadata", true),
         Field::new("created_at", DataType::Utf8, false),
+        Field::new("origin_key", DataType::Utf8, true),
         json_field("snapshot_content", true),
     ]))
 }
@@ -223,6 +225,7 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
             Col::Utf8Owned(|row| row.metadata.as_deref().map(serialize_row_metadata)),
         ),
         ("created_at", Col::Utf8(|row| Some(row.created_at.as_str()))),
+        ("origin_key", Col::Utf8(|row| row.origin_key.as_deref())),
         (
             "snapshot_content",
             Col::Utf8(|row| row.snapshot_content.as_deref()),

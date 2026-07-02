@@ -296,6 +296,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
         snapshot: change.snapshot,
         metadata: change.metadata,
         created_at: change.created_at,
+        origin_key: change.origin_key,
     }
 }
 
@@ -373,6 +374,7 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: record.created_at,
+        origin_key: None,
     }
 }
 
@@ -730,6 +732,7 @@ mod tests {
                     snapshot: crate::json_store::JsonSlot::None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts("2026-01-01T00:00:00Z"),
+                    origin_key: None,
                 },
                 commit_change_ids: change_ids
                     .iter()
@@ -763,6 +766,7 @@ mod tests {
                         }),
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts(created_at),
+                    origin_key: None,
                 },
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
@@ -888,6 +892,7 @@ mod tests {
             snapshot: change.change.snapshot.clone(),
             metadata: change.change.metadata.clone(),
             created_at: change.change.created_at,
+            origin_key: change.change.origin_key.clone(),
         }
     }
 

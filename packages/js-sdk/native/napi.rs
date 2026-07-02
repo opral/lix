@@ -1,13 +1,14 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, FsBackend, FsBackendOpenOptions, InMemoryBackend,
-    Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, SqliteBackend,
-    SqliteBackendOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value,
-    open_lix, open_lix_with_backend,
+    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, FsBackend,
+    FsBackendOpenOptions, InMemoryBackend, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
+    OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, open_lix,
+    open_lix_with_backend,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
@@ -46,6 +47,21 @@ enum NativeObserveEventsInner {
     Fs(RsObserveEvents<FsBackend>),
 }
 
+#[napi(object)]
+#[derive(Debug)]
+pub struct NativeExecuteOptions {
+    #[napi(js_name = "originKey")]
+    pub origin_key: Option<String>,
+}
+
+impl From<NativeExecuteOptions> for RsExecuteOptions {
+    fn from(options: NativeExecuteOptions) -> Self {
+        Self {
+            origin_key: options.origin_key,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct NativeLixActor {
     commands: Sender<LixCommand>,
@@ -75,6 +91,7 @@ enum LixCommand {
     Execute {
         sql: String,
         params: Vec<Value>,
+        options: RsExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
     BeginTransaction {
@@ -114,6 +131,7 @@ enum LixCommand {
         transaction_id: u64,
         sql: String,
         params: Vec<Value>,
+        options: RsExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
     TransactionCommit {
@@ -279,10 +297,11 @@ fn handle_lix_command(
         LixCommand::Execute {
             sql,
             params,
+            options,
             deferred,
         } => {
             let result = rt
-                .block_on(state.lix.execute(&sql, &params))
+                .block_on(state.lix.execute(&sql, &params, options))
                 .and_then(ExecuteResult::try_from);
             settle_deferred(deferred, result);
             false
@@ -370,12 +389,13 @@ fn handle_lix_command(
             transaction_id,
             sql,
             params,
+            options,
             deferred,
         } => {
             let result = state.transactions.get_mut(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
                 |transaction| {
-                    rt.block_on(transaction.execute(&sql, &params))
+                    rt.block_on(transaction.execute(&sql, &params, options))
                         .and_then(ExecuteResult::try_from)
                 },
             );
@@ -464,11 +484,12 @@ impl NativeLixInner {
         &self,
         sql: &str,
         params: &[Value],
+        options: RsExecuteOptions,
     ) -> std::result::Result<RsExecuteResult, LixError> {
         match self {
-            Self::Memory(lix) => lix.execute(sql, params).await,
-            Self::Sqlite(lix) => lix.execute(sql, params).await,
-            Self::Fs(lix) => lix.execute(sql, params).await,
+            Self::Memory(lix) => lix.execute_with_options(sql, params, options).await,
+            Self::Sqlite(lix) => lix.execute_with_options(sql, params, options).await,
+            Self::Fs(lix) => lix.execute_with_options(sql, params, options).await,
         }
     }
 
@@ -587,11 +608,16 @@ impl NativeLixTransactionInner {
         &mut self,
         sql: &str,
         params: &[Value],
+        options: RsExecuteOptions,
     ) -> std::result::Result<RsExecuteResult, LixError> {
         match self {
-            Self::Memory(transaction) => transaction.execute(sql, params).await,
-            Self::Sqlite(transaction) => transaction.execute(sql, params).await,
-            Self::Fs(transaction) => transaction.execute(sql, params).await,
+            Self::Memory(transaction) => {
+                transaction.execute_with_options(sql, params, options).await
+            }
+            Self::Sqlite(transaction) => {
+                transaction.execute_with_options(sql, params, options).await
+            }
+            Self::Fs(transaction) => transaction.execute_with_options(sql, params, options).await,
         }
     }
 
@@ -754,6 +780,7 @@ impl NativeLix {
         env: &'env Env,
         sql: String,
         params: Option<Vec<LixValue>>,
+        options: Option<NativeExecuteOptions>,
     ) -> Result<Object<'env>> {
         let params = match params {
             Some(params) => params
@@ -763,11 +790,13 @@ impl NativeLix {
                 .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
+        let options = options.map(RsExecuteOptions::from).unwrap_or_default();
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::Execute {
                 sql,
                 params,
+                options,
                 deferred,
             });
         Ok(promise)
@@ -1194,6 +1223,7 @@ impl NativeLixTransaction {
         env: &'env Env,
         sql: String,
         params: Option<Vec<LixValue>>,
+        options: Option<NativeExecuteOptions>,
     ) -> Result<Object<'env>> {
         let params = match params {
             Some(params) => params
@@ -1203,6 +1233,7 @@ impl NativeLixTransaction {
                 .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
+        let options = options.map(RsExecuteOptions::from).unwrap_or_default();
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         if self.closed.load(Ordering::SeqCst) {
             settle_deferred(deferred, Err(transaction_closed_error()));
@@ -1214,6 +1245,7 @@ impl NativeLixTransaction {
                 transaction_id,
                 sql,
                 params,
+                options,
                 deferred,
             });
         Ok(promise)

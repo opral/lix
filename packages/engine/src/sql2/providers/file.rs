@@ -1177,6 +1177,7 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
+    live: MaterializedLiveStateRow,
 }
 
 #[derive(Debug, Clone)]
@@ -2305,6 +2306,7 @@ async fn lix_file_record_batch(
                     FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
                     BlobRefRecord {
                         blob_hash: snapshot.blob_hash,
+                        live: row,
                     },
                 );
             }
@@ -2395,6 +2397,10 @@ async fn lix_file_record_batch(
         } else {
             Some(Vec::new())
         };
+        let blob_ref = blob_rows.get(&file.blob_ref_key());
+        let projected_change_id = blob_ref
+            .and_then(|blob_ref| blob_ref.live.change_id)
+            .or(file.live.change_id);
 
         ids.push(Some(file.id));
         paths.push(Some(path));
@@ -2405,7 +2411,7 @@ async fn lix_file_record_batch(
         schema_keys.push(Some(file.live.schema_key));
         file_ids.push(file.live.file_id);
         globals.push(Some(file.live.global));
-        change_ids.push(file.live.change_id.map(|id| id.to_string()));
+        change_ids.push(projected_change_id.map(|id| id.to_string()));
         created_ats.push(file.live.created_at);
         updated_ats.push(file.live.updated_at);
         commit_ids.push(file.live.commit_id.map(|id| id.to_string()));

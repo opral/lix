@@ -636,6 +636,7 @@ fn direct_append_with_shape(
                     "created_at",
                     "2026-05-20T00:00:00Z",
                 ),
+                origin_key: None,
             });
             refs.push(typed_change_id);
             next_change += 1;
