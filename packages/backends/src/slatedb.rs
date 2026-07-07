@@ -114,9 +114,28 @@ impl SlateDbBackend {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
+        std::fs::create_dir_all(&path).map_err(|error| {
+            BackendError::Io(format!(
+                "create slatedb backend directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?);
+        Self::open_object_store(DB_PATH, object_store).map(|mut backend| {
+            backend.path = path;
+            backend
+        })
+    }
+
+    pub fn open_object_store(
+        db_path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self, BackendError> {
+        let db_path = db_path.into();
         Ok(Self {
-            worker: SlateDbWorker::start(path.clone())?,
-            path,
+            worker: SlateDbWorker::start(db_path.clone(), object_store)?,
+            path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
         })
     }
@@ -389,12 +408,12 @@ enum SlateDbCommand {
 }
 
 impl SlateDbWorker {
-    fn start(path: PathBuf) -> Result<Self, BackendError> {
+    fn start(db_path: String, object_store: Arc<dyn ObjectStore>) -> Result<Self, BackendError> {
         let (commands, receiver) = mpsc::channel();
         let (opened_tx, opened_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("lix-slatedb".to_string())
-            .spawn(move || run_slatedb_worker(path, receiver, opened_tx))
+            .spawn(move || run_slatedb_worker(db_path, object_store, receiver, opened_tx))
             .map_err(|error| BackendError::Io(format!("spawn slatedb worker: {error}")))?;
 
         match opened_rx
@@ -447,7 +466,8 @@ impl Drop for SlateDbWorkerInner {
 }
 
 fn run_slatedb_worker(
-    path: PathBuf,
+    db_path: String,
+    object_store: Arc<dyn ObjectStore>,
     receiver: mpsc::Receiver<SlateDbCommand>,
     opened: mpsc::Sender<Result<(), BackendError>>,
 ) {
@@ -461,7 +481,7 @@ fn run_slatedb_worker(
         }
     };
 
-    let db = match open_slatedb(&runtime, &path) {
+    let db = match open_slatedb(&runtime, db_path, object_store) {
         Ok(db) => db,
         Err(error) => {
             let _ = opened.send(Err(error));
@@ -481,17 +501,13 @@ fn run_slatedb_worker(
     let _ = runtime.block_on(db.close());
 }
 
-fn open_slatedb(runtime: &Runtime, path: &Path) -> Result<Db, BackendError> {
-    std::fs::create_dir_all(path).map_err(|error| {
-        BackendError::Io(format!(
-            "create slatedb backend directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    let object_store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(path).map_err(object_store_error)?);
+fn open_slatedb(
+    runtime: &Runtime,
+    db_path: String,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<Db, BackendError> {
     runtime
-        .block_on(Db::open(DB_PATH, object_store))
+        .block_on(Db::open(db_path, object_store))
         .map_err(slatedb_error)
 }
 
@@ -764,5 +780,50 @@ impl Drop for WriterPermit {
             *active = false;
             self.state.available.notify_one();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lix_engine::backend::{
+        Backend, BackendWrite, GetOptions, ProjectedValue, PutEntry, ReadOptions, StoredValue,
+        WriteOptions, get_many,
+    };
+    use object_store::memory::InMemory;
+
+    #[test]
+    fn open_object_store_round_trips_with_memory_store() {
+        let backend = SlateDbBackend::open_object_store("test-db", Arc::new(InMemory::new()))
+            .expect("open memory object-store slatedb backend");
+
+        let space = SpaceId(7);
+        let key = Key(Bytes::from_static(b"hello"));
+        let value = Bytes::from_static(b"world");
+
+        let mut write = backend
+            .begin_write(WriteOptions::default())
+            .expect("begin write");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key.clone(),
+                        value: StoredValue {
+                            bytes: value.clone(),
+                        },
+                    }],
+                },
+            )
+            .expect("put row");
+        write.commit().expect("commit row");
+
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let result = get_many(&read, space, &[key], GetOptions::default()).expect("read row");
+
+        assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
     }
 }
