@@ -24,9 +24,9 @@ Use Lix standalone or as the change-control backend for editors, knowledge bases
 
 ## Try a demo app
 
-[Flashtype](https://flashtype.com) is a Markdown editor for Claude and Codex built on Lix. Open local Markdown files, let agents edit them, review changes as diffs, and restore previous versions from history.
+[Flashtype](https://flashtype.ai) is a Markdown editor for Claude and Codex built on Lix. Open local Markdown files, let agents edit them, review changes as diffs, and restore previous versions from history.
 
-[![Flashtype app preview](https://flashtype.com/og.png)](https://flashtype.com)
+[![Flashtype app preview](https://flashtype.ai/og.png)](https://flashtype.ai)
 
 ## Getting started
 
@@ -79,7 +79,7 @@ Most version control systems assume source code and text diffs. But many importa
 
 Lix is built for those files. Plugins translate file updates into semantic changes that can be queried, reviewed, branched, merged, and rolled back.
 
-[Flashtype](https://flashtype.com), a Markdown editor for Claude and Codex, uses Lix so every local Markdown edit can be checkpointed, reviewed as a diff, and restored.
+[Flashtype](https://flashtype.ai), a Markdown editor for Claude and Codex, uses Lix so every local Markdown edit can be checkpointed, reviewed as a diff, and restored.
 
 [How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
