@@ -4,6 +4,8 @@
 mod redb;
 #[cfg(feature = "rocksdb")]
 mod rocksdb;
+#[cfg(feature = "slatedb")]
+mod slatedb;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -12,6 +14,11 @@ pub use redb::{RedbBackend, RedbBackendFactory, RedbBackendFixture, RedbRead, Re
 #[cfg(feature = "rocksdb")]
 pub use rocksdb::{
     RocksDbBackend, RocksDbBackendFactory, RocksDbBackendFixture, RocksDbRead, RocksDbWrite,
+};
+#[cfg(feature = "slatedb")]
+pub use slatedb::{
+    SlateDbBackend, SlateDbBackendFactory, SlateDbBackendFixture, SlateDbBackendOptions,
+    SlateDbRead, SlateDbWrite,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{

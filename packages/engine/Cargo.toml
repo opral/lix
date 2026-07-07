@@ -20,6 +20,7 @@ workspace = true
 [features]
 rocksdb = ["dep:rocksdb", "lix_backends/rocksdb"]
 redb = ["dep:redb", "lix_backends/redb"]
+slatedb = ["lix_backends/slatedb"]
 storage-benches = ["rocksdb", "redb"]
 
 [[bench]]
