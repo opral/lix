@@ -11,6 +11,10 @@ pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixErro
 }
 
 #[cfg(target_family = "wasm")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keep the native and WASM compression APIs identical"
+)]
 pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixError> {
     Ok(ruzstd::encoding::compress_to_vec(
         json_data,

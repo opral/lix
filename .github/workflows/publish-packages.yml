@@ -184,6 +184,14 @@ jobs:
         with:
           shared-key: publish-js-sdk
 
+      - name: Install WebAssembly build target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.122
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:

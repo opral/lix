@@ -1,6 +1,27 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import type {
+	LixBackendConfig,
+	LixBinding,
+	PluginRuntimeDispatch,
+} from "./binding-types.js";
+
+type NativeAddon = {
+	Lix: {
+		openMemory(dispatch: PluginRuntimeDispatch): Promise<LixBinding>;
+		openSqlite(
+			path: string,
+			dispatch: PluginRuntimeDispatch,
+		): Promise<LixBinding>;
+		openFs(
+			path: string,
+			lixDir: string | undefined,
+			syncAllFiles: boolean,
+			dispatch: PluginRuntimeDispatch,
+		): Promise<LixBinding>;
+	};
+};
 
 const require = createRequire(import.meta.url);
 const localNativePath = fileURLToPath(new URL("../lix_js_sdk.node", import.meta.url));
@@ -12,16 +33,10 @@ const nativePackages = {
 	"win32-x64": "@lix-js/sdk-win32-x64",
 } as const;
 
-function nativePackageName() {
-	const key = `${process.platform}-${process.arch}` as keyof typeof nativePackages;
-	return nativePackages[key];
-}
-
 function resolveNativePath() {
-	if (existsSync(localNativePath)) {
-		return localNativePath;
-	}
-	const packageName = nativePackageName();
+	if (existsSync(localNativePath)) return localNativePath;
+	const key = `${process.platform}-${process.arch}` as keyof typeof nativePackages;
+	const packageName = nativePackages[key];
 	let packageResolutionError: unknown;
 	if (packageName) {
 		try {
@@ -36,10 +51,9 @@ function resolveNativePath() {
 	throw packageResolutionError;
 }
 
-const native = { exports: {} as Record<string, any> };
+let addon: NativeAddon;
 try {
-	const nativePath = resolveNativePath();
-	process.dlopen(native, nativePath);
+	addon = require(resolveNativePath()) as NativeAddon;
 } catch (cause) {
 	const error = new Error(
 		`Failed to load @lix-js/sdk native addon for ${process.platform}-${process.arch}. ` +
@@ -50,4 +64,21 @@ try {
 	throw error;
 }
 
-export const addon = native.exports;
+export function openLixBinding(
+	backend: LixBackendConfig,
+	dispatch: PluginRuntimeDispatch,
+): Promise<LixBinding> {
+	switch (backend.kind) {
+		case "memory":
+			return addon.Lix.openMemory(dispatch);
+		case "sqlite":
+			return addon.Lix.openSqlite(backend.path, dispatch);
+		case "fs":
+			return addon.Lix.openFs(
+				backend.path,
+				backend.lixDir,
+				backend.syncAllFiles,
+				dispatch,
+			);
+	}
+}

@@ -7,8 +7,11 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { expect, test } from "vitest";
 import {
 	bundledPluginArchives,
@@ -19,8 +22,12 @@ import {
 	type ExecuteResult,
 	type Lix,
 } from "./index.js";
-import { addon } from "./native.js";
-import { createPluginRuntimeDispatch } from "./plugin-runtime.js";
+import { registerMemoryBackendContract } from "../tests/memory-backend-contract.js";
+
+registerMemoryBackendContract({
+	name: "Node native",
+	loadSdk: async () => await import("./index.js"),
+});
 
 test("openLix exposes the lix-sdk e2e flow", async () => {
 	const lix = await openLix();
@@ -139,68 +146,6 @@ test("committed writes survive close and reopen", async () => {
 	await second.close();
 });
 
-test("observe emits initial snapshot and committed updates", async () => {
-	const lix = await openLix();
-	const events = lix.observe(
-		"SELECT key, value FROM lix_key_value WHERE key = $1 ORDER BY key",
-		["js-observe"],
-	);
-
-	const initial = await events.next();
-	expect(initial?.sequence).toBe(0);
-	expect(typeof initial?.mutationSequence).toBe("number");
-	expect(initial?.result.rows).toHaveLength(0);
-
-	await lix.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe', 'v0')",
-	);
-
-	const update = await events.next();
-	expect(update?.sequence).toBe(1);
-	expect(update?.mutationSequence).toBeGreaterThanOrEqual(
-		initial?.mutationSequence ?? 0,
-	);
-	expect(update?.result.rows).toHaveLength(1);
-	expect(update?.result.rows[0]?.value("key").toJS()).toBe("js-observe");
-	expect(update?.result.rows[0]?.value("value").toJS()).toBe("v0");
-
-	events.close();
-	await expect(events.next()).resolves.toBeUndefined();
-	await lix.close();
-});
-
-test("observe rejects concurrent next calls on the same handle", async () => {
-	const lix = await openLix();
-	const events = lix.observe("SELECT key FROM lix_key_value WHERE key = $1", [
-		"js-observe-concurrent",
-	]);
-
-	await events.next();
-	const pending = events.next();
-	await expect(events.next()).rejects.toMatchObject({
-		code: "LIX_OBSERVE_NEXT_IN_FLIGHT",
-	});
-
-	events.close();
-	await expect(withTimeout(pending)).resolves.toBeUndefined();
-	await lix.close();
-});
-
-test("observe close resolves a pending next call", async () => {
-	const lix = await openLix();
-	const events = lix.observe("SELECT key FROM lix_key_value WHERE key = $1", [
-		"js-observe-close",
-	]);
-
-	await events.next();
-	const pending = events.next();
-	events.close();
-
-	await expect(withTimeout(pending)).resolves.toBeUndefined();
-	await expect(events.next()).resolves.toBeUndefined();
-	await lix.close();
-});
-
 test("observe close reliably resolves pending next calls", async () => {
 	const lix = await openLix();
 
@@ -244,7 +189,6 @@ test("observe remains usable after next rejects", async () => {
 });
 
 test.each([
-	["memory", () => openLix()],
 	[
 		"sqlite",
 		() => openLix({ backend: new SqliteBackend({ path: tempLixPath() }) }),
@@ -299,53 +243,7 @@ test.each([
 	await lix.close();
 });
 
-test("native fs open returns a promise", async () => {
-	const dir = tempFsDir();
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(join(dir, "note.md"), "local");
-
-	const native = addon.Lix.openFs(
-		dir,
-		undefined,
-		true,
-		createPluginRuntimeDispatch(),
-	);
-	expect(native).toBeInstanceOf(Promise);
-	const lix = await native;
-	await lix.close();
-});
-
-test("native awaited APIs return promises", async () => {
-	const opened = addon.Lix.openMemory(createPluginRuntimeDispatch());
-	expect(opened).toBeInstanceOf(Promise);
-	const lix = await opened;
-
-	const execute = lix.execute("SELECT 1 AS ok", []);
-	expect(execute).toBeInstanceOf(Promise);
-	expect((await execute).rows).toHaveLength(1);
-
-	const activeBranchId = lix.activeBranchId();
-	expect(activeBranchId).toBeInstanceOf(Promise);
-	expect(await activeBranchId).toEqual(expect.any(String));
-
-	const transaction = lix.beginTransaction();
-	expect(transaction).toBeInstanceOf(Promise);
-	const tx = await transaction;
-
-	const txExecute = tx.execute("SELECT 2 AS ok", []);
-	expect(txExecute).toBeInstanceOf(Promise);
-	expect((await txExecute).rows).toHaveLength(1);
-
-	const rollback = tx.rollback();
-	expect(rollback).toBeInstanceOf(Promise);
-	await rollback;
-
-	const close = lix.close();
-	expect(close).toBeInstanceOf(Promise);
-	await close;
-});
-
-test("native actor preserves queued execution order", async () => {
+test("worker preserves queued execution order", async () => {
 	const lix = await openLix();
 	await registerCrmTaskSchema(lix);
 
@@ -367,7 +265,7 @@ test("native actor preserves queued execution order", async () => {
 	await lix.close();
 });
 
-test("native actor settles commands queued behind close", async () => {
+test("worker settles commands queued behind close", async () => {
 	const lix = await openLix();
 
 	const firstClose = lix.close();
@@ -384,6 +282,26 @@ test("native actor settles commands queued behind close", async () => {
 		reason: { code: "LIX_ERROR_CLOSED" },
 	});
 	expect(settled[2].status).toBe("fulfilled");
+});
+
+test("an idle open Lix worker does not keep Node.js alive", async () => {
+	const sdkUrl = pathToFileURL(join(process.cwd(), "dist", "index.js")).href;
+	const script = `
+		(async () => {
+			const { openLix } = await import(${JSON.stringify(sdkUrl)});
+			const lix = await openLix();
+			const result = await lix.execute("SELECT 42 AS answer");
+			console.log(result.rows[0]?.get("answer"));
+		})().catch((error) => {
+			console.error(error);
+			process.exitCode = 1;
+		});
+	`;
+	const run = promisify(execFile);
+	const { stdout } = await run(process.execPath, ["-e", script], {
+		timeout: 5_000,
+	});
+	expect(stdout.trim()).toBe("42");
 });
 
 test("fs backend imports local files and materializes lix_file writes", async () => {
@@ -666,13 +584,6 @@ test("fs backend syncAllFiles validates option shape", () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 
-	expect(
-		() =>
-			new FsBackend({
-				path: dir,
-				storage: "memory",
-			} as never),
-	).toThrow("FsBackend storage is no longer supported");
 	expect(() => new FsBackend({ path: dir } as never)).toThrow(
 		"FsBackend syncAllFiles must be a boolean",
 	);
@@ -1051,34 +962,6 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 		"csv_row",
 		"csv_table",
 	]);
-
-	await lix.close();
-});
-
-test("bundled CSV plugin executes detect-changes and render", async () => {
-	const lix = await openLix();
-	const csvPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_csv",
-	);
-	if (!csvPlugin) {
-		throw new Error("expected bundled CSV plugin");
-	}
-
-	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
-	const source = "name,age\nAda,36\nGrace,37\n";
-	await writeFile(lix, "/people.csv", new TextEncoder().encode(source));
-
-	const result = await lix.execute(
-		"SELECT cells FROM csv_row ORDER BY order_key",
-	);
-	expect(result.rows.map((row) => row.get("cells"))).toEqual([
-		["name", "age"],
-		["Ada", "36"],
-		["Grace", "37"],
-	]);
-
-	const rendered = await readFile(lix, "/people.csv");
-	expect(rendered && new TextDecoder().decode(rendered)).toBe(source);
 
 	await lix.close();
 });

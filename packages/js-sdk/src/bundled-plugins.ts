@@ -1,5 +1,3 @@
-import { readFile } from "node:fs/promises";
-
 export type BundledPluginArchive = {
 	key: string;
 	fileName: string;
@@ -34,10 +32,19 @@ async function readBundledArchive(fileName: string): Promise<Uint8Array> {
 	];
 	for (const url of urls) {
 		try {
+			if (url.protocol !== "file:") {
+				const response = await fetch(url);
+				if (response.ok) {
+					return new Uint8Array(await response.arrayBuffer());
+				}
+				continue;
+			}
+			const moduleName = "node:fs/promises";
+			const { readFile } = await import(/* @vite-ignore */ moduleName);
 			return new Uint8Array(await readFile(url));
 		} catch {
 			// Try the next build/source layout.
 		}
 	}
-	return new Uint8Array(await readFile(urls[0]));
+	throw new Error(`Could not load bundled plugin archive ${fileName}`);
 }

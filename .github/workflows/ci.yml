@@ -92,6 +92,14 @@ jobs:
         with:
           shared-key: ${{ github.job }}
 
+      - name: Install WebAssembly build target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.122
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -106,3 +114,15 @@ jobs:
       - name: Run JS SDK binding tests
         working-directory: packages/js-sdk
         run: npm test
+
+      - name: Install Chromium
+        working-directory: packages/js-sdk
+        run: npx playwright install --with-deps chromium
+
+      - name: Run JS SDK browser tests
+        working-directory: packages/js-sdk
+        run: npm run test:browser:built
+
+      - name: Run packed Vite production smoke
+        working-directory: packages/js-sdk
+        run: node ./scripts/test-packed-vite.js
