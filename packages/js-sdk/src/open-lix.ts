@@ -3,10 +3,13 @@ import {
 	fsBackendNotOpen,
 	invalidArgument,
 } from "./errors.js";
-import { addon } from "./native.js";
-import { createPluginRuntimeDispatch } from "./plugin-runtime.js";
+import type {
+	BindingExecuteResult,
+	BindingObserveEvent,
+} from "./binding-types.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
+import { LixWorkerClient, openLixWorker } from "./worker/client.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -24,46 +27,20 @@ import type {
 	SwitchBranchReceipt,
 } from "./types.js";
 
-type NativeExecuteResult = Parameters<typeof wrapExecuteResult>[0];
-type NativeObserveEvent = {
-	sequence: number;
-	mutationSequence: number;
-	rows: NativeExecuteResult;
-};
-type NativeParam = ReturnType<typeof toNativeValue>;
-
-type NativeLix = {
-	execute(
-		sql: string,
-		params: NativeParam[],
-		options?: ExecuteOptions,
-	): Promise<NativeExecuteResult>;
-	observe(sql: string, params: NativeParam[]): Promise<NativeObserveEvents>;
-	beginTransaction(): Promise<NativeLixTransaction>;
-	activeBranchId(): Promise<string>;
-	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
-	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
-	importFilesystemPaths(paths: string[]): Promise<void>;
-	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
-	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
-	syncDiskToLix(): Promise<void>;
-	close(): Promise<void>;
-};
-
-type NativeLixTransaction = {
-	execute(
-		sql: string,
-		params: NativeParam[],
-		options?: ExecuteOptions,
-	): Promise<NativeExecuteResult>;
-	commit(): Promise<void>;
-	rollback(): Promise<void>;
-};
-
-type NativeObserveEvents = {
-	next(): Promise<NativeObserveEvent | null | undefined>;
-	close(): void;
-};
+const transactionFinalizer = new FinalizationRegistry<{
+	client: LixWorkerClient;
+	transactionId: number;
+}>(({ client, transactionId }) => {
+	client.notify({ kind: "transaction.abandon", transactionId });
+});
+const observeFinalizer = new FinalizationRegistry<{
+	client: LixWorkerClient;
+	observeId: Promise<number | undefined>;
+}>(({ client, observeId }) => {
+	void observeId.then((id) => {
+		if (id !== undefined) client.notify({ kind: "observe.close", observeId: id });
+	});
+});
 
 export class SqliteBackend {
 	readonly path: string;
@@ -80,7 +57,7 @@ export class SqliteBackend {
 	}
 }
 
-const openFsBackends = new WeakMap<FsBackend, NativeLix | null>();
+const openFsBackends = new WeakMap<FsBackend, LixWorkerClient | null>();
 
 export class FsBackend {
 	readonly path: string;
@@ -94,9 +71,6 @@ export class FsBackend {
 			options.path.length === 0
 		) {
 			throw new TypeError("FsBackend requires a non-empty path");
-		}
-		if ("storage" in options) {
-			throw new TypeError("FsBackend storage is no longer supported");
 		}
 		if (
 			options.lixDir !== undefined &&
@@ -128,19 +102,22 @@ export class FsBackend {
 				);
 			}
 		}
-		await this.native("importPaths").importFilesystemPaths([...paths]);
+		await this.client("importPaths").request({
+			kind: "importFilesystemPaths",
+			paths: [...paths],
+		});
 	}
 
 	async syncDiskToLix(): Promise<void> {
-		return this.native("syncDiskToLix").syncDiskToLix();
+		return this.client("syncDiskToLix").request({ kind: "syncDiskToLix" });
 	}
 
-	private native(operation: string): NativeLix {
-		const native = openFsBackends.get(this);
-		if (!native) {
+	private client(operation: string): LixWorkerClient {
+		const client = openFsBackends.get(this);
+		if (!client) {
 			throw fsBackendNotOpen(operation);
 		}
-		return native;
+		return client;
 	}
 }
 
@@ -148,16 +125,12 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (!options || typeof options !== "object") {
 		throw new TypeError("openLix() options must be an object");
 	}
-	const pluginRuntimeDispatch = createPluginRuntimeDispatch();
 	if (options.backend === undefined) {
-		return new Lix(await addon.Lix.openMemory(pluginRuntimeDispatch));
+		return new Lix(await openLixWorker({ kind: "memory" }));
 	}
 	if (options.backend instanceof SqliteBackend) {
 		return new Lix(
-			await addon.Lix.openSqlite(
-				options.backend.path,
-				pluginRuntimeDispatch,
-			),
+			await openLixWorker({ kind: "sqlite", path: options.backend.path }),
 		);
 	}
 	if (options.backend instanceof FsBackend) {
@@ -167,14 +140,17 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		}
 		openFsBackends.set(backend, null);
 		try {
-			const native = await addon.Lix.openFs(
-				backend.path,
-				backend.lixDir,
-				backend.syncAllFiles,
-				pluginRuntimeDispatch,
+			const client = await openLixWorker(
+				{
+					kind: "fs",
+					path: backend.path,
+					lixDir: backend.lixDir,
+					syncAllFiles: backend.syncAllFiles,
+				},
+				() => openFsBackends.delete(backend),
 			);
-			openFsBackends.set(backend, native);
-			return new Lix(native, () => openFsBackends.delete(backend));
+			openFsBackends.set(backend, client);
+			return new Lix(client);
 		} catch (error) {
 			openFsBackends.delete(backend);
 			throw error;
@@ -186,10 +162,9 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 }
 
 export class Lix {
-	constructor(
-		private readonly native: NativeLix,
-		private readonly onClose?: () => void,
-	) {}
+	private closePromise: Promise<void> | undefined;
+
+	constructor(private readonly client: LixWorkerClient) {}
 
 	async execute(
 		sql: string,
@@ -198,83 +173,115 @@ export class Lix {
 	): Promise<ExecuteResult> {
 		assertExecuteArgs("lix", sql, params, options);
 		return wrapExecuteResult(
-			await this.native.execute(
+			await this.client.request<BindingExecuteResult>({
+				kind: "execute",
 				sql,
-				params.map((param, index) =>
+				params: params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
-				normalizeExecuteOptions(options),
-			),
+				options,
+			}),
 		);
 	}
 
 	observe(sql: string, params: SqlParam[] = []): ObserveEvents {
 		assertSqlArgs("observe", "lix", sql, params);
 		return new ObserveEvents(
-			this.native.observe(
+			this.client,
+			this.client.request<number>({
+				kind: "observe",
 				sql,
-				params.map((param, index) =>
+				params: params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
-			),
+			}),
 		);
 	}
 
 	async beginTransaction(): Promise<LixTransaction> {
-		return new LixTransaction(await this.native.beginTransaction());
+		const transactionId = await this.client.request<number>({
+			kind: "beginTransaction",
+		});
+		return new LixTransaction(this.client, transactionId);
 	}
 
 	async activeBranchId(): Promise<string> {
-		return this.native.activeBranchId();
+		return this.client.request({ kind: "activeBranchId" });
 	}
 
 	async createBranch(
 		options: CreateBranchOptions,
 	): Promise<CreateBranchReceipt> {
-		return this.native.createBranch(options);
+		return this.client.request({ kind: "createBranch", options });
 	}
 
 	async switchBranch(
 		options: SwitchBranchOptions,
 	): Promise<SwitchBranchReceipt> {
-		return this.native.switchBranch(options);
+		return this.client.request({ kind: "switchBranch", options });
 	}
 
 	async mergeBranchPreview(
 		options: MergeBranchOptions,
 	): Promise<MergeBranchPreview> {
-		return normalizeOptionals(await this.native.mergeBranchPreview(options));
+		return normalizeOptionals(
+			await this.client.request({ kind: "mergeBranchPreview", options }),
+		);
 	}
 
 	async mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt> {
-		const receipt = normalizeOptionals(await this.native.mergeBranch(options));
+		const receipt = normalizeOptionals<MergeBranchReceipt>(
+			await this.client.request({ kind: "mergeBranch", options }),
+		);
 		receipt.createdMergeCommitId ??= null;
 		return receipt;
 	}
 
 	async close(): Promise<void> {
-		await this.native.close();
-		this.onClose?.();
+		this.closePromise ??= (async () => {
+			await this.client.request({ kind: "close" });
+			await this.client.terminate();
+		})();
+		try {
+			await this.closePromise;
+		} catch (error) {
+			this.closePromise = undefined;
+			throw error;
+		}
 	}
 }
 
 export class ObserveEvents {
-	private setupError: unknown;
-	private readonly native: Promise<NativeObserveEvents | undefined>;
+	private readonly setup: { error?: unknown } = {};
+	private closed = false;
+	private readonly observeId: Promise<number | undefined>;
 
-	constructor(native: Promise<NativeObserveEvents>) {
-		this.native = native.catch((error: unknown) => {
-			this.setupError = error;
+	constructor(
+		private readonly client: LixWorkerClient,
+		observeId: Promise<number>,
+	) {
+		const setup = this.setup;
+		this.observeId = observeId.catch((error: unknown) => {
+			setup.error = error;
 			return undefined;
 		});
+		observeFinalizer.register(
+			this,
+			{ client, observeId: this.observeId },
+			this,
+		);
 	}
 
 	async next(): Promise<ObserveEvent | undefined> {
-		const native = await this.native;
-		if (native === undefined) {
-			throw this.setupError;
+		if (this.closed) return undefined;
+		const observeId = await this.observeId;
+		if (observeId === undefined) {
+			throw this.setup.error;
 		}
-		const event = await native.next();
+		const event = await this.client.request<BindingObserveEvent | undefined>({
+			kind: "observe.next",
+			observeId,
+		});
 		if (event == null) {
 			return undefined;
 		}
@@ -286,12 +293,28 @@ export class ObserveEvents {
 	}
 
 	close(): void {
-		void this.native.then((native) => native?.close());
+		if (this.closed) return;
+		this.closed = true;
+		observeFinalizer.unregister(this);
+		void this.observeId.then((observeId) => {
+			if (observeId !== undefined) {
+				this.client.notify({ kind: "observe.close", observeId });
+			}
+		});
 	}
 }
 
 export class LixTransaction {
-	constructor(private readonly native: NativeLixTransaction) {}
+	constructor(
+		private readonly client: LixWorkerClient,
+		private readonly transactionId: number,
+	) {
+		transactionFinalizer.register(
+			this,
+			{ client, transactionId },
+			this,
+		);
+	}
 
 	async execute(
 		sql: string,
@@ -300,22 +323,31 @@ export class LixTransaction {
 	): Promise<ExecuteResult> {
 		assertExecuteArgs("lixTransaction", sql, params, options);
 		return wrapExecuteResult(
-			await this.native.execute(
+			await this.client.request<BindingExecuteResult>({
+				kind: "transaction.execute",
+				transactionId: this.transactionId,
 				sql,
-				params.map((param, index) =>
+				params: params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
-				normalizeExecuteOptions(options),
-			),
+				options,
+			}),
 		);
 	}
 
 	async commit(): Promise<void> {
-		return this.native.commit();
+		return this.finish("transaction.commit");
 	}
 
 	async rollback(): Promise<void> {
-		return this.native.rollback();
+		return this.finish("transaction.rollback");
+	}
+
+	private async finish(
+		kind: "transaction.commit" | "transaction.rollback",
+	): Promise<void> {
+		transactionFinalizer.unregister(this);
+		return this.client.request({ kind, transactionId: this.transactionId });
 	}
 }
 
@@ -350,15 +382,6 @@ function assertExecuteArgs(
 			receiver,
 		);
 	}
-}
-
-function normalizeExecuteOptions(
-	options: ExecuteOptions | undefined,
-): ExecuteOptions | undefined {
-	if (options?.originKey === undefined) {
-		return undefined;
-	}
-	return { originKey: options.originKey };
 }
 
 function assertSqlArgs(

@@ -3,8 +3,6 @@
 	"type": "module",
 	"version": "0.7.0",
 	"license": "MIT",
-	"main": "./dist/index.js",
-	"types": "./dist/index.d.ts",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/opral/lix"
@@ -15,16 +13,38 @@
 			"default": "./dist/index.js"
 		}
 	},
+	"imports": {
+		"#binding": {
+			"node": "./dist/binding.node.js",
+			"default": "./dist/binding.browser.js"
+		},
+		"#jco-transpile": {
+			"node": "@bytecodealliance/jco-transpile",
+			"default": "./dist/jco-transpile.browser.js"
+		},
+		"#worker-factory": {
+			"node": "./dist/worker/factory.node.js",
+			"default": "./dist/worker/factory.browser.js"
+		}
+	},
 	"files": [
 		"dist"
 	],
 	"scripts": {
-		"build": "npm run build:native && npm run build:ts && npm run build:plugins",
+		"build": "npm run clean && npm run build:native && npm run build:wasm && npm run build:ts && npm run build:jco-browser && npm run build:plugins",
+		"build:browser": "npm run clean && npm run build:wasm && npm run build:ts && npm run build:jco-browser && npm run build:plugins",
+		"build:jco-browser": "node ./scripts/build-jco-browser.js",
 		"build:native": "node ./scripts/build-native.js",
+		"build:wasm": "node ./scripts/build-wasm.js",
+		"build:wasm:dev": "LIX_WASM_PROFILE=dev node ./scripts/build-wasm.js",
 		"build:plugins": "node ./scripts/build-bundled-plugins.js",
+		"clean": "node ./scripts/clean.js",
 		"prepare:native-package": "node ./scripts/prepare-native-package.js",
 		"build:ts": "tsc -p tsconfig.json",
 		"test": "npm run build && vitest run",
+		"test:browser": "npm run build:browser && vitest run --config vitest.browser.config.ts",
+		"test:browser:built": "vitest run --config vitest.browser.config.ts",
+		"test:browser:production": "node ./scripts/test-packed-vite.js",
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"optionalDependencies": {
@@ -34,7 +54,9 @@
 		"@lix-js/sdk-win32-x64": "0.7.0"
 	},
 	"devDependencies": {
+		"@vitest/browser-playwright": "4.0.18",
 		"@types/node": "^24.10.2",
+		"playwright": "1.57.0",
 		"typescript": "^5.5.4",
 		"vitest": "^4.0.18"
 	},

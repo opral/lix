@@ -1,6 +1,7 @@
 # @lix-js/sdk
 
-JavaScript SDK for Lix, backed by the native Rust SDK.
+JavaScript SDK for Lix. It uses the native Rust addon in Node.js and the same
+Rust SDK compiled to WebAssembly in browsers.
 
 ## Install
 
@@ -9,6 +10,19 @@ npm install @lix-js/sdk
 ```
 
 ## Usage
+
+The default in-memory backend works in browsers and Node.js:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix();
+const result = await lix.execute("SELECT $1 AS message", ["hello"]);
+console.log(result.rows[0]?.get("message"));
+await lix.close();
+```
+
+Filesystem and SQLite backends use native Node.js dependencies:
 
 ```ts
 import { FsBackend, openLix } from "@lix-js/sdk";
@@ -79,9 +93,56 @@ try {
 - Pass `new FsBackend({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
 - Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `backend.importPaths(["notes/today.md"])` on the `FsBackend` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
 - Use `new SqliteBackend({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
-- The SDK is Node/native only right now; it is not browser-compatible.
+- In browsers, `openLix()` loads the Rust engine as WebAssembly and uses the
+  in-memory backend.
+- `FsBackend` and `SqliteBackend` are Node.js-only. Constructing them is safe in
+  shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
-- The native addon is built from Rust and loaded by the TypeScript wrapper.
-- Installed WASM plugin components are transpiled with JCO and executed by Node's built-in WebAssembly runtime.
+- The package uses conditional ESM imports internally: Node.js resolves the
+  native N-API binding, while browsers and other runtimes resolve the portable
+  WebAssembly binding. Vite follows this split without consumer configuration.
+- Every `openLix()` owns one dedicated worker. The engine, storage backend, and
+  installed WASM plugin components all run in that worker in both Node.js and
+  browsers, so database and plugin work does not block the page's main thread.
+- Installed WASM plugin components are transpiled with JCO and executed by the
+  worker's WebAssembly runtime in both environments. Plugin execution does not
+  yet enforce the declared fuel, timeout, or memory limits, so only install
+  trusted plugins.
+- A page Content Security Policy only needs to permit the package's same-origin
+  worker. WebAssembly compilation and JCO's generated `data:` module imports
+  happen inside that worker, so they can be scoped to the worker script's HTTP
+  response instead of being allowed by the document:
+
+  ```http
+  # HTML document response
+  Content-Security-Policy: default-src 'self'; script-src 'self'; worker-src 'self'
+
+  # Lix worker response (Vite emits assets/entry.browser-<hash>.js)
+  Content-Security-Policy: default-src 'none'; script-src 'self' data: 'wasm-unsafe-eval'; connect-src 'self'
+  ```
+
+  Hosts that apply one policy to every response can use
+  `script-src 'self' data: 'wasm-unsafe-eval'; worker-src 'self'` globally
+  instead. Worker-scoped headers keep those permissions out of the page.
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
 - Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.json(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
+
+## Browser development
+
+The browser suite runs the published package shape in a real headless Chromium
+page through Vite/Vitest Browser Mode:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.122 --locked
+npx playwright install chromium
+npm run test:browser
+```
+
+`npm run test:browser:production` additionally packs the SDK, installs the
+tarball into a minimal Vite app, makes a production build, and exercises SQL
+plus both bundled plugins in Chromium. It runs with both worker-scoped and
+global strict CSP headers.
+
+Use `npm run build:wasm:dev` while iterating on the Rust bridge when release
+optimization is unnecessary.

@@ -1,5 +1,5 @@
-import { transpileBytes } from "@bytecodealliance/jco-transpile";
 import { WASIShim } from "@bytecodealliance/preview2-shim/instantiation";
+import { transpileBytes } from "#jco-transpile";
 
 type PluginRuntimeOperation =
 	| "initComponent"
@@ -67,7 +67,7 @@ type InstantiationModule = {
 	): Promise<{ api?: PluginApi }>;
 };
 
-class NodeWasmPluginRuntime {
+class WasmPluginRuntime {
 	private nextComponentId = 1;
 	private readonly components = new Map<number, PluginApi>();
 
@@ -109,8 +109,10 @@ class NodeWasmPluginRuntime {
 		});
 		const files = new Map(Object.entries(transpiled.files));
 		const moduleSource = requiredFile(files, `${name}.js`);
-		const moduleUrl = `data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}`;
-		const generatedModule = (await import(moduleUrl)) as InstantiationModule;
+		const moduleUrl = `data:text/javascript;base64,${bytesToBase64(moduleSource)}`;
+		const generatedModule = (await import(
+			/* @vite-ignore */ moduleUrl
+		)) as InstantiationModule;
 		const wasi = new WASIShim({
 			sandbox: {
 				preopens: {},
@@ -165,8 +167,17 @@ class NodeWasmPluginRuntime {
 	}
 }
 
-export function createPluginRuntimeDispatch(): NodeWasmPluginRuntime["dispatch"] {
-	return new NodeWasmPluginRuntime().dispatch;
+export function createPluginRuntimeDispatch(): WasmPluginRuntime["dispatch"] {
+	return new WasmPluginRuntime().dispatch;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+	let binary = "";
+	const chunkSize = 0x8000;
+	for (let index = 0; index < bytes.length; index += chunkSize) {
+		binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+	}
+	return btoa(binary);
 }
 
 function requiredFile(

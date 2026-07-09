@@ -120,6 +120,7 @@ where
     async fn evaluate_stable_snapshot(&mut self) -> Result<Option<(u64, ExecuteResult)>, LixError> {
         loop {
             let operation_guard = self.session.begin_waitable_session_operation().await?;
+            #[cfg(not(target_family = "wasm"))]
             self.session
                 .observe_invalidation
                 .ensure_external_watcher(self.session.storage.clone())?;

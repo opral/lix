@@ -1,19 +1,27 @@
+#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_family = "wasm"))]
+use std::{thread, time::Duration};
 
 use tokio::sync::watch;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::LixError;
-use crate::storage::{StorageBackend, StorageContext, StorageWriteSetStats};
+use crate::storage::StorageWriteSetStats;
+#[cfg(not(target_family = "wasm"))]
+use crate::storage::{StorageBackend, StorageContext};
 
+#[cfg(not(target_family = "wasm"))]
 const EXTERNAL_MUTATION_REVISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub(crate) struct ObserveInvalidation {
     generation: AtomicU64,
     sender: watch::Sender<u64>,
+    #[cfg(not(target_family = "wasm"))]
     external_watcher_started: AtomicBool,
 }
 
@@ -23,6 +31,7 @@ impl ObserveInvalidation {
         Self {
             generation: AtomicU64::new(0),
             sender,
+            #[cfg(not(target_family = "wasm"))]
             external_watcher_started: AtomicBool::new(false),
         }
     }
@@ -43,6 +52,7 @@ impl ObserveInvalidation {
         self.sender.subscribe()
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn ensure_external_watcher<B>(
         self: &Arc<Self>,
         storage: StorageContext<B>,
