@@ -327,7 +327,9 @@ fn file_metadata() -> Value {
 }
 
 fn upload_file_bytes(version: u64) -> Vec<u8> {
-    let byte = u8::try_from((version as usize + SEED_FILE_COUNT) % 251)
+    let seed_file_count =
+        u64::try_from(SEED_FILE_COUNT).expect("seed file count fits in u64");
+    let byte = u8::try_from((version % 251 + seed_file_count % 251) % 251)
         .expect("upload byte pattern fits in u8");
     vec![byte; FILE_SIZE_BYTES]
 }
