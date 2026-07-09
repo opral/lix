@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use bytes::Bytes;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
     Key, KeyRange, PointVisitor, ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions,
@@ -14,14 +15,19 @@ use lix_engine::backend::{
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
-use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
+use slatedb::config::ScanOptions as SlateDbScanOptions;
+use slatedb::{Db, DbSnapshot, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
 
 const DB_PATH: &str = "db";
 const SPACE_PREFIX_LEN: usize = 4;
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
-const SCAN_BATCH_ROWS: usize = 1024;
+const POINT_READ_CONCURRENCY: usize = 64;
+const SCAN_INITIAL_CAPACITY: usize = 1024;
+const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
+const SCAN_MAX_FETCH_TASKS: usize = 16;
+const SCAN_CACHE_BLOCKS: bool = true;
 
 #[derive(Debug)]
 pub struct SlateDbBackendFactory {
@@ -206,16 +212,9 @@ impl BackendRead for SlateDbRead {
             .map(|key| physical_key(space, key))
             .collect::<Result<Vec<_>, _>>()?;
         let snapshot = Arc::clone(&self.snapshot);
-        let values = self.worker.call(move |runtime, _db| {
-            physical_keys
-                .iter()
-                .map(|key| {
-                    runtime
-                        .block_on(snapshot.get(key.0.clone()))
-                        .map_err(slatedb_error)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+        let values = self
+            .worker
+            .call(move |runtime, _db| get_snapshot_values(runtime, snapshot, physical_keys))?;
 
         for (index, (key, value)) in keys.iter().zip(values.iter()).enumerate() {
             visitor.visit(
@@ -253,53 +252,21 @@ impl BackendRead for SlateDbRead {
             return Ok(ScanResult::default());
         }
 
+        let projection = opts.projection;
+        let limit_rows = opts.limit_rows;
         let snapshot = Arc::clone(&self.snapshot);
-        let mut iter = Some(
-            self.worker
-                .call(move |runtime, _db| open_snapshot_scan(runtime, &snapshot, bounds))?,
-        );
-        let mut emitted = 0usize;
+        let batch = self.worker.call(move |runtime, _db| {
+            scan_snapshot(runtime, &snapshot, bounds, limit_rows, projection)
+        })?;
+        let ScanBatch { entries, has_more } = batch;
 
-        loop {
-            let remaining = opts.limit_rows - emitted;
-            let batch_limit = remaining.min(SCAN_BATCH_ROWS);
-            let lookahead = batch_limit == remaining;
-            let current_iter = iter
-                .take()
-                .expect("slatedb scan iterator is present until scan returns");
-            let projection = opts.projection;
-            let batch = self.worker.call(move |runtime, _db| {
-                scan_snapshot_batch(runtime, current_iter, batch_limit, projection, lookahead)
-            })?;
-            let ScanBatch {
-                iter: next_iter,
-                entries,
-                state,
-            } = batch;
-
-            for (key, value) in &entries {
-                visitor.visit(key.as_ref(), value.as_ref())?;
-            }
-            emitted += entries.len();
-
-            match state {
-                ScanBatchState::Exhausted => {
-                    return Ok(ScanResult {
-                        emitted,
-                        has_more: false,
-                    });
-                }
-                ScanBatchState::HasMore => {
-                    return Ok(ScanResult {
-                        emitted,
-                        has_more: true,
-                    });
-                }
-                ScanBatchState::MoreUnknown => {
-                    iter = Some(next_iter);
-                }
-            }
+        for (key, value) in &entries {
+            visitor.visit(key.as_ref(), value.as_ref())?;
         }
+        Ok(ScanResult {
+            emitted: entries.len(),
+            has_more,
+        })
     }
 }
 
@@ -580,44 +547,47 @@ impl EncodedBounds {
     }
 }
 
+fn get_snapshot_values(
+    runtime: &Runtime,
+    snapshot: Arc<DbSnapshot>,
+    keys: Vec<Key>,
+) -> Result<Vec<Option<Bytes>>, BackendError> {
+    runtime.block_on(async move {
+        stream::iter(keys)
+            .map(|key| {
+                let snapshot = Arc::clone(&snapshot);
+                async move { snapshot.get(key.0).await.map_err(slatedb_error) }
+            })
+            .buffered(POINT_READ_CONCURRENCY)
+            .try_collect()
+            .await
+    })
+}
+
 struct ScanBatch {
-    iter: DbIterator,
     entries: Vec<(Key, ProjectedValue)>,
-    state: ScanBatchState,
+    has_more: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScanBatchState {
-    Exhausted,
-    MoreUnknown,
-    HasMore,
-}
-
-fn open_snapshot_scan(
+fn scan_snapshot(
     runtime: &Runtime,
     snapshot: &DbSnapshot,
     bounds: EncodedBounds,
-) -> Result<DbIterator, BackendError> {
-    runtime
-        .block_on(snapshot.scan(bounds.range()))
-        .map_err(slatedb_error)
-}
-
-fn scan_snapshot_batch(
-    runtime: &Runtime,
-    mut iter: DbIterator,
     limit_rows: usize,
     projection: CoreProjection,
-    lookahead: bool,
 ) -> Result<ScanBatch, BackendError> {
     runtime.block_on(async {
-        let mut entries = Vec::with_capacity(limit_rows);
+        let scan_options = slatedb_scan_options();
+        let mut iter = snapshot
+            .scan_with_options(bounds.range(), &scan_options)
+            .await
+            .map_err(slatedb_error)?;
+        let mut entries = Vec::with_capacity(limit_rows.min(SCAN_INITIAL_CAPACITY));
         while entries.len() < limit_rows {
             let Some(row) = iter.next().await.map_err(slatedb_error)? else {
                 return Ok(ScanBatch {
-                    iter,
                     entries,
-                    state: ScanBatchState::Exhausted,
+                    has_more: false,
                 });
             };
             if row.key.len() < SPACE_PREFIX_LEN {
@@ -634,20 +604,8 @@ fn scan_snapshot_batch(
             entries.push((key, value));
         }
 
-        let state = if lookahead {
-            if iter.next().await.map_err(slatedb_error)?.is_some() {
-                ScanBatchState::HasMore
-            } else {
-                ScanBatchState::Exhausted
-            }
-        } else {
-            ScanBatchState::MoreUnknown
-        };
-        Ok(ScanBatch {
-            iter,
-            entries,
-            state,
-        })
+        let has_more = iter.next().await.map_err(slatedb_error)?.is_some();
+        Ok(ScanBatch { entries, has_more })
     })
 }
 
@@ -657,13 +615,26 @@ fn collect_snapshot_keys(
     bounds: EncodedBounds,
 ) -> Result<Vec<Key>, BackendError> {
     runtime.block_on(async {
-        let mut iter = snapshot.scan(bounds.range()).await.map_err(slatedb_error)?;
+        let scan_options = slatedb_scan_options();
+        let mut iter = snapshot
+            .scan_with_options(bounds.range(), &scan_options)
+            .await
+            .map_err(slatedb_error)?;
         let mut keys = Vec::new();
         while let Some(row) = iter.next().await.map_err(slatedb_error)? {
             keys.push(Key(row.key));
         }
         Ok(keys)
     })
+}
+
+fn slatedb_scan_options() -> SlateDbScanOptions {
+    // SlateDB's default scan options fetch one block at a time. Keep iteration
+    // ordered, but let SlateDB prefetch remote SST blocks behind the iterator.
+    SlateDbScanOptions::default()
+        .with_read_ahead_bytes(SCAN_READ_AHEAD_BYTES)
+        .with_max_fetch_tasks(SCAN_MAX_FETCH_TASKS)
+        .with_cache_blocks(SCAN_CACHE_BLOCKS)
 }
 
 fn max_lower_bound(left: Bound<Vec<u8>>, right: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
