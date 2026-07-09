@@ -3198,6 +3198,7 @@ dependencies = [
 name = "lix_js_sdk"
 version = "0.7.0"
 dependencies = [
+ "async-trait",
  "lix_sdk",
  "napi",
  "napi-derive",

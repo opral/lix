@@ -82,5 +82,6 @@ try {
 - The SDK is Node/native only right now; it is not browser-compatible.
 - The package is ESM-only.
 - The native addon is built from Rust and loaded by the TypeScript wrapper.
+- Installed WASM plugin components are transpiled with JCO and executed by Node's built-in WebAssembly runtime.
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
 - Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.json(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
