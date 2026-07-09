@@ -18,7 +18,7 @@ pub use rocksdb::{
 #[cfg(feature = "slatedb")]
 pub use slatedb::{
     SlateDbBackend, SlateDbBackendFactory, SlateDbBackendFixture, SlateDbBackendOptions,
-    SlateDbRead, SlateDbWrite,
+    SlateDbCacheOptions, SlateDbObjectStoreOptions, SlateDbRead, SlateDbWrite,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{

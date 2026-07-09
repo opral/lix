@@ -15,7 +15,11 @@ use lix_engine::backend::{
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
-use slatedb::config::ScanOptions as SlateDbScanOptions;
+use slatedb::config::{
+    ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDbScanOptions, Settings,
+};
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
+use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
@@ -28,6 +32,7 @@ const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
+const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SlateDbBackendFactory {
@@ -51,6 +56,19 @@ pub struct SlateDbBackend {
 #[derive(Clone, Debug)]
 pub struct SlateDbBackendOptions {
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SlateDbObjectStoreOptions {
+    pub cache: Option<SlateDbCacheOptions>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SlateDbCacheOptions {
+    pub root_folder: PathBuf,
+    pub max_disk_cache_bytes: usize,
+    pub block_cache_bytes: u64,
+    pub metadata_cache_bytes: u64,
 }
 
 #[allow(missing_debug_implementations)]
@@ -138,9 +156,22 @@ impl SlateDbBackend {
         db_path: impl Into<String>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self, BackendError> {
+        Self::open_object_store_with_options(
+            db_path,
+            object_store,
+            SlateDbObjectStoreOptions::default(),
+        )
+    }
+
+    pub fn open_object_store_with_options(
+        db_path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        options: SlateDbObjectStoreOptions,
+    ) -> Result<Self, BackendError> {
+        validate_object_store_options(&options)?;
         let db_path = db_path.into();
         Ok(Self {
-            worker: SlateDbWorker::start(db_path.clone(), object_store)?,
+            worker: SlateDbWorker::start(db_path.clone(), object_store, options)?,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
         })
@@ -407,12 +438,18 @@ enum SlateDbCommand {
 }
 
 impl SlateDbWorker {
-    fn start(db_path: String, object_store: Arc<dyn ObjectStore>) -> Result<Self, BackendError> {
+    fn start(
+        db_path: String,
+        object_store: Arc<dyn ObjectStore>,
+        options: SlateDbObjectStoreOptions,
+    ) -> Result<Self, BackendError> {
         let (commands, receiver) = mpsc::channel();
         let (opened_tx, opened_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("lix-slatedb".to_string())
-            .spawn(move || run_slatedb_worker(db_path, object_store, receiver, opened_tx))
+            .spawn(move || {
+                run_slatedb_worker(db_path, object_store, options, receiver, opened_tx);
+            })
             .map_err(|error| BackendError::Io(format!("spawn slatedb worker: {error}")))?;
 
         match opened_rx
@@ -467,6 +504,7 @@ impl Drop for SlateDbWorkerInner {
 fn run_slatedb_worker(
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
+    options: SlateDbObjectStoreOptions,
     receiver: mpsc::Receiver<SlateDbCommand>,
     opened: mpsc::Sender<Result<(), BackendError>>,
 ) {
@@ -480,7 +518,7 @@ fn run_slatedb_worker(
         }
     };
 
-    let db = match open_slatedb(&runtime, db_path, object_store) {
+    let db = match open_slatedb(&runtime, db_path, object_store, options) {
         Ok(db) => db,
         Err(error) => {
             let _ = opened.send(Err(error));
@@ -504,10 +542,66 @@ fn open_slatedb(
     runtime: &Runtime,
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
+    options: SlateDbObjectStoreOptions,
 ) -> Result<Db, BackendError> {
-    runtime
-        .block_on(Db::open(db_path, object_store))
-        .map_err(slatedb_error)
+    runtime.block_on(async move {
+        let mut builder = Db::builder(db_path, object_store);
+        if let Some(cache) = options.cache {
+            let settings = Settings {
+                object_store_cache_options: ObjectStoreCacheOptions {
+                    root_folder: Some(cache.root_folder),
+                    max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
+                    part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
+                    cache_puts: true,
+                    preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+                    scan_interval: None,
+                    ..ObjectStoreCacheOptions::default()
+                },
+                ..Settings::default()
+            };
+            let db_cache = SplitCache::new()
+                .with_block_cache(moka_cache(cache.block_cache_bytes))
+                .with_meta_cache(moka_cache(cache.metadata_cache_bytes))
+                .build();
+            builder = builder
+                .with_settings(settings)
+                .with_db_cache(Arc::new(db_cache));
+        } else {
+            // The SlateDB dependency is compiled with Moka support so cached
+            // callers can choose bounded capacities. Keep the legacy constructor
+            // cacheless instead of accepting SlateDB's much larger defaults.
+            builder = builder.with_db_cache_disabled();
+        }
+        builder.build().await.map_err(slatedb_error)
+    })
+}
+
+fn validate_object_store_options(options: &SlateDbObjectStoreOptions) -> Result<(), BackendError> {
+    let Some(cache) = &options.cache else {
+        return Ok(());
+    };
+    if cache.root_folder.as_os_str().is_empty() {
+        return Err(BackendError::Io(
+            "slatedb cache root folder must not be empty".to_string(),
+        ));
+    }
+    if cache.max_disk_cache_bytes == 0 {
+        return Err(BackendError::Io(
+            "slatedb disk cache size must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn moka_cache(capacity: u64) -> Option<Arc<dyn DbCache>> {
+    if capacity == 0 {
+        return None;
+    }
+    Some(Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
+        max_capacity: capacity,
+        time_to_live: None,
+        time_to_idle: None,
+    })))
 }
 
 fn physical_key(space: SpaceId, key: &Key) -> Result<Key, BackendError> {
