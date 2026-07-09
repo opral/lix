@@ -52,9 +52,17 @@ type PluginApi = {
 	render(state: PluginEntityState[]): Uint8Array;
 };
 
+type WebAssemblyHost = {
+	compile(bytes: ArrayBuffer): Promise<object>;
+};
+
+const webAssembly = (
+	globalThis as typeof globalThis & { WebAssembly: WebAssemblyHost }
+).WebAssembly;
+
 type InstantiationModule = {
 	instantiate(
-		getCoreModule: (path: string) => Promise<WebAssembly.Module>,
+		getCoreModule: (path: string) => Promise<object>,
 		imports: Record<string, unknown>,
 	): Promise<{ api?: PluginApi }>;
 };
@@ -113,7 +121,7 @@ class NodeWasmPluginRuntime {
 		});
 		const instance = await generatedModule.instantiate(
 			async (path) =>
-				await WebAssembly.compile(copyArrayBuffer(requiredFile(files, path))),
+				await webAssembly.compile(copyArrayBuffer(requiredFile(files, path))),
 			wasi.getImportObject() as Record<string, unknown>,
 		);
 		if (!instance.api) {
