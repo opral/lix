@@ -46,7 +46,6 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     _engine: Engine<B>,
-    backend: B,
     session: SessionContext<B>,
 }
 
@@ -61,12 +60,10 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    let backend = options.backend;
-    let engine = open_or_initialize_engine(backend.clone(), options.wasm_runtime).await?;
+    let engine = open_or_initialize_engine(options.backend, options.wasm_runtime).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
-        backend,
         session,
     })
 }
@@ -158,36 +155,6 @@ where
     }
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
-impl Lix<crate::FsBackend> {
-    pub async fn import_filesystem_paths<I, S>(&self, paths: I) -> Result<(), LixError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.ensure_open()?;
-        self.backend.import_paths(paths).await
-    }
-
-    pub async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
-        self.ensure_open()?;
-        self.backend.sync_disk_to_lix().await
-    }
-
-    fn ensure_open(&self) -> Result<(), LixError> {
-        if self.session.is_closed() {
-            return Err(lix_closed_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
-fn lix_closed_error() -> LixError {
-    LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
-        .with_hint("Open a new Lix handle before calling this method.")
-}
-
 #[expect(missing_debug_implementations)]
 pub struct LixTransaction<B = InMemoryBackend>
 where
@@ -235,26 +202,6 @@ where
 }
 
 pub(crate) async fn open_or_initialize_engine<B>(
-    backend: B,
-    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
-) -> Result<Engine<B>, LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    match new_engine(backend.clone(), wasm_runtime.clone()).await {
-        Ok(engine) => Ok(engine),
-        Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
-            Engine::initialize(backend.clone()).await?;
-            new_engine(backend, wasm_runtime).await
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(feature = "fs_backend")]
-pub(crate) async fn open_or_initialize_filesystem_engine<B>(
     backend: B,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 ) -> Result<Engine<B>, LixError>

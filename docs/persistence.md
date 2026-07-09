@@ -81,20 +81,19 @@ const lix = await openLix({
 ```
 
 Set `syncAllFiles: false` when filesystem sync should start with no regular
-workspace files, then import selected files with `importFilesystemPaths()`. Imported paths
+workspace files, then import selected files with `backend.importPaths()`. Imported paths
 are exact workspace-relative file paths, not directories or globs. They may be
 written with or without a leading slash, for example `"notes/today.md"` or
 `"/notes/today.md"`. This scopes disk import, file watching, and
 materialization; it does not filter unrelated Lix SQL state.
 
 ```ts
-const lix = await openLix({
-	backend: new FsBackend({
-		path: "/Users/me/Downloads",
-		syncAllFiles: false,
-	}),
+const backend = new FsBackend({
+	path: "/Users/me/Downloads",
+	syncAllFiles: false,
 });
-await lix.importFilesystemPaths(["notes/today.md"]);
+const lix = await openLix({ backend });
+await backend.importPaths(["notes/today.md"]);
 ```
 
 ## Single .lix application file

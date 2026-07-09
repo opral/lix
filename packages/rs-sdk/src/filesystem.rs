@@ -425,8 +425,7 @@ where
         layout: FilesystemLayout,
         sync_all_files: bool,
     ) -> Result<Self, LixError> {
-        let engine =
-            crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None).await?;
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
         Self::open_with_engine(backend, engine, layout, sync_all_files).await
     }
 
@@ -2539,7 +2538,7 @@ mod tests {
         path_filter: FilesystemPathFilter,
     ) -> FilesystemState<RocksDbFilesystemBackend> {
         let backend = open_filesystem_rocksdb_backend(&layout).unwrap();
-        let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None)
             .await
             .unwrap();
         FilesystemState {
@@ -2885,13 +2884,15 @@ mod tests {
         })
         .await
         .unwrap();
-        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
-        lix.import_filesystem_paths(["tracked.md"]).await.unwrap();
+        let lix = crate::lix::open_lix_with_backend(backend.clone())
+            .await
+            .unwrap();
+        backend.import_paths(["tracked.md"]).await.unwrap();
 
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"changed").unwrap();
 
-        lix.sync_disk_to_lix().await.unwrap();
+        backend.sync_disk_to_lix().await.unwrap();
 
         let tracked = lix
             .execute(
@@ -2924,7 +2925,7 @@ mod tests {
 
     #[cfg(feature = "fs_backend")]
     #[tokio::test]
-    async fn fs_backend_sync_disk_to_lix_after_close_returns_closed() {
+    async fn fs_backend_sync_disk_to_lix_outlives_lix_session() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
 
@@ -2935,16 +2936,33 @@ mod tests {
         })
         .await
         .unwrap();
-        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
+        let lix = crate::lix::open_lix_with_backend(backend.clone())
+            .await
+            .unwrap();
 
         lix.close().await.unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
 
-        let error = lix
-            .sync_disk_to_lix()
+        backend.sync_disk_to_lix().await.unwrap();
+
+        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
+        let tracked = lix
+            .execute(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text("/tracked.md".to_string())],
+            )
             .await
-            .expect_err("sync after close should fail closed");
-        assert_eq!(error.code, LixError::CODE_CLOSED);
+            .unwrap();
+        assert_eq!(
+            tracked
+                .rows()
+                .first()
+                .unwrap()
+                .get::<Vec<u8>>("data")
+                .unwrap(),
+            b"changed"
+        );
+        lix.close().await.unwrap();
     }
 
     #[cfg(feature = "fs_backend")]
