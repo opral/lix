@@ -1,5 +1,5 @@
 ---
-type: major
+type: minor
 ---
 
 `FsBackend` now requires an explicit `syncAllFiles` option and supports on-demand file sync.
