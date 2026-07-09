@@ -39,6 +39,8 @@
 		"vitest": "^4.0.18"
 	},
 	"dependencies": {
+		"@bytecodealliance/jco-transpile": "0.4.2",
+		"@bytecodealliance/preview2-shim": "0.19.0",
 		"fflate": "^0.8.3"
 	}
 }

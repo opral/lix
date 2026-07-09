@@ -4,6 +4,7 @@ import {
 	invalidArgument,
 } from "./errors.js";
 import { addon } from "./native.js";
+import { createPluginRuntimeDispatch } from "./plugin-runtime.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
 import type {
@@ -147,11 +148,17 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (!options || typeof options !== "object") {
 		throw new TypeError("openLix() options must be an object");
 	}
+	const pluginRuntimeDispatch = createPluginRuntimeDispatch();
 	if (options.backend === undefined) {
-		return new Lix(await addon.Lix.openMemory());
+		return new Lix(await addon.Lix.openMemory(pluginRuntimeDispatch));
 	}
 	if (options.backend instanceof SqliteBackend) {
-		return new Lix(await addon.Lix.openSqlite(options.backend.path));
+		return new Lix(
+			await addon.Lix.openSqlite(
+				options.backend.path,
+				pluginRuntimeDispatch,
+			),
+		);
 	}
 	if (options.backend instanceof FsBackend) {
 		const backend = options.backend;
@@ -164,6 +171,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				backend.path,
 				backend.lixDir,
 				backend.syncAllFiles,
+				pluginRuntimeDispatch,
 			);
 			openFsBackends.set(backend, native);
 			return new Lix(native, () => openFsBackends.delete(backend));

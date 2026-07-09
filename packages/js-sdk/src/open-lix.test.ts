@@ -20,6 +20,7 @@ import {
 	type Lix,
 } from "./index.js";
 import { addon } from "./native.js";
+import { createPluginRuntimeDispatch } from "./plugin-runtime.js";
 
 test("openLix exposes the lix-sdk e2e flow", async () => {
 	const lix = await openLix();
@@ -303,14 +304,19 @@ test("native fs open returns a promise", async () => {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "local");
 
-	const native = addon.Lix.openFs(dir, undefined, true);
+	const native = addon.Lix.openFs(
+		dir,
+		undefined,
+		true,
+		createPluginRuntimeDispatch(),
+	);
 	expect(native).toBeInstanceOf(Promise);
 	const lix = await native;
 	await lix.close();
 });
 
 test("native awaited APIs return promises", async () => {
-	const opened = addon.Lix.openMemory();
+	const opened = addon.Lix.openMemory(createPluginRuntimeDispatch());
 	expect(opened).toBeInstanceOf(Promise);
 	const lix = await opened;
 
@@ -1045,6 +1051,65 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 		"csv_row",
 		"csv_table",
 	]);
+
+	await lix.close();
+});
+
+test("bundled CSV plugin executes detect-changes and render", async () => {
+	const lix = await openLix();
+	const csvPlugin = (await bundledPluginArchives()).find(
+		(plugin) => plugin.key === "plugin_csv",
+	);
+	if (!csvPlugin) {
+		throw new Error("expected bundled CSV plugin");
+	}
+
+	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
+	const source = "name,age\nAda,36\nGrace,37\n";
+	await writeFile(lix, "/people.csv", new TextEncoder().encode(source));
+
+	const result = await lix.execute(
+		"SELECT cells FROM csv_row ORDER BY order_key",
+	);
+	expect(result.rows.map((row) => row.get("cells"))).toEqual([
+		["name", "age"],
+		["Ada", "36"],
+		["Grace", "37"],
+	]);
+
+	const rendered = await readFile(lix, "/people.csv");
+	expect(rendered && new TextDecoder().decode(rendered)).toBe(source);
+
+	await lix.close();
+});
+
+test("bundled Markdown plugin executes detect-changes and render", async () => {
+	const lix = await openLix();
+	const markdownPlugin = (await bundledPluginArchives()).find(
+		(plugin) => plugin.key === "plugin_md_v2",
+	);
+	if (!markdownPlugin) {
+		throw new Error("expected bundled Markdown plugin");
+	}
+
+	await upsertPluginArchive(
+		lix,
+		markdownPlugin.key,
+		markdownPlugin.archiveBytes,
+	);
+	const source = "# Heading\n\nParagraph with **bold** text.\n";
+	await writeFile(lix, "/notes.md", new TextEncoder().encode(source));
+
+	const blocks = await lix.execute(
+		"SELECT block FROM markdown_block ORDER BY order_key",
+	);
+	expect(blocks.rows.map((row) => row.get("block"))).toEqual([
+		"# Heading",
+		"Paragraph with **bold** text.",
+	]);
+
+	const rendered = await readFile(lix, "/notes.md");
+	expect(rendered && new TextDecoder().decode(rendered)).toBe(source);
 
 	await lix.close();
 });
