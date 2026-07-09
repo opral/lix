@@ -59,6 +59,12 @@ path = "benches/tracked_state_crud/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "slatedb_file_api"
+path = "benches/slatedb_file_api.rs"
+harness = false
+required-features = ["slatedb"]
+
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"
@@ -97,6 +103,7 @@ redb = { version = "4.1.0", optional = true }
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 iref = "4.0.0"
 lix_backends = { workspace = true, features = ["sqlite"] }
+object_store = { version = "0.14", default-features = false }
 paste = "1"
 rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }

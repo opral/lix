@@ -3096,6 +3096,7 @@ name = "lix_backends"
 version = "0.7.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "lix_engine",
  "object_store 0.14.0",
  "redb",
@@ -3144,6 +3145,7 @@ dependencies = [
  "jsonschema",
  "lix_backends",
  "musli",
+ "object_store 0.14.0",
  "paste",
  "precis-profiles",
  "redb",

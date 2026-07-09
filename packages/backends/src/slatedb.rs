@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use bytes::Bytes;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
     Key, KeyRange, PointVisitor, ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions,
@@ -14,6 +15,7 @@ use lix_engine::backend::{
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
+use slatedb::config::ScanOptions as SlateDbScanOptions;
 use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
@@ -21,7 +23,11 @@ use tokio::runtime::{Builder, Runtime};
 const DB_PATH: &str = "db";
 const SPACE_PREFIX_LEN: usize = 4;
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
+const POINT_READ_CONCURRENCY: usize = 64;
 const SCAN_BATCH_ROWS: usize = 1024;
+const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
+const SCAN_MAX_FETCH_TASKS: usize = 16;
+const SCAN_CACHE_BLOCKS: bool = true;
 
 #[derive(Debug)]
 pub struct SlateDbBackendFactory {
@@ -206,16 +212,9 @@ impl BackendRead for SlateDbRead {
             .map(|key| physical_key(space, key))
             .collect::<Result<Vec<_>, _>>()?;
         let snapshot = Arc::clone(&self.snapshot);
-        let values = self.worker.call(move |runtime, _db| {
-            physical_keys
-                .iter()
-                .map(|key| {
-                    runtime
-                        .block_on(snapshot.get(key.0.clone()))
-                        .map_err(slatedb_error)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+        let values = self
+            .worker
+            .call(move |runtime, _db| get_snapshot_values(runtime, snapshot, physical_keys))?;
 
         for (index, (key, value)) in keys.iter().zip(values.iter()).enumerate() {
             visitor.visit(
@@ -580,6 +579,23 @@ impl EncodedBounds {
     }
 }
 
+fn get_snapshot_values(
+    runtime: &Runtime,
+    snapshot: Arc<DbSnapshot>,
+    keys: Vec<Key>,
+) -> Result<Vec<Option<Bytes>>, BackendError> {
+    runtime.block_on(async move {
+        stream::iter(keys)
+            .map(|key| {
+                let snapshot = Arc::clone(&snapshot);
+                async move { snapshot.get(key.0).await.map_err(slatedb_error) }
+            })
+            .buffered(POINT_READ_CONCURRENCY)
+            .try_collect()
+            .await
+    })
+}
+
 struct ScanBatch {
     iter: DbIterator,
     entries: Vec<(Key, ProjectedValue)>,
@@ -598,9 +614,13 @@ fn open_snapshot_scan(
     snapshot: &DbSnapshot,
     bounds: EncodedBounds,
 ) -> Result<DbIterator, BackendError> {
-    runtime
-        .block_on(snapshot.scan(bounds.range()))
-        .map_err(slatedb_error)
+    runtime.block_on(async {
+        let scan_options = slatedb_scan_options();
+        snapshot
+            .scan_with_options(bounds.range(), &scan_options)
+            .await
+            .map_err(slatedb_error)
+    })
 }
 
 fn scan_snapshot_batch(
@@ -657,13 +677,26 @@ fn collect_snapshot_keys(
     bounds: EncodedBounds,
 ) -> Result<Vec<Key>, BackendError> {
     runtime.block_on(async {
-        let mut iter = snapshot.scan(bounds.range()).await.map_err(slatedb_error)?;
+        let scan_options = slatedb_scan_options();
+        let mut iter = snapshot
+            .scan_with_options(bounds.range(), &scan_options)
+            .await
+            .map_err(slatedb_error)?;
         let mut keys = Vec::new();
         while let Some(row) = iter.next().await.map_err(slatedb_error)? {
             keys.push(Key(row.key));
         }
         Ok(keys)
     })
+}
+
+fn slatedb_scan_options() -> SlateDbScanOptions {
+    // SlateDB's default scan options fetch one block at a time. Keep iteration
+    // ordered, but let SlateDB prefetch remote SST blocks behind the iterator.
+    SlateDbScanOptions::default()
+        .with_read_ahead_bytes(SCAN_READ_AHEAD_BYTES)
+        .with_max_fetch_tasks(SCAN_MAX_FETCH_TASKS)
+        .with_cache_blocks(SCAN_CACHE_BLOCKS)
 }
 
 fn max_lower_bound(left: Bound<Vec<u8>>, right: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
