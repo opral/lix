@@ -9,7 +9,7 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
-use lix_backends::SlateDbBackend;
+use lix_backends::{SlateDbBackend, SlateDbCacheOptions, SlateDbObjectStoreOptions};
 use lix_engine::{Engine, SessionContext, Value};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -19,11 +19,16 @@ use object_store::{
     Result as ObjectStoreResult,
 };
 use serde_json::json;
+use tempfile::TempDir;
 
 const DELAYS_MS: &[u64] = &[0, 10, 25, 50];
 const SEED_FILE_COUNT: usize = 100;
 const FILE_SIZE_BYTES: usize = 4096;
 const UPLOAD_BATCH_SIZE: usize = 10;
+const BENCH_DISK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const BENCH_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const BENCH_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_UPLOAD_REMOTE_WRITE_OPS: u64 = 8;
 
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -46,7 +51,17 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
                 b.iter_custom(|iterations| {
                     let fixture = runtime.block_on(UploadBenchFixture::seeded(delay));
                     measure_iterations(iterations, || {
-                        runtime.block_on(fixture.upload_overwrite_file())
+                        fixture.object_store.reset_counts();
+                        let result = runtime.block_on(fixture.upload_overwrite_file());
+                        let counts = fixture.object_store.counts();
+                        assert_eq!(counts.reads, 0, "cached upload issued remote reads");
+                        assert!(
+                            counts.writes <= MAX_UPLOAD_REMOTE_WRITE_OPS,
+                            "cached upload issued {} remote writes",
+                            counts.writes
+                        );
+                        black_box(counts);
+                        result
                     })
                 });
             },
@@ -59,7 +74,13 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
                 b.iter_custom(|iterations| {
                     let fixture = runtime.block_on(ReadBenchFixture::seeded(delay));
                     measure_iterations(iterations, || {
-                        runtime.block_on(fixture.list_root_directory())
+                        fixture.object_store.reset_counts();
+                        let result = runtime.block_on(fixture.list_root_directory());
+                        let counts = fixture.object_store.counts();
+                        assert_eq!(counts.reads, 0, "cached directory list issued remote reads");
+                        assert_eq!(counts.writes, 0, "directory list issued remote writes");
+                        black_box(counts);
+                        result
                     })
                 });
             },
@@ -71,7 +92,15 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
             |b, &delay| {
                 b.iter_custom(|iterations| {
                     let fixture = runtime.block_on(ReadBenchFixture::seeded(delay));
-                    measure_iterations(iterations, || runtime.block_on(fixture.download_file()))
+                    measure_iterations(iterations, || {
+                        fixture.object_store.reset_counts();
+                        let result = runtime.block_on(fixture.download_file());
+                        let counts = fixture.object_store.counts();
+                        assert_eq!(counts.reads, 0, "cached download issued remote reads");
+                        assert_eq!(counts.writes, 0, "download issued remote writes");
+                        black_box(counts);
+                        result
+                    })
                 });
             },
         );
@@ -133,25 +162,30 @@ impl SeededStore {
         }
     }
 
-    async fn open_session(&self) -> SessionContext<SlateDbBackend> {
-        let backend = SlateDbBackend::open_object_store(
+    async fn open_session(&self) -> (SessionContext<SlateDbBackend>, TempDir) {
+        let cache_dir = tempfile::tempdir().expect("create SlateDB benchmark cache directory");
+        let backend = SlateDbBackend::open_object_store_with_options(
             self.db_path.clone(),
             object_store_handle(&self.object_store),
+            cached_object_store_options(&cache_dir),
         )
         .expect("reopen delayed SlateDB backend");
         let engine = Engine::new(backend)
             .await
             .expect("reopen SlateDB file benchmark engine");
-        engine
+        let session = engine
             .open_session(self.main_branch_id.clone())
             .await
-            .expect("reopen SlateDB file benchmark session")
+            .expect("reopen SlateDB file benchmark session");
+        (session, cache_dir)
     }
 }
 
 struct UploadBenchFixture {
     backend: SlateDbBackend,
     session: SessionContext<SlateDbBackend>,
+    object_store: Arc<DelayedObjectStore>,
+    _cache_dir: TempDir,
     next_upload_version: AtomicU64,
     upload_path: String,
 }
@@ -159,9 +193,11 @@ struct UploadBenchFixture {
 impl UploadBenchFixture {
     async fn seeded(delay: Duration) -> Self {
         let seeded = SeededStore::create(Duration::ZERO).await;
-        let backend = SlateDbBackend::open_object_store(
+        let cache_dir = tempfile::tempdir().expect("create SlateDB upload cache directory");
+        let backend = SlateDbBackend::open_object_store_with_options(
             seeded.db_path.clone(),
             object_store_handle(&seeded.object_store),
+            cached_object_store_options(&cache_dir),
         )
         .expect("reopen delayed SlateDB backend for upload benchmark");
         let engine = Engine::new(backend.clone())
@@ -172,10 +208,13 @@ impl UploadBenchFixture {
             .await
             .expect("open SlateDB upload benchmark session");
         seeded.object_store.set_delay(delay);
+        seeded.object_store.reset_counts();
 
         Self {
             backend,
             session,
+            object_store: seeded.object_store,
+            _cache_dir: cache_dir,
             next_upload_version: AtomicU64::new(0),
             upload_path: seeded.upload_path,
         }
@@ -206,17 +245,22 @@ impl UploadBenchFixture {
 
 struct ReadBenchFixture {
     session: SessionContext<SlateDbBackend>,
+    object_store: Arc<DelayedObjectStore>,
+    _cache_dir: TempDir,
     file_id: String,
 }
 
 impl ReadBenchFixture {
     async fn seeded(delay: Duration) -> Self {
         let seeded = SeededStore::create(Duration::ZERO).await;
-        let session = seeded.open_session().await;
+        let (session, cache_dir) = seeded.open_session().await;
         seeded.object_store.set_delay(delay);
+        seeded.object_store.reset_counts();
 
         Self {
             session,
+            object_store: seeded.object_store,
+            _cache_dir: cache_dir,
             file_id: seeded.file_id,
         }
     }
@@ -327,8 +371,7 @@ fn file_metadata() -> Value {
 }
 
 fn upload_file_bytes(version: u64) -> Vec<u8> {
-    let seed_file_count =
-        u64::try_from(SEED_FILE_COUNT).expect("seed file count fits in u64");
+    let seed_file_count = u64::try_from(SEED_FILE_COUNT).expect("seed file count fits in u64");
     let byte = u8::try_from((version % 251 + seed_file_count % 251) % 251)
         .expect("upload byte pattern fits in u8");
     vec![byte; FILE_SIZE_BYTES]
@@ -345,10 +388,29 @@ fn object_store_handle(object_store: &Arc<DelayedObjectStore>) -> Arc<dyn Object
     object_store.clone()
 }
 
+fn cached_object_store_options(cache_dir: &TempDir) -> SlateDbObjectStoreOptions {
+    SlateDbObjectStoreOptions {
+        cache: Some(SlateDbCacheOptions {
+            root_folder: cache_dir.path().join("object-cache"),
+            max_disk_cache_bytes: BENCH_DISK_CACHE_BYTES,
+            block_cache_bytes: BENCH_BLOCK_CACHE_BYTES,
+            metadata_cache_bytes: BENCH_METADATA_CACHE_BYTES,
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObjectStoreOperationCounts {
+    reads: u64,
+    writes: u64,
+}
+
 #[derive(Clone, Debug)]
 struct DelayedObjectStore {
     inner: Arc<dyn ObjectStore>,
     delay_nanos: Arc<AtomicU64>,
+    read_ops: Arc<AtomicU64>,
+    write_ops: Arc<AtomicU64>,
 }
 
 impl DelayedObjectStore {
@@ -356,6 +418,8 @@ impl DelayedObjectStore {
         Self {
             inner,
             delay_nanos: Arc::new(AtomicU64::new(duration_nanos(delay))),
+            read_ops: Arc::new(AtomicU64::new(0)),
+            write_ops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -366,6 +430,18 @@ impl DelayedObjectStore {
 
     fn delay(&self) -> Duration {
         Duration::from_nanos(self.delay_nanos.load(Ordering::Relaxed))
+    }
+
+    fn reset_counts(&self) {
+        self.read_ops.store(0, Ordering::Relaxed);
+        self.write_ops.store(0, Ordering::Relaxed);
+    }
+
+    fn counts(&self) -> ObjectStoreOperationCounts {
+        ObjectStoreOperationCounts {
+            reads: self.read_ops.load(Ordering::Relaxed),
+            writes: self.write_ops.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -388,6 +464,7 @@ impl ObjectStore for DelayedObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.put_opts(location, payload, opts).await
     }
@@ -397,11 +474,13 @@ impl ObjectStore for DelayedObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.get_opts(location, options).await
     }
@@ -411,6 +490,7 @@ impl ObjectStore for DelayedObjectStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> ObjectStoreResult<Vec<Bytes>> {
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.get_ranges(location, ranges).await
     }
@@ -421,6 +501,7 @@ impl ObjectStore for DelayedObjectStore {
     ) -> BoxStream<'static, ObjectStoreResult<Path>> {
         let inner = Arc::clone(&self.inner);
         let delay_nanos = Arc::clone(&self.delay_nanos);
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         stream::once(async move {
             delay_once(current_delay(&delay_nanos)).await;
             inner.delete_stream(locations)
@@ -433,6 +514,7 @@ impl ObjectStore for DelayedObjectStore {
         let inner = Arc::clone(&self.inner);
         let prefix = prefix.cloned();
         let delay_nanos = Arc::clone(&self.delay_nanos);
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
         stream::once(async move {
             delay_once(current_delay(&delay_nanos)).await;
             inner.list(prefix.as_ref())
@@ -450,6 +532,7 @@ impl ObjectStore for DelayedObjectStore {
         let prefix = prefix.cloned();
         let offset = offset.clone();
         let delay_nanos = Arc::clone(&self.delay_nanos);
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
         stream::once(async move {
             delay_once(current_delay(&delay_nanos)).await;
             inner.list_with_offset(prefix.as_ref(), &offset)
@@ -459,6 +542,7 @@ impl ObjectStore for DelayedObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.list_with_delimiter(prefix).await
     }
@@ -469,6 +553,7 @@ impl ObjectStore for DelayedObjectStore {
         to: &Path,
         options: CopyOptions,
     ) -> ObjectStoreResult<()> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.copy_opts(from, to, options).await
     }
@@ -479,6 +564,7 @@ impl ObjectStore for DelayedObjectStore {
         to: &Path,
         options: RenameOptions,
     ) -> ObjectStoreResult<()> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.rename_opts(from, to, options).await
     }

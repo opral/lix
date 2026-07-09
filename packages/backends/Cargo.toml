@@ -32,6 +32,6 @@ object_store = { version = "0.14", default-features = false, features = ["fs"], 
 redb = { version = "4.1.0", optional = true }
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-slatedb = { version = "0.14.1", default-features = false, optional = true }
+slatedb = { version = "0.14.1", default-features = false, features = ["moka"], optional = true }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
