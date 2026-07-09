@@ -32,7 +32,7 @@ pub struct NativeLix {
 enum NativeLixInner {
     Memory(RsLix<InMemoryBackend>),
     Sqlite(RsLix<SqliteBackend>),
-    Fs(RsLix<FsBackend>),
+    Fs(RsLix<FsBackend>, FsBackend),
 }
 
 enum NativeLixTransactionInner {
@@ -489,7 +489,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.execute_with_options(sql, params, options).await,
             Self::Sqlite(lix) => lix.execute_with_options(sql, params, options).await,
-            Self::Fs(lix) => lix.execute_with_options(sql, params, options).await,
+            Self::Fs(lix, _) => lix.execute_with_options(sql, params, options).await,
         }
     }
 
@@ -501,7 +501,7 @@ impl NativeLixInner {
             Self::Sqlite(lix) => Ok(NativeLixTransactionInner::Sqlite(
                 lix.begin_transaction().await?,
             )),
-            Self::Fs(lix) => Ok(NativeLixTransactionInner::Fs(
+            Self::Fs(lix, _) => Ok(NativeLixTransactionInner::Fs(
                 lix.begin_transaction().await?,
             )),
         }
@@ -515,7 +515,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
             Self::Sqlite(lix) => Ok(NativeObserveEventsInner::Sqlite(lix.observe(sql, params)?)),
-            Self::Fs(lix) => Ok(NativeObserveEventsInner::Fs(lix.observe(sql, params)?)),
+            Self::Fs(lix, _) => Ok(NativeObserveEventsInner::Fs(lix.observe(sql, params)?)),
         }
     }
 
@@ -523,7 +523,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
             Self::Sqlite(lix) => lix.active_branch_id().await,
-            Self::Fs(lix) => lix.active_branch_id().await,
+            Self::Fs(lix, _) => lix.active_branch_id().await,
         }
     }
 
@@ -534,7 +534,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
             Self::Sqlite(lix) => lix.create_branch(options).await,
-            Self::Fs(lix) => lix.create_branch(options).await,
+            Self::Fs(lix, _) => lix.create_branch(options).await,
         }
     }
 
@@ -545,7 +545,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
             Self::Sqlite(lix) => lix.switch_branch(options).await,
-            Self::Fs(lix) => lix.switch_branch(options).await,
+            Self::Fs(lix, _) => lix.switch_branch(options).await,
         }
     }
 
@@ -554,7 +554,7 @@ impl NativeLixInner {
         paths: Vec<String>,
     ) -> std::result::Result<(), LixError> {
         match self {
-            Self::Fs(lix) => lix.import_filesystem_paths(paths).await,
+            Self::Fs(_, backend) => backend.import_paths(paths).await,
             Self::Memory(_) | Self::Sqlite(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_BACKEND",
                 "importFilesystemPaths requires a filesystem backend",
@@ -569,7 +569,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
             Self::Sqlite(lix) => lix.merge_branch_preview(options).await,
-            Self::Fs(lix) => lix.merge_branch_preview(options).await,
+            Self::Fs(lix, _) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -580,13 +580,13 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
             Self::Sqlite(lix) => lix.merge_branch(options).await,
-            Self::Fs(lix) => lix.merge_branch(options).await,
+            Self::Fs(lix, _) => lix.merge_branch(options).await,
         }
     }
 
     async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
         match self {
-            Self::Fs(lix) => lix.sync_disk_to_lix().await,
+            Self::Fs(_, backend) => backend.sync_disk_to_lix().await,
             Self::Memory(_) | Self::Sqlite(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_BACKEND",
                 "syncDiskToLix requires a filesystem backend",
@@ -598,7 +598,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.close().await,
             Self::Sqlite(lix) => lix.close().await,
-            Self::Fs(lix) => lix.close().await,
+            Self::Fs(lix, _) => lix.close().await,
         }
     }
 }
@@ -745,8 +745,8 @@ fn open_fs_native(
     let mut options = FsBackendOpenOptions::new(path, sync_all_files);
     options.lix_dir = lix_dir.map(Into::into);
     let backend = rt.block_on(FsBackend::open_with_options(options))?;
-    let lix = rt.block_on(open_lix_with_backend(backend))?;
-    NativeLix::new(NativeLixInner::Fs(lix))
+    let lix = rt.block_on(open_lix_with_backend(backend.clone()))?;
+    NativeLix::new(NativeLixInner::Fs(lix, backend))
 }
 
 #[napi]

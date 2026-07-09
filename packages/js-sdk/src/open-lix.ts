@@ -1,4 +1,8 @@
-import { invalidArgument } from "./errors.js";
+import {
+	fsBackendAlreadyOpen,
+	fsBackendNotOpen,
+	invalidArgument,
+} from "./errors.js";
 import { addon } from "./native.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
@@ -75,6 +79,8 @@ export class SqliteBackend {
 	}
 }
 
+const openFsBackends = new WeakMap<FsBackend, NativeLix | null>();
+
 export class FsBackend {
 	readonly path: string;
 	readonly lixDir: string | undefined;
@@ -104,6 +110,37 @@ export class FsBackend {
 		this.lixDir = options.lixDir;
 		this.syncAllFiles = options.syncAllFiles;
 	}
+
+	async importPaths(paths: readonly string[]): Promise<void> {
+		if (!Array.isArray(paths)) {
+			throw new TypeError("importPaths() paths must be an array");
+		}
+		for (const path of paths) {
+			if (typeof path !== "string" || path.length === 0) {
+				throw new TypeError(
+					"importPaths() paths must contain non-empty strings",
+				);
+			}
+			if (path.endsWith("/")) {
+				throw new TypeError(
+					"importPaths() paths must contain file paths, not directory paths",
+				);
+			}
+		}
+		await this.native("importPaths").importFilesystemPaths([...paths]);
+	}
+
+	async syncDiskToLix(): Promise<void> {
+		return this.native("syncDiskToLix").syncDiskToLix();
+	}
+
+	private native(operation: string): NativeLix {
+		const native = openFsBackends.get(this);
+		if (!native) {
+			throw fsBackendNotOpen(operation);
+		}
+		return native;
+	}
 }
 
 export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
@@ -117,13 +154,23 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		return new Lix(await addon.Lix.openSqlite(options.backend.path));
 	}
 	if (options.backend instanceof FsBackend) {
-		return new Lix(
-			await addon.Lix.openFs(
-				options.backend.path,
-				options.backend.lixDir,
-				options.backend.syncAllFiles,
-			),
-		);
+		const backend = options.backend;
+		if (openFsBackends.has(backend)) {
+			throw fsBackendAlreadyOpen();
+		}
+		openFsBackends.set(backend, null);
+		try {
+			const native = await addon.Lix.openFs(
+				backend.path,
+				backend.lixDir,
+				backend.syncAllFiles,
+			);
+			openFsBackends.set(backend, native);
+			return new Lix(native, () => openFsBackends.delete(backend));
+		} catch (error) {
+			openFsBackends.delete(backend);
+			throw error;
+		}
 	}
 	throw new TypeError(
 		"openLix() requires backend to be SqliteBackend or FsBackend",
@@ -131,7 +178,10 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 }
 
 export class Lix {
-	constructor(private readonly native: NativeLix) {}
+	constructor(
+		private readonly native: NativeLix,
+		private readonly onClose?: () => void,
+	) {}
 
 	async execute(
 		sql: string,
@@ -182,25 +232,6 @@ export class Lix {
 		return this.native.switchBranch(options);
 	}
 
-	async importFilesystemPaths(paths: readonly string[]): Promise<void> {
-		if (!Array.isArray(paths)) {
-			throw new TypeError("importFilesystemPaths() paths must be an array");
-		}
-		for (const path of paths) {
-			if (typeof path !== "string" || path.length === 0) {
-				throw new TypeError(
-					"importFilesystemPaths() paths must contain non-empty strings",
-				);
-			}
-			if (path.endsWith("/")) {
-				throw new TypeError(
-					"importFilesystemPaths() paths must contain file paths, not directory paths",
-				);
-			}
-		}
-		await this.native.importFilesystemPaths([...paths]);
-	}
-
 	async mergeBranchPreview(
 		options: MergeBranchOptions,
 	): Promise<MergeBranchPreview> {
@@ -213,12 +244,9 @@ export class Lix {
 		return receipt;
 	}
 
-	async syncDiskToLix(): Promise<void> {
-		return this.native.syncDiskToLix();
-	}
-
 	async close(): Promise<void> {
-		return this.native.close();
+		await this.native.close();
+		this.onClose?.();
 	}
 }
 

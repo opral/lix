@@ -77,7 +77,7 @@ try {
 
 - `openLix()` opens a fresh in-memory Lix. Pass `new FsBackend({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
 - Pass `new FsBackend({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
-- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `lix.importFilesystemPaths(["notes/today.md"])` to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
+- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `backend.importPaths(["notes/today.md"])` on the `FsBackend` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
 - Use `new SqliteBackend({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 - The SDK is Node/native only right now; it is not browser-compatible.
 - The package is ESM-only.

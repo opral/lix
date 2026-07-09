@@ -540,8 +540,9 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
 async fn open_lix_with_on_demand_filesystem(path: &Path, file_paths: &[&str]) -> Lix<FsBackend> {
     let options = FsBackendOpenOptions::new(path.to_path_buf(), false);
     let backend = FsBackend::open_with_options(options).await.unwrap();
-    let lix = open_lix_with_backend(backend).await.unwrap();
-    lix.import_filesystem_paths(file_paths.iter().copied())
+    let lix = open_lix_with_backend(backend.clone()).await.unwrap();
+    backend
+        .import_paths(file_paths.iter().copied())
         .await
         .unwrap();
     lix
