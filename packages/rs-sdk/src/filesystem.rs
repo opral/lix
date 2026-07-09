@@ -425,8 +425,7 @@ where
         layout: FilesystemLayout,
         sync_all_files: bool,
     ) -> Result<Self, LixError> {
-        let engine =
-            crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None).await?;
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
         Self::open_with_engine(backend, engine, layout, sync_all_files).await
     }
 
@@ -2539,7 +2538,7 @@ mod tests {
         path_filter: FilesystemPathFilter,
     ) -> FilesystemState<RocksDbFilesystemBackend> {
         let backend = open_filesystem_rocksdb_backend(&layout).unwrap();
-        let engine = crate::lix::open_or_initialize_filesystem_engine(backend.clone(), None)
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None)
             .await
             .unwrap();
         FilesystemState {
