@@ -100,6 +100,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang
 
+      - name: Install LLVM build dependencies (Windows)
+        if: matrix.suffix == 'win32-x64'
+        shell: pwsh
+        run: |
+          choco install llvm --no-progress -y
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -116,11 +124,13 @@ jobs:
         working-directory: packages/js-sdk
         run: npm install
 
-      - name: Build JS SDK native package
+      - name: Build JS SDK native binary
         working-directory: packages/js-sdk
-        run: |
-          npm run build:native
-          npm run prepare:native-package -- --suffix=${{ matrix.suffix }}
+        run: npm run build:native
+
+      - name: Prepare JS SDK native package
+        working-directory: packages/js-sdk
+        run: npm run prepare:native-package -- --suffix=${{ matrix.suffix }}
 
       - name: Upload JS SDK native package
         uses: actions/upload-artifact@v4
