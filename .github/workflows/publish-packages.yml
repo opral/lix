@@ -408,7 +408,7 @@ jobs:
             fi
           fi
 
-          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$RELEASE_TAG" --generate-notes
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_SHA" --title "$RELEASE_TAG" --generate-notes
 
           created_tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)"
           if [ "$created_tag_sha" != "$RELEASE_SHA" ]; then
