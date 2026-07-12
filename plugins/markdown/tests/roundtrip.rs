@@ -1,615 +1,361 @@
-use plugin_md_v2::exports::lix::plugin::api::{EntityState, Guest};
-use plugin_md_v2::{
-    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, File, MarkdownPlugin, PluginError,
-    ROOT_ENTITY_PK,
-};
-use serde_json::Value;
-use std::collections::BTreeMap;
-use uuid::Uuid;
+mod support;
 
-fn file_from_bytes(data: &[u8]) -> File {
-    File {
-        filename: None,
-        data: data.to_vec(),
-    }
-}
-
-fn active_state_from_file(file: File) -> Vec<EntityState> {
-    active_state_from_changes(
-        MarkdownPlugin::detect_changes(Vec::new(), file).expect("detect_changes should succeed"),
-    )
-}
-
-fn apply_changes_to_active_state(
-    active_state: Vec<EntityState>,
-    changes: Vec<DetectedChange>,
-) -> Vec<EntityState> {
-    let mut rows = active_state
-        .into_iter()
-        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
-        .collect::<BTreeMap<_, _>>();
-
-    for change in changes {
-        let key = (change.schema_key.clone(), change.entity_pk.clone());
-        match change.snapshot_content {
-            Some(snapshot_content) => {
-                rows.insert(
-                    key,
-                    EntityState {
-                        entity_pk: change.entity_pk,
-                        schema_key: change.schema_key,
-                        snapshot_content,
-                        metadata: change.metadata,
-                    },
-                );
-            }
-            None => {
-                rows.remove(&key);
-            }
-        }
-    }
-
-    rows.into_values().collect()
-}
-
-fn active_state_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {
-    apply_changes_to_active_state(Vec::new(), changes)
-}
-
-fn render_active_state(active_state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
-    MarkdownPlugin::render(active_state)
-}
-
-fn render_changes(changes: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> {
-    render_active_state(active_state_from_changes(changes))
-}
-
-fn snapshot_value(change: &DetectedChange) -> Value {
-    let raw = change
-        .snapshot_content
-        .as_ref()
-        .expect("snapshot_content should exist");
-    serde_json::from_str(raw).expect("snapshot_content should parse")
-}
-
-fn active_state_snapshot_value(row: &EntityState) -> Value {
-    serde_json::from_str(&row.snapshot_content).expect("snapshot_content should parse")
-}
-
-fn snapshot_order_key_from_value(value: &Value) -> String {
-    let raw = value
-        .get("order_key")
-        .and_then(Value::as_str)
-        .expect("block order_key should exist")
-        .to_string();
-    assert_order_key_is_valid(&raw);
-    raw
-}
-
-fn snapshot_order_key(change: &DetectedChange) -> String {
-    snapshot_order_key_from_value(&snapshot_value(change))
-}
-
-fn snapshot_block(change: &DetectedChange) -> String {
-    snapshot_value(change)
-        .get("block")
-        .and_then(Value::as_str)
-        .expect("block content should exist")
-        .to_string()
-}
-
-fn assert_generated_block_id_is_uuid_v7(change: &DetectedChange) {
-    let [entity_pk] = change.entity_pk.as_slice() else {
-        panic!("block entity_pk should have one component");
-    };
-    let value = snapshot_value(change);
-    assert_eq!(
-        value.get("id").and_then(Value::as_str),
-        Some(entity_pk.as_str())
-    );
-    let uuid = Uuid::parse_str(entity_pk).expect("block entity_pk should parse as UUID");
-    assert_eq!(uuid.get_version_num(), 7);
-}
-
-fn block_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String, String> {
-    active_state
-        .iter()
-        .filter(|row| row.schema_key == BLOCK_SCHEMA_KEY)
-        .map(|row| {
-            let value = active_state_snapshot_value(row);
-            let block = value
-                .get("block")
-                .and_then(Value::as_str)
-                .expect("block content should exist")
-                .to_string();
-            (block, snapshot_order_key_from_value(&value))
-        })
-        .collect()
-}
-
-fn block_ids_by_content(active_state: &[EntityState]) -> BTreeMap<String, String> {
-    active_state
-        .iter()
-        .filter(|row| row.schema_key == BLOCK_SCHEMA_KEY)
-        .map(|row| {
-            let value = active_state_snapshot_value(row);
-            let block = value
-                .get("block")
-                .and_then(Value::as_str)
-                .expect("block content should exist")
-                .to_string();
-            let [entity_pk] = row.entity_pk.as_slice() else {
-                panic!("block entity_pk should have one component");
-            };
-            (block, entity_pk.clone())
-        })
-        .collect()
-}
-
-fn markdown_active_state_with_block_order_keys(blocks: &[(&str, &str, &str)]) -> Vec<EntityState> {
-    let mut state = vec![EntityState {
-        entity_pk: vec![ROOT_ENTITY_PK.to_string()],
-        schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        snapshot_content: serde_json::json!({
-            "id": ROOT_ENTITY_PK,
-        })
-        .to_string(),
-        metadata: None,
-    }];
-
-    state.extend(blocks.iter().map(|(id, order_key, block)| {
-        EntityState {
-            entity_pk: vec![(*id).to_string()],
-            schema_key: BLOCK_SCHEMA_KEY.to_string(),
-            snapshot_content: serde_json::json!({
-                "id": id,
-                "order_key": order_key,
-                "block": block,
-            })
-            .to_string(),
-            metadata: None,
-        }
-    }));
-
-    state
-}
-
-fn assert_order_key_is_valid(raw: &str) {
-    assert!(!raw.is_empty(), "order_key should not be empty");
-    assert!(
-        raw.bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
-        "order_key should contain only lowercase hexadecimal digits: {raw}"
-    );
-    assert_eq!(raw.len() % 2, 0, "order_key should have even length: {raw}");
-    assert!(
-        !raw.ends_with("00"),
-        "order_key should not end with the minimum byte: {raw}"
-    );
-}
+use plugin_md_v2::MarkdownPlugin;
+use plugin_md_v2::exports::lix::plugin::api::Guest;
+use support::{file, render, rows_of_kind, semantic_html, snapshot, state_from_source};
 
 #[test]
-fn detects_initial_projection_and_renders_normalized_markdown() {
-    let after = file_from_bytes(b"# Title\r\n\r\nHello **Ada**\r\n\r\n- one\r\n- two\r\n");
-
-    let changes =
-        MarkdownPlugin::detect_changes(Vec::new(), after).expect("detect_changes should succeed");
-
-    assert_eq!(
-        changes
-            .iter()
-            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-            .count(),
-        3
-    );
-    let document = changes
-        .iter()
-        .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
-        .expect("document snapshot should exist");
-    assert_eq!(document.entity_pk, [ROOT_ENTITY_PK]);
-    assert_eq!(snapshot_value(document), serde_json::json!({"id": "root"}));
-
-    let blocks = changes
-        .iter()
-        .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-        .map(snapshot_block)
-        .collect::<Vec<_>>();
-    assert_eq!(blocks, ["# Title", "Hello **Ada**", "- one\n- two"]);
-    for block in changes
-        .iter()
-        .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-    {
-        assert_generated_block_id_is_uuid_v7(block);
-        assert_order_key_is_valid(
-            snapshot_value(block)
-                .get("order_key")
-                .and_then(Value::as_str)
-                .expect("block order_key should exist"),
-        );
-    }
-
-    let output = render_changes(changes).expect("render should succeed");
-    assert_eq!(output, b"# Title\n\nHello **Ada**\n\n- one\n- two\n");
-}
-
-#[test]
-fn detects_empty_initial_markdown_file_as_document() {
-    let changes = MarkdownPlugin::detect_changes(Vec::new(), file_from_bytes(b""))
-        .expect("detect_changes should succeed");
-
-    assert_eq!(changes.len(), 1);
-    let document = changes
-        .iter()
-        .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
-        .expect("document snapshot should exist");
-    assert_eq!(document.entity_pk, [ROOT_ENTITY_PK]);
-    assert_eq!(snapshot_value(document), serde_json::json!({"id": "root"}));
-    assert_eq!(
-        changes
-            .iter()
-            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-            .count(),
-        0
-    );
-
-    let output = render_changes(changes).expect("render should succeed");
-    assert_eq!(output, b"\n");
-}
-
-#[test]
-fn applies_delta_to_existing_markdown() {
-    let before_bytes = b"# Title\n\nHello\n";
-    let after_bytes = b"# Title\n\nHello **Ada**\n\n- one\n";
-    let before_state = active_state_from_file(file_from_bytes(before_bytes));
-
-    let changes =
-        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
-            .expect("detect_changes should succeed");
-    let output = render_active_state(apply_changes_to_active_state(before_state, changes))
-        .expect("render should succeed");
-
-    assert_eq!(output, b"# Title\n\nHello **Ada**\n\n- one\n");
-}
-
-#[test]
-fn normalizes_adjacent_blocks_to_blank_line_separators() {
-    let output = render_changes(vec![
-        DetectedChange {
-            entity_pk: vec![ROOT_ENTITY_PK.to_string()],
-            schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(r#"{"id":"root"}"#.to_string()),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["block:0".to_string()],
-            schema_key: BLOCK_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r##"{"id":"block:0","order_key":"80","block":"# Title"}"##.to_string(),
-            ),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["block:1".to_string()],
-            schema_key: BLOCK_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r#"{"id":"block:1","order_key":"c0","block":"paragraph"}"#.to_string(),
-            ),
-            metadata: None,
-        },
-    ])
-    .expect("render should succeed");
-
-    assert_eq!(output, b"# Title\n\nparagraph\n");
-}
-
-#[test]
-fn detects_sorted_blocks_as_order_key_changes() {
-    let before_bytes = b"# A\n\n# B\n\n# C\n";
-    let after_bytes = b"# C\n\n# B\n\n# A\n";
-    let before_state = active_state_from_file(file_from_bytes(before_bytes));
-    let before_ids = block_ids_by_content(&before_state);
-
-    let changes =
-        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
-            .expect("detect_changes should succeed");
-
-    assert!(
-        changes
-            .iter()
-            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-            .all(|change| change.snapshot_content.is_some()),
-        "sorting blocks should not delete existing block entities"
-    );
-
-    let active_state = apply_changes_to_active_state(before_state, changes);
-    let after_ids = block_ids_by_content(&active_state);
-    let output = render_active_state(active_state).expect("render should succeed");
-
-    assert_eq!(after_ids, before_ids);
-    assert_eq!(output, after_bytes);
-}
-
-#[test]
-fn inserted_blocks_get_order_key_between_neighbors() {
-    let before_state = active_state_from_file(file_from_bytes(b"# A\n\n# C"));
-    let order_keys_by_block = block_order_keys_by_content(&before_state);
-
-    let changes =
-        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(b"# A\n\n# B\n\n# C"))
-            .expect("detect_changes should succeed");
-    let inserted_order_key = {
-        let block_changes = changes
-            .iter()
-            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-            .collect::<Vec<_>>();
-
-        assert_eq!(block_changes.len(), 1);
-        snapshot_order_key(block_changes[0])
-    };
-    let lower = order_keys_by_block
-        .get("# A")
-        .expect("before state should contain block A");
-    let upper = order_keys_by_block
-        .get("# C")
-        .expect("before state should contain block C");
-    assert!(inserted_order_key.as_str() > lower.as_str());
-    assert!(inserted_order_key.as_str() < upper.as_str());
-
-    let output = render_active_state(apply_changes_to_active_state(before_state, changes))
-        .expect("render should succeed");
-
-    assert_eq!(output, b"# A\n\n# B\n\n# C\n");
-}
-
-#[test]
-fn repairs_duplicate_block_order_keys_when_inserting_between_them() {
-    let before_state = markdown_active_state_with_block_order_keys(&[
-        ("block:a", "80", "# A"),
-        ("block:c", "80", "# C"),
-    ]);
-
-    let changes =
-        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(b"# A\n\n# B\n\n# C"))
-            .expect("detect_changes should succeed");
-    let active_state = apply_changes_to_active_state(before_state, changes);
-    let order_keys_by_block = block_order_keys_by_content(&active_state);
-    let unique_order_keys = order_keys_by_block
-        .values()
-        .collect::<std::collections::BTreeSet<_>>();
-
-    assert_eq!(order_keys_by_block.len(), 3);
-    assert_eq!(unique_order_keys.len(), 3);
-
-    let output = render_active_state(active_state).expect("render should succeed");
-    assert_eq!(output, b"# A\n\n# B\n\n# C\n");
-}
-
-#[test]
-fn render_rebuilds_from_unordered_active_state() {
-    let mut active_state = active_state_from_file(file_from_bytes(b"# A\n\n# B\n\n# C"));
-    active_state.reverse();
-
-    let output = MarkdownPlugin::render(active_state).expect("render should succeed");
-
-    assert_eq!(output, b"# A\n\n# B\n\n# C\n");
-}
-
-#[test]
-fn rejects_block_snapshot_with_invalid_order_key() {
-    let changes = vec![DetectedChange {
-        entity_pk: vec!["block:0".to_string()],
-        schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(
-            r##"{"id":"block:0","order_key":"ba00","block":"# A"}"##.to_string(),
+fn promised_format_tier_round_trips_exactly() {
+    let fixtures = [
+        ("empty", ""),
+        ("no-final-newline", "paragraph"),
+        ("final-newline", "paragraph\n"),
+        ("crlf", "# A\r\n\r\nB\r\n"),
+        ("crlf-no-final-newline", "# A\r\n\r\nB"),
+        ("crlf-html", "<!-- comment\r\ncontinues -->\r\n"),
+        ("crlf-fence", "~~~ rust\r\ncode\r\n~~~\r\n"),
+        ("setext", "Heading\n=======\n"),
+        ("setext-level-two", "Heading\n-------\n"),
+        ("emphasis", "Text _em_ and __strong__.\n"),
+        ("nested-emphasis", "**bold _italic_ bold**\n"),
+        ("single-tilde-delete", "Text ~deleted~.\n"),
+        ("double-tilde-delete", "Text ~~deleted~~.\n"),
+        ("list-markers", "* one\n* two\n\n1) first\n2) second\n"),
+        ("thematic-marker", "***\n"),
+        ("fence", "~~~~\ncode\n~~~~\n"),
+        ("hard-break", "line one\\\nline two\n"),
+        ("hard-break-spaces", "line one  \nline two\n"),
+        ("crlf-hard-break", "line one  \r\nline two\r\n"),
+        ("character-reference", "A &#38; B\n"),
+        ("named-character-reference", "A &amp; B\n"),
+        ("inline-code", "Use `` a ` b `` here.\n"),
+        (
+            "resource-angle-destination",
+            "[text](<https://example.com/a b>)\n",
         ),
-        metadata: None,
-    }];
-
-    let error = render_changes(changes).expect_err("render should reject invalid projection");
-
-    match error {
-        PluginError::InvalidInput(message) => {
-            assert!(message.contains("invalid markdown block order_key"));
-        }
-        PluginError::Internal(message) => {
-            panic!("expected InvalidInput, got Internal({message})");
+        ("resource-single-title", "[text](/target 'title')\n"),
+        ("resource-paren-title", "[text](/target (title))\n"),
+        ("image-resource", "![alt](<image name.png> 'title')\n"),
+        (
+            "reference",
+            "[text][Label]\n\n[Label]: <https://example.com> 'title'\n",
+        ),
+        (
+            "crlf-reference",
+            "[text][Label]\r\n\r\n[Label]: <https://example.com> 'title'\r\n",
+        ),
+        ("collapsed-reference", "[Label][]\n\n[Label]: /target\n"),
+        ("shortcut-reference", "[Label]\n\n[Label]: /target\n"),
+        ("autolink", "Visit www.example.com.\n"),
+        ("angle-autolink", "<https://example.com/a?b=1>\n"),
+        ("email-autolink", "Mail user.name+tag@example.com.\n"),
+        ("inline-html", "before <kbd>Ctrl</kbd> after\n"),
+    ];
+    let mut failures = Vec::new();
+    for (name, source) in fixtures {
+        let output = render(state_from_source(source));
+        if output != source {
+            failures.push(format!(
+                "{name}: exact mismatch\ninput={source:?}\noutput={output:?}"
+            ));
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 #[test]
-fn roundtrip_file_detect_state_render_markdown() {
-    let markdown = "# Title\n\nParagraph one.\n\nParagraph two.\n";
-    let state = active_state_from_file(file_from_bytes(markdown.as_bytes()));
-
-    let output = render_active_state(state).expect("render should succeed");
-
-    assert_eq!(output, b"# Title\n\nParagraph one.\n\nParagraph two.\n");
-}
-
-#[test]
-fn roundtrip_edit_move_delete_across_block_rows() {
-    let before = b"Alpha.\n\nBravo.\n\nCharlie.\n";
-    let after = b"Charlie.\n\nAlpha updated.\n";
-    let before_state = active_state_from_file(file_from_bytes(before));
-
-    let delta = MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(after))
-        .expect("detect_changes should succeed");
-    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
-        .expect("render should succeed");
-
-    assert_eq!(output, b"Charlie.\n\nAlpha updated.\n");
-}
-
-#[test]
-fn roundtrip_multi_step_evolution() {
-    let a = b"# Title\n\nOne.\n";
-    let b = b"# Title v2\n\nOne.\n\nTwo.\n";
-    let c = b"Two.\n\n# Title v3\n";
-    let mut state = active_state_from_file(file_from_bytes(a));
-
-    let delta_b = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(b))
-        .expect("detect_changes should succeed");
-    state = apply_changes_to_active_state(state, delta_b);
-
-    let delta_c = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(c))
-        .expect("detect_changes should succeed");
-    state = apply_changes_to_active_state(state, delta_c);
-
-    let output = render_active_state(state).expect("render should succeed");
-    assert_eq!(output, b"Two.\n\n# Title v3\n");
-}
-
-#[test]
-fn roundtrip_delete_all_blocks_to_empty_document() {
-    let before_state = active_state_from_file(file_from_bytes(b"A\n\nB\n"));
-
-    let delta = MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(b""))
-        .expect("detect_changes should succeed");
-    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
-        .expect("render should succeed");
-
-    assert_eq!(output, b"\n");
-}
-
-#[test]
-fn roundtrip_list_internal_edit_keeps_top_level_block_model() {
-    let before_state = active_state_from_file(file_from_bytes(b"- one\n- two\n"));
-
-    let delta = MarkdownPlugin::detect_changes(
-        before_state.clone(),
-        file_from_bytes(b"- one\n- two changed\n"),
-    )
-    .expect("detect_changes should succeed");
-
-    assert_eq!(
-        delta
-            .iter()
-            .filter(
-                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none()
-            )
-            .count(),
-        0
-    );
-    assert_eq!(
-        delta
-            .iter()
-            .filter(
-                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
-            )
-            .count(),
-        1
-    );
-
-    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
-        .expect("render should succeed");
-    assert_eq!(output, b"- one\n- two changed\n");
-}
-
-#[test]
-fn roundtrip_table_row_add_remove_reorder() {
-    let initial = b"| a | b |\n| - | - |\n| 1 | 2 |\n";
-    let add = b"| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
-    let reorder = b"| a | b |\n| - | - |\n| 3 | 4 |\n| 1 | 2 |\n";
-    let remove = b"| a | b |\n| - | - |\n| 3 | 4 |\n";
-    let mut state = active_state_from_file(file_from_bytes(initial));
-
-    for next in [add.as_slice(), reorder.as_slice(), remove.as_slice()] {
-        let delta = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(next))
-            .expect("detect_changes should succeed");
-        assert_eq!(
-            delta
-                .iter()
-                .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY
-                    && change.snapshot_content.is_some())
-                .count(),
-            1
+fn canonicalized_features_are_semantic_and_idempotent() {
+    let fixtures = [
+        "# Heading #\n",
+        "# A\n\n\n\nB\n",
+        "| A | B |\n| - | -: |\n| x | y |\n",
+        "~~~js\ncode();\n~~~\n",
+    ];
+    for source in fixtures {
+        let state = state_from_source(source);
+        let output = render(state.clone());
+        assert_eq!(semantic_html(source), semantic_html(&output), "{source:?}");
+        assert!(
+            MarkdownPlugin::detect_changes(state, file(&output))
+                .unwrap()
+                .is_empty(),
+            "canonical output was not idempotent: {output:?}"
         );
-        state = apply_changes_to_active_state(state, delta);
     }
-
-    let output = render_active_state(state).expect("render should succeed");
-    assert_eq!(output, b"| a | b |\n| - | - |\n| 3 | 4 |\n");
 }
 
 #[test]
-fn roundtrip_large_tiny_edits_500_with_state_context() {
-    let paragraphs = (1..=500)
-        .map(|index| format!("P{index}"))
-        .collect::<Vec<_>>();
-    let before = paragraphs.join("\n\n") + "\n";
-    let mut state = active_state_from_file(file_from_bytes(before.as_bytes()));
-
-    let mut after = paragraphs;
-    for index in [10usize, 111, 222, 333, 444] {
-        after[index] = format!("{} x", after[index]);
+fn adjacency_regressions_keep_gfm_semantics() {
+    let fixtures = [
+        "[a]: /u\n---\n",
+        "[a]: /u\n    code\n",
+        "[a]: /u\n<x>\n",
+        "~~~\n\n",
+    ];
+    for source in fixtures {
+        let output = render(state_from_source(source));
+        assert_eq!(
+            semantic_html(source),
+            semantic_html(&output),
+            "output: {output:?}"
+        );
     }
-    let after = after.join("\n\n") + "\n";
-
-    let delta = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(after.as_bytes()))
-        .expect("detect_changes should succeed");
-    assert_eq!(
-        delta
-            .iter()
-            .filter(
-                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
-            )
-            .count(),
-        5
-    );
-    state = apply_changes_to_active_state(state, delta);
-
-    let output = render_active_state(state).expect("render should succeed");
-    assert_eq!(output, after.as_bytes());
 }
 
 #[test]
-fn roundtrip_large_duplicate_edit_with_state_context() {
-    let before_blocks = (0..500).map(|_| "Same").collect::<Vec<_>>();
-    let before = before_blocks.join("\n\n") + "\n";
-    let mut state = active_state_from_file(file_from_bytes(before.as_bytes()));
-
-    let mut after_blocks = before_blocks;
-    after_blocks[349] = "Same updated";
-    let after = after_blocks.join("\n\n") + "\n";
-
-    let delta = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(after.as_bytes()))
-        .expect("detect_changes should succeed");
-    assert_eq!(
-        delta
-            .iter()
-            .filter(
-                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
-            )
-            .count(),
-        1
+fn mixed_gfm_document_round_trips_semantically() {
+    let source = concat!(
+        "# Release\n\n",
+        "> Quoted **context**.\n\n",
+        "- [x] shipped\n",
+        "- [ ] follow up\n\n",
+        "| Name | Status |\n",
+        "| :--- | ---: |\n",
+        "| parser | ready |\n\n",
+        "A [link](https://example.com \"title\") and ~~old text~~.\n\n",
+        "```rust\nfn main() {}\n```\n\n",
+        "[^1]: Footnote body.\n\n",
+        "See note[^1].\n",
     );
-    state = apply_changes_to_active_state(state, delta);
-
-    let output = render_active_state(state).expect("render should succeed");
-    assert_eq!(output, after.as_bytes());
+    let state = state_from_source(source);
+    let output = render(state.clone());
+    assert_eq!(semantic_html(source), semantic_html(&output));
+    assert!(
+        MarkdownPlugin::detect_changes(state, file(&output))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
-fn guest_interface_uses_active_state_for_low_noise_edit_and_render() {
-    let before_state = active_state_from_file(file_from_bytes(b"Hello\n\nWorld\n"));
+fn live_edit_states_are_semantic_and_idempotent() {
+    let fixtures = [
+        ("single-space", " "),
+        ("single-newline", "\n"),
+        ("crlf-only", "\r\n"),
+        ("indent-only", "    "),
+        ("heading-marker", "#"),
+        ("heading-marker-space", "## "),
+        ("list-marker", "-"),
+        ("list-marker-space", "- "),
+        ("ordered-list-marker", "1."),
+        ("task-prefix", "- ["),
+        ("blockquote-marker", ">"),
+        ("blockquote-marker-space", "> "),
+        ("open-bracket", "["),
+        ("unfinished-link-label", "[label"),
+        ("unfinished-link-destination", "[label]("),
+        ("empty-link-destination", "[label]()"),
+        ("open-code-span", "`code"),
+        ("open-emphasis", "*text"),
+        ("open-strong", "**text"),
+        ("open-delete", "~~text"),
+        ("open-fence", "```"),
+        ("open-fence-info", "```rust"),
+        ("open-angle", "<"),
+        ("open-entity", "&amp"),
+        ("open-footnote", "[^"),
+        ("empty-footnote-definition", "[^note]:"),
+        ("empty-link-definition", "[label]:"),
+        ("unfinished-angle-definition", "[label]: <"),
+        ("unfinished-title-definition", "[label]: /target \""),
+        ("table-fragment", "| a |"),
+        ("table-delimiter-fragment", "| a |\n| -"),
+    ];
+    assert_semantic_and_idempotent(fixtures);
+}
 
-    let delta = MarkdownPlugin::detect_changes(
-        before_state.clone(),
-        file_from_bytes(b"Hello updated\n\nWorld\n"),
-    )
-    .expect("detect_changes should succeed");
-    assert_eq!(
-        delta
-            .iter()
-            .filter(
-                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
-            )
-            .count(),
-        1
-    );
+#[test]
+fn nested_inline_constructs_are_semantic_and_idempotent() {
+    let fixtures = [
+        ("nested-strong-emphasis", "**bold _italic_ bold**\n"),
+        ("nested-emphasis-strong", "_italic **bold** italic_\n"),
+        ("combined-asterisk", "***bold italic***\n"),
+        ("combined-underscore", "___bold italic___\n"),
+        ("delete-containing-strong", "~~gone **strongly**~~\n"),
+        ("strong-containing-delete", "**keep ~~except this~~**\n"),
+        (
+            "link-containing-emphasis",
+            "[an *important* link](/target)\n",
+        ),
+        (
+            "image-alt-formatting",
+            "![an *important* image](/asset.png)\n",
+        ),
+        ("code-containing-markers", "`**literal** and _literal_`\n"),
+        ("escaped-markers", "\\*literal\\* and \\_literal\\_\n"),
+        ("adjacent-asterisk-emphasis", "*one**two*\n"),
+        ("adjacent-underscore-emphasis", "__three___four_\n"),
+        ("literal-underscores-inside-strong", "__foo__bar__baz__\n"),
+        ("adjacent-emphasis", "*one**two* __three___four_\n"),
+        ("unicode-delimiters", "**你好 _café_ 👩‍💻**\n"),
+    ];
+    assert_semantic_and_idempotent(fixtures);
+}
 
-    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
-        .expect("render should succeed");
-    assert_eq!(output, b"Hello updated\n\nWorld\n");
+#[test]
+fn links_references_and_autolinks_are_semantic_and_idempotent() {
+    let fixtures = [
+        ("bare-resource", "[label](https://example.com/a?b=1#c)\n"),
+        ("angle-resource", "[label](<https://example.com/a b>)\n"),
+        ("empty-resource", "[label]()\n"),
+        ("double-title", "[label](/target \"double\")\n"),
+        ("single-title", "[label](/target 'single')\n"),
+        ("paren-title", "[label](/target (paren))\n"),
+        (
+            "full-reference",
+            "[text][Mixed Label]\n\n[Mixed Label]: /target\n",
+        ),
+        (
+            "collapsed-reference",
+            "[Mixed Label][]\n\n[Mixed Label]: /target\n",
+        ),
+        (
+            "shortcut-reference",
+            "[Mixed Label]\n\n[Mixed Label]: /target\n",
+        ),
+        (
+            "image-reference",
+            "![alt][image]\n\n[image]: /asset.png 'title'\n",
+        ),
+        (
+            "escaped-reference-label",
+            "[a \\] b][id]\n\n[id]: /target\n",
+        ),
+        ("angle-uri-autolink", "<https://example.com/a?b=1&c=2>\n"),
+        ("angle-email-autolink", "<user.name+tag@example.com>\n"),
+        ("literal-www-autolink", "Visit www.example.com/path?q=1.\n"),
+        (
+            "literal-http-autolink",
+            "Visit https://example.com/path_(x).\n",
+        ),
+        (
+            "literal-email-autolink",
+            "Mail user.name+tag@example.com.\n",
+        ),
+        ("bracketed-autolink", "[www.example.com]\n"),
+        (
+            "autolink-next-to-brackets",
+            "[www.example.com] and [https://example.com]\n",
+        ),
+        (
+            "autolink-next-to-entity-like-text",
+            "www.google.com/search?q=commonmark&hl;\n",
+        ),
+        ("autolink-next-to-emphasis", "www.example.com*emphasis*\n"),
+        ("autolink-next-to-less-than", "www.example.com<literal\n"),
+    ];
+    assert_semantic_and_idempotent(fixtures);
+}
+
+#[test]
+fn block_edge_cases_are_semantic_and_idempotent() {
+    let fixtures = [
+        ("crlf-without-final-newline", "# A\r\n\r\nB"),
+        ("crlf-hard-break", "one  \r\ntwo\r\n"),
+        ("crlf-fenced-code", "~~~ rust\r\ncode\r\n~~~\r\n"),
+        ("empty-fenced-code", "```\n```\n"),
+        ("empty-fence-in-blockquote", "> ```\n> ```\n"),
+        ("nonempty-fence-in-blockquote", "> ```\n> code\n> ```\n"),
+        ("empty-fence-in-bullet", "- ```\n  ```\n"),
+        ("empty-fence-in-ordered-item", "1. ```\n   ```\n"),
+        ("empty-fence-in-nested-blockquote", "> > ```\n> > ```\n"),
+        ("fence-containing-shorter-fence", "````\n```\n````\n"),
+        (
+            "empty-fence-interrupted-by-blockquote-exit",
+            "> ```\nfoo\n```\n",
+        ),
+        ("unclosed-fence-with-content", "~~~js\ncode\n"),
+        ("tilde-fence-info", "~~~~ rust key=value\ncode\n~~~~\n"),
+        ("indented-blank-code", "    one\n    \n    two\n"),
+        ("html-comment", "<!-- a > b -->\n"),
+        ("html-declaration", "<!DOCTYPE html>\n"),
+        ("html-processing-instruction", "<?target data?>\n"),
+        ("html-cdata", "<![CDATA[a < b]]>\n"),
+        (
+            "html-container",
+            "<details open>\n<summary>Title</summary>\n\nBody\n</details>\n",
+        ),
+        (
+            "inline-html",
+            "before <span data-x=\"1\">inside</span> after\n",
+        ),
+        (
+            "nested-task-list",
+            "- [x] parent\n  - [ ] child\n  - ordinary\n",
+        ),
+        ("loose-task-list", "- [x] one\n\n- [ ] two\n"),
+        ("task-like-text", "- [X] upper\n- [~] not-a-task\n"),
+        (
+            "multiblock-footnote",
+            "Text[^note].\n\n[^note]: first\n\n    second *paragraph*\n",
+        ),
+        (
+            "footnote-with-list",
+            "Text[^note].\n\n[^note]:\n    - one\n    - two\n",
+        ),
+        (
+            "table-escaped-pipe",
+            "| A | B |\n| - | - |\n| a \\| b | `x|y` |\n",
+        ),
+        (
+            "table-inline-formatting",
+            "| A | B |\n| - | - |\n| **x** | [y](/z) |\n",
+        ),
+    ];
+    assert_semantic_and_idempotent(fixtures);
+}
+
+#[test]
+fn empty_fence_sentinel_cannot_remove_authored_code_content() {
+    let mut state = state_from_source("```\n```\n\n```\ncontent\n```\n");
+    let code_rows = rows_of_kind(&state, "code_block");
+    let empty_id = code_rows
+        .iter()
+        .find(|row| snapshot(row)["payload"]["value"] == "")
+        .expect("fixture should contain an empty code block")
+        .entity_pk[0]
+        .clone();
+    let nonempty_id = code_rows
+        .iter()
+        .find(|row| snapshot(row)["payload"]["value"] != "")
+        .expect("fixture should contain a nonempty code block")
+        .entity_pk[0]
+        .clone();
+    let authored_sentinel = format!("\u{e000}lix-empty-code:{empty_id}\u{e001}");
+    let row = state
+        .iter_mut()
+        .find(|row| row.entity_pk.first() == Some(&nonempty_id))
+        .unwrap();
+    let mut value = snapshot(row);
+    value["payload"]["value"] = format!("before\n{authored_sentinel}\nafter\n").into();
+    row.snapshot_content = value.to_string();
+
+    let output = render(state);
+    assert!(output.contains(&authored_sentinel), "output={output:?}");
+    assert!(output.contains("before\n"), "output={output:?}");
+    assert!(output.contains("after\n"), "output={output:?}");
+}
+
+fn assert_semantic_and_idempotent<const N: usize>(fixtures: [(&str, &str); N]) {
+    let mut failures = Vec::new();
+    for (name, source) in fixtures {
+        let state = state_from_source(source);
+        let output = render(state.clone());
+        let input_html = semantic_html(source);
+        let output_html = semantic_html(&output);
+        if input_html != output_html {
+            failures.push(format!(
+                "{name}: semantic mismatch\ninput={source:?}\noutput={output:?}\ninput_html={input_html:?}\noutput_html={output_html:?}"
+            ));
+            continue;
+        }
+        let delta = MarkdownPlugin::detect_changes(state, file(&output)).unwrap();
+        if !delta.is_empty() {
+            failures.push(format!(
+                "{name}: output was not idempotent\ninput={source:?}\noutput={output:?}\ndelta={delta:#?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

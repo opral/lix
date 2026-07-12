@@ -3344,6 +3344,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "markdown-syntax"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cb3dad9640aa950d085c143ad2f43f16889daf7443035a3df1ad3cc66108c45"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4012,10 +4018,10 @@ version = "0.8.0"
 dependencies = [
  "chardetng 1.0.0",
  "encoding_rs",
- "imara-diff",
  "lix_order_key",
  "markdown",
- "rand 0.9.2",
+ "markdown-syntax",
+ "serde",
  "serde_json",
  "uuid",
  "wit-bindgen 0.57.1",

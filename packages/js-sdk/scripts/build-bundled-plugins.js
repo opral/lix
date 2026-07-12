@@ -98,12 +98,8 @@ await writeBundledPlugin({
 	files: [
 		["manifest.json", join(repoRoot, "plugins", "markdown", "manifest.json")],
 		[
-			"schema/markdown_document.json",
-			join(repoRoot, "plugins", "markdown", "schema", "markdown_document.json"),
-		],
-		[
-			"schema/markdown_block.json",
-			join(repoRoot, "plugins", "markdown", "schema", "markdown_block.json"),
+			"schema/markdown_node.json",
+			join(repoRoot, "plugins", "markdown", "schema", "markdown_node.json"),
 		],
 	],
 });

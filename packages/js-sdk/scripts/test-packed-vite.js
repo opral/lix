@@ -209,7 +209,7 @@ async function runBrowserSmoke(browser, port, cspMode) {
 				rendered: "name,age\nAda,36\nGrace,37\n",
 			},
 			markdown: {
-				blocks: ["# Heading", "Paragraph with **bold** text."],
+				kinds: ["document", "heading", "paragraph"],
 				rendered: "# Heading\n\nParagraph with **bold** text.\n",
 			},
 		});
