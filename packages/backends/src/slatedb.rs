@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -186,8 +186,14 @@ impl SlateDbBackend {
     }
 
     pub fn flush(&self) -> Result<(), BackendError> {
-        self.worker
-            .call(|db| async move { db.flush().await.map_err(slatedb_error) })
+        self.worker.ensure_usable()?;
+        let durability_failed = Arc::clone(&self.worker.inner.durability_failed);
+        self.worker.call(move |db| async move {
+            db.flush().await.map_err(|error| {
+                durability_failed.store(true, Ordering::Release);
+                slatedb_error(error)
+            })
+        })
     }
 }
 
@@ -214,6 +220,7 @@ impl Backend for SlateDbBackend {
 
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         let writer_permit = self.write_gate.acquire()?;
+        self.worker.ensure_usable()?;
         let base = self
             .worker
             .call(|db| async move { db.snapshot().await.map_err(slatedb_error) })?;
@@ -403,6 +410,7 @@ impl BackendWrite for SlateDbWrite {
             });
         }
 
+        let durability_failed = Arc::clone(&self.worker.inner.durability_failed);
         self.worker.call_with_visibility_lock(move |db| async move {
             let mut batch = WriteBatch::new();
             for (key, value) in self.overlay {
@@ -419,14 +427,20 @@ impl BackendWrite for SlateDbWrite {
                 },
             )
             .await
-            .map_err(slatedb_error)?;
+            .map_err(|error| {
+                durability_failed.store(true, Ordering::Release);
+                slatedb_error(error)
+            })?;
             // SlateDB's default durable write waits for its periodic WAL
             // flush (100 ms by default). The backend already serializes
             // writers, so separate commits cannot benefit from that group
             // commit window. Request and await the WAL flush immediately to
             // preserve the existing durability contract without the timer
             // latency floor.
-            db.flush().await.map_err(slatedb_error)?;
+            db.flush().await.map_err(|error| {
+                durability_failed.store(true, Ordering::Release);
+                slatedb_error(error)
+            })?;
             Ok(CommitResult {
                 commit_id: None,
                 stats,
@@ -453,6 +467,10 @@ struct SlateDbWorkerInner {
     // snapshots share this lock with that write-plus-flush window; operations
     // on already-pinned snapshots remain fully concurrent.
     visibility_lock: Arc<AsyncMutex<()>>,
+    // SlateDB applies writes to its visible memtable before WAL durability.
+    // Publish a terminal failure before releasing the visibility lock so a
+    // failed commit can never be captured by a later backend snapshot.
+    durability_failed: Arc<AtomicBool>,
     #[cfg(test)]
     next_visibility_wait: Mutex<Option<mpsc::Sender<()>>>,
     shutdown: mpsc::Sender<()>,
@@ -483,6 +501,7 @@ impl SlateDbWorker {
                     runtime,
                     db,
                     visibility_lock: Arc::new(AsyncMutex::new(())),
+                    durability_failed: Arc::new(AtomicBool::new(false)),
                     #[cfg(test)]
                     next_visibility_wait: Mutex::new(None),
                     shutdown,
@@ -503,6 +522,14 @@ impl SlateDbWorker {
         Fut: Future<Output = Result<R, BackendError>> + Send + 'static,
     {
         self.call_inner(None, operation)
+    }
+
+    fn ensure_usable(&self) -> Result<(), BackendError> {
+        if self.inner.durability_failed.load(Ordering::Acquire) {
+            Err(BackendError::Durability)
+        } else {
+            Ok(())
+        }
     }
 
     fn call_with_visibility_lock<R, F, Fut>(&self, operation: F) -> Result<R, BackendError>
@@ -526,6 +553,9 @@ impl SlateDbWorker {
     {
         let (reply_tx, reply_rx) = mpsc::channel();
         let db = Arc::clone(&self.inner.db);
+        let durability_failed = visibility_lock
+            .as_ref()
+            .map(|_| Arc::clone(&self.inner.durability_failed));
         #[cfg(test)]
         let visibility_wait = if visibility_lock.is_some() {
             self.inner
@@ -547,7 +577,11 @@ impl SlateDbWorker {
                 }
                 None => None,
             };
-            let result = operation(db).await;
+            let result = if durability_failed.is_some_and(|failed| failed.load(Ordering::Acquire)) {
+                Err(BackendError::Durability)
+            } else {
+                operation(db).await
+            };
             let _ = reply_tx.send(result);
         });
         reply_rx
@@ -992,12 +1026,11 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::{
-        CopyOptions, GetOptions as ObjectStoreGetOptions, GetResult, ListResult, MultipartUpload,
-        ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-        Result as ObjectStoreResult,
+        CopyOptions, Error as ObjectStoreError, GetOptions as ObjectStoreGetOptions, GetResult,
+        ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult, RenameOptions, Result as ObjectStoreResult,
     };
     use std::ops::Range;
-    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1110,6 +1143,71 @@ mod tests {
     }
 
     #[test]
+    fn failed_commit_rejects_queued_readers_and_future_writers() {
+        let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+        let backend = SlateDbBackend::open_object_store("test-failed-commit", store.clone())
+            .expect("open failed commit backend");
+        let space = SpaceId(9);
+        let key = Key(Bytes::from_static(b"rejected"));
+
+        let blocked_write = store.block_next_write();
+        store.fail_writes();
+        let commit_backend = backend.clone();
+        let commit = std::thread::spawn(move || {
+            let mut write = commit_backend
+                .begin_write(WriteOptions::default())
+                .expect("begin failing write");
+            write
+                .put_many(
+                    space,
+                    PutBatch {
+                        entries: vec![PutEntry {
+                            key,
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"not-durable"),
+                            },
+                        }],
+                    },
+                )
+                .expect("stage failing write");
+            write.commit()
+        });
+        blocked_write.wait_for_entries(1, "failing SlateDB WAL write");
+
+        let visibility_wait = backend.worker.observe_next_visibility_wait();
+        let read_backend = backend.clone();
+        let reader =
+            std::thread::spawn(move || read_backend.begin_read(ReadOptions::default()).map(|_| ()));
+        visibility_wait
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader should queue on the visibility lock");
+
+        drop(blocked_write);
+        let commit_error = commit
+            .join()
+            .expect("join failing commit")
+            .expect_err("WAL failure must fail commit");
+        assert!(
+            matches!(commit_error, BackendError::Io(message) if message.contains("injected write failure")),
+            "commit should preserve the SlateDB write error"
+        );
+        assert_eq!(
+            reader
+                .join()
+                .expect("join queued reader")
+                .expect_err("queued reader must reject a failed commit"),
+            BackendError::Durability
+        );
+        assert_eq!(
+            backend
+                .begin_write(WriteOptions::default())
+                .map(|_| ())
+                .expect_err("future writers must reject a failed commit"),
+            BackendError::Durability
+        );
+    }
+
+    #[test]
     fn independent_backend_reads_overlap() {
         let inner = Arc::new(InMemory::new());
         let db_path = "test-concurrent-reads";
@@ -1190,6 +1288,7 @@ mod tests {
     struct BlockingStore {
         inner: Arc<InMemory>,
         next_write: Arc<AtomicBool>,
+        fail_writes: Arc<AtomicBool>,
         writes: Arc<OperationBlock>,
         block_reads: Arc<AtomicBool>,
         reads: Arc<OperationBlock>,
@@ -1200,6 +1299,7 @@ mod tests {
             Self {
                 inner,
                 next_write: Arc::new(AtomicBool::new(false)),
+                fail_writes: Arc::new(AtomicBool::new(false)),
                 writes: Arc::new(OperationBlock::default()),
                 block_reads: Arc::new(AtomicBool::new(false)),
                 reads: Arc::new(OperationBlock::default()),
@@ -1210,6 +1310,10 @@ mod tests {
             OperationBlockGuard::arm(Arc::clone(&self.next_write), Arc::clone(&self.writes))
         }
 
+        fn fail_writes(&self) {
+            self.fail_writes.store(true, Ordering::Release);
+        }
+
         fn block_sst_reads(&self) -> OperationBlockGuard {
             OperationBlockGuard::arm(Arc::clone(&self.block_reads), Arc::clone(&self.reads))
         }
@@ -1217,6 +1321,16 @@ mod tests {
         fn maybe_block_write(&self) {
             if self.next_write.swap(false, Ordering::AcqRel) {
                 self.writes.enter();
+            }
+        }
+
+        fn maybe_fail_write(&self) -> ObjectStoreResult<()> {
+            if self.fail_writes.load(Ordering::Acquire) {
+                Err(ObjectStoreError::NotSupported {
+                    source: Box::new(std::io::Error::other("injected write failure")),
+                })
+            } else {
+                Ok(())
             }
         }
 
@@ -1320,6 +1434,7 @@ mod tests {
             options: PutOptions,
         ) -> ObjectStoreResult<PutResult> {
             self.maybe_block_write();
+            self.maybe_fail_write()?;
             self.inner.put_opts(location, payload, options).await
         }
 
