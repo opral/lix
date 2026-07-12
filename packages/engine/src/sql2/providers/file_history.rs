@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -426,28 +427,26 @@ where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
     let filesystem_schema_keys = file_history_filesystem_schema_keys();
-    let event_entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
-        },
-        Arc::clone(&commit_graph),
-        query_source.json_reader.clone(),
-        event_route,
-        filesystem_schema_keys.clone(),
-    )
-    .await?;
-    let context_entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
-        },
-        commit_graph,
-        query_source.json_reader,
-        context_route,
-        filesystem_schema_keys,
-    )
-    .await?;
+    let (event_entries, context_entries) =
+        load_file_history_entry_sets(event_route, context_route, move |route| {
+            let commit_graph = Arc::clone(&commit_graph);
+            let json_reader = query_source.json_reader.clone();
+            let schema_keys = filesystem_schema_keys.clone();
+            async move {
+                load_history_entries(
+                    HistoryViewDescriptor {
+                        view_name: "lix_file_history",
+                        start_commit_column: HISTORY_COL_START_COMMIT_ID,
+                    },
+                    commit_graph,
+                    json_reader,
+                    &route,
+                    schema_keys,
+                )
+                .await
+            }
+        })
+        .await?;
 
     Ok(FileHistoryFilesystemContext {
         event_descriptors: parse_file_history_descriptors(&event_entries)?,
@@ -475,32 +474,48 @@ async fn load_file_history_plugin_state<S>(
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    let event_entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
-        },
-        Arc::clone(&commit_graph),
-        query_source.json_reader.clone(),
-        event_route,
-        plugin_schema_keys.clone(),
-    )
-    .await?;
-    let context_entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
-        },
-        commit_graph,
-        query_source.json_reader,
-        context_route,
-        plugin_schema_keys,
-    )
-    .await?;
+    let (event_entries, context_entries) =
+        load_file_history_entry_sets(event_route, context_route, move |route| {
+            let commit_graph = Arc::clone(&commit_graph);
+            let json_reader = query_source.json_reader.clone();
+            let schema_keys = plugin_schema_keys.clone();
+            async move {
+                load_history_entries(
+                    HistoryViewDescriptor {
+                        view_name: "lix_file_history",
+                        start_commit_column: HISTORY_COL_START_COMMIT_ID,
+                    },
+                    commit_graph,
+                    json_reader,
+                    &route,
+                    schema_keys,
+                )
+                .await
+            }
+        })
+        .await?;
     Ok((
         parse_file_history_plugin_state(&event_entries),
         parse_file_history_plugin_state(&context_entries),
     ))
+}
+
+async fn load_file_history_entry_sets<Load, LoadFuture>(
+    event_route: &HistoryRoute,
+    context_route: &HistoryRoute,
+    load: Load,
+) -> Result<(Vec<HistoryEntry>, Vec<HistoryEntry>), LixError>
+where
+    Load: Fn(HistoryRoute) -> LoadFuture,
+    LoadFuture: Future<Output = Result<Vec<HistoryEntry>, LixError>>,
+{
+    let event_entries = load(event_route.clone()).await?;
+    let context_entries = if event_route == context_route {
+        event_entries.clone()
+    } else {
+        load(context_route.clone()).await?
+    };
+    Ok((event_entries, context_entries))
 }
 
 fn file_history_filesystem_schema_keys() -> Vec<String> {
@@ -1340,4 +1355,64 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{HistoryRoute, load_file_history_entry_sets};
+
+    #[tokio::test]
+    async fn identical_event_and_context_routes_load_history_once() {
+        let route = HistoryRoute {
+            start_commit_ids: vec!["cid-start".to_string()],
+            file_ids: vec!["file-a".to_string()],
+            ..HistoryRoute::default()
+        };
+        let event_route = route.traversal_only();
+        let context_route = route.starts_only();
+        assert_eq!(event_route, context_route);
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counted_loads = Arc::clone(&loads);
+        let (event_entries, context_entries) =
+            load_file_history_entry_sets(&event_route, &context_route, move |_| {
+                counted_loads.fetch_add(1, Ordering::SeqCst);
+                async { Ok(Vec::new()) }
+            })
+            .await
+            .expect("identical routes should load");
+
+        assert!(event_entries.is_empty());
+        assert!(context_entries.is_empty());
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn differing_depth_routes_load_history_twice() {
+        let route = HistoryRoute {
+            start_commit_ids: vec!["cid-start".to_string()],
+            max_depth: Some(3),
+            ..HistoryRoute::default()
+        };
+        let event_route = route.traversal_only();
+        let context_route = route.starts_only();
+        assert_ne!(event_route, context_route);
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counted_loads = Arc::clone(&loads);
+        let (event_entries, context_entries) =
+            load_file_history_entry_sets(&event_route, &context_route, move |_| {
+                counted_loads.fetch_add(1, Ordering::SeqCst);
+                async { Ok(Vec::new()) }
+            })
+            .await
+            .expect("distinct routes should load");
+
+        assert!(event_entries.is_empty());
+        assert!(context_entries.is_empty());
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
 }
