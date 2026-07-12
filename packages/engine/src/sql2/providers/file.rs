@@ -382,6 +382,7 @@ impl TableSpec for LixFileSpec {
         .map_err(lix_error_to_datafusion_error)?;
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
+        let path_predicate = file_path_predicate_from_filters(&filters);
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
@@ -399,6 +400,7 @@ impl TableSpec for LixFileSpec {
                     projection.cloned(),
                     request,
                     target_file_ids,
+                    path_predicate,
                     physical_filters,
                     needs_data,
                     limit,
@@ -411,6 +413,7 @@ impl TableSpec for LixFileSpec {
                     projection,
                     request,
                     target_file_ids,
+                    path_predicate,
                     filters,
                     needs_data,
                     limit,
@@ -424,25 +427,35 @@ impl TableSpec for LixFileSpec {
                     .map_err(|error| {
                         DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                     })?;
-                    let plugin_render = plugin_render_context_for_lix_file_scan(
-                        Arc::clone(&live_state),
-                        &blob_reader,
-                        &request,
-                        plugin_host,
-                        needs_data,
-                    )
-                    .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file plugin discovery failed: {error}"
-                        ))
-                    })?;
-                    let batch = lix_file_record_batch(
+                    let prepared =
+                        prepare_lix_file_rows(rows, &path_predicate).map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "sql2 lix_file row preparation failed: {error}"
+                            ))
+                        })?;
+                    let plugin_render = if prepared.needs_plugin_render(needs_data) {
+                        plugin_render_context_for_lix_file_scan(
+                            Arc::clone(&live_state),
+                            &blob_reader,
+                            &request,
+                            plugin_host,
+                            true,
+                        )
+                        .await
+                        .map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "sql2 lix_file plugin discovery failed: {error}"
+                            ))
+                        })?
+                    } else {
+                        None
+                    };
+                    let batch = lix_file_record_batch_from_prepared(
                         &batch_schema,
                         &blob_reader,
                         plugin_render,
                         needs_data,
-                        rows,
+                        prepared,
                     )
                     .await
                     .map_err(|error| {
@@ -2261,13 +2274,31 @@ async fn lix_file_record_batch(
     load_data: bool,
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
-    let projected_columns = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().as_str())
-        .collect::<Vec<_>>();
-    let needs_data = load_data && projected_columns.contains(&"data");
+    let prepared = prepare_lix_file_rows(rows, &FilePathPredicate::All)?;
+    lix_file_record_batch_from_prepared(schema, blob_reader, plugin_render, load_data, prepared)
+        .await
+}
 
+struct PreparedLixFileRows {
+    file_rows: BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+    file_paths: BTreeMap<FilesystemDescriptorKey, String>,
+}
+
+impl PreparedLixFileRows {
+    fn needs_plugin_render(&self, needs_data: bool) -> bool {
+        needs_data
+            && self
+                .file_rows
+                .values()
+                .any(|file| !self.blob_rows.contains_key(&file.blob_ref_key()))
+    }
+}
+
+fn prepare_lix_file_rows(
+    rows: Vec<MaterializedLiveStateRow>,
+    path_predicate: &FilePathPredicate,
+) -> Result<PreparedLixFileRows, LixError> {
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
@@ -2339,29 +2370,8 @@ async fn lix_file_record_batch(
 
     let directory_paths =
         derive_directory_paths(directory_rows.iter().map(|row| (row.key.clone(), row)))?;
-    let mut ids = Vec::new();
-    let mut paths = Vec::new();
-    let mut directory_ids = Vec::new();
-    let mut names = Vec::new();
-    let mut data_values = Vec::new();
-    let mut entity_pks = Vec::new();
-    let mut schema_keys = Vec::new();
-    let mut file_ids = Vec::new();
-    let mut globals = Vec::new();
-    let mut change_ids = Vec::new();
-    let mut created_ats = Vec::new();
-    let mut updated_ats = Vec::new();
-    let mut commit_ids = Vec::new();
-    let mut untracked_values = Vec::new();
-    let mut metadata_values = Vec::new();
-    let mut branch_ids = Vec::new();
-    let mut blob_bytes = if needs_data {
-        load_blob_bytes_for_files(blob_reader, &file_rows, &blob_rows).await?
-    } else {
-        LoadedBlobBytes::default()
-    };
-
-    for (_, file) in file_rows {
+    let mut file_paths = BTreeMap::<FilesystemDescriptorKey, String>::new();
+    for (key, file) in &file_rows {
         let directory_path = match file.directory_id.as_ref() {
             Some(directory_id) => {
                 let parent_key = file
@@ -2386,6 +2396,63 @@ async fn lix_file_record_batch(
             None => None,
         };
         let path = compose_file_path(directory_path.as_deref(), &file.name)?;
+        if path_predicate.matches(&path) {
+            file_paths.insert(key.clone(), path);
+        }
+    }
+    file_rows.retain(|key, _| file_paths.contains_key(key));
+
+    Ok(PreparedLixFileRows {
+        file_rows,
+        blob_rows,
+        file_paths,
+    })
+}
+
+async fn lix_file_record_batch_from_prepared(
+    schema: &SchemaRef,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
+    prepared: PreparedLixFileRows,
+) -> Result<RecordBatch, LixError> {
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let needs_data = load_data && projected_columns.contains(&"data");
+    let PreparedLixFileRows {
+        file_rows,
+        blob_rows,
+        mut file_paths,
+    } = prepared;
+    let mut ids = Vec::new();
+    let mut paths = Vec::new();
+    let mut directory_ids = Vec::new();
+    let mut names = Vec::new();
+    let mut data_values = Vec::new();
+    let mut entity_pks = Vec::new();
+    let mut schema_keys = Vec::new();
+    let mut file_ids = Vec::new();
+    let mut globals = Vec::new();
+    let mut change_ids = Vec::new();
+    let mut created_ats = Vec::new();
+    let mut updated_ats = Vec::new();
+    let mut commit_ids = Vec::new();
+    let mut untracked_values = Vec::new();
+    let mut metadata_values = Vec::new();
+    let mut branch_ids = Vec::new();
+    let mut blob_bytes = if needs_data {
+        load_blob_bytes_for_files(blob_reader, &file_rows, &blob_rows).await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+
+    for (key, file) in file_rows {
+        let path = file_paths
+            .remove(&key)
+            .expect("prepared lix_file descriptor should have a path");
         let data = if needs_data {
             let blob_key = file.blob_ref_key();
             match blob_bytes.take(&blob_key) {
@@ -2777,6 +2844,154 @@ fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint>
         }
     }
     Ok(constraint)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilePathPredicate {
+    All,
+    Comparison {
+        operation: FilePathComparison,
+        value: String,
+    },
+    In(BTreeSet<String>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+}
+
+impl FilePathPredicate {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Comparison { operation, value } => operation.matches(path, value),
+            Self::In(values) => values.contains(path),
+            Self::And(left, right) => left.matches(path) && right.matches(path),
+            Self::Or(left, right) => left.matches(path) || right.matches(path),
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, predicate) | (predicate, Self::All) => predicate,
+            (left, right) => Self::And(Box::new(left), Box::new(right)),
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (left, right) => Self::Or(Box::new(left), Box::new(right)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilePathComparison {
+    Equal,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+impl FilePathComparison {
+    fn matches(self, path: &str, value: &str) -> bool {
+        match self {
+            Self::Equal => path == value,
+            Self::LessThan => path < value,
+            Self::LessThanOrEqual => path <= value,
+            Self::GreaterThan => path > value,
+            Self::GreaterThanOrEqual => path >= value,
+        }
+    }
+
+    fn reversed(self) -> Self {
+        match self {
+            Self::Equal => Self::Equal,
+            Self::LessThan => Self::GreaterThan,
+            Self::LessThanOrEqual => Self::GreaterThanOrEqual,
+            Self::GreaterThan => Self::LessThan,
+            Self::GreaterThanOrEqual => Self::LessThanOrEqual,
+        }
+    }
+}
+
+fn file_path_predicate_from_filters(filters: &[Expr]) -> FilePathPredicate {
+    filters
+        .iter()
+        .fold(FilePathPredicate::All, |predicate, filter| {
+            predicate.and(file_path_predicate_from_expr(filter))
+        })
+}
+
+fn file_path_predicate_from_expr(expr: &Expr) -> FilePathPredicate {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            file_path_predicate_from_expr(&binary_expr.left)
+                .and(file_path_predicate_from_expr(&binary_expr.right))
+        }
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+            file_path_predicate_from_expr(&binary_expr.left)
+                .or(file_path_predicate_from_expr(&binary_expr.right))
+        }
+        Expr::BinaryExpr(binary_expr) => {
+            file_path_comparison_from_binary_filter(binary_expr).unwrap_or(FilePathPredicate::All)
+        }
+        Expr::InList(in_list) => file_path_in_predicate(in_list),
+        _ => FilePathPredicate::All,
+    }
+}
+
+fn file_path_comparison_from_binary_filter(binary_expr: &BinaryExpr) -> Option<FilePathPredicate> {
+    let operation = match binary_expr.op {
+        Operator::Eq => FilePathComparison::Equal,
+        Operator::Lt => FilePathComparison::LessThan,
+        Operator::LtEq => FilePathComparison::LessThanOrEqual,
+        Operator::Gt => FilePathComparison::GreaterThan,
+        Operator::GtEq => FilePathComparison::GreaterThanOrEqual,
+        _ => return None,
+    };
+    let direct = string_column_literal_filter(&binary_expr.left, &binary_expr.right, "path")
+        .map(|value| (operation, value));
+    let (operation, value) = direct.or_else(|| {
+        string_column_literal_filter(&binary_expr.right, &binary_expr.left, "path")
+            .map(|value| (operation.reversed(), value))
+    })?;
+    Some(FilePathPredicate::Comparison { operation, value })
+}
+
+fn file_path_in_predicate(in_list: &InList) -> FilePathPredicate {
+    if in_list.negated {
+        return FilePathPredicate::All;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return FilePathPredicate::All;
+    };
+    if column.name != "path" {
+        return FilePathPredicate::All;
+    }
+    let Some(values) = in_list
+        .list
+        .iter()
+        .map(string_expr_literal)
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return FilePathPredicate::All;
+    };
+    FilePathPredicate::In(values)
+}
+
+fn string_column_literal_filter(
+    column_expr: &Expr,
+    literal_expr: &Expr,
+    column_name: &str,
+) -> Option<String> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != column_name {
+        return None;
+    }
+    string_expr_literal(literal_expr)
 }
 
 struct LixFileIdFilterAnalyzer;
@@ -3469,6 +3684,55 @@ mod tests {
     }
 
     #[test]
+    fn file_path_predicates_support_atelier_equality_and_range_filters() {
+        let predicate = super::file_path_predicate_from_filters(&[
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("path")),
+                Operator::GtEq,
+                Box::new(string_literal("/extensions/")),
+            )),
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("path")),
+                Operator::Lt,
+                Box::new(string_literal("/extensions0")),
+            )),
+        ]);
+
+        assert!(predicate.matches("/extensions/example.js"));
+        assert!(!predicate.matches("/extension.txt"));
+        assert!(!predicate.matches("/extensions0"));
+
+        let reversed_equality =
+            super::file_path_predicate_from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(string_literal("/readme.md")),
+                Operator::Eq,
+                Box::new(column("path")),
+            ))]);
+        assert!(reversed_equality.matches("/readme.md"));
+        assert!(!reversed_equality.matches("/other.md"));
+    }
+
+    #[test]
+    fn file_path_predicates_stay_conservative_across_boolean_filters() {
+        let path_filter = eq_filter("path", "/readme.md");
+        let id_filter = eq_filter("id", "file-other");
+        let conjunction =
+            super::file_path_predicate_from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(path_filter.clone()),
+                Operator::And,
+                Box::new(id_filter.clone()),
+            ))]);
+        assert!(conjunction.matches("/readme.md"));
+        assert!(!conjunction.matches("/other.md"));
+
+        let disjunction = super::file_path_predicate_from_filters(&[Expr::BinaryExpr(
+            BinaryExpr::new(Box::new(path_filter), Operator::Or, Box::new(id_filter)),
+        )]);
+        assert!(disjunction.matches("/readme.md"));
+        assert!(disjunction.matches("/other.md"));
+    }
+
+    #[test]
     fn contains_column_finds_nested_cast_and_function_references() {
         let cast_data = Expr::Cast(Cast::new(Box::new(column("data")), DataType::Utf8));
         let function_data = scalar_function_expr("some_fn", vec![cast_data.clone()]);
@@ -3582,6 +3846,11 @@ mod tests {
         bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
     }
 
+    struct ExactBlobReader {
+        expected_hashes: Vec<BlobHash>,
+        bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
+    }
+
     impl StaticBlobReader {
         fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
             Self {
@@ -3603,6 +3872,19 @@ mod tests {
     #[async_trait]
     impl BlobDataReader for StaticBlobReader {
         async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(
+                hashes
+                    .iter()
+                    .map(|hash| self.bytes_by_hash.get(hash).cloned())
+                    .collect(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl BlobDataReader for ExactBlobReader {
+        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            assert_eq!(hashes, self.expected_hashes.as_slice());
             Ok(BlobBytesBatch::new(
                 hashes
                     .iter()
@@ -4020,6 +4302,117 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
         assert!(error.message.contains("missing-dir"));
+    }
+
+    #[tokio::test]
+    async fn file_path_predicate_filters_before_blob_and_plugin_hydration() {
+        let selected_data = b"selected".to_vec();
+        let other_data = b"other".to_vec();
+        let selected_hash = BlobHash::from_content(&selected_data);
+        let other_hash = BlobHash::from_content(&other_data);
+        let rows = vec![
+            live_file_row(
+                "file-selected",
+                "branch-b",
+                r#"{"id":"file-selected","directory_id":null,"name":"selected.md"}"#,
+            ),
+            live_blob_ref_row(
+                "file-selected",
+                "branch-b",
+                "file-selected",
+                &selected_hash.to_hex(),
+                selected_data.len(),
+            ),
+            live_file_row(
+                "file-other",
+                "branch-b",
+                r#"{"id":"file-other","directory_id":null,"name":"other.md"}"#,
+            ),
+            live_blob_ref_row(
+                "file-other",
+                "branch-b",
+                "file-other",
+                &other_hash.to_hex(),
+                other_data.len(),
+            ),
+        ];
+        let predicate =
+            super::file_path_predicate_from_filters(&[eq_filter("path", "/selected.md")]);
+        let prepared = super::prepare_lix_file_rows(rows, &predicate)
+            .expect("path-filtered rows should prepare");
+        assert_eq!(prepared.file_rows.len(), 1);
+        assert!(!prepared.needs_plugin_render(true));
+
+        let blob_reader = Arc::new(ExactBlobReader {
+            expected_hashes: vec![selected_hash],
+            bytes_by_hash: BTreeMap::from([
+                (selected_hash, selected_data.clone()),
+                (other_hash, other_data),
+            ]),
+        }) as Arc<dyn BlobDataReader>;
+        let batch = super::lix_file_record_batch_from_prepared(
+            &super::lix_file_schema(),
+            &blob_reader,
+            None,
+            true,
+            prepared,
+        )
+        .await
+        .expect("path-filtered batch should build");
+
+        assert_eq!(batch.num_rows(), 1);
+        let path_column = batch
+            .column(batch.schema().index_of("path").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let data_column = batch
+            .column(batch.schema().index_of("data").unwrap())
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(path_column.value(0), "/selected.md");
+        assert_eq!(data_column.value(0), selected_data.as_slice());
+    }
+
+    #[test]
+    fn file_path_predicate_only_discovers_plugins_for_selected_blobless_files() {
+        let blob_data = b"stored".to_vec();
+        let blob_hash = BlobHash::from_content(&blob_data);
+        let rows = vec![
+            live_file_row(
+                "file-stored",
+                "branch-b",
+                r#"{"id":"file-stored","directory_id":null,"name":"stored.md"}"#,
+            ),
+            live_blob_ref_row(
+                "file-stored",
+                "branch-b",
+                "file-stored",
+                &blob_hash.to_hex(),
+                blob_data.len(),
+            ),
+            live_file_row(
+                "file-rendered",
+                "branch-b",
+                r#"{"id":"file-rendered","directory_id":null,"name":"rendered.md"}"#,
+            ),
+        ];
+
+        let stored = super::prepare_lix_file_rows(
+            rows.clone(),
+            &super::file_path_predicate_from_filters(&[eq_filter("path", "/stored.md")]),
+        )
+        .unwrap();
+        assert!(!stored.needs_plugin_render(true));
+
+        let rendered = super::prepare_lix_file_rows(
+            rows,
+            &super::file_path_predicate_from_filters(&[eq_filter("path", "/rendered.md")]),
+        )
+        .unwrap();
+        assert!(rendered.needs_plugin_render(true));
+        assert!(!rendered.needs_plugin_render(false));
     }
 
     #[tokio::test]
