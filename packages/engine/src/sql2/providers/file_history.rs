@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -45,7 +46,6 @@ use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::file::load_single_blob_bytes;
 use super::history::entity_pk_json_array;
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 
@@ -108,8 +108,14 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
+        if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some()
+            || FileHistoryPublicPredicate::parse_exact(filter).is_some()
+        {
             TableProviderFilterPushDown::Exact
+        } else if !FileHistoryPublicPredicate::extract_conjuncts(filter).is_all() {
+            // A mixed conjunction can be pruned by its public id/path terms,
+            // but DataFusion must still evaluate the complete expression.
+            TableProviderFilterPushDown::Inexact
         } else {
             TableProviderFilterPushDown::Unsupported
         }
@@ -136,6 +142,7 @@ where
         let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
         let metadata_projection =
             HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
+        let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
@@ -145,6 +152,7 @@ where
                     Arc::clone(&self.blob_reader),
                     self.plugin_host.clone(),
                     route,
+                    public_predicate,
                     schema,
                     metadata_projection,
                 ),
@@ -154,6 +162,7 @@ where
                     blob_reader,
                     plugin_host,
                     route,
+                    public_predicate,
                     schema,
                     metadata_projection,
                 )| async move {
@@ -163,6 +172,7 @@ where
                         &blob_reader,
                         plugin_host,
                         &route,
+                        &public_predicate,
                         needs_data,
                         metadata_projection,
                     )
@@ -251,6 +261,141 @@ struct FileHistoryOutputRow {
     event: FileHistoryEvent,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedFileHistoryRow {
+    id: String,
+    path: Option<String>,
+    descriptor: FileHistoryDescriptorRecord,
+    blob_hash: Option<String>,
+    event: FileHistoryEvent,
+}
+
+/// Conservative early predicate for the public columns Atelier uses to point
+/// lookup file history. `All` means that no safe public predicate was found;
+/// unsupported expressions are always left to DataFusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileHistoryPublicPredicate {
+    All,
+    Ids(BTreeSet<String>),
+    Paths(BTreeSet<String>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+}
+
+impl FileHistoryPublicPredicate {
+    fn from_filters(filters: &[Expr]) -> Self {
+        filters.iter().fold(Self::All, |predicate, filter| {
+            predicate.and(Self::extract_conjuncts(filter))
+        })
+    }
+
+    /// Extract only predicates that are guaranteed conjuncts. In particular,
+    /// one supported side of an OR is not enough to prune the whole OR.
+    fn extract_conjuncts(expr: &Expr) -> Self {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                Self::extract_conjuncts(&binary_expr.left)
+                    .and(Self::extract_conjuncts(&binary_expr.right))
+            }
+            _ => Self::parse_exact(expr).unwrap_or(Self::All),
+        }
+    }
+
+    fn parse_exact(expr: &Expr) -> Option<Self> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => Some(
+                Self::parse_exact(&binary_expr.left)?.and(Self::parse_exact(&binary_expr.right)?),
+            ),
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => Some(
+                Self::parse_exact(&binary_expr.left)?.or(Self::parse_exact(&binary_expr.right)?),
+            ),
+            Expr::BinaryExpr(binary_expr) => Self::from_binary_filter(binary_expr),
+            Expr::InList(in_list) => Self::from_in_list(in_list),
+            _ => None,
+        }
+    }
+
+    fn from_binary_filter(binary_expr: &BinaryExpr) -> Option<Self> {
+        if binary_expr.op != Operator::Eq {
+            return None;
+        }
+        Self::from_column_literal(&binary_expr.left, &binary_expr.right)
+            .or_else(|| Self::from_column_literal(&binary_expr.right, &binary_expr.left))
+    }
+
+    fn from_column_literal(column_expr: &Expr, literal_expr: &Expr) -> Option<Self> {
+        let Expr::Column(column) = column_expr else {
+            return None;
+        };
+        let value = string_literal(literal_expr)?;
+        match column.name.as_str() {
+            "id" => Some(Self::Ids(BTreeSet::from([value]))),
+            "path" => Some(Self::Paths(BTreeSet::from([value]))),
+            _ => None,
+        }
+    }
+
+    fn from_in_list(in_list: &InList) -> Option<Self> {
+        if in_list.negated {
+            return None;
+        }
+        let Expr::Column(column) = in_list.expr.as_ref() else {
+            return None;
+        };
+        let values = in_list
+            .list
+            .iter()
+            .map(string_literal)
+            .collect::<Option<BTreeSet<_>>>()?;
+        if values.is_empty() {
+            return None;
+        }
+        match column.name.as_str() {
+            "id" => Some(Self::Ids(values)),
+            "path" => Some(Self::Paths(values)),
+            _ => None,
+        }
+    }
+
+    fn matches(&self, id: &str, path: Option<&str>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ids(ids) => ids.contains(id),
+            // SQL equality/IN does not select a NULL path.
+            Self::Paths(paths) => path.is_some_and(|path| paths.contains(path)),
+            Self::And(left, right) => left.matches(id, path) && right.matches(id, path),
+            Self::Or(left, right) => left.matches(id, path) || right.matches(id, path),
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, predicate) | (predicate, Self::All) => predicate,
+            (left, right) => Self::And(Box::new(left), Box::new(right)),
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        Self::Or(Box::new(self), Box::new(other))
+    }
+
+    fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+fn string_literal(expr: &Expr) -> Option<String> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct FileDescriptorSnapshot {
     id: String,
@@ -286,6 +431,7 @@ async fn load_file_history_rows<S>(
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     route: &HistoryRoute,
+    public_predicate: &FileHistoryPublicPredicate,
     needs_data: bool,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<FileHistoryOutputRow>, LixError>
@@ -325,9 +471,10 @@ where
         &mut installed_plugin_metadata_cache,
         &filesystem_context,
         &events,
+        public_predicate,
     )
     .await?;
-    let (event_plugin_state, plugin_state) = if plugin_schema_keys.is_empty() {
+    let (mut event_plugin_state, plugin_state) = if plugin_schema_keys.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         load_file_history_plugin_state(
@@ -340,6 +487,12 @@ where
         )
         .await?
     };
+    retain_matching_plugin_events(
+        &mut event_plugin_state,
+        &filesystem_context.descriptors,
+        &filesystem_context.directories,
+        public_predicate,
+    );
     cache_installed_plugins_for_plugin_state_depths(
         blob_reader,
         &mut installed_plugin_metadata_cache,
@@ -354,20 +507,19 @@ where
         &filesystem_context.directories,
     );
     let events = sorted_deduped_file_history_events(events.into_iter().chain(plugin_events));
+    let prepared = prepare_file_history_rows(&filesystem_context, events, route, public_predicate)?;
+    let blob_bytes = if needs_data {
+        load_file_history_blob_bytes(blob_reader, &prepared).await?
+    } else {
+        BTreeMap::new()
+    };
 
-    let mut output = Vec::new();
-    for event in events {
-        let Some(descriptor) = nearest_file_descriptor(&filesystem_context.descriptors, &event)
-        else {
-            continue;
-        };
-        let blob = nearest_blob_ref(&filesystem_context.blobs, &event);
-        let path =
-            resolve_file_history_path(descriptor, &filesystem_context.directories, event.depth);
-        let data = if needs_data && descriptor.name.is_some() {
-            match blob.and_then(|blob| blob.blob_hash.as_deref()) {
-                Some(blob_hash) => load_single_blob_bytes(blob_reader, blob_hash).await?,
-                None => match path.as_deref() {
+    let mut output = Vec::with_capacity(prepared.len());
+    for prepared_row in prepared {
+        let data = if needs_data && prepared_row.descriptor.name.is_some() {
+            match prepared_row.blob_hash.as_deref() {
+                Some(blob_hash) => blob_bytes.get(blob_hash).cloned().flatten(),
+                None => match prepared_row.path.as_deref() {
                     Some(path) => {
                         let rendered = render_plugin_file_history_data(
                             &plugin_host,
@@ -375,8 +527,8 @@ where
                             &mut installed_plugins_cache,
                             &installed_plugin_metadata_cache,
                             &plugin_state,
-                            descriptor,
-                            &event,
+                            &prepared_row.descriptor,
+                            &prepared_row.event,
                             path,
                         )
                         .await?;
@@ -388,34 +540,18 @@ where
         } else {
             None
         };
-        let id = tombstone_identity_column_value(
-            "id",
-            &descriptor.id,
-            HistoryIdentityProjection::SingleColumn { column: "id" },
-        )?
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| descriptor.id.clone());
 
         output.push(FileHistoryOutputRow {
-            entity_pk: descriptor.id.clone(),
-            id,
-            path,
-            directory_id: descriptor.directory_id.clone(),
-            name: descriptor.name.clone(),
+            entity_pk: prepared_row.descriptor.id.clone(),
+            id: prepared_row.id,
+            path: prepared_row.path,
+            directory_id: prepared_row.descriptor.directory_id.clone(),
+            name: prepared_row.descriptor.name.clone(),
             data,
-            descriptor_change: descriptor.entry.change.clone(),
-            event,
+            descriptor_change: prepared_row.descriptor.entry.change.clone(),
+            event: prepared_row.event,
         });
     }
-    output.retain(|row| {
-        let entity_pk = entity_pk_json_array(&row.entity_pk).ok();
-        route.matches_surface_row(
-            FILE_DESCRIPTOR_SCHEMA_KEY,
-            entity_pk.as_deref().unwrap_or(&row.entity_pk),
-            Some(&row.entity_pk),
-            row.event.depth,
-        )
-    });
 
     output.sort_by(|left, right| {
         left.entity_pk
@@ -430,6 +566,90 @@ where
             .then(left.event.change.id.cmp(&right.event.change.id))
     });
     Ok(output)
+}
+
+fn prepare_file_history_rows(
+    filesystem_context: &FileHistoryFilesystemContext,
+    events: Vec<FileHistoryEvent>,
+    route: &HistoryRoute,
+    public_predicate: &FileHistoryPublicPredicate,
+) -> Result<Vec<PreparedFileHistoryRow>, LixError> {
+    let mut prepared = Vec::new();
+    for event in events {
+        let Some(descriptor) = nearest_file_descriptor(&filesystem_context.descriptors, &event)
+        else {
+            continue;
+        };
+        let path =
+            resolve_file_history_path(descriptor, &filesystem_context.directories, event.depth);
+        let id = tombstone_identity_column_value(
+            "id",
+            &descriptor.id,
+            HistoryIdentityProjection::SingleColumn { column: "id" },
+        )?
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| descriptor.id.clone());
+        if !public_predicate.matches(&id, path.as_deref()) {
+            continue;
+        }
+        let entity_pk = entity_pk_json_array(&descriptor.id).ok();
+        if !route.matches_surface_row(
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            entity_pk.as_deref().unwrap_or(&descriptor.id),
+            Some(&descriptor.id),
+            event.depth,
+        ) {
+            continue;
+        }
+        prepared.push(PreparedFileHistoryRow {
+            id,
+            path,
+            descriptor: descriptor.clone(),
+            blob_hash: nearest_blob_ref(&filesystem_context.blobs, &event)
+                .and_then(|blob| blob.blob_hash.clone()),
+            event,
+        });
+    }
+    Ok(prepared)
+}
+
+async fn load_file_history_blob_bytes(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    rows: &[PreparedFileHistoryRow],
+) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
+    let mut hashes = BTreeMap::<BlobHash, BTreeSet<String>>::new();
+    for hash in rows
+        .iter()
+        .filter(|row| row.descriptor.name.is_some())
+        .filter_map(|row| row.blob_hash.as_deref())
+    {
+        hashes
+            .entry(BlobHash::from_hex(hash)?)
+            .or_default()
+            .insert(hash.to_string());
+    }
+    if hashes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let request = hashes.keys().copied().collect::<Vec<_>>();
+    let loaded = blob_reader.load_bytes_many(&request).await?.into_vec();
+    if loaded.len() != request.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "file history blob batch returned {} values for {} requested hashes",
+                loaded.len(),
+                request.len()
+            ),
+        ));
+    }
+    let mut by_encoded_hash = BTreeMap::new();
+    for ((_, encoded_hashes), bytes) in hashes.into_iter().zip(loaded) {
+        for encoded_hash in encoded_hashes {
+            by_encoded_hash.insert(encoded_hash, bytes.clone());
+        }
+    }
+    Ok(by_encoded_hash)
 }
 
 async fn load_file_history_filesystem_context<S>(
@@ -629,6 +849,7 @@ async fn discover_file_history_plugin_schema_keys(
     installed_plugin_metadata_cache: &mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
     filesystem_context: &FileHistoryFilesystemContext,
     events: &[FileHistoryEvent],
+    public_predicate: &FileHistoryPublicPredicate,
 ) -> Result<Vec<String>, LixError> {
     let mut depths = BTreeSet::<(String, u32)>::new();
     for event in events {
@@ -640,12 +861,18 @@ async fn discover_file_history_plugin_schema_keys(
 
     let mut schema_keys = BTreeSet::new();
     for (start_commit_id, depth) in depths {
-        let paths = file_paths_at_history_depth(
+        let paths = file_identity_paths_at_history_depth(
             &filesystem_context.descriptors,
             &filesystem_context.directories,
             &start_commit_id,
             depth,
-        );
+        )
+        .into_iter()
+        .filter_map(|(id, path)| public_predicate.matches(&id, Some(&path)).then_some(path))
+        .collect::<Vec<_>>();
+        if paths.is_empty() {
+            continue;
+        }
         let plugins = installed_plugins_at_history_depth(
             blob_reader,
             installed_plugin_metadata_cache,
@@ -669,12 +896,12 @@ async fn discover_file_history_plugin_schema_keys(
     Ok(schema_keys.into_iter().collect())
 }
 
-fn file_paths_at_history_depth(
+fn file_identity_paths_at_history_depth(
     descriptors: &[FileHistoryDescriptorRecord],
     directories: &[FileHistoryDirectoryRecord],
     start_commit_id: &str,
     depth: u32,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let file_ids = descriptors
         .iter()
         .filter(|record| record.entry.start_commit_id == start_commit_id)
@@ -689,7 +916,8 @@ fn file_paths_at_history_depth(
                 }),
                 depth,
             )?;
-            resolve_file_history_path(descriptor, directories, depth)
+            let path = resolve_file_history_path(descriptor, directories, depth)?;
+            Some((file_id, path))
         })
         .collect()
 }
@@ -762,6 +990,22 @@ fn file_history_plugin_events(
         }
     }
     events
+}
+
+fn retain_matching_plugin_events(
+    plugin_state: &mut Vec<FileHistoryPluginStateRecord>,
+    descriptors: &[FileHistoryDescriptorRecord],
+    directories: &[FileHistoryDirectoryRecord],
+    public_predicate: &FileHistoryPublicPredicate,
+) {
+    plugin_state.retain(|record| {
+        let event = file_history_event_from_entry(record.file_id.clone(), &record.entry, 4);
+        let Some(descriptor) = nearest_file_descriptor(descriptors, &event) else {
+            return false;
+        };
+        let path = resolve_file_history_path(descriptor, directories, event.depth);
+        public_predicate.matches(&descriptor.id, path.as_deref())
+    });
 }
 
 fn file_history_event_from_entry(
@@ -1378,10 +1622,323 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{HistoryRoute, load_file_history_entry_sets};
+    use async_trait::async_trait;
+    use datafusion::common::{Column, ScalarValue};
+    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+
+    use crate::LixError;
+    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
+    use crate::entity_pk::EntityPk;
+    use crate::sql2::change_materialization::MaterializedChange;
+    use crate::sql2::history_route::HistoryEntry;
+
+    use super::{
+        FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryFilesystemContext,
+        FileHistoryPublicPredicate, HistoryRoute, PreparedFileHistoryRow,
+        file_history_event_from_entry, load_file_history_blob_bytes, load_file_history_entry_sets,
+        prepare_file_history_rows,
+    };
+
+    fn history_entry(file_id: &str, depth: u32, snapshot_content: Option<String>) -> HistoryEntry {
+        HistoryEntry {
+            change: MaterializedChange {
+                id: format!("change-{file_id}-{depth}"),
+                entity_pk: EntityPk::single(file_id),
+                schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                file_id: Some(file_id.to_string()),
+                snapshot_content,
+                metadata: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                origin_key: None,
+            },
+            observed_commit_id: format!("commit-{depth}"),
+            commit_created_at: "2026-01-01T00:00:00Z".to_string(),
+            start_commit_id: "start".to_string(),
+            depth,
+        }
+    }
+
+    fn descriptor(file_id: &str, name: Option<&str>, depth: u32) -> FileHistoryDescriptorRecord {
+        let snapshot = name.map(|name| {
+            serde_json::json!({
+                "id": file_id,
+                "directory_id": null,
+                "name": name,
+            })
+            .to_string()
+        });
+        FileHistoryDescriptorRecord {
+            id: file_id.to_string(),
+            directory_id: None,
+            name: name.map(str::to_string),
+            entry: history_entry(file_id, depth, snapshot),
+        }
+    }
+
+    fn blob_record(file_id: &str, hash: BlobHash, depth: u32) -> FileHistoryBlobRecord {
+        let mut entry = history_entry(file_id, depth, None);
+        entry.change.id = format!("blob-{file_id}-{depth}");
+        entry.change.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
+        FileHistoryBlobRecord {
+            file_id: file_id.to_string(),
+            blob_hash: Some(hash.to_hex()),
+            entry,
+        }
+    }
+
+    fn filesystem_context(
+        descriptors: Vec<FileHistoryDescriptorRecord>,
+        blobs: Vec<FileHistoryBlobRecord>,
+    ) -> FileHistoryFilesystemContext {
+        FileHistoryFilesystemContext {
+            event_descriptors: descriptors.clone(),
+            event_directories: Vec::new(),
+            event_blobs: blobs.clone(),
+            descriptors,
+            directories: Vec::new(),
+            blobs,
+        }
+    }
+
+    fn eq_filter(column_name: &str, value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name(column_name))),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(value.to_string())),
+                None,
+            )),
+        ))
+    }
+
+    #[derive(Default)]
+    struct RecordingBlobReader {
+        calls: StdMutex<Vec<Vec<BlobHash>>>,
+        values: BTreeMap<BlobHash, Option<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl BlobDataReader for RecordingBlobReader {
+        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            self.calls.lock().unwrap().push(hashes.to_vec());
+            Ok(BlobBytesBatch::new(
+                hashes
+                    .iter()
+                    .map(|hash| self.values.get(hash).cloned().flatten())
+                    .collect(),
+            ))
+        }
+    }
+
+    struct FixedBatchBlobReader(Vec<Option<Vec<u8>>>);
+
+    #[async_trait]
+    impl BlobDataReader for FixedBatchBlobReader {
+        async fn load_bytes_many(&self, _hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn public_id_and_path_filters_prune_before_hydration() {
+        let hash = BlobHash::from_content(b"content");
+        let live_a = descriptor("file-a", Some("a.md"), 0);
+        let live_b = descriptor("file-b", Some("b.md"), 0);
+        let tombstone = descriptor("file-deleted", None, 0);
+        let events = [&live_a, &live_b, &tombstone]
+            .into_iter()
+            .map(|descriptor| {
+                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry, 1)
+            })
+            .collect::<Vec<_>>();
+        let context = filesystem_context(
+            vec![live_a, live_b, tombstone],
+            vec![
+                blob_record("file-a", hash, 0),
+                blob_record("file-b", hash, 0),
+            ],
+        );
+
+        let id_predicate = FileHistoryPublicPredicate::from_filters(&[eq_filter("id", "file-a")]);
+        let by_id = prepare_file_history_rows(
+            &context,
+            events.clone(),
+            &HistoryRoute::default(),
+            &id_predicate,
+        )
+        .unwrap();
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, "file-a");
+
+        let path_predicate =
+            FileHistoryPublicPredicate::from_filters(&[eq_filter("path", "/b.md")]);
+        let by_path = prepare_file_history_rows(
+            &context,
+            events.clone(),
+            &HistoryRoute::default(),
+            &path_predicate,
+        )
+        .unwrap();
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].id, "file-b");
+
+        let tombstone_predicate =
+            FileHistoryPublicPredicate::from_filters(&[eq_filter("id", "file-deleted")]);
+        let deleted = prepare_file_history_rows(
+            &context,
+            events,
+            &HistoryRoute::default(),
+            &tombstone_predicate,
+        )
+        .unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, "file-deleted");
+        assert_eq!(deleted[0].path, None);
+
+        let unsafe_or = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "file-a")),
+            Operator::Or,
+            Box::new(eq_filter("name", "b.md")),
+        ));
+        assert!(
+            FileHistoryPublicPredicate::extract_conjuncts(&unsafe_or).is_all(),
+            "one supported OR arm must not prune rows needed by the other arm"
+        );
+        let mixed_and = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "file-a")),
+            Operator::And,
+            Box::new(eq_filter("name", "a.md")),
+        ));
+        assert!(
+            FileHistoryPublicPredicate::extract_conjuncts(&mixed_and)
+                .matches("file-a", Some("/a.md")),
+            "a guaranteed public conjunct remains safe for early pruning"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_hydration_batches_deduplicates_and_preserves_missing_values() {
+        let present_hash = BlobHash::from_content(b"present");
+        let missing_hash = BlobHash::from_content(b"missing");
+        let descriptor = descriptor("file-a", Some("a.md"), 0);
+        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry, 1);
+        let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
+            id: id.to_string(),
+            path: Some(format!("/{id}.md")),
+            descriptor: FileHistoryDescriptorRecord {
+                id: id.to_string(),
+                ..descriptor.clone()
+            },
+            blob_hash: Some(hash.to_hex()),
+            event: event.clone(),
+        };
+        let rows = vec![
+            row("file-a", present_hash),
+            row("file-b", present_hash),
+            row("file-c", missing_hash),
+        ];
+        let reader = Arc::new(RecordingBlobReader {
+            calls: StdMutex::new(Vec::new()),
+            values: BTreeMap::from([(present_hash, Some(b"present".to_vec()))]),
+        });
+        let blob_reader: Arc<dyn BlobDataReader> = reader.clone();
+
+        let loaded = load_file_history_blob_bytes(&blob_reader, &rows)
+            .await
+            .unwrap();
+
+        let calls = reader.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].iter().copied().collect::<BTreeSet<_>>().len(), 2);
+        assert_eq!(
+            loaded.get(&present_hash.to_hex()),
+            Some(&Some(b"present".to_vec()))
+        );
+        assert_eq!(loaded.get(&missing_hash.to_hex()), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn blob_hydration_rejects_malformed_batch_lengths() {
+        let descriptor = descriptor("file-a", Some("a.md"), 0);
+        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry, 1);
+        let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
+            id: id.to_string(),
+            path: Some(format!("/{id}.md")),
+            descriptor: FileHistoryDescriptorRecord {
+                id: id.to_string(),
+                ..descriptor.clone()
+            },
+            blob_hash: Some(hash.to_hex()),
+            event: event.clone(),
+        };
+        let rows = vec![
+            row("file-a", BlobHash::from_content(b"first")),
+            row("file-b", BlobHash::from_content(b"second")),
+        ];
+
+        for malformed in [
+            vec![Some(b"only-one".to_vec())],
+            vec![None, None, Some(b"extra".to_vec())],
+        ] {
+            let reader: Arc<dyn BlobDataReader> = Arc::new(FixedBatchBlobReader(malformed));
+            let error = load_file_history_blob_bytes(&reader, &rows)
+                .await
+                .expect_err("mismatched positional batch must fail");
+            assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+            assert!(error.message.contains("values for 2 requested hashes"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unfiltered_bulk_history_keeps_all_rows_and_uses_one_blob_batch() {
+        let first_hash = BlobHash::from_content(b"first");
+        let second_hash = BlobHash::from_content(b"second");
+        let descriptors = vec![
+            descriptor("file-a", Some("a.md"), 0),
+            descriptor("file-b", Some("b.md"), 0),
+        ];
+        let events = descriptors
+            .iter()
+            .map(|descriptor| {
+                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry, 1)
+            })
+            .collect::<Vec<_>>();
+        let context = filesystem_context(
+            descriptors,
+            vec![
+                blob_record("file-a", first_hash, 0),
+                blob_record("file-b", second_hash, 0),
+            ],
+        );
+        let rows = prepare_file_history_rows(
+            &context,
+            events,
+            &HistoryRoute::default(),
+            &FileHistoryPublicPredicate::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let reader = Arc::new(RecordingBlobReader {
+            calls: StdMutex::new(Vec::new()),
+            values: BTreeMap::from([
+                (first_hash, Some(b"first".to_vec())),
+                (second_hash, Some(b"second".to_vec())),
+            ]),
+        });
+        let blob_reader: Arc<dyn BlobDataReader> = reader.clone();
+        let loaded = load_file_history_blob_bytes(&blob_reader, &rows)
+            .await
+            .unwrap();
+
+        assert_eq!(reader.calls.lock().unwrap().len(), 1);
+        assert_eq!(loaded.len(), 2);
+    }
 
     #[tokio::test]
     async fn identical_event_and_context_routes_load_history_once() {
