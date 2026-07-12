@@ -403,6 +403,7 @@ impl BackendWrite for SlateDbWrite {
     fn commit(self) -> Result<CommitResult, BackendError> {
         let stats = self.stats;
         if self.overlay.is_empty() {
+            self.worker.ensure_usable()?;
             return Ok(CommitResult {
                 commit_id: None,
                 stats,
@@ -1224,6 +1225,31 @@ mod tests {
                 .begin_write(WriteOptions::default())
                 .map(|_| ())
                 .expect_err("future writers must reject a failed commit"),
+            BackendError::Durability
+        );
+    }
+
+    #[test]
+    fn empty_commit_observes_prior_durability_failure() {
+        let backend = SlateDbBackend::open_object_store(
+            "test-empty-failed-commit",
+            Arc::new(InMemory::new()),
+        )
+        .expect("open empty failed commit backend");
+        let write = backend
+            .begin_write(WriteOptions::default())
+            .expect("begin empty write before failure");
+
+        backend
+            .worker
+            .inner
+            .durability_failed
+            .store(true, Ordering::Release);
+
+        assert_eq!(
+            write
+                .commit()
+                .expect_err("empty commit must observe prior durability failure"),
             BackendError::Durability
         );
     }
