@@ -408,8 +408,17 @@ async fn load_branch_rows(
             if descriptors.len() <= 2 {
                 return load_branch_rows_with_point_lookups(descriptors, branch_ref).await;
             }
-            let heads = branch_ref.scan_heads().await?;
-            Ok(join_branch_descriptors_with_heads(descriptors, heads))
+            match branch_ref.scan_heads().await {
+                Ok(heads) => Ok(join_branch_descriptors_with_heads(descriptors, heads)),
+                // A full scan can encounter a malformed ref unrelated to the
+                // descriptors being listed. Preserve point-read semantics in
+                // that case while keeping the one-scan fast path for valid
+                // branch-ref state.
+                Err(error) if error.code != LixError::CODE_STORAGE_ERROR => {
+                    load_branch_rows_with_point_lookups(descriptors, branch_ref).await
+                }
+                Err(error) => Err(error),
+            }
         }
         BranchHeadReadStrategy::Point => {
             load_branch_rows_with_point_lookups(descriptors, branch_ref).await
@@ -806,12 +815,20 @@ mod tests {
         heads: Vec<BranchHead>,
         point_reads: AtomicUsize,
         scans: AtomicUsize,
+        scan_error: Option<LixError>,
+        point_error_branch: Option<String>,
     }
 
     #[async_trait]
     impl BranchRefReader for CountingBranchRefReader {
         async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             self.point_reads.fetch_add(1, Ordering::Relaxed);
+            if self.point_error_branch.as_deref() == Some(branch_id) {
+                return Err(LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("branch ref for '{branch_id}' is malformed"),
+                ));
+            }
             Ok(self
                 .heads
                 .iter()
@@ -821,6 +838,9 @@ mod tests {
 
         async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             self.scans.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = &self.scan_error {
+                return Err(error.clone());
+            }
             Ok(self.heads.clone())
         }
     }
@@ -865,6 +885,8 @@ mod tests {
             heads: vec![head("branch-a"), head("branch-b"), head("ref-only")],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
+            scan_error: None,
+            point_error_branch: None,
         });
 
         let rows = load_branch_rows(
@@ -905,6 +927,8 @@ mod tests {
             heads: vec![head("branch-a")],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
+            scan_error: None,
+            point_error_branch: None,
         });
 
         let rows = load_branch_rows(
@@ -918,5 +942,104 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 0);
         assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_head_read_falls_back_to_point_reads_when_scan_fails() {
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                descriptor_row("branch-a", "Branch A"),
+                descriptor_row("branch-b", "Branch B"),
+                descriptor_row("branch-c", "Branch C"),
+            ],
+        });
+        let branch_ref = Arc::new(CountingBranchRefReader {
+            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            point_reads: AtomicUsize::new(0),
+            scans: AtomicUsize::new(0),
+            scan_error: Some(LixError::new(
+                LixError::CODE_UNKNOWN,
+                "unrelated branch ref is malformed",
+            )),
+            point_error_branch: None,
+        });
+
+        let rows = load_branch_rows(
+            live_state,
+            branch_ref.clone(),
+            BranchHeadReadStrategy::Batch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
+        assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn batch_head_read_still_rejects_a_malformed_selected_ref() {
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                descriptor_row("branch-a", "Branch A"),
+                descriptor_row("branch-b", "Branch B"),
+                descriptor_row("branch-c", "Branch C"),
+            ],
+        });
+        let branch_ref = Arc::new(CountingBranchRefReader {
+            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            point_reads: AtomicUsize::new(0),
+            scans: AtomicUsize::new(0),
+            scan_error: Some(LixError::new(
+                LixError::CODE_UNKNOWN,
+                "a branch ref is malformed",
+            )),
+            point_error_branch: Some("branch-b".to_string()),
+        });
+
+        let error = load_branch_rows(
+            live_state,
+            branch_ref.clone(),
+            BranchHeadReadStrategy::Batch,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.message.contains("branch-b"));
+        assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
+        assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_head_read_does_not_amplify_storage_errors() {
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                descriptor_row("branch-a", "Branch A"),
+                descriptor_row("branch-b", "Branch B"),
+                descriptor_row("branch-c", "Branch C"),
+            ],
+        });
+        let branch_ref = Arc::new(CountingBranchRefReader {
+            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            point_reads: AtomicUsize::new(0),
+            scans: AtomicUsize::new(0),
+            scan_error: Some(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "branch-ref scan failed",
+            )),
+            point_error_branch: None,
+        });
+
+        let error = load_branch_rows(
+            live_state,
+            branch_ref.clone(),
+            BranchHeadReadStrategy::Batch,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
+        assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
+        assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 0);
     }
 }
