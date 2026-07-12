@@ -402,10 +402,10 @@ async fn load_branch_rows(
     match head_read_strategy {
         BranchHeadReadStrategy::Batch => {
             // A read session has already resolved and cached the active branch.
-            // Keep the zero/one-descriptor case on point lookup so an empty or
-            // brand-new workspace does not add a ref scan; batch once there is
-            // actual fanout to collapse.
-            if descriptors.len() <= 1 {
+            // Keep the zero-to-two-descriptor case on point lookup: the active
+            // head is already cached, so at most one backend read remains.
+            // Batch once there is actual fanout to collapse.
+            if descriptors.len() <= 2 {
                 return load_branch_rows_with_point_lookups(descriptors, branch_ref).await;
             }
             let heads = branch_ref.scan_heads().await?;
@@ -857,11 +857,12 @@ mod tests {
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 descriptor_row("branch-a", "Branch A"),
+                descriptor_row("branch-b", "Branch B"),
                 descriptor_row("descriptor-only", "Descriptor only"),
             ],
         });
         let branch_ref = Arc::new(CountingBranchRefReader {
-            heads: vec![head("branch-a"), head("ref-only")],
+            heads: vec![head("branch-a"), head("branch-b"), head("ref-only")],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
         });
@@ -876,12 +877,20 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![BranchRow {
-                id: "branch-a".to_string(),
-                name: "Branch A".to_string(),
-                hidden: false,
-                commit_id: head("branch-a").commit_id,
-            }]
+            vec![
+                BranchRow {
+                    id: "branch-a".to_string(),
+                    name: "Branch A".to_string(),
+                    hidden: false,
+                    commit_id: head("branch-a").commit_id,
+                },
+                BranchRow {
+                    id: "branch-b".to_string(),
+                    name: "Branch B".to_string(),
+                    hidden: false,
+                    commit_id: head("branch-b").commit_id,
+                },
+            ]
         );
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
         assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 0);
