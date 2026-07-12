@@ -111,14 +111,22 @@ pub(crate) fn verify_chunk_hash(
     expected: &[u8; TRACKED_STATE_HASH_BYTES],
     bytes: &[u8],
 ) -> Result<(), LixError> {
+    let actual = crate::tracked_state::codec::hash_bytes(bytes);
+    if &actual != expected {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state chunk hash mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn debug_verify_chunk_hash(
+    expected: &[u8; TRACKED_STATE_HASH_BYTES],
+    bytes: &[u8],
+) -> Result<(), LixError> {
     if cfg!(debug_assertions) {
-        let actual = crate::tracked_state::codec::hash_bytes(bytes);
-        if &actual != expected {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state chunk hash mismatch",
-            ));
-        }
+        verify_chunk_hash(expected, bytes)?;
     }
     Ok(())
 }
@@ -143,15 +151,8 @@ impl TrackedStateChunkOverlay {
         Self::default()
     }
 
-    pub(crate) async fn read_chunk(
-        &self,
-        store: &(impl StorageRead + ?Sized),
-        hash: &[u8; TRACKED_STATE_HASH_BYTES],
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        if let Some(bytes) = self.chunks.get(hash) {
-            return Ok(Some(bytes.clone()));
-        }
-        read_chunk(store, hash).await
+    pub(crate) fn staged_chunk(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<&[u8]> {
+        self.chunks.get(hash).map(Vec::as_slice)
     }
 
     pub(crate) fn stage_chunks(

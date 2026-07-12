@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,16 +18,19 @@ use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use slatedb::config::{
     ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDbScanOptions, Settings,
+    WriteOptions as SlateDbWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
 use tempfile::TempDir;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::{Builder, Handle, Runtime};
+use tokio::sync::Mutex as AsyncMutex;
 
 const DB_PATH: &str = "db";
 const SPACE_PREFIX_LEN: usize = 4;
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
+const RUNTIME_WORKER_THREADS: usize = 2;
 const POINT_READ_CONCURRENCY: usize = 64;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
@@ -183,7 +187,7 @@ impl SlateDbBackend {
 
     pub fn flush(&self) -> Result<(), BackendError> {
         self.worker
-            .call(|runtime, db| runtime.block_on(db.flush()).map_err(slatedb_error))
+            .call(|db| async move { db.flush().await.map_err(slatedb_error) })
     }
 }
 
@@ -199,9 +203,9 @@ impl Backend for SlateDbBackend {
         Self: 'a;
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        let snapshot = self
-            .worker
-            .call(|runtime, db| runtime.block_on(db.snapshot()).map_err(slatedb_error))?;
+        let snapshot = self.worker.call_with_visibility_lock(|db| async move {
+            db.snapshot().await.map_err(slatedb_error)
+        })?;
         Ok(SlateDbRead {
             worker: self.worker.clone(),
             snapshot,
@@ -212,7 +216,7 @@ impl Backend for SlateDbBackend {
         let writer_permit = self.write_gate.acquire()?;
         let base = self
             .worker
-            .call(|runtime, db| runtime.block_on(db.snapshot()).map_err(slatedb_error))?;
+            .call(|db| async move { db.snapshot().await.map_err(slatedb_error) })?;
         Ok(SlateDbWrite {
             worker: self.worker.clone(),
             _writer_permit: writer_permit,
@@ -245,7 +249,7 @@ impl BackendRead for SlateDbRead {
         let snapshot = Arc::clone(&self.snapshot);
         let values = self
             .worker
-            .call(move |runtime, _db| get_snapshot_values(runtime, snapshot, physical_keys))?;
+            .call(move |_db| get_snapshot_values(snapshot, physical_keys))?;
 
         for (index, (key, value)) in keys.iter().zip(values.iter()).enumerate() {
             visitor.visit(
@@ -286,7 +290,7 @@ impl BackendRead for SlateDbRead {
         let snapshot = Arc::clone(&self.snapshot);
         let mut iter = Some(
             self.worker
-                .call(move |runtime, _db| open_snapshot_scan(runtime, &snapshot, bounds))?,
+                .call(move |_db| open_snapshot_scan(snapshot, bounds))?,
         );
         let mut emitted = 0usize;
 
@@ -298,8 +302,8 @@ impl BackendRead for SlateDbRead {
                 .take()
                 .expect("slatedb scan iterator is present until scan returns");
             let projection = opts.projection;
-            let batch = self.worker.call(move |runtime, _db| {
-                scan_snapshot_batch(runtime, current_iter, batch_limit, projection, lookahead)
+            let batch = self.worker.call(move |_db| {
+                scan_snapshot_batch(current_iter, batch_limit, projection, lookahead)
             })?;
             let ScanBatch {
                 iter: next_iter,
@@ -367,7 +371,7 @@ impl BackendWrite for SlateDbWrite {
         let base = Arc::clone(&self.base);
         let base_keys = self
             .worker
-            .call(move |runtime, _db| collect_snapshot_keys(runtime, &base, bounds))?;
+            .call(move |_db| collect_snapshot_keys(base, bounds))?;
 
         let overlay_keys = self
             .overlay
@@ -399,7 +403,7 @@ impl BackendWrite for SlateDbWrite {
             });
         }
 
-        self.worker.call(move |runtime, db| {
+        self.worker.call_with_visibility_lock(move |db| async move {
             let mut batch = WriteBatch::new();
             for (key, value) in self.overlay {
                 match value {
@@ -407,7 +411,22 @@ impl BackendWrite for SlateDbWrite {
                     None => batch.delete(key.0),
                 }
             }
-            runtime.block_on(db.write(batch)).map_err(slatedb_error)?;
+            db.write_with_options(
+                batch,
+                &SlateDbWriteOptions {
+                    await_durable: false,
+                    ..SlateDbWriteOptions::default()
+                },
+            )
+            .await
+            .map_err(slatedb_error)?;
+            // SlateDB's default durable write waits for its periodic WAL
+            // flush (100 ms by default). The backend already serializes
+            // writers, so separate commits cannot benefit from that group
+            // commit window. Request and await the WAL flush immediately to
+            // preserve the existing durability contract without the timer
+            // latency floor.
+            db.flush().await.map_err(slatedb_error)?;
             Ok(CommitResult {
                 commit_id: None,
                 stats,
@@ -428,13 +447,16 @@ struct SlateDbWorker {
 
 #[allow(missing_debug_implementations)]
 struct SlateDbWorkerInner {
-    commands: mpsc::Sender<SlateDbCommand>,
-    thread: Mutex<Option<JoinHandle<()>>>,
-}
-
-enum SlateDbCommand {
-    Run(Box<dyn FnOnce(&Runtime, &Db) + Send + 'static>),
-    Shutdown,
+    runtime: Handle,
+    db: Arc<Db>,
+    // A commit becomes visible before its explicit WAL flush completes. New
+    // snapshots share this lock with that write-plus-flush window; operations
+    // on already-pinned snapshots remain fully concurrent.
+    visibility_lock: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    next_visibility_wait: Mutex<Option<mpsc::Sender<()>>>,
+    shutdown: mpsc::Sender<()>,
+    manager: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SlateDbWorker {
@@ -443,12 +465,12 @@ impl SlateDbWorker {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDbObjectStoreOptions,
     ) -> Result<Self, BackendError> {
-        let (commands, receiver) = mpsc::channel();
-        let (opened_tx, opened_rx) = mpsc::channel();
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (opened_tx, opened_rx) = mpsc::channel::<Result<(Handle, Arc<Db>), BackendError>>();
         let thread = std::thread::Builder::new()
-            .name("lix-slatedb".to_string())
+            .name("lix-slatedb-manager".to_string())
             .spawn(move || {
-                run_slatedb_worker(db_path, object_store, options, receiver, opened_tx);
+                run_slatedb_manager(db_path, object_store, options, shutdown_rx, opened_tx);
             })
             .map_err(|error| BackendError::Io(format!("spawn slatedb worker: {error}")))?;
 
@@ -456,10 +478,15 @@ impl SlateDbWorker {
             .recv()
             .map_err(|error| BackendError::Io(format!("slatedb worker did not open: {error}")))?
         {
-            Ok(()) => Ok(Self {
+            Ok((runtime, db)) => Ok(Self {
                 inner: Arc::new(SlateDbWorkerInner {
-                    commands,
-                    thread: Mutex::new(Some(thread)),
+                    runtime,
+                    db,
+                    visibility_lock: Arc::new(AsyncMutex::new(())),
+                    #[cfg(test)]
+                    next_visibility_wait: Mutex::new(None),
+                    shutdown,
+                    manager: Mutex::new(Some(thread)),
                 }),
             }),
             Err(error) => {
@@ -469,46 +496,101 @@ impl SlateDbWorker {
         }
     }
 
-    fn call<R>(
+    fn call<R, F, Fut>(&self, operation: F) -> Result<R, BackendError>
+    where
+        R: Send + 'static,
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, BackendError>> + Send + 'static,
+    {
+        self.call_inner(None, operation)
+    }
+
+    fn call_with_visibility_lock<R, F, Fut>(&self, operation: F) -> Result<R, BackendError>
+    where
+        R: Send + 'static,
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, BackendError>> + Send + 'static,
+    {
+        self.call_inner(Some(Arc::clone(&self.inner.visibility_lock)), operation)
+    }
+
+    fn call_inner<R, F, Fut>(
         &self,
-        operation: impl FnOnce(&Runtime, &Db) -> Result<R, BackendError> + Send + 'static,
+        visibility_lock: Option<Arc<AsyncMutex<()>>>,
+        operation: F,
     ) -> Result<R, BackendError>
     where
         R: Send + 'static,
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, BackendError>> + Send + 'static,
     {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.inner
-            .commands
-            .send(SlateDbCommand::Run(Box::new(move |runtime, db| {
-                let _ = reply_tx.send(operation(runtime, db));
-            })))
-            .map_err(|error| BackendError::Io(format!("send slatedb worker command: {error}")))?;
+        let db = Arc::clone(&self.inner.db);
+        #[cfg(test)]
+        let visibility_wait = if visibility_lock.is_some() {
+            self.inner
+                .next_visibility_wait
+                .lock()
+                .expect("lock visibility wait probe")
+                .take()
+        } else {
+            None
+        };
+        self.inner.runtime.spawn(async move {
+            let _visibility_guard = match visibility_lock {
+                Some(visibility_lock) => {
+                    #[cfg(test)]
+                    if let Some(visibility_wait) = visibility_wait {
+                        let _ = visibility_wait.send(());
+                    }
+                    Some(visibility_lock.lock_owned().await)
+                }
+                None => None,
+            };
+            let result = operation(db).await;
+            let _ = reply_tx.send(result);
+        });
         reply_rx
             .recv()
             .map_err(|error| BackendError::Io(format!("receive slatedb worker reply: {error}")))?
+    }
+
+    #[cfg(test)]
+    fn observe_next_visibility_wait(&self) -> mpsc::Receiver<()> {
+        let (wait_tx, wait_rx) = mpsc::channel();
+        *self
+            .inner
+            .next_visibility_wait
+            .lock()
+            .expect("lock visibility wait probe") = Some(wait_tx);
+        wait_rx
     }
 }
 
 impl Drop for SlateDbWorkerInner {
     fn drop(&mut self) {
-        let _ = self.commands.send(SlateDbCommand::Shutdown);
-        let Ok(mut thread) = self.thread.lock() else {
+        let _ = self.shutdown.send(());
+        let Ok(mut manager) = self.manager.lock() else {
             return;
         };
-        if let Some(thread) = thread.take() {
-            let _ = thread.join();
+        if let Some(manager) = manager.take() {
+            let _ = manager.join();
         }
     }
 }
 
-fn run_slatedb_worker(
+fn run_slatedb_manager(
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
     options: SlateDbObjectStoreOptions,
-    receiver: mpsc::Receiver<SlateDbCommand>,
-    opened: mpsc::Sender<Result<(), BackendError>>,
+    shutdown: mpsc::Receiver<()>,
+    opened: mpsc::Sender<Result<(Handle, Arc<Db>), BackendError>>,
 ) {
-    let runtime = match Builder::new_current_thread().enable_all().build() {
+    let runtime = match Builder::new_multi_thread()
+        .worker_threads(RUNTIME_WORKER_THREADS)
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = opened.send(Err(BackendError::Io(format!(
@@ -526,15 +608,15 @@ fn run_slatedb_worker(
         }
     };
 
-    let _ = opened.send(Ok(()));
-
-    while let Ok(command) = receiver.recv() {
-        match command {
-            SlateDbCommand::Run(operation) => operation(&runtime, &db),
-            SlateDbCommand::Shutdown => break,
-        }
+    let db = Arc::new(db);
+    if opened
+        .send(Ok((runtime.handle().clone(), Arc::clone(&db))))
+        .is_err()
+    {
+        let _ = runtime.block_on(db.close());
+        return;
     }
-
+    let _ = shutdown.recv();
     let _ = runtime.block_on(db.close());
 }
 
@@ -673,21 +755,18 @@ impl EncodedBounds {
     }
 }
 
-fn get_snapshot_values(
-    runtime: &Runtime,
+async fn get_snapshot_values(
     snapshot: Arc<DbSnapshot>,
     keys: Vec<Key>,
 ) -> Result<Vec<Option<Bytes>>, BackendError> {
-    runtime.block_on(async move {
-        stream::iter(keys)
-            .map(|key| {
-                let snapshot = Arc::clone(&snapshot);
-                async move { snapshot.get(key.0).await.map_err(slatedb_error) }
-            })
-            .buffered(POINT_READ_CONCURRENCY)
-            .try_collect()
-            .await
-    })
+    stream::iter(keys)
+        .map(|key| {
+            let snapshot = Arc::clone(&snapshot);
+            async move { snapshot.get(key.0).await.map_err(slatedb_error) }
+        })
+        .buffered(POINT_READ_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 struct ScanBatch {
@@ -703,85 +782,76 @@ enum ScanBatchState {
     HasMore,
 }
 
-fn open_snapshot_scan(
-    runtime: &Runtime,
-    snapshot: &DbSnapshot,
+async fn open_snapshot_scan(
+    snapshot: Arc<DbSnapshot>,
     bounds: EncodedBounds,
 ) -> Result<DbIterator, BackendError> {
-    runtime.block_on(async {
-        let scan_options = slatedb_scan_options();
-        snapshot
-            .scan_with_options(bounds.range(), &scan_options)
-            .await
-            .map_err(slatedb_error)
-    })
+    let scan_options = slatedb_scan_options();
+    snapshot
+        .scan_with_options(bounds.range(), &scan_options)
+        .await
+        .map_err(slatedb_error)
 }
 
-fn scan_snapshot_batch(
-    runtime: &Runtime,
+async fn scan_snapshot_batch(
     mut iter: DbIterator,
     limit_rows: usize,
     projection: CoreProjection,
     lookahead: bool,
 ) -> Result<ScanBatch, BackendError> {
-    runtime.block_on(async {
-        let mut entries = Vec::with_capacity(limit_rows);
-        while entries.len() < limit_rows {
-            let Some(row) = iter.next().await.map_err(slatedb_error)? else {
-                return Ok(ScanBatch {
-                    iter,
-                    entries,
-                    state: ScanBatchState::Exhausted,
-                });
-            };
-            if row.key.len() < SPACE_PREFIX_LEN {
-                return Err(BackendError::Corruption(format!(
-                    "slatedb key was shorter than space prefix: {:?}",
-                    row.key
-                )));
-            }
-            let key = Key(Bytes::copy_from_slice(&row.key[SPACE_PREFIX_LEN..]));
-            let value = match projection {
-                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-                CoreProjection::FullValue => ProjectedValue::FullValue(row.value),
-            };
-            entries.push((key, value));
-        }
-
-        let state = if lookahead {
-            if iter.next().await.map_err(slatedb_error)?.is_some() {
-                ScanBatchState::HasMore
-            } else {
-                ScanBatchState::Exhausted
-            }
-        } else {
-            ScanBatchState::MoreUnknown
+    let mut entries = Vec::with_capacity(limit_rows);
+    while entries.len() < limit_rows {
+        let Some(row) = iter.next().await.map_err(slatedb_error)? else {
+            return Ok(ScanBatch {
+                iter,
+                entries,
+                state: ScanBatchState::Exhausted,
+            });
         };
-        Ok(ScanBatch {
-            iter,
-            entries,
-            state,
-        })
+        if row.key.len() < SPACE_PREFIX_LEN {
+            return Err(BackendError::Corruption(format!(
+                "slatedb key was shorter than space prefix: {:?}",
+                row.key
+            )));
+        }
+        let key = Key(Bytes::copy_from_slice(&row.key[SPACE_PREFIX_LEN..]));
+        let value = match projection {
+            CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+            CoreProjection::FullValue => ProjectedValue::FullValue(row.value),
+        };
+        entries.push((key, value));
+    }
+
+    let state = if lookahead {
+        if iter.next().await.map_err(slatedb_error)?.is_some() {
+            ScanBatchState::HasMore
+        } else {
+            ScanBatchState::Exhausted
+        }
+    } else {
+        ScanBatchState::MoreUnknown
+    };
+    Ok(ScanBatch {
+        iter,
+        entries,
+        state,
     })
 }
 
-fn collect_snapshot_keys(
-    runtime: &Runtime,
-    snapshot: &DbSnapshot,
+async fn collect_snapshot_keys(
+    snapshot: Arc<DbSnapshot>,
     bounds: EncodedBounds,
 ) -> Result<Vec<Key>, BackendError> {
-    runtime.block_on(async {
-        let scan_options = slatedb_scan_options();
-        let mut iter = snapshot
-            .scan_with_options(bounds.range(), &scan_options)
-            .await
-            .map_err(slatedb_error)?;
-        let mut keys = Vec::new();
-        while let Some(row) = iter.next().await.map_err(slatedb_error)? {
-            keys.push(Key(row.key));
-        }
-        Ok(keys)
-    })
+    let scan_options = slatedb_scan_options();
+    let mut iter = snapshot
+        .scan_with_options(bounds.range(), &scan_options)
+        .await
+        .map_err(slatedb_error)?;
+    let mut keys = Vec::new();
+    while let Some(row) = iter.next().await.map_err(slatedb_error)? {
+        keys.push(Key(row.key));
+    }
+    Ok(keys)
 }
 
 fn slatedb_scan_options() -> SlateDbScanOptions {
@@ -913,11 +983,22 @@ impl Drop for WriterPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures_util::stream::BoxStream;
     use lix_engine::backend::{
         Backend, BackendWrite, GetOptions, ProjectedValue, PutEntry, ReadOptions, StoredValue,
         WriteOptions, get_many,
     };
     use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions as ObjectStoreGetOptions, GetResult, ListResult, MultipartUpload,
+        ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+        Result as ObjectStoreResult,
+    };
+    use std::ops::Range;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn open_object_store_round_trips_with_memory_store() {
@@ -952,5 +1033,367 @@ mod tests {
         let result = get_many(&read, space, &[key], GetOptions::default()).expect("read row");
 
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
+    }
+
+    #[test]
+    fn begin_read_waits_for_commit_wal_durability() {
+        let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+        let backend = SlateDbBackend::open_object_store("test-commit-visibility", store.clone())
+            .expect("open commit visibility backend");
+        let space = SpaceId(8);
+        let key = Key(Bytes::from_static(b"visible-after-durable"));
+
+        let blocked_write = store.block_next_write();
+        let commit_backend = backend.clone();
+        let commit_key = key.clone();
+        let commit = std::thread::spawn(move || {
+            let mut write = commit_backend
+                .begin_write(WriteOptions::default())
+                .expect("begin visibility write");
+            write
+                .put_many(
+                    space,
+                    PutBatch {
+                        entries: vec![PutEntry {
+                            key: commit_key,
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"value"),
+                            },
+                        }],
+                    },
+                )
+                .expect("stage visibility write");
+            write.commit()
+        });
+        blocked_write.wait_for_entries(1, "SlateDB WAL write");
+
+        let visibility_wait = backend.worker.observe_next_visibility_wait();
+        let read_backend = backend;
+        let read_key = key;
+        let (read_result_tx, read_result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = (|| {
+                let read = read_backend.begin_read(ReadOptions::default())?;
+                get_many(&read, space, &[read_key], GetOptions::default())
+                    .map(|result| result.values)
+            })();
+            let _ = read_result_tx.send(result);
+        });
+
+        visibility_wait
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader should reach the visibility lock");
+        assert!(
+            matches!(
+                read_result_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "begin_read must remain queued until the WAL write is durable"
+        );
+
+        drop(blocked_write);
+        commit
+            .join()
+            .expect("join visibility commit")
+            .expect("commit visibility value");
+        let values = read_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("visibility read should finish after WAL durability")
+            .expect("read visibility value");
+        assert_eq!(
+            values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"value"
+            )))]
+        );
+        reader.join().expect("join visibility reader");
+    }
+
+    #[test]
+    fn independent_backend_reads_overlap() {
+        let inner = Arc::new(InMemory::new());
+        let db_path = "test-concurrent-reads";
+        let space = SpaceId(9);
+        let left_key = Key(Bytes::from_static(b"left"));
+        let right_key = Key(Bytes::from_static(b"right"));
+        let value = Bytes::from(vec![b'x'; 128 * 1024]);
+
+        {
+            let backend = SlateDbBackend::open_object_store(db_path, inner.clone())
+                .expect("open concurrent-read seed backend");
+            let mut write = backend
+                .begin_write(WriteOptions::default())
+                .expect("begin concurrent-read seed write");
+            write
+                .put_many(
+                    space,
+                    PutBatch {
+                        entries: vec![
+                            PutEntry {
+                                key: left_key.clone(),
+                                value: StoredValue {
+                                    bytes: value.clone(),
+                                },
+                            },
+                            PutEntry {
+                                key: right_key.clone(),
+                                value: StoredValue {
+                                    bytes: value.clone(),
+                                },
+                            },
+                        ],
+                    },
+                )
+                .expect("stage concurrent-read seed values");
+            write.commit().expect("commit concurrent-read seed values");
+        }
+
+        let store = Arc::new(BlockingStore::new(inner));
+        let backend = SlateDbBackend::open_object_store(db_path, store.clone())
+            .expect("reopen concurrent-read backend");
+        let left_read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin left read");
+        let right_read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin right read");
+        let blocked_reads = store.block_sst_reads();
+
+        let left = std::thread::spawn(move || {
+            get_many(&left_read, space, &[left_key], GetOptions::default())
+        });
+        blocked_reads.wait_for_entries(1, "first SST read");
+        let right = std::thread::spawn(move || {
+            get_many(&right_read, space, &[right_key], GetOptions::default())
+        });
+        blocked_reads.wait_for_entries(2, "second concurrent SST read");
+        drop(blocked_reads);
+
+        assert_eq!(
+            left.join()
+                .expect("join left read")
+                .expect("read left value")
+                .values,
+            vec![Some(ProjectedValue::FullValue(value.clone()))]
+        );
+        assert_eq!(
+            right
+                .join()
+                .expect("join right read")
+                .expect("read right value")
+                .values,
+            vec![Some(ProjectedValue::FullValue(value))]
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockingStore {
+        inner: Arc<InMemory>,
+        next_write: Arc<AtomicBool>,
+        writes: Arc<OperationBlock>,
+        block_reads: Arc<AtomicBool>,
+        reads: Arc<OperationBlock>,
+    }
+
+    impl BlockingStore {
+        fn new(inner: Arc<InMemory>) -> Self {
+            Self {
+                inner,
+                next_write: Arc::new(AtomicBool::new(false)),
+                writes: Arc::new(OperationBlock::default()),
+                block_reads: Arc::new(AtomicBool::new(false)),
+                reads: Arc::new(OperationBlock::default()),
+            }
+        }
+
+        fn block_next_write(&self) -> OperationBlockGuard {
+            OperationBlockGuard::arm(Arc::clone(&self.next_write), Arc::clone(&self.writes))
+        }
+
+        fn block_sst_reads(&self) -> OperationBlockGuard {
+            OperationBlockGuard::arm(Arc::clone(&self.block_reads), Arc::clone(&self.reads))
+        }
+
+        fn maybe_block_write(&self) {
+            if self.next_write.swap(false, Ordering::AcqRel) {
+                self.writes.enter();
+            }
+        }
+
+        fn maybe_block_read(&self, location: &ObjectPath) {
+            if self.block_reads.load(Ordering::Acquire)
+                && location
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"))
+            {
+                self.reads.enter();
+            }
+        }
+    }
+
+    impl std::fmt::Display for BlockingStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("BlockingStore")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct OperationBlock {
+        state: Mutex<OperationBlockState>,
+        available: Condvar,
+    }
+
+    #[derive(Debug, Default)]
+    struct OperationBlockState {
+        entries: usize,
+        released: bool,
+    }
+
+    impl OperationBlock {
+        fn reset(&self) {
+            let mut state = self.state.lock().expect("lock operation block");
+            state.entries = 0;
+            state.released = false;
+        }
+
+        fn enter(&self) {
+            let mut state = self.state.lock().expect("lock operation block");
+            state.entries += 1;
+            self.available.notify_all();
+            while !state.released {
+                state = self
+                    .available
+                    .wait(state)
+                    .expect("wait for operation release");
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("lock operation block");
+            state.released = true;
+            self.available.notify_all();
+        }
+    }
+
+    #[derive(Debug)]
+    struct OperationBlockGuard {
+        enabled: Arc<AtomicBool>,
+        block: Arc<OperationBlock>,
+    }
+
+    impl OperationBlockGuard {
+        fn arm(enabled: Arc<AtomicBool>, block: Arc<OperationBlock>) -> Self {
+            block.reset();
+            enabled.store(true, Ordering::Release);
+            Self { enabled, block }
+        }
+
+        fn wait_for_entries(&self, expected: usize, description: &str) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut state = self.block.state.lock().expect("lock operation block");
+            while state.entries < expected {
+                let now = Instant::now();
+                assert!(now < deadline, "timed out waiting for {description}");
+                let (next_state, _) = self
+                    .block
+                    .available
+                    .wait_timeout(state, deadline - now)
+                    .expect("wait for blocked operation");
+                state = next_state;
+            }
+        }
+    }
+
+    impl Drop for OperationBlockGuard {
+        fn drop(&mut self) {
+            self.enabled.store(false, Ordering::Release);
+            self.block.release();
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BlockingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.maybe_block_write();
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: ObjectStoreGetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.maybe_block_read(location);
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjectPath,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
+            self.maybe_block_read(location);
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
     }
 }
