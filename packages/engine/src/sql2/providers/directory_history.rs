@@ -23,8 +23,8 @@ use crate::sql2::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryRoute,
-    HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
+    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection,
+    HistoryRoute, HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
     parse_history_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
@@ -101,6 +101,8 @@ where
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema, projection);
         let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
@@ -110,11 +112,17 @@ where
                     schema,
                     route,
                     limit,
+                    metadata_projection,
                 ),
-                |(commit_graph, query_source, schema, route, limit)| async move {
-                    let mut rows = load_directory_history_rows(commit_graph, query_source, &route)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                |(commit_graph, query_source, schema, route, limit, metadata_projection)| async move {
+                    let mut rows = load_directory_history_rows(
+                        commit_graph,
+                        query_source,
+                        &route,
+                        metadata_projection,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
@@ -186,6 +194,7 @@ async fn load_directory_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     route: &HistoryRoute,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -200,6 +209,7 @@ where
         query_source.json_reader.clone(),
         &event_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        metadata_projection,
     )
     .await?;
     let context_route = route.starts_only();
@@ -212,6 +222,7 @@ where
         query_source.json_reader,
         &context_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        metadata_projection,
     )
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;

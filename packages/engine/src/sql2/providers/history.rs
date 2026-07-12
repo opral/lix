@@ -16,8 +16,8 @@ use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{
-    HistoryColumnStyle, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-    parse_history_filter,
+    HistoryColumnStyle, HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor,
+    load_history_entries, parse_history_filter,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
@@ -89,6 +89,8 @@ where
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&lix_state_history_schema(), projection);
         let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Bare);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Bare);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
@@ -97,14 +99,20 @@ where
                     self.query_source.clone(),
                     route,
                     schema,
+                    metadata_projection,
                 ),
-                move |(commit_graph, query_source, route, schema)| async move {
+                move |(commit_graph, query_source, route, schema, metadata_projection)| async move {
                     let rows = if route.is_contradictory() {
                         Vec::new()
                     } else {
-                        load_state_history_rows(commit_graph, query_source, &route)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
+                        load_state_history_rows(
+                            commit_graph,
+                            query_source,
+                            &route,
+                            metadata_projection,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
                     };
                     let rows = if let Some(limit) = limit {
                         rows.into_iter().take(limit).collect::<Vec<_>>()
@@ -210,6 +218,7 @@ async fn load_state_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     route: &HistoryRoute,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<StateHistorySqlRow>, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -223,6 +232,7 @@ where
         query_source.json_reader,
         route,
         Vec::new(),
+        metadata_projection,
     )
     .await?;
     let mut rows = entries

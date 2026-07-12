@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, Operator};
@@ -165,6 +166,39 @@ pub(crate) enum HistoryColumnStyle {
     Prefixed,
 }
 
+/// Commit metadata that a history scan must materialize for its projected
+/// columns and residual filters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HistoryMetadataProjection {
+    commit_created_at: bool,
+}
+
+impl HistoryMetadataProjection {
+    pub(crate) fn from_scan(
+        projected_schema: &SchemaRef,
+        filters: &[Expr],
+        column_style: HistoryColumnStyle,
+    ) -> Self {
+        let column_name = match column_style {
+            HistoryColumnStyle::Bare => "commit_created_at",
+            HistoryColumnStyle::Prefixed => HISTORY_COL_COMMIT_CREATED_AT,
+        };
+        let commit_created_at = projected_schema.field_with_name(column_name).is_ok()
+            || filters.iter().any(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .any(|column| column.name == column_name)
+            });
+        Self { commit_created_at }
+    }
+
+    #[cfg(test)]
+    fn commit_created_at(self) -> bool {
+        self.commit_created_at
+    }
+}
+
 /// Shaped history views expose delete events as tombstone rows.
 ///
 /// If the current event is the descriptor tombstone itself, the provider must
@@ -213,6 +247,7 @@ pub(crate) async fn load_history_entries<S>(
     mut json_reader: SqlJsonReader<S>,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<HistoryEntry>, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -245,7 +280,11 @@ where
             let entries = guard
                 .change_history_from_commit(&start_commit_id, &request)
                 .await?;
-            let reachable_commits = guard.reachable_commits(&start_commit_id).await?;
+            let reachable_commits = if metadata_projection.commit_created_at {
+                guard.reachable_commits(&start_commit_id).await?
+            } else {
+                Vec::new()
+            };
             (entries, reachable_commits)
         };
         let commit_created_at_by_id = reachable_commits
@@ -591,10 +630,31 @@ fn scalar_i64_literal(expr: &Expr) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
+    use tokio::sync::Mutex;
 
-    use super::{HistoryColumnStyle, HistoryRoute, parse_history_filter};
+    use crate::LixError;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::commit_graph::{
+        CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
+        CommitGraphCommit, CommitGraphReader, ReachableCommitGraphCommit,
+    };
+    use crate::entity_pk::EntityPk;
+    use crate::json_store::{JsonSlot, JsonStoreContext};
+    use crate::storage::{
+        InMemoryStorageBackend, InMemoryStorageRead, SharedStorageRead, StorageContext,
+        StorageReadOptions,
+    };
+
+    use super::{
+        HistoryColumnStyle, HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor,
+        load_history_entries, parse_history_filter,
+    };
 
     #[test]
     fn route_extraction_keeps_supported_terms_from_mixed_and_filter() {
@@ -636,6 +696,190 @@ mod tests {
             route.start_commit_ids.is_empty(),
             "partial OR pushdown would change SQL semantics"
         );
+    }
+
+    #[test]
+    fn commit_metadata_projection_tracks_projection_and_filters() {
+        let unrelated_schema = Arc::new(Schema::new(vec![Field::new(
+            "depth",
+            DataType::Int64,
+            false,
+        )]));
+        assert!(
+            !HistoryMetadataProjection::from_scan(
+                &unrelated_schema,
+                &[],
+                HistoryColumnStyle::Bare,
+            )
+            .commit_created_at()
+        );
+
+        let projected_schema = Arc::new(Schema::new(vec![Field::new(
+            "lixcol_commit_created_at",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(
+            HistoryMetadataProjection::from_scan(
+                &projected_schema,
+                &[],
+                HistoryColumnStyle::Prefixed,
+            )
+            .commit_created_at()
+        );
+
+        let residual_filter = eq(col("commit_created_at"), str_lit("2026-07-12T00:00:00Z"));
+        assert!(
+            HistoryMetadataProjection::from_scan(
+                &unrelated_schema,
+                &[residual_filter],
+                HistoryColumnStyle::Bare,
+            )
+            .commit_created_at()
+        );
+    }
+
+    #[tokio::test]
+    async fn history_loader_skips_unprojected_commit_metadata_walk() {
+        let reachable_calls = Arc::new(AtomicUsize::new(0));
+        let start_commit_id = CommitId::for_test_label("start");
+        let rows = load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "test_history",
+                start_commit_column: "start_commit_id",
+            },
+            test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
+            empty_json_reader().await,
+            &HistoryRoute {
+                start_commit_ids: vec![start_commit_id.to_string()],
+                ..HistoryRoute::default()
+            },
+            vec!["message".to_string()],
+            HistoryMetadataProjection::default(),
+        )
+        .await
+        .expect("history load should succeed without commit metadata");
+
+        assert_eq!(reachable_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_loader_preserves_projected_commit_timestamp() {
+        let reachable_calls = Arc::new(AtomicUsize::new(0));
+        let start_commit_id = CommitId::for_test_label("start");
+        let metadata_schema = Arc::new(Schema::new(vec![Field::new(
+            "commit_created_at",
+            DataType::Utf8,
+            false,
+        )]));
+        let rows = load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "test_history",
+                start_commit_column: "start_commit_id",
+            },
+            test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
+            empty_json_reader().await,
+            &HistoryRoute {
+                start_commit_ids: vec![start_commit_id.to_string()],
+                ..HistoryRoute::default()
+            },
+            vec!["message".to_string()],
+            HistoryMetadataProjection::from_scan(&metadata_schema, &[], HistoryColumnStyle::Bare),
+        )
+        .await
+        .expect("history load should enrich commit metadata");
+
+        assert_eq!(reachable_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_created_at, commit_timestamp().to_string());
+    }
+
+    struct CountingCommitGraphReader {
+        reachable_calls: Arc<AtomicUsize>,
+        start_commit_id: CommitId,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitGraphReader for CountingCommitGraphReader {
+        async fn load_commit(
+            &mut self,
+            _commit_id: &CommitId,
+        ) -> Result<Option<CommitGraphCommit>, LixError> {
+            Ok(None)
+        }
+
+        async fn reachable_commits(
+            &mut self,
+            _head_commit_id: &CommitId,
+        ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+            self.reachable_calls.fetch_add(1, Ordering::SeqCst);
+            let change = test_change("commit-change", commit_timestamp());
+            Ok(vec![ReachableCommitGraphCommit {
+                commit: CommitGraphCommit {
+                    canonical_change: change.clone(),
+                    change,
+                    commit_id: self.start_commit_id,
+                    change_ids: vec![ChangeId::for_test_label("entity-change")],
+                    author_account_ids: Vec::new(),
+                    parent_commit_ids: Vec::new(),
+                },
+                depth: 0,
+            }])
+        }
+
+        async fn change_history_from_commit(
+            &mut self,
+            _start_commit_id: &CommitId,
+            _request: &CommitGraphChangeHistoryRequest,
+        ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
+            Ok(vec![CommitGraphChangeHistoryEntry {
+                change: test_change("entity-change", event_timestamp()),
+                observed_commit_id: self.start_commit_id,
+                start_commit_id: self.start_commit_id,
+                depth: 0,
+            }])
+        }
+    }
+
+    fn test_commit_graph(
+        reachable_calls: Arc<AtomicUsize>,
+        start_commit_id: CommitId,
+    ) -> Arc<Mutex<Box<dyn CommitGraphReader>>> {
+        Arc::new(Mutex::new(Box::new(CountingCommitGraphReader {
+            reachable_calls,
+            start_commit_id,
+        })))
+    }
+
+    fn test_change(label: &str, created_at: crate::common::LixTimestamp) -> CommitGraphChange {
+        CommitGraphChange {
+            id: ChangeId::for_test_label(label),
+            entity_pk: EntityPk::single("entity-1"),
+            schema_key: "message".to_string(),
+            file_id: None,
+            snapshot: JsonSlot::None,
+            metadata: JsonSlot::None,
+            created_at,
+            origin_key: None,
+        }
+    }
+
+    fn event_timestamp() -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("event timestamp", "2026-07-11T00:00:00Z")
+    }
+
+    fn commit_timestamp() -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("commit timestamp", "2026-07-12T00:00:00Z")
+    }
+
+    async fn empty_json_reader()
+    -> crate::sql2::SqlJsonReader<SharedStorageRead<InMemoryStorageRead>> {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read_scope = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        JsonStoreContext::new().reader(SharedStorageRead::new(read_scope))
     }
 
     fn and(left: Expr, right: Expr) -> Expr {
