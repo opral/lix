@@ -1,7 +1,7 @@
 use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -10,6 +10,10 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
 use lix_backends::{SlateDbBackend, SlateDbCacheOptions, SlateDbObjectStoreOptions};
+use lix_engine::backend::{
+    Backend, BackendWrite, GetOptions as BackendGetOptions, Key, ProjectedValue, PutBatch,
+    PutEntry, ReadOptions, SpaceId, StoredValue, WriteOptions, get_many,
+};
 use lix_engine::{Engine, SessionContext, Value};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -28,7 +32,11 @@ const UPLOAD_BATCH_SIZE: usize = 10;
 const BENCH_DISK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const BENCH_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const BENCH_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_UPLOAD_REMOTE_WRITE_OPS: u64 = 8;
+const FRESH_ENGINE_DELAYS_MS: &[u64] = &[0, 25];
+const CONCURRENCY_DELAY_MS: u64 = 10;
+const CONCURRENCY_REQUESTS: usize = 4;
+const CONCURRENCY_VALUE_BYTES: usize = 16 * 1024;
+const CONCURRENCY_SPACE: SpaceId = SpaceId(0x00ff_0001);
 
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -37,7 +45,7 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("create tokio runtime for slatedb_file_api benchmarks");
-    let mut group = c.benchmark_group("slatedb_file_api");
+    let mut group = c.benchmark_group("slatedb_file_api_warm_cache");
     group.sample_size(10);
 
     for &delay_ms in DELAYS_MS {
@@ -45,62 +53,75 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
         let delay_label = format!("{delay_ms}ms");
 
         group.bench_with_input(
-            BenchmarkId::new("upload_overwrite_file", &delay_label),
+            BenchmarkId::new("upload_overwrite_file_after_preload", &delay_label),
             &delay,
             |b, &delay| {
                 b.iter_custom(|iterations| {
                     let fixture = runtime.block_on(UploadBenchFixture::seeded(delay));
+                    black_box(runtime.block_on(fixture.upload_overwrite_file()));
                     measure_iterations(iterations, || {
-                        fixture.object_store.reset_counts();
-                        let result = runtime.block_on(fixture.upload_overwrite_file());
-                        let counts = fixture.object_store.counts();
-                        assert_eq!(counts.reads, 0, "cached upload issued remote reads");
-                        assert!(
-                            counts.writes <= MAX_UPLOAD_REMOTE_WRITE_OPS,
-                            "cached upload issued {} remote writes",
-                            counts.writes
-                        );
-                        black_box(counts);
-                        result
+                        runtime.block_on(fixture.upload_overwrite_file())
                     })
                 });
             },
         );
 
         group.bench_with_input(
-            BenchmarkId::new("list_root_directory", &delay_label),
+            BenchmarkId::new("list_root_directory_after_preload", &delay_label),
             &delay,
             |b, &delay| {
                 b.iter_custom(|iterations| {
                     let fixture = runtime.block_on(ReadBenchFixture::seeded(delay));
+                    black_box(runtime.block_on(fixture.list_root_directory()));
                     measure_iterations(iterations, || {
-                        fixture.object_store.reset_counts();
-                        let result = runtime.block_on(fixture.list_root_directory());
-                        let counts = fixture.object_store.counts();
-                        assert_eq!(counts.reads, 0, "cached directory list issued remote reads");
-                        assert_eq!(counts.writes, 0, "directory list issued remote writes");
-                        black_box(counts);
-                        result
+                        runtime.block_on(fixture.list_root_directory())
                     })
                 });
             },
         );
 
         group.bench_with_input(
-            BenchmarkId::new("download_file", delay_label),
+            BenchmarkId::new("download_file_after_preload", delay_label),
             &delay,
             |b, &delay| {
                 b.iter_custom(|iterations| {
                     let fixture = runtime.block_on(ReadBenchFixture::seeded(delay));
-                    measure_iterations(iterations, || {
-                        fixture.object_store.reset_counts();
-                        let result = runtime.block_on(fixture.download_file());
-                        let counts = fixture.object_store.counts();
-                        assert_eq!(counts.reads, 0, "cached download issued remote reads");
-                        assert_eq!(counts.writes, 0, "download issued remote writes");
-                        black_box(counts);
-                        result
-                    })
+                    black_box(runtime.block_on(fixture.download_file()));
+                    measure_iterations(iterations, || runtime.block_on(fixture.download_file()))
+                });
+            },
+        );
+    }
+
+    group.finish();
+
+    fresh_engine_select_benches(c, &runtime);
+    backend_concurrency_benches(c);
+}
+
+fn fresh_engine_select_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
+    let mut group = c.benchmark_group("slatedb_file_api_fresh_engine_select");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &delay_ms in FRESH_ENGINE_DELAYS_MS {
+        let delay = Duration::from_millis(delay_ms);
+
+        group.bench_with_input(
+            BenchmarkId::new("download_file", format!("{delay_ms}ms")),
+            &delay,
+            |b, &delay| {
+                b.iter_custom(|iterations| {
+                    let fixture = runtime.block_on(FreshEngineSelectBenchFixture::seeded(delay));
+                    // Constructing the Engine and session can itself fetch
+                    // repository state. Prepare each fresh session outside the
+                    // manual timer so this measures only its first SELECT.
+                    measure_prepared_iterations(
+                        iterations,
+                        || runtime.block_on(fixture.open_session()),
+                        |session| runtime.block_on(download_file(session, &fixture.file_id)),
+                    )
                 });
             },
         );
@@ -109,12 +130,61 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn backend_concurrency_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("slatedb_backend_concurrency");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    group.bench_function("one_point_read", |b| {
+        b.iter_custom(|iterations| {
+            let fixture =
+                BackendConcurrencyFixture::seeded(Duration::from_millis(CONCURRENCY_DELAY_MS));
+            measure_iterations(iterations, || fixture.read_sequential(1))
+        });
+    });
+
+    group.bench_function("four_sequential_point_reads", |b| {
+        b.iter_custom(|iterations| {
+            let fixture =
+                BackendConcurrencyFixture::seeded(Duration::from_millis(CONCURRENCY_DELAY_MS));
+            measure_iterations(iterations, || fixture.read_sequential(CONCURRENCY_REQUESTS))
+        });
+    });
+
+    group.bench_function("four_parallel_point_reads", |b| {
+        b.iter_custom(|iterations| {
+            let fixture =
+                BackendConcurrencyFixture::seeded(Duration::from_millis(CONCURRENCY_DELAY_MS));
+            measure_iterations(iterations, || fixture.read_parallel(CONCURRENCY_REQUESTS))
+        });
+    });
+
+    group.finish();
+}
+
 fn measure_iterations<T>(iterations: u64, mut operation: impl FnMut() -> T) -> Duration {
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
-        let start = Instant::now();
+        let started = Instant::now();
         let result = operation();
-        elapsed += start.elapsed();
+        elapsed += started.elapsed();
+        black_box(result);
+    }
+    elapsed
+}
+
+fn measure_prepared_iterations<P, T>(
+    iterations: u64,
+    mut prepare: impl FnMut() -> P,
+    mut operation: impl FnMut(&P) -> T,
+) -> Duration {
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iterations {
+        let prepared = prepare();
+        let started = Instant::now();
+        let result = operation(&prepared);
+        elapsed += started.elapsed();
         black_box(result);
     }
     elapsed
@@ -129,7 +199,7 @@ struct SeededStore {
 }
 
 impl SeededStore {
-    async fn create(delay: Duration) -> Self {
+    async fn create() -> Self {
         let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
         let db_path = format!("slatedb-file-api-bench-{}-{db_id}", std::process::id());
         let seed_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -151,7 +221,7 @@ impl SeededStore {
         let upload_path = file_path(0);
         let file_id = lookup_file_id(&session, &upload_path).await;
         backend.flush().expect("flush seeded file benchmark store");
-        let object_store = Arc::new(DelayedObjectStore::new(seed_object_store, delay));
+        let object_store = Arc::new(DelayedObjectStore::new(seed_object_store, Duration::ZERO));
 
         Self {
             object_store,
@@ -182,9 +252,7 @@ impl SeededStore {
 }
 
 struct UploadBenchFixture {
-    backend: SlateDbBackend,
     session: SessionContext<SlateDbBackend>,
-    object_store: Arc<DelayedObjectStore>,
     _cache_dir: TempDir,
     next_upload_version: AtomicU64,
     upload_path: String,
@@ -192,7 +260,7 @@ struct UploadBenchFixture {
 
 impl UploadBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create(Duration::ZERO).await;
+        let seeded = SeededStore::create().await;
         let cache_dir = tempfile::tempdir().expect("create SlateDB upload cache directory");
         let backend = SlateDbBackend::open_object_store_with_options(
             seeded.db_path.clone(),
@@ -200,7 +268,7 @@ impl UploadBenchFixture {
             cached_object_store_options(&cache_dir),
         )
         .expect("reopen delayed SlateDB backend for upload benchmark");
-        let engine = Engine::new(backend.clone())
+        let engine = Engine::new(backend)
             .await
             .expect("open SlateDB upload benchmark engine");
         let session = engine
@@ -208,12 +276,9 @@ impl UploadBenchFixture {
             .await
             .expect("open SlateDB upload benchmark session");
         seeded.object_store.set_delay(delay);
-        seeded.object_store.reset_counts();
 
         Self {
-            backend,
             session,
-            object_store: seeded.object_store,
             _cache_dir: cache_dir,
             next_upload_version: AtomicU64::new(0),
             upload_path: seeded.upload_path,
@@ -236,30 +301,24 @@ impl UploadBenchFixture {
             )
             .await
             .expect("overwrite benchmark file");
-        self.backend
-            .flush()
-            .expect("flush overwritten benchmark file");
         result.rows_affected()
     }
 }
 
 struct ReadBenchFixture {
     session: SessionContext<SlateDbBackend>,
-    object_store: Arc<DelayedObjectStore>,
     _cache_dir: TempDir,
     file_id: String,
 }
 
 impl ReadBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create(Duration::ZERO).await;
+        let seeded = SeededStore::create().await;
         let (session, cache_dir) = seeded.open_session().await;
         seeded.object_store.set_delay(delay);
-        seeded.object_store.reset_counts();
 
         Self {
             session,
-            object_store: seeded.object_store,
             _cache_dir: cache_dir,
             file_id: seeded.file_id,
         }
@@ -288,23 +347,222 @@ impl ReadBenchFixture {
     }
 
     async fn download_file(&self) -> usize {
-        let result = self
-            .session
-            .execute(
-                "SELECT data FROM lix_file WHERE id = $1",
-                &[Value::Text(self.file_id.clone())],
-            )
-            .await
-            .expect("download benchmark file");
-        let value = result
-            .rows()
-            .first()
-            .and_then(|row| row.values().first())
-            .expect("download query should return one data value");
-        match value {
-            Value::Blob(bytes) => bytes.len(),
-            other => panic!("download query returned non-blob value: {other:?}"),
+        download_file(&self.session, &self.file_id).await
+    }
+}
+
+struct FreshEngineSelectBenchFixture {
+    backend: SlateDbBackend,
+    main_branch_id: String,
+    file_id: String,
+}
+
+impl FreshEngineSelectBenchFixture {
+    async fn seeded(delay: Duration) -> Self {
+        let seeded = SeededStore::create().await;
+        let backend = SlateDbBackend::open_object_store(
+            seeded.db_path.clone(),
+            object_store_handle(&seeded.object_store),
+        )
+        .expect("reopen uncached SlateDB file benchmark backend");
+        seeded.object_store.set_delay(delay);
+
+        Self {
+            backend,
+            main_branch_id: seeded.main_branch_id,
+            file_id: seeded.file_id,
         }
+    }
+
+    async fn open_session(&self) -> SessionContext<SlateDbBackend> {
+        // A fresh Engine owns a fresh immutable-node cache. The benchmark
+        // creates this session before starting its manual request timer.
+        let engine = Engine::new(self.backend.clone())
+            .await
+            .expect("open fresh-engine SlateDB benchmark engine");
+        engine
+            .open_session(self.main_branch_id.clone())
+            .await
+            .expect("open fresh-engine SlateDB benchmark session")
+    }
+}
+
+async fn download_file(session: &SessionContext<SlateDbBackend>, file_id: &str) -> usize {
+    let result = session
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.to_string())],
+        )
+        .await
+        .expect("download benchmark file");
+    let value = result
+        .rows()
+        .first()
+        .and_then(|row| row.values().first())
+        .expect("download query should return one data value");
+    match value {
+        Value::Blob(bytes) => bytes.len(),
+        other => panic!("download query returned non-blob value: {other:?}"),
+    }
+}
+
+struct BackendConcurrencyFixture {
+    readers: BackendReadWorkers,
+}
+
+struct BackendReadRequest {
+    barrier: Arc<Barrier>,
+    result: std::sync::mpsc::Sender<usize>,
+}
+
+struct BackendReadWorkers {
+    commands: Vec<std::sync::mpsc::Sender<BackendReadRequest>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl BackendConcurrencyFixture {
+    fn seeded(delay: Duration) -> Self {
+        let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
+        let db_path = format!("slatedb-concurrency-bench-{}-{db_id}", std::process::id());
+        let seed_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let keys = (0..CONCURRENCY_REQUESTS)
+            .map(|index| Key(Bytes::from(format!("concurrency-key-{index}"))))
+            .collect::<Vec<_>>();
+
+        {
+            let backend =
+                SlateDbBackend::open_object_store(db_path.clone(), Arc::clone(&seed_object_store))
+                    .expect("open SlateDB concurrency seed backend");
+            let mut write = backend
+                .begin_write(WriteOptions::default())
+                .expect("begin SlateDB concurrency seed write");
+            write
+                .put_many(
+                    CONCURRENCY_SPACE,
+                    PutBatch {
+                        entries: keys
+                            .iter()
+                            .cloned()
+                            .map(|key| PutEntry {
+                                key,
+                                value: StoredValue {
+                                    bytes: Bytes::from(vec![0x5a; CONCURRENCY_VALUE_BYTES]),
+                                },
+                            })
+                            .collect(),
+                    },
+                )
+                .expect("stage SlateDB concurrency seed value");
+            write
+                .commit()
+                .expect("commit SlateDB concurrency seed value");
+        }
+
+        let object_store = Arc::new(DelayedObjectStore::new(seed_object_store, Duration::ZERO));
+        let backend =
+            SlateDbBackend::open_object_store(db_path, object_store_handle(&object_store))
+                .expect("reopen SlateDB concurrency benchmark backend");
+        let readers = BackendReadWorkers::new(&backend, &keys);
+        object_store.set_delay(delay);
+
+        Self { readers }
+    }
+
+    fn read_sequential(&self, request_count: usize) -> usize {
+        self.readers.read_sequential(request_count)
+    }
+
+    fn read_parallel(&self, request_count: usize) -> usize {
+        self.readers.read_parallel(request_count)
+    }
+}
+
+impl BackendReadWorkers {
+    fn new(backend: &SlateDbBackend, keys: &[Key]) -> Self {
+        let mut commands = Vec::with_capacity(keys.len());
+        let mut threads = Vec::with_capacity(keys.len());
+        for key in keys {
+            let (command_tx, command_rx) = std::sync::mpsc::channel::<BackendReadRequest>();
+            let backend = backend.clone();
+            let key = key.clone();
+            threads.push(std::thread::spawn(move || {
+                while let Ok(request) = command_rx.recv() {
+                    request.barrier.wait();
+                    let result = read_backend_key(&backend, &key);
+                    let _ = request.result.send(result);
+                }
+            }));
+            commands.push(command_tx);
+        }
+        Self { commands, threads }
+    }
+
+    fn read_sequential(&self, request_count: usize) -> usize {
+        assert!(
+            request_count > 0 && request_count <= self.commands.len(),
+            "benchmark request count must fit the persistent reader pool"
+        );
+        let barrier = Arc::new(Barrier::new(1));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut result = 0;
+        for command in self.commands.iter().take(request_count) {
+            command
+                .send(BackendReadRequest {
+                    barrier: Arc::clone(&barrier),
+                    result: result_tx.clone(),
+                })
+                .expect("dispatch sequential SlateDB point read");
+            result += result_rx
+                .recv()
+                .expect("receive sequential SlateDB point read");
+        }
+        result
+    }
+
+    fn read_parallel(&self, request_count: usize) -> usize {
+        assert!(
+            request_count > 0 && request_count <= self.commands.len(),
+            "benchmark request count must fit the persistent reader pool"
+        );
+        let barrier = Arc::new(Barrier::new(request_count));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        for command in self.commands.iter().take(request_count) {
+            command
+                .send(BackendReadRequest {
+                    barrier: Arc::clone(&barrier),
+                    result: result_tx.clone(),
+                })
+                .expect("dispatch parallel SlateDB point read");
+        }
+        drop(result_tx);
+        result_rx.into_iter().sum()
+    }
+}
+
+impl Drop for BackendReadWorkers {
+    fn drop(&mut self) {
+        self.commands.clear();
+        for thread in self.threads.drain(..) {
+            thread.join().expect("join persistent SlateDB reader");
+        }
+    }
+}
+
+fn read_backend_key(backend: &SlateDbBackend, key: &Key) -> usize {
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .expect("begin SlateDB concurrency read");
+    let result = get_many(
+        &read,
+        CONCURRENCY_SPACE,
+        std::slice::from_ref(key),
+        BackendGetOptions::default(),
+    )
+    .expect("read SlateDB concurrency key");
+    match result.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(value)) => value.len(),
+        Some(ProjectedValue::KeyOnly) => panic!("concurrency read returned key-only value"),
+        None => panic!("concurrency read did not find seeded key"),
     }
 }
 
@@ -399,18 +657,10 @@ fn cached_object_store_options(cache_dir: &TempDir) -> SlateDbObjectStoreOptions
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct ObjectStoreOperationCounts {
-    reads: u64,
-    writes: u64,
-}
-
 #[derive(Clone, Debug)]
 struct DelayedObjectStore {
     inner: Arc<dyn ObjectStore>,
     delay_nanos: Arc<AtomicU64>,
-    read_ops: Arc<AtomicU64>,
-    write_ops: Arc<AtomicU64>,
 }
 
 impl DelayedObjectStore {
@@ -418,8 +668,6 @@ impl DelayedObjectStore {
         Self {
             inner,
             delay_nanos: Arc::new(AtomicU64::new(duration_nanos(delay))),
-            read_ops: Arc::new(AtomicU64::new(0)),
-            write_ops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -430,18 +678,6 @@ impl DelayedObjectStore {
 
     fn delay(&self) -> Duration {
         Duration::from_nanos(self.delay_nanos.load(Ordering::Relaxed))
-    }
-
-    fn reset_counts(&self) {
-        self.read_ops.store(0, Ordering::Relaxed);
-        self.write_ops.store(0, Ordering::Relaxed);
-    }
-
-    fn counts(&self) -> ObjectStoreOperationCounts {
-        ObjectStoreOperationCounts {
-            reads: self.read_ops.load(Ordering::Relaxed),
-            writes: self.write_ops.load(Ordering::Relaxed),
-        }
     }
 }
 
@@ -464,7 +700,6 @@ impl ObjectStore for DelayedObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.put_opts(location, payload, opts).await
     }
@@ -474,13 +709,11 @@ impl ObjectStore for DelayedObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.get_opts(location, options).await
     }
@@ -490,7 +723,6 @@ impl ObjectStore for DelayedObjectStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> ObjectStoreResult<Vec<Bytes>> {
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.get_ranges(location, ranges).await
     }
@@ -501,7 +733,6 @@ impl ObjectStore for DelayedObjectStore {
     ) -> BoxStream<'static, ObjectStoreResult<Path>> {
         let inner = Arc::clone(&self.inner);
         let delay_nanos = Arc::clone(&self.delay_nanos);
-        self.write_ops.fetch_add(1, Ordering::Relaxed);
         stream::once(async move {
             delay_once(current_delay(&delay_nanos)).await;
             inner.delete_stream(locations)
@@ -514,7 +745,6 @@ impl ObjectStore for DelayedObjectStore {
         let inner = Arc::clone(&self.inner);
         let prefix = prefix.cloned();
         let delay_nanos = Arc::clone(&self.delay_nanos);
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
         stream::once(async move {
             delay_once(current_delay(&delay_nanos)).await;
             inner.list(prefix.as_ref())
@@ -532,7 +762,6 @@ impl ObjectStore for DelayedObjectStore {
         let prefix = prefix.cloned();
         let offset = offset.clone();
         let delay_nanos = Arc::clone(&self.delay_nanos);
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
         stream::once(async move {
             delay_once(current_delay(&delay_nanos)).await;
             inner.list_with_offset(prefix.as_ref(), &offset)
@@ -542,7 +771,6 @@ impl ObjectStore for DelayedObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.read_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.list_with_delimiter(prefix).await
     }
@@ -553,7 +781,6 @@ impl ObjectStore for DelayedObjectStore {
         to: &Path,
         options: CopyOptions,
     ) -> ObjectStoreResult<()> {
-        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.copy_opts(from, to, options).await
     }
@@ -564,7 +791,6 @@ impl ObjectStore for DelayedObjectStore {
         to: &Path,
         options: RenameOptions,
     ) -> ObjectStoreResult<()> {
-        self.write_ops.fetch_add(1, Ordering::Relaxed);
         delay_once(self.delay()).await;
         self.inner.rename_opts(from, to, options).await
     }

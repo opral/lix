@@ -227,6 +227,32 @@ fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
     );
 }
 
+#[test]
+fn slatedb_commit_flushes_one_wal_write_immediately() {
+    let object_store = Arc::new(InMemory::new());
+    let counting_store = Arc::new(FaultStore::new(object_store));
+    let backend =
+        SlateDbBackend::open_object_store("slatedb-immediate-wal-flush", counting_store.clone())
+            .expect("open immediate WAL flush backend");
+    counting_store.reset_write_count();
+
+    write_one(
+        &backend,
+        SpaceId(13),
+        Key(Bytes::from_static(b"durable")),
+        b"value",
+    )
+    .expect("commit immediately durable value");
+
+    assert_eq!(counting_store.write_count(), 1);
+    backend.flush().expect("flush already durable backend");
+    assert_eq!(
+        counting_store.write_count(),
+        1,
+        "an explicit flush after commit should not issue another remote write"
+    );
+}
+
 fn write_one(
     backend: &SlateDbBackend,
     space: SpaceId,
@@ -375,6 +401,7 @@ impl BackendFixture for CachedSlateDbBackendFixture {
 struct FaultStore {
     inner: Arc<InMemory>,
     fail_writes: Arc<AtomicBool>,
+    write_ops: Arc<AtomicU64>,
 }
 
 impl FaultStore {
@@ -382,11 +409,20 @@ impl FaultStore {
         Self {
             inner,
             fail_writes: Arc::new(AtomicBool::new(false)),
+            write_ops: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn should_fail_writes(&self) -> bool {
         self.fail_writes.load(Ordering::Relaxed)
+    }
+
+    fn reset_write_count(&self) {
+        self.write_ops.store(0, Ordering::Relaxed);
+    }
+
+    fn write_count(&self) -> u64 {
+        self.write_ops.load(Ordering::Relaxed)
     }
 }
 
@@ -404,6 +440,7 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         if self.should_fail_writes() {
             return Err(fault_error());
         }
@@ -415,6 +452,7 @@ impl ObjectStore for FaultStore {
         location: &Path,
         options: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         if self.should_fail_writes() {
             return Err(fault_error());
         }
@@ -441,6 +479,7 @@ impl ObjectStore for FaultStore {
         &self,
         locations: BoxStream<'static, ObjectStoreResult<Path>>,
     ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         if self.should_fail_writes() {
             return Box::pin(stream::once(async { Err(fault_error()) }));
         }
@@ -469,6 +508,7 @@ impl ObjectStore for FaultStore {
         to: &Path,
         options: CopyOptions,
     ) -> ObjectStoreResult<()> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         if self.should_fail_writes() {
             return Err(fault_error());
         }
@@ -481,6 +521,7 @@ impl ObjectStore for FaultStore {
         to: &Path,
         options: RenameOptions,
     ) -> ObjectStoreResult<()> {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
         if self.should_fail_writes() {
             return Err(fault_error());
         }

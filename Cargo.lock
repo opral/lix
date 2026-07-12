@@ -3127,6 +3127,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "lix_backends"
 version = "0.8.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures-util",
  "lix_engine",
@@ -3176,6 +3177,7 @@ dependencies = [
  "jiff",
  "jsonschema",
  "lix_backends",
+ "lru",
  "musli",
  "object_store 0.14.0",
  "paste",

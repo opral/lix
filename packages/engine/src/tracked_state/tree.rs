@@ -1,9 +1,13 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
+    num::NonZeroUsize,
     ops::Range,
     pin::Pin,
+    sync::{Arc, Mutex},
 };
+
+use lru::LruCache;
 
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::codec::{
@@ -21,6 +25,13 @@ use crate::tracked_state::types::{
     TrackedStateTreeScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
+
+// Nodes are immutable and addressed by their BLAKE3 content hash, so verified
+// bytes are safe to share across tree clones. Nodes larger than the configured
+// maximum chunk size bypass the cache, bounding production payload bytes at
+// about 64 MiB (excluding cache metadata and live Arcs held by callers).
+const TRACKED_STATE_NODE_CACHE_CAPACITY: usize = 4096;
+type TrackedStateNodeCache = LruCache<[u8; TRACKED_STATE_HASH_BYTES], Arc<[u8]>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeOptions {
@@ -51,18 +62,27 @@ impl Default for TrackedStateTreeOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct TrackedStateTree {
     options: TrackedStateTreeOptions,
+    node_cache: Arc<Mutex<TrackedStateNodeCache>>,
 }
 
 impl TrackedStateTree {
     pub(crate) fn new() -> Self {
-        Self {
-            options: TrackedStateTreeOptions::default(),
-        }
+        Self::with_options_inner(TrackedStateTreeOptions::default())
     }
 
     #[cfg(test)]
     pub(crate) fn with_options(options: TrackedStateTreeOptions) -> Self {
-        Self { options }
+        Self::with_options_inner(options)
+    }
+
+    fn with_options_inner(options: TrackedStateTreeOptions) -> Self {
+        Self {
+            options,
+            node_cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(TRACKED_STATE_NODE_CACHE_CAPACITY)
+                    .expect("tracked-state node cache capacity must be non-zero"),
+            ))),
+        }
     }
 
     pub(crate) async fn load_root(
@@ -1657,11 +1677,30 @@ impl TrackedStateTree {
         &self,
         store: &(impl StorageRead + Send + Sync + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
-    ) -> Result<Vec<u8>, LixError> {
+    ) -> Result<Arc<[u8]>, LixError> {
+        let cached = {
+            let mut cache = self
+                .node_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get(hash).cloned()
+        };
+        if let Some(bytes) = cached {
+            return Ok(bytes);
+        }
+
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
             LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
         })?;
+        // Verify once on a durable-store miss before making the bytes reusable.
         storage::verify_chunk_hash(hash, &bytes)?;
+        let bytes: Arc<[u8]> = bytes.into();
+        if bytes.len() <= self.options.max_chunk_bytes {
+            self.node_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .put(*hash, Arc::clone(&bytes));
+        }
         Ok(bytes)
     }
 
@@ -1671,10 +1710,12 @@ impl TrackedStateTree {
         overlay: &storage::TrackedStateChunkOverlay,
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
-        let bytes = overlay.read_chunk(store, hash).await?.ok_or_else(|| {
-            LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
-        })?;
-        storage::verify_chunk_hash(hash, &bytes)?;
+        if let Some(bytes) = overlay.staged_chunk(hash) {
+            // Overlay chunks are not cached until a later durable-store read.
+            storage::debug_verify_chunk_hash(hash, bytes)?;
+            return decode_node(bytes);
+        }
+        let bytes = self.load_node_bytes(store, hash).await?;
         decode_node(&bytes)
     }
 }
@@ -2373,11 +2414,151 @@ fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::backend::{
+        BackendError, BackendRead, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef,
+        ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    };
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
-    use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::tracked_state::codec::encode_value;
+    use crate::storage::{StorageContext, StorageReadScope};
+    use crate::tracked_state::codec::{encode_value, hash_bytes};
+
+    struct CountingChunkRead {
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        bytes: Vec<u8>,
+        backend_reads: Arc<AtomicUsize>,
+        corrupt_first_read: bool,
+    }
+
+    impl BackendRead for CountingChunkRead {
+        fn visit_keys<V>(
+            &self,
+            space: SpaceId,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            assert_eq!(space, storage::TRACKED_STATE_TREE_CHUNK_SPACE.id);
+            let read_index = self.backend_reads.fetch_add(1, Ordering::Relaxed);
+            let bytes = if self.corrupt_first_read && read_index == 0 {
+                b"corrupt tracked-state node".as_slice()
+            } else {
+                self.bytes.as_slice()
+            };
+            for (index, key) in keys.iter().enumerate() {
+                let value =
+                    (key.0.as_ref() == self.hash).then_some(ProjectedValueRef::FullValue(bytes));
+                visitor.visit(index, key, value)?;
+            }
+            Ok(())
+        }
+
+        fn scan<V>(
+            &self,
+            _space: SpaceId,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
+        where
+            V: ScanVisitor + ?Sized,
+        {
+            unreachable!("tracked-state node cache test only performs point reads")
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_node_loads_from_tree_clones_avoid_backend_reads() {
+        let bytes = encode_leaf_node(&[]);
+        let hash = hash_bytes(&bytes);
+        let backend_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageReadScope::new(CountingChunkRead {
+            hash,
+            bytes,
+            backend_reads: Arc::clone(&backend_reads),
+            corrupt_first_read: false,
+        });
+        let tree = TrackedStateTree::new();
+        let cloned_tree = tree.clone();
+
+        assert!(matches!(
+            tree.load_node(&store, &hash)
+                .await
+                .expect("first node load should succeed"),
+            DecodedNode::Leaf(_)
+        ));
+        assert!(matches!(
+            cloned_tree
+                .load_node(&store, &hash)
+                .await
+                .expect("cached node load should succeed"),
+            DecodedNode::Leaf(_)
+        ));
+
+        assert_eq!(backend_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_node_loads_are_not_cached() {
+        let bytes = encode_leaf_node(&[]);
+        assert!(bytes.len() > 1, "test node must have an encoded body");
+        let hash = hash_bytes(&bytes);
+        let backend_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageReadScope::new(CountingChunkRead {
+            hash,
+            bytes: bytes.clone(),
+            backend_reads: Arc::clone(&backend_reads),
+            corrupt_first_read: false,
+        });
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: bytes.len() - 1,
+            min_chunk_bytes: 1,
+            max_chunk_bytes: bytes.len() - 1,
+        });
+
+        tree.load_node(&store, &hash)
+            .await
+            .expect("first oversized node load should succeed");
+        tree.load_node(&store, &hash)
+            .await
+            .expect("second oversized node load should succeed");
+
+        assert_eq!(backend_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_node_miss_does_not_poison_cache() {
+        let bytes = encode_leaf_node(&[]);
+        let hash = hash_bytes(&bytes);
+        let backend_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageReadScope::new(CountingChunkRead {
+            hash,
+            bytes,
+            backend_reads: Arc::clone(&backend_reads),
+            corrupt_first_read: true,
+        });
+        let tree = TrackedStateTree::new();
+
+        let error = tree
+            .load_node(&store, &hash)
+            .await
+            .expect_err("corrupt node load should fail");
+        assert!(error.message.contains("chunk hash mismatch"));
+        tree.load_node(&store, &hash)
+            .await
+            .expect("valid retry should succeed");
+        tree.load_node(&store, &hash)
+            .await
+            .expect("validated node should be cached");
+
+        assert_eq!(backend_reads.load(Ordering::Relaxed), 2);
+    }
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_applied_root() {
