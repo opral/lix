@@ -1556,6 +1556,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
     struct CapturedStageRow {
         entity_pk: String,
         schema_key: String,
@@ -4566,6 +4567,321 @@ mod tests {
             rows[0].metadata.as_deref(),
             Some("{\"source\":\"file-update\"}")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_fast_path_matches_datafusion() {
+        let rows = vec![
+            live_directory_row("dir-docs", "branch-a", None, "docs"),
+            live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
+            live_blob_ref_row("file-readme", "branch-a", b"old"),
+        ];
+        let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows.clone());
+        let (mut datafusion_ctx, datafusion_staged, datafusion_scans) =
+            counting_write_context(rows);
+        let sql = "UPDATE lix_file SET data = X'4142' WHERE id = 'file-readme'";
+
+        let (fast_result, fast_path) =
+            execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
+                .await
+                .expect("file data update should use the bound fast path");
+        let (datafusion_result, datafusion_path) = execute_write_sql_trace(
+            &mut datafusion_ctx,
+            sql,
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("reference file data update should succeed");
+
+        assert_eq!(fast_path, WriteExecutorPath::Fast);
+        assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
+        assert_eq!(fast_result.rows, datafusion_result.rows);
+        assert_eq!(fast_scans.load(Ordering::SeqCst), 2);
+        assert_eq!(datafusion_scans.load(Ordering::SeqCst), 4);
+
+        let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
+            .pending_write_overlay()
+            .expect("fast staged delta should project")
+            .visible_all_semantic_rows();
+        let datafusion_rows = datafusion_staged
+            .lock()
+            .expect("DataFusion writes lock")
+            .deltas[0]
+            .pending_write_overlay()
+            .expect("DataFusion staged delta should project")
+            .visible_all_semantic_rows();
+        assert_eq!(fast_rows, datafusion_rows);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_updates_same_path_in_every_matching_scope() {
+        let root = live_file_row("file-readme", "branch-a", None, "shared.md");
+        let mut scoped = live_file_row("file-readme", "branch-a", None, "shared.md");
+        scoped.file_id = Some("owner-file".to_string());
+        let rows = vec![root, scoped];
+        let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
+        let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);
+        let sql = "UPDATE lix_file SET data = X'4142' WHERE id = 'file-readme'";
+
+        let (fast_result, fast_path) =
+            execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
+                .await
+                .expect("scoped file data update should use the fast path");
+        let (datafusion_result, datafusion_path) = execute_write_sql_trace(
+            &mut datafusion_ctx,
+            sql,
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("reference scoped file data update should succeed");
+
+        assert_eq!(fast_path, WriteExecutorPath::Fast);
+        assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
+        assert_eq!(fast_result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(fast_result.rows, datafusion_result.rows);
+        let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
+            .pending_write_overlay()
+            .expect("fast staged delta should project")
+            .visible_all_semantic_rows();
+        let datafusion_rows = datafusion_staged
+            .lock()
+            .expect("DataFusion writes lock")
+            .deltas[0]
+            .pending_write_overlay()
+            .expect("DataFusion staged delta should project")
+            .visible_all_semantic_rows();
+        assert_eq!(fast_rows, datafusion_rows);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_validates_active_branch() {
+        let make_context = || {
+            let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+            DummySqlWriteExecutionContext {
+                active_branch_id: "missing-branch",
+                blob_reader: Arc::new(DummyBlobReader),
+                live_state: Arc::new(RowsLiveStateReader { rows: Vec::new() }),
+                staged_writes,
+                schema_definitions: vec![],
+            }
+        };
+        let sql = "UPDATE lix_file SET data = X'41' WHERE id = 'file-readme'";
+        let mut fast_ctx = make_context();
+        let mut datafusion_ctx = make_context();
+
+        let fast_error =
+            execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
+                .await
+                .expect_err("fast update must reject a missing active branch");
+        let datafusion_error = execute_write_sql_trace(
+            &mut datafusion_ctx,
+            sql,
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect_err("DataFusion update must reject a missing active branch");
+
+        assert_eq!(fast_error.code, datafusion_error.code);
+        assert_eq!(fast_error.code, LixError::CODE_BRANCH_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_validates_orphan_blob_refs() {
+        let mut malformed = live_blob_ref_row("file-readme", "branch-a", b"old");
+        malformed.snapshot_content = Some("not-json".to_string());
+        let (mut fast_ctx, _, _) = counting_write_context(vec![malformed.clone()]);
+        let (mut datafusion_ctx, _, _) = counting_write_context(vec![malformed]);
+        let sql = "UPDATE lix_file SET data = X'41' WHERE id = 'file-readme'";
+
+        let fast_error =
+            execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
+                .await
+                .expect_err("fast update must validate targeted orphan blob refs");
+        let datafusion_error = execute_write_sql_trace(
+            &mut datafusion_ctx,
+            sql,
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect_err("DataFusion update must validate targeted orphan blob refs");
+
+        assert_eq!(fast_error.code, datafusion_error.code);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_supports_params() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![live_file_row(
+            "file-readme",
+            "branch-a",
+            None,
+            "readme.md",
+        )]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "UPDATE lix_file SET data = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"parameterized".to_vec()),
+                Value::Text("file-readme".to_string()),
+            ],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("parameterized file data update should use the fast path");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let blob_refs = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_refs.len(), 1);
+        let snapshot: JsonValue = serde_json::from_str(
+            blob_refs[0]
+                .snapshot_content
+                .as_deref()
+                .expect("blob ref snapshot"),
+        )
+        .expect("blob ref snapshot JSON");
+        assert_eq!(snapshot["size_bytes"], 13);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_treats_null_id_as_no_match() {
+        let rows = vec![live_file_row("file-readme", "branch-a", None, "readme.md")];
+        let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows);
+        let sql = "UPDATE lix_file SET data = $1 WHERE id = $2";
+        let params = [Value::Blob(b"parameterized".to_vec()), Value::Null];
+
+        let (fast_result, fast_path) =
+            execute_write_sql_trace(&mut fast_ctx, sql, &params, WriteExecutorMode::ForceFast)
+                .await
+                .expect("NULL file id should be a fast no-op");
+        assert_eq!(fast_path, WriteExecutorPath::Fast);
+        assert_eq!(fast_result.rows, vec![vec![Value::Integer(0)]]);
+        assert_eq!(fast_scans.load(Ordering::SeqCst), 0);
+        assert!(
+            fast_staged
+                .lock()
+                .expect("fast writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_tombstones_blob_ref_for_empty_data() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
+            live_file_row("file-readme", "branch-a", None, "readme.md"),
+            live_blob_ref_row("file-readme", "branch-a", b"old"),
+        ]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "UPDATE lix_file SET data = X'' WHERE id = 'file-readme'",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("empty file data update should use the fast path");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let blob_refs = overlay.visible_semantic_rows(true, "lix_binary_blob_ref");
+        assert_eq!(blob_refs.len(), 1);
+        assert!(blob_refs[0].tombstone);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_returns_zero_for_missing_file() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(Vec::new());
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "UPDATE lix_file SET data = X'41' WHERE id = 'missing'",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("missing file update should still use the fast path");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_file_data_update_by_id_preserves_plugin_path_restrictions() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
+            live_directory_row("dir-lix", "branch-a", None, ".lix"),
+            live_directory_row("dir-plugins", "branch-a", Some("dir-lix"), "plugins"),
+            live_directory_row("dir-nested", "branch-a", Some("dir-plugins"), "nested"),
+            live_file_row(
+                "file-plugin",
+                "branch-a",
+                Some("dir-nested"),
+                "plugin_sentinel.lixplugin",
+            ),
+        ]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "UPDATE lix_file SET data = X'41' WHERE id = 'file-plugin'",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("nested plugin archive path should remain invalid");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_file_data_update_fast_path_rejects_broader_shapes() {
+        let (mut ctx, _, _) = counting_write_context(Vec::new());
+        for sql in [
+            "UPDATE lix_file SET data = X'41' WHERE path = '/readme.md'",
+            "UPDATE lix_file SET data = X'41', name = 'renamed.md' WHERE id = 'file-readme'",
+            "UPDATE lix_file SET data = data WHERE id = 'file-readme'",
+            "UPDATE lix_file_by_branch SET data = X'41' WHERE id = 'file-readme' AND lixcol_branch_id = 'branch-a'",
+        ] {
+            let plan = create_write_logical_plan(&mut ctx, sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql} should plan: {error}"));
+            let crate::sql2::exec::SqlLogicalPlan::Write(plan) = plan else {
+                panic!("{sql} should produce a write plan");
+            };
+            assert!(
+                !crate::sql2::exec::bound_public_write::supports_bound_public_write(&plan.plan),
+                "broader shape should fall back: {sql}"
+            );
+        }
     }
 
     #[tokio::test]
