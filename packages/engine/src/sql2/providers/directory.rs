@@ -51,9 +51,7 @@ use crate::filesystem::{
     plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
-};
+use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 use super::spec::{
@@ -116,10 +114,10 @@ pub(super) async fn register_by_branch_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     let functions = write_ctx.functions();
     let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
     register_spec_table(
         session,
         surface_name,
@@ -134,11 +132,11 @@ pub(super) async fn register_active_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     let active_branch_id = write_ctx.active_branch_id();
     let functions = write_ctx.functions();
     let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
     register_spec_table(
         session,
         surface_name,
