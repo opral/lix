@@ -186,9 +186,8 @@ impl SlateDbBackend {
     }
 
     pub fn flush(&self) -> Result<(), BackendError> {
-        self.worker.ensure_usable()?;
         let durability_failed = Arc::clone(&self.worker.inner.durability_failed);
-        self.worker.call(move |db| async move {
+        self.worker.call_with_visibility_lock(move |db| async move {
             db.flush().await.map_err(|error| {
                 durability_failed.store(true, Ordering::Release);
                 slatedb_error(error)
@@ -1069,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_read_waits_for_commit_wal_durability() {
+    fn visibility_operations_wait_for_commit_wal_durability() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let backend = SlateDbBackend::open_object_store("test-commit-visibility", store.clone())
             .expect("open commit visibility backend");
@@ -1101,7 +1100,7 @@ mod tests {
         blocked_write.wait_for_entries(1, "SlateDB WAL write");
 
         let visibility_wait = backend.worker.observe_next_visibility_wait();
-        let read_backend = backend;
+        let read_backend = backend.clone();
         let read_key = key;
         let (read_result_tx, read_result_rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -1124,6 +1123,23 @@ mod tests {
             "begin_read must remain queued until the WAL write is durable"
         );
 
+        let flush_wait = backend.worker.observe_next_visibility_wait();
+        let flush_backend = backend;
+        let (flush_result_tx, flush_result_rx) = mpsc::channel();
+        let flusher = std::thread::spawn(move || {
+            let _ = flush_result_tx.send(flush_backend.flush());
+        });
+        flush_wait
+            .recv_timeout(Duration::from_secs(2))
+            .expect("flush should reach the visibility lock");
+        assert!(
+            matches!(
+                flush_result_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "flush must remain queued until the commit WAL write finishes"
+        );
+
         drop(blocked_write);
         commit
             .join()
@@ -1140,6 +1156,11 @@ mod tests {
             )))]
         );
         reader.join().expect("join visibility reader");
+        flush_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("flush should finish after commit WAL durability")
+            .expect("flush committed database");
+        flusher.join().expect("join queued flusher");
     }
 
     #[test]
