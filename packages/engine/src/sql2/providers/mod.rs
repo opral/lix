@@ -6,6 +6,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
 use crate::LixError;
+use crate::branch::BranchRefReader;
 
 mod branch;
 mod change;
@@ -78,11 +79,14 @@ pub(crate) async fn validate_spec_upsert(
     Ok(())
 }
 
-pub(crate) async fn register_read<C>(session: &SessionContext, ctx: &C) -> Result<(), LixError>
+pub(crate) async fn register_read<C>(
+    session: &SessionContext,
+    ctx: &C,
+    branch_ref: Arc<dyn BranchRefReader>,
+) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let branch_ref = ctx.branch_ref();
     let history_query_source = ctx.history_query_source();
     let changelog_query_source = ctx.changelog_query_source();
     let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
@@ -221,6 +225,7 @@ where
 pub(crate) async fn register_write(
     session: &SessionContext,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
     let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
@@ -232,6 +237,7 @@ pub(crate) async fn register_write(
                     session,
                     &surface.name,
                     write_ctx.clone(),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
@@ -241,12 +247,19 @@ pub(crate) async fn register_write(
                     session,
                     &surface.name,
                     write_ctx.clone(),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
             PublicSurfaceKind::Branch => {
                 replace_registered_table(session, &surface.name)?;
-                branch::register_write_provider(session, &surface.name, write_ctx.clone()).await?;
+                branch::register_write_provider(
+                    session,
+                    &surface.name,
+                    write_ctx.clone(),
+                    Arc::clone(&branch_ref),
+                )
+                .await?;
             }
             PublicSurfaceKind::File => {
                 replace_registered_table(session, &surface.name)?;
@@ -254,6 +267,7 @@ pub(crate) async fn register_write(
                     session,
                     &surface.name,
                     write_ctx.clone(),
+                    Arc::clone(&branch_ref),
                     options.clone(),
                 )
                 .await?;
@@ -264,6 +278,7 @@ pub(crate) async fn register_write(
                     session,
                     &surface.name,
                     write_ctx.clone(),
+                    Arc::clone(&branch_ref),
                     options.clone(),
                 )
                 .await?;
@@ -274,6 +289,7 @@ pub(crate) async fn register_write(
                     session,
                     &surface.name,
                     write_ctx.clone(),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
@@ -283,6 +299,7 @@ pub(crate) async fn register_write(
                     session,
                     &surface.name,
                     write_ctx.clone(),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
@@ -303,7 +320,8 @@ pub(crate) async fn register_write(
             replace_registered_table(session, &surface.name)?;
         }
     }
-    entity::register_entity_write_providers(session, write_ctx.clone(), &catalog).await?;
+    entity::register_entity_write_providers(session, write_ctx.clone(), branch_ref, &catalog)
+        .await?;
     Ok(())
 }
 

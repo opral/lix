@@ -33,9 +33,7 @@ use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValu
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{LixError, NullableKeyFilter, parse_row_metadata_value};
 
-use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
-};
+use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 use crate::sql2::predicate_typecheck::{
@@ -88,9 +86,9 @@ pub(super) async fn register_lix_state_by_branch_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
     register_spec_table(
         session,
         surface_name,
@@ -103,10 +101,10 @@ pub(super) async fn register_lix_state_active_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     let active_branch_id = write_ctx.active_branch_id();
     let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
     register_spec_table(
         session,
         surface_name,
@@ -1137,8 +1135,7 @@ mod tests {
     use crate::functions::FunctionProviderHandle;
     use crate::sql2::dml::InsertExec;
     use crate::sql2::{
-        SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
-        WriteContextLiveStateReader,
+        SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
     };
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
@@ -1324,7 +1321,9 @@ mod tests {
         LixStateSpec::active_branch(
             write_ctx.active_branch_id(),
             Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-            Arc::new(WriteContextBranchRefReader::new(write_ctx.clone())),
+            Arc::new(crate::sql2::WriteContextBranchRefReader::new(
+                write_ctx.clone(),
+            )),
         )
     }
 
@@ -1700,13 +1699,26 @@ mod tests {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
+        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
+            write_ctx.clone(),
+        ));
 
-        register_lix_state_active_write_provider(&session, "lix_state", write_ctx.clone())
-            .await
-            .expect("lix_state provider should register");
-        register_lix_state_by_branch_write_provider(&session, "lix_state_by_branch", write_ctx)
-            .await
-            .expect("lix_state_by_branch provider should register");
+        register_lix_state_active_write_provider(
+            &session,
+            "lix_state",
+            write_ctx.clone(),
+            branch_ref.clone(),
+        )
+        .await
+        .expect("lix_state provider should register");
+        register_lix_state_by_branch_write_provider(
+            &session,
+            "lix_state_by_branch",
+            write_ctx,
+            branch_ref,
+        )
+        .await
+        .expect("lix_state_by_branch provider should register");
 
         let lix_state = session
             .table_provider("lix_state")

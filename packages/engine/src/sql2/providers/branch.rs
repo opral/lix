@@ -23,9 +23,7 @@ use crate::live_state::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
-use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
-};
+use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteRow,
@@ -61,9 +59,9 @@ pub(super) async fn register_write_provider(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-    let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
     register_spec_table(
         session,
         surface_name,
@@ -128,10 +126,12 @@ impl TableSpec for BranchSpec {
         write_ctx: &SqlWriteContext,
         batches: Vec<RecordBatch>,
     ) -> Result<u64> {
-        let default_commit_id = write_ctx
-            .load_branch_head(&write_ctx.active_branch_id())
+        let default_commit_id = self
+            .branch_ref
+            .load_head(&write_ctx.active_branch_id())
             .await
             .map_err(lix_error_to_datafusion_error)?
+            .map(|head| head.commit_id)
             .ok_or_else(|| {
                 DataFusionError::Execution(
                     "INSERT into lix_branch could not resolve active branch head".to_string(),
@@ -280,10 +280,12 @@ impl UpsertSupport for BranchSpec {
         write_ctx: &SqlWriteContext,
         batch: &RecordBatch,
     ) -> Result<StagedUpsert> {
-        let default_commit_id = write_ctx
-            .load_branch_head(&write_ctx.active_branch_id())
+        let default_commit_id = self
+            .branch_ref
+            .load_head(&write_ctx.active_branch_id())
             .await
             .map_err(lix_error_to_datafusion_error)?
+            .map(|head| head.commit_id)
             .ok_or_else(|| {
                 DataFusionError::Execution(
                     "INSERT into lix_branch could not resolve active branch head".to_string(),

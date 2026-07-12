@@ -1,4 +1,5 @@
 mod bind;
+mod branch_ref;
 mod branch_scope;
 mod catalog;
 mod change_materialization;

@@ -29,8 +29,7 @@ use crate::sql2::catalog::{
 use crate::sql2::error::lix_error_to_datafusion_error;
 
 use crate::sql2::{
-    SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextBranchRefReader,
-    WriteContextLiveStateReader,
+    SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
 };
 
 use super::entity_history::register_entity_history_surface;
@@ -105,6 +104,7 @@ where
 pub(crate) async fn register_entity_write_providers(
     ctx: &SessionContext,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
     catalog: &PublicCatalog,
 ) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
@@ -114,7 +114,11 @@ pub(crate) async fn register_entity_write_providers(
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::active_with_write(spec, write_ctx.clone())),
+                    Arc::new(EntitySpec::active_with_write(
+                        spec,
+                        write_ctx.clone(),
+                        Arc::clone(&branch_ref),
+                    )),
                     WriteAccess::write(write_ctx.clone()),
                 )?;
             }
@@ -123,7 +127,11 @@ pub(crate) async fn register_entity_write_providers(
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::by_branch_with_write(spec, write_ctx.clone())),
+                    Arc::new(EntitySpec::by_branch_with_write(
+                        spec,
+                        write_ctx.clone(),
+                        Arc::clone(&branch_ref),
+                    )),
                     WriteAccess::write(write_ctx.clone()),
                 )?;
             }
@@ -179,10 +187,13 @@ impl EntitySpec {
         }
     }
 
-    fn active_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
+    fn active_with_write(
+        spec: Arc<EntitySurfaceSpec>,
+        write_ctx: SqlWriteContext,
+        branch_ref: Arc<dyn BranchRefReader>,
+    ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx));
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx));
         Self::active(spec, live_state, branch_ref, active_branch_id)
     }
 
@@ -201,9 +212,12 @@ impl EntitySpec {
         }
     }
 
-    fn by_branch_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx));
+    fn by_branch_with_write(
+        spec: Arc<EntitySurfaceSpec>,
+        write_ctx: SqlWriteContext,
+        branch_ref: Arc<dyn BranchRefReader>,
+    ) -> Self {
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx));
         Self::by_branch(spec, live_state, branch_ref)
     }
 
@@ -1304,6 +1318,7 @@ mod tests {
             Arc::new(super::EntitySpec::active_with_write(
                 entity_insert_spec_with_primary_key(),
                 write_ctx.clone(),
+                empty_branch_ref(),
             )),
             WriteAccess::write(write_ctx),
         );

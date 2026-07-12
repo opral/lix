@@ -80,8 +80,7 @@ use crate::filesystem::{
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
-    WriteContextLiveStateReader,
+    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
@@ -148,6 +147,7 @@ pub(super) async fn register_by_branch_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
     register_spec_table(
@@ -155,6 +155,7 @@ pub(super) async fn register_by_branch_write_provider(
         surface_name,
         Arc::new(LixFileSpec::by_branch_with_write(
             write_ctx.clone(),
+            branch_ref,
             options,
         )),
         WriteAccess::write(write_ctx),
@@ -165,6 +166,7 @@ pub(super) async fn register_active_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
     register_spec_table(
@@ -172,6 +174,7 @@ pub(super) async fn register_active_write_provider(
         surface_name,
         Arc::new(LixFileSpec::active_branch_with_write(
             write_ctx.clone(),
+            branch_ref,
             options,
         )),
         WriteAccess::write(write_ctx),
@@ -212,12 +215,12 @@ impl LixFileSpec {
 
     fn active_branch_with_write(
         write_ctx: SqlWriteContext,
+        branch_ref: Arc<dyn BranchRefReader>,
         options: SqlWriteSessionOptions,
     ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
         Self {
@@ -251,10 +254,13 @@ impl LixFileSpec {
         }
     }
 
-    fn by_branch_with_write(write_ctx: SqlWriteContext, options: SqlWriteSessionOptions) -> Self {
+    fn by_branch_with_write(
+        write_ctx: SqlWriteContext,
+        branch_ref: Arc<dyn BranchRefReader>,
+        options: SqlWriteSessionOptions,
+    ) -> Self {
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
         Self {
