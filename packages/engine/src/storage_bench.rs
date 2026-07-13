@@ -2,13 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::entity_pk::EntityPk;
 use crate::storage::StorageBackend;
 use crate::storage::{
-    ScanPlan, StorageCoreProjection, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
-    StorageScanOptions, StorageValue, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
+    ScanPlan, StorageCoreProjection, StoragePrefix, StorageProjectedValue, StorageRead,
+    StorageScanOptions, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
 };
-use crate::untracked_state::UntrackedStateRowRef;
 
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -103,7 +101,7 @@ where
 
 fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
     &[
-        crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE,
+        crate::current_state::CURRENT_STATE_BRANCH_ROOT_SPACE,
         crate::json_store::store::JSON_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
@@ -141,98 +139,4 @@ where
             })
             .sum(),
     }
-}
-
-async fn scan_layout_entries<R>(
-    read: &R,
-    space: crate::storage::StorageSpace,
-) -> Vec<crate::storage::StorageReadEntry>
-where
-    R: StorageRead,
-{
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut entries = Vec::new();
-    let mut resume_after = None;
-    loop {
-        let result = plan
-            .collect(
-                read,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    resume_after,
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.value.has_more;
-        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
-        entries.extend(result.value.entries);
-        if !has_more {
-            return entries;
-        }
-        assert!(
-            resume_after.is_some(),
-            "storage scan reported more rows without a resume key"
-        );
-    }
-}
-
-pub fn untracked_state_row_key_value(
-    entity_pk: &str,
-    snapshot_content: &str,
-) -> (StorageKey, StorageValue) {
-    untracked_state_row_key_value_with_payload(entity_pk, snapshot_content, false)
-}
-
-pub fn untracked_state_full_row_key_value(
-    entity_pk: &str,
-    snapshot_content: &str,
-) -> (StorageKey, StorageValue) {
-    untracked_state_row_key_value_with_payload(entity_pk, snapshot_content, true)
-}
-
-fn untracked_state_row_key_value_with_payload(
-    entity_pk: &str,
-    snapshot_content: &str,
-    include_identity_in_value: bool,
-) -> (StorageKey, StorageValue) {
-    let entity_pk = EntityPk::single(entity_pk);
-    let row = UntrackedStateRowRef {
-        entity_pk: &entity_pk,
-        schema_key: "json_pointer",
-        file_id: Some(""),
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
-        created_at: crate::common::LixTimestamp::expect_parse(
-            "created_at",
-            "2026-01-01T00:00:00.000Z",
-        ),
-        updated_at: crate::common::LixTimestamp::expect_parse(
-            "updated_at",
-            "2026-01-01T00:00:00.000Z",
-        ),
-        global: false,
-        branch_id: "bench-branch",
-    };
-    let value = if include_identity_in_value {
-        crate::untracked_state::codec::encode_row_ref(row).expect("encode untracked bench row")
-    } else {
-        crate::untracked_state::codec::encode_payload_ref(row)
-            .expect("encode untracked bench payload")
-    };
-    (
-        StorageKey(Bytes::from(
-            crate::untracked_state::storage::encode_untracked_state_row_key_ref(row.into())
-                .expect("encode untracked bench key"),
-        )),
-        StorageValue {
-            bytes: Bytes::from(value),
-        },
-    )
 }

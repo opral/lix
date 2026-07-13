@@ -97,20 +97,23 @@ async fn scan_committed_constraint_rows(
     entity_pks: Vec<EntityPk>,
     include_tombstones: bool,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let rows = live_state
-        .scan_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: schema_keys.clone(),
-                entity_pks: entity_pks.clone(),
-                branch_ids: vec![domain.branch_id().to_string()],
-                file_ids: domain.file_filters(),
-                untracked: Some(domain.untracked()),
-                include_tombstones,
-                ..Default::default()
-            },
+    let request = LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: schema_keys.clone(),
+            entity_pks: entity_pks.clone(),
+            branch_ids: vec![domain.branch_id().to_string()],
+            file_ids: domain.file_filters(),
+            untracked: Some(domain.untracked()),
+            include_tombstones,
             ..Default::default()
-        })
-        .await?;
+        },
+        ..Default::default()
+    };
+    let rows = if domain.untracked() {
+        live_state.scan_rows(&request).await?
+    } else {
+        live_state.scan_tracked_rows(&request).await?
+    };
     Ok(rows
         .into_iter()
         .filter(|row| {
@@ -823,9 +826,9 @@ async fn validate_committed_insert_identities(
         .collect::<BTreeSet<_>>();
     let mut checks_by_domain_schema =
         BTreeMap::<(Domain, String), Vec<(EntityPk, Option<TransactionWriteOrigin>)>>::new();
-    for (identity, origin) in input.staged_writes.insert_identities() {
+    for (identity, untracked, origin) in input.staged_writes.insert_identities() {
         let pending_identity = DomainRowIdentity::in_domain(
-            identity.domain(),
+            identity.domain(untracked),
             identity.schema_key().to_string(),
             identity.entity_pk().clone(),
         );

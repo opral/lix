@@ -1,5 +1,5 @@
 ---
-description: Lix journals every change. Query lix_change for global per-entity history, lix_state_history for what's reachable from a version, and <schema>_by_version for current per-version state.
+description: Lix retains tracked history and canonical untracked changes. Query lix_change for ledger entries, lix_state_history for what's reachable from a version, and <schema>_by_version for current per-version state.
 ---
 
 # Change History
@@ -8,11 +8,11 @@ Lix gives you three SQL surfaces for history. Pick the one that matches the ques
 
 | Surface | What you ask it |
 | --- | --- |
-| `lix_change` | "What happened to this entity, ever?" Global, immutable journal of every write across every schema and version. |
+| `lix_change` | "Which canonical changes exist?" Tracked history plus the latest compactable untracked change for each current identity. |
 | `lix_state_history` | "What did this version see?" State walked back from a commit, with `depth` for time-travel. |
 | `<schema>_by_version` | "What's in this version right now?" Current rows in each version. Documented in [Versions & Merging](./versions.md). |
 
-Versions don't filter `lix_change` directly; `lix_change` is the raw write log, and versions are pointers in the commit graph. To scope history to a version, use `lix_state_history` with the version's `commit_id`.
+Versions don't filter `lix_change` directly; commit membership lives in the commit graph. Tracked changes are retained by commits. Untracked changes are real change rows too, but a later mutation of the same current identity compacts the superseded untracked change. To scope retained history to a version, use `lix_state_history` with the version's `commit_id`.
 
 ## `lix_change` columns
 

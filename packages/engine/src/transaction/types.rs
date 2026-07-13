@@ -8,7 +8,6 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::untracked_state::MaterializedUntrackedStateRow;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
@@ -388,24 +387,6 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
     }
 }
 
-impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
-    fn from(row: PreparedStateRow) -> Self {
-        let deleted = row.snapshot.is_none();
-        Self {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
-            metadata: row.metadata.map(|metadata| metadata.materialize()),
-            deleted,
-            created_at: row.created_at.to_string(),
-            updated_at: row.updated_at.to_string(),
-            global: row.global,
-            branch_id: row.branch_id,
-        }
-    }
-}
-
 /// Transaction-local commit change refs accumulated while rows are staged.
 ///
 /// Final commit row materialization owns commit ids, parent heads, and commit
@@ -415,6 +396,7 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
 pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_id: CommitId,
     pub(crate) commit_change_id: ChangeId,
+    pub(crate) branch_ref_change_id: ChangeId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) change_ids: BTreeSet<ChangeId>,
     pub(crate) selected_change_refs: Vec<StagedCommitChangeRef>,
@@ -426,6 +408,7 @@ impl Default for StagedCommitChangeRefs {
         Self {
             commit_id: CommitId::default(),
             commit_change_id: ChangeId::default(),
+            branch_ref_change_id: ChangeId::default(),
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
             change_ids: BTreeSet::new(),
             selected_change_refs: Vec::new(),
@@ -449,11 +432,13 @@ impl StagedCommitChangeRefs {
     pub(crate) fn new(
         commit_id: CommitId,
         commit_change_id: ChangeId,
+        branch_ref_change_id: ChangeId,
         created_at: LixTimestamp,
     ) -> Self {
         Self {
             commit_id,
             commit_change_id,
+            branch_ref_change_id,
             created_at,
             change_ids: BTreeSet::new(),
             selected_change_refs: Vec::new(),

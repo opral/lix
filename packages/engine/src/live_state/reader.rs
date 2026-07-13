@@ -16,6 +16,22 @@ pub(crate) trait LiveStateReader: Send + Sync {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
+    /// Scans the immutable tracked head selected by the current branch ref.
+    ///
+    /// Normal SQL reads use [`Self::scan_rows`] and therefore see exactly one
+    /// canonical current row. Validation and schema planning use this explicit
+    /// durability view when a tracked commit must not depend on untracked
+    /// current state. Readers that wrap canonical current scans must override
+    /// this method instead of relying on the fallback below.
+    async fn scan_tracked_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let mut request = request.clone();
+        request.filter.untracked = Some(false);
+        self.scan_rows(&request).await
+    }
+
     async fn scan_file_rows(
         &self,
         request: &LiveStateFileScanRequest,

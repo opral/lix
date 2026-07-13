@@ -554,8 +554,9 @@ where
         runtime_write_access: Option<&SessionWriteAccess>,
     ) -> Result<Option<crate::storage::StorageWriteSetStats>, LixError> {
         let mut writes = StorageWriteSet::new();
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
         runtime_functions
-            .stage_persist_if_needed(&mut writes)
+            .stage_persist_if_needed(&read, &mut writes)
             .await?;
         if writes.is_empty() {
             return Ok(None);

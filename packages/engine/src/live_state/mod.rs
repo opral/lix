@@ -1,5 +1,4 @@
 mod context;
-mod overlay;
 mod reader;
 mod types;
 pub(crate) mod visibility;
@@ -17,5 +16,5 @@ pub(crate) use types::{
 #[allow(unused_imports)]
 pub(crate) use visibility::{
     StagedLiveStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    overlay_scan_file_rows, overlay_scan_rows, resolve_visible_rows,
+    overlay_scan_file_rows, overlay_scan_rows, overlay_scan_tracked_rows, resolve_visible_rows,
 };

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use crate::storage::{StorageRead, StorageWriteSet};
-use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
+use crate::storage::StorageRead;
 
 use super::BranchRefReader;
 use super::refs::BranchRefContext;
@@ -16,9 +15,9 @@ pub(crate) struct BranchContext {
 }
 
 impl BranchContext {
-    pub(crate) fn new(untracked_state: Arc<UntrackedStateContext>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            refs: Arc::new(BranchRefContext::new(untracked_state)),
+            refs: Arc::new(BranchRefContext::new()),
         }
     }
 
@@ -28,13 +27,5 @@ impl BranchContext {
         S: StorageRead,
     {
         self.refs.reader(store)
-    }
-
-    pub(crate) fn stage_canonical_ref_rows(
-        &self,
-        writes: &mut StorageWriteSet,
-        rows: &[UntrackedStateRow],
-    ) -> Result<(), crate::LixError> {
-        self.refs.writer(writes).stage_rows(rows)
     }
 }

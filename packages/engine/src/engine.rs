@@ -5,6 +5,7 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
+use crate::current_state::CurrentStateContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
@@ -17,7 +18,6 @@ use crate::storage::StorageBackend;
 use crate::storage::{SharedStorageRead, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
-use crate::untracked_state::UntrackedStateContext;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
@@ -51,7 +51,7 @@ where
         crate::init::initialize(
             storage,
             &TrackedStateContext::new(),
-            &UntrackedStateContext::new(),
+            &CurrentStateContext::new(),
         )
         .await
     }
@@ -76,14 +76,14 @@ where
         let storage = StorageContext::new(backend);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
-        let untracked_state = Arc::new(UntrackedStateContext::new());
+        let current_state = CurrentStateContext::new();
         let commit_graph = CommitGraphContext::new();
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
-            *untracked_state,
+            current_state,
             commit_graph,
         ));
-        let branch_ctx = Arc::new(BranchContext::new(Arc::clone(&untracked_state)));
+        let branch_ctx = Arc::new(BranchContext::new());
         assert_initialized(storage.clone(), live_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
@@ -228,4 +228,45 @@ where
         "LIX_ERROR_NOT_INITIALIZED",
         "engine backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::storage::{
+        InMemoryStorageBackend, StorageKey, StorageSpace, StorageSpaceId, StorageValue,
+    };
+
+    #[tokio::test]
+    async fn engine_ignores_legacy_untracked_sidecar_bytes() {
+        let backend = InMemoryStorageBackend::new();
+        let receipt = Engine::initialize(backend.clone())
+            .await
+            .expect("engine should initialize");
+        let storage = StorageContext::new(backend.clone());
+        let mut writes = storage.new_write_set();
+        writes.put(
+            StorageSpace::new(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
+            StorageKey(Bytes::from_static(b"malformed-legacy-key")),
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed-legacy-value"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("legacy sidecar bytes should commit");
+
+        let engine = Engine::new(backend)
+            .await
+            .expect("legacy sidecar bytes must not affect engine open");
+        assert_eq!(
+            engine
+                .load_branch_head_commit_id(&receipt.main_branch_id)
+                .await
+                .expect("branch head should load"),
+            Some(receipt.initial_commit_id)
+        );
+    }
 }
