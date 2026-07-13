@@ -9,9 +9,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
-use crate::live_state::{
-    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest,
-};
+use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
 use crate::storage::StorageRead;
 use crate::storage::StorageWriteSet;
@@ -103,7 +101,7 @@ pub(crate) async fn stage_sequence(
     {
         let mut changelog_read = read;
         let mut changelog = ChangelogContext::new().writer(&mut changelog_read, writes);
-        if let Some(previous) = previous.filter(LiveStateIndexRow::untracked) {
+        if let Some(previous) = previous {
             changelog
                 .stage_delete_standalone_changes(&[previous.change_id])
                 .await?;

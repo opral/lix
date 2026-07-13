@@ -541,7 +541,7 @@ async fn seed_visible_schema_rows<B>(
         .expect("global current fixture should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
-        .expect("schema fixture current roots should commit");
+        .expect("schema fixture flat current rows should commit");
 }
 
 fn json_pointer_schema() -> JsonValue {

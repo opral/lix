@@ -236,24 +236,34 @@ mod tests {
 
     use super::*;
     use crate::storage::{
-        InMemoryStorageBackend, StorageKey, StorageSpace, StorageSpaceId, StorageValue,
+        InMemoryStorageBackend, PointReadPlan, StorageGetOptions, StorageKey,
+        StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue,
     };
 
     #[tokio::test]
-    async fn engine_ignores_legacy_untracked_sidecar_bytes() {
+    async fn engine_ignores_predecessor_state_bytes_and_leaves_them_untouched() {
         let backend = InMemoryStorageBackend::new();
         let receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
         let storage = StorageContext::new(backend.clone());
         let mut writes = storage.new_write_set();
-        writes.put(
+        let predecessor_spaces = [
             StorageSpace::new(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
-            StorageKey(Bytes::from_static(b"malformed-legacy-key")),
-            StorageValue {
-                bytes: Bytes::from_static(b"malformed-legacy-value"),
-            },
-        );
+            StorageSpace::new(
+                StorageSpaceId(0x0004_0005),
+                "live_state.index.branch_root.v1",
+            ),
+        ];
+        for space in predecessor_spaces {
+            writes.put(
+                space,
+                StorageKey(Bytes::from_static(b"malformed-legacy-key")),
+                StorageValue {
+                    bytes: Bytes::from_static(b"malformed-legacy-value"),
+                },
+            );
+        }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -268,6 +278,75 @@ mod tests {
                 .await
                 .expect("branch head should load"),
             Some(receipt.initial_commit_id)
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy verification read should open");
+        for space in predecessor_spaces {
+            let value = PointReadPlan::new(
+                space,
+                &[StorageKey(Bytes::from_static(b"malformed-legacy-key"))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("legacy bytes should remain readable")
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+            assert_eq!(
+                value,
+                Some(StorageProjectedValue::FullValue(Bytes::from_static(
+                    b"malformed-legacy-value"
+                )))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn predecessor_only_repository_is_uninitialized_and_untouched() {
+        let backend = InMemoryStorageBackend::new();
+        let storage = StorageContext::new(backend.clone());
+        let predecessor_space = StorageSpace::new(
+            StorageSpaceId(0x0004_0005),
+            "live_state.index.branch_root.v1",
+        );
+        let predecessor_key = StorageKey(Bytes::from_static(b"legacy-current-root"));
+        let predecessor_value = Bytes::from_static(b"legacy-root-bytes");
+        let mut writes = storage.new_write_set();
+        writes.put(
+            predecessor_space,
+            predecessor_key.clone(),
+            StorageValue {
+                bytes: predecessor_value.clone(),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("predecessor bytes should commit");
+
+        let Err(error) = Engine::new(backend).await else {
+            panic!("predecessor-only repository must not open");
+        };
+        assert_eq!(error.code, "LIX_ERROR_NOT_INITIALIZED");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        let value = PointReadPlan::new(predecessor_space, &[predecessor_key])
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("predecessor bytes should remain readable")
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+        assert_eq!(
+            value,
+            Some(StorageProjectedValue::FullValue(predecessor_value))
         );
     }
 }

@@ -30,8 +30,9 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
-/// Live state serves one canonical live-state root per branch. Immutable
-/// tracked roots remain a separate history and validation concern.
+/// Tracked rows are resolved from the branch head's immutable commit root.
+/// Untracked and engine-owned current rows are resolved through a flat mutable
+/// identity-to-change index, then both sources are combined for serving.
 pub(crate) struct LiveStateContext {
     tracked_state: TrackedStateContext,
     live_index: LiveStateIndexContext,
@@ -432,9 +433,6 @@ fn index_scan_request_from_live(
             schema_keys: request.filter.schema_keys.clone(),
             entity_pks: request.filter.entity_pks.clone(),
             file_ids: request.filter.file_ids.clone(),
-            // Tombstones must win global/branch resolution before the caller's
-            // requested visibility is applied.
-            include_tombstones: true,
         },
         projection: request.projection.columns.clone(),
         limit: None,
@@ -479,7 +477,7 @@ async fn all_branch_ref_ids(
 ) -> Result<Vec<String>, LixError> {
     let rows = live_index
         .reader(store)
-        .scan_rows(&LiveStateIndexScanRequest {
+        .scan_index_rows(&LiveStateIndexScanRequest {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             filter: LiveStateIndexFilter {
                 schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
@@ -975,7 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_state_serves_untracked_change_from_current_root() {
+    async fn live_state_serves_untracked_change_from_flat_index() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -983,28 +981,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        {
-            let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
-            {
-                stage_materialized_live_rows(
-                    &read,
-                    &mut writes,
-                    &mut json_writer,
-                    &[tracked_row_with_commit(
-                        "tracked-value",
-                        Some("change-tracked"),
-                        "commit-tracked",
-                    )],
-                )
-                .await
-                .expect("tracked row should stage");
-            }
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("writes should commit");
-        }
+        write_empty_commits_to_store(&storage, &read, &["commit-tracked"]).await;
         write_untracked_rows_to_store(
             &storage,
             &read,
@@ -1051,7 +1028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_row_is_visible_from_current_root() {
+    async fn tracked_row_is_visible_from_commit_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -1320,62 +1297,6 @@ mod tests {
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"main-tracked\"}")
-        );
-    }
-
-    #[tokio::test]
-    async fn load_row_prefers_requested_untracked_over_requested_tracked_and_global_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let live_state = live_state_context();
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        {
-            let rows = [
-                tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
-                tracked_row_at_with_commit(
-                    "branch-a",
-                    "branch-tracked",
-                    Some("change-branch"),
-                    "commit-branch",
-                ),
-            ];
-            let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
-            {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
-                    .await
-                    .expect("tracked rows should stage");
-            }
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("writes should commit");
-        }
-        write_untracked_rows_to_store(
-            &storage,
-            &read,
-            &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch"),
-                untracked_row_at("global", "global-untracked"),
-                untracked_row_at("branch-a", "branch-untracked"),
-            ],
-        )
-        .await;
-
-        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
-            .await
-            .expect("load should succeed")
-            .expect("branch untracked row should be visible");
-
-        assert_eq!(loaded.branch_id, "branch-a");
-        assert!(loaded.untracked);
-        assert_eq!(
-            loaded.snapshot_content.as_deref(),
-            Some("{\"value\":\"branch-untracked\"}")
         );
     }
 

@@ -128,6 +128,44 @@ struct CountingWrite<W> {
     stats: Arc<Mutex<IoStats>>,
 }
 
+#[derive(Clone)]
+struct TempBackend<B> {
+    inner: B,
+    _dir: Arc<TempDir>,
+}
+
+impl<B> TempBackend<B> {
+    fn new(inner: B, dir: TempDir) -> Self {
+        Self {
+            inner,
+            _dir: Arc::new(dir),
+        }
+    }
+}
+
+impl<B> Backend for TempBackend<B>
+where
+    B: Backend,
+{
+    type Read<'a>
+        = B::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = B::Write<'a>
+    where
+        Self: 'a;
+
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts).await
+    }
+
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.inner.begin_write(opts).await
+    }
+}
+
 impl<B> CountingBackend<B> {
     fn new(inner: B) -> (Self, Arc<Mutex<IoStats>>) {
         let stats = Arc::new(Mutex::new(IoStats::default()));
@@ -495,7 +533,11 @@ fn bench_lix_profile(
     group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || profile_storage(profile),
-            |storage| black_box(runtime.block_on(storage.insert_all(rows))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.insert_all(rows))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
@@ -503,10 +545,10 @@ fn bench_lix_profile(
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
             |storage| {
-                black_box(
+                retain_fixture(storage, |storage| {
                     runtime
-                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::FullValue)),
-                )
+                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::FullValue))
+                })
             },
             BatchSize::LargeInput,
         );
@@ -515,10 +557,9 @@ fn bench_lix_profile(
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
             |storage| {
-                black_box(
-                    runtime
-                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly)),
-                )
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly))
+                })
             },
             BatchSize::LargeInput,
         );
@@ -527,11 +568,11 @@ fn bench_lix_profile(
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
             |storage| {
-                black_box(
+                retain_fixture(storage, |storage| {
                     runtime.block_on(
                         storage.select_points(std::slice::from_ref(&rows[rows.len() / 2])),
-                    ),
-                )
+                    )
+                })
             },
             BatchSize::LargeInput,
         );
@@ -539,35 +580,51 @@ fn bench_lix_profile(
     group.bench_function(format!("select_all_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.select_points(rows))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.select_points(rows))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.update_all(rows))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.update_all(rows))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.update_all(&rows[..1]))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.update_all(&rows[..1]))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.delete_all())),
+            |storage| retain_fixture(storage, |storage| runtime.block_on(storage.delete_all())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.delete_one(&rows[rows.len() / 2]))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.delete_one(&rows[rows.len() / 2]))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
@@ -592,8 +649,10 @@ fn bench_session_execute_untracked_insert(
             b.iter_batched(
                 || runtime.block_on(prepare_profile_session_empty(profile)),
                 |session| {
-                    runtime.block_on(session.insert_untracked_json_pointer_rows(&rows));
-                    black_box(rows.len())
+                    retain_fixture(session, |session| {
+                        runtime.block_on(session.insert_untracked_json_pointer_rows(&rows));
+                        rows.len()
+                    })
                 },
                 BatchSize::LargeInput,
             );
@@ -601,6 +660,13 @@ fn bench_session_execute_untracked_insert(
 
         group.finish();
     }
+}
+
+/// Keeps fixture destruction (including recursive TempDir cleanup) outside
+/// Criterion's measured routine interval.
+fn retain_fixture<I, O>(fixture: I, routine: impl FnOnce(&I) -> O) -> (O, I) {
+    let output = routine(&fixture);
+    (output, fixture)
 }
 
 async fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
@@ -797,15 +863,15 @@ fn profile_storage(profile: LixBackendProfile) -> ProfileStorage {
 }
 
 enum ProfileStorage {
-    Sqlite(StorageContext<SqliteBackend>),
-    RocksDb(StorageContext<RocksDbBackend>),
-    Redb(StorageContext<RedbBackend>),
+    Sqlite(StorageContext<TempBackend<SqliteBackend>>),
+    RocksDb(StorageContext<TempBackend<RocksDbBackend>>),
+    Redb(StorageContext<TempBackend<RedbBackend>>),
 }
 
 enum ProfileSession {
-    Sqlite(SessionContext<SqliteBackend>),
-    RocksDb(SessionContext<RocksDbBackend>),
-    Redb(SessionContext<RedbBackend>),
+    Sqlite(SessionContext<TempBackend<SqliteBackend>>),
+    RocksDb(SessionContext<TempBackend<RocksDbBackend>>),
+    Redb(SessionContext<TempBackend<RedbBackend>>),
 }
 
 async fn prepare_profile_session_empty(profile: LixBackendProfile) -> ProfileSession {
@@ -934,22 +1000,25 @@ impl ProfileSession {
     }
 }
 
-fn sqlite_backend() -> SqliteBackend {
+fn sqlite_backend() -> TempBackend<SqliteBackend> {
     let dir = TempDir::new().expect("create sqlite backend tempdir");
-    let path = dir.keep().join("bench.sqlite");
-    SqliteBackend::open(path).expect("open sqlite backend")
+    let path = dir.path().join("bench.sqlite");
+    TempBackend::new(SqliteBackend::open(path).expect("open sqlite backend"), dir)
 }
 
-fn rocksdb_backend() -> RocksDbBackend {
+fn rocksdb_backend() -> TempBackend<RocksDbBackend> {
     let dir = TempDir::new().expect("create rocksdb backend tempdir");
-    let path = dir.keep().join("bench.rocksdb");
-    RocksDbBackend::open(path).expect("open rocksdb backend")
+    let path = dir.path().join("bench.rocksdb");
+    TempBackend::new(
+        RocksDbBackend::open(path).expect("open rocksdb backend"),
+        dir,
+    )
 }
 
-fn redb_backend() -> RedbBackend {
+fn redb_backend() -> TempBackend<RedbBackend> {
     let dir = TempDir::new().expect("create redb backend tempdir");
-    let path = dir.keep().join("bench.redb");
-    RedbBackend::open(path).expect("open redb backend")
+    let path = dir.path().join("bench.redb");
+    TempBackend::new(RedbBackend::open(path).expect("open redb backend"), dir)
 }
 
 fn configure_group(

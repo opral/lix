@@ -29,12 +29,12 @@ use std::collections::{BTreeMap, BTreeSet};
 type RowIndex = usize;
 
 /// Commits prepared transaction rows into the unified change ledger and the
-/// canonical live-state roots.
+/// current live-state indexes.
 ///
 /// Providers decode DataFusion DML into hydrated `PreparedStateRow`s. Every row
 /// stages a canonical changelog fact. Tracked rows additionally become commit
 /// members and update immutable history roots; untracked rows update only the
-/// mutable current root.
+/// mutable flat live-state index.
 pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
     branch_ctx: &BranchContext,
@@ -99,7 +99,7 @@ pub(crate) async fn commit_prepared_writes(
         return Ok(writes);
     }
 
-    let compactable_change_ids = stage_current_roots(
+    let compactable_change_ids = stage_flat_current_rows(
         live_index,
         read,
         &mut writes,
@@ -418,7 +418,7 @@ fn deterministic_sequence_current_row(
     })
 }
 
-async fn stage_current_roots(
+async fn stage_flat_current_rows(
     current: &LiveStateIndexContext,
     read: &(impl StorageRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -508,10 +508,10 @@ async fn stage_current_roots(
                     file_id: row.file_id.clone(),
                 })
                 .collect::<Vec<_>>();
-            let report = writer
+            let superseded = writer
                 .stage_branch_rows_with_known_absent(branch_id, new_deltas, &known_absent)
                 .await?;
-            compactable_change_ids.extend(report.superseded_untracked_change_ids);
+            compactable_change_ids.extend(superseded);
         }
     }
     let new_ids = state_rows
@@ -563,19 +563,15 @@ async fn branch_has_local_untracked_rows<S>(
 where
     S: StorageRead,
 {
-    Ok(reader
-        .scan_rows(&LiveStateIndexScanRequest {
+    Ok(!reader
+        .scan_index_rows(&LiveStateIndexScanRequest {
             branch_id: branch_id.to_string(),
-            filter: LiveStateIndexFilter {
-                include_tombstones: true,
-                ..LiveStateIndexFilter::default()
-            },
+            filter: LiveStateIndexFilter::default(),
             projection: Vec::new(),
-            limit: None,
+            limit: Some(1),
         })
         .await?
-        .into_iter()
-        .any(|row| row.untracked))
+        .is_empty())
 }
 
 fn branch_ref_with_untracked_rows_error(branch_id: &str, deletion: bool) -> LixError {
@@ -1231,7 +1227,6 @@ mod tests {
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert!(loaded.untracked);
         assert_eq!(loaded.change_id, change_id("change-untracked"));
 
         let mut changelog_reader = ChangelogContext::new().reader(
@@ -1547,7 +1542,6 @@ mod tests {
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert!(untracked.untracked);
 
         let sequence_row = live_state
             .reader(

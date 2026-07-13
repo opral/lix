@@ -10,8 +10,7 @@ pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
 pub(crate) use index::{
     LIVE_STATE_INDEX_ROW_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
     LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
-    LiveStateIndexStoreReader, LiveStateIndexWriteReport, LiveStateIndexWriter,
-    MaterializedLiveStateIndexRow,
+    LiveStateIndexStoreReader, LiveStateIndexWriter, MaterializedLiveStateIndexRow,
 };
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;

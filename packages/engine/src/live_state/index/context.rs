@@ -1,12 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
-use crate::changelog::ChangeId;
+use crate::changelog::{ChangeId, ChangeRecordProjection, materialize_change_payloads};
 use crate::storage::{StorageRead, StorageWriteSet};
-use crate::tracked_state::{
-    TrackedRowMaterialization, TrackedStateIndexValue, TrackedStateKey,
-    materialize_rows_from_index_entries,
-};
 
 use super::storage::{
     FlatIdentity, FlatValue, load_value, load_values, scan_values, stage_delete, stage_put,
@@ -72,6 +68,22 @@ where
         materialize_entries(&self.store, entries, &request.projection).await
     }
 
+    pub(crate) async fn scan_index_rows(
+        &self,
+        request: &LiveStateIndexScanRequest,
+    ) -> Result<Vec<LiveStateIndexRow>, LixError> {
+        Ok(scan_values(
+            &self.store,
+            &request.branch_id,
+            &request.filter,
+            request.limit,
+        )
+        .await?
+        .into_iter()
+        .map(|(identity, value)| index_row(identity, value))
+        .collect())
+    }
+
     pub(crate) async fn load_row(
         &self,
         request: &LiveStateIndexRowRequest,
@@ -121,13 +133,6 @@ pub(crate) struct LiveStateIndexWriter<'a, S: ?Sized> {
     staged: BTreeMap<FlatIdentity, Option<FlatValue>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveStateIndexWriteReport {
-    pub(crate) branch_id: String,
-    pub(crate) changed_rows: usize,
-    pub(crate) superseded_untracked_change_ids: Vec<ChangeId>,
-}
-
 impl<S> LiveStateIndexWriter<'_, S>
 where
     S: StorageRead + ?Sized,
@@ -136,7 +141,7 @@ where
         &mut self,
         branch_id: &str,
         deltas: I,
-    ) -> Result<LiveStateIndexWriteReport, LixError>
+    ) -> Result<Vec<ChangeId>, LixError>
     where
         I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
     {
@@ -149,7 +154,7 @@ where
         branch_id: &str,
         deltas: I,
         known_absent: &[LiveStateIndexRowRequest],
-    ) -> Result<LiveStateIndexWriteReport, LixError>
+    ) -> Result<Vec<ChangeId>, LixError>
     where
         I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
     {
@@ -215,11 +220,7 @@ where
             self.staged.insert(identity, Some(value));
         }
 
-        Ok(LiveStateIndexWriteReport {
-            branch_id: branch_id.to_string(),
-            changed_rows: self.staged.len(),
-            superseded_untracked_change_ids: superseded.into_iter().collect(),
-        })
+        Ok(superseded.into_iter().collect())
     }
 }
 
@@ -231,49 +232,61 @@ async fn materialize_entries<S>(
 where
     S: StorageRead,
 {
-    let mut branch_ids = Vec::with_capacity(entries.len());
-    let mut tracked_entries = Vec::with_capacity(entries.len());
-    for (identity, value) in entries {
-        branch_ids.push(identity.branch_id);
-        tracked_entries.push((
-            TrackedStateKey {
+    let materialization = ChangeRecordProjection::from_columns(projection);
+    let mut payloads = materialize_change_payloads(
+        store,
+        entries.iter().map(|(_, value)| value.change_id),
+        materialization,
+        "flat live-state entry",
+    )
+    .await?;
+    entries
+        .into_iter()
+        .map(|(identity, value)| {
+            let payload = payloads.remove(&value.change_id).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "flat live-state entry references ChangeRecord '{}' that was not materialized",
+                        value.change_id
+                    ),
+                )
+            })?;
+            if let Some(change_identity) = payload.identity.as_ref() {
+                validate_change_identity(&identity, value.change_id, change_identity)?;
+            }
+            Ok(MaterializedLiveStateIndexRow {
+                branch_id: identity.branch_id,
                 schema_key: identity.schema_key,
                 file_id: identity.file_id,
                 entity_pk: identity.entity_pk,
-            },
-            TrackedStateIndexValue {
+                snapshot_content: payload.snapshot_content,
+                metadata: payload.metadata,
+                created_at: value.created_at.to_string(),
+                updated_at: value.updated_at.to_string(),
                 change_id: value.change_id,
-                commit_id: crate::changelog::CommitId::new(uuid::Uuid::nil()),
-                deleted: false,
-                created_at: value.created_at,
-                updated_at: value.updated_at,
-            },
-        ));
-    }
-    let rows = materialize_rows_from_index_entries(
-        store,
-        tracked_entries,
-        &TrackedRowMaterialization::from_columns(projection),
-    )
-    .await?;
-    Ok(branch_ids
-        .into_iter()
-        .zip(rows)
-        .map(|(branch_id, row)| MaterializedLiveStateIndexRow {
-            branch_id,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            entity_pk: row.entity_pk,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
-            deleted: false,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            change_id: row.change_id,
-            commit_id: None,
-            untracked: true,
+            })
         })
-        .collect())
+        .collect()
+}
+
+fn validate_change_identity(
+    index_identity: &FlatIdentity,
+    change_id: ChangeId,
+    change_identity: &crate::changelog::MaterializedChangeIdentity,
+) -> Result<(), LixError> {
+    if change_identity.schema_key == index_identity.schema_key
+        && change_identity.entity_pk == index_identity.entity_pk
+        && change_identity.file_id == index_identity.file_id
+    {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!(
+            "flat live-state entry identity does not match referenced ChangeRecord '{change_id}'"
+        ),
+    ))
 }
 
 fn index_row(identity: FlatIdentity, value: FlatValue) -> LiveStateIndexRow {
@@ -283,9 +296,143 @@ fn index_row(identity: FlatIdentity, value: FlatValue) -> LiveStateIndexRow {
         file_id: identity.file_id,
         entity_pk: identity.entity_pk,
         change_id: value.change_id,
-        commit_id: None,
-        deleted: false,
         created_at: value.created_at,
         updated_at: value.updated_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{
+        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
+    };
+
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("test timestamp", value)
+    }
+
+    fn request() -> LiveStateIndexRowRequest {
+        LiveStateIndexRowRequest {
+            branch_id: "branch-a".to_string(),
+            schema_key: "schema".to_string(),
+            entity_pk: crate::entity_pk::EntityPk::single("entity"),
+            file_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_created_at_and_reports_superseded_change() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let identity = FlatIdentity::from_request(&request());
+        let old_change = ChangeId::for_test_label("old");
+        let new_change = ChangeId::for_test_label("new");
+        let mut writes = StorageWriteSet::new();
+        stage_put(
+            &mut writes,
+            &identity,
+            &FlatValue {
+                change_id: old_change,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+            },
+        )
+        .expect("seed should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("seed should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let superseded = LiveStateIndexContext::new()
+            .writer(&read, &mut writes)
+            .stage_branch_rows(
+                "branch-a",
+                [LiveStateIndexDeltaRef {
+                    schema_key: "schema",
+                    file_id: None,
+                    entity_pk: &identity.entity_pk,
+                    change_id: new_change,
+                    commit_id: None,
+                    deleted: false,
+                    created_at: ts("2026-01-02T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                }],
+            )
+            .await
+            .expect("replacement should stage");
+        assert_eq!(superseded, vec![old_change]);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("replacement should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should reopen");
+        let value = load_value(&read, &identity)
+            .await
+            .expect("value should load")
+            .expect("value should exist");
+        assert_eq!(value.change_id, new_change);
+        assert_eq!(value.created_at, ts("2026-01-01T00:00:00Z"));
+        assert_eq!(value.updated_at, ts("2026-01-02T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn missing_change_record_has_flat_index_error() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let identity = FlatIdentity::from_request(&request());
+        let mut writes = StorageWriteSet::new();
+        stage_put(
+            &mut writes,
+            &identity,
+            &FlatValue {
+                change_id: ChangeId::for_test_label("missing"),
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+            },
+        )
+        .expect("row should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("row should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = LiveStateIndexContext::new()
+            .reader(&read)
+            .load_row(&request())
+            .await
+            .expect_err("missing ChangeRecord should fail");
+        assert!(error.message.contains("flat live-state entry"));
+        assert!(error.message.contains("missing from the changelog"));
+    }
+
+    #[test]
+    fn mismatched_change_record_identity_is_rejected() {
+        let identity = FlatIdentity::from_request(&request());
+        let error = validate_change_identity(
+            &identity,
+            ChangeId::for_test_label("wrong-identity"),
+            &crate::changelog::MaterializedChangeIdentity {
+                schema_key: "other-schema".to_string(),
+                entity_pk: identity.entity_pk.clone(),
+                file_id: identity.file_id.clone(),
+            },
+        )
+        .expect_err("mismatched identity should fail");
+
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("identity does not match"));
     }
 }

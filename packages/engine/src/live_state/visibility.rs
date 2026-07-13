@@ -105,10 +105,9 @@ where
 
 /// Overlays staged tracked rows on the immutable tracked head.
 ///
-/// This is deliberately separate from [`overlay_scan_rows`]: canonical current
-/// state may contain an untracked row that shadows the same tracked identity,
-/// but tracked schema planning and validation must still be based on a commit
-/// that is independently valid without that untracked state.
+/// This is deliberately separate from [`overlay_scan_rows`]: tracked schema
+/// planning and validation must ignore unrelated untracked transaction rows
+/// and remain based on an independently valid commit.
 pub(crate) async fn overlay_scan_tracked_rows<S>(
     base: &dyn LiveStateReader,
     staged: &S,

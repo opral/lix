@@ -19,15 +19,15 @@ pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,
 };
-pub(crate) use row_materialization::{
-    TrackedRowMaterialization, materialize_rows_from_index_entries,
-};
+pub(crate) use row_materialization::materialize_rows_from_index_entries;
 pub(crate) use storage::load_root;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE};
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use types::TrackedStateKey;
 pub(crate) use types::{
-    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
-    TrackedStateKey, TrackedStateReadColumns, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateReadColumns,
+    TrackedStateScanRequest,
 };
 #[cfg(feature = "storage-benches")]
 pub mod bench {

@@ -483,6 +483,9 @@ where
         append: &ChangelogAppend,
         append_changes: &HashMap<ChangeId, &ChangeRecord>,
     ) -> Result<(), LixError> {
+        if append.commits.is_empty() {
+            return Ok(());
+        }
         for commit in &append.commits {
             if append_changes.contains_key(&commit.change_id)
                 || self.change_exists(&commit.change_id).await?

@@ -299,3 +299,182 @@ fn matches_filter(identity: &FlatIdentity, filter: &LiveStateIndexFilter) -> boo
                 NullableKeyFilter::Value(value) => identity.file_id.as_ref() == Some(value),
             }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{
+        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
+    };
+
+    fn identity(
+        branch_id: &str,
+        schema_key: &str,
+        parts: &[&str],
+        file_id: Option<&str>,
+    ) -> FlatIdentity {
+        FlatIdentity {
+            branch_id: branch_id.to_string(),
+            schema_key: schema_key.to_string(),
+            entity_pk: EntityPk::tuple(parts.iter().map(|part| (*part).to_string()).collect())
+                .expect("test entity pk"),
+            file_id: file_id.map(str::to_string),
+        }
+    }
+
+    fn value(label: &str, timestamp: &str) -> FlatValue {
+        let timestamp = LixTimestamp::expect_parse("test timestamp", timestamp);
+        FlatValue {
+            change_id: ChangeId::for_test_label(label),
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    }
+
+    #[test]
+    fn key_roundtrips_and_all_structural_prefixes_match() {
+        let identity = identity(
+            "brånch/東京",
+            "schema.ü",
+            &["first", "二番"],
+            Some("file/ß"),
+        );
+        let key = encode_key(&identity).expect("key should encode");
+        assert_eq!(decode_key(&key).expect("key should decode"), identity);
+
+        let prefixes = [
+            storage_codec::encode(
+                "branch prefix",
+                &BranchPrefixRef {
+                    branch_id: &identity.branch_id,
+                },
+            )
+            .expect("branch prefix"),
+            storage_codec::encode(
+                "branch/schema prefix",
+                &BranchSchemaPrefixRef {
+                    branch_id: &identity.branch_id,
+                    schema_key: &identity.schema_key,
+                },
+            )
+            .expect("branch/schema prefix"),
+            storage_codec::encode(
+                "branch/schema/entity prefix",
+                &BranchSchemaEntityPrefixRef {
+                    branch_id: &identity.branch_id,
+                    schema_key: &identity.schema_key,
+                    entity_pk: &identity.entity_pk,
+                },
+            )
+            .expect("branch/schema/entity prefix"),
+            storage_codec::encode(
+                "branch/schema/entity/file prefix",
+                &BranchSchemaEntityFilePrefixRef {
+                    branch_id: &identity.branch_id,
+                    schema_key: &identity.schema_key,
+                    entity_pk: &identity.entity_pk,
+                    file_id: identity.file_id.as_deref(),
+                },
+            )
+            .expect("branch/schema/entity/file prefix"),
+        ];
+        for prefix in prefixes {
+            assert!(key.starts_with(&prefix));
+        }
+    }
+
+    #[tokio::test]
+    async fn scans_isolate_branches_and_nullable_file_filters_then_delete_physically() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let rows = [
+            (
+                identity("branch-a", "schema", &["one"], None),
+                value("a-null", "2026-01-01T00:00:00Z"),
+            ),
+            (
+                identity("branch-a", "schema", &["one"], Some("file-a")),
+                value("a-file", "2026-01-01T00:00:01Z"),
+            ),
+            (
+                identity("branch-a", "other", &["二"], None),
+                value("a-other", "2026-01-01T00:00:02Z"),
+            ),
+            (
+                identity("branch-b", "schema", &["one"], None),
+                value("b-null", "2026-01-01T00:00:03Z"),
+            ),
+        ];
+        let mut writes = StorageWriteSet::new();
+        for (identity, value) in &rows {
+            stage_put(&mut writes, identity, value).expect("row should stage");
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("rows should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+
+        let branch_rows = scan_values(&read, "branch-a", &LiveStateIndexFilter::default(), None)
+            .await
+            .expect("branch scan");
+        assert_eq!(branch_rows.len(), 3);
+        assert!(
+            branch_rows
+                .iter()
+                .all(|(row, _)| row.branch_id == "branch-a")
+        );
+
+        for (filter, expected_file_id) in [
+            (NullableKeyFilter::Null, None),
+            (
+                NullableKeyFilter::Value("file-a".to_string()),
+                Some("file-a"),
+            ),
+        ] {
+            let matches = scan_values(
+                &read,
+                "branch-a",
+                &LiveStateIndexFilter {
+                    schema_keys: vec!["schema".to_string()],
+                    entity_pks: vec![EntityPk::single("one")],
+                    file_ids: vec![filter],
+                },
+                None,
+            )
+            .await
+            .expect("filtered scan");
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].0.file_id.as_deref(), expected_file_id);
+        }
+
+        let any = scan_values(
+            &read,
+            "branch-a",
+            &LiveStateIndexFilter {
+                schema_keys: vec!["schema".to_string()],
+                entity_pks: vec![EntityPk::single("one")],
+                file_ids: vec![NullableKeyFilter::Any],
+            },
+            None,
+        )
+        .await
+        .expect("any-file scan");
+        assert_eq!(any.len(), 2);
+        drop(read);
+
+        let mut writes = StorageWriteSet::new();
+        stage_delete(&mut writes, &rows[0].0).expect("delete should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("delete should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should reopen");
+        assert_eq!(load_value(&read, &rows[0].0).await.expect("load"), None);
+    }
+}

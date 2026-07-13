@@ -3,11 +3,11 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 
-/// One canonical live-state index mutation.
+/// One mutation applied to the mutable flat portion of live state.
 ///
-/// Tracked and untracked rows share the same identity and live-state tree.
-/// A missing `commit_id` means the change is untracked; storage encodes that
-/// case with the reserved nil commit id used by the tracked-state index codec.
+/// Untracked and engine-owned rows are inserted by change id. Tracked rows and
+/// deletions use the same internal command type only to remove an existing flat
+/// entry during promotion or physical deletion.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LiveStateIndexDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
@@ -20,7 +20,7 @@ pub(crate) struct LiveStateIndexDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
-/// One cheap materialized header from a branch's live-state index.
+/// One cheap header from the mutable flat portion of live state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveStateIndexRow {
     pub(crate) branch_id: String,
@@ -28,16 +28,8 @@ pub(crate) struct LiveStateIndexRow {
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: ChangeId,
-    pub(crate) commit_id: Option<CommitId>,
-    pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-}
-
-impl LiveStateIndexRow {
-    pub(crate) fn untracked(&self) -> bool {
-        self.commit_id.is_none()
-    }
 }
 
 /// Fully hydrated canonical live-state index row.
@@ -52,12 +44,9 @@ pub(crate) struct MaterializedLiveStateIndexRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-    pub(crate) deleted: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) change_id: ChangeId,
-    pub(crate) commit_id: Option<CommitId>,
-    pub(crate) untracked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -65,7 +54,6 @@ pub(crate) struct LiveStateIndexFilter {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
-    pub(crate) include_tombstones: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -34,13 +34,13 @@ impl From<MaterializedLiveStateIndexRow> for MaterializedLiveStateRow {
             file_id: row.file_id,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
-            deleted: row.deleted,
+            deleted: false,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global,
             change_id: Some(row.change_id),
-            commit_id: row.commit_id,
-            untracked: row.untracked,
+            commit_id: None,
+            untracked: true,
             branch_id: row.branch_id,
         }
     }
