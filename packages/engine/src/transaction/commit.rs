@@ -6,7 +6,7 @@
 
 use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
-use crate::branch::{BranchContext, BranchRefReader};
+use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader};
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
     CommitId, CommitRecord,
@@ -53,10 +53,10 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     let state_rows = prepared_writes.state_rows;
-    let filesystem_paths_changed = state_rows.iter().any(|row| {
+    let filesystem_view_changed = state_rows.iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
-            "lix_file_descriptor" | "lix_directory_descriptor"
+            "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
         )
     });
     let finalized = finalize_commit_rows(
@@ -146,7 +146,7 @@ pub(crate) async fn commit_prepared_writes(
         branch_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
-    if filesystem_paths_changed {
+    if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
     }
 

@@ -1689,6 +1689,104 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_path_index_invalidates_when_branch_head_moves,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('branch-head-file', '/branch-head.txt', X'68656164')",
+                &[],
+            )
+            .await
+            .expect("file fixture should insert");
+        let current_head = session
+            .execute(
+                &format!(
+                    "SELECT commit_id FROM lix_branch WHERE id = '{}'",
+                    sim.main_branch_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("current branch head should query")
+            .rows()[0]
+            .values()[0]
+            .clone();
+
+        let warm = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/branch-head.txt'",
+                &[],
+            )
+            .await
+            .expect("exact path lookup should warm the filesystem index");
+        assert_rows_eq(
+            warm,
+            vec![vec![Value::Text("branch-head-file".to_string())]],
+        );
+
+        let reset = session
+            .execute(
+                &format!(
+                    "UPDATE lix_branch SET commit_id = '{}' WHERE id = '{}'",
+                    sim.initial_commit_id(),
+                    sim.main_branch_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("branch head should reset to the initial commit");
+        assert_eq!(reset, ExecuteResult::from_rows_affected(1));
+
+        let old_head_lookup = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/branch-head.txt'",
+                &[],
+            )
+            .await
+            .expect("path lookup after branch reset should succeed");
+        assert_eq!(old_head_lookup.len(), 0);
+
+        let current_head = match current_head {
+            Value::Text(commit_id) => commit_id,
+            other => panic!("expected text commit id, got {other:?}"),
+        };
+        let restore = session
+            .execute(
+                &format!(
+                    "UPDATE lix_branch SET commit_id = '{current_head}' WHERE id = '{}'",
+                    sim.main_branch_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("branch head should restore to the file commit");
+        assert_eq!(restore, ExecuteResult::from_rows_affected(1));
+
+        let restored_lookup = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/branch-head.txt'",
+                &[],
+            )
+            .await
+            .expect("path lookup after branch restore should succeed");
+        assert_rows_eq(
+            restored_lookup,
+            vec![vec![Value::Text("branch-head-file".to_string())]],
+        );
+    }
+);
+
+simulation_test!(
     atelier_current_path_range_and_order_workloads,
     |sim| async move {
         let engine = sim.boot_engine().await;
