@@ -16,7 +16,8 @@ use crate::serialize_row_metadata;
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::{
-    MaterializedChange, materialize_changelog_change_record, materialize_commit_graph_change,
+    ChangePayloadProjection, MaterializedChange, materialize_changelog_change_record,
+    materialize_commit_graph_change,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
@@ -74,6 +75,7 @@ where
     ) -> Result<PlannedScan> {
         let pushed_limit = if filters.is_empty() { limit } else { None };
         let schema = projected_schema(&lix_change_schema(), projection);
+        let payload_projection = change_payload_projection(schema.as_ref(), filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
@@ -88,14 +90,22 @@ where
                     for change in canonical_changes {
                         match change {
                             LixChangeRow::Direct(change) => changes.push(
-                                materialize_changelog_change_record(&mut json_reader, change)
-                                    .await
-                                    .map_err(lix_error_to_datafusion_error)?,
+                                materialize_changelog_change_record(
+                                    &mut json_reader,
+                                    change,
+                                    payload_projection,
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?,
                             ),
                             LixChangeRow::DerivedCommit(change) => changes.push(
-                                materialize_commit_graph_change(&mut json_reader, change)
-                                    .await
-                                    .map_err(lix_error_to_datafusion_error)?,
+                                materialize_commit_graph_change(
+                                    &mut json_reader,
+                                    change,
+                                    payload_projection,
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?,
                             ),
                         }
                     }
@@ -105,6 +115,22 @@ where
                 },
             ),
         })
+    }
+}
+
+fn change_payload_projection(schema: &Schema, filters: &[Expr]) -> ChangePayloadProjection {
+    let needs = |column_name: &str| {
+        schema.field_with_name(column_name).is_ok()
+            || filters.iter().any(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .any(|column| column.name.as_str() == column_name)
+            })
+    };
+    ChangePayloadProjection {
+        snapshot_content: needs("snapshot_content"),
+        metadata: needs("metadata"),
     }
 }
 
@@ -242,5 +268,42 @@ fn change_batch_error(error: ColumnTableError) -> DataFusionError {
             DataFusionError::Execution(format!("failed to build lix_change batch: {error}"))
         }
         ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::logical_expr::{Expr, col};
+
+    use super::{change_payload_projection, lix_change_schema};
+
+    #[test]
+    fn identity_projection_skips_json_payloads() {
+        let full_schema = lix_change_schema();
+        let projected = Schema::new(vec![
+            full_schema.field_with_name("id").expect("id").clone(),
+            full_schema
+                .field_with_name("origin_key")
+                .expect("origin_key")
+                .clone(),
+        ]);
+
+        let projection = change_payload_projection(&projected, &[]);
+
+        assert!(!projection.snapshot_content);
+        assert!(!projection.metadata);
+    }
+
+    #[test]
+    fn payload_filter_requires_materialization() {
+        let full_schema = lix_change_schema();
+        let projected = Schema::new(vec![full_schema.field_with_name("id").expect("id").clone()]);
+        let filters = vec![Expr::IsNotNull(Box::new(col("metadata")))];
+
+        let projection = change_payload_projection(&projected, &filters);
+
+        assert!(!projection.snapshot_content);
+        assert!(projection.metadata);
     }
 }
