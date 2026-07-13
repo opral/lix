@@ -23,7 +23,6 @@ pub(crate) mod cel;
 pub mod changelog;
 pub(crate) mod commit_graph;
 mod common;
-pub(crate) mod current_state;
 pub(crate) mod domain;
 pub mod engine;
 pub(crate) mod entity_pk;

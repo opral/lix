@@ -5,11 +5,11 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
-use crate::current_state::CurrentStateContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
+use crate::live_state::index::LiveStateIndexContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
@@ -51,7 +51,7 @@ where
         crate::init::initialize(
             storage,
             &TrackedStateContext::new(),
-            &CurrentStateContext::new(),
+            &LiveStateIndexContext::new(),
         )
         .await
     }
@@ -76,11 +76,11 @@ where
         let storage = StorageContext::new(backend);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
-        let current_state = CurrentStateContext::new();
+        let live_index = LiveStateIndexContext::new();
         let commit_graph = CommitGraphContext::new();
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
-            current_state,
+            live_index,
             commit_graph,
         ));
         let branch_ctx = Arc::new(BranchContext::new());

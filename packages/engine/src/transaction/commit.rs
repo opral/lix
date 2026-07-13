@@ -12,14 +12,14 @@ use crate::changelog::{
     CommitId, CommitRecord,
 };
 use crate::common::LixTimestamp;
-use crate::current_state::{
-    CurrentStateContext, CurrentStateDeltaRef, CurrentStateFilter, CurrentStateRowRequest,
-    CurrentStateScanRequest,
-};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::live_state::index::{
+    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
+    LiveStateIndexScanRequest,
+};
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::staging::PreparedWriteSet;
@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 type RowIndex = usize;
 
 /// Commits prepared transaction rows into the unified change ledger and the
-/// canonical current-state roots.
+/// canonical live-state roots.
 ///
 /// Providers decode DataFusion DML into hydrated `PreparedStateRow`s. Every row
 /// stages a canonical changelog fact. Tracked rows additionally become commit
@@ -406,18 +406,18 @@ async fn compactable_current_change_ids(
     engine_rows: &[EngineCurrentRow],
     commit_rows: &[FinalizedCommitRow],
 ) -> Result<Vec<ChangeId>, LixError> {
-    let current = CurrentStateContext::new();
+    let current = LiveStateIndexContext::new();
     let reader = current.reader(read);
     let mut compact = BTreeSet::new();
     for request in state_rows
         .iter()
-        .map(|row| CurrentStateRowRequest {
+        .map(|row| LiveStateIndexRowRequest {
             branch_id: row.branch_id.clone(),
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
         })
-        .chain(engine_rows.iter().map(|row| CurrentStateRowRequest {
+        .chain(engine_rows.iter().map(|row| LiveStateIndexRowRequest {
             branch_id: row.branch_id.clone(),
             schema_key: row.change.schema_key.clone(),
             entity_pk: row.change.entity_pk.clone(),
@@ -426,7 +426,7 @@ async fn compactable_current_change_ids(
         .chain(commit_rows.iter().flat_map(|row| {
             row.selected_change_refs
                 .iter()
-                .map(|change_ref| CurrentStateRowRequest {
+                .map(|change_ref| LiveStateIndexRowRequest {
                     branch_id: row.branch_id.clone(),
                     schema_key: change_ref.schema_key.clone(),
                     entity_pk: change_ref.entity_pk.clone(),
@@ -458,16 +458,16 @@ async fn stage_current_roots(
 ) -> Result<(), LixError> {
     let mut referenced_roots = BTreeMap::new();
     let mut deleted_branch_roots = BTreeSet::new();
-    let current = CurrentStateContext::new();
-    let current_reader = current.reader(read);
+    let current = LiveStateIndexContext::new();
+    let index_reader = current.reader(read);
     for row in state_rows
         .iter()
         .filter(|row| row.untracked && row.schema_key == crate::branch::BRANCH_REF_SCHEMA_KEY)
     {
         let branch_id = row.entity_pk.as_single_string_owned()?;
         let Some(snapshot) = row.snapshot.as_ref() else {
-            if current_reader.load_branch_root(&branch_id)?.is_some()
-                && branch_has_local_untracked_rows(&current_reader, &branch_id).await?
+            if index_reader.load_branch_root(&branch_id)?.is_some()
+                && branch_has_local_untracked_rows(&index_reader, &branch_id).await?
             {
                 return Err(branch_ref_with_untracked_rows_error(&branch_id, true));
             }
@@ -482,14 +482,14 @@ async fn stage_current_roots(
             continue;
         };
         let existing_commit_id =
-            load_current_branch_ref_commit_id(&current_reader, &branch_id).await?;
+            load_current_branch_ref_commit_id(&index_reader, &branch_id).await?;
         if existing_commit_id.as_deref() == Some(commit_id) {
             // Updating descriptor fields or assigning the current head again
-            // must not disturb branch-local current state.
+            // must not disturb branch-local live state.
             continue;
         }
         if existing_commit_id.is_some()
-            && branch_has_local_untracked_rows(&current_reader, &branch_id).await?
+            && branch_has_local_untracked_rows(&index_reader, &branch_id).await?
         {
             return Err(branch_ref_with_untracked_rows_error(&branch_id, false));
         }
@@ -557,14 +557,14 @@ async fn stage_current_roots(
 }
 
 async fn load_current_branch_ref_commit_id<S>(
-    reader: &crate::current_state::CurrentStateStoreReader<S>,
+    reader: &crate::live_state::index::LiveStateIndexStoreReader<S>,
     branch_id: &str,
 ) -> Result<Option<String>, LixError>
 where
     S: StorageRead + Send + Sync,
 {
     let Some(row) = reader
-        .load_row(&CurrentStateRowRequest {
+        .load_row(&LiveStateIndexRowRequest {
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
             schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
             entity_pk: EntityPk::single(branch_id),
@@ -590,18 +590,18 @@ where
 }
 
 async fn branch_has_local_untracked_rows<S>(
-    reader: &crate::current_state::CurrentStateStoreReader<S>,
+    reader: &crate::live_state::index::LiveStateIndexStoreReader<S>,
     branch_id: &str,
 ) -> Result<bool, LixError>
 where
     S: StorageRead + Send + Sync,
 {
     Ok(reader
-        .scan_rows(&CurrentStateScanRequest {
+        .scan_rows(&LiveStateIndexScanRequest {
             branch_id: branch_id.to_string(),
-            filter: CurrentStateFilter {
+            filter: LiveStateIndexFilter {
                 include_tombstones: true,
-                ..CurrentStateFilter::default()
+                ..LiveStateIndexFilter::default()
             },
             projection: Vec::new(),
             limit: None,
@@ -624,8 +624,8 @@ fn branch_ref_with_untracked_rows_error(branch_id: &str, deletion: bool) -> LixE
 fn current_delta_from_selected_change_ref(
     change_ref: &StagedCommitChangeRef,
     commit_id: CommitId,
-) -> CurrentStateDeltaRef<'_> {
-    CurrentStateDeltaRef {
+) -> LiveStateIndexDeltaRef<'_> {
+    LiveStateIndexDeltaRef {
         schema_key: &change_ref.schema_key,
         file_id: change_ref.file_id.as_deref(),
         entity_pk: &change_ref.entity_pk,
@@ -639,14 +639,14 @@ fn current_delta_from_selected_change_ref(
 
 fn current_delta_from_state_row(
     row: &PreparedStateRow,
-) -> Result<CurrentStateDeltaRef<'_>, LixError> {
+) -> Result<LiveStateIndexDeltaRef<'_>, LixError> {
     let change_id = row.change_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "current-state row is missing change_id",
+            "live-state index row is missing change_id",
         )
     })?;
-    Ok(CurrentStateDeltaRef {
+    Ok(LiveStateIndexDeltaRef {
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
         entity_pk: &row.entity_pk,
@@ -658,8 +658,8 @@ fn current_delta_from_state_row(
     })
 }
 
-fn current_delta_from_engine_row(row: &EngineCurrentRow) -> CurrentStateDeltaRef<'_> {
-    CurrentStateDeltaRef {
+fn current_delta_from_engine_row(row: &EngineCurrentRow) -> LiveStateIndexDeltaRef<'_> {
+    LiveStateIndexDeltaRef {
         schema_key: &row.change.schema_key,
         file_id: row.change.file_id.as_deref(),
         entity_pk: &row.change.entity_pk,
@@ -1011,7 +1011,7 @@ mod tests {
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
-    use crate::current_state::{CurrentStateContext, CurrentStateRowRequest};
+    use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexRowRequest};
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, InMemoryStorageWrite, StorageContext,
@@ -1030,7 +1030,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
-            CurrentStateContext::new(),
+            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
     }
@@ -1267,17 +1267,17 @@ mod tests {
             .await
             .expect("writes should commit");
 
-        let loaded = CurrentStateContext::new()
+        let loaded = LiveStateIndexContext::new()
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&current_state_request("entity-1"))
+            .load_row(&live_index_request("entity-1"))
             .await
             .expect("current row load should succeed")
-            .expect("untracked row should be persisted in current state");
+            .expect("untracked row should be persisted in live state");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
@@ -1572,17 +1572,17 @@ mod tests {
         let expected_commit_id = commit_id("test-uuid-1");
         assert_eq!(loaded_head, Some(expected_commit_id));
 
-        let untracked = CurrentStateContext::new()
+        let untracked = LiveStateIndexContext::new()
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&current_state_request("entity-2"))
+            .load_row(&live_index_request("entity-2"))
             .await
             .expect("untracked row load should succeed")
-            .expect("untracked row should persist in current state");
+            .expect("untracked row should persist in live state");
         assert_eq!(
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
@@ -1906,8 +1906,8 @@ mod tests {
         }
     }
 
-    fn current_state_request(entity_pk: &str) -> CurrentStateRowRequest {
-        CurrentStateRowRequest {
+    fn live_index_request(entity_pk: &str) -> LiveStateIndexRowRequest {
+        LiveStateIndexRowRequest {
             schema_key: "test_schema".to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single(entity_pk),

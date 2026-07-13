@@ -8,13 +8,14 @@ use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphContext;
-use crate::current_state::{
-    CurrentStateContext, CurrentStateFilter, CurrentStateRowRequest, CurrentStateScanRequest,
-};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
+};
+use crate::live_state::index::{
+    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
+    LiveStateIndexScanRequest,
 };
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -33,11 +34,11 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
-/// Live state serves one canonical current-state root per branch. Immutable
+/// Live state serves one canonical live-state root per branch. Immutable
 /// tracked roots remain a separate history and validation concern.
 pub(crate) struct LiveStateContext {
     tracked_state: TrackedStateContext,
-    current_state: CurrentStateContext,
+    live_index: LiveStateIndexContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
@@ -45,12 +46,12 @@ pub(crate) struct LiveStateContext {
 impl LiveStateContext {
     pub(crate) fn new(
         tracked_state: TrackedStateContext,
-        current_state: CurrentStateContext,
+        live_index: LiveStateIndexContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
         Self {
             tracked_state,
-            current_state,
+            live_index,
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
         }
@@ -64,7 +65,7 @@ impl LiveStateContext {
         LiveStateStoreReader {
             store,
             tracked_state: self.tracked_state.clone(),
-            current_state: self.current_state.clone(),
+            live_index: self.live_index.clone(),
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
         }
@@ -75,7 +76,7 @@ impl LiveStateContext {
 pub(crate) struct LiveStateStoreReader<S> {
     store: S,
     tracked_state: TrackedStateContext,
-    current_state: CurrentStateContext,
+    live_index: LiveStateIndexContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
@@ -89,16 +90,16 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
-        let scope = scan_scope(store, &self.current_state, request).await?;
+        let scope = scan_scope(store, &self.live_index, request).await?;
         let derived_rows =
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut rows = Vec::new();
         if !is_commit_derived_only_request(request) {
             for branch_id in &scope.storage_branch_ids {
                 rows.extend(
-                    self.current_state
+                    self.live_index
                         .reader(store)
-                        .scan_rows(&current_scan_request_from_live(request, branch_id))
+                        .scan_rows(&index_scan_request_from_live(request, branch_id))
                         .await?
                         .into_iter()
                         .map(MaterializedLiveStateRow::from)
@@ -131,7 +132,7 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         {
-            if !branch_ref_exists(&self.store, &self.current_state, &request.branch_id).await? {
+            if !branch_ref_exists(&self.store, &self.live_index, &request.branch_id).await? {
                 return Ok(None);
             }
         }
@@ -157,12 +158,12 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
-        let scope = scan_scope(store, &self.current_state, request).await?;
+        let scope = scan_scope(store, &self.live_index, request).await?;
         let mut rows = scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         if !is_commit_derived_only_request(request) {
             for branch_id in &scope.storage_branch_ids {
                 let Some(commit_id) =
-                    load_branch_ref_commit_id(store, &self.current_state, branch_id).await?
+                    load_branch_ref_commit_id(store, &self.live_index, branch_id).await?
                 else {
                     continue;
                 };
@@ -404,13 +405,13 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
     }
 }
 
-fn current_scan_request_from_live(
+fn index_scan_request_from_live(
     request: &LiveStateScanRequest,
     branch_id: &str,
-) -> CurrentStateScanRequest {
-    CurrentStateScanRequest {
+) -> LiveStateIndexScanRequest {
+    LiveStateIndexScanRequest {
         branch_id: branch_id.to_string(),
-        filter: CurrentStateFilter {
+        filter: LiveStateIndexFilter {
             schema_keys: request.filter.schema_keys.clone(),
             entity_pks: request.filter.entity_pks.clone(),
             file_ids: request.filter.file_ids.clone(),
@@ -431,19 +432,19 @@ struct LiveStateScanScope {
 
 async fn scan_scope(
     store: &(impl StorageRead + Send + Sync + ?Sized),
-    current_state: &CurrentStateContext,
+    live_index: &LiveStateIndexContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
     if request.filter.branch_ids.is_empty() {
         return Ok(LiveStateScanScope {
-            storage_branch_ids: all_branch_ref_ids(store, current_state).await?,
+            storage_branch_ids: all_branch_ref_ids(store, live_index).await?,
             projection_branch_ids: Vec::new(),
         });
     }
 
     let mut projection_branch_ids = Vec::new();
     for branch_id in &request.filter.branch_ids {
-        if branch_ref_exists(store, current_state, branch_id).await? {
+        if branch_ref_exists(store, live_index, branch_id).await? {
             projection_branch_ids.push(branch_id.clone());
         }
     }
@@ -457,13 +458,13 @@ async fn scan_scope(
 
 async fn all_branch_ref_ids(
     store: &(impl StorageRead + Send + Sync + ?Sized),
-    current_state: &CurrentStateContext,
+    live_index: &LiveStateIndexContext,
 ) -> Result<Vec<String>, LixError> {
-    let rows = current_state
+    let rows = live_index
         .reader(store)
-        .scan_rows(&CurrentStateScanRequest {
+        .scan_rows(&LiveStateIndexScanRequest {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
-            filter: CurrentStateFilter {
+            filter: LiveStateIndexFilter {
                 schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
                 ..Default::default()
             },
@@ -478,12 +479,12 @@ async fn all_branch_ref_ids(
 
 async fn load_branch_ref_commit_id(
     store: &(impl StorageRead + Send + Sync + ?Sized),
-    current_state: &CurrentStateContext,
+    live_index: &LiveStateIndexContext,
     branch_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(row) = current_state
+    let Some(row) = live_index
         .reader(store)
-        .load_row(&CurrentStateRowRequest {
+        .load_row(&LiveStateIndexRowRequest {
             schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single(branch_id),
@@ -511,10 +512,10 @@ async fn load_branch_ref_commit_id(
 
 async fn branch_ref_exists(
     store: &(impl StorageRead + Send + Sync + ?Sized),
-    current_state: &CurrentStateContext,
+    live_index: &LiveStateIndexContext,
     branch_id: &str,
 ) -> Result<bool, LixError> {
-    Ok(load_branch_ref_commit_id(store, current_state, branch_id)
+    Ok(load_branch_ref_commit_id(store, live_index, branch_id)
         .await?
         .is_some())
 }
@@ -560,10 +561,10 @@ mod tests {
     use super::*;
     use crate::NullableKeyFilter;
     use crate::changelog::{ChangeId, ChangeRecord, ChangelogAppend, CommitId};
-    use crate::current_state::{CurrentStateContext, CurrentStateDeltaRef};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::LiveStateFilter;
+    use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
@@ -595,7 +596,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
-            CurrentStateContext::new(),
+            LiveStateIndexContext::new(),
             CommitGraphContext::new(),
         )
     }
@@ -607,7 +608,7 @@ mod tests {
     ) {
         let read = storage
             .begin_read(StorageReadOptions::default())
-            .expect("current-state read should open");
+            .expect("current index read should open");
         let mut writes = storage.new_write_set();
         let mut json_writer = JsonStoreContext::new().writer();
         let changes = rows
@@ -674,7 +675,7 @@ mod tests {
             rows_by_branch
                 .entry(&row.branch_id)
                 .or_default()
-                .push(CurrentStateDeltaRef {
+                .push(LiveStateIndexDeltaRef {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
@@ -685,15 +686,15 @@ mod tests {
                     updated_at: ts(&row.updated_at),
                 });
         }
-        let current_state = CurrentStateContext::new();
-        let mut current_writer = current_state.writer(&read, &mut writes);
+        let live_index = LiveStateIndexContext::new();
+        let mut index_writer = live_index.writer(&read, &mut writes);
         for (branch_id, deltas) in rows_by_branch {
-            current_writer
+            index_writer
                 .stage_branch_rows(branch_id, deltas)
                 .await
                 .expect("current rows should write");
         }
-        drop(current_writer);
+        drop(index_writer);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("current rows should commit");
@@ -881,12 +882,12 @@ mod tests {
         }
 
         let mut current_rows_by_branch =
-            std::collections::BTreeMap::<&str, Vec<CurrentStateDeltaRef<'_>>>::new();
+            std::collections::BTreeMap::<&str, Vec<LiveStateIndexDeltaRef<'_>>>::new();
         for (branch_id, row) in &current_rows {
             current_rows_by_branch
                 .entry(branch_id)
                 .or_default()
-                .push(CurrentStateDeltaRef {
+                .push(LiveStateIndexDeltaRef {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
@@ -897,10 +898,10 @@ mod tests {
                     updated_at: ts(&row.updated_at),
                 });
         }
-        let current_state = CurrentStateContext::new();
-        let mut current_writer = current_state.writer(store, writes);
+        let live_index = LiveStateIndexContext::new();
+        let mut index_writer = live_index.writer(store, writes);
         for (branch_id, deltas) in current_rows_by_branch {
-            current_writer.stage_branch_rows(branch_id, deltas).await?;
+            index_writer.stage_branch_rows(branch_id, deltas).await?;
         }
         Ok(())
     }
@@ -1194,7 +1195,7 @@ mod tests {
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
-            crate::current_state::CurrentStateContext::new(),
+            crate::live_state::index::LiveStateIndexContext::new(),
             CommitGraphContext::new(),
         );
 

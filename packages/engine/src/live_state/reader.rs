@@ -21,7 +21,7 @@ pub(crate) trait LiveStateReader: Send + Sync {
     /// Normal SQL reads use [`Self::scan_rows`] and therefore see exactly one
     /// canonical current row. Validation and schema planning use this explicit
     /// durability view when a tracked commit must not depend on untracked
-    /// current state. Readers that wrap canonical current scans must override
+    /// live state. Readers that wrap canonical current scans must override
     /// this method instead of relying on the fallback below.
     async fn scan_tracked_rows(
         &self,

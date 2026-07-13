@@ -8,10 +8,10 @@ use crate::changelog::{
     CommitId, CommitRecord,
 };
 use crate::common::LixTimestamp;
-use crate::current_state::{CurrentStateContext, CurrentStateDeltaRef};
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
@@ -183,7 +183,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 pub(crate) async fn initialize<B>(
     storage: StorageContext<B>,
     tracked_state: &TrackedStateContext,
-    current_state: &CurrentStateContext,
+    live_index: &LiveStateIndexContext,
 ) -> Result<InitReceipt, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
@@ -252,13 +252,13 @@ where
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
 
-        let mut current_writer = current_state.writer(&read, &mut writes);
-        current_writer
+        let mut index_writer = live_index.writer(&read, &mut writes);
+        index_writer
             .stage_branch_rows(
                 GLOBAL_BRANCH_ID,
                 authored_changes
                     .iter()
-                    .map(|change| CurrentStateDeltaRef {
+                    .map(|change| LiveStateIndexDeltaRef {
                         schema_key: &change.schema_key,
                         file_id: change.file_id.as_deref(),
                         entity_pk: &change.entity_pk,
@@ -268,19 +268,23 @@ where
                         created_at: change.created_at,
                         updated_at: change.created_at,
                     })
-                    .chain(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
-                        schema_key: &row.schema_key,
-                        file_id: None,
-                        entity_pk: &row.entity_pk,
-                        change_id: row.id,
-                        commit_id: None,
-                        deleted: false,
-                        created_at: row.created_at,
-                        updated_at: row.updated_at,
-                    })),
+                    .chain(
+                        plan.untracked_rows
+                            .iter()
+                            .map(|row| LiveStateIndexDeltaRef {
+                                schema_key: &row.schema_key,
+                                file_id: None,
+                                entity_pk: &row.entity_pk,
+                                change_id: row.id,
+                                commit_id: None,
+                                deleted: false,
+                                created_at: row.created_at,
+                                updated_at: row.updated_at,
+                            }),
+                    ),
             )
             .await?;
-        current_writer
+        index_writer
             .stage_branch_root_from_existing(&receipt.main_branch_id, &tracked_report.root_id)?;
     }
 
@@ -604,9 +608,9 @@ mod tests {
         let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend);
         let tracked_state = TrackedStateContext::new();
-        let current_state = CurrentStateContext::new();
+        let live_index = LiveStateIndexContext::new();
 
-        let receipt = initialize(storage.clone(), &tracked_state, &current_state)
+        let receipt = initialize(storage.clone(), &tracked_state, &live_index)
             .await
             .expect("engine should initialize");
         let mut reader = ChangelogContext::new().reader(

@@ -123,7 +123,7 @@ pub(crate) struct TrackedStateCommitRootParent {
 ///
 /// Tracked rows are the serving state that can be rebuilt from changelog facts.
 /// They intentionally do not carry an `untracked` flag: commit roots contain
-/// tracked history only. Canonical current state reuses the same index codec
+/// tracked history only. Canonical live state reuses the same index codec
 /// and reserves the nil commit id for untracked entries.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {

@@ -3,19 +3,19 @@ use crate::LixError;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
-use crate::current_state::{
-    CurrentStateContext, CurrentStateFilter, CurrentStateRowRequest, CurrentStateScanRequest,
-    MaterializedCurrentStateRow,
-};
 use crate::entity_pk::EntityPk;
+use crate::live_state::index::{
+    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
+    LiveStateIndexScanRequest, MaterializedLiveStateIndexRow,
+};
 use crate::storage::StorageRead;
 
-/// Typed access to moving branch heads stored in current state.
+/// Typed access to moving branch heads stored in live state.
 ///
 /// Branch refs are one of the inputs used by live_state visibility, so this
 /// context deliberately bypasses live_state and reads the canonical current
 /// rows directly. That keeps the dependency acyclic:
-/// current_state -> branch_ref -> live_state.
+/// live_index -> branch_ref -> live_state.
 pub(super) struct BranchRefContext {}
 
 impl BranchRefContext {
@@ -46,9 +46,9 @@ where
     S: StorageRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        let Some(row) = CurrentStateContext::new()
+        let Some(row) = LiveStateIndexContext::new()
             .reader(&self.store)
-            .load_row(&CurrentStateRowRequest {
+            .load_row(&LiveStateIndexRowRequest {
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(branch_id),
@@ -70,13 +70,13 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        let rows = CurrentStateContext::new()
+        let rows = LiveStateIndexContext::new()
             .reader(&self.store)
-            .scan_rows(&CurrentStateScanRequest {
+            .scan_rows(&LiveStateIndexScanRequest {
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                filter: CurrentStateFilter {
+                filter: LiveStateIndexFilter {
                     schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                    ..CurrentStateFilter::default()
+                    ..LiveStateIndexFilter::default()
                 },
                 projection: Vec::new(),
                 limit: None,
@@ -117,7 +117,7 @@ where
 
 fn decode_branch_head(
     requested_branch_id: &str,
-    row: &MaterializedCurrentStateRow,
+    row: &MaterializedLiveStateIndexRow,
 ) -> Result<Option<BranchHead>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
@@ -149,7 +149,7 @@ mod tests {
     use crate::changelog::{
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
     };
-    use crate::current_state::{CurrentStateDeltaRef, CurrentStateRowRequest};
+    use crate::live_state::index::{LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
@@ -199,9 +199,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let row = CurrentStateContext::new()
+        let row = LiveStateIndexContext::new()
             .reader(read)
-            .load_row(&CurrentStateRowRequest {
+            .load_row(&LiveStateIndexRowRequest {
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single("branch-a"),
@@ -292,11 +292,11 @@ mod tests {
                 })
                 .await?;
         }
-        CurrentStateContext::new()
+        LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows(
                 GLOBAL_BRANCH_ID,
-                [CurrentStateDeltaRef {
+                [LiveStateIndexDeltaRef {
                     schema_key: BRANCH_REF_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,

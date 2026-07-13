@@ -7,10 +7,10 @@ use crate::storage::{
 };
 use crate::tracked_state::TrackedStateRootId;
 
-pub(crate) const CURRENT_STATE_BRANCH_ROOT_NAMESPACE: &str = "current_state.branch_root.v1";
-pub(crate) const CURRENT_STATE_BRANCH_ROOT_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const LIVE_STATE_INDEX_BRANCH_ROOT_NAMESPACE: &str = "live_state.index.branch_root.v1";
+pub(crate) const LIVE_STATE_INDEX_BRANCH_ROOT_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0005),
-    CURRENT_STATE_BRANCH_ROOT_NAMESPACE,
+    LIVE_STATE_INDEX_BRANCH_ROOT_NAMESPACE,
 );
 
 pub(crate) fn load_branch_root(
@@ -18,14 +18,14 @@ pub(crate) fn load_branch_root(
     branch_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
     let result = PointReadPlan::new(
-        CURRENT_STATE_BRANCH_ROOT_SPACE,
+        LIVE_STATE_INDEX_BRANCH_ROOT_SPACE,
         &[branch_root_key(branch_id)],
     )
     .materialize(store, StorageGetOptions::default())?;
     let value = result.value.into_iter().next().flatten();
     match value {
         Some(StorageProjectedValue::FullValue(bytes)) => {
-            crate::storage_codec::decode("current-state branch root", &bytes).map(Some)
+            crate::storage_codec::decode("current index branch root", &bytes).map(Some)
         }
         Some(StorageProjectedValue::KeyOnly) | None => Ok(None),
     }
@@ -37,11 +37,11 @@ pub(crate) fn stage_branch_root(
     root_id: &TrackedStateRootId,
 ) -> Result<(), LixError> {
     writes.put(
-        CURRENT_STATE_BRANCH_ROOT_SPACE,
+        LIVE_STATE_INDEX_BRANCH_ROOT_SPACE,
         branch_root_key(branch_id),
         StorageValue {
             bytes: Bytes::from(crate::storage_codec::encode(
-                "current-state branch root",
+                "current index branch root",
                 root_id,
             )?),
         },
@@ -50,7 +50,10 @@ pub(crate) fn stage_branch_root(
 }
 
 pub(crate) fn stage_delete_branch_root(writes: &mut StorageWriteSet, branch_id: &str) {
-    writes.delete(CURRENT_STATE_BRANCH_ROOT_SPACE, branch_root_key(branch_id));
+    writes.delete(
+        LIVE_STATE_INDEX_BRANCH_ROOT_SPACE,
+        branch_root_key(branch_id),
+    );
 }
 
 fn branch_root_key(branch_id: &str) -> StorageKey {

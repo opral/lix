@@ -6,12 +6,12 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
 };
 use crate::common::LixTimestamp;
-use crate::current_state::{
-    CurrentStateContext, CurrentStateDeltaRef, CurrentStateIndexRow, CurrentStateRowRequest,
-};
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
+use crate::live_state::index::{
+    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest,
+};
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
 use crate::storage::StorageRead;
 use crate::storage::StorageWriteSet;
@@ -73,13 +73,13 @@ pub(crate) async fn stage_sequence(
     })?;
     let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
     let entity_pk = EntityPk::single(DETERMINISTIC_SEQUENCE_KEY);
-    let request = CurrentStateRowRequest {
+    let request = LiveStateIndexRowRequest {
         branch_id: GLOBAL_BRANCH_ID.to_string(),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         entity_pk: entity_pk.clone(),
         file_id: None,
     };
-    let previous = CurrentStateContext::new()
+    let previous = LiveStateIndexContext::new()
         .reader(read)
         .load_index_row(&request)
         .await?;
@@ -103,7 +103,7 @@ pub(crate) async fn stage_sequence(
     {
         let mut changelog_read = read;
         let mut changelog = ChangelogContext::new().writer(&mut changelog_read, writes);
-        if let Some(previous) = previous.filter(CurrentStateIndexRow::untracked) {
+        if let Some(previous) = previous.filter(LiveStateIndexRow::untracked) {
             changelog
                 .stage_delete_standalone_changes(&[previous.change_id])
                 .await?;
@@ -115,11 +115,11 @@ pub(crate) async fn stage_sequence(
             })
             .await?;
     }
-    CurrentStateContext::new()
+    LiveStateIndexContext::new()
         .writer(read, writes)
         .stage_branch_rows(
             GLOBAL_BRANCH_ID,
-            [CurrentStateDeltaRef {
+            [LiveStateIndexDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &entity_pk,
@@ -213,7 +213,7 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 
 #[cfg(test)]
 mod tests {
-    use crate::current_state::CurrentStateContext;
+    use crate::live_state::index::LiveStateIndexContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
@@ -223,7 +223,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
-            CurrentStateContext::new(),
+            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
     }
@@ -408,11 +408,11 @@ mod tests {
                 .await
                 .expect("test key-value change should stage");
         }
-        CurrentStateContext::new()
+        LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows(
                 GLOBAL_BRANCH_ID,
-                [CurrentStateDeltaRef {
+                [LiveStateIndexDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,
