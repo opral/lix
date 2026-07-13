@@ -152,9 +152,9 @@ fn cached_preloaded_request_benches(c: &mut Criterion, runtime: &tokio::runtime:
                         measure_prepared_iterations(
                             iterations,
                             || runtime.block_on(fixture.prepare_request(stage)),
-                            |prepared| {
+                            |engine| {
                                 runtime.block_on(lixray_download_file(
-                                    &prepared.engine,
+                                    engine,
                                     &fixture.main_branch_id,
                                     &fixture.file_id,
                                 ))
@@ -482,11 +482,6 @@ struct CachedRequestBenchFixture {
     file_id: String,
 }
 
-struct PreparedCachedRequest {
-    engine: Engine<SlateDbBackend>,
-    _backend: SlateDbBackend,
-}
-
 impl CachedLifecycleBenchFixture {
     async fn seeded(delay: Duration) -> Self {
         let seeded = SeededStore::create().await;
@@ -572,23 +567,20 @@ impl CachedRequestBenchFixture {
         }
     }
 
-    async fn prepare_request(&self, stage: CachedRequestStage) -> PreparedCachedRequest {
+    async fn prepare_request(&self, stage: CachedRequestStage) -> Engine<SlateDbBackend> {
         let backend = SlateDbBackend::open_object_store_with_options(
             self.db_path.clone(),
             object_store_handle(&self.object_store),
             cached_object_store_options(&self.cache_dir),
         )
         .expect("reopen cached preloaded request backend");
-        let engine = Engine::new(backend.clone())
+        let engine = Engine::new(backend)
             .await
             .expect("open cached preloaded request engine");
         if matches!(stage, CachedRequestStage::Second) {
             black_box(lixray_download_file(&engine, &self.main_branch_id, &self.file_id).await);
         }
-        PreparedCachedRequest {
-            engine,
-            _backend: backend,
-        }
+        engine
     }
 }
 
