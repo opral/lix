@@ -371,7 +371,7 @@ fn branch_ref_current_row(head: &PendingBranchHead) -> Result<EngineCurrentRow, 
         change: ChangeRecord {
             format_version: 2,
             change_id: head.change_id,
-            schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
+            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
             entity_pk: EntityPk::single(&head.branch_id),
             file_id: None,
             snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
@@ -429,7 +429,7 @@ async fn stage_flat_current_rows(
     let index_reader = current.reader(read);
     for row in state_rows
         .iter()
-        .filter(|row| row.untracked && row.schema_key == crate::branch::BRANCH_REF_SCHEMA_KEY)
+        .filter(|row| row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
     {
         let branch_id = row.entity_pk.as_single_string_owned()?;
         let Some(snapshot) = row.snapshot.as_ref() else {
@@ -473,8 +473,8 @@ async fn stage_flat_current_rows(
 
     let branch_ids = state_rows
         .iter()
-        .map(|row| row.branch_id.clone())
-        .chain(engine_rows.iter().map(|row| row.branch_id.clone()))
+        .map(|row| row.branch_id.as_str())
+        .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
         .collect::<BTreeSet<_>>();
     let mut writer = current.writer(read, writes);
     let mut compactable_change_ids = BTreeSet::new();
@@ -499,6 +499,7 @@ async fn stage_flat_current_rows(
                 .iter()
                 .filter(|row| {
                     row.branch_id == *branch_id
+                        && row.snapshot.is_some()
                         && insert_identities.contains(&PreparedStateRowIdentity::from(*row))
                 })
                 .map(|row| LiveStateIndexRowRequest {
@@ -513,6 +514,9 @@ async fn stage_flat_current_rows(
                 .await?;
             compactable_change_ids.extend(superseded);
         }
+    }
+    if compactable_change_ids.is_empty() {
+        return Ok(Vec::new());
     }
     let new_ids = state_rows
         .iter()
@@ -533,7 +537,7 @@ where
     let Some(row) = reader
         .load_row(&LiveStateIndexRowRequest {
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
-            schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
+            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
             entity_pk: EntityPk::single(branch_id),
             file_id: None,
         })

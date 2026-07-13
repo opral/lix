@@ -152,6 +152,69 @@ simulation_test!(
 );
 
 simulation_test!(
+    insert_then_delete_transaction_removes_preexisting_untracked_row,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('untracked-ledger-insert-delete', 'old', true)",
+                &[],
+            )
+            .await
+            .expect("preexisting untracked row should insert");
+        let old_change_id = current_change_id(&session, "untracked-ledger-insert-delete").await;
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('untracked-ledger-insert-delete', 'replacement', true)",
+                &[],
+            )
+            .await
+            .expect("replacement insert should stage until commit validation");
+        transaction
+            .execute(
+                "DELETE FROM lix_key_value \
+                 WHERE key = 'untracked-ledger-insert-delete'",
+                &[],
+            )
+            .await
+            .expect("delete should replace the staged insert");
+        transaction
+            .commit()
+            .await
+            .expect("final tombstone should commit");
+
+        let visible = session
+            .execute(
+                "SELECT value FROM lix_key_value \
+                 WHERE key = 'untracked-ledger-insert-delete'",
+                &[],
+            )
+            .await
+            .expect("live state should remain readable");
+        assert_eq!(visible.len(), 0);
+        assert!(
+            !change_exists(&session, &old_change_id).await,
+            "the preexisting standalone change should be compacted"
+        );
+    }
+);
+
+simulation_test!(
     untracked_insert_rejects_tracked_canonical_row,
     |sim| async move {
         let engine = sim.boot_engine().await;

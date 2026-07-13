@@ -28,7 +28,8 @@ use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 #[cfg(test)]
 use crate::live_state::LiveStateRowIdentity;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 #[cfg(test)]
 use crate::schema::{
@@ -139,6 +140,15 @@ async fn scan_committed_canonical_rows(
                 file_ids: domain.file_filters(),
                 include_tombstones: false,
                 ..Default::default()
+            },
+            projection: LiveStateProjection {
+                columns: vec![
+                    "schema_key".to_string(),
+                    "entity_pk".to_string(),
+                    "file_id".to_string(),
+                    "deleted".to_string(),
+                    "untracked".to_string(),
+                ],
             },
             ..Default::default()
         })
@@ -883,9 +893,7 @@ async fn validate_committed_insert_identities(
                 .await?;
         let committed_rows_by_entity_pk = committed_rows
             .into_iter()
-            .filter(|row| {
-                row.snapshot_content.is_some() && !pending_constraints.tombstones_identity(row)
-            })
+            .filter(|row| !row.deleted && !pending_constraints.tombstones_identity(row))
             .map(|row| (row.entity_pk.clone(), row))
             .collect::<BTreeMap<_, _>>();
         for (entity_pk, origin) in checks {

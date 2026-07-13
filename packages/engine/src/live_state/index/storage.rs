@@ -141,6 +141,16 @@ pub(super) async fn scan_values(
     filter: &LiveStateIndexFilter,
     limit: Option<usize>,
 ) -> Result<Vec<(FlatIdentity, FlatValue)>, LixError> {
+    if let Some(identities) = exact_filter_identities(branch_id, filter) {
+        let values = load_values(store, &identities).await?;
+        return Ok(identities
+            .into_iter()
+            .zip(values)
+            .filter_map(|(identity, value)| value.map(|value| (identity, value)))
+            .take(limit.unwrap_or(usize::MAX))
+            .collect());
+    }
+
     let mut prefixes = scan_prefixes(branch_id, filter)?;
     prefixes.sort();
     prefixes.dedup();
@@ -186,6 +196,49 @@ pub(super) async fn scan_values(
         }
     }
     Ok(rows)
+}
+
+/// Returns concrete flat identities when every filter dimension resolves to
+/// exact keys. This lets multi-row validation use one batched point read
+/// instead of one prefix scan per entity.
+fn exact_filter_identities(
+    branch_id: &str,
+    filter: &LiveStateIndexFilter,
+) -> Option<Vec<FlatIdentity>> {
+    if filter.schema_keys.is_empty()
+        || filter.entity_pks.is_empty()
+        || filter.file_ids.is_empty()
+        || filter
+            .file_ids
+            .iter()
+            .any(|filter| matches!(filter, NullableKeyFilter::Any))
+    {
+        return None;
+    }
+
+    let mut identities = Vec::with_capacity(
+        filter.schema_keys.len() * filter.entity_pks.len() * filter.file_ids.len(),
+    );
+    for schema_key in &filter.schema_keys {
+        for entity_pk in &filter.entity_pks {
+            for file_id in &filter.file_ids {
+                let file_id = match file_id {
+                    NullableKeyFilter::Null => None,
+                    NullableKeyFilter::Value(value) => Some(value.clone()),
+                    NullableKeyFilter::Any => unreachable!("Any rejected above"),
+                };
+                identities.push(FlatIdentity {
+                    branch_id: branch_id.to_string(),
+                    schema_key: schema_key.clone(),
+                    entity_pk: entity_pk.clone(),
+                    file_id,
+                });
+            }
+        }
+    }
+    identities.sort();
+    identities.dedup();
+    Some(identities)
 }
 
 pub(super) fn stage_put(

@@ -11,8 +11,7 @@ use crate::filesystem::{
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
 };
 use crate::live_state::index::{
-    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
-    LiveStateIndexScanRequest,
+    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexScanRequest,
 };
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -24,6 +23,10 @@ use crate::tracked_state::{
     TrackedStateScanRequest,
 };
 use async_trait::async_trait;
+use futures_util::{StreamExt, TryStreamExt, stream};
+
+const BRANCH_READ_CONCURRENCY: usize = 8;
+type BranchCommitIds = std::collections::BTreeMap<String, String>;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -91,45 +94,35 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
-        let scope = scan_scope(store, &self.live_index, request).await?;
+        let reads_tracked =
+            request.filter.untracked != Some(true) && !is_commit_derived_only_request(request);
+        let scope = scan_scope(store, &self.live_index, request, reads_tracked).await?;
         let mut rows = Vec::new();
         if request.filter.untracked != Some(true) {
             rows.extend(
                 scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
             );
             if !is_commit_derived_only_request(request) {
-                for branch_id in &scope.storage_branch_ids {
-                    let Some(commit_id) =
-                        load_branch_ref_commit_id(store, &self.live_index, branch_id).await?
-                    else {
-                        continue;
-                    };
-                    let source = tracked_source_from_branch_id(branch_id);
-                    rows.extend(
-                        self.tracked_state
-                            .reader(store)
-                            .scan_rows_at_commit(
-                                &commit_id,
-                                &tracked_scan_request_from_live(request),
-                            )
-                            .await?
-                            .into_iter()
-                            .map(|row| project_tracked_row(row, branch_id, source)),
-                    );
-                }
+                rows.extend(self.scan_tracked_branch_rows(request, &scope).await?);
             }
         }
         if request.filter.untracked != Some(false) && !is_commit_derived_only_request(request) {
-            for branch_id in &scope.storage_branch_ids {
-                rows.extend(
-                    self.live_index
+            let branch_rows = stream::iter(scope.storage_branch_ids.clone())
+                .map(|branch_id| async move {
+                    let rows: Vec<_> = self
+                        .live_index
                         .reader(store)
-                        .scan_rows(&index_scan_request_from_live(request, branch_id))
+                        .scan_rows(&index_scan_request_from_live(request, &branch_id))
                         .await?
                         .into_iter()
-                        .map(MaterializedLiveStateRow::from),
-                );
-            }
+                        .map(MaterializedLiveStateRow::from)
+                        .collect();
+                    Ok::<_, LixError>(rows)
+                })
+                .buffered(BRANCH_READ_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+            rows.extend(branch_rows.into_iter().flatten());
         }
         rows = resolve_visible_rows(
             rows,
@@ -149,11 +142,6 @@ where
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        {
-            if !branch_ref_exists(&self.store, &self.live_index, &request.branch_id).await? {
-                return Ok(None);
-            }
-        }
         let rows = self
             .scan_rows(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
@@ -176,25 +164,11 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
-        let scope = scan_scope(store, &self.live_index, request).await?;
+        let reads_tracked = !is_commit_derived_only_request(request);
+        let scope = scan_scope(store, &self.live_index, request, reads_tracked).await?;
         let mut rows = scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         if !is_commit_derived_only_request(request) {
-            for branch_id in &scope.storage_branch_ids {
-                let Some(commit_id) =
-                    load_branch_ref_commit_id(store, &self.live_index, branch_id).await?
-                else {
-                    continue;
-                };
-                let source = tracked_source_from_branch_id(branch_id);
-                rows.extend(
-                    self.tracked_state
-                        .reader(store)
-                        .scan_rows_at_commit(&commit_id, &tracked_scan_request_from_live(request))
-                        .await?
-                        .into_iter()
-                        .map(|row| project_tracked_row(row, branch_id, source)),
-                );
-            }
+            rows.extend(self.scan_tracked_branch_rows(request, &scope).await?);
         }
         Ok(resolve_visible_rows(
             rows,
@@ -207,6 +181,45 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    async fn scan_tracked_branch_rows(
+        &self,
+        request: &LiveStateScanRequest,
+        scope: &LiveStateScanScope,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let store = &self.store;
+        let tracked_request = tracked_scan_request_from_live(request);
+        let branches = scope
+            .storage_branch_ids
+            .iter()
+            .filter_map(|branch_id| {
+                scope
+                    .branch_commit_ids
+                    .get(branch_id)
+                    .map(|commit_id| (branch_id.clone(), commit_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        let branch_rows = stream::iter(branches)
+            .map(|(branch_id, commit_id)| {
+                let tracked_request = tracked_request.clone();
+                async move {
+                    let source = tracked_source_from_branch_id(&branch_id);
+                    let rows = self
+                        .tracked_state
+                        .reader(store)
+                        .scan_rows_at_commit(&commit_id, &tracked_request)
+                        .await?
+                        .into_iter()
+                        .map(|row| project_tracked_row(row, &branch_id, source))
+                        .collect::<Vec<_>>();
+                    Ok::<_, LixError>(rows)
+                }
+            })
+            .buffered(BRANCH_READ_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(branch_rows.into_iter().flatten().collect())
     }
 }
 
@@ -443,37 +456,109 @@ fn index_scan_request_from_live(
 struct LiveStateScanScope {
     storage_branch_ids: Vec<String>,
     projection_branch_ids: Vec<String>,
+    branch_commit_ids: BranchCommitIds,
 }
 
 async fn scan_scope(
     store: &(impl StorageRead + ?Sized),
     live_index: &LiveStateIndexContext,
     request: &LiveStateScanRequest,
+    resolve_branch_heads: bool,
 ) -> Result<LiveStateScanScope, LixError> {
     if request.filter.branch_ids.is_empty() {
+        if resolve_branch_heads {
+            let branch_commit_ids = load_branch_ref_commit_ids(store, live_index, &[]).await?;
+            return Ok(LiveStateScanScope {
+                storage_branch_ids: branch_commit_ids.keys().cloned().collect(),
+                projection_branch_ids: Vec::new(),
+                branch_commit_ids,
+            });
+        }
         return Ok(LiveStateScanScope {
             storage_branch_ids: all_branch_ref_ids(store, live_index).await?,
             projection_branch_ids: Vec::new(),
+            branch_commit_ids: BranchCommitIds::new(),
         });
     }
 
-    let mut projection_branch_ids = Vec::new();
-    for branch_id in &request.filter.branch_ids {
-        if branch_ref_exists(store, live_index, branch_id).await? {
-            projection_branch_ids.push(branch_id.clone());
-        }
+    if resolve_branch_heads {
+        let candidate_branch_ids = expanded_branch_ids(&request.filter.branch_ids);
+        let branch_commit_ids =
+            load_branch_ref_commit_ids(store, live_index, &candidate_branch_ids).await?;
+        let projection_branch_ids = request
+            .filter
+            .branch_ids
+            .iter()
+            .filter(|branch_id| branch_commit_ids.contains_key(*branch_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let storage_branch_ids = expanded_branch_ids(&projection_branch_ids);
+        return Ok(LiveStateScanScope {
+            storage_branch_ids,
+            projection_branch_ids,
+            branch_commit_ids,
+        });
     }
+
+    let existing_branch_ids = load_branch_ref_ids(store, live_index, &request.filter.branch_ids)
+        .await?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let projection_branch_ids = request
+        .filter
+        .branch_ids
+        .iter()
+        .filter(|branch_id| existing_branch_ids.contains(*branch_id))
+        .cloned()
+        .collect::<Vec<_>>();
 
     let storage_branch_ids = expanded_branch_ids(&projection_branch_ids);
     Ok(LiveStateScanScope {
         storage_branch_ids,
         projection_branch_ids,
+        branch_commit_ids: BranchCommitIds::new(),
     })
+}
+
+async fn load_branch_ref_commit_ids(
+    store: &(impl StorageRead + ?Sized),
+    live_index: &LiveStateIndexContext,
+    branch_ids: &[String],
+) -> Result<BranchCommitIds, LixError> {
+    let rows = live_index
+        .reader(store)
+        .scan_rows(&LiveStateIndexScanRequest {
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            filter: LiveStateIndexFilter {
+                schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
+                entity_pks: branch_ids.iter().map(EntityPk::single).collect(),
+                file_ids: vec![NullableKeyFilter::Null],
+            },
+            projection: vec!["snapshot_content".to_string()],
+            limit: None,
+        })
+        .await?;
+    let mut branch_commit_ids = BranchCommitIds::new();
+    for row in rows {
+        let branch_id = row.entity_pk.as_single_string_owned()?;
+        if let Some(commit_id) = parse_branch_ref_commit_id(row.snapshot_content.as_deref())? {
+            branch_commit_ids.insert(branch_id, commit_id);
+        }
+    }
+    Ok(branch_commit_ids)
 }
 
 async fn all_branch_ref_ids(
     store: &(impl StorageRead + ?Sized),
     live_index: &LiveStateIndexContext,
+) -> Result<Vec<String>, LixError> {
+    load_branch_ref_ids(store, live_index, &[]).await
+}
+
+async fn load_branch_ref_ids(
+    store: &(impl StorageRead + ?Sized),
+    live_index: &LiveStateIndexContext,
+    branch_ids: &[String],
 ) -> Result<Vec<String>, LixError> {
     let rows = live_index
         .reader(store)
@@ -481,7 +566,8 @@ async fn all_branch_ref_ids(
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             filter: LiveStateIndexFilter {
                 schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                ..Default::default()
+                entity_pks: branch_ids.iter().map(EntityPk::single).collect(),
+                file_ids: vec![NullableKeyFilter::Null],
             },
             projection: Vec::new(),
             limit: None,
@@ -492,24 +578,8 @@ async fn all_branch_ref_ids(
         .collect()
 }
 
-async fn load_branch_ref_commit_id(
-    store: &(impl StorageRead + ?Sized),
-    live_index: &LiveStateIndexContext,
-    branch_id: &str,
-) -> Result<Option<String>, LixError> {
-    let Some(row) = live_index
-        .reader(store)
-        .load_row(&LiveStateIndexRowRequest {
-            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-            entity_pk: EntityPk::single(branch_id),
-            file_id: None,
-        })
-        .await?
-    else {
-        return Ok(None);
-    };
-    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+fn parse_branch_ref_commit_id(snapshot_content: Option<&str>) -> Result<Option<String>, LixError> {
+    let Some(snapshot_content) = snapshot_content else {
         return Ok(None);
     };
     let snapshot =
@@ -523,16 +593,6 @@ async fn load_branch_ref_commit_id(
         .get("commit_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string))
-}
-
-async fn branch_ref_exists(
-    store: &(impl StorageRead + ?Sized),
-    live_index: &LiveStateIndexContext,
-    branch_id: &str,
-) -> Result<bool, LixError> {
-    Ok(load_branch_ref_commit_id(store, live_index, branch_id)
-        .await?
-        .is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

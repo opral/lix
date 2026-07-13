@@ -38,7 +38,7 @@ Schema-agnostic, JSON-shaped reads across every registered schema.
 
 Common columns (`lix_state` and `lix_state_by_version`): `entity_pk` (JSON array of primary-key values), `schema_key`, `file_id`, `snapshot_content` (JSON), `metadata` (JSON), `schema_version`, `change_id`, `commit_id`. `lix_state_by_version` adds `version_id`.
 
-Every canonical current row has a `change_id`, including rows written with `lixcol_untracked = true`. Untracked current rows have no `commit_id`; tracked rows reference the commit that retained their change. Current reads use one materialized row per logical identity, so deleting an untracked row leaves a current tombstone and never reveals an older tracked value underneath it.
+Every canonical current row has a `change_id`, including rows written with `lixcol_untracked = true`. Untracked current rows have no `commit_id`; tracked rows reference the commit that retained their change. Deleting an untracked row physically removes its flat current-index entry and standalone ChangeRecord; no untracked tombstone is retained. Valid writes reject tracked and untracked rows with the same canonical identity.
 
 `lix_state_history` shares `entity_pk` (JSON array of primary-key values), `schema_key`, `file_id`, `snapshot_content`, `metadata`, `schema_version`, `change_id`, and instead of `commit_id` exposes `start_commit_id`, `observed_commit_id`, `commit_created_at`, and `depth` (commit-graph distance from `start_commit_id`; `0` is the freshest observation, higher values walk back, and intermediate commits that didn't touch the entity are skipped).
 

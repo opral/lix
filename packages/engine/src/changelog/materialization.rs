@@ -66,6 +66,9 @@ where
             unique.push(change_id);
         }
     }
+    if unique.is_empty() {
+        return Ok(HashMap::new());
+    }
     let keys = unique
         .iter()
         .map(|change_id| crate::storage::StorageKey(bytes::Bytes::from(change_key(*change_id))))

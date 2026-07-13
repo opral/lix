@@ -5,7 +5,8 @@ use crate::changelog::{ChangeId, ChangeRecordProjection, materialize_change_payl
 use crate::storage::{StorageRead, StorageWriteSet};
 
 use super::storage::{
-    FlatIdentity, FlatValue, load_value, load_values, scan_values, stage_delete, stage_put,
+    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_value, load_values, scan_values,
+    stage_delete, stage_put,
 };
 use super::{
     LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
@@ -174,6 +175,15 @@ where
                 delta,
             );
         }
+        let delete_count = final_deltas
+            .values()
+            .filter(|delta| delta.commit_id.is_some() || delta.deleted)
+            .count();
+        self.writes.reserve_space(
+            LIVE_STATE_INDEX_ROW_SPACE,
+            final_deltas.len() - delete_count,
+            delete_count,
+        );
 
         let identities_to_load = final_deltas
             .keys()

@@ -331,6 +331,10 @@ where
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         self.validate_append(&append).await?;
 
+        self.writes
+            .reserve_space(CHANGE_SPACE, append.changes.len(), 0);
+        self.staged_changes.reserve(append.changes.len());
+
         for change in append.changes {
             self.writes.put(
                 CHANGE_SPACE,
