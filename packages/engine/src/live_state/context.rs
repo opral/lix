@@ -223,10 +223,7 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<std::sync::Arc<FilesystemPathIndex>, LixError> {
-        let revision = {
-            let store = self.store.lock().await;
-            load_path_index_revision(&*store)?
-        };
+        let revision = load_path_index_revision(&self.store).await?;
         if let Some(index) = self
             .filesystem_path_index_cache
             .get(request, revision.as_deref())

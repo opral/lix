@@ -505,7 +505,7 @@ impl FilesystemPathIndexCache {
     }
 }
 
-pub(crate) fn load_path_index_revision(
+pub(crate) async fn load_path_index_revision(
     store: &(impl StorageRead + ?Sized),
 ) -> Result<Option<Vec<u8>>, LixError> {
     let result = PointReadPlan::new(
@@ -516,9 +516,9 @@ pub(crate) fn load_path_index_revision(
         store,
         StorageGetOptions {
             projection: StorageCoreProjection::FullValue,
-            ..StorageGetOptions::default()
         },
-    )?;
+    )
+    .await?;
     Ok(result
         .value
         .into_iter()

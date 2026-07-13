@@ -1360,8 +1360,11 @@ where
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         if !self.staged_writes.has_staged_filesystem_descriptors()? {
-            let read =
-                SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+            let read = SharedStorageRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
             return self.live_state.reader(read).path_index(request).await;
         }
         let rows = self
