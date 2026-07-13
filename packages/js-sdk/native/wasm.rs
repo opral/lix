@@ -30,6 +30,7 @@ type BrowserObserveEvents = RsObserveEvents<InMemoryBackend>;
 #[wasm_bindgen]
 pub struct WasmLix {
     inner: BrowserLix,
+    backend: InMemoryBackend,
 }
 
 #[wasm_bindgen]
@@ -46,15 +47,35 @@ pub struct WasmObserveEvents {
 
 #[wasm_bindgen(js_name = openMemory)]
 pub async fn open_memory(plugin_runtime_dispatch: Function) -> Result<WasmLix, JsValue> {
+    open_memory_from_snapshot(plugin_runtime_dispatch, None).await
+}
+
+#[wasm_bindgen(js_name = openMemoryFromSnapshot)]
+pub async fn open_memory_from_snapshot(
+    plugin_runtime_dispatch: Function,
+    snapshot: Option<Vec<u8>>,
+) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
     let runtime = Arc::new(BrowserJsWasmRuntime::new(plugin_runtime_dispatch));
-    let options = RsOpenLixOptions::default().with_wasm_runtime(runtime);
+    let backend = match snapshot {
+        Some(snapshot) => InMemoryBackend::from_snapshot(&snapshot)
+            .map_err(|error| lix_error_to_js(error.into()))?,
+        None => InMemoryBackend::new(),
+    };
+    let options = RsOpenLixOptions::new(backend.clone()).with_wasm_runtime(runtime);
     let inner = open_lix(options).await.map_err(lix_error_to_js)?;
-    Ok(WasmLix { inner })
+    Ok(WasmLix { inner, backend })
 }
 
 #[wasm_bindgen]
 impl WasmLix {
+    #[wasm_bindgen(js_name = exportSnapshot)]
+    pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
+        self.backend
+            .export_snapshot()
+            .map_err(|error| lix_error_to_js(error.into()))
+    }
+
     #[wasm_bindgen(js_name = execute)]
     pub async fn execute(
         &self,
