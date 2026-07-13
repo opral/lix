@@ -131,13 +131,52 @@ where
         &self,
         request: &LiveStateIndexRowRequest,
     ) -> Result<Option<LiveStateIndexRow>, LixError> {
-        let Some(root_id) = self.load_branch_root(&request.branch_id)? else {
-            return Ok(None);
-        };
         Ok(self
-            .load_index_entry(&root_id, request)
+            .load_index_rows(std::slice::from_ref(request))
             .await?
-            .map(|(key, value)| materialize_index_entry(&request.branch_id, key, value)))
+            .pop()
+            .flatten())
+    }
+
+    /// Loads current index headers in request order without hydrating payloads.
+    ///
+    /// Requests are batched by branch so each branch root is loaded once and
+    /// all of its keys share one tree traversal.
+    pub(crate) async fn load_index_rows(
+        &self,
+        requests: &[LiveStateIndexRowRequest],
+    ) -> Result<Vec<Option<LiveStateIndexRow>>, LixError> {
+        let mut requests_by_branch = BTreeMap::<&str, Vec<(usize, TrackedStateKey)>>::new();
+        for (request_index, request) in requests.iter().enumerate() {
+            requests_by_branch
+                .entry(&request.branch_id)
+                .or_default()
+                .push((
+                    request_index,
+                    TrackedStateKey {
+                        schema_key: request.schema_key.clone(),
+                        file_id: request.file_id.clone(),
+                        entity_pk: request.entity_pk.clone(),
+                    },
+                ));
+        }
+
+        let mut rows = vec![None; requests.len()];
+        for (branch_id, indexed_keys) in requests_by_branch {
+            let Some(root_id) = self.load_branch_root(branch_id)? else {
+                continue;
+            };
+            let keys = indexed_keys
+                .iter()
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            let values = self.tree.get_many(&self.store, &root_id, &keys).await?;
+            for ((request_index, key), value) in indexed_keys.into_iter().zip(values) {
+                rows[request_index] =
+                    value.map(|value| materialize_index_entry(branch_id, key, value));
+            }
+        }
+        Ok(rows)
     }
 
     async fn load_index_entry(
