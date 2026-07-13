@@ -111,6 +111,7 @@ where
             HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
+            ordering: None,
             load: row_source(
                 (
                     Arc::clone(&self.spec),

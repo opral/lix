@@ -23,7 +23,8 @@ use crate::common::LixTimestamp;
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    FilesystemIndex, FilesystemRowContext, blob_ref_tombstone_row, filesystem_schema_keys,
+    FilesystemIndex, FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    FilesystemRowContext, blob_ref_tombstone_row, build_path_index, filesystem_schema_keys,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
@@ -1006,6 +1007,13 @@ where
         })
     }
 
+    fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
+        Arc::new(TransactionReadLiveStateReader {
+            base: self.live_state.reader(self.read_store.clone()),
+            staged: self.staged.clone(),
+        })
+    }
+
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
@@ -1139,6 +1147,19 @@ where
             .await?
             .into_iter()
             .next())
+    }
+}
+
+#[async_trait]
+impl<R> FilesystemPathIndexReader for TransactionReadLiveStateReader<R>
+where
+    R: crate::storage::StorageBackendRead + Send + 'static,
+{
+    async fn path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        build_path_index(self, request).await
     }
 }
 
@@ -1332,6 +1353,24 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         self.scan_visible_live_state(request).await
+    }
+
+    async fn filesystem_path_index(
+        &mut self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        if !self.staged_writes.has_staged_filesystem_descriptors()? {
+            let read = SharedStorageRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
+            return self.live_state.reader(read).path_index(request).await;
+        }
+        let rows = self
+            .scan_visible_live_state(&request.live_state_request())
+            .await?;
+        Ok(Arc::new(FilesystemPathIndex::from_live_rows(rows)?))
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {

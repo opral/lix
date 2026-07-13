@@ -35,6 +35,10 @@ use crate::branch::BranchRefReader;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
+use crate::filesystem::{
+    FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
+    FilesystemPathSelection,
+};
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
     LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -72,10 +76,10 @@ use crate::filesystem::{
     FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
     FilesystemBlobRefKey, FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
     blob_ref_row, blob_ref_tombstone_row, derive_directory_paths,
-    directory_path_resolvers_from_live_state, directory_path_resolvers_from_state_rows,
-    file_descriptor_row, file_descriptor_write_row, filesystem_storage_scope_key, plan_file_delete,
-    plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
-    plan_parsed_file_path_write_with_resolvers,
+    directory_path_resolvers_from_live_state, directory_path_resolvers_from_path_index,
+    directory_path_resolvers_from_state_rows, file_descriptor_row, file_descriptor_write_row,
+    filesystem_storage_scope_key, plan_file_delete, plan_file_descriptor_write,
+    plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -100,6 +104,7 @@ pub(super) async fn register_lix_file_active_provider(
     surface_name: &str,
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
@@ -111,6 +116,7 @@ pub(super) async fn register_lix_file_active_provider(
         Arc::new(LixFileSpec::active_branch(
             active_branch_id,
             live_state,
+            filesystem_path_index,
             branch_ref,
             blob_reader,
             plugin_host,
@@ -124,6 +130,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
     session: &SessionContext,
     surface_name: &str,
     live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
@@ -134,6 +141,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
         surface_name,
         Arc::new(LixFileSpec::by_branch(
             live_state,
+            filesystem_path_index,
             branch_ref,
             blob_reader,
             plugin_host,
@@ -184,6 +192,7 @@ pub(super) async fn register_active_write_provider(
 struct LixFileSpec {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
@@ -196,14 +205,35 @@ struct LixFileDmlSourceState {
     blob_ref_keys: BTreeSet<FilesystemBlobRefKey>,
     plugin_render: Option<PluginRenderContext>,
     path_resolver_rows: Option<Vec<MaterializedLiveStateRow>>,
+    path_index: Option<FilesystemPathSelection>,
 }
 
 type SharedLixFileDmlSourceState = Arc<Mutex<Option<LixFileDmlSourceState>>>;
 
 impl LixFileSpec {
+    async fn indexed_path_matches(
+        &self,
+        request: &LiveStateScanRequest,
+        filters: &[Expr],
+    ) -> Result<Option<FilesystemPathSelection>> {
+        let predicate = file_path_predicate_from_filters(filters);
+        if predicate == FilePathPredicate::All {
+            return Ok(None);
+        }
+        let index = self
+            .filesystem_path_index
+            .path_index(&FilesystemPathIndexRequest::new(
+                request.filter.branch_ids.clone(),
+            ))
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        Ok(Some(indexed_file_matches(index, &predicate)))
+    }
+
     fn active_branch(
         active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
         plugin_host: PluginRuntimeHost,
@@ -212,6 +242,7 @@ impl LixFileSpec {
         Self {
             schema: lix_file_schema(),
             live_state,
+            filesystem_path_index,
             branch_ref,
             blob_reader,
             plugin_host,
@@ -229,11 +260,13 @@ impl LixFileSpec {
         let active_branch_id = write_ctx.active_branch_id();
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
         Self {
             schema: lix_file_schema(),
             live_state,
+            filesystem_path_index,
             branch_ref,
             blob_reader,
             plugin_host,
@@ -245,6 +278,7 @@ impl LixFileSpec {
 
     fn by_branch(
         live_state: Arc<dyn LiveStateReader>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
         plugin_host: PluginRuntimeHost,
@@ -253,6 +287,7 @@ impl LixFileSpec {
         Self {
             schema: lix_file_by_branch_schema(),
             live_state,
+            filesystem_path_index,
             branch_ref,
             blob_reader,
             plugin_host,
@@ -269,11 +304,13 @@ impl LixFileSpec {
     ) -> Self {
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
         Self {
             schema: lix_file_by_branch_schema(),
             live_state,
+            filesystem_path_index,
             branch_ref,
             blob_reader,
             plugin_host,
@@ -291,6 +328,7 @@ impl LixFileSpec {
         write_ctx: &SqlWriteContext,
         request: LiveStateScanRequest,
         target_file_ids: FileIdConstraint,
+        indexed_matches: Option<FilesystemPathSelection>,
         needs_data: bool,
         capture_path_resolver_rows: bool,
         captured: SharedLixFileDmlSourceState,
@@ -303,6 +341,7 @@ impl LixFileSpec {
                 Arc::clone(&self.schema),
                 request,
                 target_file_ids,
+                indexed_matches,
                 needs_data,
                 capture_path_resolver_rows,
                 captured,
@@ -314,31 +353,55 @@ impl LixFileSpec {
                 table_schema,
                 request,
                 target_file_ids,
+                indexed_matches,
                 needs_data,
                 capture_path_resolver_rows,
                 captured,
             )| async move {
                 *captured.lock().expect("lix_file DML source mutex poisoned") = None;
                 let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-                let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+                let (prepared, path_resolver_rows, path_index) = if let Some(indexed_matches) =
+                    indexed_matches.as_ref()
+                {
+                    let rows =
+                        scan_indexed_file_rows(live_state.clone(), &request, indexed_matches, true)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    (
+                        prepare_indexed_lix_file_rows(indexed_matches, rows),
+                        None,
+                        capture_path_resolver_rows.then(|| indexed_matches.clone()),
+                    )
+                } else {
+                    let rows =
+                        scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    let path_resolver_rows = capture_path_resolver_rows.then(|| rows.clone());
+                    (
+                        prepare_lix_file_rows(rows, &FilePathPredicate::All),
+                        path_resolver_rows,
+                        None,
+                    )
+                };
+                let prepared = prepared.map_err(lix_error_to_datafusion_error)?;
+                let plugin_render = if prepared.needs_plugin_render(needs_data) {
+                    plugin_render_context_for_lix_file_scan(
+                        live_state,
+                        &blob_reader,
+                        &request,
+                        plugin_host,
+                        needs_data,
+                    )
                     .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                let plugin_render = plugin_render_context_for_lix_file_scan(
-                    live_state,
-                    &blob_reader,
-                    &request,
-                    plugin_host,
-                    needs_data,
-                )
-                .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!(
-                        "sql2 lix_file plugin discovery failed: {error}"
-                    ))
-                })?;
-                let path_resolver_rows = capture_path_resolver_rows.then(|| rows.clone());
-                let prepared = prepare_lix_file_rows(rows, &FilePathPredicate::All)
-                    .map_err(lix_error_to_datafusion_error)?;
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file plugin discovery failed: {error}"
+                        ))
+                    })?
+                } else {
+                    None
+                };
                 let blob_ref_keys = prepared.blob_rows.keys().cloned().collect();
                 let source_batch = lix_file_record_batch_from_prepared(
                     &table_schema,
@@ -354,6 +417,7 @@ impl LixFileSpec {
                         blob_ref_keys,
                         plugin_render,
                         path_resolver_rows,
+                        path_index,
                     });
                 Ok(source_batch)
             },
@@ -436,16 +500,42 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
+        let needs_blob_rows = scan_needs_blob_rows(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let path_predicate = file_path_predicate_from_filters(&filters);
+        let use_path_index = path_predicate != FilePathPredicate::All
+            || (filters.is_empty()
+                && projected_schema.index_of("path").is_ok()
+                && !needs_blob_rows);
+        let indexed_matches = if !use_path_index {
+            None
+        } else {
+            let index = self
+                .filesystem_path_index
+                .path_index(&FilesystemPathIndexRequest::new(
+                    request.filter.branch_ids.clone(),
+                ))
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            let matches = indexed_file_matches(Arc::clone(&index), &path_predicate);
+            let index_scan_threshold =
+                2_048_usize.max(index.kind_count(FilesystemPathKind::File) / 1_000);
+            if needs_blob_rows && matches.len() > index_scan_threshold {
+                None
+            } else {
+                Some(matches)
+            }
+        };
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, props))
             .collect::<Result<Vec<_>>>()?;
+        let ordering = indexed_matches.as_ref().map(|_| "path".to_string());
         Ok(PlannedScan {
             schema: Arc::clone(&projected_schema),
+            ordering,
             load: row_source(
                 (
                     Arc::clone(&self.live_state),
@@ -456,8 +546,10 @@ impl TableSpec for LixFileSpec {
                     request,
                     target_file_ids,
                     path_predicate,
+                    indexed_matches,
                     physical_filters,
                     needs_data,
+                    needs_blob_rows,
                     limit,
                 ),
                 |(
@@ -469,25 +561,45 @@ impl TableSpec for LixFileSpec {
                     request,
                     target_file_ids,
                     path_predicate,
+                    indexed_matches,
                     filters,
                     needs_data,
+                    needs_blob_rows,
                     limit,
                 )| async move {
-                    let rows = scan_lix_file_live_rows(
-                        Arc::clone(&live_state),
-                        &request,
-                        &target_file_ids,
-                    )
-                    .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
-                    })?;
-                    let prepared =
-                        prepare_lix_file_rows(rows, &path_predicate).map_err(|error| {
+                    let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
+                        let rows = scan_indexed_file_rows(
+                            Arc::clone(&live_state),
+                            &request,
+                            indexed_matches,
+                            needs_blob_rows,
+                        )
+                        .await
+                        .map_err(|error| {
                             DataFusionError::Execution(format!(
-                                "sql2 lix_file row preparation failed: {error}"
+                                "sql2 indexed lix_file scan failed: {error}"
                             ))
                         })?;
+                        prepare_indexed_lix_file_rows(indexed_matches, rows)
+                    } else {
+                        let rows = scan_lix_file_live_rows(
+                            Arc::clone(&live_state),
+                            &request,
+                            &target_file_ids,
+                        )
+                        .await
+                        .map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "sql2 lix_file scan failed: {error}"
+                            ))
+                        })?;
+                        prepare_lix_file_rows(rows, &path_predicate)
+                    }
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file row preparation failed: {error}"
+                        ))
+                    })?;
                     let plugin_render = if prepared.needs_plugin_render(needs_data) {
                         plugin_render_context_for_lix_file_scan(
                             Arc::clone(&live_state),
@@ -579,12 +691,14 @@ impl TableSpec for LixFileSpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
+        let indexed_matches = self.indexed_path_matches(&request, filters).await?;
 
         let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
         let source = self.dml_source(
             &write_ctx,
             request,
             target_file_ids,
+            indexed_matches,
             needs_data,
             false,
             Arc::clone(&captured),
@@ -640,6 +754,7 @@ impl TableSpec for LixFileSpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
+        let indexed_matches = self.indexed_path_matches(&request, filters).await?;
 
         let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let capture_path_resolver_rows = (update_columns.path || update_columns.descriptor)
@@ -652,6 +767,7 @@ impl TableSpec for LixFileSpec {
             &write_ctx,
             request,
             target_file_ids,
+            indexed_matches,
             needs_data,
             capture_path_resolver_rows,
             Arc::clone(&captured),
@@ -669,6 +785,7 @@ impl TableSpec for LixFileSpec {
                     blob_ref_keys,
                     plugin_render,
                     path_resolver_rows,
+                    path_index,
                 } = lix_file_dml_source_state(&captured, "UPDATE")?;
                 let assignment_values =
                     UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
@@ -684,21 +801,25 @@ impl TableSpec for LixFileSpec {
                 };
                 let mut path_resolvers = None;
                 if update_columns.path || update_columns.descriptor {
-                    path_resolvers = Some(
-                        if let (Some(rows), Some(active_branch_id)) =
-                            (path_resolver_rows, branch_binding.active_branch_id())
-                        {
-                            path_resolvers_from_dml_source_rows(rows, active_branch_id)
-                                .map_err(lix_error_to_datafusion_error)?
-                        } else {
-                            directory_path_resolvers_from_live_state(
-                                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                                branch_binding.active_branch_id(),
-                            )
-                            .await
+                    path_resolvers = Some(if let Some(path_index) = path_index {
+                        directory_path_resolvers_from_path_index(
+                            path_index.index(),
+                            branch_binding.active_branch_id(),
+                        )
+                        .map_err(lix_error_to_datafusion_error)?
+                    } else if let (Some(rows), Some(active_branch_id)) =
+                        (path_resolver_rows, branch_binding.active_branch_id())
+                    {
+                        path_resolvers_from_dml_source_rows(rows, active_branch_id)
                             .map_err(lix_error_to_datafusion_error)?
-                        },
-                    );
+                    } else {
+                        directory_path_resolvers_from_live_state(
+                            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                            branch_binding.active_branch_id(),
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                    });
                 }
                 let staged = lix_file_update_stage_from_batch(
                     &matched_batch,
@@ -1504,6 +1625,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
         file_rows,
         blob_rows,
         file_paths,
+        ..
     } = prepare_lix_file_rows(rows, &FilePathPredicate::All)?;
     let existing = file_rows
         .into_iter()
@@ -2409,6 +2531,7 @@ struct PreparedLixFileRows {
     file_rows: BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
     file_paths: BTreeMap<FilesystemDescriptorKey, String>,
+    path_ordered_file_keys: Option<Vec<FilesystemDescriptorKey>>,
 }
 
 impl PreparedLixFileRows {
@@ -2532,6 +2655,65 @@ fn prepare_lix_file_rows(
         file_rows,
         blob_rows,
         file_paths,
+        path_ordered_file_keys: None,
+    })
+}
+
+fn prepare_indexed_lix_file_rows(
+    matches: &FilesystemPathSelection,
+    rows: Vec<MaterializedLiveStateRow>,
+) -> Result<PreparedLixFileRows, LixError> {
+    let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
+    let mut file_paths = BTreeMap::<FilesystemDescriptorKey, String>::new();
+    let mut path_ordered_file_keys = Vec::with_capacity(matches.len());
+    for entry in matches.entries() {
+        if entry.kind != FilesystemPathKind::File {
+            continue;
+        }
+        let key = entry.key.clone();
+        path_ordered_file_keys.push(key.clone());
+        file_paths.insert(key.clone(), entry.path.clone());
+        file_rows.insert(
+            key.clone(),
+            FileDescriptorRecord {
+                id: entry.id().to_string(),
+                directory_id: entry.parent_id.clone(),
+                name: entry.name.clone(),
+                key,
+                live: entry.live_row(),
+            },
+        );
+    }
+
+    let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
+    for row in rows {
+        if row.schema_key != BLOB_REF_SCHEMA_KEY {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot: BlobRefSnapshot =
+            serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
+                )
+            })?;
+        blob_rows.insert(
+            FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
+            BlobRefRecord {
+                blob_hash: snapshot.blob_hash,
+                live: row,
+            },
+        );
+    }
+
+    Ok(PreparedLixFileRows {
+        file_rows,
+        blob_rows,
+        file_paths,
+        path_ordered_file_keys: Some(path_ordered_file_keys),
     })
 }
 
@@ -2549,9 +2731,10 @@ async fn lix_file_record_batch_from_prepared(
         .collect::<Vec<_>>();
     let needs_data = load_data && projected_columns.contains(&"data");
     let PreparedLixFileRows {
-        file_rows,
+        mut file_rows,
         blob_rows,
         mut file_paths,
+        path_ordered_file_keys,
     } = prepared;
     let mut ids = Vec::new();
     let mut paths = Vec::new();
@@ -2575,7 +2758,12 @@ async fn lix_file_record_batch_from_prepared(
         LoadedBlobBytes::default()
     };
 
-    for (key, file) in file_rows {
+    let file_keys =
+        path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect::<Vec<_>>());
+    for key in file_keys {
+        let file = file_rows
+            .remove(&key)
+            .expect("prepared lix_file order should reference a descriptor");
         let path = file_paths
             .remove(&key)
             .expect("prepared lix_file descriptor should have a path");
@@ -2834,6 +3022,26 @@ fn scan_needs_data(
     projected_needs_data || filters.iter().any(|filter| contains_column(filter, "data"))
 }
 
+fn scan_needs_blob_rows(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projects_blob_column = match projection {
+        Some(indices) => indices.iter().any(|index| {
+            matches!(
+                base_schema.field(*index).name().as_str(),
+                "data" | "lixcol_change_id"
+            )
+        }),
+        None => true,
+    };
+    projects_blob_column
+        || filters.iter().any(|filter| {
+            contains_column(filter, "data") || contains_column(filter, "lixcol_change_id")
+        })
+}
+
 fn lix_file_scan_request(
     branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
@@ -2903,6 +3111,37 @@ async fn scan_lix_file_live_rows(
     Ok(rows)
 }
 
+async fn scan_indexed_file_rows(
+    live_state: Arc<dyn LiveStateReader>,
+    request: &LiveStateScanRequest,
+    matches: &FilesystemPathSelection,
+    needs_blob_rows: bool,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    if matches.is_empty() || !needs_blob_rows {
+        return Ok(Vec::new());
+    }
+    let file_ids = matches
+        .entries()
+        .filter(|entry| entry.kind == FilesystemPathKind::File)
+        .map(|entry| entry.id().to_string())
+        .collect::<BTreeSet<_>>();
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut blob_request = request.clone();
+    blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
+    blob_request.filter.entity_pks = file_ids
+        .iter()
+        .map(|file_id| EntityPk::single(file_id.clone()))
+        .collect();
+    blob_request.filter.file_ids = file_ids
+        .into_iter()
+        .map(crate::NullableKeyFilter::Value)
+        .collect();
+    blob_request.limit = None;
+    live_state.scan_rows(&blob_request).await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileIdConstraint {
     All,
@@ -2959,7 +3198,7 @@ fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FilePathPredicate {
+pub(super) enum FilePathPredicate {
     All,
     Comparison {
         operation: FilePathComparison,
@@ -2997,7 +3236,7 @@ impl FilePathPredicate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilePathComparison {
+pub(super) enum FilePathComparison {
     Equal,
     LessThan,
     LessThanOrEqual,
@@ -3027,7 +3266,7 @@ impl FilePathComparison {
     }
 }
 
-fn file_path_predicate_from_filters(filters: &[Expr]) -> FilePathPredicate {
+pub(super) fn file_path_predicate_from_filters(filters: &[Expr]) -> FilePathPredicate {
     filters
         .iter()
         .fold(FilePathPredicate::All, |predicate, filter| {
@@ -3051,6 +3290,70 @@ fn file_path_predicate_from_expr(expr: &Expr) -> FilePathPredicate {
         Expr::InList(in_list) => file_path_in_predicate(in_list),
         _ => FilePathPredicate::All,
     }
+}
+
+pub(super) fn indexed_path_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+    predicate: &FilePathPredicate,
+    kind: FilesystemPathKind,
+) -> FilesystemPathSelection {
+    fn indices(
+        index: &crate::filesystem::FilesystemPathIndex,
+        predicate: &FilePathPredicate,
+        kind: FilesystemPathKind,
+    ) -> BTreeSet<usize> {
+        let candidate_indices: Box<dyn Iterator<Item = usize>> = match predicate {
+            FilePathPredicate::All => Box::new(index.all_indices()),
+            FilePathPredicate::Comparison { operation, value } => {
+                let range = match operation {
+                    FilePathComparison::Equal => index.exact_indices(value),
+                    FilePathComparison::LessThan => index.range_indices(
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Excluded(value.as_str()),
+                    ),
+                    FilePathComparison::LessThanOrEqual => index.range_indices(
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Included(value.as_str()),
+                    ),
+                    FilePathComparison::GreaterThan => index.range_indices(
+                        std::ops::Bound::Excluded(value.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ),
+                    FilePathComparison::GreaterThanOrEqual => index.range_indices(
+                        std::ops::Bound::Included(value.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ),
+                };
+                Box::new(range)
+            }
+            FilePathPredicate::In(values) => {
+                Box::new(values.iter().flat_map(|value| index.exact_indices(value)))
+            }
+            FilePathPredicate::And(left, right) => {
+                let left = indices(index, left, kind);
+                let right = indices(index, right, kind);
+                return left.intersection(&right).copied().collect();
+            }
+            FilePathPredicate::Or(left, right) => {
+                let mut matches = indices(index, left, kind);
+                matches.extend(indices(index, right, kind));
+                return matches;
+            }
+        };
+        candidate_indices
+            .filter(|candidate| index.entry(*candidate).kind == kind)
+            .collect()
+    }
+
+    let indices = indices(&index, predicate, kind).into_iter().collect();
+    FilesystemPathSelection::new(index, indices)
+}
+
+fn indexed_file_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+    predicate: &FilePathPredicate,
+) -> FilesystemPathSelection {
+    indexed_path_matches(index, predicate, FilesystemPathKind::File)
 }
 
 fn file_path_comparison_from_binary_filter(binary_expr: &BinaryExpr) -> Option<FilePathPredicate> {

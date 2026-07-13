@@ -78,6 +78,7 @@ where
         let payload_projection = change_payload_projection(schema.as_ref(), filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
+            ordering: None,
             load: row_source(
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {

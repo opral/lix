@@ -403,6 +403,21 @@ impl TransactionWriteBuffer {
         })
     }
 
+    pub(crate) fn has_staged_filesystem_descriptors(&self) -> Result<bool, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        Ok(rows.iter().flatten().any(|row| {
+            matches!(
+                row.schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor"
+            )
+        }))
+    }
+
     /// Returns transaction-local file bytes addressed by their eventual CAS hash.
     ///
     /// File data is flushed into the binary CAS only during commit, while SQL reads

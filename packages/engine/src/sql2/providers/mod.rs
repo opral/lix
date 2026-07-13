@@ -146,6 +146,7 @@ where
                     &surface.name,
                     ctx.active_branch_id(),
                     ctx.live_state(),
+                    ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
                     ctx.plugin_host(),
@@ -158,6 +159,7 @@ where
                     session,
                     &surface.name,
                     ctx.live_state(),
+                    ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
                     ctx.plugin_host(),
@@ -182,6 +184,7 @@ where
                     &surface.name,
                     ctx.active_branch_id(),
                     ctx.live_state(),
+                    ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
                 )
@@ -192,6 +195,7 @@ where
                     session,
                     &surface.name,
                     ctx.live_state(),
+                    ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
                 )

@@ -10,6 +10,10 @@ use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
+use crate::filesystem::{
+    FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    UncachedFilesystemPathIndexReader,
+};
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
@@ -50,6 +54,9 @@ pub(crate) trait SqlExecutionContext {
 
     fn active_branch_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
+    fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
+        Arc::new(UncachedFilesystemPathIndexReader::new(self.live_state()))
+    }
     fn functions(&self) -> FunctionProviderHandle;
     fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore>;
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
@@ -70,7 +77,7 @@ pub(crate) trait SqlExecutionContext {
 /// payloads stay in the existing engine forms so this boundary centralizes
 /// authority without adding another translation layer.
 #[async_trait]
-pub(crate) trait SqlWriteExecutionContext {
+pub(crate) trait SqlWriteExecutionContext: Send {
     fn active_branch_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
@@ -84,6 +91,14 @@ pub(crate) trait SqlWriteExecutionContext {
         &mut self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+
+    async fn filesystem_path_index(
+        &mut self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let rows = self.scan_live_state(&request.live_state_request()).await?;
+        Ok(Arc::new(FilesystemPathIndex::from_live_rows(rows)?))
+    }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
 
@@ -186,6 +201,22 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .load_branch_head(branch_id)
+                .await
+        }
+    }
+
+    pub(crate) async fn filesystem_path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .filesystem_path_index(request)
                 .await
         }
     }
@@ -294,6 +325,16 @@ impl LiveStateReader for WriteContextLiveStateReader {
             })
             .await?;
         Ok(rows.pop())
+    }
+}
+
+#[async_trait]
+impl FilesystemPathIndexReader for WriteContextLiveStateReader {
+    async fn path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        self.ctx.filesystem_path_index(request).await
     }
 }
 
