@@ -488,9 +488,8 @@ fn entity_system_columns(variant: EntitySurfaceShape) -> Vec<PublicColumn> {
             | "lixcol_updated_at" | "lixcol_commit_id" => {
                 PublicColumn::public_read_only(field.name().as_str())
             }
-            "lixcol_entity_pk" | "lixcol_global" | "lixcol_untracked" | "lixcol_branch_id" => {
-                PublicColumn::public_insert_only(field.name().as_str())
-            }
+            "lixcol_entity_pk" | "lixcol_file_id" | "lixcol_global" | "lixcol_untracked"
+            | "lixcol_branch_id" => PublicColumn::public_insert_only(field.name().as_str()),
             "lixcol_metadata" => PublicColumn::public(field.name().as_str()),
             _ => PublicColumn::hidden(field.name().as_str()),
         })

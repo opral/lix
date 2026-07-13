@@ -1141,6 +1141,92 @@ simulation_test!(
 );
 
 simulation_test!(
+    typed_entity_update_accepts_file_id_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES \
+                 ('file-1', '/file-1.txt', X'31'), \
+                 ('file-2', '/file-2.txt', X'32')",
+                &[],
+            )
+            .await
+            .expect("file inserts should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_file_scoped_entity_schema \
+                 (id, name, lixcol_file_id, lixcol_global, lixcol_untracked) \
+                 VALUES \
+                 ('row-1', 'before-1', 'file-1', false, false), \
+                 ('row-2', 'before-2', 'file-2', false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity inserts with file ids should succeed");
+
+        let update = session
+            .execute(
+                "UPDATE engine_file_scoped_entity_schema \
+                 SET name = 'after' \
+                 WHERE lixcol_file_id = 'file-1'",
+                &[],
+            )
+            .await
+            .expect("file id should be accepted in an entity write predicate");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT id, name, lixcol_file_id \
+                 FROM engine_file_scoped_entity_schema \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("entity file id should be readable");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("row-1".to_string()),
+                    Value::Text("after".to_string()),
+                    Value::Text("file-1".to_string()),
+                ],
+                vec![
+                    Value::Text("row-2".to_string()),
+                    Value::Text("before-2".to_string()),
+                    Value::Text("file-2".to_string()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
     typed_entity_update_accepts_parseable_json_text_identity_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
