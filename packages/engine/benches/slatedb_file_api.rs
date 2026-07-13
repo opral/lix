@@ -95,8 +95,78 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
 
     group.finish();
 
+    cached_cold_lifecycle_benches(c, &runtime);
+    cached_preloaded_request_benches(c, &runtime);
     fresh_engine_select_benches(c, &runtime);
     backend_concurrency_benches(c);
+}
+
+fn cached_cold_lifecycle_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
+    let mut group = c.benchmark_group("slatedb_file_api_cached_cold_lifecycle");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &delay_ms in FRESH_ENGINE_DELAYS_MS {
+        let delay = Duration::from_millis(delay_ms);
+        for stage in CachedLifecycleStage::ALL {
+            group.bench_with_input(
+                BenchmarkId::new(stage.label(), format!("{delay_ms}ms")),
+                &(delay, stage),
+                |b, &(delay, stage)| {
+                    b.iter_custom(|iterations| {
+                        let fixture = runtime.block_on(CachedLifecycleBenchFixture::seeded(delay));
+                        measure_prepared_iterations(
+                            iterations,
+                            // Keep cache-directory creation and teardown outside the
+                            // cumulative startup interval.
+                            || tempfile::tempdir().expect("create lifecycle cache directory"),
+                            |cache_dir| runtime.block_on(fixture.run(stage, cache_dir)),
+                        )
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn cached_preloaded_request_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
+    let mut group = c.benchmark_group("slatedb_file_api_cached_preloaded_request");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &delay_ms in FRESH_ENGINE_DELAYS_MS {
+        let delay = Duration::from_millis(delay_ms);
+        for stage in CachedRequestStage::ALL {
+            group.bench_with_input(
+                BenchmarkId::new(stage.label(), format!("{delay_ms}ms")),
+                &(delay, stage),
+                |b, &(delay, stage)| {
+                    b.iter_custom(|iterations| {
+                        let fixture = runtime.block_on(CachedRequestBenchFixture::seeded(delay));
+                        // Reuse the preloaded backend while starting each sample with
+                        // a fresh Engine to isolate request-serving latency.
+                        measure_prepared_iterations(
+                            iterations,
+                            || runtime.block_on(fixture.prepare_engine(stage)),
+                            |engine| {
+                                runtime.block_on(lixray_download_file(
+                                    engine,
+                                    &fixture.main_branch_id,
+                                    &fixture.file_id,
+                                ))
+                            },
+                        )
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
 }
 
 fn fresh_engine_select_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
@@ -357,6 +427,154 @@ struct FreshEngineSelectBenchFixture {
     file_id: String,
 }
 
+#[derive(Clone, Copy)]
+enum CachedLifecycleStage {
+    BackendOpen,
+    EngineOpen,
+    FirstRequest,
+    SecondRequest,
+}
+
+impl CachedLifecycleStage {
+    const ALL: [Self; 4] = [
+        Self::BackendOpen,
+        Self::EngineOpen,
+        Self::FirstRequest,
+        Self::SecondRequest,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::BackendOpen => "startup_through_backend_open",
+            Self::EngineOpen => "startup_through_engine_open",
+            Self::FirstRequest => "startup_through_first_request",
+            Self::SecondRequest => "startup_through_second_request",
+        }
+    }
+}
+
+struct CachedLifecycleBenchFixture {
+    seeded: SeededStore,
+}
+
+#[derive(Clone, Copy)]
+enum CachedRequestStage {
+    First,
+    Second,
+}
+
+impl CachedRequestStage {
+    const ALL: [Self; 2] = [Self::First, Self::Second];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::First => "first_request",
+            Self::Second => "second_request",
+        }
+    }
+}
+
+struct CachedRequestBenchFixture {
+    backend: SlateDbBackend,
+    _cache_dir: TempDir,
+    main_branch_id: String,
+    file_id: String,
+}
+
+impl CachedLifecycleBenchFixture {
+    async fn seeded(delay: Duration) -> Self {
+        let seeded = SeededStore::create().await;
+        seeded.object_store.set_delay(delay);
+        Self { seeded }
+    }
+
+    async fn run(
+        &self,
+        stage: CachedLifecycleStage,
+        cache_dir: &TempDir,
+    ) -> CachedLifecycleBenchResult {
+        let backend = SlateDbBackend::open_object_store_with_options(
+            self.seeded.db_path.clone(),
+            object_store_handle(&self.seeded.object_store),
+            cached_object_store_options(cache_dir),
+        )
+        .expect("open cached lifecycle backend");
+        if matches!(stage, CachedLifecycleStage::BackendOpen) {
+            return CachedLifecycleBenchResult {
+                _value: 1,
+                _backend: backend,
+                _engine: None,
+            };
+        }
+
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("open cached lifecycle engine");
+        if matches!(stage, CachedLifecycleStage::EngineOpen) {
+            return CachedLifecycleBenchResult {
+                _value: 1,
+                _backend: backend,
+                _engine: Some(engine),
+            };
+        }
+
+        let first =
+            lixray_download_file(&engine, &self.seeded.main_branch_id, &self.seeded.file_id).await;
+        if matches!(stage, CachedLifecycleStage::FirstRequest) {
+            return CachedLifecycleBenchResult {
+                _value: first,
+                _backend: backend,
+                _engine: Some(engine),
+            };
+        }
+
+        let second =
+            lixray_download_file(&engine, &self.seeded.main_branch_id, &self.seeded.file_id).await;
+        CachedLifecycleBenchResult {
+            _value: first + second,
+            _backend: backend,
+            _engine: Some(engine),
+        }
+    }
+}
+
+struct CachedLifecycleBenchResult {
+    _value: usize,
+    _engine: Option<Engine<SlateDbBackend>>,
+    _backend: SlateDbBackend,
+}
+
+impl CachedRequestBenchFixture {
+    async fn seeded(delay: Duration) -> Self {
+        let seeded = SeededStore::create().await;
+        seeded.object_store.set_delay(delay);
+        let cache_dir = tempfile::tempdir().expect("create preloaded request cache directory");
+        let backend = SlateDbBackend::open_object_store_with_options(
+            seeded.db_path,
+            object_store_handle(&seeded.object_store),
+            cached_object_store_options(&cache_dir),
+        )
+        .expect("open cached preloaded request backend");
+
+        Self {
+            backend,
+            _cache_dir: cache_dir,
+            main_branch_id: seeded.main_branch_id,
+            file_id: seeded.file_id,
+        }
+    }
+
+    async fn prepare_engine(&self, stage: CachedRequestStage) -> Engine<SlateDbBackend> {
+        let engine = Engine::new(self.backend.clone())
+            .await
+            .expect("open cached preloaded request engine");
+        if matches!(stage, CachedRequestStage::Second) {
+            black_box(lixray_download_file(&engine, &self.main_branch_id, &self.file_id).await);
+        }
+        engine
+    }
+}
+
 impl FreshEngineSelectBenchFixture {
     async fn seeded(delay: Duration) -> Self {
         let seeded = SeededStore::create().await;
@@ -404,6 +622,26 @@ async fn download_file(session: &SessionContext<SlateDbBackend>, file_id: &str) 
         Value::Blob(bytes) => bytes.len(),
         other => panic!("download query returned non-blob value: {other:?}"),
     }
+}
+
+async fn lixray_download_file(
+    engine: &Engine<SlateDbBackend>,
+    branch_id: &str,
+    file_id: &str,
+) -> usize {
+    assert!(
+        engine
+            .load_branch_head_commit_id(branch_id)
+            .await
+            .expect("validate lifecycle branch")
+            .is_some(),
+        "seeded lifecycle branch should exist"
+    );
+    let session = engine
+        .open_session(branch_id.to_string())
+        .await
+        .expect("open lifecycle session");
+    download_file(&session, file_id).await
 }
 
 struct BackendConcurrencyFixture {
