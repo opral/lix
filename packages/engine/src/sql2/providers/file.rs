@@ -1157,6 +1157,16 @@ struct FileDescriptorRecord {
 }
 
 impl FileDescriptorRecord {
+    fn row_context(&self) -> FilesystemRowContext {
+        FilesystemRowContext {
+            branch_id: self.live.branch_id.clone(),
+            global: self.live.global,
+            untracked: self.live.untracked,
+            file_id: self.live.file_id.clone(),
+            metadata: None,
+        }
+    }
+
     fn directory_parent_keys(&self, directory_id: &str) -> Vec<FilesystemDescriptorKey> {
         let mut keys = vec![self.key.in_same_scope(directory_id)];
         if self.key.is_untracked() {
@@ -1166,14 +1176,7 @@ impl FileDescriptorRecord {
     }
 
     fn blob_ref_key(&self) -> FilesystemBlobRefKey {
-        let context = FilesystemRowContext {
-            branch_id: self.live.branch_id.clone(),
-            global: self.live.global,
-            untracked: self.live.untracked,
-            file_id: self.live.file_id.clone(),
-            metadata: None,
-        };
-        FilesystemBlobRefKey::from_context(&context, &self.id)
+        FilesystemBlobRefKey::from_context(&self.row_context(), &self.id)
     }
 }
 
@@ -1417,6 +1420,81 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         }
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await
+}
+
+pub(crate) async fn execute_fast_lix_file_data_update_by_id(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    file_id: Option<String>,
+    data: Vec<u8>,
+) -> Result<u64, LixError> {
+    let active_branch_id = ctx.active_branch_id().to_string();
+    ctx.load_branch_head(&active_branch_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::branch_not_found(
+                active_branch_id.clone(),
+                "execute bound public write",
+                "active branch",
+            )
+        })?;
+    let Some(file_id) = file_id else {
+        return Ok(0);
+    };
+    let mut file_request = lix_file_scan_request(Some(&active_branch_id), None, None);
+    file_request.filter.schema_keys = vec![
+        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+        BLOB_REF_SCHEMA_KEY.to_string(),
+    ];
+    file_request.filter.entity_pks = vec![EntityPk::single(file_id.clone())];
+    let mut rows = ctx.scan_live_state(&file_request).await?;
+
+    let mut directory_request = lix_file_scan_request(Some(&active_branch_id), None, None);
+    directory_request.filter.schema_keys = vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()];
+    rows.extend(ctx.scan_live_state(&directory_request).await?);
+
+    let PreparedLixFileRows {
+        file_rows,
+        blob_rows,
+        file_paths,
+    } = prepare_lix_file_rows(rows, &FilePathPredicate::All)?;
+    let existing = file_rows
+        .into_iter()
+        .filter(|(_, file)| file.id == file_id)
+        .map(|(key, file)| {
+            let path = file_paths
+                .get(&key)
+                .cloned()
+                .expect("prepared lix_file descriptor should have a path");
+            let has_blob_ref = blob_rows.contains_key(&file.blob_ref_key());
+            (path, file, has_blob_ref)
+        })
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        return Ok(0);
+    }
+
+    let mut staged = LixFileStagedBatch::default();
+    for (path, existing, has_blob_ref) in existing {
+        parse_file_upsert_path(&path, TransactionWriteOperation::Update)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        let mut context = existing.row_context();
+        if context.global {
+            context.branch_id = GLOBAL_BRANCH_ID.to_string();
+        }
+        stage_lix_file_data_update_write(
+            &mut staged,
+            existing.id,
+            Some(path),
+            None,
+            data.clone(),
+            context,
+            has_blob_ref,
+            None,
+        )
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        staged.add_count(1)?;
+    }
+    stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
 }
 
 struct FastLixFilePathWrite {

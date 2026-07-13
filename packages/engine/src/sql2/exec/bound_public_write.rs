@@ -16,7 +16,7 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
-use crate::sql2::plan::predicate::FilterSet;
+use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
@@ -27,7 +27,10 @@ use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
         BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
-        BoundWriteTarget::File(surface) => fast_file_path_write_shape(plan, surface).is_some(),
+        BoundWriteTarget::File(surface) => {
+            fast_file_path_write_shape(plan, surface).is_some()
+                || fast_file_data_update_shape(plan, surface).is_some()
+        }
         _ => false,
     }
 }
@@ -49,15 +52,94 @@ pub(crate) async fn try_execute_bound_public_write(
                 .map(BoundPublicWriteExecution::Executed)
         }
         BoundWriteTarget::File(surface) => {
-            let Some(shape) = fast_file_path_write_shape(plan, surface) else {
-                return Ok(BoundPublicWriteExecution::Unsupported);
-            };
-            execute_file_path_write(ctx, plan, params, shape)
-                .await
-                .map(BoundPublicWriteExecution::Executed)
+            if let Some(shape) = fast_file_path_write_shape(plan, surface) {
+                execute_file_path_write(ctx, plan, params, shape)
+                    .await
+                    .map(BoundPublicWriteExecution::Executed)
+            } else if let Some(shape) = fast_file_data_update_shape(plan, surface) {
+                execute_file_data_update(ctx, params, &shape)
+                    .await
+                    .map(BoundPublicWriteExecution::Executed)
+            } else {
+                Ok(BoundPublicWriteExecution::Unsupported)
+            }
         }
         _ => Ok(BoundPublicWriteExecution::Unsupported),
     }
+}
+
+struct FastFileDataUpdateShape {
+    id: BoundExpr,
+    data: BoundExpr,
+}
+
+async fn execute_file_data_update(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    shape: &FastFileDataUpdateShape,
+) -> Result<u64, LixError> {
+    let id = eval_fast_file_nullable_text(&shape.id, params, "id")?;
+    let data = eval_fast_file_blob(&shape.data, params, "data")?;
+    crate::sql2::providers::execute_fast_lix_file_data_update_by_id(ctx, id, data).await
+}
+
+fn fast_file_data_update_shape(
+    plan: &LogicalWritePlan,
+    surface: &FileWriteSurface,
+) -> Option<FastFileDataUpdateShape> {
+    if !matches!(surface, FileWriteSurface::Base)
+        || plan.bound.op != BoundWriteOp::Update
+        || !matches!(plan.bound.input, BoundWriteInput::None)
+        || plan.bound.conflict.is_some()
+        || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
+        || plan.bound.assignments.len() != 1
+    {
+        return None;
+    }
+    let assignment = &plan.bound.assignments[0];
+    if assignment.column.name != "data" || !fast_file_blob_expr_supported(&assignment.value) {
+        return None;
+    }
+    let id = fast_file_id_predicate_value(&plan.bound.predicate)?;
+    Some(FastFileDataUpdateShape {
+        id: id.clone(),
+        data: assignment.value.clone(),
+    })
+}
+
+fn fast_file_id_predicate_value(predicate: &BoundPredicate) -> Option<&BoundExpr> {
+    let BoundPredicate::Eq(left, right) = predicate else {
+        return None;
+    };
+    fast_file_id_column_value(left, right).or_else(|| fast_file_id_column_value(right, left))
+}
+
+fn fast_file_id_column_value<'a>(
+    column_expr: &BoundExpr,
+    value_expr: &'a BoundExpr,
+) -> Option<&'a BoundExpr> {
+    let BoundExpr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name == "id" && fast_file_text_expr_supported(value_expr) {
+        Some(value_expr)
+    } else {
+        None
+    }
+}
+
+fn fast_file_text_expr_supported(expr: &BoundExpr) -> bool {
+    matches!(
+        expr,
+        BoundExpr::Param(_) | BoundExpr::Literal(BoundLiteral::Text(_))
+    )
+}
+
+fn fast_file_blob_expr_supported(expr: &BoundExpr) -> bool {
+    matches!(
+        expr,
+        BoundExpr::Param(_) | BoundExpr::Literal(BoundLiteral::Blob(_))
+    )
 }
 
 async fn execute_entity_write(
@@ -250,6 +332,19 @@ fn eval_fast_file_text(
             format!("lix_file fast write column '{column}' supports params and literals only"),
         )),
     }
+}
+
+fn eval_fast_file_nullable_text(
+    expr: &BoundExpr,
+    params: &[Value],
+    column: &str,
+) -> Result<Option<String>, LixError> {
+    if let BoundExpr::Param(param) = expr
+        && matches!(params.get(param.index.saturating_sub(1)), Some(Value::Null))
+    {
+        return Ok(None);
+    }
+    eval_fast_file_text(expr, params, column).map(Some)
 }
 
 fn eval_fast_file_blob(
@@ -1173,7 +1268,7 @@ fn eval_expr_value(
 }
 
 fn predicate_matches(
-    predicate: &crate::sql2::plan::predicate::BoundPredicate,
+    predicate: &BoundPredicate,
     context: &EntityEvalContext<'_>,
     spec: &EntitySurfaceSpec,
     ctx: &mut dyn SqlWriteExecutionContext,
@@ -1375,9 +1470,7 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
         })
 }
 
-fn validate_predicate_supported(
-    predicate: &crate::sql2::plan::predicate::BoundPredicate,
-) -> Result<(), LixError> {
+fn validate_predicate_supported(predicate: &BoundPredicate) -> Result<(), LixError> {
     use crate::sql2::plan::predicate::BoundPredicate;
     match predicate {
         BoundPredicate::True | BoundPredicate::False => Ok(()),
@@ -1405,7 +1498,7 @@ fn validate_predicate_supported(
 }
 
 fn validate_json_predicate_types(
-    predicate: &crate::sql2::plan::predicate::BoundPredicate,
+    predicate: &BoundPredicate,
     spec: &EntitySurfaceSpec,
 ) -> Result<(), LixError> {
     use crate::sql2::plan::predicate::BoundPredicate;
