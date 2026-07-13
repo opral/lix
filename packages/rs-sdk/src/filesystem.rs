@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     Backend, BackendError, BackendWrite, CommitResult, Engine, Key, KeyRange, LixError, PutBatch,
     ReadOptions, SessionContext, SpaceId, Value, WriteOptions,
@@ -346,10 +347,28 @@ impl FsBackend {
     }
 
     pub async fn open_with_options(options: FsBackendOpenOptions) -> Result<Self, LixError> {
+        Self::open_with_options_and_runtime(options, None).await
+    }
+
+    /// Opens a filesystem backend whose disk-sync supervisor uses the same
+    /// component runtime as the Lix session that owns it.
+    pub async fn open_with_options_and_wasm_runtime(
+        options: FsBackendOpenOptions,
+        wasm_runtime: Arc<dyn WasmRuntime>,
+    ) -> Result<Self, LixError> {
+        Self::open_with_options_and_runtime(options, Some(wasm_runtime)).await
+    }
+
+    async fn open_with_options_and_runtime(
+        options: FsBackendOpenOptions,
+        wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    ) -> Result<Self, LixError> {
         let layout = prepare_filesystem_layout(&options.root, options.lix_dir.as_deref())?;
         let backend = open_filesystem_rocksdb_backend(&layout)?;
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), wasm_runtime).await?;
         let inner =
-            FilesystemSync::open_filesystem(backend, layout, options.sync_all_files).await?;
+            FilesystemSync::open_with_engine(backend, engine, layout, options.sync_all_files)
+                .await?;
         Ok(Self { inner })
     }
 
@@ -436,16 +455,6 @@ impl<B> FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
 {
-    #[cfg(feature = "fs_backend")]
-    async fn open_filesystem(
-        backend: B,
-        layout: FilesystemLayout,
-        sync_all_files: bool,
-    ) -> Result<Self, LixError> {
-        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
-        Self::open_with_engine(backend, engine, layout, sync_all_files).await
-    }
-
     async fn open_with_engine(
         backend: B,
         engine: Engine<B>,
