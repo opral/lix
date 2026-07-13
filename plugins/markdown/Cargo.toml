@@ -22,12 +22,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 chardetng = "1"
 encoding_rs = "0.8"
-imara-diff = "0.2"
 lix_order_key.workspace = true
-markdown = "1"
+markdown-syntax = "=0.2.0"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v7", "std", "js", "fast-rng"] }
 wit-bindgen = "0.57"
 
 [dev-dependencies]
-rand = { version = "0.9", features = ["small_rng"] }
+markdown = "1"

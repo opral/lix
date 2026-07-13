@@ -1,160 +1,151 @@
 use plugin_md_v2::exports::lix::plugin::api::{EntityState, Guest};
-use plugin_md_v2::{
-    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, MarkdownPlugin, PluginError, ROOT_ENTITY_PK,
-};
+use plugin_md_v2::{File, MarkdownPlugin, NODE_SCHEMA_KEY, PluginError, ROOT_ENTITY_PK};
 
-fn entity_state(
-    entity_pk: &[&str],
-    schema_key: &str,
-    snapshot_content: serde_json::Value,
-) -> EntityState {
+fn row(id: &str, value: serde_json::Value) -> EntityState {
     EntityState {
-        entity_pk: entity_pk.iter().map(|part| (*part).to_string()).collect(),
-        schema_key: schema_key.to_string(),
-        snapshot_content: snapshot_content.to_string(),
+        entity_pk: vec![id.to_string()],
+        schema_key: NODE_SCHEMA_KEY.to_string(),
+        snapshot_content: value.to_string(),
         metadata: None,
     }
 }
 
-fn document_row() -> EntityState {
-    entity_state(
-        &[ROOT_ENTITY_PK],
-        DOCUMENT_SCHEMA_KEY,
-        serde_json::json!({"id": ROOT_ENTITY_PK}),
+fn root() -> EntityState {
+    row(
+        ROOT_ENTITY_PK,
+        serde_json::json!({
+            "id": ROOT_ENTITY_PK,
+            "kind": "document",
+            "parent_id": null,
+            "order_key": null,
+            "payload": {"dialect": "gfm"},
+            "format": {"line_ending": "lf", "final_newline": true}
+        }),
     )
 }
 
-fn block_row(id: &str, order_key: &str, block: &str) -> EntityState {
-    entity_state(
-        &[id],
-        BLOCK_SCHEMA_KEY,
+fn paragraph(id: &str, order_key: &str, text: &str) -> EntityState {
+    row(
+        id,
         serde_json::json!({
             "id": id,
+            "kind": "paragraph",
+            "parent_id": ROOT_ENTITY_PK,
             "order_key": order_key,
-            "block": block,
+            "payload": {"inline": [{"type": "text", "value": text}]},
+            "format": {}
         }),
     )
 }
 
-fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
-    MarkdownPlugin::render(state)
-}
-
-fn assert_invalid_input(error: PluginError) {
-    match error {
-        PluginError::InvalidInput(_) => {}
-        PluginError::Internal(message) => panic!("expected InvalidInput, got Internal({message})"),
-    }
+fn assert_invalid(error: PluginError) {
+    assert!(matches!(error, PluginError::InvalidInput(_)));
 }
 
 #[test]
-fn renders_single_trailing_newline_when_no_markdown_rows_are_present() {
-    let data = render(Vec::new()).expect("render should succeed");
-
-    assert_eq!(data, b"\n");
-}
-
-#[test]
-fn materializes_deterministically_from_order_keys() {
-    let data = render(vec![
-        block_row("b2", "c0", "Second paragraph."),
-        document_row(),
-        block_row("b1", "80", "# Title"),
+fn renders_nodes_by_order_key_then_id() {
+    let output = MarkdownPlugin::render(vec![
+        paragraph("z", "80", "second tie"),
+        paragraph("a", "80", "first tie"),
+        paragraph("last", "c0", "last"),
+        root(),
     ])
-    .expect("render should succeed");
-
-    assert_eq!(data, b"# Title\n\nSecond paragraph.\n");
+    .unwrap();
+    assert_eq!(output, b"first tie\n\nsecond tie\n\nlast\n");
 }
 
 #[test]
-fn rejects_duplicate_document_rows() {
-    let error = render(vec![document_row(), document_row()]).expect_err("render should fail");
-
-    assert_invalid_input(error);
+fn rendered_equal_order_key_collisions_detect_as_no_change() {
+    let state = vec![
+        paragraph("z", "80", "second tie"),
+        paragraph("a", "80", "first tie"),
+        root(),
+    ];
+    let output = MarkdownPlugin::render(state.clone()).unwrap();
+    let delta = MarkdownPlugin::detect_changes(
+        state,
+        File {
+            filename: Some("collision.md".to_string()),
+            data: output,
+        },
+    )
+    .unwrap();
+    assert!(delta.is_empty(), "{delta:#?}");
 }
 
 #[test]
-fn rejects_duplicate_block_rows() {
-    let error = render(vec![block_row("b1", "80", "a"), block_row("b1", "c0", "b")])
-        .expect_err("render should fail");
-
-    assert_invalid_input(error);
+fn rejects_missing_root() {
+    assert_invalid(MarkdownPlugin::render(vec![paragraph("p", "80", "x")]).unwrap_err());
 }
 
 #[test]
-fn rejects_unknown_document_entity_pk() {
-    let error = render(vec![entity_state(
-        &["other"],
-        DOCUMENT_SCHEMA_KEY,
-        serde_json::json!({"id": ROOT_ENTITY_PK}),
-    )])
-    .expect_err("render should fail");
-
-    assert_invalid_input(error);
+fn rejects_duplicate_rows_and_id_mismatches() {
+    assert_invalid(MarkdownPlugin::render(vec![root(), root()]).unwrap_err());
+    let mut mismatch = paragraph("p", "80", "x");
+    mismatch.entity_pk = vec!["other".to_string()];
+    assert_invalid(MarkdownPlugin::render(vec![root(), mismatch]).unwrap_err());
 }
 
 #[test]
-fn rejects_invalid_block_snapshot_json() {
-    let error = MarkdownPlugin::render(vec![EntityState {
-        entity_pk: vec!["b1".to_string()],
-        schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        snapshot_content: "{".to_string(),
+fn rejects_orphans_and_invalid_order_keys() {
+    let mut orphan = paragraph("p", "80", "x");
+    let mut value: serde_json::Value = serde_json::from_str(&orphan.snapshot_content).unwrap();
+    value["parent_id"] = serde_json::json!("missing");
+    orphan.snapshot_content = value.to_string();
+    assert_invalid(MarkdownPlugin::render(vec![root(), orphan]).unwrap_err());
+
+    let invalid = paragraph("p", "not-an-order-key", "x");
+    assert_invalid(MarkdownPlugin::render(vec![root(), invalid]).unwrap_err());
+}
+
+#[test]
+fn ignores_other_plugin_rows_when_root_is_present() {
+    let other = EntityState {
+        entity_pk: vec!["other".to_string()],
+        schema_key: "other_schema".to_string(),
+        snapshot_content: "{}".to_string(),
         metadata: None,
-    }])
-    .expect_err("render should fail");
-
-    assert_invalid_input(error);
+    };
+    assert_eq!(MarkdownPlugin::render(vec![other, root()]).unwrap(), b"");
 }
 
 #[test]
-fn rejects_invalid_document_snapshot_json() {
-    let error = MarkdownPlugin::render(vec![EntityState {
-        entity_pk: vec![ROOT_ENTITY_PK.to_string()],
-        schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        snapshot_content: "{".to_string(),
-        metadata: None,
-    }])
-    .expect_err("render should fail");
-
-    assert_invalid_input(error);
+fn rejects_cycles_even_when_every_parent_exists() {
+    let mut a = paragraph("a", "80", "a");
+    let mut b = paragraph("b", "c0", "b");
+    for (row, parent) in [(&mut a, "b"), (&mut b, "a")] {
+        let mut value: serde_json::Value = serde_json::from_str(&row.snapshot_content).unwrap();
+        value["parent_id"] = serde_json::json!(parent);
+        row.snapshot_content = value.to_string();
+    }
+    assert_invalid(MarkdownPlugin::render(vec![root(), a, b]).unwrap_err());
 }
 
 #[test]
-fn rejects_block_snapshot_id_mismatch_with_entity_pk() {
-    let error = render(vec![entity_state(
-        &["b1"],
-        BLOCK_SCHEMA_KEY,
+fn nested_order_key_collisions_are_deterministic() {
+    let mut quote = row(
+        "quote",
         serde_json::json!({
-            "id": "b2",
+            "id": "quote",
+            "kind": "block_quote",
+            "parent_id": ROOT_ENTITY_PK,
             "order_key": "80",
-            "block": "hello",
+            "payload": {},
+            "format": {}
         }),
-    )])
-    .expect_err("render should fail");
-
-    assert_invalid_input(error);
-}
-
-#[test]
-fn rejects_document_snapshot_id_mismatch_with_root() {
-    let error = render(vec![entity_state(
-        &[ROOT_ENTITY_PK],
-        DOCUMENT_SCHEMA_KEY,
-        serde_json::json!({"id": "other"}),
-    )])
-    .expect_err("render should fail");
-
-    assert_invalid_input(error);
-}
-
-#[test]
-fn ignores_unknown_schema_rows() {
-    let data = render(vec![entity_state(
-        &["unknown1"],
-        "other_schema",
-        serde_json::json!({"x": 1}),
-    )])
-    .expect("render should succeed");
-
-    assert_eq!(data, b"\n");
+    );
+    let mut a = paragraph("a", "80", "first");
+    let mut z = paragraph("z", "80", "second");
+    for child in [&mut a, &mut z] {
+        let mut value: serde_json::Value = serde_json::from_str(&child.snapshot_content).unwrap();
+        value["parent_id"] = serde_json::json!("quote");
+        child.snapshot_content = value.to_string();
+    }
+    // Keep row construction deliberately out of entity order: rendering is based on
+    // (order_key, id), including at nested levels.
+    quote.metadata = Some("ignored".to_string());
+    assert_eq!(
+        MarkdownPlugin::render(vec![z, root(), quote, a]).unwrap(),
+        b"> first\n> \n> second\n"
+    );
 }

@@ -34,8 +34,8 @@ async function run() {
 		const csvRows = await lix.execute(
 			"SELECT cells FROM csv_row ORDER BY order_key",
 		);
-		const markdownBlocks = await lix.execute(
-			"SELECT block FROM markdown_block ORDER BY order_key",
+		const markdownNodes = await lix.execute(
+			"SELECT kind FROM markdown_node ORDER BY kind",
 		);
 		return {
 			message: query.rows[0]?.get("message"),
@@ -46,7 +46,7 @@ async function run() {
 				),
 			},
 			markdown: {
-				blocks: markdownBlocks.rows.map((row) => row.get("block")),
+				kinds: markdownNodes.rows.map((row) => row.get("kind")),
 				rendered: new TextDecoder().decode(
 					await readFile(lix, "/notes.md"),
 				),

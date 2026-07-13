@@ -920,15 +920,14 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 	const schemas = await lix.execute(
 		"SELECT table_name \
 		 FROM information_schema.tables \
-		 WHERE table_name IN ($1, $2, $3, $4) \
+		 WHERE table_name IN ($1, $2, $3) \
 		 ORDER BY table_name",
-		["csv_row", "csv_table", "markdown_block", "markdown_document"],
+		["csv_row", "csv_table", "markdown_node"],
 	);
 	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
 		"csv_row",
 		"csv_table",
-		"markdown_block",
-		"markdown_document",
+		"markdown_node",
 	]);
 
 	await lix.close();
@@ -983,16 +982,30 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 	const source = "# Heading\n\nParagraph with **bold** text.\n";
 	await writeFile(lix, "/notes.md", new TextEncoder().encode(source));
 
-	const blocks = await lix.execute(
-		"SELECT block FROM markdown_block ORDER BY order_key",
+	const nodes = await lix.execute(
+		"SELECT id, kind FROM markdown_node ORDER BY kind",
 	);
-	expect(blocks.rows.map((row) => row.get("block"))).toEqual([
-		"# Heading",
-		"Paragraph with **bold** text.",
+	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
+		"document",
+		"heading",
+		"paragraph",
 	]);
 
 	const rendered = await readFile(lix, "/notes.md");
 	expect(rendered && new TextDecoder().decode(rendered)).toBe(source);
+
+	const paragraphId = nodes.rows
+		.find((row) => row.get("kind") === "paragraph")
+		?.get("id");
+	expect(typeof paragraphId).toBe("string");
+	await lix.execute("UPDATE markdown_node SET payload = $1 WHERE id = $2", [
+		{ inline: [{ type: "text", value: "Edited paragraph." }] },
+		paragraphId,
+	]);
+	const stateEdited = await readFile(lix, "/notes.md");
+	expect(stateEdited && new TextDecoder().decode(stateEdited)).toBe(
+		"# Heading\n\nEdited paragraph.\n",
+	);
 
 	await lix.close();
 });

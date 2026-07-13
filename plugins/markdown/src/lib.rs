@@ -6,61 +6,69 @@ wit_bindgen::generate!({
     world: "plugin",
 });
 
-mod diff;
 mod markdown_file;
+mod model;
 pub mod schemas;
 
-use crate::diff::{DiffRun, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
-use crate::markdown_file::{
-    MarkdownDocumentSnapshot, ParsedMarkdown, document_upsert_change, parse_document_snapshot,
-    parse_file, render_projection,
+use crate::markdown_file::{ParsedMarkdown, parse_file, render_tree};
+use crate::model::{
+    InlineNode, NodeKind, NodeSnapshot, NodeTree, Projection, parse_inline_payload,
+    replace_column_ids, semantic_payload,
 };
 use lix_order_key::OrderKey;
-use serde_json::Value;
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
-use std::str;
-use uuid::Uuid;
+use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 pub const ROOT_ENTITY_PK: &str = "root";
-pub const DOCUMENT_SCHEMA_KEY: &str = schemas::DOCUMENT_SCHEMA_KEY;
-pub const BLOCK_SCHEMA_KEY: &str = schemas::BLOCK_SCHEMA_KEY;
-
+pub const NODE_SCHEMA_KEY: &str = schemas::NODE_SCHEMA_KEY;
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
+
+type SubtreeHash = u64;
+
+#[derive(Default)]
+struct SubtreeHashes {
+    by_address: HashMap<usize, SubtreeHash>,
+}
+
+impl SubtreeHashes {
+    fn from_tree(tree: &NodeTree) -> Self {
+        fn visit(tree: &NodeTree, output: &mut SubtreeHashes) -> SubtreeHash {
+            let mut hasher = DefaultHasher::new();
+            tree.node.content_signature().hash(&mut hasher);
+            tree.children.len().hash(&mut hasher);
+            for child in &tree.children {
+                visit(child, output).hash(&mut hasher);
+            }
+            let hash = hasher.finish();
+            output.by_address.insert(tree_address(tree), hash);
+            hash
+        }
+
+        let mut output = Self::default();
+        visit(tree, &mut output);
+        output
+    }
+
+    fn get(&self, tree: &NodeTree) -> SubtreeHash {
+        *self
+            .by_address
+            .get(&tree_address(tree))
+            .expect("Markdown subtree hash must be precomputed")
+    }
+}
+
+fn tree_address(tree: &NodeTree) -> usize {
+    std::ptr::from_ref(tree).addr()
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownPlugin;
 #[cfg(target_family = "wasm")]
 export!(MarkdownPlugin);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Projection {
-    blocks_by_id: BTreeMap<String, BlockSnapshot>,
-    document: MarkdownDocumentSnapshot,
-    document_present: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Block {
-    id: String,
-    order_key: OrderKey,
-    block: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BlockSnapshot {
-    order_key: OrderKey,
-    block: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReplaceRun {
-    old: Range<usize>,
-    new: Range<usize>,
-}
 
 impl Plugin for MarkdownPlugin {
     fn detect_changes(
@@ -69,295 +77,571 @@ impl Plugin for MarkdownPlugin {
     ) -> Result<Vec<DetectedChange>, PluginError> {
         let before = Projection::from_entity_state(state.into_iter())?;
         let after = parse_file(&file)?;
-        detect_changes_for_markdown(&before, &after)
+        detect_changes_for_markdown(&before, after)
     }
 
     fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
         let projection = Projection::from_entity_state(state.into_iter())?;
-        Ok(render_projection(&projection))
+        let root = projection.to_tree()?;
+        render_tree(&root)
     }
 }
 
 fn detect_changes_for_markdown(
     before: &Projection,
-    after: &ParsedMarkdown,
+    mut after: ParsedMarkdown,
 ) -> Result<Vec<DetectedChange>, PluginError> {
-    let base = before.to_blocks();
-    if has_duplicate_order_keys(&base) {
-        return detect_changes_for_markdown_with_reindexed_order(before, after, &base);
-    }
-
-    let (old_for_new, new_for_old) = match_diff_blocks(
-        &base,
-        &after.blocks,
-        imara_diff_runs(base.iter().map(|block| &block.block), after.blocks.iter()),
-    );
-    let inserted_ids = inserted_block_ids(&old_for_new);
-    let mut changes = Vec::new();
-
-    for base_index in (0..base.len()).filter(|index| new_for_old[*index].is_none()) {
-        changes.push(DetectedChange {
-            entity_pk: vec![base[base_index].id.clone()],
-            schema_key: BLOCK_SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        });
-    }
-    detect_block_upsert_changes(
-        &base,
-        &after.blocks,
-        &old_for_new,
-        &inserted_ids,
-        &mut changes,
-    )?;
-
-    if !before.document_present || before.document != after.document {
-        changes.push(document_upsert_change(after.document)?);
-    }
-
-    Ok(changes)
-}
-
-fn detect_changes_for_markdown_with_reindexed_order(
-    before: &Projection,
-    after: &ParsedMarkdown,
-    base: &[Block],
-) -> Result<Vec<DetectedChange>, PluginError> {
-    let (old_for_new, new_for_old) = match_diff_blocks(
-        base,
-        &after.blocks,
-        imara_diff_runs(base.iter().map(|block| &block.block), after.blocks.iter()),
-    );
-    let inserted_ids = inserted_block_ids(&old_for_new);
-    let planned_ids = (0..after.blocks.len())
-        .map(|new_index| block_id_for_new(base, &old_for_new, &inserted_ids, new_index).to_string())
-        .collect::<Vec<_>>();
-    let order_keys =
-        OrderKey::evenly_between(None, None, planned_ids.len()).map_err(PluginError::Internal)?;
-    let planned_id_set = planned_ids
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut changes = Vec::new();
-
-    for base_index in (0..base.len()).filter(|index| new_for_old[*index].is_none()) {
-        let id = &base[base_index].id;
-        if !planned_id_set.contains(id) {
-            changes.push(DetectedChange {
-                entity_pk: vec![id.clone()],
-                schema_key: BLOCK_SCHEMA_KEY.to_string(),
-                snapshot_content: None,
-                metadata: None,
-            });
-        }
-    }
-
-    for ((id, block), order_key) in planned_ids
-        .iter()
-        .zip(after.blocks.iter())
-        .zip(order_keys.iter())
-    {
-        changes.push(block_upsert_change(id, order_key, block)?);
-    }
-
-    if !before.document_present || before.document != after.document {
-        changes.push(document_upsert_change(after.document)?);
-    }
-
-    Ok(changes)
-}
-
-fn match_diff_blocks(
-    base: &[Block],
-    file_blocks: &[String],
-    diff_runs: impl IntoIterator<Item = DiffRun>,
-) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
-    let mut old_for_new = vec![None; file_blocks.len()];
-    let mut new_for_old = vec![None; base.len()];
-    let mut replace_runs = Vec::new();
-    let mut base_index = 0usize;
-    let mut file_index = 0usize;
-
-    for run in diff_runs {
-        match run {
-            DiffRun::Equal { len } => {
-                for (old_index, new_index) in
-                    (base_index..base_index + len).zip(file_index..file_index + len)
-                {
-                    old_for_new[new_index] = Some(old_index);
-                    new_for_old[old_index] = Some(new_index);
-                }
-                base_index += len;
-                file_index += len;
-            }
-            DiffRun::Replace { old, new } => {
-                replace_runs.push(ReplaceRun {
-                    old: base_index..base_index + old,
-                    new: file_index..file_index + new,
-                });
-                base_index += old;
-                file_index += new;
-            }
-        }
-    }
-
-    let old_replace_len = replace_runs.iter().map(|run| run.old.len()).sum();
-    let mut old_blocks_by_content = HashMap::<&str, Vec<usize>>::with_capacity(old_replace_len);
-    for run in replace_runs.iter().rev() {
-        for old_index in run.old.clone().rev() {
-            old_blocks_by_content
-                .entry(base[old_index].block.as_str())
-                .or_default()
-                .push(old_index);
-        }
-    }
-
-    for run in &replace_runs {
-        for new_index in run.new.clone() {
-            let Some(old_indices) = old_blocks_by_content.get_mut(file_blocks[new_index].as_str())
-            else {
-                continue;
-            };
-            let Some(old_index) = old_indices.pop() else {
-                continue;
-            };
-            old_for_new[new_index] = Some(old_index);
-            new_for_old[old_index] = Some(new_index);
-        }
-    }
-
-    for run in &replace_runs {
-        let mut old_index = run.old.start;
-        let mut new_index = run.new.start;
-        loop {
-            while old_index < run.old.end && new_for_old[old_index].is_some() {
-                old_index += 1;
-            }
-            while new_index < run.new.end && old_for_new[new_index].is_some() {
-                new_index += 1;
-            }
-            if old_index == run.old.end || new_index == run.new.end {
-                break;
-            }
-            old_for_new[new_index] = Some(old_index);
-            new_for_old[old_index] = Some(new_index);
-            old_index += 1;
-            new_index += 1;
-        }
-    }
-
-    (old_for_new, new_for_old)
-}
-
-fn inserted_block_ids(old_for_new: &[Option<usize>]) -> Vec<Option<String>> {
-    old_for_new
-        .iter()
-        .map(|old_index| match old_index {
-            Some(_) => None,
-            None => Some(Uuid::now_v7().to_string()),
-        })
-        .collect()
-}
-
-fn block_id_for_new<'a>(
-    base: &'a [Block],
-    old_for_new: &[Option<usize>],
-    inserted_ids: &'a [Option<String>],
-    new_index: usize,
-) -> &'a str {
-    match old_for_new[new_index] {
-        Some(old_index) => &base[old_index].id,
-        None => inserted_ids[new_index]
-            .as_deref()
-            .expect("inserted block id should exist"),
-    }
-}
-
-fn detect_block_upsert_changes(
-    base: &[Block],
-    file_blocks: &[String],
-    old_for_new: &[Option<usize>],
-    inserted_ids: &[Option<String>],
-    changes: &mut Vec<DetectedChange>,
-) -> Result<(), PluginError> {
-    let keep_order_key = kept_order_key_indices(base, old_for_new);
-    let mut previous_order_key = None::<OrderKey>;
-    let mut pending = Vec::new();
-
-    for new_index in 0..file_blocks.len() {
-        if keep_order_key[new_index] {
-            let old_index =
-                old_for_new[new_index].expect("kept order key should belong to an existing block");
-            let order_key = &base[old_index].order_key;
-            flush_generated_block_upserts(
-                &mut pending,
-                &mut previous_order_key,
-                Some(order_key),
-                base,
-                file_blocks,
-                old_for_new,
-                inserted_ids,
-                changes,
+    let before_root = if before.nodes_by_id.is_empty() {
+        None
+    } else {
+        Some(before.to_tree()?)
+    };
+    let mut replacements = BTreeMap::new();
+    if let Some(before_root) = &before_root {
+        let old_hashes = SubtreeHashes::from_tree(before_root);
+        let new_hashes = SubtreeHashes::from_tree(&after.root);
+        let mut global_subtrees = HashMap::<SubtreeHash, Vec<&NodeTree>>::new();
+        collect_subtrees(before_root, &old_hashes, &mut global_subtrees);
+        let mut new_signature_counts = HashMap::<SubtreeHash, usize>::new();
+        collect_signature_counts(&after.root, &new_hashes, &mut new_signature_counts);
+        let mut used_ids = BTreeSet::from([ROOT_ENTITY_PK.to_string()]);
+        let mut has_fresh_subtrees = false;
+        after.root.node.id = ROOT_ENTITY_PK.to_string();
+        reconcile_node(
+            before_root,
+            &mut after.root,
+            None,
+            &mut replacements,
+            &global_subtrees,
+            &new_signature_counts,
+            &old_hashes,
+            &new_hashes,
+            &mut used_ids,
+            &mut has_fresh_subtrees,
+        )?;
+        if has_fresh_subtrees {
+            adopt_unique_global_moves(
+                &mut after.root,
+                &global_subtrees,
+                &new_signature_counts,
+                &old_hashes,
+                &new_hashes,
+                &mut used_ids,
+                &mut replacements,
             )?;
-            if base[old_index].block != file_blocks[new_index] {
-                changes.push(block_upsert_change(
-                    block_id_for_new(base, old_for_new, inserted_ids, new_index),
-                    order_key,
-                    &file_blocks[new_index],
-                )?);
-            }
-            previous_order_key = Some(order_key.clone());
-        } else {
-            pending.push(new_index);
         }
+    } else {
+        initialize_subtree(&mut after.root, None)?;
     }
 
-    flush_generated_block_upserts(
-        &mut pending,
-        &mut previous_order_key,
-        None,
-        base,
-        file_blocks,
-        old_for_new,
-        inserted_ids,
-        changes,
+    after.root.visit_mut(&mut |node| {
+        replace_column_ids(&mut node.payload, &replacements);
+    });
+    let after_nodes = flatten_tree(&after.root);
+    diff_projections(before, &after_nodes)
+}
+
+fn reconcile_node(
+    old: &NodeTree,
+    new: &mut NodeTree,
+    parent_id: Option<&str>,
+    replacements: &mut BTreeMap<String, String>,
+    global_subtrees: &HashMap<SubtreeHash, Vec<&NodeTree>>,
+    new_signature_counts: &HashMap<SubtreeHash, usize>,
+    old_hashes: &SubtreeHashes,
+    new_hashes: &SubtreeHashes,
+    used_ids: &mut BTreeSet<String>,
+    has_fresh_subtrees: &mut bool,
+) -> Result<(), PluginError> {
+    let generated_id = new.node.id.clone();
+    new.node.id.clone_from(&old.node.id);
+    if generated_id != new.node.id {
+        replacements.insert(generated_id, new.node.id.clone());
+    }
+    new.node.parent_id = parent_id.map(str::to_string);
+    new.node.order_key.clone_from(&old.node.order_key);
+    reconcile_inline_payload(old, new)?;
+    reconcile_children(
+        old,
+        new,
+        replacements,
+        global_subtrees,
+        new_signature_counts,
+        old_hashes,
+        new_hashes,
+        used_ids,
+        has_fresh_subtrees,
     )
 }
 
-fn kept_order_key_indices(base: &[Block], old_for_new: &[Option<usize>]) -> Vec<bool> {
-    let mut keep = vec![false; old_for_new.len()];
-    if old_for_new
+fn reconcile_children(
+    old: &NodeTree,
+    new: &mut NodeTree,
+    replacements: &mut BTreeMap<String, String>,
+    global_subtrees: &HashMap<SubtreeHash, Vec<&NodeTree>>,
+    new_signature_counts: &HashMap<SubtreeHash, usize>,
+    old_hashes: &SubtreeHashes,
+    new_hashes: &SubtreeHashes,
+    used_ids: &mut BTreeSet<String>,
+    has_fresh_subtrees: &mut bool,
+) -> Result<(), PluginError> {
+    let mut old_for_new = vec![None; new.children.len()];
+    let mut old_used = old
+        .children
         .iter()
-        .copied()
-        .flatten()
-        .map(|old_index| &base[old_index].order_key)
-        .is_sorted_by(|previous, current| previous < current)
-    {
-        for (new_index, old_index) in old_for_new.iter().enumerate() {
-            keep[new_index] = old_index.is_some();
-        }
-        return keep;
+        .map(|child| used_ids.contains(&child.node.id))
+        .collect::<Vec<_>>();
+    if old.node.kind == NodeKind::Table && new.node.kind == NodeKind::Table {
+        match_table_columns(old, new, &mut old_for_new, &mut old_used, used_ids);
     }
-
-    let mut pile_tops = Vec::<usize>::new();
-    let mut predecessors = vec![None; old_for_new.len()];
-
-    for (new_index, old_index) in old_for_new.iter().copied().enumerate() {
-        let Some(old_index) = old_index else {
+    for index in 0..new.children.len().min(old.children.len()) {
+        if old_for_new[index].is_none()
+            && !old_used[index]
+            && new.children[index].subtree_signature() == old.children[index].subtree_signature()
+        {
+            old_for_new[index] = Some(index);
+            old_used[index] = true;
+            used_ids.insert(old.children[index].node.id.clone());
+        }
+    }
+    let mut exact = HashMap::<String, Vec<usize>>::new();
+    for (index, child) in old.children.iter().enumerate().rev() {
+        if old_used[index] {
+            continue;
+        }
+        exact
+            .entry(child.subtree_signature())
+            .or_default()
+            .push(index);
+    }
+    for (new_index, child) in new.children.iter().enumerate() {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        let signature = child.subtree_signature();
+        let Some(indices) = exact.get_mut(&signature) else {
             continue;
         };
-        let order_key = &base[old_index].order_key;
-        let pile = pile_tops
-            .partition_point(|top_index| old_order_key(base, old_for_new, *top_index) < order_key);
-        if pile != 0 {
-            predecessors[new_index] = Some(pile_tops[pile - 1]);
-        }
-        if pile == pile_tops.len() {
-            pile_tops.push(new_index);
-        } else if old_order_key(base, old_for_new, pile_tops[pile]) > order_key {
-            pile_tops[pile] = new_index;
+        while let Some(old_index) = indices.pop() {
+            if !old_used[old_index] {
+                old_for_new[new_index] = Some(old_index);
+                old_used[old_index] = true;
+                used_ids.insert(old.children[old_index].node.id.clone());
+                break;
+            }
         }
     }
 
+    let mut search_start = 0;
+    for (new_index, child) in new.children.iter().enumerate() {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        let matching = (search_start..old.children.len())
+            .chain(0..search_start)
+            .find(|old_index| {
+                !old_used[*old_index]
+                    && node_kinds_are_identity_compatible(
+                        old.children[*old_index].node.kind,
+                        child.node.kind,
+                    )
+                    && !has_available_unique_global_match(
+                        child,
+                        global_subtrees,
+                        new_signature_counts,
+                        old_hashes,
+                        new_hashes,
+                        used_ids,
+                    )
+            });
+        if let Some(old_index) = matching {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+            used_ids.insert(old.children[old_index].node.id.clone());
+            search_start = old_index.saturating_add(1);
+        }
+    }
+
+    let parent_id = new.node.id.clone();
+    for (new_index, child) in new.children.iter_mut().enumerate() {
+        if let Some(old_index) = old_for_new[new_index] {
+            reconcile_node(
+                &old.children[old_index],
+                child,
+                Some(&parent_id),
+                replacements,
+                global_subtrees,
+                new_signature_counts,
+                old_hashes,
+                new_hashes,
+                used_ids,
+                has_fresh_subtrees,
+            )?;
+        }
+    }
+    for (new_index, child) in new.children.iter_mut().enumerate() {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        *has_fresh_subtrees = true;
+        initialize_subtree(child, Some(&parent_id))?;
+    }
+    if new.node.kind == NodeKind::TableRow {
+        preserve_table_cell_order_keys(&mut new.children, &old_for_new, &old.children)
+    } else {
+        assign_sibling_order_keys(&mut new.children, &old_for_new, &old.children)
+    }
+}
+
+fn node_kinds_are_identity_compatible(old: NodeKind, new: NodeKind) -> bool {
+    old == new
+        || matches!(
+            (old, new),
+            (NodeKind::Paragraph, NodeKind::Heading) | (NodeKind::Heading, NodeKind::Paragraph)
+        )
+}
+
+fn has_available_unique_global_match(
+    tree: &NodeTree,
+    global_subtrees: &HashMap<SubtreeHash, Vec<&NodeTree>>,
+    new_signature_counts: &HashMap<SubtreeHash, usize>,
+    old_hashes: &SubtreeHashes,
+    new_hashes: &SubtreeHashes,
+    used_ids: &BTreeSet<String>,
+) -> bool {
+    let signature = new_hashes.get(tree);
+    global_subtrees.get(&signature).is_some_and(|candidates| {
+        candidates.len() == 1
+            && new_signature_counts.get(&signature) == Some(&1)
+            && subtree_ids_are_available(candidates[0], used_ids)
+            && old_hashes.get(candidates[0]) == signature
+            && candidates[0].subtree_signature() == tree.subtree_signature()
+    })
+}
+
+fn match_table_columns(
+    old: &NodeTree,
+    new: &NodeTree,
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+    used_ids: &mut BTreeSet<String>,
+) {
+    let mut old_by_signature = HashMap::<String, Vec<usize>>::new();
+    for (index, column) in old.children.iter().enumerate() {
+        if column.node.kind == NodeKind::TableColumn && !old_used[index] {
+            old_by_signature
+                .entry(table_column_signature(old, column))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut new_counts = HashMap::<String, usize>::new();
+    for column in &new.children {
+        if column.node.kind == NodeKind::TableColumn {
+            *new_counts
+                .entry(table_column_signature(new, column))
+                .or_default() += 1;
+        }
+    }
+    for (new_index, column) in new.children.iter().enumerate() {
+        if column.node.kind != NodeKind::TableColumn || old_for_new[new_index].is_some() {
+            continue;
+        }
+        let signature = table_column_signature(new, column);
+        let Some(old_indices) = old_by_signature.get(&signature) else {
+            continue;
+        };
+        if old_indices.len() != 1 || new_counts.get(&signature) != Some(&1) {
+            continue;
+        }
+        let old_index = old_indices[0];
+        old_for_new[new_index] = Some(old_index);
+        old_used[old_index] = true;
+        used_ids.insert(old.children[old_index].node.id.clone());
+    }
+}
+
+fn table_column_signature(table: &NodeTree, column: &NodeTree) -> String {
+    let mut cells = Vec::new();
+    for row in table
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableRow)
+    {
+        let cell = row.children.iter().find(|cell| {
+            cell.node
+                .payload
+                .get("column_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(column.node.id.as_str())
+        });
+        cells.push(cell.map(NodeTree::subtree_signature));
+    }
+    serde_json::to_string(&(column.node.content_signature(), cells))
+        .expect("table column signature must serialize")
+}
+
+fn preserve_table_cell_order_keys(
+    children: &mut [NodeTree],
+    old_for_new: &[Option<usize>],
+    old_children: &[NodeTree],
+) -> Result<(), PluginError> {
+    let fresh_count = old_for_new.iter().filter(|old| old.is_none()).count();
+    let mut fresh = OrderKey::evenly_between(None, None, fresh_count)
+        .map_err(PluginError::Internal)?
+        .into_iter();
+    for (index, child) in children.iter_mut().enumerate() {
+        child.node.order_key = old_for_new[index].map_or_else(
+            || {
+                Some(
+                    fresh
+                        .next()
+                        .expect("fresh table cell order key must exist")
+                        .to_snapshot_string(),
+                )
+            },
+            |old_index| old_children[old_index].node.order_key.clone(),
+        );
+    }
+    Ok(())
+}
+
+fn collect_subtrees<'a>(
+    tree: &'a NodeTree,
+    hashes: &SubtreeHashes,
+    output: &mut HashMap<SubtreeHash, Vec<&'a NodeTree>>,
+) {
+    if tree.node.id != ROOT_ENTITY_PK {
+        output.entry(hashes.get(tree)).or_default().push(tree);
+    }
+    for child in &tree.children {
+        collect_subtrees(child, hashes, output);
+    }
+}
+
+fn adopt_unique_global_moves(
+    tree: &mut NodeTree,
+    global_subtrees: &HashMap<SubtreeHash, Vec<&NodeTree>>,
+    new_signature_counts: &HashMap<SubtreeHash, usize>,
+    old_hashes: &SubtreeHashes,
+    new_hashes: &SubtreeHashes,
+    used_ids: &mut BTreeSet<String>,
+    replacements: &mut BTreeMap<String, String>,
+) -> Result<(), PluginError> {
+    for child in &mut tree.children {
+        let signature = new_hashes.get(child);
+        let candidate = global_subtrees.get(&signature).and_then(|candidates| {
+            (candidates.len() == 1 && new_signature_counts.get(&signature) == Some(&1))
+                .then_some(candidates[0])
+        });
+        if let Some(candidate) = candidate.filter(|candidate| {
+            subtree_ids_are_available(candidate, used_ids)
+                && !used_ids.contains(&child.node.id)
+                && old_hashes.get(candidate) == signature
+                && candidate.subtree_signature() == child.subtree_signature()
+        }) {
+            adopt_exact_subtree(candidate, child, used_ids, replacements)?;
+        } else {
+            adopt_unique_global_moves(
+                child,
+                global_subtrees,
+                new_signature_counts,
+                old_hashes,
+                new_hashes,
+                used_ids,
+                replacements,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn subtree_ids_are_available(tree: &NodeTree, used_ids: &BTreeSet<String>) -> bool {
+    !used_ids.contains(&tree.node.id)
+        && tree
+            .children
+            .iter()
+            .all(|child| subtree_ids_are_available(child, used_ids))
+}
+
+fn adopt_exact_subtree(
+    old: &NodeTree,
+    new: &mut NodeTree,
+    used_ids: &mut BTreeSet<String>,
+    replacements: &mut BTreeMap<String, String>,
+) -> Result<(), PluginError> {
+    let generated_id = new.node.id.clone();
+    let parent_id = new.node.parent_id.clone();
+    let order_key = new.node.order_key.clone();
+    new.node.id.clone_from(&old.node.id);
+    new.node.parent_id = parent_id;
+    new.node.order_key = order_key;
+    used_ids.insert(new.node.id.clone());
+    if generated_id != new.node.id {
+        replacements.insert(generated_id, new.node.id.clone());
+    }
+    reconcile_inline_payload(old, new)?;
+
+    if old.children.len() != new.children.len() {
+        return Err(PluginError::Internal(
+            "equal Markdown subtree signatures had different child counts".to_string(),
+        ));
+    }
+    let parent_id = new.node.id.clone();
+    for (old_child, new_child) in old.children.iter().zip(&mut new.children) {
+        adopt_exact_subtree_child(old_child, new_child, &parent_id, used_ids, replacements)?;
+    }
+    Ok(())
+}
+
+fn adopt_exact_subtree_child(
+    old: &NodeTree,
+    new: &mut NodeTree,
+    parent_id: &str,
+    used_ids: &mut BTreeSet<String>,
+    replacements: &mut BTreeMap<String, String>,
+) -> Result<(), PluginError> {
+    let generated_id = new.node.id.clone();
+    new.node.id.clone_from(&old.node.id);
+    new.node.parent_id = Some(parent_id.to_string());
+    new.node.order_key.clone_from(&old.node.order_key);
+    used_ids.insert(new.node.id.clone());
+    if generated_id != new.node.id {
+        replacements.insert(generated_id, new.node.id.clone());
+    }
+    reconcile_inline_payload(old, new)?;
+    if old.children.len() != new.children.len() {
+        return Err(PluginError::Internal(
+            "equal Markdown subtree signatures had different child counts".to_string(),
+        ));
+    }
+    let parent_id = new.node.id.clone();
+    for (old_child, new_child) in old.children.iter().zip(&mut new.children) {
+        adopt_exact_subtree_child(old_child, new_child, &parent_id, used_ids, replacements)?;
+    }
+    Ok(())
+}
+
+fn collect_signature_counts(
+    tree: &NodeTree,
+    hashes: &SubtreeHashes,
+    output: &mut HashMap<SubtreeHash, usize>,
+) {
+    if tree.node.id != ROOT_ENTITY_PK {
+        *output.entry(hashes.get(tree)).or_default() += 1;
+    }
+    for child in &tree.children {
+        collect_signature_counts(child, hashes, output);
+    }
+}
+
+fn initialize_subtree(tree: &mut NodeTree, parent_id: Option<&str>) -> Result<(), PluginError> {
+    tree.node.parent_id = parent_id.map(str::to_string);
+    if tree.node.kind == NodeKind::Document {
+        tree.node.id = ROOT_ENTITY_PK.to_string();
+        tree.node.order_key = None;
+    }
+    let parent_id = tree.node.id.clone();
+    for child in &mut tree.children {
+        initialize_subtree(child, Some(&parent_id))?;
+    }
+    assign_fresh_order_keys(&mut tree.children)
+}
+
+fn assign_fresh_order_keys(children: &mut [NodeTree]) -> Result<(), PluginError> {
+    let keys =
+        OrderKey::evenly_between(None, None, children.len()).map_err(PluginError::Internal)?;
+    for (child, key) in children.iter_mut().zip(keys) {
+        child.node.order_key = Some(key.to_snapshot_string());
+    }
+    Ok(())
+}
+
+fn assign_sibling_order_keys(
+    children: &mut [NodeTree],
+    old_for_new: &[Option<usize>],
+    old_children: &[NodeTree],
+) -> Result<(), PluginError> {
+    if children.is_empty() {
+        return Ok(());
+    }
+    let old_keys = old_for_new
+        .iter()
+        .map(|old_index| {
+            old_index
+                .map(|index| old_children[index].node.parsed_order_key())
+                .transpose()
+                .map(Option::flatten)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| PluginError::InvalidInput(format!("invalid order_key: {message}")))?;
+    let keep = longest_increasing_key_subsequence(&old_keys, children);
+    let mut previous = None::<OrderKey>;
+    let mut pending = Vec::new();
+
+    for index in 0..children.len() {
+        if keep[index] {
+            let next = old_keys[index]
+                .as_ref()
+                .expect("kept order key must belong to an existing child");
+            if flush_order_keys(&mut pending, &mut previous, Some(next), children).is_err() {
+                return assign_fresh_order_keys(children);
+            }
+            children[index].node.order_key = Some(next.to_snapshot_string());
+            previous = Some(next.clone());
+        } else {
+            pending.push(index);
+        }
+    }
+    if flush_order_keys(&mut pending, &mut previous, None, children).is_err() {
+        return assign_fresh_order_keys(children);
+    }
+    Ok(())
+}
+
+fn flush_order_keys(
+    pending: &mut Vec<usize>,
+    previous: &mut Option<OrderKey>,
+    next: Option<&OrderKey>,
+    children: &mut [NodeTree],
+) -> Result<(), PluginError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let keys = OrderKey::evenly_between(previous.as_ref(), next, pending.len())
+        .map_err(PluginError::Internal)?;
+    for (index, key) in pending.drain(..).zip(keys) {
+        children[index].node.order_key = Some(key.to_snapshot_string());
+        *previous = Some(key);
+    }
+    Ok(())
+}
+
+fn longest_increasing_key_subsequence(
+    keys: &[Option<OrderKey>],
+    children: &[NodeTree],
+) -> Vec<bool> {
+    let mut keep = vec![false; keys.len()];
+    let mut pile_tops = Vec::<usize>::new();
+    let mut predecessors = vec![None; keys.len()];
+    for (index, key) in keys.iter().enumerate() {
+        if key.is_none() {
+            continue;
+        }
+        let pile = pile_tops.partition_point(|top| {
+            compare_sibling_positions(*top, index, keys, children) == Ordering::Less
+        });
+        if pile > 0 {
+            predecessors[index] = Some(pile_tops[pile - 1]);
+        }
+        if pile == pile_tops.len() {
+            pile_tops.push(index);
+        } else if compare_sibling_positions(pile_tops[pile], index, keys, children)
+            == Ordering::Greater
+        {
+            pile_tops[pile] = index;
+        }
+    }
     let Some(mut current) = pile_tops.last().copied() else {
         return keep;
     };
@@ -371,49 +655,350 @@ fn kept_order_key_indices(base: &[Block], old_for_new: &[Option<usize>]) -> Vec<
     keep
 }
 
-fn old_order_key<'a>(
-    base: &'a [Block],
-    old_for_new: &[Option<usize>],
-    new_index: usize,
-) -> &'a OrderKey {
-    let old_index = old_for_new[new_index].expect("old order key should belong to existing block");
-    &base[old_index].order_key
+fn compare_sibling_positions(
+    left: usize,
+    right: usize,
+    keys: &[Option<OrderKey>],
+    children: &[NodeTree],
+) -> Ordering {
+    keys[left]
+        .as_ref()
+        .expect("left sibling position has key")
+        .cmp(
+            keys[right]
+                .as_ref()
+                .expect("right sibling position has key"),
+        )
+        .then_with(|| children[left].node.id.cmp(&children[right].node.id))
 }
 
-fn flush_generated_block_upserts(
-    pending: &mut Vec<usize>,
-    previous_order_key: &mut Option<OrderKey>,
-    next_order_key: Option<&OrderKey>,
-    base: &[Block],
-    file_blocks: &[String],
-    old_for_new: &[Option<usize>],
-    inserted_ids: &[Option<String>],
-    changes: &mut Vec<DetectedChange>,
-) -> Result<(), PluginError> {
-    if pending.is_empty() {
+fn reconcile_inline_payload(old: &NodeTree, new: &mut NodeTree) -> Result<(), PluginError> {
+    if !matches!(
+        new.node.kind,
+        NodeKind::Paragraph | NodeKind::Heading | NodeKind::TableCell
+    ) {
         return Ok(());
     }
-
-    let order_keys =
-        OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, pending.len())
-            .map_err(PluginError::Internal)?;
-
-    for (new_index, order_key) in pending.drain(..).zip(order_keys) {
-        changes.push(block_upsert_change(
-            block_id_for_new(base, old_for_new, inserted_ids, new_index),
-            &order_key,
-            &file_blocks[new_index],
-        )?);
-        *previous_order_key = Some(order_key);
-    }
-
+    let old_inlines = parse_inline_payload(&old.node.payload).map_err(PluginError::InvalidInput)?;
+    let mut new_inlines =
+        parse_inline_payload(&new.node.payload).map_err(PluginError::InvalidInput)?;
+    reconcile_inline_sequence(&old_inlines, &mut new_inlines);
+    new.node.payload["inline"] = serde_json::to_value(new_inlines).map_err(|error| {
+        PluginError::Internal(format!("failed to serialize inline AST: {error}"))
+    })?;
     Ok(())
 }
 
-fn has_duplicate_order_keys(blocks: &[Block]) -> bool {
-    blocks
-        .windows(2)
-        .any(|pair| pair[0].order_key == pair[1].order_key)
+fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
+    if old.is_empty() || new.is_empty() {
+        return;
+    }
+    if let ([old_inline], [new_inline]) = (old, &mut *new) {
+        if old_inline.signature() == new_inline.signature()
+            || old_inline.kind_tag() == new_inline.kind_tag()
+        {
+            new_inline.id.clone_from(&old_inline.id);
+            if let (Some(old_children), Some(new_children)) =
+                (old_inline.children(), new_inline.children_mut())
+            {
+                reconcile_inline_sequence(old_children, new_children);
+            }
+        }
+        return;
+    }
+
+    let old_signatures = old.iter().map(InlineNode::signature).collect::<Vec<_>>();
+    let new_signatures = new.iter().map(InlineNode::signature).collect::<Vec<_>>();
+    let mut old_for_new = vec![None; new.len()];
+    let mut old_used = vec![false; old.len()];
+    // Unique, non-crossing atoms (including plain text) establish context before
+    // repeated atoms are matched inside each gap. A fully identical run still
+    // has no knowable insertion position, so it uses deterministic local order
+    // while retaining every reusable old ID exactly once.
+    let anchors = unique_non_crossing_inline_anchors(&old_signatures, &new_signatures);
+    for &(old_index, new_index) in &anchors {
+        old_for_new[new_index] = Some(old_index);
+        old_used[old_index] = true;
+    }
+
+    for_each_inline_gap(
+        old.len(),
+        new.len(),
+        &anchors,
+        |old_start, old_end, new_start, new_end| {
+            match_exact_inlines_in_range(
+                &old_signatures,
+                &new_signatures,
+                old_start,
+                old_end,
+                new_start,
+                new_end,
+                &mut old_for_new,
+                &mut old_used,
+            );
+        },
+    );
+
+    match_exact_inlines_in_range(
+        &old_signatures,
+        &new_signatures,
+        0,
+        old.len(),
+        0,
+        new.len(),
+        &mut old_for_new,
+        &mut old_used,
+    );
+
+    for_each_inline_gap(
+        old.len(),
+        new.len(),
+        &anchors,
+        |old_start, old_end, new_start, new_end| {
+            match_compatible_inlines_in_range(
+                old,
+                new,
+                old_start,
+                old_end,
+                new_start,
+                new_end,
+                &mut old_for_new,
+                &mut old_used,
+            );
+        },
+    );
+
+    match_compatible_inlines_in_range(
+        old,
+        new,
+        0,
+        old.len(),
+        0,
+        new.len(),
+        &mut old_for_new,
+        &mut old_used,
+    );
+
+    for (new_index, inline) in new.iter_mut().enumerate() {
+        let Some(old_index) = old_for_new[new_index] else {
+            continue;
+        };
+        inline.id.clone_from(&old[old_index].id);
+        if let (Some(old_children), Some(new_children)) =
+            (old[old_index].children(), inline.children_mut())
+        {
+            reconcile_inline_sequence(old_children, new_children);
+        }
+    }
+}
+
+fn unique_non_crossing_inline_anchors(
+    old_signatures: &[String],
+    new_signatures: &[String],
+) -> Vec<(usize, usize)> {
+    let mut old_positions = HashMap::<&str, Vec<usize>>::new();
+    let mut new_positions = HashMap::<&str, Vec<usize>>::new();
+    for (index, signature) in old_signatures.iter().enumerate() {
+        old_positions.entry(signature).or_default().push(index);
+    }
+    for (index, signature) in new_signatures.iter().enumerate() {
+        new_positions.entry(signature).or_default().push(index);
+    }
+
+    let mut candidates = old_positions
+        .into_iter()
+        .filter_map(|(signature, old_indices)| {
+            let new_indices = new_positions.get(&signature)?;
+            (old_indices.len() == 1 && new_indices.len() == 1)
+                .then_some((old_indices[0], new_indices[0]))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(old_index, _)| *old_index);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pile_tops = Vec::<usize>::new();
+    let mut predecessors = vec![None; candidates.len()];
+    for (index, &(_, new_index)) in candidates.iter().enumerate() {
+        let pile = pile_tops.partition_point(|top| candidates[*top].1 < new_index);
+        if pile > 0 {
+            predecessors[index] = Some(pile_tops[pile - 1]);
+        }
+        if pile == pile_tops.len() {
+            pile_tops.push(index);
+        } else {
+            pile_tops[pile] = index;
+        }
+    }
+
+    let mut anchors = Vec::with_capacity(pile_tops.len());
+    let mut current = *pile_tops.last().expect("inline anchor pile must exist");
+    loop {
+        anchors.push(candidates[current]);
+        let Some(previous) = predecessors[current] else {
+            break;
+        };
+        current = previous;
+    }
+    anchors.reverse();
+    anchors
+}
+
+fn for_each_inline_gap(
+    old_len: usize,
+    new_len: usize,
+    anchors: &[(usize, usize)],
+    mut visitor: impl FnMut(usize, usize, usize, usize),
+) {
+    let mut old_start = 0;
+    let mut new_start = 0;
+    for &(old_anchor, new_anchor) in anchors {
+        visitor(old_start, old_anchor, new_start, new_anchor);
+        old_start = old_anchor + 1;
+        new_start = new_anchor + 1;
+    }
+    visitor(old_start, old_len, new_start, new_len);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_exact_inlines_in_range(
+    old_signatures: &[String],
+    new_signatures: &[String],
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+) {
+    let paired = (old_end - old_start).min(new_end - new_start);
+    for offset in 0..paired {
+        let old_index = old_start + offset;
+        let new_index = new_start + offset;
+        if old_for_new[new_index].is_none()
+            && !old_used[old_index]
+            && new_signatures[new_index] == old_signatures[old_index]
+        {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+    }
+
+    let mut exact = HashMap::<&str, Vec<usize>>::new();
+    for old_index in (old_start..old_end).rev() {
+        if old_used[old_index] {
+            continue;
+        }
+        exact
+            .entry(old_signatures[old_index].as_str())
+            .or_default()
+            .push(old_index);
+    }
+    for new_index in new_start..new_end {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        if let Some(indices) = exact.get_mut(new_signatures[new_index].as_str())
+            && let Some(old_index) = indices.pop()
+        {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_compatible_inlines_in_range(
+    old: &[InlineNode],
+    new: &[InlineNode],
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+) {
+    let mut available = HashMap::<&'static str, VecDeque<usize>>::new();
+    for old_index in old_start..old_end {
+        if !old_used[old_index] {
+            available
+                .entry(old[old_index].kind_tag())
+                .or_default()
+                .push_back(old_index);
+        }
+    }
+    for new_index in new_start..new_end {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        if let Some(old_index) = available
+            .get_mut(new[new_index].kind_tag())
+            .and_then(VecDeque::pop_front)
+        {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+    }
+}
+
+fn flatten_tree(root: &NodeTree) -> BTreeMap<String, NodeSnapshot> {
+    fn visit(tree: &NodeTree, output: &mut BTreeMap<String, NodeSnapshot>) {
+        output.insert(tree.node.id.clone(), tree.node.clone());
+        for child in &tree.children {
+            visit(child, output);
+        }
+    }
+    let mut output = BTreeMap::new();
+    visit(root, &mut output);
+    output
+}
+
+fn diff_projections(
+    before: &Projection,
+    after: &BTreeMap<String, NodeSnapshot>,
+) -> Result<Vec<DetectedChange>, PluginError> {
+    let mut changes = Vec::new();
+    for id in before.nodes_by_id.keys() {
+        if !after.contains_key(id) {
+            changes.push(DetectedChange {
+                entity_pk: vec![id.clone()],
+                schema_key: NODE_SCHEMA_KEY.to_string(),
+                snapshot_content: None,
+                metadata: None,
+            });
+        }
+    }
+    for (id, node) in after {
+        if before.nodes_by_id.get(id) == Some(node) {
+            continue;
+        }
+        let snapshot_content = serde_json::to_string(node).map_err(|error| {
+            PluginError::Internal(format!("failed to serialize Markdown node '{id}': {error}"))
+        })?;
+        changes.push(DetectedChange {
+            entity_pk: vec![id.clone()],
+            schema_key: NODE_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(snapshot_content),
+            metadata: change_metadata(before.nodes_by_id.get(id), node),
+        });
+    }
+    Ok(changes)
+}
+
+fn change_metadata(before: Option<&NodeSnapshot>, after: &NodeSnapshot) -> Option<String> {
+    let before = before?;
+    if before.id == after.id
+        && before.kind == after.kind
+        && before.parent_id == after.parent_id
+        && before.order_key == after.order_key
+        && semantic_payload(&before.payload) == semantic_payload(&after.payload)
+        && (before.payload != after.payload || before.format != after.format)
+    {
+        Some(r#"{"impact":"format"}"#.to_string())
+    } else {
+        None
+    }
 }
 
 fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
@@ -427,407 +1012,129 @@ fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
 }
 
 impl Projection {
-    fn from_entity_state(changes: impl Iterator<Item = EntityState>) -> Result<Self, PluginError> {
-        let mut blocks_by_id = BTreeMap::new();
-        let mut document = None;
-
-        for change in changes {
-            match change.schema_key.as_str() {
-                DOCUMENT_SCHEMA_KEY => {
-                    let entity_pk = single_entity_pk(change.entity_pk)?;
-                    if entity_pk != ROOT_ENTITY_PK {
-                        return Err(PluginError::InvalidInput(format!(
-                            "unsupported entity_pk '{entity_pk}' for schema_key '{DOCUMENT_SCHEMA_KEY}', expected '{ROOT_ENTITY_PK}'"
-                        )));
-                    }
-                    if document.is_some() {
-                        return Err(PluginError::InvalidInput(format!(
-                            "duplicate entity_pk '{ROOT_ENTITY_PK}' for schema_key '{DOCUMENT_SCHEMA_KEY}'"
-                        )));
-                    }
-                    document = Some(parse_document_snapshot(&change.snapshot_content)?);
-                }
-                BLOCK_SCHEMA_KEY => {
-                    let entity_pk = single_entity_pk(change.entity_pk)?;
-                    match blocks_by_id.entry(entity_pk) {
-                        Entry::Occupied(entry) => {
-                            return Err(PluginError::InvalidInput(format!(
-                                "duplicate entity_pk '{}' for schema_key '{BLOCK_SCHEMA_KEY}'",
-                                entry.key()
-                            )));
-                        }
-                        Entry::Vacant(entry) => {
-                            let block =
-                                parse_block_snapshot(&change.snapshot_content, entry.key())?;
-                            entry.insert(block);
-                        }
-                    }
-                }
-                _ => {}
+    fn from_entity_state(rows: impl Iterator<Item = EntityState>) -> Result<Self, PluginError> {
+        let mut nodes_by_id = BTreeMap::new();
+        for row in rows {
+            if row.schema_key != NODE_SCHEMA_KEY {
+                continue;
+            }
+            let entity_pk = single_entity_pk(row.entity_pk)?;
+            let node: NodeSnapshot =
+                serde_json::from_str(&row.snapshot_content).map_err(|error| {
+                    PluginError::InvalidInput(format!(
+                        "invalid Markdown node snapshot for entity_pk '{entity_pk}': {error}"
+                    ))
+                })?;
+            if node.id != entity_pk {
+                return Err(PluginError::InvalidInput(format!(
+                    "Markdown node snapshot id '{}' does not match entity_pk '{entity_pk}'",
+                    node.id
+                )));
+            }
+            if nodes_by_id.insert(entity_pk.clone(), node).is_some() {
+                return Err(PluginError::InvalidInput(format!(
+                    "duplicate Markdown node entity_pk '{entity_pk}'"
+                )));
             }
         }
-
-        Ok(Self {
-            blocks_by_id,
-            document: document.unwrap_or_default(),
-            document_present: document.is_some(),
-        })
+        Ok(Self { nodes_by_id })
     }
 
-    fn to_blocks(&self) -> Vec<Block> {
-        let mut blocks = self
-            .blocks_by_id
-            .iter()
-            .map(|(id, block)| Block {
-                id: id.clone(),
-                order_key: block.order_key.clone(),
-                block: block.block.clone(),
-            })
-            .collect::<Vec<_>>();
-        blocks.sort_by(|a, b| a.order_key.cmp(&b.order_key).then_with(|| a.id.cmp(&b.id)));
-        blocks
-    }
-}
-
-fn block_upsert_change(
-    id: &str,
-    order_key: &OrderKey,
-    block: &str,
-) -> Result<DetectedChange, PluginError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": id,
-        "order_key": order_key.to_snapshot_string(),
-        "block": block,
-    }))
-    .map_err(|error| {
-        PluginError::Internal(format!("failed to serialize markdown block: {error}"))
-    })?;
-
-    Ok(DetectedChange {
-        entity_pk: vec![id.to_string()],
-        schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
-    })
-}
-
-fn parse_block_snapshot(raw: &str, entity_pk: &str) -> Result<BlockSnapshot, PluginError> {
-    let value: Value = serde_json::from_str(raw).map_err(|error| {
-        PluginError::InvalidInput(format!(
-            "invalid markdown block snapshot_content for entity_pk '{entity_pk}': {error}"
-        ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        PluginError::InvalidInput(format!(
-            "markdown block snapshot_content for entity_pk '{entity_pk}' must be an object"
-        ))
-    })?;
-    reject_unknown_fields(
-        object.keys(),
-        &["id", "order_key", "block"],
-        "markdown block",
-    )?;
-
-    let id = object.get("id").and_then(Value::as_str).ok_or_else(|| {
-        PluginError::InvalidInput(format!(
-            "markdown block snapshot for entity_pk '{entity_pk}' must contain string 'id'"
-        ))
-    })?;
-    if id != entity_pk {
-        return Err(PluginError::InvalidInput(format!(
-            "markdown block snapshot id '{id}' does not match entity_pk '{entity_pk}'"
-        )));
-    }
-    if id.is_empty() {
-        return Err(PluginError::InvalidInput(format!(
-            "markdown block snapshot id for entity_pk '{entity_pk}' must not be empty"
-        )));
-    }
-
-    let order_key = parse_order_key_snapshot(object.get("order_key"), entity_pk)?;
-    let block = object
-        .get("block")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            PluginError::InvalidInput(format!(
-                "markdown block snapshot for entity_pk '{entity_pk}' must contain string 'block'"
-            ))
+    fn to_tree(&self) -> Result<NodeTree, PluginError> {
+        let root = self.nodes_by_id.get(ROOT_ENTITY_PK).ok_or_else(|| {
+            PluginError::InvalidInput("Markdown state is missing document root 'root'".to_string())
         })?;
-
-    Ok(BlockSnapshot { order_key, block })
-}
-
-fn reject_unknown_fields<'a>(
-    keys: impl Iterator<Item = &'a String>,
-    allowed: &[&str],
-    label: &str,
-) -> Result<(), PluginError> {
-    for key in keys {
-        if !allowed.contains(&key.as_str()) {
+        if root.kind != NodeKind::Document || root.parent_id.is_some() || root.order_key.is_some() {
+            return Err(PluginError::InvalidInput(
+                "Markdown document root must have kind=document, parent_id=null, order_key=null"
+                    .to_string(),
+            ));
+        }
+        let mut children_by_parent = BTreeMap::<String, Vec<&NodeSnapshot>>::new();
+        for node in self.nodes_by_id.values() {
+            if node.id == ROOT_ENTITY_PK {
+                continue;
+            }
+            let parent = node.parent_id.as_ref().ok_or_else(|| {
+                PluginError::InvalidInput(format!(
+                    "Markdown node '{}' is missing parent_id",
+                    node.id
+                ))
+            })?;
+            if node.order_key.is_none() {
+                return Err(PluginError::InvalidInput(format!(
+                    "Markdown node '{}' is missing order_key",
+                    node.id
+                )));
+            }
+            if let Err(message) = node.parsed_order_key() {
+                return Err(PluginError::InvalidInput(format!(
+                    "Markdown node '{}' has invalid order_key: {message}",
+                    node.id
+                )));
+            }
+            if !self.nodes_by_id.contains_key(parent) {
+                return Err(PluginError::InvalidInput(format!(
+                    "Markdown node '{}' references missing parent '{parent}'",
+                    node.id
+                )));
+            }
+            children_by_parent
+                .entry(parent.clone())
+                .or_default()
+                .push(node);
+        }
+        for children in children_by_parent.values_mut() {
+            children.sort_by(|left, right| {
+                let left_key = left.parsed_order_key();
+                let right_key = right.parsed_order_key();
+                match (left_key, right_key) {
+                    (Ok(Some(left_key)), Ok(Some(right_key))) => left_key
+                        .cmp(&right_key)
+                        .then_with(|| left.id.cmp(&right.id)),
+                    _ => left.id.cmp(&right.id),
+                }
+            });
+        }
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let tree = build_tree(root, &children_by_parent, &mut visiting, &mut visited)?;
+        if visited.len() != self.nodes_by_id.len() {
+            let unreachable = self
+                .nodes_by_id
+                .keys()
+                .find(|id| !visited.contains(*id))
+                .expect("unreachable node must exist");
             return Err(PluginError::InvalidInput(format!(
-                "{label} snapshot contains unsupported field '{key}'"
+                "Markdown node '{unreachable}' is not reachable from the document root"
             )));
         }
+        Ok(tree)
     }
-    Ok(())
 }
 
-fn parse_order_key_snapshot(
-    value: Option<&Value>,
-    entity_pk: &str,
-) -> Result<OrderKey, PluginError> {
-    let raw = value.and_then(Value::as_str).ok_or_else(|| {
-        PluginError::InvalidInput(format!(
-            "markdown block snapshot for entity_pk '{entity_pk}' must contain string 'order_key'"
-        ))
-    })?;
-
-    OrderKey::from_snapshot_string(raw).map_err(|message| {
-        PluginError::InvalidInput(format!(
-            "invalid markdown block order_key for entity_pk '{entity_pk}': {message}"
-        ))
+fn build_tree(
+    node: &NodeSnapshot,
+    children_by_parent: &BTreeMap<String, Vec<&NodeSnapshot>>,
+    visiting: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) -> Result<NodeTree, PluginError> {
+    if !visiting.insert(node.id.clone()) {
+        return Err(PluginError::InvalidInput(format!(
+            "Markdown graph contains a cycle at node '{}'",
+            node.id
+        )));
+    }
+    let children = children_by_parent
+        .get(&node.id)
+        .into_iter()
+        .flatten()
+        .map(|child| build_tree(child, children_by_parent, visiting, visited))
+        .collect::<Result<Vec<_>, _>>()?;
+    visiting.remove(&node.id);
+    visited.insert(node.id.clone());
+    Ok(NodeTree {
+        node: node.clone(),
+        children,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::markdown_file::parse_markdown_source;
-    use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn fuzz_detect_changes_round_trips_blocks() {
-        let mut rng = SmallRng::seed_from_u64(0);
-
-        for _ in 0..10_000 {
-            let before_markdown = parse_markdown_source(&random_markdown_source(&mut rng))
-                .expect("random before markdown should parse");
-            let after_markdown = parse_markdown_source(&random_markdown_source(&mut rng))
-                .expect("random after markdown should parse");
-            let before = projection_from_markdown(before_markdown);
-
-            let changes = detect_changes_for_markdown(&before, &after_markdown).unwrap();
-
-            let mut applied = before;
-            for change in changes {
-                apply_entity_change(&mut applied, change).unwrap();
-            }
-
-            let applied_blocks = applied
-                .to_blocks()
-                .into_iter()
-                .map(|block| block.block)
-                .collect::<Vec<_>>();
-            assert_eq!(applied_blocks, after_markdown.blocks);
-            assert_eq!(applied.document, after_markdown.document);
-            assert_eq!(
-                render_projection(&applied),
-                normalized_bytes(&after_markdown)
-            );
-        }
-    }
-
-    #[test]
-    fn fuzz_detect_changes_reorders_blocks_without_changing_ids() {
-        let mut rng = SmallRng::seed_from_u64(1);
-
-        for _ in 0..10_000 {
-            let before_markdown = parse_markdown_source(&random_markdown_source(&mut rng))
-                .expect("random before markdown should parse");
-            let before = projection_from_markdown(before_markdown.clone());
-            let mut reordered_blocks = before_markdown.blocks.clone();
-            shuffle(&mut reordered_blocks, &mut rng);
-            let after_markdown = ParsedMarkdown {
-                document: before_markdown.document,
-                blocks: reordered_blocks.clone(),
-            };
-
-            let changes = detect_changes_for_markdown(&before, &after_markdown).unwrap();
-
-            for change in &changes {
-                assert_eq!(
-                    change.schema_key, BLOCK_SCHEMA_KEY,
-                    "reordering blocks should not change the document snapshot"
-                );
-
-                let entity_pk = single_entity_pk(change.entity_pk.clone()).unwrap();
-                let before_block = before
-                    .blocks_by_id
-                    .get(&entity_pk)
-                    .expect("reordering blocks should only update existing block ids");
-                let snapshot_content = change
-                    .snapshot_content
-                    .as_deref()
-                    .expect("reordering blocks should not delete existing block entities");
-                let after_block = parse_block_snapshot(snapshot_content, &entity_pk).unwrap();
-
-                assert_eq!(
-                    after_block.block, before_block.block,
-                    "reordering blocks should only update order keys"
-                );
-                assert_ne!(
-                    after_block.order_key, before_block.order_key,
-                    "reordering blocks should not emit unchanged block snapshots"
-                );
-            }
-
-            let mut applied = before;
-            for change in changes {
-                apply_entity_change(&mut applied, change).unwrap();
-            }
-
-            let applied_blocks = applied
-                .to_blocks()
-                .into_iter()
-                .map(|block| block.block)
-                .collect::<Vec<_>>();
-            assert_eq!(applied_blocks, reordered_blocks);
-            assert_eq!(applied.document, after_markdown.document);
-        }
-    }
-
-    fn random_markdown_source(rng: &mut (impl Rng + ?Sized)) -> String {
-        let block_count = rng.random_range(0..=8);
-        let mut output = String::new();
-
-        if rng.random_range(0..4) == 0 {
-            output.push('\n');
-        }
-
-        for offset in 0..block_count {
-            if offset != 0 {
-                output.push_str(random_separator(rng));
-            }
-            output.push_str(&random_markdown_block(rng));
-        }
-
-        if rng.random_range(0..4) == 0 {
-            output.push('\n');
-        }
-
-        output
-    }
-
-    fn random_separator(rng: &mut (impl Rng + ?Sized)) -> &'static str {
-        match rng.random_range(0..5) {
-            0 => "\n\n",
-            1 => "\r\n\r\n",
-            2 => "\n\n\n",
-            3 => "\r\r",
-            _ => "\n \n",
-        }
-    }
-
-    fn random_markdown_block(rng: &mut (impl Rng + ?Sized)) -> String {
-        match rng.random_range(0..8) {
-            0 => format!(
-                "{} {}",
-                "#".repeat(rng.random_range(1..=3)),
-                random_words(rng)
-            ),
-            1 => format!("{}\n{}", random_words(rng), random_words(rng)),
-            2 => {
-                let mut list = String::new();
-                for item in 0..rng.random_range(1..=4) {
-                    if item != 0 {
-                        list.push('\n');
-                    }
-                    list.push_str("- ");
-                    list.push_str(&random_words(rng));
-                }
-                list
-            }
-            3 => format!("> {}\n> {}", random_words(rng), random_words(rng)),
-            4 => format!("```\n{}\n```", random_words(rng)),
-            5 => "---".to_string(),
-            6 => format!(
-                "[{}]: https://example.com/{}",
-                random_word(rng),
-                random_word(rng)
-            ),
-            _ => format!(
-                "| {} | {} |\n| --- | --- |\n| {} | {} |",
-                random_word(rng),
-                random_word(rng),
-                random_word(rng),
-                random_word(rng)
-            ),
-        }
-    }
-
-    fn random_words(rng: &mut (impl Rng + ?Sized)) -> String {
-        let count = rng.random_range(1..=5);
-        (0..count)
-            .map(|_| random_word(rng))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn random_word(rng: &mut (impl Rng + ?Sized)) -> String {
-        let alphabet = ["alpha", "beta", "gamma", "delta", "one", "two", "x"];
-        alphabet[rng.random_range(0..alphabet.len())].to_string()
-    }
-
-    fn shuffle<T>(items: &mut [T], rng: &mut (impl Rng + ?Sized)) {
-        for index in (1..items.len()).rev() {
-            items.swap(index, rng.random_range(0..=index));
-        }
-    }
-
-    fn projection_from_markdown(markdown: ParsedMarkdown) -> Projection {
-        let ids = (0..markdown.blocks.len())
-            .map(|offset| format!("block:{offset}"))
-            .collect::<Vec<_>>();
-        let order_keys = OrderKey::evenly_between(None, None, ids.len()).unwrap();
-        let blocks_by_id = markdown
-            .blocks
-            .into_iter()
-            .zip(ids.into_iter().zip(order_keys))
-            .map(|(block, (id, order_key))| (id, BlockSnapshot { order_key, block }))
-            .collect::<BTreeMap<_, _>>();
-
-        Projection {
-            blocks_by_id,
-            document: markdown.document,
-            document_present: true,
-        }
-    }
-
-    fn normalized_bytes(markdown: &ParsedMarkdown) -> Vec<u8> {
-        let mut rendered = markdown.blocks.join("\n\n");
-        rendered.push('\n');
-        rendered.into_bytes()
-    }
-
-    fn apply_entity_change(
-        projection: &mut Projection,
-        change: DetectedChange,
-    ) -> Result<(), PluginError> {
-        match change.schema_key.as_str() {
-            DOCUMENT_SCHEMA_KEY => {
-                if let Some(raw) = change.snapshot_content {
-                    projection.document = parse_document_snapshot(&raw)?;
-                    projection.document_present = true;
-                } else {
-                    projection.document = MarkdownDocumentSnapshot;
-                    projection.document_present = false;
-                }
-            }
-            BLOCK_SCHEMA_KEY => {
-                let entity_pk = single_entity_pk(change.entity_pk)?;
-                if let Some(raw) = change.snapshot_content {
-                    let block = parse_block_snapshot(&raw, &entity_pk)?;
-                    projection.blocks_by_id.insert(entity_pk, block);
-                } else {
-                    projection.blocks_by_id.remove(&entity_pk);
-                }
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
 }
