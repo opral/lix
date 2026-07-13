@@ -43,7 +43,7 @@ pub(crate) struct TransactionWriteBuffer {
     functions: FunctionProviderHandle,
     rows: Mutex<Vec<Option<PreparedStateRow>>>,
     by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
-    insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>>,
+    insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>>,
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
@@ -57,8 +57,7 @@ pub(crate) enum RowSlot {
 /// Drained prepared transaction writes ready for commit.
 pub(crate) struct PreparedWriteSet {
     pub(crate) state_rows: Vec<PreparedStateRow>,
-    pub(crate) insert_identities:
-        BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>,
+    pub(crate) insert_identities: BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
@@ -67,21 +66,13 @@ pub(crate) struct PreparedWriteSet {
 pub(crate) struct PreparedWriteValidationSet<'a> {
     rows: Vec<PreparedValidationRow<'a>>,
     constraint_rows: Vec<PreparedValidationRow<'a>>,
-    insert_identities: Vec<(
-        &'a PreparedStateRowIdentity,
-        Option<&'a TransactionWriteOrigin>,
-    )>,
+    insert_identities: Vec<(&'a PreparedStateRowIdentity, &'a PreparedInsertIdentity)>,
 }
 
 pub(crate) struct PreparedWriteValidationIndex<'a> {
     rows_by_schema_scope: BTreeMap<Domain, Vec<PreparedValidationRow<'a>>>,
-    insert_identities_by_schema_scope: BTreeMap<
-        Domain,
-        Vec<(
-            &'a PreparedStateRowIdentity,
-            Option<&'a TransactionWriteOrigin>,
-        )>,
-    >,
+    insert_identities_by_schema_scope:
+        BTreeMap<Domain, Vec<(&'a PreparedStateRowIdentity, &'a PreparedInsertIdentity)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -224,10 +215,16 @@ impl<'a> PreparedWriteValidationSet<'a> {
 
     pub(crate) fn insert_identities(
         &self,
-    ) -> impl Iterator<Item = (&PreparedStateRowIdentity, Option<&TransactionWriteOrigin>)> {
+    ) -> impl Iterator<
+        Item = (
+            &PreparedStateRowIdentity,
+            bool,
+            Option<&TransactionWriteOrigin>,
+        ),
+    > {
         self.insert_identities
             .iter()
-            .map(|(identity, origin)| (*identity, *origin))
+            .map(|(identity, insert)| (*identity, insert.untracked, insert.origin.as_ref()))
     }
 }
 
@@ -246,15 +243,13 @@ impl PreparedWriteSet {
                 .or_default()
                 .push(row);
         }
-        let mut insert_identities_by_schema_scope = BTreeMap::<
-            Domain,
-            Vec<(&PreparedStateRowIdentity, Option<&TransactionWriteOrigin>)>,
-        >::new();
-        for (identity, origin) in &self.insert_identities {
+        let mut insert_identities_by_schema_scope =
+            BTreeMap::<Domain, Vec<(&PreparedStateRowIdentity, &PreparedInsertIdentity)>>::new();
+        for (identity, insert) in &self.insert_identities {
             insert_identities_by_schema_scope
-                .entry(identity.domain().schema_catalog_domain())
+                .entry(identity.domain(insert.untracked).schema_catalog_domain())
                 .or_default()
-                .push((identity, origin.as_ref()));
+                .push((identity, insert));
         }
 
         PreparedWriteValidationIndex {
@@ -266,11 +261,7 @@ impl PreparedWriteSet {
     #[cfg(test)]
     pub(crate) fn validation_set_for_tests(&self) -> PreparedWriteValidationSet<'_> {
         let rows: Vec<_> = self.validation_rows().collect();
-        let insert_identities = self
-            .insert_identities
-            .iter()
-            .map(|(identity, origin)| (identity, origin.as_ref()))
-            .collect();
+        let insert_identities = self.insert_identities.iter().collect();
         PreparedWriteValidationSet {
             constraint_rows: rows.clone(),
             rows,
@@ -386,6 +377,7 @@ impl TransactionWriteBuffer {
             StagedCommitChangeRefs::new(
                 CommitId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
                 timestamp,
             )
         });
@@ -454,6 +446,7 @@ impl TransactionWriteBuffer {
         };
         let functions = self.functions.clone();
         let (rows, file_data_writes) = self.state_rows_from_stage_write(write);
+        reject_mixed_durability_rows_in_batch(&rows)?;
         reject_duplicate_present_rows_in_batch(&rows)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -480,20 +473,32 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged insert identity lock",
             )
         })?;
-        for mut row in rows {
+        for row in &rows {
             if row.global && row.branch_id != GLOBAL_BRANCH_ID {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     "global staged rows must use the global branch id",
                 ));
             }
+            let identity = PreparedStateRowIdentity::from(row);
+            let Some(RowSlot::State(index)) = by_identity_guard.get(&identity).copied() else {
+                continue;
+            };
+            let Some(previous) = guard.get(index).and_then(Option::as_ref) else {
+                continue;
+            };
+            if previous.untracked != row.untracked {
+                return Err(mixed_durability_error(row));
+            }
+        }
+        for mut row in rows {
             let identity = PreparedStateRowIdentity::from(&row);
             if mode == Some(TransactionWriteMode::Insert)
                 && by_identity_guard.contains_key(&identity)
             {
                 return Err(duplicate_insert_identity_error(&row));
             }
-            let existing_slot = by_identity_guard.remove(&identity);
+            let existing_slot = by_identity_guard.get(&identity).copied();
             if let Some(RowSlot::State(index)) = existing_slot {
                 if let Some(previous) = guard.get_mut(index).and_then(Option::take) {
                     remove_row_from_commit_change_refs(&mut commit_change_refs_guard, &previous);
@@ -502,14 +507,20 @@ impl TransactionWriteBuffer {
             add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &functions);
             let identity = PreparedStateRowIdentity::from(&row);
             if mode == Some(TransactionWriteMode::Insert) {
-                insert_identities_guard.insert(identity.clone(), row.origin.clone());
+                insert_identities_guard.insert(
+                    identity.clone(),
+                    PreparedInsertIdentity {
+                        untracked: row.untracked,
+                        origin: row.origin.clone(),
+                    },
+                );
             }
             let slot = match existing_slot {
                 Some(RowSlot::State(index)) => {
                     guard[index] = Some(row);
                     RowSlot::State(index)
                 }
-                _ => {
+                None => {
                     let index = guard.len();
                     guard.push(Some(row));
                     RowSlot::State(index)
@@ -630,16 +641,7 @@ impl PreparedStateRowOverlay {
     /// Returns a staged exact-row answer, if this transaction has one.
     #[cfg(test)]
     pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
-        let untracked_identity = PreparedStateRowIdentity::from_exact_request(request, true)?;
-        if let Some(row) = self.load_state_slot(&untracked_identity) {
-            return Some(if row.snapshot.is_none() {
-                StagedExactRow::Tombstone
-            } else {
-                StagedExactRow::Row(MaterializedLiveStateRow::from(&row))
-            });
-        }
-
-        let identity = PreparedStateRowIdentity::from_exact_request(request, false)?;
+        let identity = PreparedStateRowIdentity::from_exact_request(request)?;
         if let Some(row) = self.load_state_slot(&identity) {
             return Some(if row.snapshot.is_none() {
                 StagedExactRow::Tombstone
@@ -678,17 +680,21 @@ pub(crate) enum StagedExactRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PreparedStateRowIdentity {
-    untracked: bool,
     schema_key: String,
     entity_pk: EntityPk,
     file_id: Option<String>,
     branch_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedInsertIdentity {
+    untracked: bool,
+    origin: Option<TransactionWriteOrigin>,
+}
+
 impl PreparedStateRowIdentity {
     fn from_staged_row(row: &PreparedStateRow) -> Self {
         Self {
-            untracked: row.untracked,
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
@@ -697,7 +703,7 @@ impl PreparedStateRowIdentity {
     }
 
     #[cfg(test)]
-    fn from_exact_request(request: &LiveStateRowRequest, untracked: bool) -> Option<Self> {
+    fn from_exact_request(request: &LiveStateRowRequest) -> Option<Self> {
         let file_id = match &request.file_id {
             NullableKeyFilter::Null => None,
             NullableKeyFilter::Value(value) => Some(value.clone()),
@@ -705,7 +711,6 @@ impl PreparedStateRowIdentity {
             NullableKeyFilter::Any => return None,
         };
         Some(Self {
-            untracked,
             schema_key: request.schema_key.clone(),
             entity_pk: request.entity_pk.clone(),
             file_id,
@@ -721,8 +726,8 @@ impl PreparedStateRowIdentity {
         &self.entity_pk
     }
 
-    pub(crate) fn domain(&self) -> Domain {
-        Domain::exact_file(self.branch_id.clone(), self.untracked, self.file_id.clone())
+    pub(crate) fn domain(&self, untracked: bool) -> Domain {
+        Domain::exact_file(self.branch_id.clone(), untracked, self.file_id.clone())
     }
 }
 
@@ -735,13 +740,40 @@ impl From<&PreparedStateRow> for PreparedStateRowIdentity {
 impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
     fn from(row: &MaterializedLiveStateRow) -> Self {
         Self {
-            untracked: row.untracked,
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
             branch_id: row.branch_id.clone(),
         }
     }
+}
+
+fn reject_mixed_durability_rows_in_batch(rows: &[PreparedStateRow]) -> Result<(), LixError> {
+    let mut durability_by_identity = BTreeMap::<PreparedStateRowIdentity, bool>::new();
+    for row in rows {
+        let identity = PreparedStateRowIdentity::from(row);
+        if durability_by_identity
+            .insert(identity, row.untracked)
+            .is_some_and(|untracked| untracked != row.untracked)
+        {
+            return Err(mixed_durability_error(row));
+        }
+    }
+    Ok(())
+}
+
+fn mixed_durability_error(row: &PreparedStateRow) -> LixError {
+    let entity_pk = row
+        .entity_pk
+        .as_json_array_text()
+        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        format!(
+            "cannot mix tracked and untracked writes for schema '{}' entity_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
+            row.schema_key, entity_pk, row.branch_id
+        ),
+    )
 }
 
 fn reject_duplicate_present_rows_in_batch(rows: &[PreparedStateRow]) -> Result<(), LixError> {
@@ -859,6 +891,7 @@ fn add_row_to_commit_change_refs(
             let timestamp = functions.call_timestamp();
             StagedCommitChangeRefs::new(
                 CommitId::from(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
                 timestamp,
             )
@@ -1235,10 +1268,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_keep_tracked_and_untracked_domains_separate() {
+    async fn staged_writes_reject_mixed_durability_in_one_batch() {
         let staged_writes = test_staged_writes();
 
-        staged_writes
+        let error = staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
@@ -1249,24 +1282,15 @@ mod tests {
                         .with_change_id("change-untracked"),
                 ],
             })
-            .expect("untracked overwrite should stage");
+            .expect_err("mixed durability should be rejected");
 
-        let drained = staged_writes.drain().expect("drain should succeed");
-        assert_eq!(drained.state_rows.len(), 2);
-        assert!(drained.state_rows.iter().any(|row| {
-            row.change_id == Some(labeled_change_id("change-tracked")) && !row.untracked
-        }));
-        assert!(drained.state_rows.iter().any(|row| {
-            row.change_id == Some(labeled_change_id("change-untracked")) && row.untracked
-        }));
-        let change_refs = drained
-            .commit_change_refs_by_branch
-            .get("global")
-            .expect("tracked commit member should remain in tracked domain");
-        assert_eq!(
-            change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec![labeled_change_id("change-tracked")]
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            error
+                .message
+                .contains("cannot mix tracked and untracked writes")
         );
+        assert!(staged_writes.drain().unwrap().state_rows.is_empty());
     }
 
     #[tokio::test]
@@ -1291,27 +1315,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_insert_keeps_tracked_and_untracked_rows_as_distinct_identities() {
+    async fn staged_writes_reject_mixed_durability_across_calls() {
         let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Insert,
-                rows: vec![
-                    state_row("shared-domain-key", "tracked").with_tracked(),
-                    state_row("shared-domain-key", "untracked"),
-                ],
+                mode: TransactionWriteMode::Replace,
+                rows: vec![state_row("shared-domain-key", "tracked").with_tracked()],
             })
-            .expect("tracked and untracked rows are distinct domain identities");
+            .expect("tracked row should stage");
+        let error = staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![state_row("shared-domain-key", "untracked")],
+            })
+            .expect_err("durability switch should fail");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert!(!drained.state_rows[0].untracked);
+    }
+
+    #[tokio::test]
+    async fn same_durability_replacement_keeps_only_the_latest_row() {
+        let staged_writes = test_staged_writes();
+        for row in [
+            state_row("alternating-key", "tracked-first").with_tracked(),
+            state_row("alternating-key", "tracked-final").with_tracked(),
+        ] {
+            staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows: vec![row],
+                })
+                .expect("alternating row should stage");
+        }
 
         let drained = staged_writes.drain().expect("drain should succeed");
-        assert_eq!(drained.state_rows.len(), 2);
-        assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == EntityPk::single("shared-domain-key") && !row.untracked
-        }));
-        assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == EntityPk::single("shared-domain-key") && row.untracked
-        }));
+        assert_eq!(drained.state_rows.len(), 1);
+        assert!(!drained.state_rows[0].untracked);
+        assert_eq!(
+            drained.state_rows[0]
+                .snapshot
+                .as_ref()
+                .map(crate::transaction::types::StageJson::materialize)
+                .as_deref(),
+            Some("{\"key\":\"alternating-key\",\"value\":\"tracked-final\"}")
+        );
     }
 
     #[tokio::test]
@@ -1376,11 +1427,10 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
-                    state_row("shared-entity", "base"),
+                    state_row("shared-entity", "latest"),
                     state_row("shared-entity", "other-branch").with_branch("branch-b"),
                     state_row("shared-entity", "other-schema").with_schema("other_schema"),
                     state_row("shared-entity", "other-file").with_file_id("file-a"),
-                    state_row("shared-entity", "tracked").with_tracked(),
                 ],
             })
             .expect("staging rows should succeed");
@@ -1409,10 +1459,6 @@ mod tests {
                 .count(),
             1
         );
-        assert!(rows.iter().any(|row| {
-            row.snapshot_content.as_deref()
-                == Some("{\"key\":\"shared-entity\",\"value\":\"base\"}")
-        }));
     }
 
     #[tokio::test]

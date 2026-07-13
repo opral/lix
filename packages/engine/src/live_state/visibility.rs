@@ -103,6 +103,40 @@ where
     ))
 }
 
+/// Overlays staged tracked rows on the immutable tracked head.
+///
+/// This is deliberately separate from [`overlay_scan_rows`]: canonical current
+/// state may contain an untracked row that shadows the same tracked identity,
+/// but tracked schema planning and validation must still be based on a commit
+/// that is independently valid without that untracked state.
+pub(crate) async fn overlay_scan_tracked_rows<S>(
+    base: &dyn LiveStateReader,
+    staged: &S,
+    request: &LiveStateScanRequest,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError>
+where
+    S: StagedLiveStateRows + ?Sized,
+{
+    let mut candidate_request = request.clone();
+    candidate_request.limit = None;
+    candidate_request.filter.include_tombstones = true;
+    candidate_request.filter.branch_ids = expanded_branch_ids(&request.filter.branch_ids);
+    candidate_request.filter.untracked = Some(false);
+    let staged_rows = staged.staged_rows(&candidate_request)?;
+    let rows = base.scan_tracked_rows(&candidate_request).await?;
+    Ok(resolve_visible_rows(
+        rows,
+        staged_rows,
+        &VisibilityRequest {
+            branch_scope: VisibilityBranchScope::BranchIds {
+                branch_ids: request.filter.branch_ids.clone(),
+            },
+            include_tombstones: request.filter.include_tombstones,
+            limit: request.limit,
+        },
+    ))
+}
+
 pub(crate) async fn overlay_scan_file_rows<S>(
     base: &dyn LiveStateReader,
     staged: &S,
@@ -212,7 +246,7 @@ fn project_global_rows_into_requested_branches(
             if row.branch_id == GLOBAL_BRANCH_ID {
                 let mut projected = row.clone();
                 projected.branch_id.clone_from(requested_branch_id);
-                insert_row_preferring_untracked(&mut rows_by_identity, projected);
+                rows_by_identity.insert(LiveStateRowIdentity::from_row(&projected), projected);
             }
         }
         let mut branch_rows_by_identity =
@@ -221,7 +255,7 @@ fn project_global_rows_into_requested_branches(
             .iter()
             .filter(|row| row.branch_id == *requested_branch_id)
         {
-            insert_row_preferring_untracked(&mut branch_rows_by_identity, row.clone());
+            branch_rows_by_identity.insert(LiveStateRowIdentity::from_row(row), row.clone());
         }
         rows_by_identity.extend(branch_rows_by_identity);
     }
@@ -232,7 +266,7 @@ fn project_global_rows_into_requested_branches(
 fn dedupe_rows(rows: Vec<MaterializedLiveStateRow>) -> Vec<MaterializedLiveStateRow> {
     let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
     for row in rows {
-        insert_row_preferring_untracked(&mut rows_by_identity, row);
+        rows_by_identity.insert(LiveStateRowIdentity::from_row(&row), row);
     }
     rows_by_identity.into_values().collect()
 }
@@ -245,23 +279,8 @@ fn insert_overlay_row(
     let identity = LiveStateRowIdentity::from_row(&row);
     match rows_by_identity.get(&identity) {
         Some((existing_tier, _)) if *existing_tier > tier => {}
-        Some((existing_tier, existing))
-            if *existing_tier == tier && existing.untracked && !row.untracked => {}
         _ => {
             rows_by_identity.insert(identity, (tier, row));
-        }
-    }
-}
-
-fn insert_row_preferring_untracked(
-    rows_by_identity: &mut BTreeMap<LiveStateRowIdentity, MaterializedLiveStateRow>,
-    row: MaterializedLiveStateRow,
-) {
-    let identity = LiveStateRowIdentity::from_row(&row);
-    match rows_by_identity.get(&identity) {
-        Some(existing) if existing.untracked && !row.untracked => {}
-        _ => {
-            rows_by_identity.insert(identity, row);
         }
     }
 }
@@ -343,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_branch_filter_dedupes_duplicate_base_rows() {
+    fn empty_branch_filter_uses_last_base_row_for_duplicate_identity() {
         let mut tracked = row_at(
             "branch-a",
             "entity",
@@ -352,8 +371,15 @@ mod tests {
             Some("change-tracked"),
         );
         tracked.untracked = false;
-        let mut untracked = row_at("branch-a", "entity", "untracked", false, None);
+        let mut untracked = row_at(
+            "branch-a",
+            "entity",
+            "untracked",
+            false,
+            Some("change-untracked"),
+        );
         untracked.untracked = true;
+        untracked.commit_id = None;
 
         let rows = resolve_scan_rows(vec![tracked, untracked], &[], false);
 
@@ -400,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_prefers_staged_untracked_over_staged_tracked_for_same_visible_identity() {
+    fn staged_duplicate_identity_uses_last_mutation_without_tracking_lane_preference() {
         let mut tracked = row_at(
             "branch-a",
             "entity",
@@ -409,8 +435,15 @@ mod tests {
             Some("change-tracked"),
         );
         tracked.untracked = false;
-        let mut untracked = row_at("branch-a", "entity", "untracked", false, None);
+        let mut untracked = row_at(
+            "branch-a",
+            "entity",
+            "untracked",
+            false,
+            Some("change-untracked"),
+        );
         untracked.untracked = true;
+        untracked.commit_id = None;
 
         let rows = resolve_live_state_rows(
             Vec::new(),
@@ -421,10 +454,10 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].untracked);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"untracked\"}")
+            Some("{\"value\":\"tracked\"}")
         );
 
         let rows = resolve_live_state_rows(
@@ -444,9 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn overlay_prefers_staged_tracked_over_base_untracked_for_same_visible_identity() {
-        let mut base = row_at("branch-a", "entity", "base-untracked", false, None);
+    fn staged_row_replaces_base_row_for_same_visible_identity() {
+        let mut base = row_at(
+            "branch-a",
+            "entity",
+            "base-untracked",
+            false,
+            Some("change-base-untracked"),
+        );
         base.untracked = true;
+        base.commit_id = None;
         let mut staged = row_at(
             "branch-a",
             "entity",
@@ -510,11 +550,11 @@ mod tests {
     }
 
     #[test]
-    fn base_tracked_branch_tombstone_hides_staged_untracked_global_row() {
-        let mut base = tombstone_at("branch-a", "entity", false, Some("change-base"));
-        base.untracked = false;
-        let mut staged = row_at("global", "entity", "staged", true, None);
+    fn base_branch_tombstone_hides_staged_global_row_regardless_of_tracking_state() {
+        let base = tombstone_at("branch-a", "entity", false, Some("change-base"));
+        let mut staged = row_at("global", "entity", "staged", true, Some("change-staged"));
         staged.untracked = true;
+        staged.commit_id = None;
 
         let rows = resolve_live_state_rows(
             vec![base],

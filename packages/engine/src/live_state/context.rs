@@ -8,6 +8,9 @@ use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphContext;
+use crate::current_state::{
+    CurrentStateContext, CurrentStateFilter, CurrentStateRowRequest, CurrentStateScanRequest,
+};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -18,9 +21,6 @@ use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest,
 };
-use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
-};
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
 
@@ -29,24 +29,23 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
-/// Live state composes the rebuildable tracked projection with the durable
-/// untracked local overlay. Lower stores own persistence; this facade owns the
-/// visibility rule.
+/// Live state serves one canonical current-state root per branch. Immutable
+/// tracked roots remain a separate history and validation concern.
 pub(crate) struct LiveStateContext {
     tracked_state: TrackedStateContext,
-    untracked_state: UntrackedStateContext,
+    current_state: CurrentStateContext,
     commit_graph: CommitGraphContext,
 }
 
 impl LiveStateContext {
     pub(crate) fn new(
         tracked_state: TrackedStateContext,
-        untracked_state: UntrackedStateContext,
+        current_state: CurrentStateContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
         Self {
             tracked_state,
-            untracked_state,
+            current_state,
             commit_graph,
         }
     }
@@ -59,7 +58,7 @@ impl LiveStateContext {
         LiveStateStoreReader {
             store,
             tracked_state: self.tracked_state.clone(),
-            untracked_state: self.untracked_state,
+            current_state: self.current_state.clone(),
             commit_graph: self.commit_graph.clone(),
         }
     }
@@ -69,7 +68,7 @@ impl LiveStateContext {
 pub(crate) struct LiveStateStoreReader<S> {
     store: S,
     tracked_state: TrackedStateContext,
-    untracked_state: UntrackedStateContext,
+    current_state: CurrentStateContext,
     commit_graph: CommitGraphContext,
 }
 
@@ -82,69 +81,29 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
-        let scope = scan_scope(store, &self.untracked_state, request).await?;
+        let scope = scan_scope(store, &self.current_state, request).await?;
         let derived_rows =
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
-        let mut tracked_rows = Vec::new();
-        if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
-            let tracked_request = tracked_scan_request_from_live(request);
-            let rows = stream::iter(scope.storage_branch_ids.clone().into_iter().enumerate())
-                .map(|(index, branch_id)| {
-                    let tracked_request = tracked_request.clone();
-                    async move {
-                        let Some(commit_id) =
-                            load_branch_ref_commit_id(store, &self.untracked_state, &branch_id)
-                                .await?
-                        else {
-                            return Ok::<_, LixError>((index, Vec::new()));
-                        };
-                        let source = tracked_source_from_branch_id(&branch_id);
-                        let rows = self
-                            .tracked_state
-                            .reader(store)
-                            .scan_rows_at_commit(&commit_id, &tracked_request)
-                            .await?
-                            .into_iter()
-                            .map(|row| project_tracked_row(row, &branch_id, source))
-                            .collect();
-                        Ok((index, rows))
-                    }
-                })
-                .buffer_unordered(BRANCH_READ_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await?;
-            let mut rows = rows;
-            rows.sort_by_key(|(index, _)| *index);
-            tracked_rows.extend(rows.into_iter().flat_map(|(_, rows)| rows));
+        let mut rows = Vec::new();
+        if !is_commit_derived_only_request(request) {
+            for branch_id in &scope.storage_branch_ids {
+                rows.extend(
+                    self.current_state
+                        .reader(store)
+                        .scan_rows(&current_scan_request_from_live(request, branch_id))
+                        .await?
+                        .into_iter()
+                        .map(MaterializedLiveStateRow::from)
+                        .filter(|row| {
+                            request
+                                .filter
+                                .untracked
+                                .is_none_or(|untracked| row.untracked == untracked)
+                        }),
+                );
+            }
         }
-
-        let untracked_rows = if request.filter.untracked != Some(false) {
-            self.untracked_state
-                .reader(store)
-                .scan_rows(&untracked_scan_request_from_live(
-                    request,
-                    &scope.storage_branch_ids,
-                ))
-                .await?
-                .into_iter()
-                .map(MaterializedLiveStateRow::from)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        let mut rows = if request.filter.untracked.is_some() {
-            tracked_rows
-                .into_iter()
-                .chain(untracked_rows)
-                .chain(derived_rows)
-                .collect()
-        } else {
-            crate::live_state::overlay::overlay_untracked_rows(tracked_rows, untracked_rows)
-                .into_iter()
-                .chain(derived_rows)
-                .collect()
-        };
+        rows.extend(derived_rows);
         rows = resolve_visible_rows(
             rows,
             Vec::new(),
@@ -164,7 +123,7 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         {
-            if !branch_ref_exists(&self.store, &self.untracked_state, &request.branch_id).await? {
+            if !branch_ref_exists(&self.store, &self.current_state, &request.branch_id).await? {
                 return Ok(None);
             }
         }
@@ -183,6 +142,44 @@ where
             })
             .await?;
         Ok(rows.into_iter().next())
+    }
+
+    pub(crate) async fn scan_tracked_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let store = &self.store;
+        let scope = scan_scope(store, &self.current_state, request).await?;
+        let mut rows = scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
+        if !is_commit_derived_only_request(request) {
+            for branch_id in &scope.storage_branch_ids {
+                let Some(commit_id) =
+                    load_branch_ref_commit_id(store, &self.current_state, branch_id).await?
+                else {
+                    continue;
+                };
+                let source = tracked_source_from_branch_id(branch_id);
+                rows.extend(
+                    self.tracked_state
+                        .reader(store)
+                        .scan_rows_at_commit(&commit_id, &tracked_scan_request_from_live(request))
+                        .await?
+                        .into_iter()
+                        .map(|row| project_tracked_row(row, branch_id, source)),
+                );
+            }
+        }
+        Ok(resolve_visible_rows(
+            rows,
+            Vec::new(),
+            &VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids,
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            },
+        ))
     }
 }
 
@@ -203,6 +200,13 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         Self::load_row(self, request).await
+    }
+
+    async fn scan_tracked_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        Self::scan_tracked_rows(self, request).await
     }
 }
 
@@ -369,17 +373,21 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
     }
 }
 
-fn untracked_scan_request_from_live(
+fn current_scan_request_from_live(
     request: &LiveStateScanRequest,
-    branch_ids: &[String],
-) -> UntrackedStateScanRequest {
-    let mut filter: crate::untracked_state::UntrackedStateFilter = request.filter.clone().into();
-    filter.branch_ids = branch_ids.to_vec();
-    UntrackedStateScanRequest {
-        filter,
-        projection: crate::untracked_state::UntrackedStateProjection {
-            columns: request.projection.columns.clone(),
+    branch_id: &str,
+) -> CurrentStateScanRequest {
+    CurrentStateScanRequest {
+        branch_id: branch_id.to_string(),
+        filter: CurrentStateFilter {
+            schema_keys: request.filter.schema_keys.clone(),
+            entity_pks: request.filter.entity_pks.clone(),
+            file_ids: request.filter.file_ids.clone(),
+            // Tombstones must win global/branch resolution before the caller's
+            // requested visibility is applied.
+            include_tombstones: true,
         },
+        projection: request.projection.columns.clone(),
         limit: None,
     }
 }
@@ -391,20 +399,20 @@ struct LiveStateScanScope {
 }
 
 async fn scan_scope(
-    store: &(impl StorageRead + ?Sized),
-    untracked_state: &UntrackedStateContext,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
+    current_state: &CurrentStateContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
     if request.filter.branch_ids.is_empty() {
         return Ok(LiveStateScanScope {
-            storage_branch_ids: all_branch_ref_ids(store, untracked_state).await?,
+            storage_branch_ids: all_branch_ref_ids(store, current_state).await?,
             projection_branch_ids: Vec::new(),
         });
     }
 
     let mut projection_branch_ids = Vec::new();
     for branch_id in &request.filter.branch_ids {
-        if branch_ref_exists(store, untracked_state, branch_id).await? {
+        if branch_ref_exists(store, current_state, branch_id).await? {
             projection_branch_ids.push(branch_id.clone());
         }
     }
@@ -417,18 +425,19 @@ async fn scan_scope(
 }
 
 async fn all_branch_ref_ids(
-    store: &(impl StorageRead + ?Sized),
-    untracked_state: &UntrackedStateContext,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
+    current_state: &CurrentStateContext,
 ) -> Result<Vec<String>, LixError> {
-    let rows = untracked_state
+    let rows = current_state
         .reader(store)
-        .scan_rows(&UntrackedStateScanRequest {
-            filter: crate::untracked_state::UntrackedStateFilter {
+        .scan_rows(&CurrentStateScanRequest {
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            filter: CurrentStateFilter {
                 schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                 ..Default::default()
             },
-            ..Default::default()
+            projection: Vec::new(),
+            limit: None,
         })
         .await?;
     rows.into_iter()
@@ -437,17 +446,17 @@ async fn all_branch_ref_ids(
 }
 
 async fn load_branch_ref_commit_id(
-    store: &(impl StorageRead + ?Sized),
-    untracked_state: &UntrackedStateContext,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
+    current_state: &CurrentStateContext,
     branch_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(row) = untracked_state
+    let Some(row) = current_state
         .reader(store)
-        .load_row(&UntrackedStateRowRequest {
+        .load_row(&CurrentStateRowRequest {
             schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single(branch_id),
-            file_id: NullableKeyFilter::Null,
+            file_id: None,
         })
         .await?
     else {
@@ -470,11 +479,11 @@ async fn load_branch_ref_commit_id(
 }
 
 async fn branch_ref_exists(
-    store: &(impl StorageRead + ?Sized),
-    untracked_state: &UntrackedStateContext,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
+    current_state: &CurrentStateContext,
     branch_id: &str,
 ) -> Result<bool, LixError> {
-    Ok(load_branch_ref_commit_id(store, untracked_state, branch_id)
+    Ok(load_branch_ref_commit_id(store, current_state, branch_id)
         .await?
         .is_some())
 }
@@ -519,17 +528,30 @@ fn project_tracked_row(
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::changelog::{ChangeId, CommitId};
+    use crate::changelog::{ChangeId, ChangeRecord, ChangelogAppend, CommitId};
+    use crate::current_state::{CurrentStateContext, CurrentStateDeltaRef};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::LiveStateFilter;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
-    use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
     use serde_json::json;
 
     const COMMIT_SCHEMA_KEY: &str = "lix_commit";
+
+    #[derive(Clone)]
+    struct MaterializedUntrackedStateRow {
+        entity_pk: EntityPk,
+        schema_key: String,
+        file_id: Option<String>,
+        snapshot_content: Option<String>,
+        metadata: Option<String>,
+        deleted: bool,
+        created_at: String,
+        updated_at: String,
+        branch_id: String,
+    }
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -542,7 +564,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
-            crate::untracked_state::UntrackedStateContext::new(),
+            CurrentStateContext::new(),
             CommitGraphContext::new(),
         )
     }
@@ -552,20 +574,98 @@ mod tests {
         _read: &(impl StorageRead + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("current-state read should open");
         let mut writes = storage.new_write_set();
-        let canonical_rows = rows
+        let mut json_writer = JsonStoreContext::new().writer();
+        let changes = rows
             .iter()
-            .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
+            .enumerate()
+            .map(|(index, row)| {
+                if let Some(snapshot) = row.snapshot_content.as_deref() {
+                    json_writer.stage_batch(
+                        &mut writes,
+                        JsonWritePlacementRef::OutOfBand,
+                        [NormalizedJsonRef::trusted_prehashed(
+                            snapshot,
+                            JsonRef::for_content(snapshot.as_bytes()),
+                        )],
+                    )?;
+                }
+                let change_id = ChangeId::for_test_label(&format!(
+                    "current:{}:{}:{index}",
+                    row.branch_id, row.schema_key
+                ));
+                Ok::<_, LixError>((
+                    row,
+                    ChangeRecord {
+                        format_version: 1,
+                        change_id,
+                        schema_key: row.schema_key.clone(),
+                        entity_pk: row.entity_pk.clone(),
+                        file_id: row.file_id.clone(),
+                        snapshot: row
+                            .snapshot_content
+                            .as_deref()
+                            .map_or(crate::json_store::JsonSlot::None, |snapshot| {
+                                crate::json_store::JsonSlot::from_json(snapshot)
+                            }),
+                        metadata: row
+                            .metadata
+                            .as_deref()
+                            .map_or(crate::json_store::JsonSlot::None, |metadata| {
+                                crate::json_store::JsonSlot::from_json(metadata)
+                            }),
+                        created_at: ts(&row.updated_at),
+                        origin_key: None,
+                    },
+                ))
+            })
             .collect::<Result<Vec<_>, _>>()
-            .expect("untracked rows should canonicalize");
-        UntrackedStateContext::new()
-            .writer(&mut writes)
-            .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
-            .expect("untracked rows should write");
+            .expect("untracked changes should canonicalize");
+        let mut changelog_read = &read;
+        let mut changelog_writer =
+            crate::changelog::ChangelogContext::new().writer(&mut changelog_read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut changelog_writer,
+            ChangelogAppend {
+                changes: changes.iter().map(|(_, change)| change.clone()).collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("untracked changes should write");
+        drop(changelog_writer);
+
+        let mut rows_by_branch = std::collections::BTreeMap::<&str, Vec<_>>::new();
+        for (row, change) in &changes {
+            rows_by_branch
+                .entry(&row.branch_id)
+                .or_default()
+                .push(CurrentStateDeltaRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                    change_id: change.change_id,
+                    commit_id: None,
+                    deleted: row.deleted,
+                    created_at: ts(&row.created_at),
+                    updated_at: ts(&row.updated_at),
+                });
+        }
+        let current_state = CurrentStateContext::new();
+        let mut current_writer = current_state.writer(&read, &mut writes);
+        for (branch_id, deltas) in rows_by_branch {
+            current_writer
+                .stage_branch_rows(branch_id, deltas)
+                .await
+                .expect("current rows should write");
+        }
+        drop(current_writer);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("untracked rows should commit");
+            .expect("current rows should commit");
     }
 
     async fn write_empty_commits_to_store(
@@ -574,7 +674,7 @@ mod tests {
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
-        let mut append = crate::changelog::ChangelogAppend::default();
+        let mut append = ChangelogAppend::default();
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let commit_change_id = format!("{commit_id_text}:commit");
@@ -633,11 +733,11 @@ mod tests {
         json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
     ) -> Result<(), LixError> {
-        let mut untracked_rows = Vec::new();
+        let mut current_rows = Vec::<(String, MaterializedTrackedStateRow)>::new();
         let mut tracked_rows_by_commit = std::collections::BTreeMap::<
             String,
             Vec<(
-                crate::changelog::ChangeRecord,
+                ChangeRecord,
                 crate::common::LixTimestamp,
                 crate::common::LixTimestamp,
             )>,
@@ -646,13 +746,10 @@ mod tests {
 
         for row in rows {
             if row.untracked {
-                let materialized = MaterializedUntrackedStateRow::from(row);
-                let canonical = crate::test_support::untracked_state_row_from_materialized(
-                    writes,
-                    &materialized,
-                )?;
-                untracked_rows.push(canonical);
-                continue;
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "test tracked-row helper does not accept untracked rows",
+                ));
             }
             let materialized = MaterializedTrackedStateRow::try_from(row)?;
             let commit_id = row.commit_id.clone().ok_or_else(|| {
@@ -668,6 +765,7 @@ mod tests {
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
                 stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
+                current_rows.push((row.branch_id.clone(), materialized.clone()));
                 tracked_rows_by_commit
                     .entry(commit_id_text)
                     .or_default()
@@ -679,9 +777,6 @@ mod tests {
             }
         }
 
-        UntrackedStateContext::new()
-            .writer(writes)
-            .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
         for (commit_id, rows) in tracked_rows_by_commit {
             let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
             let parent_ids = parent_commit_id
@@ -697,7 +792,7 @@ mod tests {
                 .map(|(change, _, _)| change.change_id)
                 .collect::<Vec<_>>();
             let commit_change_id = format!("{commit_id}:commit");
-            let mut append = crate::changelog::ChangelogAppend::default();
+            let mut append = ChangelogAppend::default();
             append
                 .changes
                 .extend(rows.iter().map(|(change, _, _)| change.clone()));
@@ -753,6 +848,29 @@ mod tests {
                 .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
                 .await?;
         }
+
+        let mut current_rows_by_branch =
+            std::collections::BTreeMap::<&str, Vec<CurrentStateDeltaRef<'_>>>::new();
+        for (branch_id, row) in &current_rows {
+            current_rows_by_branch
+                .entry(branch_id)
+                .or_default()
+                .push(CurrentStateDeltaRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                    change_id: row.change_id,
+                    commit_id: Some(row.commit_id),
+                    deleted: row.deleted,
+                    created_at: ts(&row.created_at),
+                    updated_at: ts(&row.updated_at),
+                });
+        }
+        let current_state = CurrentStateContext::new();
+        let mut current_writer = current_state.writer(store, writes);
+        for (branch_id, deltas) in current_rows_by_branch {
+            current_writer.stage_branch_rows(branch_id, deltas).await?;
+        }
         Ok(())
     }
 
@@ -806,7 +924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_state_overlays_untracked_rows() {
+    async fn live_state_serves_untracked_change_from_current_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -855,7 +973,7 @@ mod tests {
             Some("{\"value\":\"untracked-value\"}")
         );
         assert!(rows[0].untracked);
-        assert_eq!(rows[0].change_id, None);
+        assert!(rows[0].change_id.is_some());
 
         let loaded = live_state
             .reader(
@@ -872,8 +990,9 @@ mod tests {
             })
             .await
             .expect("load should succeed")
-            .expect("overlay row should be visible");
+            .expect("current row should be visible");
         assert!(loaded.untracked);
+        assert!(loaded.change_id.is_some());
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked-value\"}")
@@ -881,7 +1000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_row_is_visible_without_untracked_overlay() {
+    async fn tracked_row_is_visible_from_current_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -931,7 +1050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_untracked_row_reveals_tracked_row() {
+    async fn deleting_untracked_row_persists_tombstone_without_revealing_tracked_row() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -970,34 +1089,20 @@ mod tests {
             ],
         )
         .await;
-        {
-            let mut writes = StorageWriteSet::new();
-            let identity = crate::untracked_state::UntrackedStateIdentity {
-                branch_id: "global".to_string(),
-                schema_key: "lix_key_value".to_string(),
-                entity_pk: EntityPk::single("selected-tab"),
-                file_id: None,
-            };
-            UntrackedStateContext::new()
-                .writer(&mut writes)
-                .stage_delete_rows(std::iter::once(identity.as_ref()))
-                .expect("delete identity should stage");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("writes should commit");
-        }
+        write_untracked_rows_to_store(&storage, &read, &[untracked_tombstone_at("global")]).await;
 
         let loaded = load_selected_tab(&live_state, &storage)
             .await
-            .expect("load should succeed")
-            .expect("tracked row should be visible again");
-        assert!(!loaded.untracked);
-        assert_eq!(loaded.change_id, Some(change_id("change-tracked")));
-        assert_eq!(
-            loaded.snapshot_content.as_deref(),
-            Some("{\"value\":\"tracked-value\"}")
-        );
+            .expect("load should succeed");
+        assert_eq!(loaded, None, "the tracked predecessor must stay hidden");
+
+        let rows = scan_selected_tab_at(&live_state, &storage, "global", true)
+            .await
+            .expect("tombstone scan should succeed");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].deleted);
+        assert!(rows[0].untracked);
+        assert!(rows[0].change_id.is_some());
     }
 
     #[tokio::test]
@@ -1058,7 +1163,7 @@ mod tests {
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
-            UntrackedStateContext::new(),
+            crate::current_state::CurrentStateContext::new(),
             CommitGraphContext::new(),
         );
 
@@ -1845,8 +1950,16 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: branch_id == "global",
             branch_id: branch_id.to_string(),
+        }
+    }
+
+    fn untracked_tombstone_at(branch_id: &str) -> MaterializedUntrackedStateRow {
+        MaterializedUntrackedStateRow {
+            snapshot_content: None,
+            deleted: true,
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            ..untracked_row_at(branch_id, "ignored")
         }
     }
 
@@ -1867,7 +1980,6 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: true,
             branch_id: "global".to_string(),
         }
     }

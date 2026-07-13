@@ -23,6 +23,7 @@ pub(crate) mod cel;
 pub mod changelog;
 pub(crate) mod commit_graph;
 mod common;
+pub(crate) mod current_state;
 pub(crate) mod domain;
 pub mod engine;
 pub(crate) mod entity_pk;
@@ -53,7 +54,6 @@ pub(crate) mod tracked_state;
 pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
-pub(crate) mod untracked_state;
 pub mod wasm;
 
 pub use schema::{

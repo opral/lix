@@ -71,6 +71,7 @@ impl ChangelogContext {
             writes,
             staged_commits: HashMap::new(),
             staged_changes: HashMap::new(),
+            staged_change_deletes: HashSet::new(),
             staged_commit_change_ref_chunks: HashMap::new(),
         }
     }
@@ -85,6 +86,7 @@ pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
     writes: &'a mut StorageWriteSet,
     staged_commits: HashMap<CommitId, CommitRecord>,
     staged_changes: HashMap<ChangeId, ChangeRecord>,
+    staged_change_deletes: HashSet<ChangeId>,
     staged_commit_change_ref_chunks: HashMap<CommitId, Vec<CommitChangeRefChunk>>,
 }
 
@@ -363,6 +365,26 @@ where
         Ok(())
     }
 
+    async fn stage_delete_standalone_changes(
+        &mut self,
+        change_ids: &[ChangeId],
+    ) -> Result<(), LixError> {
+        let change_ids = change_ids.iter().copied().collect::<HashSet<_>>();
+        for change_id in &change_ids {
+            if self.staged_changes.contains_key(change_id) {
+                return Err(LixError::unknown(format!(
+                    "cannot delete changelog change '{change_id}' because it was staged in the same transaction"
+                )));
+            }
+        }
+        for change_id in change_ids {
+            if self.staged_change_deletes.insert(change_id) {
+                self.writes.delete(CHANGE_SPACE, change_key(change_id));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "storage-benches")]
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
         Ok(empty_gc_plan(roots))
@@ -401,6 +423,26 @@ where
             .iter()
             .map(|change| (change.change_id, change))
             .collect::<HashMap<_, _>>();
+
+        if let Some(change_id) = append
+            .commit_change_refs
+            .iter()
+            .flat_map(|refs| refs.entries.iter())
+            .find(|change_id| self.staged_change_deletes.contains(change_id))
+        {
+            return Err(LixError::unknown(format!(
+                "cannot retain changelog change '{change_id}' in a commit because it was deleted in the same transaction"
+            )));
+        }
+
+        if let Some(change_id) = append_changes
+            .keys()
+            .find(|change_id| self.staged_change_deletes.contains(change_id))
+        {
+            return Err(LixError::unknown(format!(
+                "cannot append changelog change '{change_id}' because it was deleted in the same transaction"
+            )));
+        }
 
         self.reject_existing_commits(&append_commit_ids).await?;
         self.reject_existing_changes(append_changes.keys().copied())
@@ -1122,6 +1164,123 @@ mod tests {
             .unwrap();
         assert_eq!(changes.entries[0].as_ref().unwrap().schema_key, "message");
         assert!(changes.entries[1].is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_delete_standalone_changes_removes_change() {
+        let (context, storage) = changelog_test_context();
+        let change_id = ChangeId::for_test_label("standalone-change");
+        let change = ChangeRecord {
+            change_id,
+            ..test_change_record()
+        };
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .stage_append(ChangelogAppend {
+                    commits: Vec::new(),
+                    changes: vec![change],
+                    commit_change_refs: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .stage_delete_standalone_changes(&[change_id])
+                .await
+                .unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut read = storage.begin_read_transaction().await.unwrap();
+        let mut reader = context.reader(&mut *read);
+        let changes = reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &[change_id],
+            })
+            .await
+            .unwrap();
+        assert_eq!(changes.entries, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn stage_delete_standalone_changes_rejects_change_appended_in_same_transaction() {
+        let (context, storage) = changelog_test_context();
+        let change_id = ChangeId::for_test_label("new-change");
+        let change = ChangeRecord {
+            change_id,
+            ..test_change_record()
+        };
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .stage_append(ChangelogAppend {
+                    commits: Vec::new(),
+                    changes: vec![change],
+                    commit_change_refs: Vec::new(),
+                })
+                .await
+                .unwrap();
+            writer
+                .stage_delete_standalone_changes(&[change_id])
+                .await
+                .unwrap_err()
+        };
+        assert!(error.message.contains("staged in the same transaction"));
+    }
+
+    #[tokio::test]
+    async fn stage_append_rejects_ref_to_change_deleted_in_same_transaction() {
+        let (context, storage) = changelog_test_context();
+        let change_id = ChangeId::for_test_label("standalone-promoted-change");
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            context
+                .writer(&mut *transaction, &mut writes)
+                .stage_append(ChangelogAppend {
+                    changes: vec![ChangeRecord {
+                        change_id,
+                        ..test_change_record()
+                    }],
+                    ..ChangelogAppend::default()
+                })
+                .await
+                .unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut append = test_append();
+        append.changes.clear();
+        append.commit_change_refs[0].entries = vec![change_id];
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .stage_delete_standalone_changes(&[change_id])
+                .await
+                .unwrap();
+            writer.stage_append(append).await.unwrap_err()
+        };
+        assert!(error.message.contains("retain"));
+        assert!(error.message.contains("deleted in the same transaction"));
     }
 
     #[tokio::test]

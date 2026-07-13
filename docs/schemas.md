@@ -93,7 +93,7 @@ A registered schema's `x-lix-key` is the relation's durable identity. You can re
 
 ### Why amendments must be backward compatible
 
-Lix is a version-controlled repository. Every change is immutable. Once a row has been written under a schema, that historical change cannot be rewritten. A Lix repository may hold years of changes spread across many versions and many authors' schemas, and all of it must remain readable.
+Lix is a version-controlled repository. Changes retained by commits are immutable. Untracked current changes may be compacted when replaced, but committed historical rows cannot be rewritten. A Lix repository may hold years of committed changes spread across many versions and many authors' schemas, and all of it must remain readable.
 
 This makes retroactive schema migrations impossible. There is no point in time at which Lix could "convert all existing rows from the old shape to the new one"; the old rows are part of history, and history doesn't change.
 
