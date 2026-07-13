@@ -21,7 +21,7 @@ use crate::live_state::index::{
 };
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
-use crate::transaction::staging::PreparedWriteSet;
+use crate::transaction::staging::{PreparedStateRowIdentity, PreparedWriteSet};
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,6 +52,10 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     let mut state_rows = prepared_writes.state_rows;
+    let insert_identities = prepared_writes
+        .insert_identities
+        .into_keys()
+        .collect::<BTreeSet<_>>();
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.extra_commit_parents_by_branch,
@@ -92,7 +96,14 @@ pub(crate) async fn commit_prepared_writes(
         &mut writes,
         &state_rows,
         &engine_rows,
-        &compactable_current_change_ids(read, &state_rows, &engine_rows, &commit_rows).await?,
+        &compactable_current_change_ids(
+            read,
+            &state_rows,
+            &engine_rows,
+            &commit_rows,
+            &insert_identities,
+        )
+        .await?,
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
     )
@@ -394,11 +405,13 @@ async fn compactable_current_change_ids(
     state_rows: &[PreparedStateRow],
     engine_rows: &[EngineCurrentRow],
     commit_rows: &[FinalizedCommitRow],
+    insert_identities: &BTreeSet<PreparedStateRowIdentity>,
 ) -> Result<Vec<ChangeId>, LixError> {
     let current = LiveStateIndexContext::new();
     let reader = current.reader(read);
     let requests = state_rows
         .iter()
+        .filter(|row| !insert_identities.contains(&PreparedStateRowIdentity::from(*row)))
         .map(|row| LiveStateIndexRowRequest {
             branch_id: row.branch_id.clone(),
             schema_key: row.schema_key.clone(),
