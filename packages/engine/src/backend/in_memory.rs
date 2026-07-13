@@ -13,6 +13,10 @@ use crate::backend::{
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
 
+const SNAPSHOT_MAGIC: &[u8; 8] = b"LIXMEM\0\x01";
+const SNAPSHOT_HEADER_BYTES: usize = SNAPSHOT_MAGIC.len() + size_of::<u32>();
+const SNAPSHOT_ENTRY_HEADER_BYTES: usize = size_of::<u32>() * 2;
+
 /// The in-memory backend has no native namespaces; it scopes keys to spaces
 /// by prefixing the 4-byte big-endian space id internally. The prefix never
 /// crosses the trait boundary: reads return logical keys.
@@ -92,6 +96,26 @@ impl InMemoryBackend {
         Self::default()
     }
 
+    /// Opens an in-memory backend from a deterministic snapshot previously
+    /// returned by [`Self::export_snapshot`].
+    pub fn from_snapshot(snapshot: &[u8]) -> Result<Self, BackendError> {
+        let entries = decode_snapshot(snapshot)?;
+        let state = if entries.is_empty() {
+            EntriesState::Empty
+        } else {
+            EntriesState::Flat(entries)
+        };
+        Ok(Self {
+            entries: Arc::new(Mutex::new(Arc::new(state))),
+        })
+    }
+
+    /// Exports one coherent, deterministic snapshot of the complete backend.
+    pub fn export_snapshot(&self) -> Result<Vec<u8>, BackendError> {
+        let state = self.snapshot()?;
+        encode_snapshot(&flatten_entries(&state))
+    }
+
     #[cfg(feature = "storage-benches")]
     pub fn fork_snapshot(&self) -> Result<Self, BackendError> {
         Ok(Self {
@@ -105,6 +129,142 @@ impl InMemoryBackend {
             .map_err(|_| BackendError::Io("in-memory backend lock poisoned".to_string()))
             .map(|entries| Arc::clone(&entries))
     }
+}
+
+fn flatten_entries(state: &EntriesState) -> InMemoryMap {
+    let mut entries = InMemoryMap::new();
+    apply_entries_state(state, &mut entries);
+    entries
+}
+
+fn apply_entries_state(state: &EntriesState, entries: &mut InMemoryMap) {
+    match state {
+        EntriesState::Empty => {}
+        EntriesState::Flat(flat) => entries.extend(flat.clone()),
+        EntriesState::Layered {
+            base,
+            puts,
+            deletes,
+        } => {
+            apply_entries_state(base, entries);
+            for key in deletes {
+                entries.remove(key);
+            }
+            entries.extend(puts.clone());
+        }
+    }
+}
+
+fn encode_snapshot(entries: &InMemoryMap) -> Result<Vec<u8>, BackendError> {
+    let entry_count = u32::try_from(entries.len())
+        .map_err(|_| snapshot_corruption("too many entries to encode"))?;
+    let mut encoded_len = SNAPSHOT_HEADER_BYTES;
+    for (key, value) in entries {
+        let _ = u32::try_from(key.0.len())
+            .map_err(|_| snapshot_corruption("key is too large to encode"))?;
+        let _ = u32::try_from(value.len())
+            .map_err(|_| snapshot_corruption("value is too large to encode"))?;
+        encoded_len = encoded_len
+            .checked_add(SNAPSHOT_ENTRY_HEADER_BYTES)
+            .and_then(|len| len.checked_add(key.0.len()))
+            .and_then(|len| len.checked_add(value.len()))
+            .ok_or_else(|| snapshot_corruption("encoded snapshot length overflowed"))?;
+    }
+
+    let mut encoded = Vec::with_capacity(encoded_len);
+    encoded.extend_from_slice(SNAPSHOT_MAGIC);
+    encoded.extend_from_slice(&entry_count.to_be_bytes());
+    for (key, value) in entries {
+        let key_len = u32::try_from(key.0.len())
+            .map_err(|_| snapshot_corruption("key is too large to encode"))?;
+        let value_len = u32::try_from(value.len())
+            .map_err(|_| snapshot_corruption("value is too large to encode"))?;
+        encoded.extend_from_slice(&key_len.to_be_bytes());
+        encoded.extend_from_slice(&value_len.to_be_bytes());
+        encoded.extend_from_slice(&key.0);
+        encoded.extend_from_slice(value);
+    }
+    Ok(encoded)
+}
+
+fn decode_snapshot(snapshot: &[u8]) -> Result<InMemoryMap, BackendError> {
+    let mut decoder = SnapshotDecoder::new(snapshot);
+    let magic = decoder.take(SNAPSHOT_MAGIC.len(), "snapshot magic")?;
+    if magic != SNAPSHOT_MAGIC {
+        return Err(snapshot_corruption("unsupported snapshot magic or version"));
+    }
+    let entry_count = decoder.read_u32("entry count")? as usize;
+    if entry_count > decoder.remaining() / SNAPSHOT_ENTRY_HEADER_BYTES {
+        return Err(snapshot_corruption("entry count exceeds snapshot length"));
+    }
+
+    let mut entries = InMemoryMap::new();
+    let mut previous_key: Option<Key> = None;
+    for index in 0..entry_count {
+        let key_len = decoder.read_u32("key length")? as usize;
+        let value_len = decoder.read_u32("value length")? as usize;
+        if key_len < size_of::<u32>() {
+            return Err(snapshot_corruption(format!(
+                "entry {index} key is missing its space prefix"
+            )));
+        }
+        let key = Key(Bytes::copy_from_slice(decoder.take(key_len, "entry key")?));
+        let value = Bytes::copy_from_slice(decoder.take(value_len, "entry value")?);
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            return Err(snapshot_corruption(format!(
+                "entry {index} keys are duplicated or out of order"
+            )));
+        }
+        previous_key = Some(key.clone());
+        entries.insert(key, value);
+    }
+    if decoder.remaining() != 0 {
+        return Err(snapshot_corruption("snapshot contains trailing data"));
+    }
+    Ok(entries)
+}
+
+struct SnapshotDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnapshotDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn read_u32(&mut self, label: &str) -> Result<u32, BackendError> {
+        let bytes: [u8; 4] = self
+            .take(size_of::<u32>(), label)?
+            .try_into()
+            .map_err(|_| snapshot_corruption(format!("invalid {label}")))?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn take(&mut self, len: usize, label: &str) -> Result<&'a [u8], BackendError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| snapshot_corruption(format!("{label} length overflowed")))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| snapshot_corruption(format!("snapshot truncated in {label}")))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+}
+
+fn snapshot_corruption(message: impl Into<String>) -> BackendError {
+    BackendError::Corruption(format!("invalid in-memory snapshot: {}", message.into()))
 }
 
 impl BackendFactory for InMemoryBackendFactory {
@@ -517,14 +677,16 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
 
 #[cfg(test)]
 mod tests {
+    use super::SNAPSHOT_MAGIC;
     use std::ops::Bound;
 
     use bytes::Bytes;
 
     use crate::backend::conformance::{ConformanceStatus, run_backend_conformance};
     use crate::backend::{
-        Backend, BackendRead, BackendWrite, InMemoryBackend, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-        PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
+        Backend, BackendError, BackendRead, BackendWrite, GetOptions, InMemoryBackend, Key,
+        KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions,
+        SpaceId, StoredValue, WriteOptions,
     };
 
     #[tokio::test]
@@ -604,5 +766,126 @@ mod tests {
             .expect("scan after range delete");
         assert!(chunk.entries.is_empty());
         assert!(!chunk.has_more);
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrip_is_deterministic_and_point_in_time() {
+        let backend = InMemoryBackend::new();
+        let space = SpaceId(17);
+        let key_a = Key(Bytes::from_static(b"a"));
+        let key_b = Key(Bytes::from_static(b"b"));
+        let mut write = backend
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin seed write");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key_b.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"B"),
+                            },
+                        },
+                        PutEntry {
+                            key: key_a.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"A"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("seed rows");
+        write.commit().await.expect("commit seed rows");
+
+        let snapshot = backend.export_snapshot().expect("export snapshot");
+        assert_eq!(
+            snapshot,
+            backend
+                .export_snapshot()
+                .expect("repeat deterministic export")
+        );
+
+        let mut later = backend
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin later write");
+        later
+            .delete_many(space, std::slice::from_ref(&key_a))
+            .await
+            .expect("delete a");
+        later.commit().await.expect("commit later write");
+
+        let restored = InMemoryBackend::from_snapshot(&snapshot).expect("restore snapshot");
+        let read = restored
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin restored read");
+        let values = read
+            .get_many(space, &[key_a, key_b], GetOptions::default())
+            .await
+            .expect("read restored rows");
+        assert_eq!(
+            values.values,
+            vec![
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_malformed_encodings() {
+        let empty = InMemoryBackend::new()
+            .export_snapshot()
+            .expect("export empty snapshot");
+        let entry = |key: &[u8], value: &[u8]| {
+            [
+                &u32::try_from(key.len())
+                    .expect("test key length fits")
+                    .to_be_bytes(),
+                &u32::try_from(value.len())
+                    .expect("test value length fits")
+                    .to_be_bytes(),
+                key,
+                value,
+            ]
+            .concat()
+        };
+        let physical_key = [0_u8, 0, 0, 1, b'k'];
+        let duplicate_entries = [
+            SNAPSHOT_MAGIC.as_slice(),
+            &2_u32.to_be_bytes(),
+            &entry(&physical_key, b"one"),
+            &entry(&physical_key, b"two"),
+        ]
+        .concat();
+        let impossible_lengths = [
+            SNAPSHOT_MAGIC.as_slice(),
+            &1_u32.to_be_bytes(),
+            &u32::MAX.to_be_bytes(),
+            &u32::MAX.to_be_bytes(),
+        ]
+        .concat();
+        let cases = [
+            Vec::new(),
+            b"not-a-lix-snapshot".to_vec(),
+            empty[..empty.len() - 1].to_vec(),
+            [empty.as_slice(), b"trailing"].concat(),
+            [b"LIXMEM\0\x01".as_slice(), &1_u32.to_be_bytes()].concat(),
+            duplicate_entries,
+            impossible_lengths,
+        ];
+        for snapshot in cases {
+            assert!(matches!(
+                InMemoryBackend::from_snapshot(&snapshot),
+                Err(BackendError::Corruption(message))
+                    if message.contains("invalid in-memory snapshot")
+            ));
+        }
     }
 }
