@@ -243,7 +243,7 @@ enum FilesystemNamespaceEntry {
 /// Resolves directory paths while planning filesystem writes.
 ///
 /// The resolver is seeded from the transaction-visible filesystem state and is
-/// then updated as the current statement stages implicit directories. That is
+/// then updated as the live statement stages implicit directories. That is
 /// what prevents path inserts from restaging committed ancestors or duplicating
 /// an ancestor created earlier in the same SQL batch.
 #[derive(Debug, Clone, Default)]

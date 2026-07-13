@@ -1,6 +1,6 @@
 use crate::changelog::{ChangeId, CommitId};
-use crate::current_state::MaterializedCurrentStateRow;
 use crate::entity_pk::EntityPk;
+use crate::live_state::index::MaterializedLiveStateIndexRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
 
@@ -25,8 +25,8 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) branch_id: String,
 }
 
-impl From<MaterializedCurrentStateRow> for MaterializedLiveStateRow {
-    fn from(row: MaterializedCurrentStateRow) -> Self {
+impl From<MaterializedLiveStateIndexRow> for MaterializedLiveStateRow {
+    fn from(row: MaterializedLiveStateIndexRow) -> Self {
         let global = row.branch_id == crate::GLOBAL_BRANCH_ID;
         Self {
             entity_pk: row.entity_pk,

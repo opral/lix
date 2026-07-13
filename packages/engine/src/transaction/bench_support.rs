@@ -9,8 +9,8 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
 };
 use crate::common::LixTimestamp;
-use crate::current_state::{CurrentStateContext, CurrentStateDeltaRef};
 use crate::entity_pk::EntityPk;
+use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
     LiveStateScanRequest,
@@ -89,7 +89,7 @@ where
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
-            CurrentStateContext::new(),
+            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         ));
         let branch_ctx = Arc::new(BranchContext::new());
@@ -369,11 +369,11 @@ where
         })
         .await
         .expect("deterministic mode change should stage");
-    CurrentStateContext::new()
+    LiveStateIndexContext::new()
         .writer(&read, &mut writes)
         .stage_branch_rows(
             GLOBAL_BRANCH_ID,
-            [CurrentStateDeltaRef {
+            [LiveStateIndexDeltaRef {
                 schema_key: "lix_key_value",
                 file_id: None,
                 entity_pk: &entity_pk,
@@ -520,15 +520,15 @@ async fn seed_visible_schema_rows<B>(
         })
         .await
         .expect("schema fixture branch-ref changes should stage");
-    let current_context = CurrentStateContext::new();
-    let mut current = current_context.writer(&read, &mut writes);
+    let live_index = LiveStateIndexContext::new();
+    let mut current = live_index.writer(&read, &mut writes);
     current
         .stage_branch_rows_from_existing_root(
             GLOBAL_BRANCH_ID,
             &root_id,
             branch_refs
                 .iter()
-                .map(|(_, entity_pk, _, change_id)| CurrentStateDeltaRef {
+                .map(|(_, entity_pk, _, change_id)| LiveStateIndexDeltaRef {
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY,
                     file_id: None,
                     entity_pk,

@@ -132,11 +132,11 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("current state should remain readable");
+            .expect("live state should remain readable");
         assert_eq!(
             visible.len(),
             0,
-            "deleting untracked current state must not reveal the older tracked value"
+            "deleting untracked live state must not reveal the older tracked value"
         );
         assert_eq!(
             branch_head(&session, sim.main_branch_id()).await,

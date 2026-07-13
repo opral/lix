@@ -3,13 +3,13 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 
-/// One canonical current-state mutation.
+/// One canonical live-state index mutation.
 ///
-/// Tracked and untracked rows share the same identity and current-state tree.
+/// Tracked and untracked rows share the same identity and live-state tree.
 /// A missing `commit_id` means the change is untracked; storage encodes that
 /// case with the reserved nil commit id used by the tracked-state index codec.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentStateDeltaRef<'a> {
+pub(crate) struct LiveStateIndexDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
     pub(crate) entity_pk: &'a EntityPk,
@@ -20,9 +20,9 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
-/// One cheap materialized header from a branch's current-state index.
+/// One cheap materialized header from a branch's live-state index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CurrentStateIndexRow {
+pub(crate) struct LiveStateIndexRow {
     pub(crate) branch_id: String,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -34,18 +34,18 @@ pub(crate) struct CurrentStateIndexRow {
     pub(crate) updated_at: LixTimestamp,
 }
 
-impl CurrentStateIndexRow {
+impl LiveStateIndexRow {
     pub(crate) fn untracked(&self) -> bool {
         self.commit_id.is_none()
     }
 }
 
-/// Fully hydrated canonical current-state row.
+/// Fully hydrated canonical live-state index row.
 ///
 /// The index owns identity and change references. Snapshot and metadata JSON
 /// are hydrated from the referenced changelog change in one batched read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MaterializedCurrentStateRow {
+pub(crate) struct MaterializedLiveStateIndexRow {
     pub(crate) branch_id: String,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -61,7 +61,7 @@ pub(crate) struct MaterializedCurrentStateRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct CurrentStateFilter {
+pub(crate) struct LiveStateIndexFilter {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
@@ -69,15 +69,15 @@ pub(crate) struct CurrentStateFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CurrentStateScanRequest {
+pub(crate) struct LiveStateIndexScanRequest {
     pub(crate) branch_id: String,
-    pub(crate) filter: CurrentStateFilter,
+    pub(crate) filter: LiveStateIndexFilter,
     pub(crate) projection: Vec<String>,
     pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CurrentStateRowRequest {
+pub(crate) struct LiveStateIndexRowRequest {
     pub(crate) branch_id: String,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,

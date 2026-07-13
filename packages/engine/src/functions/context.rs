@@ -110,11 +110,11 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::{ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter};
-    use crate::current_state::{CurrentStateContext, CurrentStateDeltaRef};
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
+    use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
@@ -123,7 +123,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
-            CurrentStateContext::new(),
+            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
     }
@@ -376,11 +376,11 @@ mod tests {
                 .await
                 .expect("test key-value change should stage");
         }
-        CurrentStateContext::new()
+        LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows(
                 GLOBAL_BRANCH_ID,
-                [CurrentStateDeltaRef {
+                [LiveStateIndexDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
                     entity_pk: &entity_pk,

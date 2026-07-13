@@ -11,28 +11,28 @@ use crate::tracked_state::{
 
 use super::storage::{load_branch_root, stage_branch_root, stage_delete_branch_root};
 use super::{
-    CurrentStateDeltaRef, CurrentStateIndexRow, CurrentStateRowRequest, CurrentStateScanRequest,
-    MaterializedCurrentStateRow,
+    LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
+    MaterializedLiveStateIndexRow,
 };
 
-/// Factory for canonical current-state readers and writers.
+/// Factory for canonical current index readers and writers.
 #[derive(Clone)]
-pub(crate) struct CurrentStateContext {
+pub(crate) struct LiveStateIndexContext {
     tree: TrackedStateTree,
 }
 
-impl CurrentStateContext {
+impl LiveStateIndexContext {
     pub(crate) fn new() -> Self {
         Self {
             tree: TrackedStateTree::new(),
         }
     }
 
-    pub(crate) fn reader<S>(&self, store: S) -> CurrentStateStoreReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> LiveStateIndexStoreReader<S>
     where
         S: StorageRead + Send + Sync,
     {
-        CurrentStateStoreReader {
+        LiveStateIndexStoreReader {
             store,
             tree: self.tree.clone(),
         }
@@ -42,11 +42,11 @@ impl CurrentStateContext {
         &'a self,
         store: &'a S,
         writes: &'a mut StorageWriteSet,
-    ) -> CurrentStateWriter<'a, S>
+    ) -> LiveStateIndexWriter<'a, S>
     where
         S: StorageRead + Send + Sync + ?Sized,
     {
-        CurrentStateWriter {
+        LiveStateIndexWriter {
             chunk_overlay: TrackedStateChunkOverlay::new(),
             staged_roots: BTreeMap::new(),
             tree: self.tree.clone(),
@@ -56,12 +56,12 @@ impl CurrentStateContext {
     }
 }
 
-pub(crate) struct CurrentStateStoreReader<S> {
+pub(crate) struct LiveStateIndexStoreReader<S> {
     store: S,
     tree: TrackedStateTree,
 }
 
-impl<S> CurrentStateStoreReader<S>
+impl<S> LiveStateIndexStoreReader<S>
 where
     S: StorageRead + Send + Sync,
 {
@@ -74,8 +74,8 @@ where
 
     pub(crate) async fn scan_rows(
         &self,
-        request: &CurrentStateScanRequest,
-    ) -> Result<Vec<MaterializedCurrentStateRow>, LixError> {
+        request: &LiveStateIndexScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateIndexRow>, LixError> {
         let Some(root_id) = self.load_branch_root(&request.branch_id)? else {
             return Ok(Vec::new());
         };
@@ -107,8 +107,8 @@ where
 
     pub(crate) async fn load_row(
         &self,
-        request: &CurrentStateRowRequest,
-    ) -> Result<Option<MaterializedCurrentStateRow>, LixError> {
+        request: &LiveStateIndexRowRequest,
+    ) -> Result<Option<MaterializedLiveStateIndexRow>, LixError> {
         let Some(root_id) = self.load_branch_root(&request.branch_id)? else {
             return Ok(None);
         };
@@ -129,8 +129,8 @@ where
     /// Loads one current index header without hydrating changelog payloads.
     pub(crate) async fn load_index_row(
         &self,
-        request: &CurrentStateRowRequest,
-    ) -> Result<Option<CurrentStateIndexRow>, LixError> {
+        request: &LiveStateIndexRowRequest,
+    ) -> Result<Option<LiveStateIndexRow>, LixError> {
         let Some(root_id) = self.load_branch_root(&request.branch_id)? else {
             return Ok(None);
         };
@@ -143,7 +143,7 @@ where
     async fn load_index_entry(
         &self,
         root_id: &TrackedStateRootId,
-        request: &CurrentStateRowRequest,
+        request: &LiveStateIndexRowRequest,
     ) -> Result<Option<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
         let key = TrackedStateKey {
             schema_key: request.schema_key.clone(),
@@ -161,7 +161,7 @@ where
     }
 }
 
-pub(crate) struct CurrentStateWriter<'a, S: ?Sized> {
+pub(crate) struct LiveStateIndexWriter<'a, S: ?Sized> {
     chunk_overlay: TrackedStateChunkOverlay,
     staged_roots: BTreeMap<String, TrackedStateRootId>,
     tree: TrackedStateTree,
@@ -170,17 +170,17 @@ pub(crate) struct CurrentStateWriter<'a, S: ?Sized> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CurrentStateWriteReport {
+pub(crate) struct LiveStateIndexWriteReport {
     pub(crate) branch_id: String,
     pub(crate) root_id: TrackedStateRootId,
     pub(crate) changed_rows: usize,
 }
 
-impl<S> CurrentStateWriter<'_, S>
+impl<S> LiveStateIndexWriter<'_, S>
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
-    /// Deletes the mutable current-state pointer for one branch.
+    /// Deletes the mutable current index pointer for one branch.
     ///
     /// Immutable tracked roots remain available through retained commits.
     pub(crate) fn stage_delete_branch_root(&mut self, branch_id: &str) {
@@ -188,7 +188,7 @@ where
         self.staged_roots.remove(branch_id);
     }
 
-    /// Points a branch's canonical current state at an existing tree root.
+    /// Points a branch's canonical live state at an existing tree root.
     ///
     /// This shares immutable tracked-state chunks without copying rows and is
     /// used when initialization or branch creation already knows the desired
@@ -197,11 +197,11 @@ where
         &mut self,
         branch_id: &str,
         root_id: &TrackedStateRootId,
-    ) -> Result<CurrentStateWriteReport, LixError> {
+    ) -> Result<LiveStateIndexWriteReport, LixError> {
         stage_branch_root(self.writes, branch_id, root_id)?;
         self.staged_roots
             .insert(branch_id.to_string(), root_id.clone());
-        Ok(CurrentStateWriteReport {
+        Ok(LiveStateIndexWriteReport {
             branch_id: branch_id.to_string(),
             root_id: root_id.clone(),
             changed_rows: 0,
@@ -212,9 +212,9 @@ where
         &mut self,
         branch_id: &str,
         deltas: I,
-    ) -> Result<CurrentStateWriteReport, LixError>
+    ) -> Result<LiveStateIndexWriteReport, LixError>
     where
-        I: IntoIterator<Item = CurrentStateDeltaRef<'a>>,
+        I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
     {
         let base_root = match self.staged_roots.get(branch_id) {
             Some(root_id) => Some(root_id.clone()),
@@ -235,9 +235,9 @@ where
         branch_id: &str,
         base_root: &TrackedStateRootId,
         deltas: I,
-    ) -> Result<CurrentStateWriteReport, LixError>
+    ) -> Result<LiveStateIndexWriteReport, LixError>
     where
-        I: IntoIterator<Item = CurrentStateDeltaRef<'a>>,
+        I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
     {
         self.stage_branch_rows_with_base(branch_id, Some(base_root.clone()), deltas)
             .await
@@ -248,11 +248,11 @@ where
         branch_id: &str,
         base_root: Option<TrackedStateRootId>,
         deltas: I,
-    ) -> Result<CurrentStateWriteReport, LixError>
+    ) -> Result<LiveStateIndexWriteReport, LixError>
     where
-        I: IntoIterator<Item = CurrentStateDeltaRef<'a>>,
+        I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
     {
-        let mut final_deltas = BTreeMap::<TrackedStateKey, CurrentStateDeltaRef<'a>>::new();
+        let mut final_deltas = BTreeMap::<TrackedStateKey, LiveStateIndexDeltaRef<'a>>::new();
         for delta in deltas {
             if delta
                 .commit_id
@@ -260,7 +260,7 @@ where
             {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    "current-state tracked commit_id must not be the reserved nil UUID",
+                    "current index tracked commit_id must not be the reserved nil UUID",
                 ));
             }
             final_deltas.insert(
@@ -275,7 +275,7 @@ where
         if final_deltas.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "current-state stage_branch_rows requires at least one delta",
+                "current index stage_branch_rows requires at least one delta",
             ));
         }
 
@@ -327,7 +327,7 @@ where
         stage_branch_root(self.writes, branch_id, &result.root_id)?;
         self.staged_roots
             .insert(branch_id.to_string(), result.root_id.clone());
-        Ok(CurrentStateWriteReport {
+        Ok(LiveStateIndexWriteReport {
             branch_id: branch_id.to_string(),
             root_id: result.root_id,
             changed_rows,
@@ -339,9 +339,9 @@ fn materialize_index_entry(
     branch_id: &str,
     key: TrackedStateKey,
     value: TrackedStateIndexValue,
-) -> CurrentStateIndexRow {
+) -> LiveStateIndexRow {
     let commit_id = (!value.commit_id.as_uuid().is_nil()).then_some(value.commit_id);
-    CurrentStateIndexRow {
+    LiveStateIndexRow {
         branch_id: branch_id.to_string(),
         schema_key: key.schema_key,
         file_id: key.file_id,
@@ -357,9 +357,9 @@ fn materialize_index_entry(
 fn materialize_current_row(
     branch_id: &str,
     row: crate::tracked_state::MaterializedTrackedStateRow,
-) -> MaterializedCurrentStateRow {
+) -> MaterializedLiveStateIndexRow {
     let commit_id = (!row.commit_id.as_uuid().is_nil()).then_some(row.commit_id);
-    MaterializedCurrentStateRow {
+    MaterializedLiveStateIndexRow {
         branch_id: branch_id.to_string(),
         schema_key: row.schema_key,
         file_id: row.file_id,
@@ -382,10 +382,10 @@ mod tests {
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
     };
     use crate::common::LixTimestamp;
-    use crate::current_state::{
-        CurrentStateFilter, CurrentStateRowRequest, CurrentStateScanRequest,
-    };
     use crate::entity_pk::EntityPk;
+    use crate::live_state::index::{
+        LiveStateIndexFilter, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
+    };
     use crate::storage::{
         InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
     };
@@ -401,8 +401,8 @@ mod tests {
         deleted: bool,
         created_at: &'a str,
         updated_at: &'a str,
-    ) -> CurrentStateDeltaRef<'a> {
-        CurrentStateDeltaRef {
+    ) -> LiveStateIndexDeltaRef<'a> {
+        LiveStateIndexDeltaRef {
             schema_key: "test_schema",
             file_id: None,
             entity_pk,
@@ -417,13 +417,13 @@ mod tests {
     async fn stage_and_commit(
         storage: &StorageContext,
         branch_id: &str,
-        deltas: Vec<CurrentStateDeltaRef<'_>>,
-    ) -> CurrentStateWriteReport {
+        deltas: Vec<LiveStateIndexDeltaRef<'_>>,
+    ) -> LiveStateIndexWriteReport {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let report = CurrentStateContext::new()
+        let report = LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows(branch_id, deltas)
             .await
@@ -435,8 +435,8 @@ mod tests {
         report
     }
 
-    fn row_request(branch_id: &str, entity_pk: &EntityPk) -> CurrentStateRowRequest {
-        CurrentStateRowRequest {
+    fn row_request(branch_id: &str, entity_pk: &EntityPk) -> LiveStateIndexRowRequest {
+        LiveStateIndexRowRequest {
             branch_id: branch_id.to_string(),
             schema_key: "test_schema".to_string(),
             entity_pk: entity_pk.clone(),
@@ -476,11 +476,11 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let reader = CurrentStateContext::new().reader(read);
+        let reader = LiveStateIndexContext::new().reader(read);
         let rows = reader
-            .scan_rows(&CurrentStateScanRequest {
+            .scan_rows(&LiveStateIndexScanRequest {
                 branch_id: "branch-a".to_string(),
-                filter: CurrentStateFilter::default(),
+                filter: LiveStateIndexFilter::default(),
                 projection: vec!["change_id".to_string()],
                 limit: None,
             })
@@ -526,11 +526,11 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let reader = CurrentStateContext::new().reader(read);
+        let reader = LiveStateIndexContext::new().reader(read);
         let default_rows = reader
-            .scan_rows(&CurrentStateScanRequest {
+            .scan_rows(&LiveStateIndexScanRequest {
                 branch_id: "branch-a".to_string(),
-                filter: CurrentStateFilter::default(),
+                filter: LiveStateIndexFilter::default(),
                 projection: Vec::new(),
                 limit: None,
             })
@@ -547,11 +547,11 @@ mod tests {
         assert!(tombstone.untracked);
 
         let rows_with_tombstones = reader
-            .scan_rows(&CurrentStateScanRequest {
+            .scan_rows(&LiveStateIndexScanRequest {
                 branch_id: "branch-a".to_string(),
-                filter: CurrentStateFilter {
+                filter: LiveStateIndexFilter {
                     include_tombstones: true,
-                    ..CurrentStateFilter::default()
+                    ..LiveStateIndexFilter::default()
                 },
                 projection: Vec::new(),
                 limit: None,
@@ -597,7 +597,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let reader = CurrentStateContext::new().reader(read);
+        let reader = LiveStateIndexContext::new().reader(read);
         assert_eq!(
             reader
                 .load_branch_root("branch-a")
@@ -650,7 +650,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let reader = CurrentStateContext::new().reader(read);
+        let reader = LiveStateIndexContext::new().reader(read);
         let row_a = reader
             .load_index_row(&row_request("branch-a", &entity_pk))
             .await
@@ -696,11 +696,11 @@ mod tests {
             })
             .await
             .expect("change should stage");
-        CurrentStateContext::new()
+        LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows(
                 "branch-a",
-                [CurrentStateDeltaRef {
+                [LiveStateIndexDeltaRef {
                     schema_key: "test_schema",
                     file_id: None,
                     entity_pk: &entity_pk,
@@ -721,7 +721,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let row = CurrentStateContext::new()
+        let row = LiveStateIndexContext::new()
             .reader(read)
             .load_row(&row_request("branch-a", &entity_pk))
             .await
@@ -755,7 +755,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let report = CurrentStateContext::new()
+        let report = LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_root_from_existing("branch-b", &source.root_id)
             .expect("existing root should stage");
@@ -769,7 +769,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let row = CurrentStateContext::new()
+        let row = LiveStateIndexContext::new()
             .reader(read)
             .load_index_row(&row_request("branch-b", &entity_pk))
             .await
@@ -785,7 +785,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        CurrentStateContext::new()
+        LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows_from_existing_root(
                 "branch-c",
@@ -809,7 +809,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let reader = CurrentStateContext::new().reader(read);
+        let reader = LiveStateIndexContext::new().reader(read);
         assert!(
             reader
                 .load_index_row(&row_request("branch-c", &entity_pk))

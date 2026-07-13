@@ -1,4 +1,5 @@
 mod context;
+pub(crate) mod index;
 mod reader;
 mod types;
 pub(crate) mod visibility;

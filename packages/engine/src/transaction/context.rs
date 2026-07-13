@@ -1644,7 +1644,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
-            crate::current_state::CurrentStateContext::new(),
+            crate::live_state::index::LiveStateIndexContext::new(),
             CommitGraphContext::new(),
         )
     }
