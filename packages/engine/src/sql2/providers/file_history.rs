@@ -34,8 +34,8 @@ use crate::sql2::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryRoute,
-    HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
+    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection,
+    HistoryRoute, HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
     parse_history_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
@@ -134,6 +134,8 @@ where
             })
         });
         let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
@@ -144,8 +146,17 @@ where
                     self.plugin_host.clone(),
                     route,
                     schema,
+                    metadata_projection,
                 ),
-                move |(commit_graph, query_source, blob_reader, plugin_host, route, schema)| async move {
+                move |(
+                    commit_graph,
+                    query_source,
+                    blob_reader,
+                    plugin_host,
+                    route,
+                    schema,
+                    metadata_projection,
+                )| async move {
                     let mut rows = load_file_history_rows(
                         commit_graph,
                         query_source,
@@ -153,6 +164,7 @@ where
                         plugin_host,
                         &route,
                         needs_data,
+                        metadata_projection,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -275,6 +287,7 @@ async fn load_file_history_rows<S>(
     plugin_host: PluginRuntimeHost,
     route: &HistoryRoute,
     needs_data: bool,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<FileHistoryOutputRow>, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -295,6 +308,7 @@ where
         query_source.clone(),
         &event_route,
         &context_route,
+        metadata_projection,
     )
     .await?;
     let mut installed_plugins_cache = BTreeMap::<(String, u32, String), InstalledPlugin>::new();
@@ -322,6 +336,7 @@ where
             &event_route,
             &context_route,
             plugin_schema_keys,
+            metadata_projection,
         )
         .await?
     };
@@ -422,6 +437,7 @@ async fn load_file_history_filesystem_context<S>(
     query_source: SqlHistoryQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryFilesystemContext, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -442,6 +458,7 @@ where
                     json_reader,
                     &route,
                     schema_keys,
+                    metadata_projection,
                 )
                 .await
             }
@@ -464,6 +481,7 @@ async fn load_file_history_plugin_state<S>(
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
     plugin_schema_keys: Vec<String>,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<
     (
         Vec<FileHistoryPluginStateRecord>,
@@ -489,6 +507,7 @@ where
                     json_reader,
                     &route,
                     schema_keys,
+                    metadata_projection,
                 )
                 .await
             }

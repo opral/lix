@@ -25,8 +25,8 @@ use crate::sql2::catalog::{
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryRoute, HistoryViewDescriptor,
-    load_history_entries, parse_history_filter,
+    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryMetadataProjection, HistoryRoute,
+    HistoryViewDescriptor, load_history_entries, parse_history_filter,
 };
 use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot,
@@ -107,6 +107,8 @@ where
     ) -> Result<PlannedScan> {
         let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
         let schema = projected_schema(&self.schema, projection);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             load: row_source(
@@ -116,12 +118,19 @@ where
                     self.query_source.clone(),
                     route,
                     schema,
+                    metadata_projection,
                 ),
-                move |(spec, commit_graph, query_source, route, schema)| async move {
-                    let rows =
-                        load_entity_history_rows(&spec, commit_graph, query_source, &route, limit)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
+                move |(spec, commit_graph, query_source, route, schema, metadata_projection)| async move {
+                    let rows = load_entity_history_rows(
+                        &spec,
+                        commit_graph,
+                        query_source,
+                        &route,
+                        limit,
+                        metadata_projection,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
                     entity_history_record_batch(&schema, &spec, &rows)
                 },
             ),
@@ -144,6 +153,7 @@ async fn load_entity_history_rows<S>(
     query_source: SqlHistoryQuerySource<S>,
     route: &HistoryRoute,
     limit: Option<usize>,
+    metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<EntityHistoryRow>, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -158,6 +168,7 @@ where
         query_source.json_reader,
         route,
         vec![spec.schema_key.clone()],
+        metadata_projection,
     )
     .await?;
     let mut rows = entries
