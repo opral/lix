@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::observe_coordinator::{ObserveQueryKey, ObserveQueryState, ObserveSessionScope};
-use crate::storage::{InMemoryStorageBackend, StorageBackend};
+use crate::storage::InMemoryStorageBackend;
+use crate::storage::StorageBackend;
 use crate::{ExecuteResult, LixError, Value, sql2};
 
 use super::{SessionContext, SessionMode};
@@ -40,8 +41,6 @@ pub struct ObserveEvent {
 pub struct ObserveEvents<B = InMemoryStorageBackend>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     session: SessionContext<B>,
     query: ObserveQuery,
@@ -54,8 +53,6 @@ where
 impl<B> ObserveEvents<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
         if self.closed || self.session.is_closed() {
@@ -123,7 +120,8 @@ where
             #[cfg(not(target_family = "wasm"))]
             self.session
                 .observe_invalidation
-                .ensure_external_watcher(self.session.storage.clone())?;
+                .ensure_external_watcher(self.session.storage.clone())
+                .await?;
             let before = *self.receiver.borrow_and_update();
             let rows = self.execute_or_share(before).await;
             drop(operation_guard);
@@ -163,8 +161,6 @@ where
 impl<B> Drop for ObserveEvents<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     fn drop(&mut self) {
         self.close();
@@ -174,8 +170,6 @@ where
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     pub fn observe(&self, sql: &str, params: &[Value]) -> Result<ObserveEvents<B>, LixError> {
         self.ensure_observe_registration_allowed()?;

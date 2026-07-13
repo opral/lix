@@ -39,7 +39,7 @@ impl CommitGraphContext {
     /// Creates a graph reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> CommitGraphStoreReader<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         CommitGraphStoreReader { store }
     }
@@ -48,14 +48,14 @@ impl CommitGraphContext {
 /// Commit-graph reader that resolves changelog entities at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     store: S,
 }
 
 impl<S> CommitGraphStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     /// Loads and parses a `lix_commit` canonical change by commit id.
     pub(crate) async fn load_commit(
@@ -303,7 +303,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
 #[async_trait::async_trait]
 impl<S> CommitGraphReader for CommitGraphStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     async fn load_commit(
         &mut self,
@@ -439,6 +439,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_1 = commit_id("commit-1");
@@ -460,6 +461,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let missing = commit_id("missing");
@@ -488,6 +490,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commits = reader
@@ -510,6 +513,7 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let reader = graph.reader(read);
         let commits = vec![parsed_commit(
@@ -558,6 +562,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -635,6 +640,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -678,6 +684,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -782,6 +789,7 @@ mod tests {
     async fn append_changes(storage: &StorageContext, changes: &[TestChange]) {
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let canonical_changes = changes
@@ -863,6 +871,7 @@ mod tests {
             .expect("changelog append should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("commit should succeed");
     }
 

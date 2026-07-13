@@ -3,8 +3,8 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::backend::{
-    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, Prefix, ProjectedValue,
-    ProjectedValueRef, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
+    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, Prefix, ProjectedValue,
+    ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
 };
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageContext, StorageReadStats, StorageReadStatsCollector,
@@ -12,11 +12,6 @@ use crate::storage::{
 };
 
 type StorageConformanceResult = Result<(), String>;
-
-struct StorageConformanceTest {
-    name: &'static str,
-    run: fn() -> StorageConformanceResult,
-}
 
 #[derive(Debug, PartialEq, Eq)]
 enum StorageConformanceStatus {
@@ -53,49 +48,44 @@ impl StorageConformanceReport {
     }
 }
 
-fn run_storage_conformance() -> StorageConformanceReport {
-    let tests = [
-        StorageConformanceTest {
-            name: "write_set_commits_and_reads_back",
-            run: write_set_commits_and_reads_back,
-        },
-        StorageConformanceTest {
-            name: "point_reads_preserve_caller_order_duplicates_and_missing",
-            run: point_reads_preserve_caller_order_duplicates_and_missing,
-        },
-        StorageConformanceTest {
-            name: "prefix_scan_lowers_to_backend_range",
-            run: prefix_scan_lowers_to_backend_range,
-        },
-        StorageConformanceTest {
-            name: "scan_stats_collector_accumulates_chunked_drain_shape",
-            run: scan_stats_collector_accumulates_chunked_drain_shape,
-        },
-        StorageConformanceTest {
-            name: "read_scope_pins_snapshot",
-            run: read_scope_pins_snapshot,
-        },
-        StorageConformanceTest {
-            name: "write_set_rejects_conflicting_space_declarations",
-            run: write_set_rejects_conflicting_space_declarations,
-        },
-    ];
-
-    StorageConformanceReport {
-        tests: tests
-            .into_iter()
-            .map(|test| StorageConformanceTestResult {
-                name: test.name,
-                status: match (test.run)() {
+async fn run_storage_conformance() -> StorageConformanceReport {
+    let mut report = StorageConformanceReport { tests: Vec::new() };
+    macro_rules! run {
+        ($name:literal, $test:ident) => {
+            report.tests.push(StorageConformanceTestResult {
+                name: $name,
+                status: match $test().await {
                     Ok(()) => StorageConformanceStatus::Passed,
                     Err(error) => StorageConformanceStatus::Failed(error),
                 },
-            })
-            .collect(),
+            });
+        };
     }
+    run!(
+        "write_set_commits_and_reads_back",
+        write_set_commits_and_reads_back
+    );
+    run!(
+        "point_reads_preserve_caller_order_duplicates_and_missing",
+        point_reads_preserve_caller_order_duplicates_and_missing
+    );
+    run!(
+        "prefix_scan_lowers_to_backend_range",
+        prefix_scan_lowers_to_backend_range
+    );
+    run!(
+        "scan_stats_collector_accumulates_chunked_drain_shape",
+        scan_stats_collector_accumulates_chunked_drain_shape
+    );
+    run!("read_scope_pins_snapshot", read_scope_pins_snapshot);
+    run!(
+        "write_set_rejects_conflicting_space_declarations",
+        write_set_rejects_conflicting_space_declarations
+    );
+    report
 }
 
-fn write_set_commits_and_reads_back() -> StorageConformanceResult {
+async fn write_set_commits_and_reads_back() -> StorageConformanceResult {
     let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
@@ -105,6 +95,7 @@ fn write_set_commits_and_reads_back() -> StorageConformanceResult {
 
     let (_commit, stats) = storage
         .commit_write_set(writes, WriteOptions::default())
+        .await
         .map_err(|error| format!("commit_write_set failed: {error}"))?;
 
     assert_eq!(stats.staged_puts, 3);
@@ -115,9 +106,11 @@ fn write_set_commits_and_reads_back() -> StorageConformanceResult {
 
     let read = storage
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = PointReadPlan::new(space_one(), &[key("a"), key("b")])
         .materialize(&read, GetOptions::default())
+        .await
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     assert_eq!(
@@ -131,26 +124,28 @@ fn write_set_commits_and_reads_back() -> StorageConformanceResult {
     Ok(())
 }
 
-fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConformanceResult {
+async fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConformanceResult {
     let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
     writes.put(space_one(), key("b"), value("B"));
     storage
         .commit_write_set(writes, WriteOptions::default())
+        .await
         .map_err(|error| format!("seed failed: {error}"))?;
 
     let read = storage
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = PointReadPlan::new(space_one(), &[key("b"), key("missing"), key("a"), key("b")])
         .materialize(
             &read,
             GetOptions {
                 projection: CoreProjection::KeyOnly,
-                ..GetOptions::default()
             },
         )
+        .await
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     assert_eq!(
@@ -166,7 +161,7 @@ fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConforma
     Ok(())
 }
 
-fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
+async fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("aa"), value("AA"));
@@ -174,10 +169,12 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     writes.put(space_one(), key("b"), value("B"));
     storage
         .commit_write_set(writes, WriteOptions::default())
+        .await
         .map_err(|error| format!("seed failed: {error}"))?;
 
     let read = storage
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let chunk = ScanPlan::prefix(
         space_one(),
@@ -186,6 +183,7 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
         },
     )
     .collect(&read, ScanOptions::default())
+    .await
     .map_err(|error| format!("scan_prefix failed: {error}"))?;
 
     assert_eq!(
@@ -201,7 +199,7 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     Ok(())
 }
 
-fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceResult {
+async fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceResult {
     let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     for suffix in ["0", "1", "2", "3", "4"] {
@@ -213,45 +211,46 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
     }
     storage
         .commit_write_set(writes, WriteOptions::default())
+        .await
         .map_err(|error| format!("seed failed: {error}"))?;
 
     let read = storage
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let mut collector = StorageReadStatsCollector::new();
     let mut resume_after = None::<Key>;
     let mut emitted = 0usize;
 
     loop {
-        let mut chunk_last_key = None::<Key>;
         let result = ScanPlan::prefix(
             space_one(),
             Prefix {
                 bytes: Bytes::from_static(b"item-"),
             },
         )
-        .visit(
+        .collect(
             &read,
             ScanOptions {
                 projection: CoreProjection::KeyOnly,
                 limit_rows: 2,
-                resume_after: resume_after.as_ref(),
-            },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                if !matches!(value, ProjectedValueRef::KeyOnly) {
-                    return Err(crate::backend::BackendError::Corruption(
-                        "expected key-only scan value".to_string(),
-                    ));
-                }
-                chunk_last_key = Some(key.to_owned_key());
-                Ok(())
+                resume_after,
             },
         )
-        .map_err(|error| format!("scan plan visit failed: {error}"))?;
+        .await
+        .map_err(|error| format!("scan plan collect failed: {error}"))?;
 
-        emitted += result.value.emitted;
+        if result
+            .value
+            .entries
+            .iter()
+            .any(|entry| !matches!(entry.value, ProjectedValue::KeyOnly))
+        {
+            return Err("expected key-only scan value".to_string());
+        }
+        emitted += result.value.entries.len();
         collector.record(result.stats);
-        resume_after = chunk_last_key;
+        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
 
         if !result.value.has_more {
             break;
@@ -280,22 +279,25 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
     Ok(())
 }
 
-fn read_scope_pins_snapshot() -> StorageConformanceResult {
+async fn read_scope_pins_snapshot() -> StorageConformanceResult {
     let storage = StorageContext::new(InMemoryBackend::new());
     let mut seed = storage.new_write_set();
     seed.put(space_one(), key("a"), value("A"));
     storage
         .commit_write_set(seed, WriteOptions::default())
+        .await
         .map_err(|error| format!("seed failed: {error}"))?;
 
     let read = storage
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
     let mut later = storage.new_write_set();
     later.put(space_one(), key("a"), value("B"));
     storage
         .commit_write_set(later, WriteOptions::default())
+        .await
         .map_err(|error| format!("later commit failed: {error}"))?;
 
     let chunk = ScanPlan::range(
@@ -306,6 +308,7 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
         },
     )
     .collect(&read, ScanOptions::default())
+    .await
     .map_err(|error| format!("scan_range failed: {error}"))?;
 
     assert_eq!(
@@ -321,7 +324,7 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
     Ok(())
 }
 
-fn write_set_rejects_conflicting_space_declarations() -> StorageConformanceResult {
+async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanceResult {
     let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
@@ -331,7 +334,10 @@ fn write_set_rejects_conflicting_space_declarations() -> StorageConformanceResul
         value("B"),
     );
 
-    match storage.commit_write_set(writes, WriteOptions::default()) {
+    match storage
+        .commit_write_set(writes, WriteOptions::default())
+        .await
+    {
         Err(StorageWriteSetError::ConflictingSpaceDeclaration {
             id: SpaceId(1),
             existing_name: "storage.conformance.one",
@@ -372,9 +378,9 @@ fn value(bytes: &'static str) -> StoredValue {
 mod tests {
     use super::{StorageConformanceStatus, run_storage_conformance};
 
-    #[test]
-    fn in_memory_backend_passes_storage_conformance() {
-        let report = run_storage_conformance();
+    #[tokio::test]
+    async fn in_memory_backend_passes_storage_conformance() {
+        let report = run_storage_conformance().await;
 
         report.assert_no_failures();
 

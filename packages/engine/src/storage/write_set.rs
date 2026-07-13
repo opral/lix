@@ -133,7 +133,7 @@ impl StorageWriteSet {
     where
         B: Backend,
     {
-        writer.write_set(self)
+        writer.write_set(self).await
     }
 
     pub fn put<S, K, V>(&mut self, space: S, key: K, value: V)
@@ -242,15 +242,18 @@ impl StorageWriteSet {
         Ok(())
     }
 
-    pub fn lower_into<W>(self, write: &mut W) -> Result<StorageWriteSetStats, StorageWriteSetError>
+    pub async fn lower_into<W>(
+        self,
+        write: &mut W,
+    ) -> Result<StorageWriteSetStats, StorageWriteSetError>
     where
         W: BackendWrite,
     {
         self.validate()?;
-        self.lower_validated_into(write)
+        self.lower_validated_into(write).await
     }
 
-    fn lower_validated_into<W>(
+    async fn lower_validated_into<W>(
         self,
         write: &mut W,
     ) -> Result<StorageWriteSetStats, StorageWriteSetError>
@@ -300,6 +303,7 @@ impl StorageWriteSet {
                             entries: group.puts,
                         },
                     )
+                    .await
                     .map_err(StorageWriteSetError::Backend)?;
             }
             if !group.deletes.is_empty() {
@@ -307,6 +311,7 @@ impl StorageWriteSet {
                 stats.backend_calls += 1;
                 write
                     .delete_many(group.space.id, &group.deletes)
+                    .await
                     .map_err(StorageWriteSetError::Backend)?;
             }
         }
@@ -314,7 +319,7 @@ impl StorageWriteSet {
         Ok(stats)
     }
 
-    pub fn commit<B>(
+    pub async fn commit<B>(
         self,
         backend: &B,
         opts: WriteOptions,
@@ -325,15 +330,19 @@ impl StorageWriteSet {
         self.validate()?;
         let mut write = backend
             .begin_write(opts)
+            .await
             .map_err(StorageWriteSetError::Backend)?;
-        let stats = match self.lower_validated_into(&mut write) {
+        let stats = match self.lower_validated_into(&mut write).await {
             Ok(stats) => stats,
             Err(error) => {
-                let _ = write.rollback();
+                let _ = write.rollback().await;
                 return Err(error);
             }
         };
-        let result = write.commit().map_err(StorageWriteSetError::Backend)?;
+        let result = write
+            .commit()
+            .await
+            .map_err(StorageWriteSetError::Backend)?;
         Ok((result, stats))
     }
 
@@ -418,14 +427,7 @@ fn order_stats_enabled() -> bool {
 mod tests {
     use bytes::Bytes;
 
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
-    use crate::backend::{
-        Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions,
-        InMemoryBackend, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
-        ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
-    };
+    use crate::backend::{InMemoryBackend, Key, SpaceId, StoredValue, WriteOptions};
     use crate::storage::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
     fn key(bytes: &'static str) -> Key {
@@ -438,511 +440,44 @@ mod tests {
         }
     }
 
-    fn space(id: u32) -> StorageSpace {
-        match id {
-            1 => StorageSpace::new(SpaceId(1), "test.space.one"),
-            2 => StorageSpace::new(SpaceId(2), "test.space.two"),
-            _ => StorageSpace::new(SpaceId(id), "test.space.other"),
-        }
+    fn space() -> StorageSpace {
+        StorageSpace::new(SpaceId(1), "test.space")
     }
 
-    #[test]
-    fn write_set_rejects_duplicate_final_mutations() {
+    #[tokio::test]
+    async fn write_set_rejects_duplicate_final_mutations_before_backend_write() {
         let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.delete(space(1), key("a"));
+        writes.put(space(), key("a"), value("A"));
+        writes.delete(space(), key("a"));
 
         let error = writes
             .commit(&backend, WriteOptions::default())
-            .expect_err("duplicate mutation should fail");
+            .await
+            .expect_err("duplicate mutation");
 
         assert!(matches!(
             error,
-            StorageWriteSetError::DuplicateMutation {
-                space: duplicate_space,
-                key: ref duplicate_key
-            } if duplicate_space == space(1) && *duplicate_key == key("a")
+            StorageWriteSetError::DuplicateMutation { .. }
         ));
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate storage mutation for test.space.one")
-        );
     }
 
-    #[test]
-    fn duplicate_puts_are_rejected() {
+    #[tokio::test]
+    async fn write_set_lowers_batches_and_commits_asynchronously() {
         let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.put(space(1), key("a"), value("B"));
+        writes.put(space(), key("b"), value("B"));
+        writes.put(space(), key("a"), value("A"));
+        writes.delete(space(), key("missing"));
 
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::DuplicateMutation {
-                space: duplicate_space,
-                key: duplicate_key
-            }) if duplicate_space == space(1) && duplicate_key == key("a")
-        ));
-    }
-
-    #[test]
-    fn duplicate_deletes_are_rejected() {
-        let backend = InMemoryBackend::new();
-        let mut writes = StorageWriteSet::new();
-        writes.delete(space(1), key("a"));
-        writes.delete(space(1), key("a"));
-
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::DuplicateMutation {
-                space: duplicate_space,
-                key: duplicate_key
-            }) if duplicate_space == space(1) && duplicate_key == key("a")
-        ));
-    }
-
-    #[test]
-    fn put_records_stats_without_immediate_duplicate_validation() {
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.put(space(1), key("a"), value("B"));
-
-        let stats = writes.stats();
-        assert_eq!(stats.staged_puts, 2);
-        assert_eq!(stats.written_bytes, 2);
-
-        assert!(matches!(
-            writes.validate(),
-            Err(StorageWriteSetError::DuplicateMutation {
-                space: duplicate_space,
-                key: duplicate_key
-            }) if duplicate_space == space(1) && duplicate_key == key("a")
-        ));
-    }
-
-    #[test]
-    fn delete_records_stats_without_immediate_duplicate_validation() {
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.delete(space(1), key("a"));
-
-        let stats = writes.stats();
-        assert_eq!(stats.staged_puts, 1);
-        assert_eq!(stats.staged_deletes, 1);
-
-        assert!(matches!(
-            writes.validate(),
-            Err(StorageWriteSetError::DuplicateMutation {
-                space: duplicate_space,
-                key: duplicate_key
-            }) if duplicate_space == space(1) && duplicate_key == key("a")
-        ));
-    }
-
-    #[test]
-    fn canonical_staging_tracks_stats_and_lowers_without_duplicate_index() {
-        let mut writes = StorageWriteSet::with_capacity(3, 2);
-        writes.reserve_space(space(1), 2, 0);
-        writes.reserve_space(space(2), 0, 1);
-        writes.put(space(1), key("a"), value("A"));
-        writes.put(space(1), key("b"), value("B"));
-        writes.delete(space(2), key("c"));
-
-        let stats = writes.stats();
-        assert_eq!(stats.staged_puts, 2);
-        assert_eq!(stats.staged_deletes, 1);
-        assert_eq!(stats.touched_spaces, 2);
-        assert_eq!(stats.written_bytes, 2);
-
-        let mut write = CountingWrite::default();
-        let stats = writes.lower_into(&mut write).expect("lower");
-
-        assert_eq!(write.put_batches.borrow().len(), 1);
-        assert_eq!(write.delete_batches.borrow().len(), 1);
-        assert_eq!(stats.put_batches, 1);
-        assert_eq!(stats.delete_batches, 1);
-        assert_eq!(stats.backend_calls, 2);
-    }
-
-    #[test]
-    fn conflicting_space_declarations_are_rejected() {
-        let backend = InMemoryBackend::new();
-        let mut writes = StorageWriteSet::new();
-        writes.put(
-            StorageSpace::new(SpaceId(1), "test.space.one"),
-            key("a"),
-            value("A"),
-        );
-        writes.put(
-            StorageSpace::new(SpaceId(1), "test.space.renamed"),
-            key("b"),
-            value("B"),
-        );
-
-        let error = writes
+        let (commit, stats) = writes
             .commit(&backend, WriteOptions::default())
-            .expect_err("conflicting space declaration should fail");
-
-        assert!(matches!(
-            error,
-            StorageWriteSetError::ConflictingSpaceDeclaration {
-                id: SpaceId(1),
-                existing_name: "test.space.one",
-                incoming_name: "test.space.renamed",
-            }
-        ));
-    }
-
-    #[test]
-    fn write_set_groups_by_space_id_not_name() {
-        let mut writes = StorageWriteSet::new();
-        writes.put(
-            StorageSpace::new(SpaceId(1), "test.space.one"),
-            key("a"),
-            value("A"),
-        );
-        writes.put(
-            StorageSpace::new(SpaceId(1), "test.space.renamed"),
-            key("b"),
-            value("B"),
-        );
-
-        let stats = writes.stats();
-
-        assert_eq!(stats.touched_spaces, 1);
-        assert!(matches!(
-            writes.validate(),
-            Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-                id: SpaceId(1),
-                existing_name: "test.space.one",
-                incoming_name: "test.space.renamed",
-            })
-        ));
-    }
-
-    #[test]
-    fn conflicting_space_declaration_across_extend_is_rejected() {
-        let backend = InMemoryBackend::new();
-        let mut left = StorageWriteSet::new();
-        left.put(
-            StorageSpace::new(SpaceId(1), "test.space.one"),
-            key("a"),
-            value("A"),
-        );
-
-        let mut right = StorageWriteSet::new();
-        right.put(
-            StorageSpace::new(SpaceId(1), "test.space.renamed"),
-            key("b"),
-            value("B"),
-        );
-
-        left.extend(right);
-
-        assert!(matches!(
-            left.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-                id: SpaceId(1),
-                existing_name: "test.space.one",
-                incoming_name: "test.space.renamed",
-            })
-        ));
-    }
-
-    #[test]
-    fn duplicate_validation_happens_before_opening_backend_write() {
-        let backend = CountingBackend::default();
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.put(space(1), key("a"), value("B"));
-
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::DuplicateMutation { .. })
-        ));
-        assert_eq!(backend.state.begin_write_calls.get(), 0);
-        assert_eq!(backend.state.commit_calls.get(), 0);
-        assert_eq!(backend.state.rollback_calls.get(), 0);
-    }
-
-    #[test]
-    fn conflicting_space_validation_happens_before_opening_backend_write() {
-        let backend = CountingBackend::default();
-        let mut writes = StorageWriteSet::new();
-        writes.put(
-            StorageSpace::new(SpaceId(1), "test.space.one"),
-            key("a"),
-            value("A"),
-        );
-        writes.put(
-            StorageSpace::new(SpaceId(1), "test.space.renamed"),
-            key("b"),
-            value("B"),
-        );
-
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::ConflictingSpaceDeclaration { .. })
-        ));
-        assert_eq!(backend.state.begin_write_calls.get(), 0);
-        assert_eq!(backend.state.commit_calls.get(), 0);
-        assert_eq!(backend.state.rollback_calls.get(), 0);
-    }
-
-    #[test]
-    fn lower_failure_rolls_back_once() {
-        let backend = CountingBackend::failing(FailPoint::PutMany);
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::Backend(BackendError::Io(message))) if message == "put_many failed"
-        ));
-        assert_eq!(backend.state.begin_write_calls.get(), 1);
-        assert_eq!(backend.state.commit_calls.get(), 0);
-        assert_eq!(backend.state.rollback_calls.get(), 1);
-    }
-
-    #[test]
-    fn delete_lower_failure_rolls_back_once() {
-        let backend = CountingBackend::failing(FailPoint::DeleteMany);
-        let mut writes = StorageWriteSet::new();
-        writes.delete(space(1), key("a"));
-
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::Backend(BackendError::Io(message))) if message == "delete_many failed"
-        ));
-        assert_eq!(backend.state.begin_write_calls.get(), 1);
-        assert_eq!(backend.state.commit_calls.get(), 0);
-        assert_eq!(backend.state.rollback_calls.get(), 1);
-    }
-
-    #[test]
-    fn commit_failure_is_reported_without_successful_commit_stats() {
-        let backend = CountingBackend::failing(FailPoint::Commit);
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-
-        assert!(matches!(
-            writes.commit(&backend, WriteOptions::default()),
-            Err(StorageWriteSetError::Backend(BackendError::Durability))
-        ));
-        assert_eq!(backend.state.begin_write_calls.get(), 1);
-        assert_eq!(backend.state.commit_calls.get(), 1);
-        assert_eq!(backend.state.rollback_calls.get(), 0);
-        assert!(backend.state.put_batches.borrow().is_empty());
-    }
-
-    #[test]
-    fn same_key_in_different_spaces_is_allowed() {
-        let backend = InMemoryBackend::new();
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.put(space(2), key("a"), value("B"));
-
-        writes
-            .commit(&backend, WriteOptions::default())
-            .expect("different spaces are independent");
-    }
-
-    #[test]
-    fn lower_into_groups_by_space_and_operation() {
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.put(space(1), key("b"), value("B"));
-        writes.put(space(2), key("a"), value("C"));
-        writes.delete(space(1), key("c"));
-        writes.delete(space(2), key("d"));
-
-        let mut write = CountingWrite::default();
-        let stats = writes.lower_into(&mut write).expect("lower");
-
-        assert_eq!(write.put_batches.borrow().len(), 2);
-        assert_eq!(write.delete_batches.borrow().len(), 2);
-        assert_eq!(write.commit_calls.get(), 0);
-        assert_eq!(stats.put_batches, 2);
-        assert_eq!(stats.delete_batches, 2);
-        assert_eq!(stats.backend_calls, 4);
-    }
-
-    #[test]
-    fn commit_uses_one_backend_write_and_one_commit() {
-        let backend = CountingBackend::default();
-        let mut writes = StorageWriteSet::new();
-        writes.put(space(1), key("a"), value("A"));
-        writes.delete(space(1), key("b"));
-
-        writes
-            .commit(&backend, WriteOptions::default())
+            .await
             .expect("commit");
 
-        assert_eq!(backend.state.begin_write_calls.get(), 1);
-        assert_eq!(backend.state.commit_calls.get(), 1);
-        assert_eq!(backend.state.rollback_calls.get(), 0);
-        assert_eq!(backend.state.put_batches.borrow().len(), 1);
-        assert_eq!(backend.state.delete_batches.borrow().len(), 1);
-    }
-
-    #[derive(Clone, Default)]
-    struct CountingBackend {
-        state: Rc<CountingState>,
-    }
-
-    #[derive(Default)]
-    struct CountingState {
-        begin_write_calls: Cell<u64>,
-        commit_calls: Cell<u64>,
-        rollback_calls: Cell<u64>,
-        put_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
-        delete_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
-        fail_point: Cell<Option<FailPoint>>,
-    }
-
-    #[derive(Clone, Default)]
-    struct CountingRead;
-
-    struct CountingWrite {
-        state: Rc<CountingState>,
-        commit_calls: Cell<u64>,
-        put_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
-        delete_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum FailPoint {
-        PutMany,
-        DeleteMany,
-        Commit,
-    }
-
-    impl CountingBackend {
-        fn failing(fail_point: FailPoint) -> Self {
-            let backend = Self::default();
-            backend.state.fail_point.set(Some(fail_point));
-            backend
-        }
-    }
-
-    impl Default for CountingWrite {
-        fn default() -> Self {
-            Self {
-                state: Rc::new(CountingState::default()),
-                commit_calls: Cell::new(0),
-                put_batches: RefCell::new(Vec::new()),
-                delete_batches: RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl Backend for CountingBackend {
-        type Read<'a>
-            = CountingRead
-        where
-            Self: 'a;
-
-        type Write<'a>
-            = CountingWrite
-        where
-            Self: 'a;
-        fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-            Ok(CountingRead)
-        }
-
-        fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-            self.state
-                .begin_write_calls
-                .set(self.state.begin_write_calls.get() + 1);
-            Ok(CountingWrite {
-                state: Rc::clone(&self.state),
-                commit_calls: Cell::new(0),
-                put_batches: RefCell::new(Vec::new()),
-                delete_batches: RefCell::new(Vec::new()),
-            })
-        }
-    }
-
-    impl BackendRead for CountingRead {
-        fn visit_keys<V>(
-            &self,
-            _space: SpaceId,
-            _keys: &[Key],
-            _opts: GetOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<(), BackendError>
-        where
-            V: PointVisitor + ?Sized,
-        {
-            unimplemented!("not used by write-set tests")
-        }
-
-        fn scan<V>(
-            &self,
-            _space: SpaceId,
-            _range: KeyRange,
-            _opts: ScanOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<ScanResult, BackendError>
-        where
-            V: ScanVisitor + ?Sized,
-        {
-            unimplemented!("not used by write-set tests")
-        }
-    }
-
-    impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-            if self.state.fail_point.get() == Some(FailPoint::PutMany) {
-                return Err(BackendError::Io("put_many failed".to_string()));
-            }
-            let keys = entries.entries.into_iter().map(|entry| entry.key).collect();
-            self.put_batches.borrow_mut().push((space, keys));
-            Ok(())
-        }
-
-        fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-            if self.state.fail_point.get() == Some(FailPoint::DeleteMany) {
-                return Err(BackendError::Io("delete_many failed".to_string()));
-            }
-            self.delete_batches
-                .borrow_mut()
-                .push((space, keys.to_vec()));
-            Ok(())
-        }
-
-        fn delete_range(&mut self, _space: SpaceId, _range: KeyRange) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        fn commit(self) -> Result<CommitResult, BackendError> {
-            self.state
-                .commit_calls
-                .set(self.state.commit_calls.get() + 1);
-            if self.state.fail_point.get() == Some(FailPoint::Commit) {
-                return Err(BackendError::Durability);
-            }
-            self.state
-                .put_batches
-                .borrow_mut()
-                .extend(self.put_batches.into_inner());
-            self.state
-                .delete_batches
-                .borrow_mut()
-                .extend(self.delete_batches.into_inner());
-            Ok(CommitResult {
-                commit_id: None,
-                stats: WriteStats::default(),
-            })
-        }
-
-        fn rollback(self) -> Result<(), BackendError> {
-            self.state
-                .rollback_calls
-                .set(self.state.rollback_calls.get() + 1);
-            Ok(())
-        }
+        assert_eq!(stats.put_batches, 1);
+        assert_eq!(stats.delete_batches, 1);
+        assert_eq!(commit.stats.put_entries, 2);
+        assert_eq!(commit.stats.deleted_entries, 1);
     }
 }

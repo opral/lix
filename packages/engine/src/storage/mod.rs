@@ -21,30 +21,22 @@ mod write_set;
 #[cfg(test)]
 mod conformance;
 
-pub trait StorageBackend: crate::backend::Backend {}
-impl<T> StorageBackend for T where T: crate::backend::Backend {}
-pub trait StorageBackendRead: crate::backend::BackendRead {}
-impl<T> StorageBackendRead for T where T: crate::backend::BackendRead {}
-pub type StorageBackendReadOf<'a, B> = <B as crate::backend::Backend>::Read<'a>;
-
 pub use crate::backend::{
-    BackendError as StorageBackendError, CoreProjection as StorageCoreProjection,
+    Backend as StorageBackend, BackendError as StorageBackendError,
+    BackendRead as StorageBackendRead, CoreProjection as StorageCoreProjection,
     GetOptions as StorageGetOptions, InMemoryBackend as InMemoryStorageBackend,
     InMemoryRead as InMemoryStorageRead, InMemoryWrite as InMemoryStorageWrite, Key as StorageKey,
-    KeyRange as StorageKeyRange, KeyRef as StorageKeyRef, Prefix as StoragePrefix,
-    ProjectedValue as StorageProjectedValue, ProjectedValueRef as StorageProjectedValueRef,
-    ReadOptions as StorageReadOptions, ScanOptions as StorageScanOptions,
-    SpaceId as StorageSpaceId, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
+    KeyRange as StorageKeyRange, Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
+    ReadEntry as StorageReadEntry, ReadOptions as StorageReadOptions,
+    ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId, StoredValue as StorageValue,
+    WriteOptions as StorageWriteOptions,
 };
 
 pub use context::StorageContext;
-pub use point::{
-    PointReadBuffer, PointReadPlan, PointValues, PointValuesRef, RequestedToUnique,
-    RequestedToUniqueRef,
-};
+pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageRead;
 pub use read_scope::{StorageRead, StorageReadScope};
-pub use scan::{ScanBuffer, ScanChunkRef, ScanPlan};
+pub use scan::ScanPlan;
 pub use spaces::StorageSpace;
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,

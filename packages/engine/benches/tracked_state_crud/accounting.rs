@@ -34,44 +34,44 @@ fn print_write_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow
     );
 
     for profile in BACKEND_PROFILES {
-        let mut kv_insert = kv_layout::empty_fixture(profile, rows);
+        let mut kv_insert = runtime.block_on(kv_layout::empty_fixture(profile, rows));
         print_kv_write(
             profile,
             "kv_layout",
             "insert_all",
-            kv_insert.insert_all_accounting(),
+            runtime.block_on(kv_insert.insert_all_accounting()),
         );
 
-        let mut kv_update = kv_layout::seeded_fixture(profile, rows);
+        let mut kv_update = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         print_kv_write(
             profile,
             "kv_layout",
             "update_all",
-            kv_update.update_all_accounting(),
+            runtime.block_on(kv_update.update_all_accounting()),
         );
 
-        let mut kv_update_one = kv_layout::seeded_fixture(profile, rows);
+        let mut kv_update_one = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         print_kv_write(
             profile,
             "kv_layout",
             "update_one_by_pk",
-            kv_update_one.update_one_by_pk_accounting(),
+            runtime.block_on(kv_update_one.update_one_by_pk_accounting()),
         );
 
-        let mut kv_delete = kv_layout::seeded_fixture(profile, rows);
+        let mut kv_delete = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         print_kv_write(
             profile,
             "kv_layout",
             "delete_all",
-            kv_delete.delete_all_accounting(),
+            runtime.block_on(kv_delete.delete_all_accounting()),
         );
 
-        let mut kv_delete_one = kv_layout::seeded_fixture(profile, rows);
+        let mut kv_delete_one = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         print_kv_write(
             profile,
             "kv_layout",
             "delete_one_by_pk",
-            kv_delete_one.delete_one_by_pk_accounting(),
+            runtime.block_on(kv_delete_one.delete_one_by_pk_accounting()),
         );
 
         let mut transaction_insert =
@@ -128,13 +128,13 @@ fn print_layout_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRo
     println!("| ----- | ------- | -------: | ----- | ---: | --------: | ----------: |");
 
     for profile in BACKEND_PROFILES {
-        let kv = kv_layout::seeded_fixture(profile, rows);
-        for row in kv.layout_accounting() {
+        let kv = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
+        for row in runtime.block_on(kv.layout_accounting()) {
             print_kv_layout(profile, "kv_layout", row);
         }
 
         let transaction = runtime.block_on(transaction_api::seeded_fixture(profile, rows));
-        for row in transaction.layout_accounting() {
+        for row in runtime.block_on(transaction.layout_accounting()) {
             print_transaction_layout(profile, "transaction", row);
         }
     }

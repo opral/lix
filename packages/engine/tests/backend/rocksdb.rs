@@ -1,11 +1,11 @@
 use lix_backends::{RocksDbBackend, RocksDbBackendFactory};
 use lix_engine::run_backend_conformance;
 
-#[test]
-fn rocksdb_backend_passes_backend_conformance() {
+#[tokio::test]
+async fn rocksdb_backend_passes_backend_conformance() {
     let factory = RocksDbBackendFactory::new();
 
-    run_backend_conformance(&factory).assert_no_failures();
+    run_backend_conformance(&factory).await.assert_no_failures();
 }
 
 #[test]

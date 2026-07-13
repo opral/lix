@@ -523,8 +523,6 @@ async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
 async fn install_plugin<B>(lix: &lix_sdk::Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \

@@ -103,8 +103,6 @@ pub enum MergeBranchOutcome {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Previews merging `source_branch_id` into this session's active branch
     /// without advancing refs, staging changes, or creating commits.
@@ -122,7 +120,7 @@ where
                 }
 
                 let (target_head, source_head) = {
-                    let reader = transaction.branch_ref_reader();
+                    let reader = transaction.branch_ref_reader().await;
                     let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
                         .require_existing_commit_id(
@@ -142,12 +140,12 @@ where
                 };
 
                 let merge_base = {
-                    let mut reader = transaction.commit_graph_reader();
+                    let mut reader = transaction.commit_graph_reader().await;
                     reader.merge_base(&target_head, &source_head).await?
                 };
 
                 let analysis = {
-                    let mut reader = transaction.tracked_state_reader();
+                    let mut reader = transaction.tracked_state_reader().await;
                     analyze(
                         &mut reader,
                         MergeCommits {
@@ -189,7 +187,7 @@ where
                 }
 
                 let (target_head, source_head) = {
-                    let reader = transaction.branch_ref_reader();
+                    let reader = transaction.branch_ref_reader().await;
                     let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
                         .require_existing_commit_id(
@@ -209,13 +207,13 @@ where
                 };
 
                 let merge_base = {
-                    let mut reader = transaction.commit_graph_reader();
+                    let mut reader = transaction.commit_graph_reader().await;
                     reader.merge_base(&target_head, &source_head).await?
                 };
                 let base_commit_id = merge_base.commit_id;
 
                 let analysis = {
-                    let mut reader = transaction.tracked_state_reader();
+                    let mut reader = transaction.tracked_state_reader().await;
                     analyze(
                         &mut reader,
                         MergeCommits {

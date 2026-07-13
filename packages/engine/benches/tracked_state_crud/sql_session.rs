@@ -1,7 +1,6 @@
 use std::fmt::Write as _;
 
-use lix_engine::storage::StorageBackend;
-use lix_engine::{Engine, ExecuteResult, SessionContext, Value};
+use lix_engine::{Backend, Engine, ExecuteResult, SessionContext, Value};
 
 use crate::backends::{BackendProfile, ProfileBackend, RedbBackend, RocksDbBackend, SqliteBackend};
 use crate::workload::{WorkloadRow, sql_string};
@@ -15,7 +14,7 @@ pub(crate) enum SqlFixture {
     Redb(GenericSqlFixture<RedbBackend>),
 }
 
-pub(crate) struct GenericSqlFixture<B: StorageBackend> {
+pub(crate) struct GenericSqlFixture<B: Backend> {
     session: SessionContext<B>,
     row_count: usize,
     insert_sql_chunks: Vec<String>,
@@ -116,9 +115,7 @@ impl SqlFixture {
 
 impl<B> GenericSqlFixture<B>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
@@ -188,7 +185,7 @@ where
 
 fn fixture_for_session<B>(session: SessionContext<B>, rows: &[WorkloadRow]) -> GenericSqlFixture<B>
 where
-    B: StorageBackend,
+    B: Backend,
 {
     let mid = rows.len() / 2;
     GenericSqlFixture {
@@ -210,9 +207,7 @@ where
 
 async fn prepare_session<B>(backend: B) -> SessionContext<B>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     Engine::initialize(backend.clone())
         .await
@@ -230,9 +225,7 @@ where
 
 async fn register_json_pointer_schema<B>(session: &SessionContext<B>)
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
         "x-lix-key": "json_pointer",
@@ -260,9 +253,7 @@ where
 
 async fn execute<B>(session: &SessionContext<B>, sql: &str) -> ExecuteResult
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     session
         .execute(sql, &[])

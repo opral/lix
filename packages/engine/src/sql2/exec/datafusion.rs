@@ -1448,6 +1448,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use futures_util::FutureExt;
     use serde_json::Value as JsonValue;
     use serde_json::json;
 
@@ -1505,6 +1506,8 @@ mod tests {
     ) -> StorageReadScope<InMemoryStorageRead> {
         storage
             .begin_read(StorageReadOptions::default())
+            .now_or_never()
+            .expect("in-memory read should complete without yielding")
             .expect("read should open")
     }
 

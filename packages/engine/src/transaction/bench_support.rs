@@ -12,9 +12,9 @@ use crate::live_state::{
     LiveStateScanRequest,
 };
 use crate::session::SessionMode;
+use crate::storage::StorageBackend;
 use crate::storage::{
-    SharedStorageRead, StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions,
-    StorageWriteSet, StorageWriteSetStats,
+    SharedStorageRead, StorageContext, StorageReadOptions, StorageWriteSet, StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
@@ -69,8 +69,6 @@ pub struct BenchLayoutAccounting {
 impl<B> BenchTransactionFixture<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Like [`Self::new`], but enables the engine's deterministic functions
     /// before any transaction runs, so ids and timestamps are
@@ -79,7 +77,7 @@ where
         storage: StorageContext<B>,
         rows: Vec<BenchTransactionRow>,
     ) -> Self {
-        seed_deterministic_mode(storage.clone());
+        seed_deterministic_mode(storage.clone()).await;
         Self::new(storage, rows).await
     }
 
@@ -165,6 +163,7 @@ where
         let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("begin transaction bench read"),
         );
         let rows = self
@@ -215,6 +214,7 @@ where
         let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("begin transaction bench read"),
         );
         let rows = self
@@ -251,6 +251,7 @@ where
         let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("begin transaction bench read"),
         );
         let row = self
@@ -298,20 +299,23 @@ where
     }
 
     /// Per-row inventory of one space, for byte-exact layout comparison.
-    pub fn space_inventory(&self, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub async fn space_inventory(&self, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("begin transaction inventory read");
-        crate::storage_bench::space_inventory(&read, space_name)
+        crate::storage_bench::space_inventory(&read, space_name).await
     }
 
-    pub fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
+    pub async fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("begin transaction layout accounting read");
         crate::storage_bench::layout_accounting(&read)
+            .await
             .into_iter()
             .map(|space| BenchLayoutAccounting {
                 space_id: space.space_id,
@@ -324,7 +328,7 @@ where
     }
 }
 
-fn seed_deterministic_mode<B>(storage: StorageContext<B>)
+async fn seed_deterministic_mode<B>(storage: StorageContext<B>)
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
 {
@@ -356,6 +360,7 @@ where
         .stage_rows(std::iter::once(row.as_ref()))
         .expect("deterministic mode row should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+        .await
         .expect("deterministic mode row should commit");
 }
 
@@ -401,7 +406,6 @@ async fn seed_visible_schema_rows<B>(
     tracked_state: &TrackedStateContext,
 ) where
     B: StorageBackend + Clone,
-    for<'a> StorageBackendReadOf<'a, B>: Send,
 {
     let mut writes = StorageWriteSet::new();
     let mut schemas = crate::schema::seed_schema_definitions()
@@ -445,6 +449,7 @@ async fn seed_visible_schema_rows<B>(
     let mut read = SharedStorageRead::new(
         storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("schema fixture read should open"),
     );
     crate::test_support::stage_tracked_root_from_materialized(
@@ -465,6 +470,7 @@ async fn seed_visible_schema_rows<B>(
         ])
         .expect("schema fixture branch ref should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+        .await
         .expect("schema fixture transaction should commit");
 }
 

@@ -98,7 +98,8 @@ async fn load_json_bytes_direct(
     store: &(impl StorageRead + ?Sized),
     json_ref: &JsonRef,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let result = load_values(store, JSON_SPACE, vec![json_ref.as_hash_bytes().to_vec()])?
+    let result = load_values(store, JSON_SPACE, vec![json_ref.as_hash_bytes().to_vec()])
+        .await?
         .into_iter()
         .next()
         .flatten();
@@ -190,7 +191,8 @@ async fn load_json_bytes_many_in_scope_with_hash_check(
             .iter()
             .map(|&index| unique_keys[index].clone())
             .collect(),
-    )?;
+    )
+    .await?;
     if loaded.len() != missing.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -245,7 +247,7 @@ fn json_values_in_request_order(
         .collect()
 }
 
-fn load_values(
+async fn load_values(
     store: &(impl StorageRead + ?Sized),
     space: StorageSpace,
     keys: Vec<Vec<u8>>,
@@ -254,8 +256,9 @@ fn load_values(
         .into_iter()
         .map(|key| StorageKey(Bytes::from(key)))
         .collect::<Vec<_>>();
-    let result =
-        PointReadPlan::new(space, &keys).materialize(store, StorageGetOptions::default())?;
+    let result = PointReadPlan::new(space, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
     Ok(result
         .value
         .into_iter()
@@ -387,10 +390,12 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_json_bytes_direct(&store, &encoded.json_ref)
@@ -423,10 +428,12 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let values = load_json_bytes_many_in_scope(
             &store,
@@ -462,10 +469,12 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let trusted =
             load_json_bytes_many_in_scope(&store, &[requested_ref], JsonReadScopeRef::OutOfBand)

@@ -4,17 +4,14 @@ use bytes::Bytes;
 
 use crate::backend::BackendError;
 
+/// Maximum number of owned rows returned by one backend scan page.
+pub const MAX_SCAN_PAGE_ROWS: usize = 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SpaceId(pub u32);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key(pub Bytes);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct KeyRef<'a>(pub &'a [u8]);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Value(pub Bytes);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadEntry {
@@ -50,27 +47,20 @@ pub struct Prefix {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetOptions<'a> {
+pub struct GetOptions {
     pub projection: CoreProjection,
-    pub _reserved: std::marker::PhantomData<&'a ()>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanOptions<'a> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanOptions {
     pub projection: CoreProjection,
     pub limit_rows: usize,
-    pub resume_after: Option<&'a Key>,
+    pub resume_after: Option<Key>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanChunk {
     pub entries: Vec<ReadEntry>,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ScanResult {
-    pub emitted: usize,
     pub has_more: bool,
 }
 
@@ -92,48 +82,6 @@ pub enum CoreProjection {
 pub enum ProjectedValue {
     KeyOnly,
     FullValue(Bytes),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProjectedValueRef<'a> {
-    KeyOnly,
-    FullValue(&'a [u8]),
-}
-
-impl ProjectedValueRef<'_> {
-    pub fn to_owned(self) -> ProjectedValue {
-        match self {
-            ProjectedValueRef::KeyOnly => ProjectedValue::KeyOnly,
-            ProjectedValueRef::FullValue(value) => {
-                ProjectedValue::FullValue(Bytes::copy_from_slice(value))
-            }
-        }
-    }
-}
-
-impl ProjectedValue {
-    pub fn as_ref(&self) -> ProjectedValueRef<'_> {
-        match self {
-            Self::KeyOnly => ProjectedValueRef::KeyOnly,
-            Self::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
-        }
-    }
-}
-
-impl<'a> KeyRef<'a> {
-    pub fn as_bytes(self) -> &'a [u8] {
-        self.0
-    }
-
-    pub fn to_owned_key(self) -> Key {
-        Key(Bytes::copy_from_slice(self.0))
-    }
-}
-
-impl Key {
-    pub fn as_ref(&self) -> KeyRef<'_> {
-        KeyRef(self.0.as_ref())
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -205,11 +153,10 @@ impl Prefix {
     }
 }
 
-impl Default for GetOptions<'_> {
+impl Default for GetOptions {
     fn default() -> Self {
         Self {
             projection: CoreProjection::FullValue,
-            _reserved: std::marker::PhantomData,
         }
     }
 }
@@ -228,12 +175,43 @@ impl GetManyResult {
     }
 }
 
-impl Default for ScanOptions<'_> {
+impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             projection: CoreProjection::FullValue,
             limit_rows: 1024,
             resume_after: None,
         }
+    }
+}
+
+impl ScanOptions {
+    pub fn page_size(&self) -> usize {
+        self.limit_rows.min(MAX_SCAN_PAGE_ROWS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SCAN_PAGE_ROWS, ScanOptions};
+
+    #[test]
+    fn scan_page_size_is_bounded() {
+        assert_eq!(
+            ScanOptions {
+                limit_rows: usize::MAX,
+                ..ScanOptions::default()
+            }
+            .page_size(),
+            MAX_SCAN_PAGE_ROWS
+        );
+        assert_eq!(
+            ScanOptions {
+                limit_rows: 17,
+                ..ScanOptions::default()
+            }
+            .page_size(),
+            17
+        );
     }
 }

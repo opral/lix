@@ -588,8 +588,6 @@ async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
 async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let result = lix
         .execute(
@@ -607,8 +605,6 @@ where
 async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -622,8 +618,6 @@ where
 async fn mkdir<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     lix.execute(
         "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
@@ -636,8 +630,6 @@ where
 async fn rm<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     lix.execute(
         "DELETE FROM lix_directory WHERE path = $1",
@@ -650,8 +642,6 @@ where
 async fn readdir<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<String>>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     if path == "/" {
         let entries = lix

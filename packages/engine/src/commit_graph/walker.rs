@@ -18,7 +18,7 @@ pub(crate) async fn walk_reachable_commits<S>(
     head_commit_id: &CommitId,
 ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     let mut loader = CommitTraversalLoader::new(reader);
     let mut visiting = BTreeSet::new();
@@ -70,7 +70,7 @@ pub(crate) async fn best_common_ancestors<S>(
     right_commit_id: &CommitId,
 ) -> Result<Vec<CommitGraphCommit>, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     let left_reachable = walk_reachable_commits(reader, left_commit_id).await?;
     let right_reachable = walk_reachable_commits(reader, right_commit_id).await?;
@@ -107,7 +107,7 @@ async fn has_descendant_in_set<S>(
     candidate_descendant_ids: &BTreeSet<CommitId>,
 ) -> Result<bool, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     for candidate_descendant_id in candidate_descendant_ids {
         if candidate_descendant_id == commit_id {
@@ -126,7 +126,7 @@ where
 
 struct CommitTraversalLoader<'a, S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     reader: &'a mut CommitGraphStoreReader<S>,
     loaded: BTreeMap<CommitId, CommitGraphCommit>,
@@ -134,7 +134,7 @@ where
 
 impl<'a, S> CommitTraversalLoader<'a, S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     fn new(reader: &'a mut CommitGraphStoreReader<S>) -> Self {
         Self {
@@ -282,6 +282,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -340,6 +341,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_a = commit_id("commit-a");
@@ -373,6 +375,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -422,6 +425,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -464,6 +468,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
@@ -489,6 +494,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let missing_head = commit_id("missing-head");
@@ -518,6 +524,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_c = commit_id("commit-c");
@@ -564,6 +571,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_left_head = commit_id("commit-left-head");
@@ -598,6 +606,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_b = commit_id("commit-b");
@@ -644,6 +653,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head_left = commit_id("commit-head-left");
@@ -679,6 +689,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_c = commit_id("commit-c");
@@ -706,6 +717,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_left = commit_id("commit-left");
@@ -746,6 +758,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = graph.reader(read);
         let commit_head_left = commit_id("commit-head-left");
@@ -802,6 +815,7 @@ mod tests {
     ) -> Result<(), LixError> {
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let mut append = ChangelogAppend::default();
@@ -831,6 +845,7 @@ mod tests {
             .await?;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("commit should succeed");
         Ok(())
     }

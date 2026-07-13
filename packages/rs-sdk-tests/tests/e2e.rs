@@ -547,8 +547,6 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
 async fn install_plugin<B>(lix: &Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     write_file(
         lix,
@@ -561,8 +559,6 @@ where
 async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -576,8 +572,6 @@ where
 async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let result = lix
         .execute(
@@ -601,8 +595,6 @@ struct InstalledPluginInfo {
 async fn list_installed_plugins<B>(lix: &Lix<B>) -> Vec<InstalledPluginInfo>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let archives = lix
         .execute("SELECT path, data FROM lix_file ORDER BY path", &[])

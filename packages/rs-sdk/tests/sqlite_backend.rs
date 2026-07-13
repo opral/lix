@@ -10,11 +10,11 @@ use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[test]
-fn sqlite_backend_passes_backend_conformance() {
+#[tokio::test]
+async fn sqlite_backend_passes_backend_conformance() {
     let factory = SqliteBackendFactory::new();
 
-    run_backend_conformance(&factory).assert_no_failures();
+    run_backend_conformance(&factory).await.assert_no_failures();
 }
 
 #[test]
@@ -150,8 +150,6 @@ fn sqlite_journal_mode(path: &std::path::Path) -> String {
 async fn install_plugin<B>(lix: &Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     write_file(
         lix,
@@ -164,8 +162,6 @@ where
 async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -179,8 +175,6 @@ where
 async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let result = lix
         .execute(
@@ -298,29 +292,21 @@ const RUNTIME_TEST_PLUGIN_SCHEMA: &str = r#"{
   "additionalProperties": false
 }"#;
 
-#[test]
-fn sqlite_backend_scans_with_usize_max_limit() {
+#[tokio::test]
+async fn sqlite_backend_scans_with_usize_max_limit() {
     // The engine drives unbounded scans as one visit_next(usize::MAX) call;
     // a wrapping lookahead limit returned zero rows in release builds.
     use lix_sdk::{
-        Backend, BackendRead, BackendWrite, CoreProjection, KeyRange, ProjectedValueRef, PutBatch,
-        ReadOptions, ScanOptions, ScanVisitor, SpaceId, WriteOptions,
+        Backend, BackendRead, BackendWrite, CoreProjection, KeyRange, PutBatch, ReadOptions,
+        ScanOptions, SpaceId, WriteOptions,
     };
     const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
-    struct Counter(usize);
-    impl ScanVisitor for Counter {
-        fn visit(
-            &mut self,
-            _key: lix_engine::backend::KeyRef<'_>,
-            _value: ProjectedValueRef<'_>,
-        ) -> Result<(), lix_sdk::BackendError> {
-            self.0 += 1;
-            Ok(())
-        }
-    }
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = SqliteBackend::open(dir.path().join("max.lix")).expect("open");
-    let mut write = backend.begin_write(WriteOptions::default()).expect("write");
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("write");
     write
         .put_many(
             TEST_SPACE,
@@ -335,11 +321,14 @@ fn sqlite_backend_scans_with_usize_max_limit() {
                     .collect(),
             },
         )
+        .await
         .expect("put");
-    write.commit().expect("commit");
+    write.commit().await.expect("commit");
 
-    let read = backend.begin_read(ReadOptions::default()).expect("read");
-    let mut counter = Counter(0);
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("read");
     let result = read
         .scan(
             TEST_SPACE,
@@ -352,44 +341,25 @@ fn sqlite_backend_scans_with_usize_max_limit() {
                 limit_rows: usize::MAX,
                 resume_after: None,
             },
-            &mut counter,
         )
+        .await
         .expect("scan");
-    assert_eq!(counter.0, 10);
+    assert_eq!(result.entries.len(), 10);
     assert!(!result.has_more);
 }
 
-#[test]
-fn sqlite_backend_put_many_handles_multi_chunk_batches() {
+#[tokio::test]
+async fn sqlite_backend_put_many_handles_multi_chunk_batches() {
     use bytes::Bytes;
     use lix_engine::backend::PutEntry;
     use lix_sdk::{
-        Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, PointVisitor,
-        ProjectedValueRef, PutBatch, ReadOptions, SpaceId, StoredValue, WriteOptions,
+        Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, ProjectedValue,
+        PutBatch, ReadOptions, SpaceId, StoredValue, WriteOptions,
     };
     const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
 
     // 300 entries: two full 128-row upsert chunks plus a 44-row remainder.
     const ROWS: usize = 300;
-
-    struct CollectingVisitor {
-        values: Vec<Option<Vec<u8>>>,
-    }
-    impl PointVisitor for CollectingVisitor {
-        fn visit(
-            &mut self,
-            index: usize,
-            _key: &Key,
-            value: Option<ProjectedValueRef<'_>>,
-        ) -> Result<(), lix_sdk::BackendError> {
-            self.values[index] = match value {
-                Some(ProjectedValueRef::FullValue(bytes)) => Some(bytes.to_vec()),
-                Some(ProjectedValueRef::KeyOnly) => Some(Vec::new()),
-                None => None,
-            };
-            Ok(())
-        }
-    }
 
     let tempdir = tempfile::tempdir().expect("tempdir should create");
     let backend =
@@ -412,11 +382,13 @@ fn sqlite_backend_put_many_handles_multi_chunk_batches() {
 
     let mut write = backend
         .begin_write(WriteOptions::default())
+        .await
         .expect("begin insert write");
     write
         .put_many(TEST_SPACE, batch(1))
+        .await
         .expect("insert all rows");
-    let insert_stats = write.commit().expect("commit inserts").stats;
+    let insert_stats = write.commit().await.expect("commit inserts").stats;
     assert_eq!(insert_stats.put_entries, ROWS as u64);
     assert_eq!(insert_stats.written_bytes, (ROWS * 2) as u64);
 
@@ -424,34 +396,37 @@ fn sqlite_backend_put_many_handles_multi_chunk_batches() {
     // upsert conflict branch.
     let mut write = backend
         .begin_write(WriteOptions::default())
+        .await
         .expect("begin overwrite write");
     write
         .put_many(TEST_SPACE, batch(2))
+        .await
         .expect("overwrite all rows");
-    write.commit().expect("commit overwrites");
+    write.commit().await.expect("commit overwrites");
 
     let keys = (0..ROWS).map(key).collect::<Vec<_>>();
     let read = backend
         .begin_read(ReadOptions::default())
+        .await
         .expect("begin read");
-    let mut visitor = CollectingVisitor {
-        values: vec![None; ROWS],
-    };
-    read.visit_keys(
-        TEST_SPACE,
-        &keys,
-        GetOptions {
-            projection: CoreProjection::FullValue,
-            _reserved: std::marker::PhantomData,
-        },
-        &mut visitor,
-    )
-    .expect("visit keys");
-    read.close().expect("close read");
+    let result = read
+        .get_many(
+            TEST_SPACE,
+            &keys,
+            GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        )
+        .await
+        .expect("read keys");
+    drop(read);
 
-    for (index, value) in visitor.values.iter().enumerate() {
+    for (index, value) in result.values.iter().enumerate() {
         assert_eq!(
-            value.as_deref(),
+            value.as_ref().map(|value| match value {
+                ProjectedValue::FullValue(bytes) => bytes.as_ref(),
+                ProjectedValue::KeyOnly => &[][..],
+            }),
             Some([2u8, index.to_le_bytes()[0]].as_slice()),
             "row {index} should hold the overwritten value"
         );

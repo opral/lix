@@ -13,7 +13,8 @@ use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
 use crate::session::SessionContext;
-use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions, StorageWriteOptions};
+use crate::storage::StorageBackend;
+use crate::storage::{SharedStorageRead, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
@@ -38,8 +39,6 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
 impl<B> Engine<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Seeds an empty backend with the engine repository bootstrap facts.
     ///
@@ -118,7 +117,11 @@ where
         &self,
         branch_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let result = self
             .branch_ctx
             .ref_reader(read)
@@ -182,7 +185,7 @@ where
                 )
             })?;
         let storage = self.storage();
-        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let mut writes = StorageWriteSet::new();
         let rebuild_result = self
             .tracked_state
@@ -192,6 +195,7 @@ where
         rebuild_result?;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .map(|_| ())
             .map_err(Into::into)
     }
@@ -203,10 +207,8 @@ async fn assert_initialized<B>(
 ) -> Result<(), LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
-    let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default())?);
+    let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default()).await?);
     let reader = live_state.reader(read);
     let initialized = reader
         .load_row(&LiveStateRowRequest {

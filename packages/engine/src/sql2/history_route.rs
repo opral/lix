@@ -878,6 +878,7 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         JsonStoreContext::new().reader(SharedStorageRead::new(read_scope))
     }

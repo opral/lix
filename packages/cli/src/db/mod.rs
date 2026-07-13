@@ -1,16 +1,21 @@
+#![allow(
+    clippy::manual_async_fn,
+    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+)]
+
 use crate::app::AppContext;
 use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_sdk::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    Key, KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
-    ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
-    open_lix_with_backend,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, Key, KeyRange, Lix, LixError, ProjectedValue, PutBatch, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats, open_lix_with_backend,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -224,49 +229,59 @@ impl Backend for FileBackend {
         = FileBackendWrite
     where
         Self: 'a;
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        Ok(FileBackendRead {
-            kv: self
-                .kv
-                .lock()
-                .map_err(|_| backend_lock_error("cli file backend kv"))?
-                .clone(),
-        })
+    fn begin_read(
+        &self,
+        _opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+        async move {
+            Ok(FileBackendRead {
+                kv: self
+                    .kv
+                    .lock()
+                    .map_err(|_| backend_lock_error("cli file backend kv"))?
+                    .clone(),
+            })
+        }
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        {
-            let mut active = self
-                .write_active
+    fn begin_write(
+        &self,
+        _opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            {
+                let mut active = self
+                    .write_active
+                    .lock()
+                    .map_err(|_| backend_lock_error("cli file backend write gate"))?;
+                if *active {
+                    return Err(BackendError::Io(
+                        "cli file backend write transaction already active".to_string(),
+                    ));
+                }
+                *active = true;
+            }
+            let kv = match self
+                .kv
                 .lock()
-                .map_err(|_| backend_lock_error("cli file backend write gate"))?;
-            if *active {
-                return Err(BackendError::Io(
-                    "cli file backend write transaction already active".to_string(),
-                ));
-            }
-            *active = true;
+                .map_err(|_| backend_lock_error("cli file backend kv"))
+                .map(|parent| parent.clone())
+            {
+                Ok(kv) => kv,
+                Err(error) => {
+                    self.clear_write_active();
+                    return Err(error);
+                }
+            };
+            Ok(FileBackendWrite {
+                path: Arc::clone(&self.path),
+                parent: Arc::clone(&self.kv),
+                write_active: Arc::clone(&self.write_active),
+                kv,
+                stats: WriteStats::default(),
+                closed: false,
+            })
         }
-        let kv = match self
-            .kv
-            .lock()
-            .map_err(|_| backend_lock_error("cli file backend kv"))
-            .map(|parent| parent.clone())
-        {
-            Ok(kv) => kv,
-            Err(error) => {
-                self.clear_write_active();
-                return Err(error);
-            }
-        };
-        Ok(FileBackendWrite {
-            path: Arc::clone(&self.path),
-            parent: Arc::clone(&self.kv),
-            write_active: Arc::clone(&self.write_active),
-            kv,
-            stats: WriteStats::default(),
-            closed: false,
-        })
     }
 }
 
@@ -279,7 +294,7 @@ impl FileBackend {
 }
 
 /// The CLI file backend keeps one flat map; spaces are scoped by prefixing
-/// the 4-byte big-endian space id internally. Visitors observe logical keys.
+/// the 4-byte big-endian space id internally. Reads return logical keys.
 fn physical_key(space: SpaceId, key: &Key) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
     bytes.extend_from_slice(&space.0.to_be_bytes());
@@ -308,125 +323,137 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 }
 
 impl BackendRead for FileBackendRead {
-    fn visit_keys<V>(
+    fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        for (index, key) in keys.iter().enumerate() {
-            let value = self
-                .kv
-                .get(physical_key(space, key).as_slice())
-                .map(|value| project_value_ref(value, opts.projection));
-            visitor.visit(index, key, value)?;
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        async move {
+            Ok(GetManyResult::new(
+                keys.iter()
+                    .map(|key| {
+                        self.kv
+                            .get(physical_key(space, key).as_slice())
+                            .map(|value| project_value(value, opts.projection))
+                    })
+                    .collect(),
+            ))
         }
-        Ok(())
     }
 
-    fn scan<V>(
+    fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        if opts.limit_rows == 0 {
-            return Ok(ScanResult {
-                emitted: 0,
-                has_more: false,
-            });
-        }
-        let range = physical_range(space, range);
-        let resume_after = opts
-            .resume_after
-            .map(|key| Key(Bytes::from(physical_key(space, key))));
-        let rows = self
-            .kv
-            .iter()
-            .filter(|(key, _)| key_matches_range(key, &range, resume_after.as_ref()))
-            .collect::<Vec<_>>();
-        // BTreeMap iteration is already key-ascending; no sort needed.
-        let mut emitted = 0usize;
-        for (key, value) in &rows {
-            if emitted == opts.limit_rows {
-                return Ok(ScanResult {
-                    emitted,
-                    has_more: true,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        async move {
+            if opts.page_size() == 0 {
+                return Ok(ScanChunk {
+                    entries: Vec::new(),
+                    has_more: false,
                 });
             }
-            visitor.visit(
-                lix_sdk::BackendKeyRef(&key[4..]),
-                project_value_ref(value, opts.projection),
-            )?;
-            emitted += 1;
+            let range = physical_range(space, range);
+            let resume_after = opts
+                .resume_after
+                .as_ref()
+                .map(|key| Key(Bytes::from(physical_key(space, key))));
+            let mut rows = self
+                .kv
+                .iter()
+                .filter(|(key, _)| key_matches_range(key, &range, resume_after.as_ref()));
+            let entries = rows
+                .by_ref()
+                .take(opts.page_size())
+                .map(|(key, value)| ReadEntry {
+                    key: Key(Bytes::copy_from_slice(&key[4..])),
+                    value: project_value(value, opts.projection),
+                })
+                .collect();
+            Ok(ScanChunk {
+                entries,
+                has_more: rows.next().is_some(),
+            })
         }
-        Ok(ScanResult {
-            emitted,
-            has_more: false,
-        })
     }
 }
 
 impl BackendWrite for FileBackendWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        for entry in entries.entries {
-            self.stats.put_entries += 1;
-            self.stats.written_bytes += entry.value.bytes.len() as u64;
-            self.kv.insert(
-                physical_key(space, &entry.key),
-                stored_value_bytes(entry.value),
-            );
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for entry in entries.entries {
+                self.stats.put_entries += 1;
+                self.stats.written_bytes += entry.value.bytes.len() as u64;
+                self.kv.insert(
+                    physical_key(space, &entry.key),
+                    stored_value_bytes(entry.value),
+                );
+            }
+            self.stats.backend_calls += 1;
+            Ok(())
         }
-        self.stats.backend_calls += 1;
-        Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        for key in keys {
-            self.kv.remove(physical_key(space, key).as_slice());
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for key in keys {
+                self.kv.remove(physical_key(space, key).as_slice());
+            }
+            self.stats.deleted_entries += keys.len() as u64;
+            self.stats.backend_calls += 1;
+            Ok(())
         }
-        self.stats.deleted_entries += keys.len() as u64;
-        self.stats.backend_calls += 1;
-        Ok(())
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        let range = physical_range(space, range);
-        let before = self.kv.len();
-        self.kv
-            .retain(|key, _| !key_matches_range(key, &range, None));
-        self.stats.deleted_entries += (before - self.kv.len()) as u64;
-        self.stats.deleted_ranges += 1;
-        self.stats.backend_calls += 1;
-        Ok(())
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            let range = physical_range(space, range);
+            let before = self.kv.len();
+            self.kv
+                .retain(|key, _| !key_matches_range(key, &range, None));
+            self.stats.deleted_entries += (before - self.kv.len()) as u64;
+            self.stats.deleted_ranges += 1;
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
     }
 
-    fn commit(mut self) -> Result<CommitResult, BackendError> {
-        write_kv_file(&self.path, &self.kv).map_err(lix_to_backend_error)?;
-        *self
-            .parent
-            .lock()
-            .map_err(|_| backend_lock_error("cli file backend kv"))? = self.kv.clone();
-        self.closed = true;
-        self.clear_write_active();
-        Ok(CommitResult {
-            commit_id: None,
-            stats: self.stats,
-        })
+    fn commit(mut self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+        async move {
+            write_kv_file(&self.path, &self.kv).map_err(lix_to_backend_error)?;
+            *self
+                .parent
+                .lock()
+                .map_err(|_| backend_lock_error("cli file backend kv"))? = self.kv.clone();
+            self.closed = true;
+            self.clear_write_active();
+            Ok(CommitResult {
+                commit_id: None,
+                stats: self.stats,
+            })
+        }
     }
 
-    fn rollback(mut self) -> Result<(), BackendError> {
-        self.closed = true;
-        self.clear_write_active();
-        Ok(())
+    fn rollback(mut self) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            self.closed = true;
+            self.clear_write_active();
+            Ok(())
+        }
     }
 }
 
@@ -527,10 +554,10 @@ fn key_matches_range(key: &[u8], range: &KeyRange, resume_after: Option<&Key>) -
     lower_matches && upper_matches
 }
 
-fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
+fn project_value(value: &[u8], projection: CoreProjection) -> ProjectedValue {
     match projection {
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+        CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
     }
 }
 

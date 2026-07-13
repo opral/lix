@@ -24,7 +24,7 @@ impl UntrackedStateContext {
     #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateStoreReader<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         UntrackedStateStoreReader { store }
     }
@@ -46,7 +46,7 @@ pub(crate) struct UntrackedStateStoreReader<S> {
 
 impl<S> UntrackedStateStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn scan_rows(

@@ -1,7 +1,4 @@
 //! Conformance harness for backend implementations.
-//!
-//! The harness is colocated with the experimental API for now. Once backend
-//! is stable, lix-sdk can re-export this as the public backend author test kit.
 
 mod baseline;
 mod factory;
@@ -25,9 +22,9 @@ mod tests {
     use super::{ConformanceStatus, run_backend_conformance};
     use crate::backend::InMemoryBackendFactory;
 
-    #[test]
-    fn in_memory_backend_passes_baseline_conformance() {
-        let report = run_backend_conformance(&InMemoryBackendFactory);
+    #[tokio::test]
+    async fn in_memory_backend_passes_baseline_conformance() {
+        let report = run_backend_conformance(&InMemoryBackendFactory).await;
 
         report.assert_no_failures();
 
@@ -54,6 +51,7 @@ mod tests {
                 "baseline::put_many_overwrites_existing_value",
                 "baseline::scan_range_sees_overwritten_existing_value",
                 "baseline::scan_range_returns_forward_row_bounded_chunks",
+                "baseline::scan_range_caps_owned_pages",
                 "baseline::scan_range_honors_bound_variants",
                 "baseline::scan_range_resume_before_lower_does_not_widen_range",
                 "baseline::scan_range_orders_raw_byte_keys",

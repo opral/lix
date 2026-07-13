@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use lix_engine::Engine;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
-    InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetManyResult, GetOptions,
+    InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, WriteOptions,
 };
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -597,8 +597,6 @@ fn spawn_close_waiter<B>(
 ) -> thread::JoinHandle<Result<(), lix_engine::LixError>>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -805,13 +803,13 @@ impl Backend for BlockingBeginWriteBackend {
         = <RecordingBackend as Backend>::Write<'a>
     where
         Self: 'a;
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        self.inner.begin_read(opts)
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts).await
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.gate.maybe_block();
-        self.inner.begin_write(opts)
+        self.inner.begin_write(opts).await
     }
 }
 
@@ -825,13 +823,13 @@ impl Backend for BlockingBeginReadBackend {
         = <RecordingBackend as Backend>::Write<'a>
     where
         Self: 'a;
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.gate.maybe_block();
-        self.inner.begin_read(opts)
+        self.inner.begin_read(opts).await
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        self.inner.begin_write(opts)
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.inner.begin_write(opts).await
     }
 }
 
@@ -845,13 +843,13 @@ impl Backend for BlockingCommitBackend {
         = BlockingCommitWrite
     where
         Self: 'a;
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        self.inner.begin_read(opts)
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts).await
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         Ok(BlockingCommitWrite {
-            inner: self.inner.begin_write(opts)?,
+            inner: self.inner.begin_write(opts).await?,
             gate: self.gate.clone(),
         })
     }
@@ -863,25 +861,25 @@ struct BlockingCommitWrite {
 }
 
 impl BackendWrite for BlockingCommitWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        self.inner.put_many(space, entries)
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(space, entries).await
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(space, keys)
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys).await
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(space, range)
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range).await
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, BackendError> {
         self.gate.maybe_block();
-        self.inner.commit()
+        self.inner.commit().await
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
-        self.inner.rollback()
+    async fn rollback(self) -> Result<(), BackendError> {
+        self.inner.rollback().await
     }
 }
 
@@ -1002,19 +1000,18 @@ impl Backend for RecordingBackend {
         = RecordingWrite
     where
         Self: 'a;
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {
-            inner: self.inner.begin_read(opts)?,
-            stats: Arc::clone(&self.stats),
+            inner: self.inner.begin_read(opts).await?,
             fail_read_namespace: Arc::clone(&self.fail_read_namespace),
         })
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.stats.write_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingWrite {
-            inner: self.inner.begin_write(opts)?,
+            inner: self.inner.begin_write(opts).await?,
             stats: Arc::clone(&self.stats),
             fail_write_namespace: Arc::clone(&self.fail_write_namespace),
         })
@@ -1024,7 +1021,6 @@ impl Backend for RecordingBackend {
 #[derive(Clone)]
 struct RecordingRead {
     inner: InMemoryRead,
-    stats: Arc<TransactionStats>,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
 }
 
@@ -1035,62 +1031,49 @@ struct RecordingWrite {
 }
 
 impl BackendRead for RecordingRead {
-    fn visit_keys<V>(
+    async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
+        opts: GetOptions,
+    ) -> Result<GetManyResult, BackendError> {
         self.fail_if_space_matches(space)?;
-        self.inner.visit_keys(space, keys, opts, visitor)
+        self.inner.get_many(space, keys, opts).await
     }
 
-    fn scan<V>(
+    async fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, BackendError> {
         self.fail_if_space_matches(space)?;
-        self.inner.scan(space, range, opts, visitor)
-    }
-
-    fn close(self) -> Result<(), BackendError> {
-        self.stats.read_rolled_back.fetch_add(1, Ordering::SeqCst);
-        self.inner.close()
+        self.inner.scan(space, range, opts).await
     }
 }
 
 impl BackendWrite for RecordingWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         self.fail_if_space_matches(space)?;
-        self.inner.put_many(space, entries)
+        self.inner.put_many(space, entries).await
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(space, keys)
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys).await
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(space, range)
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range).await
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, BackendError> {
         self.stats.write_committed.fetch_add(1, Ordering::SeqCst);
-        self.inner.commit()
+        self.inner.commit().await
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), BackendError> {
         self.stats.write_rolled_back.fetch_add(1, Ordering::SeqCst);
-        self.inner.rollback()
+        self.inner.rollback().await
     }
 }
 
@@ -1154,7 +1137,6 @@ fn forced_write_failure(namespace: &str) -> BackendError {
 #[derive(Default)]
 struct TransactionStats {
     read_opened: AtomicUsize,
-    read_rolled_back: AtomicUsize,
     write_opened: AtomicUsize,
     write_committed: AtomicUsize,
     write_rolled_back: AtomicUsize,
@@ -1164,7 +1146,6 @@ impl TransactionStats {
     fn snapshot(&self) -> TransactionStatsSnapshot {
         TransactionStatsSnapshot {
             read_opened: self.read_opened.load(Ordering::SeqCst),
-            read_rolled_back: self.read_rolled_back.load(Ordering::SeqCst),
             write_opened: self.write_opened.load(Ordering::SeqCst),
             write_committed: self.write_committed.load(Ordering::SeqCst),
             write_rolled_back: self.write_rolled_back.load(Ordering::SeqCst),
@@ -1175,7 +1156,6 @@ impl TransactionStats {
 #[derive(Clone, Copy)]
 struct TransactionStatsSnapshot {
     read_opened: usize,
-    read_rolled_back: usize,
     write_opened: usize,
     write_committed: usize,
     write_rolled_back: usize,
@@ -1185,7 +1165,6 @@ impl TransactionStatsSnapshot {
     fn delta_since(self, before: &Self) -> Self {
         Self {
             read_opened: self.read_opened - before.read_opened,
-            read_rolled_back: self.read_rolled_back - before.read_rolled_back,
             write_opened: self.write_opened - before.write_opened,
             write_committed: self.write_committed - before.write_committed,
             write_rolled_back: self.write_rolled_back - before.write_rolled_back,

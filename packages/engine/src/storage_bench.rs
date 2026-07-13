@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::entity_pk::EntityPk;
+use crate::storage::StorageBackend;
 use crate::storage::{
     ScanPlan, StorageCoreProjection, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
     StorageScanOptions, StorageValue, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
@@ -49,32 +50,35 @@ pub struct StorageLayoutAccounting {
     pub value_bytes: u64,
 }
 
-pub(crate) fn commit_write_set_for_bench<B>(
+pub(crate) async fn commit_write_set_for_bench<B>(
     storage: &crate::storage::StorageContext<B>,
     writes: StorageWriteSet,
 ) -> Result<crate::storage::StorageWriteSetStats, StorageWriteSetError>
 where
-    B: crate::storage::StorageBackend,
+    B: StorageBackend,
 {
-    let (_commit, stats) = storage.commit_write_set(writes, StorageWriteOptions::default())?;
+    let (_commit, stats) = storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await?;
     Ok(stats)
 }
 
-pub fn layout_accounting<R>(read: &R) -> Vec<StorageLayoutAccounting>
+pub async fn layout_accounting<R>(read: &R) -> Vec<StorageLayoutAccounting>
 where
     R: StorageRead,
 {
-    native_storage_spaces()
-        .iter()
-        .map(|space| scan_layout_space(read, *space))
-        .collect()
+    let mut accounting = Vec::with_capacity(native_storage_spaces().len());
+    for space in native_storage_spaces() {
+        accounting.push(scan_layout_space(read, *space).await);
+    }
+    accounting
 }
 
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
 /// must be complete; the function asserts it observed every row.
-pub fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)>
+pub async fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)>
 where
     R: StorageRead,
 {
@@ -82,28 +86,8 @@ where
         .iter()
         .find(|space| space.name == space_name)
         .expect("space name should exist");
-    let result = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    )
-    .collect(
-        read,
-        StorageScanOptions {
-            projection: StorageCoreProjection::FullValue,
-            limit_rows: 1_000_000,
-            ..StorageScanOptions::default()
-        },
-    )
-    .expect("inventory scan should succeed");
-    assert!(
-        !result.value.has_more,
-        "space inventory scan must observe every row"
-    );
-    result
-        .value
-        .entries
+    scan_layout_entries(read, space)
+        .await
         .iter()
         .map(|entry| {
             (
@@ -132,45 +116,70 @@ fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
     ]
 }
 
-fn scan_layout_space<R>(read: &R, space: crate::storage::StorageSpace) -> StorageLayoutAccounting
+async fn scan_layout_space<R>(
+    read: &R,
+    space: crate::storage::StorageSpace,
+) -> StorageLayoutAccounting
 where
     R: StorageRead,
 {
-    let result = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    )
-    .collect(
-        read,
-        StorageScanOptions {
-            projection: StorageCoreProjection::FullValue,
-            limit_rows: 1_000_000,
-            ..StorageScanOptions::default()
-        },
-    )
-    .expect("scan storage bench layout space");
+    let entries = scan_layout_entries(read, space).await;
 
     StorageLayoutAccounting {
         space_id: space.id.0,
         space: space.name,
-        rows: result.value.entries.len() as u64,
-        key_bytes: result
-            .value
-            .entries
+        rows: entries.len() as u64,
+        key_bytes: entries
             .iter()
             .map(|entry| entry.key.0.len() as u64 + 4)
             .sum(),
-        value_bytes: result
-            .value
-            .entries
+        value_bytes: entries
             .iter()
             .map(|entry| match &entry.value {
                 StorageProjectedValue::KeyOnly => 0,
                 StorageProjectedValue::FullValue(value) => value.len() as u64,
             })
             .sum(),
+    }
+}
+
+async fn scan_layout_entries<R>(
+    read: &R,
+    space: crate::storage::StorageSpace,
+) -> Vec<crate::storage::StorageReadEntry>
+where
+    R: StorageRead,
+{
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut entries = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let result = plan
+            .collect(
+                read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    resume_after,
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await
+            .expect("scan complete storage bench layout space");
+        let has_more = result.value.has_more;
+        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
+        entries.extend(result.value.entries);
+        if !has_more {
+            return entries;
+        }
+        assert!(
+            resume_after.is_some(),
+            "storage scan reported more rows without a resume key"
+        );
     }
 }
 

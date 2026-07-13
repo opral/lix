@@ -3207,6 +3207,7 @@ dependencies = [
  "lix_engine",
  "rocksdb",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

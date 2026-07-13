@@ -25,8 +25,6 @@ async fn open_two_engines() -> (Engine, Engine) {
 fn observe_key<B>(session: &lix_engine::SessionContext<B>, key: &str) -> ObserveEvents<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     session
         .observe(KEY_VALUE_SQL, &[Value::Text(key.to_string())])
@@ -36,8 +34,6 @@ where
 async fn next_event<B>(events: &mut ObserveEvents<B>, label: &str) -> ObserveEvent
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     tokio::time::timeout(NEXT_TIMEOUT, events.next())
         .await
@@ -49,8 +45,6 @@ where
 async fn expect_no_event<B>(events: &mut ObserveEvents<B>, label: &str)
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     match tokio::time::timeout(NO_EVENT_TIMEOUT, events.next()).await {
         Err(_) => {}

@@ -31,10 +31,11 @@ use crate::changelog::{
 #[cfg(feature = "storage-benches")]
 use crate::changelog::{GcPlan, GcRoot};
 use crate::json_store::JsonSlot;
+use crate::storage::StorageBackend;
 use crate::storage::{
-    PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
-    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
-    StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions, StorageKey,
+    StoragePrefix, StorageProjectedValue, StorageRead, StorageReadOptions, StorageScanOptions,
+    StorageSpace, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -122,7 +123,7 @@ where
         space: StorageSpace,
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-        native_get_many(self, space, keys)
+        native_get_many(self, space, keys).await
     }
 
     async fn changelog_scan(
@@ -133,7 +134,7 @@ where
         limit: usize,
         projection: StorageCoreProjection,
     ) -> Result<ChangelogScanPage, LixError> {
-        native_scan(self, space, prefix, after, limit, projection)
+        native_scan(self, space, prefix, after, limit, projection).await
     }
 }
 
@@ -147,8 +148,8 @@ where
         space: StorageSpace,
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-        let mut read = self.begin_read(StorageReadOptions::default())?;
-        native_get_many(&mut read, space, keys)
+        let mut read = self.begin_read(StorageReadOptions::default()).await?;
+        native_get_many(&mut read, space, keys).await
     }
 
     async fn changelog_scan(
@@ -159,8 +160,8 @@ where
         limit: usize,
         projection: StorageCoreProjection,
     ) -> Result<ChangelogScanPage, LixError> {
-        let mut read = self.begin_read(StorageReadOptions::default())?;
-        native_scan(&mut read, space, prefix, after, limit, projection)
+        let mut read = self.begin_read(StorageReadOptions::default()).await?;
+        native_scan(&mut read, space, prefix, after, limit, projection).await
     }
 }
 
@@ -919,7 +920,7 @@ async fn get_many(
     store.changelog_get_many(space, keys).await
 }
 
-fn native_get_many<R>(
+async fn native_get_many<R>(
     read: &mut R,
     space: StorageSpace,
     keys: Vec<Vec<u8>>,
@@ -931,8 +932,9 @@ where
         .into_iter()
         .map(|key| StorageKey(Bytes::from(key)))
         .collect::<Vec<_>>();
-    let result =
-        PointReadPlan::new(space, &keys).materialize(read, StorageGetOptions::default())?;
+    let result = PointReadPlan::new(space, &keys)
+        .materialize(read, StorageGetOptions::default())
+        .await?;
     Ok(result
         .value
         .into_iter()
@@ -944,7 +946,7 @@ where
         .collect())
 }
 
-fn native_scan<R>(
+async fn native_scan<R>(
     read: &mut R,
     space: StorageSpace,
     prefix: Vec<u8>,
@@ -959,7 +961,7 @@ where
     let opts = StorageScanOptions {
         projection,
         limit_rows: limit,
-        resume_after: after_key.as_ref(),
+        resume_after: after_key,
     };
     let chunk = ScanPlan::prefix(
         space,
@@ -967,7 +969,8 @@ where
             bytes: Bytes::from(prefix),
         },
     )
-    .collect(read, opts)?
+    .collect(read, opts)
+    .await?
     .value;
     let has_more = chunk.has_more;
     let mut keys = Vec::with_capacity(chunk.entries.len());

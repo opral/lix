@@ -11,10 +11,10 @@ use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
 use lix_backends::{SlateDbBackend, SlateDbCacheOptions, SlateDbObjectStoreOptions};
 use lix_engine::backend::{
-    Backend, BackendWrite, GetOptions as BackendGetOptions, Key, ProjectedValue, PutBatch,
-    PutEntry, ReadOptions, SpaceId, StoredValue, WriteOptions, get_many,
+    BackendRead, BackendWrite, GetOptions as BackendGetOptions, Key, ProjectedValue, PutBatch,
+    PutEntry, ReadOptions, SpaceId, StoredValue, WriteOptions,
 };
-use lix_engine::{Engine, SessionContext, Value};
+use lix_engine::{Backend, Engine, SessionContext, Value};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
@@ -290,7 +290,10 @@ impl SeededStore {
         seed_files(&session).await;
         let upload_path = file_path(0);
         let file_id = lookup_file_id(&session, &upload_path).await;
-        backend.flush().expect("flush seeded file benchmark store");
+        backend
+            .flush()
+            .await
+            .expect("flush seeded file benchmark store");
         let object_store = Arc::new(DelayedObjectStore::new(seed_object_store, Duration::ZERO));
 
         Self {
@@ -680,29 +683,38 @@ impl BackendConcurrencyFixture {
             let backend =
                 SlateDbBackend::open_object_store(db_path.clone(), Arc::clone(&seed_object_store))
                     .expect("open SlateDB concurrency seed backend");
-            let mut write = backend
-                .begin_write(WriteOptions::default())
-                .expect("begin SlateDB concurrency seed write");
-            write
-                .put_many(
-                    CONCURRENCY_SPACE,
-                    PutBatch {
-                        entries: keys
-                            .iter()
-                            .cloned()
-                            .map(|key| PutEntry {
-                                key,
-                                value: StoredValue {
-                                    bytes: Bytes::from(vec![0x5a; CONCURRENCY_VALUE_BYTES]),
-                                },
-                            })
-                            .collect(),
-                    },
-                )
-                .expect("stage SlateDB concurrency seed value");
-            write
-                .commit()
-                .expect("commit SlateDB concurrency seed value");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create SlateDB concurrency seed runtime");
+            runtime.block_on(async {
+                let mut write = backend
+                    .begin_write(WriteOptions::default())
+                    .await
+                    .expect("begin SlateDB concurrency seed write");
+                write
+                    .put_many(
+                        CONCURRENCY_SPACE,
+                        PutBatch {
+                            entries: keys
+                                .iter()
+                                .cloned()
+                                .map(|key| PutEntry {
+                                    key,
+                                    value: StoredValue {
+                                        bytes: Bytes::from(vec![0x5a; CONCURRENCY_VALUE_BYTES]),
+                                    },
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await
+                    .expect("stage SlateDB concurrency seed value");
+                write
+                    .commit()
+                    .await
+                    .expect("commit SlateDB concurrency seed value");
+            });
         }
 
         let object_store = Arc::new(DelayedObjectStore::new(seed_object_store, Duration::ZERO));
@@ -733,9 +745,13 @@ impl BackendReadWorkers {
             let backend = backend.clone();
             let key = key.clone();
             threads.push(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create persistent SlateDB reader runtime");
                 while let Ok(request) = command_rx.recv() {
                     request.barrier.wait();
-                    let result = read_backend_key(&backend, &key);
+                    let result = runtime.block_on(read_backend_key(&backend, &key));
                     let _ = request.result.send(result);
                 }
             }));
@@ -795,17 +811,19 @@ impl Drop for BackendReadWorkers {
     }
 }
 
-fn read_backend_key(backend: &SlateDbBackend, key: &Key) -> usize {
+async fn read_backend_key(backend: &SlateDbBackend, key: &Key) -> usize {
     let read = backend
         .begin_read(ReadOptions::default())
+        .await
         .expect("begin SlateDB concurrency read");
-    let result = get_many(
-        &read,
-        CONCURRENCY_SPACE,
-        std::slice::from_ref(key),
-        BackendGetOptions::default(),
-    )
-    .expect("read SlateDB concurrency key");
+    let result = read
+        .get_many(
+            CONCURRENCY_SPACE,
+            std::slice::from_ref(key),
+            BackendGetOptions::default(),
+        )
+        .await
+        .expect("read SlateDB concurrency key");
     match result.values.into_iter().next().flatten() {
         Some(ProjectedValue::FullValue(value)) => value.len(),
         Some(ProjectedValue::KeyOnly) => panic!("concurrency read returned key-only value"),

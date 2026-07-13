@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+#![allow(
+    clippy::manual_async_fn,
+    reason = "failure backends mirror explicit Send future signatures from backend traits"
+)]
+
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
@@ -8,9 +13,9 @@ use super::{
     BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus, run_backend_conformance,
 };
 use crate::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -67,121 +72,135 @@ struct BrokenWrite {
     staged: BrokenMap,
 }
 
-#[test]
-fn detects_get_many_missing_existing_key_violation() {
+#[tokio::test]
+async fn detects_get_many_missing_existing_key_violation() {
     assert_failed(
         BrokenMode::GetManyMissesExistingKey,
         "baseline::get_many_returns_requested_slots",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_read_snapshot_violation() {
+#[tokio::test]
+async fn detects_read_snapshot_violation() {
     assert_failed(
         BrokenMode::ReadSeesLaterCommits,
         "baseline::begin_read_pins_coherent_view",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_read_snapshot_second_commit_violation() {
+#[tokio::test]
+async fn detects_read_snapshot_second_commit_violation() {
     assert_failed(
         BrokenMode::ReadSeesSecondLaterCommit,
         "baseline::begin_read_pins_coherent_view",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_scan_read_snapshot_violation() {
+#[tokio::test]
+async fn detects_scan_read_snapshot_violation() {
     assert_failed(
         BrokenMode::ScanReadSeesLaterCommits,
         "baseline::begin_read_pins_coherent_view",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_delete_many_ignores_existing_keys() {
+#[tokio::test]
+async fn detects_delete_many_ignores_existing_keys() {
     assert_failed(
         BrokenMode::DeleteManyIgnoresExistingKeys,
         "baseline::delete_many_removes_existing_keys",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_delete_range_ignores_upper_bound() {
+#[tokio::test]
+async fn detects_delete_range_ignores_upper_bound() {
     assert_failed(
         BrokenMode::DeleteRangeIgnoresUpperBound,
         "baseline::delete_range_removes_exact_range",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_key_only_scan_projection_violation() {
+#[tokio::test]
+async fn detects_key_only_scan_projection_violation() {
     assert_failed(
         BrokenMode::KeyOnlyScanReturnsFullValues,
         "baseline::full_value_and_key_only_are_core",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_rollback_commits_violation() {
+#[tokio::test]
+async fn detects_rollback_commits_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
         "baseline::rollback_discards_staged_mutations",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_rollback_overwrite_delete_violation() {
+#[tokio::test]
+async fn detects_rollback_overwrite_delete_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
         "baseline::rollback_discards_overwrite_and_delete",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_bad_byte_ordering_violation() {
+#[tokio::test]
+async fn detects_bad_byte_ordering_violation() {
     assert_failed(
         BrokenMode::BadByteOrdering,
         "baseline::scan_range_orders_raw_byte_keys",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_multi_chunk_drain_repeat_violation() {
+#[tokio::test]
+async fn detects_multi_chunk_drain_repeat_violation() {
     assert_failed(
         BrokenMode::KeyResumeRepeatsLastKey,
         "baseline::scan_range_drains_multi_chunk_limits",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_opaque_byte_corruption_violation() {
+#[tokio::test]
+async fn detects_opaque_byte_corruption_violation() {
     assert_failed(
         BrokenMode::CorruptOpaqueBytes,
         "baseline::full_value_preserves_opaque_bytes",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_persistent_commit_lost_on_reopen_violation() {
+#[tokio::test]
+async fn detects_persistent_commit_lost_on_reopen_violation() {
     assert_failed(
         BrokenMode::LoseCommittedDataOnReopen,
         "persistence::committed_data_survives_reopen",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn detects_persistent_rollback_on_reopen_violation() {
+#[tokio::test]
+async fn detects_persistent_rollback_on_reopen_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
         "persistence::rolled_back_data_does_not_survive_reopen",
-    );
+    )
+    .await;
 }
 
 #[expect(clippy::uninlined_format_args)]
-fn assert_failed(mode: BrokenMode, test_name: &'static str) {
-    let report = run_backend_conformance(&BrokenBackendFactory { mode });
+async fn assert_failed(mode: BrokenMode, test_name: &'static str) {
+    let report = run_backend_conformance(&BrokenBackendFactory { mode }).await;
     let failed = report
         .tests
         .iter()
@@ -214,22 +233,24 @@ impl BackendFactory for BrokenBackendFactory {
 impl BackendFixture for BrokenBackendFixture {
     type Backend = BrokenBackend;
 
-    fn open(&self) -> Self::Backend {
-        let mut open_count = self
-            .open_count
-            .lock()
-            .expect("broken backend open count lock poisoned");
-        if matches!(self.mode, BrokenMode::LoseCommittedDataOnReopen) && *open_count > 0 {
-            self.entries
+    fn open(&self) -> impl Future<Output = Self::Backend> + Send {
+        async move {
+            let mut open_count = self
+                .open_count
                 .lock()
-                .expect("broken backend entries lock poisoned")
-                .clear();
-        }
-        *open_count += 1;
-        BrokenBackend {
-            mode: self.mode,
-            entries: Arc::clone(&self.entries),
-            commit_count: Arc::clone(&self.commit_count),
+                .expect("broken backend open count lock poisoned");
+            if matches!(self.mode, BrokenMode::LoseCommittedDataOnReopen) && *open_count > 0 {
+                self.entries
+                    .lock()
+                    .expect("broken backend entries lock poisoned")
+                    .clear();
+            }
+            *open_count += 1;
+            BrokenBackend {
+                mode: self.mode,
+                entries: Arc::clone(&self.entries),
+                commit_count: Arc::clone(&self.commit_count),
+            }
         }
     }
 }
@@ -245,26 +266,35 @@ impl Backend for BrokenBackend {
     where
         Self: 'a;
 
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        Ok(BrokenRead {
-            mode: self.mode,
-            parent: Arc::clone(&self.entries),
-            commit_count: Arc::clone(&self.commit_count),
-            snapshot_commit_count: *self
-                .commit_count
-                .lock()
-                .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))?,
-            snapshot: self.snapshot()?,
-        })
+    fn begin_read(
+        &self,
+        _opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+        async move {
+            Ok(BrokenRead {
+                mode: self.mode,
+                parent: Arc::clone(&self.entries),
+                commit_count: Arc::clone(&self.commit_count),
+                snapshot_commit_count: *self.commit_count.lock().map_err(|_| {
+                    BackendError::Io("broken backend commit lock poisoned".to_string())
+                })?,
+                snapshot: self.snapshot()?,
+            })
+        }
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(BrokenWrite {
-            mode: self.mode,
-            parent: Arc::clone(&self.entries),
-            commit_count: Arc::clone(&self.commit_count),
-            staged: self.snapshot()?,
-        })
+    fn begin_write(
+        &self,
+        _opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            Ok(BrokenWrite {
+                mode: self.mode,
+                parent: Arc::clone(&self.entries),
+                commit_count: Arc::clone(&self.commit_count),
+                staged: self.snapshot()?,
+            })
+        }
     }
 }
 
@@ -296,143 +326,141 @@ fn broken_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 }
 
 impl BackendRead for BrokenRead {
-    fn visit_keys<V>(
+    fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        let physical_keys = keys
-            .iter()
-            .map(|key| broken_physical_key(space, key))
-            .collect::<Vec<_>>();
-        let keys = &physical_keys[..];
-        let live_entries;
-        let current_commit_count = *self
-            .commit_count
-            .lock()
-            .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))?;
-        let entries = if matches!(self.mode, BrokenMode::ReadSeesLaterCommits)
-            || (matches!(self.mode, BrokenMode::ReadSeesSecondLaterCommit)
-                && current_commit_count >= self.snapshot_commit_count + 2)
-        {
-            live_entries = self
-                .parent
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        async move {
+            let physical_keys = keys
+                .iter()
+                .map(|key| broken_physical_key(space, key))
+                .collect::<Vec<_>>();
+            let live_entries;
+            let current_commit_count = *self
+                .commit_count
                 .lock()
-                .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))?
-                .clone();
-            &live_entries
-        } else {
-            &self.snapshot
-        };
-        visit_keys_from_map(entries, self.mode, keys, opts, visitor)
+                .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))?;
+            let entries = if matches!(self.mode, BrokenMode::ReadSeesLaterCommits)
+                || (matches!(self.mode, BrokenMode::ReadSeesSecondLaterCommit)
+                    && current_commit_count >= self.snapshot_commit_count + 2)
+            {
+                live_entries = self
+                    .parent
+                    .lock()
+                    .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))?
+                    .clone();
+                &live_entries
+            } else {
+                &self.snapshot
+            };
+            Ok(get_many_from_map(entries, self.mode, &physical_keys, opts))
+        }
     }
 
-    fn scan<V>(
+    fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        let range = broken_physical_range(space, range);
-        let resume_after = opts.resume_after.map(|key| broken_physical_key(space, key));
-        let opts = ScanOptions {
-            resume_after: resume_after.as_ref(),
-            ..opts
-        };
-        let live_entries;
-        let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
-            live_entries = self
-                .parent
-                .lock()
-                .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))?
-                .clone();
-            &live_entries
-        } else {
-            &self.snapshot
-        };
-        // Stream through the map visitor so has_more survives; strip the
-        // internal space prefix before the caller observes keys.
-        let mut strip = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            visitor.visit(KeyRef(&key.0[4..]), value)
-        };
-        visit_range_from_map(entries, self.mode, range, opts, &mut strip)
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        async move {
+            let range = broken_physical_range(space, range);
+            let opts = ScanOptions {
+                resume_after: opts
+                    .resume_after
+                    .as_ref()
+                    .map(|key| broken_physical_key(space, key)),
+                ..opts
+            };
+            let live_entries;
+            let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
+                live_entries = self
+                    .parent
+                    .lock()
+                    .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))?
+                    .clone();
+                &live_entries
+            } else {
+                &self.snapshot
+            };
+            let mut chunk = scan_from_map(entries, self.mode, range, &opts);
+            for entry in &mut chunk.entries {
+                entry.key = Key(entry.key.0.slice(4..));
+            }
+            Ok(chunk)
+        }
     }
 }
 
 impl BackendWrite for BrokenWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        for mut entry in entries.entries {
-            entry.key = broken_physical_key(space, &entry.key);
-            let mut bytes = stored_value_bytes(entry.value);
-            if matches!(self.mode, BrokenMode::CorruptOpaqueBytes) {
-                bytes = Bytes::from(
-                    bytes
-                        .iter()
-                        .copied()
-                        .filter(|byte| *byte != 0)
-                        .collect::<Vec<_>>(),
-                );
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for mut entry in entries.entries {
+                entry.key = broken_physical_key(space, &entry.key);
+                let mut bytes = stored_value_bytes(entry.value);
+                if matches!(self.mode, BrokenMode::CorruptOpaqueBytes) {
+                    bytes = Bytes::from(
+                        bytes
+                            .iter()
+                            .copied()
+                            .filter(|byte| *byte != 0)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                self.staged.insert(entry.key, bytes);
             }
-            self.staged.insert(entry.key, bytes);
+            Ok(())
         }
-        Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        for key in keys {
-            let key = &broken_physical_key(space, key);
-            if matches!(self.mode, BrokenMode::DeleteManyIgnoresExistingKeys)
-                && self.staged.contains_key(key)
-            {
-                continue;
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for key in keys {
+                let key = &broken_physical_key(space, key);
+                if matches!(self.mode, BrokenMode::DeleteManyIgnoresExistingKeys)
+                    && self.staged.contains_key(key)
+                {
+                    continue;
+                }
+                self.staged.remove(key);
             }
-            self.staged.remove(key);
+            Ok(())
         }
-        Ok(())
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        let range = broken_physical_range(space, range);
-        if matches!(self.mode, BrokenMode::DeleteRangeIgnoresUpperBound) {
-            self.staged.retain(|key, _value| match &range.lower {
-                Bound::Included(lower) => key < lower,
-                Bound::Excluded(lower) => key <= lower,
-                Bound::Unbounded => false,
-            });
-        } else {
-            self.staged
-                .retain(|key, _value| !range_contains(&range, key));
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            let range = broken_physical_range(space, range);
+            if matches!(self.mode, BrokenMode::DeleteRangeIgnoresUpperBound) {
+                self.staged.retain(|key, _value| match &range.lower {
+                    Bound::Included(lower) => key < lower,
+                    Bound::Excluded(lower) => key <= lower,
+                    Bound::Unbounded => false,
+                });
+            } else {
+                self.staged
+                    .retain(|key, _value| !range_contains(&range, key));
+            }
+            Ok(())
         }
-        Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        *self
-            .parent
-            .lock()
-            .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))? =
-            self.staged;
-        *self
-            .commit_count
-            .lock()
-            .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))? += 1;
-        Ok(CommitResult {
-            commit_id: None,
-            stats: WriteStats::default(),
-        })
-    }
-
-    fn rollback(self) -> Result<(), BackendError> {
-        if matches!(self.mode, BrokenMode::RollbackCommits) {
+    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+        async move {
             *self
                 .parent
                 .lock()
@@ -441,8 +469,27 @@ impl BackendWrite for BrokenWrite {
             *self.commit_count.lock().map_err(|_| {
                 BackendError::Io("broken backend commit lock poisoned".to_string())
             })? += 1;
+            Ok(CommitResult {
+                commit_id: None,
+                stats: WriteStats::default(),
+            })
         }
-        Ok(())
+    }
+
+    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            if matches!(self.mode, BrokenMode::RollbackCommits) {
+                *self
+                    .parent
+                    .lock()
+                    .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))? =
+                    self.staged;
+                *self.commit_count.lock().map_err(|_| {
+                    BackendError::Io("broken backend commit lock poisoned".to_string())
+                })? += 1;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -455,48 +502,32 @@ impl BrokenBackend {
     }
 }
 
-fn visit_keys_from_map<V>(
+fn get_many_from_map(
     entries: &BrokenMap,
     mode: BrokenMode,
     keys: &[Key],
-    opts: GetOptions<'_>,
-    visitor: &mut V,
-) -> Result<(), BackendError>
-where
-    V: PointVisitor + ?Sized,
-{
-    let mut seen = BTreeSet::new();
-    for (index, key) in keys.iter().enumerate() {
-        if matches!(mode, BrokenMode::GetManyMissesExistingKey) && key.0.ends_with(b"a") {
-            visitor.visit(index, key, None)?;
-            continue;
-        }
-        let value = if !seen.insert(key.clone()) {
-            entries
-                .get(key)
-                .map(|value| project_value_ref(value, mode, opts.projection, false))
-        } else {
-            entries
-                .get(key)
-                .map(|value| project_value_ref(value, mode, opts.projection, false))
-        };
-        visitor.visit(index, key, value)?;
-    }
-    Ok(())
+    opts: GetOptions,
+) -> GetManyResult {
+    GetManyResult::new(
+        keys.iter()
+            .map(|key| {
+                if matches!(mode, BrokenMode::GetManyMissesExistingKey) && key.0.ends_with(b"a") {
+                    return None;
+                }
+                entries
+                    .get(key)
+                    .map(|value| project_value(value, mode, opts.projection, false))
+            })
+            .collect(),
+    )
 }
 
-fn visit_range_from_map<V>(
+fn scan_from_map(
     entries: &BrokenMap,
     mode: BrokenMode,
     range: KeyRange,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    let mut emitted = 0;
-    let mut has_more = false;
+    opts: &ScanOptions,
+) -> ScanChunk {
     let mut candidates = entries
         .iter()
         .filter(|(key, _)| range_contains(&range, key))
@@ -511,28 +542,27 @@ where
         });
     }
 
-    for (key, value) in candidates {
-        if opts.resume_after.is_some_and(|resume_after| {
+    let mut candidates = candidates.into_iter().filter(|(key, _)| {
+        !opts.resume_after.as_ref().is_some_and(|resume_after| {
             if matches!(mode, BrokenMode::KeyResumeRepeatsLastKey) {
-                key < resume_after
+                *key < resume_after
             } else {
-                key <= resume_after
+                *key <= resume_after
             }
-        }) {
-            continue;
-        }
-        if emitted == opts.limit_rows {
-            has_more = true;
-            break;
-        }
-        visitor.visit(
-            key.as_ref(),
-            project_value_ref(value, mode, opts.projection, true),
-        )?;
-        emitted += 1;
+        })
+    });
+    let rows = candidates
+        .by_ref()
+        .take(opts.page_size())
+        .map(|(key, value)| ReadEntry {
+            key: key.clone(),
+            value: project_value(value, mode, opts.projection, true),
+        })
+        .collect();
+    ScanChunk {
+        entries: rows,
+        has_more: candidates.next().is_some(),
     }
-
-    Ok(ScanResult { emitted, has_more })
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {
@@ -549,20 +579,20 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
     lower_matches && upper_matches
 }
 
-fn project_value_ref(
+fn project_value(
     value: &Bytes,
     mode: BrokenMode,
     projection: CoreProjection,
     break_key_only: bool,
-) -> ProjectedValueRef<'_> {
+) -> ProjectedValue {
     match projection {
         CoreProjection::KeyOnly
             if break_key_only && matches!(mode, BrokenMode::KeyOnlyScanReturnsFullValues) =>
         {
-            ProjectedValueRef::FullValue(value.as_ref())
+            ProjectedValue::FullValue(value.clone())
         }
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value.as_ref()),
+        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+        CoreProjection::FullValue => ProjectedValue::FullValue(value.clone()),
     }
 }
 

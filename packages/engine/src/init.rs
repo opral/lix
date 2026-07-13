@@ -14,7 +14,8 @@ use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonR
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
-use crate::storage::{SharedStorageRead, StorageBackend};
+use crate::storage::SharedStorageRead;
+use crate::storage::StorageBackend;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
@@ -182,15 +183,16 @@ pub(crate) async fn initialize<B>(
 ) -> Result<InitReceipt, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let functions = FunctionProviderHandle::system();
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
-    let mut read =
-        SharedStorageRead::new(storage.begin_read(crate::storage::StorageReadOptions::default())?);
+    let mut read = SharedStorageRead::new(
+        storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .await?,
+    );
     let mut writes = StorageWriteSet::new();
 
     let authored_changes = plan
@@ -242,7 +244,9 @@ where
             .await?;
     }
 
-    storage.commit_write_set(writes, crate::storage::StorageWriteOptions::default())?;
+    storage
+        .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+        .await?;
     Ok(receipt)
 }
 
@@ -296,7 +300,7 @@ fn stage_init_json_payloads(
 }
 
 async fn stage_init_changelog_commit(
-    read: &mut (impl crate::storage::StorageRead + Send + Sync),
+    read: &mut impl crate::storage::StorageRead,
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
     changes: Vec<ChangeRecord>,
@@ -563,6 +567,7 @@ mod tests {
         let mut reader = ChangelogContext::new().reader(
             storage
                 .begin_read(crate::storage::StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let commits = reader
@@ -618,6 +623,7 @@ mod tests {
         {
             let read = storage
                 .begin_read(crate::storage::StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             tracked_state
@@ -628,11 +634,13 @@ mod tests {
             drop(read);
             storage
                 .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+                .await
                 .expect("rebuilt initial commit root should commit");
         }
         let mut tracked_reader = tracked_state.reader(
             storage
                 .begin_read(crate::storage::StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let rows = tracked_reader

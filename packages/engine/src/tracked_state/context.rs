@@ -62,7 +62,7 @@ impl TrackedStateContext {
     /// Creates a commit-id-addressed tracked-state reader.
     pub(crate) fn reader<S>(&self, store: S) -> TrackedStateStoreReader<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         TrackedStateStoreReader {
             store,
@@ -77,7 +77,7 @@ impl TrackedStateContext {
         writes: &'a mut StorageWriteSet,
     ) -> TrackedStateWriter<'a, S>
     where
-        S: StorageRead + Send + Sync + ?Sized,
+        S: StorageRead + ?Sized,
     {
         TrackedStateWriter {
             chunk_overlay: storage::TrackedStateChunkOverlay::new(),
@@ -98,7 +98,7 @@ impl TrackedStateContext {
         writes: &'a mut StorageWriteSet,
     ) -> TrackedStateRootRebuilder<'a, S>
     where
-        S: StorageRead + Send + Sync + ?Sized,
+        S: StorageRead + ?Sized,
     {
         let _ = self;
         TrackedStateRootRebuilder { store, writes }
@@ -133,7 +133,7 @@ impl DiffCommitRootValidationCache {
 
 impl<S> TrackedStateStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     pub(crate) async fn scan_rows_at_commit(
         &mut self,
@@ -887,7 +887,7 @@ pub(crate) struct TrackedStateRootRebuilder<'a, S: ?Sized> {
 
 impl<S> TrackedStateRootRebuilder<'_, S>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     pub(crate) async fn rebuild_commit_root_at(
         &mut self,
@@ -899,7 +899,7 @@ where
 
 impl<S> TrackedStateWriter<'_, S>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     pub(crate) async fn stage_commit_root<'a, I>(
         &mut self,
@@ -1188,6 +1188,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("parent read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit(
@@ -1200,6 +1201,7 @@ mod tests {
             .expect("parent changelog commit should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("parent changelog commit should commit");
         }
 
@@ -1242,6 +1244,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let parent_root = storage::load_root(&read, "parent")
             .await
@@ -1286,6 +1289,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .plan_merge(
@@ -1314,6 +1318,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .plan_merge(
@@ -1352,6 +1357,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .plan_merge(
@@ -1380,6 +1386,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .plan_merge(
@@ -1429,6 +1436,7 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("child commit_root delete should commit");
         }
 
@@ -1436,6 +1444,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1444,6 +1453,7 @@ mod tests {
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1453,12 +1463,14 @@ mod tests {
             .expect("child root should repair");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired root should commit");
 
         let diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1525,11 +1537,13 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("commit_root deletes should commit");
         }
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1539,12 +1553,14 @@ mod tests {
             .expect("child root should repair");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired root should commit");
 
         let diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1607,11 +1623,13 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("commit_root deletes should commit");
         }
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1621,12 +1639,14 @@ mod tests {
             .expect("explicit rebuild should repair missing ancestor chain");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired roots should commit");
 
         let diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1650,6 +1670,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit(
@@ -1662,11 +1683,13 @@ mod tests {
             .expect("commit-a should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("commit-a should commit");
         }
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit_with_parents(
@@ -1679,6 +1702,7 @@ mod tests {
             .expect("commit-b should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("commit-b should commit");
         }
         {
@@ -1705,11 +1729,13 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("cycle corruption should commit");
         }
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let error = tracked_state
@@ -1754,6 +1780,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1762,6 +1789,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1771,12 +1799,14 @@ mod tests {
             .expect("child root chunk should repair");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired root should commit");
 
         let diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1819,6 +1849,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1828,12 +1859,14 @@ mod tests {
             .expect("corrupt child root chunk should repair");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired root should commit");
 
         let diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .diff_commits("base", "child", &test_schema_diff_request())
@@ -1873,6 +1906,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1882,12 +1916,14 @@ mod tests {
             .expect("stale root should repair");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired root should commit");
 
         let rows = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -1935,6 +1971,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -1944,12 +1981,14 @@ mod tests {
             .expect("stale child root should repair");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repaired root should commit");
 
         let rows = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit("child", &test_schema_scan_request())
@@ -1985,6 +2024,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2031,6 +2071,7 @@ mod tests {
         let mut reader = tracked_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let header_rows = reader
@@ -2086,6 +2127,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2142,6 +2184,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2185,6 +2228,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2230,6 +2274,7 @@ mod tests {
         .expect("base root should write");
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
@@ -2239,6 +2284,7 @@ mod tests {
             .expect("base commit root should materialize");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("materialized base should commit");
         write_root_for_test(
             &storage,
@@ -2254,6 +2300,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit("child", &test_schema_scan_request())
@@ -2286,6 +2333,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit("commit-1", &test_schema_scan_request())
@@ -2334,6 +2382,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2376,6 +2425,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2423,6 +2473,7 @@ mod tests {
         let mut reader = tracked_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let loaded = reader
@@ -2474,11 +2525,13 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("delete should commit");
 
         let mut reader = tracked_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let error = reader
@@ -2509,6 +2562,7 @@ mod tests {
         let mut reader = tracked_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let request = TrackedStateScanRequest {
@@ -2572,6 +2626,7 @@ mod tests {
         let mut reader = tracked_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let scanned = reader
@@ -2614,6 +2669,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_rows_at_commit(
@@ -2673,6 +2729,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_rows_at_commit("child", std::slice::from_ref(&key))
@@ -2692,11 +2749,13 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("child root delete should commit");
         }
         {
             let read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             tracked_state
@@ -2706,6 +2765,7 @@ mod tests {
                 .expect("child root should rebuild");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("rebuilt child root should commit");
         }
 
@@ -2713,6 +2773,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_rows_at_commit("child", &[key])
@@ -2745,6 +2806,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -2833,6 +2895,7 @@ mod tests {
     ) -> Result<(), LixError> {
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         crate::test_support::stage_tracked_root_from_materialized(
@@ -2844,13 +2907,16 @@ mod tests {
             rows,
         )
         .await?;
-        storage.commit_write_set(writes, StorageWriteOptions::default())?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await?;
         Ok(())
     }
 
     async fn delete_root_chunk_for_test(storage: &StorageContext, commit_id: &str) {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let root_id = storage::load_root(&read, commit_id)
             .await
@@ -2863,12 +2929,14 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("root chunk delete should commit");
     }
 
     async fn corrupt_root_chunk_for_test(storage: &StorageContext, commit_id: &str) {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let root_id = storage::load_root(&read, commit_id)
             .await
@@ -2882,6 +2950,7 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("root chunk corruption should commit");
     }
 
@@ -2892,6 +2961,7 @@ mod tests {
     ) {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let mutations = rows
@@ -2941,6 +3011,7 @@ mod tests {
         .expect("stale metadata should encode");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("stale root overwrite should commit");
     }
 

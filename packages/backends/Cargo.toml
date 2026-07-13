@@ -21,7 +21,7 @@ default = []
 redb = ["dep:bytes", "dep:redb", "dep:tempfile"]
 rocksdb = ["dep:bytes", "dep:rocksdb", "dep:tempfile"]
 slatedb = ["dep:bytes", "dep:futures-util", "dep:object_store", "dep:slatedb", "dep:tempfile", "dep:tokio"]
-sqlite = ["dep:rusqlite", "dep:tempfile"]
+sqlite = ["dep:bytes", "dep:rusqlite", "dep:tempfile"]
 
 [dependencies]
 lix_engine = { workspace = true }
@@ -34,7 +34,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["bindgen-run
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 slatedb = { version = "0.14.1", default-features = false, features = ["moka"], optional = true }
 tempfile = { version = "3", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"], optional = true }
 
 [dev-dependencies]
 async-trait = "0.1"

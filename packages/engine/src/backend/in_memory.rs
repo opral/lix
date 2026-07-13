@@ -6,16 +6,16 @@ use bytes::Bytes;
 
 use crate::backend::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
 
 /// The in-memory backend has no native namespaces; it scopes keys to spaces
 /// by prefixing the 4-byte big-endian space id internally. The prefix never
-/// crosses the trait boundary: visitors observe logical keys.
+/// crosses the trait boundary: reads return logical keys.
 fn physical_key(space: SpaceId, key: &Key) -> Key {
     let mut bytes = bytes::BytesMut::with_capacity(4 + key.0.len());
     bytes.extend_from_slice(&space.0.to_be_bytes());
@@ -73,8 +73,6 @@ pub struct InMemoryRead {
     entries: Arc<EntriesState>,
 }
 
-pub type InMemoryScanVisitResult = ScanResult;
-
 #[expect(missing_debug_implementations)]
 pub struct InMemoryWrite {
     parent: Arc<Mutex<Arc<EntriesState>>>,
@@ -129,7 +127,7 @@ impl BackendFactory for InMemoryBackendFactory {
 impl BackendFixture for InMemoryBackendFixture {
     type Backend = InMemoryBackend;
 
-    fn open(&self) -> Self::Backend {
+    async fn open(&self) -> Self::Backend {
         InMemoryBackend {
             entries: Arc::clone(&self.entries),
         }
@@ -146,13 +144,13 @@ impl Backend for InMemoryBackend {
         = InMemoryWrite
     where
         Self: 'a;
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(InMemoryRead {
             entries: self.snapshot()?,
         })
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         Ok(InMemoryWrite {
             parent: Arc::clone(&self.entries),
             base: self.snapshot()?,
@@ -163,52 +161,47 @@ impl Backend for InMemoryBackend {
 }
 
 impl BackendRead for InMemoryRead {
-    fn visit_keys<V>(
+    async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        let entries = self.entries.as_ref();
-        for (index, key) in keys.iter().enumerate() {
-            let value = entries
-                .get(&physical_key(space, key))
-                .map(|value| project_value_ref(value, opts.projection));
-            visitor.visit(index, key, value)?;
-        }
-        Ok(())
+        opts: GetOptions,
+    ) -> Result<GetManyResult, BackendError> {
+        let values = keys
+            .iter()
+            .map(|key| {
+                self.entries
+                    .get(&physical_key(space, key))
+                    .map(|value| project_value(value, opts.projection))
+            })
+            .collect();
+        Ok(GetManyResult::new(values))
     }
 
-    fn scan<V>(
+    async fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, BackendError> {
         let physical = physical_range(space, range);
-        let resume_after = opts.resume_after.map(|key| physical_key(space, key));
         let physical_opts = ScanOptions {
-            resume_after: resume_after.as_ref(),
+            resume_after: opts
+                .resume_after
+                .as_ref()
+                .map(|key| physical_key(space, key)),
             ..opts
         };
-        // Visitors observe logical keys; strip the internal prefix.
-        let mut strip = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            visitor.visit(KeyRef(&key.0[4..]), value)
-        };
-        visit_range(&self.entries, physical, physical_opts, &mut strip)
+        let mut chunk = collect_range_chunk(&self.entries, physical, &physical_opts);
+        for entry in &mut chunk.entries {
+            entry.key = Key(entry.key.0.slice(4..));
+        }
+        Ok(chunk)
     }
 }
 
 impl BackendWrite for InMemoryWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
             let key = physical_key(space, &entry.key);
             let value = stored_value_bytes(entry.value);
@@ -223,7 +216,7 @@ impl BackendWrite for InMemoryWrite {
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
             let key = physical_key(space, key);
             if !self.overlay.puts.is_empty() {
@@ -236,22 +229,27 @@ impl BackendWrite for InMemoryWrite {
         Ok(())
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
         let range = physical_range(space, range);
         let mut base_keys = Vec::new();
-        visit_range(
-            &self.base,
-            range.clone(),
-            ScanOptions {
-                limit_rows: usize::MAX,
-                projection: CoreProjection::KeyOnly,
-                resume_after: None,
-            },
-            &mut |key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
-                base_keys.push(key.to_owned_key());
-                Ok(())
-            },
-        )?;
+        let mut resume_after = None;
+        loop {
+            let chunk = collect_range_chunk(
+                &self.base,
+                range.clone(),
+                &ScanOptions {
+                    limit_rows: usize::MAX,
+                    projection: CoreProjection::KeyOnly,
+                    resume_after,
+                },
+            );
+            let next_resume = chunk.entries.last().map(|entry| entry.key.clone());
+            base_keys.extend(chunk.entries.into_iter().map(|entry| entry.key));
+            if !chunk.has_more {
+                break;
+            }
+            resume_after = next_resume;
+        }
 
         let overlay_puts_before = self.overlay.puts.len();
         self.overlay
@@ -269,7 +267,7 @@ impl BackendWrite for InMemoryWrite {
         Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, BackendError> {
         let mut parent = self
             .parent
             .lock()
@@ -298,7 +296,7 @@ impl BackendWrite for InMemoryWrite {
         })
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), BackendError> {
         Ok(())
     }
 }
@@ -323,41 +321,38 @@ impl EntriesState {
     }
 }
 
-fn visit_range<V>(
-    entries: &EntriesState,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    if opts.limit_rows == 0 {
-        return Ok(ScanResult::default());
+fn collect_range_chunk(entries: &EntriesState, range: KeyRange, opts: &ScanOptions) -> ScanChunk {
+    if opts.page_size() == 0 {
+        return ScanChunk {
+            entries: Vec::new(),
+            has_more: false,
+        };
     }
 
-    let lower = lower_bound(&range, opts.resume_after);
+    let lower = lower_bound(&range, opts.resume_after.as_ref());
     let upper = upper_bound(&range);
     if bounds_are_empty(&lower, &upper) {
-        return Ok(ScanResult::default());
+        return ScanChunk {
+            entries: Vec::new(),
+            has_more: false,
+        };
     }
 
-    visit_entries_range(entries, lower, upper, opts, visitor)
+    collect_entries_range(entries, lower, upper, opts)
 }
 
-fn visit_entries_range<V>(
+fn collect_entries_range(
     state: &EntriesState,
     lower: Bound<&Key>,
     upper: Bound<&Key>,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
+    opts: &ScanOptions,
+) -> ScanChunk {
     match state {
-        EntriesState::Empty => Ok(ScanResult::default()),
-        EntriesState::Flat(entries) => visit_flat_range(entries, lower, upper, opts, visitor),
+        EntriesState::Empty => ScanChunk {
+            entries: Vec::new(),
+            has_more: false,
+        },
+        EntriesState::Flat(entries) => collect_flat_range(entries, lower, upper, opts),
         EntriesState::Layered {
             base,
             puts,
@@ -365,22 +360,12 @@ where
         } if !range_has_entries(puts, &lower, &upper)
             && !range_has_keys(deletes, &lower, &upper) =>
         {
-            visit_entries_range(base, lower, upper, opts, visitor)
+            collect_entries_range(base, lower, upper, opts)
         }
         EntriesState::Layered { .. } => {
             let mut rows = BTreeMap::<&Key, Option<&Bytes>>::new();
-            collect_range(state, &lower, &upper, &mut rows);
-
-            match opts.projection {
-                CoreProjection::KeyOnly => visit_rows(rows, opts.limit_rows, visitor, |_, _| {
-                    ProjectedValueRef::KeyOnly
-                }),
-                CoreProjection::FullValue => {
-                    visit_rows(rows, opts.limit_rows, visitor, |_, value| {
-                        ProjectedValueRef::FullValue(value.as_ref())
-                    })
-                }
-            }
+            collect_layer_rows(state, &lower, &upper, &mut rows);
+            materialize_rows(rows, opts)
         }
     }
 }
@@ -393,46 +378,28 @@ fn range_has_keys(keys: &BTreeSet<Key>, lower: &Bound<&Key>, upper: &Bound<&Key>
     keys.range((*lower, *upper)).next().is_some()
 }
 
-fn visit_flat_range<V>(
+fn collect_flat_range(
     entries: &InMemoryMap,
     lower: Bound<&Key>,
     upper: Bound<&Key>,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    let mut emitted = 0;
-    let mut has_more = false;
-
-    match opts.projection {
-        CoreProjection::KeyOnly => {
-            for (key, _) in entries.range((lower, upper)) {
-                if emitted == opts.limit_rows {
-                    has_more = true;
-                    break;
-                }
-                visitor.visit(key.as_ref(), ProjectedValueRef::KeyOnly)?;
-                emitted += 1;
-            }
-        }
-        CoreProjection::FullValue => {
-            for (key, value) in entries.range((lower, upper)) {
-                if emitted == opts.limit_rows {
-                    has_more = true;
-                    break;
-                }
-                visitor.visit(key.as_ref(), ProjectedValueRef::FullValue(value.as_ref()))?;
-                emitted += 1;
-            }
-        }
+    opts: &ScanOptions,
+) -> ScanChunk {
+    let mut rows = entries.range((lower, upper));
+    let collected = rows
+        .by_ref()
+        .take(opts.page_size())
+        .map(|(key, value)| ReadEntry {
+            key: key.clone(),
+            value: project_value(value, opts.projection),
+        })
+        .collect();
+    ScanChunk {
+        entries: collected,
+        has_more: rows.next().is_some(),
     }
-
-    Ok(ScanResult { emitted, has_more })
 }
 
-fn collect_range<'a>(
+fn collect_layer_rows<'a>(
     state: &'a EntriesState,
     lower: &Bound<&'a Key>,
     upper: &Bound<&'a Key>,
@@ -450,7 +417,7 @@ fn collect_range<'a>(
             puts,
             deletes,
         } => {
-            collect_range(base, lower, upper, rows);
+            collect_layer_rows(base, lower, upper, rows);
             for delete in deletes.range((*lower, *upper)) {
                 rows.insert(delete, None);
             }
@@ -461,30 +428,25 @@ fn collect_range<'a>(
     }
 }
 
-fn visit_rows<'a, V, F>(
+fn materialize_rows<'a>(
     rows: BTreeMap<&'a Key, Option<&'a Bytes>>,
-    limit_rows: usize,
-    visitor: &mut V,
-    project: F,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-    F: Fn(&'a Key, &'a Bytes) -> ProjectedValueRef<'a>,
-{
-    let mut emitted = 0;
-    let mut has_more = false;
-    for (key, value) in rows {
-        let Some(value) = value else {
-            continue;
-        };
-        if emitted == limit_rows {
-            has_more = true;
-            break;
-        }
-        visitor.visit(key.as_ref(), project(key, value))?;
-        emitted += 1;
+    opts: &ScanOptions,
+) -> ScanChunk {
+    let mut present = rows
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)));
+    let entries = present
+        .by_ref()
+        .take(opts.page_size())
+        .map(|(key, value)| ReadEntry {
+            key: key.clone(),
+            value: project_value(value, opts.projection),
+        })
+        .collect();
+    ScanChunk {
+        entries,
+        has_more: present.next().is_some(),
     }
-    Ok(ScanResult { emitted, has_more })
 }
 
 fn lower_bound<'a>(range: &'a KeyRange, resume_after: Option<&'a Key>) -> Bound<&'a Key> {
@@ -542,10 +504,10 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
     lower_matches && upper_matches
 }
 
-fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
+fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
     match projection {
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value.as_ref()),
+        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+        CoreProjection::FullValue => ProjectedValue::FullValue(value.clone()),
     }
 }
 
@@ -555,11 +517,19 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::conformance::{ConformanceStatus, run_backend_conformance};
+    use std::ops::Bound;
 
-    #[test]
-    fn in_memory_backend_passes_backend_conformance() {
-        let report = run_backend_conformance(&crate::backend::InMemoryBackendFactory);
+    use bytes::Bytes;
+
+    use crate::backend::conformance::{ConformanceStatus, run_backend_conformance};
+    use crate::backend::{
+        Backend, BackendRead, BackendWrite, InMemoryBackend, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
+        PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
+    };
+
+    #[tokio::test]
+    async fn in_memory_backend_passes_backend_conformance() {
+        let report = run_backend_conformance(&crate::backend::InMemoryBackendFactory).await;
 
         report.assert_no_failures();
 
@@ -570,5 +540,69 @@ mod tests {
                 .any(|test| matches!(test.status, ConformanceStatus::Passed)),
             "expected at least one conformance test to run"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_range_covers_more_than_one_scan_page() {
+        let backend = InMemoryBackend::new();
+        let space = SpaceId(7);
+        let mut write = backend
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin seed write");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: (0..=MAX_SCAN_PAGE_ROWS)
+                        .map(|index| {
+                            let index = u32::try_from(index).expect("test index fits u32");
+                            PutEntry {
+                                key: Key(Bytes::copy_from_slice(&index.to_be_bytes())),
+                                value: StoredValue {
+                                    bytes: Bytes::from_static(b"value"),
+                                },
+                            }
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("seed rows");
+        write.commit().await.expect("commit seed rows");
+
+        let mut write = backend
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin range delete");
+        write
+            .delete_range(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+            )
+            .await
+            .expect("delete all rows");
+        write.commit().await.expect("commit range delete");
+
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin verification read");
+        let chunk = read
+            .scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                ScanOptions::default(),
+            )
+            .await
+            .expect("scan after range delete");
+        assert!(chunk.entries.is_empty());
+        assert!(!chunk.has_more);
     }
 }

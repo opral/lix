@@ -1,8 +1,9 @@
 use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
+use crate::storage::StorageBackend;
 use crate::storage::{
-    SharedStorageRead, StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions,
-    StorageWriteOptions, StorageWriteSetStats,
+    SharedStorageRead, StorageContext, StorageReadOptions, StorageWriteOptions,
+    StorageWriteSetStats,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
@@ -71,7 +72,6 @@ impl BenchWriteOutcome {
 impl<B> BenchTrackedFixture<B>
 where
     B: StorageBackend,
-    for<'a> StorageBackendReadOf<'a, B>: Send,
 {
     pub fn new(storage: StorageContext<B>, rows: Vec<BenchTrackedRow>) -> Self {
         Self {
@@ -162,6 +162,7 @@ where
         let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("begin tracked-state read"),
         );
         let mut reader = self.context.reader(read);
@@ -194,6 +195,7 @@ where
         let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("begin tracked-state read"),
         );
         let mut reader = self.context.reader(read);
@@ -239,6 +241,7 @@ where
             let read = SharedStorageRead::new(
                 self.storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("begin tracked-state write read"),
             );
             let mut writer = self.context.writer(&read, &mut writes);
@@ -250,6 +253,7 @@ where
         let (_commit, stats) = self
             .storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("commit tracked-state writes");
         assert!(
             stats.staged_puts > 0,
@@ -262,13 +266,15 @@ where
         }
     }
 
-    pub fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
+    pub async fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
         let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("begin tracked-state layout accounting read"),
         );
         crate::storage_bench::layout_accounting(&read)
+            .await
             .into_iter()
             .map(|space| BenchLayoutAccounting {
                 space_id: space.space_id,

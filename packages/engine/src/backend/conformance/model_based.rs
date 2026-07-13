@@ -14,26 +14,27 @@ use crate::backend::conformance::{
     open_backend,
 };
 use crate::backend::{
-    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, WriteOptions,
-    get_many as backend_get_many,
+    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, ProjectedValue, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, WriteOptions,
 };
 
-pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
+pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
     F: BackendFactory,
 {
-    report.run(
-        "model::deterministic_history_matches_reference_model",
-        || deterministic_history_matches_reference_model(factory),
-    );
+    report
+        .run(
+            "model::deterministic_history_matches_reference_model",
+            deterministic_history_matches_reference_model(factory),
+        )
+        .await;
 }
 
-fn deterministic_history_matches_reference_model<F>(factory: &F) -> ConformanceResult
+async fn deterministic_history_matches_reference_model<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
-    let backend = open_backend(factory);
+    let backend = open_backend(factory).await;
     let mut model = ReferenceModel::default();
     let mut rng = TinyRng::new(0x51ce_deed);
     let keys = [
@@ -49,10 +50,12 @@ where
     for step in 0..48 {
         let old_read = backend
             .begin_read(ReadOptions::default())
+            .await
             .map_err(|error| format!("step {step}: begin old read failed: {error}"))?;
         let old_model = model.clone();
         let mut write = backend
             .begin_write(WriteOptions::default())
+            .await
             .map_err(|error| format!("step {step}: begin write failed: {error}"))?;
         let mut staged = model.clone();
 
@@ -66,11 +69,13 @@ where
                         TEST_SPACE,
                         put_batch([full_put(target_key.clone(), value.clone())]),
                     )
+                    .await
                     .map_err(|error| format!("step {step}: put_many failed: {error}"))?;
                 staged.put(target_key, value);
             } else {
                 write
                     .delete_many(TEST_SPACE, std::slice::from_ref(&target_key))
+                    .await
                     .map_err(|error| format!("step {step}: delete_many failed: {error}"))?;
                 staged.delete(&target_key);
             }
@@ -79,11 +84,13 @@ where
         if rng.bool() {
             write
                 .commit()
+                .await
                 .map_err(|error| format!("step {step}: commit failed: {error}"))?;
             model = staged;
         } else {
             write
                 .rollback()
+                .await
                 .map_err(|error| format!("step {step}: rollback failed: {error}"))?;
         }
 
@@ -93,10 +100,12 @@ where
             &keys,
             &mut rng,
             &format!("step {step} old snapshot"),
-        )?;
+        )
+        .await?;
 
         let new_read = backend
             .begin_read(ReadOptions::default())
+            .await
             .map_err(|error| format!("step {step}: begin new read failed: {error}"))?;
         compare_read_to_model(
             &new_read,
@@ -104,13 +113,14 @@ where
             &keys,
             &mut rng,
             &format!("step {step} new snapshot"),
-        )?;
+        )
+        .await?;
     }
 
     Ok(())
 }
 
-fn compare_read_to_model<R>(
+async fn compare_read_to_model<R>(
     read: &R,
     model: &ReferenceModel,
     keys: &[Key],
@@ -126,7 +136,9 @@ where
         key("missing"),
         keys[rng.usize(keys.len())].clone(),
     ];
-    let result = backend_get_many(read, TEST_SPACE, &point_keys, GetOptions::default())
+    let result = read
+        .get_many(TEST_SPACE, &point_keys, GetOptions::default())
+        .await
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
     let actual = entries_to_map(&result.entries_for_requested_keys(&point_keys));
     let expected = point_keys
@@ -158,6 +170,7 @@ where
             ..Default::default()
         },
     )
+    .await
     .map_err(|error| format!("{label}: scan_range failed: {error}"))?;
     let actual_scan = chunk_entries(&chunk.entries);
     let expected_scan = model_scan(model, &range, Some(3));
@@ -170,29 +183,15 @@ where
     Ok(())
 }
 
-fn scan_range<R>(
+async fn scan_range<R>(
     read: &R,
     range: KeyRange,
-    opts: ScanOptions<'_>,
+    opts: ScanOptions,
 ) -> Result<ScanChunk, crate::backend::BackendError>
 where
     R: BackendRead,
 {
-    let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = read.scan(TEST_SPACE, range, opts, &mut |key: KeyRef<'_>,
-                                                           value: ProjectedValueRef<
-        '_,
-    >| {
-        entries.push(ReadEntry {
-            key: key.to_owned_key(),
-            value: value.to_owned(),
-        });
-        Ok(())
-    })?;
-    Ok(ScanChunk {
-        entries,
-        has_more: result.has_more,
-    })
+    read.scan(TEST_SPACE, range, opts).await
 }
 
 fn model_scan(model: &ReferenceModel, range: &KeyRange, limit: Option<usize>) -> Vec<(Key, Bytes)> {

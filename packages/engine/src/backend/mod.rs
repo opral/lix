@@ -1,7 +1,4 @@
 //! Primary backend API.
-//!
-//! This module is intentionally isolated from the current `backend` module
-//! while the ordered byte-key API and its conformance suite settle.
 
 pub mod conformance;
 mod error;
@@ -15,17 +12,16 @@ pub use error::{
     PreconditionSupportReport,
 };
 pub use in_memory::{
-    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRead,
-    InMemoryScanVisitResult, InMemoryWrite,
+    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRead, InMemoryWrite,
 };
 pub use predicate::{
     BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
 };
-pub use traits::{Backend, BackendRead, BackendWrite, PointVisitor, ScanVisitor, get_many};
+pub use traits::{Backend, BackendRead, BackendWrite};
 pub use types::{
-    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,
-    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, ScanResult, SnapshotRef, SpaceId, StoredValue, Value,
-    WriteOptions, WriteStats,
+    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange,
+    MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, SnapshotRef, SpaceId, StoredValue, WriteOptions,
+    WriteStats,
 };

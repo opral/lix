@@ -4,15 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_family = "wasm"))]
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
 #[cfg(not(target_family = "wasm"))]
 use crate::LixError;
-use crate::storage::StorageWriteSetStats;
 #[cfg(not(target_family = "wasm"))]
-use crate::storage::{StorageBackend, StorageContext};
+use crate::storage::StorageBackend;
+#[cfg(not(target_family = "wasm"))]
+use crate::storage::StorageContext;
+use crate::storage::StorageWriteSetStats;
 
 #[cfg(not(target_family = "wasm"))]
 const EXTERNAL_MUTATION_REVISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -53,14 +55,12 @@ impl ObserveInvalidation {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn ensure_external_watcher<B>(
+    pub(crate) async fn ensure_external_watcher<B>(
         self: &Arc<Self>,
         storage: StorageContext<B>,
     ) -> Result<(), LixError>
     where
         B: StorageBackend + Clone + Send + Sync + 'static,
-        for<'backend> B::Read<'backend>: Send,
-        for<'backend> B::Write<'backend>: Send,
     {
         if self
             .external_watcher_started
@@ -69,7 +69,7 @@ impl ObserveInvalidation {
         {
             return Ok(());
         }
-        let mut last_seen_revision = match storage.load_mutation_revision() {
+        let mut last_seen_revision = match storage.load_mutation_revision().await {
             Ok(revision) => revision,
             Err(error) => {
                 self.external_watcher_started.store(false, Ordering::SeqCst);
@@ -77,29 +77,21 @@ impl ObserveInvalidation {
             }
         };
         let invalidation = Arc::downgrade(self);
-        let spawn_result = thread::Builder::new()
-            .name("lix-observe-invalidation".to_string())
-            .spawn(move || {
-                loop {
-                    thread::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL);
-                    let Some(invalidation) = invalidation.upgrade() else {
-                        break;
-                    };
-                    let Ok(current_revision) = storage.load_mutation_revision() else {
-                        continue;
-                    };
-                    if current_revision != last_seen_revision {
-                        last_seen_revision = current_revision;
-                        invalidation.bump();
-                    }
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL).await;
+                let Some(invalidation) = invalidation.upgrade() else {
+                    break;
+                };
+                let Ok(current_revision) = storage.load_mutation_revision().await else {
+                    continue;
+                };
+                if current_revision != last_seen_revision {
+                    last_seen_revision = current_revision;
+                    invalidation.bump();
                 }
-            });
-        if let Err(error) = spawn_result {
-            self.external_watcher_started.store(false, Ordering::SeqCst);
-            return Err(LixError::unknown(format!(
-                "failed to spawn observe invalidation watcher: {error}"
-            )));
-        }
+            }
+        });
         Ok(())
     }
 }
