@@ -4598,7 +4598,7 @@ mod tests {
         assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
         assert_eq!(fast_result.rows, datafusion_result.rows);
         assert_eq!(fast_scans.load(Ordering::SeqCst), 2);
-        assert_eq!(datafusion_scans.load(Ordering::SeqCst), 4);
+        assert_eq!(datafusion_scans.load(Ordering::SeqCst), 2);
 
         let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
             .pending_write_overlay()

@@ -11,7 +11,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -192,6 +192,14 @@ struct LixFileSpec {
     options: SqlWriteSessionOptions,
 }
 
+struct LixFileDmlSourceState {
+    blob_ref_keys: BTreeSet<FilesystemBlobRefKey>,
+    plugin_render: Option<PluginRenderContext>,
+    path_resolver_rows: Option<Vec<MaterializedLiveStateRow>>,
+}
+
+type SharedLixFileDmlSourceState = Arc<Mutex<Option<LixFileDmlSourceState>>>;
+
 impl LixFileSpec {
     fn active_branch(
         active_branch_id: impl Into<String>,
@@ -284,6 +292,8 @@ impl LixFileSpec {
         request: LiveStateScanRequest,
         target_file_ids: FileIdConstraint,
         needs_data: bool,
+        capture_path_resolver_rows: bool,
+        captured: SharedLixFileDmlSourceState,
     ) -> RowSource {
         row_source(
             (
@@ -294,6 +304,8 @@ impl LixFileSpec {
                 request,
                 target_file_ids,
                 needs_data,
+                capture_path_resolver_rows,
+                captured,
             ),
             |(
                 write_ctx,
@@ -303,7 +315,10 @@ impl LixFileSpec {
                 request,
                 target_file_ids,
                 needs_data,
+                capture_path_resolver_rows,
+                captured,
             )| async move {
+                *captured.lock().expect("lix_file DML source mutex poisoned") = None;
                 let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
                 let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                     .await
@@ -321,12 +336,52 @@ impl LixFileSpec {
                         "sql2 lix_file plugin discovery failed: {error}"
                     ))
                 })?;
-                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)
+                let path_resolver_rows = capture_path_resolver_rows.then(|| rows.clone());
+                let prepared = prepare_lix_file_rows(rows, &FilePathPredicate::All)
+                    .map_err(lix_error_to_datafusion_error)?;
+                let blob_ref_keys = prepared.blob_rows.keys().cloned().collect();
+                let source_batch = lix_file_record_batch_from_prepared(
+                    &table_schema,
+                    &blob_reader,
+                    plugin_render.clone(),
+                    needs_data,
+                    prepared,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+                *captured.lock().expect("lix_file DML source mutex poisoned") =
+                    Some(LixFileDmlSourceState {
+                        blob_ref_keys,
+                        plugin_render,
+                        path_resolver_rows,
+                    });
+                Ok(source_batch)
             },
         )
     }
+}
+
+fn lix_file_dml_source_state(
+    captured: &SharedLixFileDmlSourceState,
+    action: &str,
+) -> Result<LixFileDmlSourceState> {
+    captured
+        .lock()
+        .expect("lix_file DML source mutex poisoned")
+        .take()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("lix_file {action} source state missing"))
+        })
+}
+
+fn path_resolvers_from_dml_source_rows(
+    rows: Vec<MaterializedLiveStateRow>,
+    active_branch_id: &str,
+) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let mut path_resolvers = directory_path_resolvers_from_state_rows(rows)?;
+    let resolver_key = filesystem_storage_scope_key(active_branch_id, false, false, None);
+    path_resolvers.entry(resolver_key).or_default();
+    Ok(path_resolvers)
 }
 
 #[async_trait]
@@ -525,29 +580,26 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
+        let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
         let source = self.dml_source(
             &write_ctx,
-            request.clone(),
-            target_file_ids.clone(),
+            request,
+            target_file_ids,
             needs_data,
+            false,
+            Arc::clone(&captured),
         );
         let branch_binding = self.branch_binding.clone();
         let apply: DmlApply = Arc::new(move |matched_batch| {
             let write_ctx = write_ctx.clone();
             let branch_binding = branch_binding.clone();
-            let request = request.clone();
-            let target_file_ids = target_file_ids.clone();
+            let captured = Arc::clone(&captured);
             async move {
-                let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-                let rows = scan_lix_file_live_rows(live_state, &request, &target_file_ids)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                let blob_ref_keys =
-                    blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+                let source_state = lix_file_dml_source_state(&captured, "DELETE")?;
                 let staged = lix_file_delete_stage_from_batch(
                     &matched_batch,
                     branch_binding.active_branch_id(),
-                    &blob_ref_keys,
+                    &source_state.blob_ref_keys,
                 )?;
                 let count = staged.count;
 
@@ -589,48 +641,37 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
+        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
+        let capture_path_resolver_rows = (update_columns.path || update_columns.descriptor)
+            && matches!(
+                (&self.branch_binding, &target_file_ids),
+                (BranchBinding::Active { .. }, FileIdConstraint::All)
+            );
+        let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
         let source = self.dml_source(
             &write_ctx,
-            request.clone(),
-            target_file_ids.clone(),
+            request,
+            target_file_ids,
             needs_data,
+            capture_path_resolver_rows,
+            Arc::clone(&captured),
         );
         let branch_binding = self.branch_binding.clone();
         let functions = self.functions.clone();
-        let blob_reader = Arc::clone(&self.blob_reader);
-        let plugin_host = self.plugin_host.clone();
         let apply: DmlApply = Arc::new(move |matched_batch| {
             let write_ctx = write_ctx.clone();
             let branch_binding = branch_binding.clone();
             let functions = functions.clone();
-            let blob_reader = Arc::clone(&blob_reader);
-            let plugin_host = plugin_host.clone();
-            let request = request.clone();
-            let target_file_ids = target_file_ids.clone();
             let assignments = assignments.clone();
+            let captured = Arc::clone(&captured);
             async move {
-                let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-                let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                let blob_ref_keys =
-                    blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-                let plugin_render = plugin_render_context_for_lix_file_scan(
-                    live_state,
-                    &blob_reader,
-                    &request,
-                    plugin_host,
-                    needs_data,
-                )
-                .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!(
-                        "sql2 lix_file plugin discovery failed: {error}"
-                    ))
-                })?;
+                let LixFileDmlSourceState {
+                    blob_ref_keys,
+                    plugin_render,
+                    path_resolver_rows,
+                } = lix_file_dml_source_state(&captured, "UPDATE")?;
                 let assignment_values =
                     UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
-                let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
                 let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
                     path_update_plugin_rewrite_file_ids(
                         plugin_render.as_ref(),
@@ -644,12 +685,19 @@ impl TableSpec for LixFileSpec {
                 let mut path_resolvers = None;
                 if update_columns.path || update_columns.descriptor {
                     path_resolvers = Some(
-                        directory_path_resolvers_from_live_state(
-                            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                            branch_binding.active_branch_id(),
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?,
+                        if let (Some(rows), Some(active_branch_id)) =
+                            (path_resolver_rows, branch_binding.active_branch_id())
+                        {
+                            path_resolvers_from_dml_source_rows(rows, active_branch_id)
+                                .map_err(lix_error_to_datafusion_error)?
+                        } else {
+                            directory_path_resolvers_from_live_state(
+                                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                                branch_binding.active_branch_id(),
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                        },
                     );
                 }
                 let staged = lix_file_update_stage_from_batch(
@@ -3603,6 +3651,8 @@ mod tests {
     use datafusion::logical_expr::{
         BinaryExpr, ColumnarValue, Expr, Operator, Volatility, create_udf,
     };
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::Literal;
     use serde_json::Value as JsonValue;
 
     use crate::LixError;
@@ -3613,14 +3663,14 @@ mod tests {
     use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::dml::InsertSink;
-    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteContextBranchRefReader};
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
 
     use super::{
-        BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, derive_directory_paths,
-        lix_file_delete_stage_from_batch, lix_file_insert_stage_from_batch,
+        BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, LixFileSpec, TableSpec,
+        derive_directory_paths, lix_file_delete_stage_from_batch, lix_file_insert_stage_from_batch,
         lix_file_insert_stage_from_batch_with_path_resolvers, lix_file_write_rows_from_batch,
     };
 
@@ -3904,6 +3954,7 @@ mod tests {
     struct CapturingWriteContext {
         rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
+        scan_count: usize,
     }
 
     struct StaticBlobReader {
@@ -3983,6 +4034,7 @@ mod tests {
             &mut self,
             _request: &LiveStateScanRequest,
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_count += 1;
             Ok(self.rows.clone())
         }
 
@@ -4088,6 +4140,36 @@ mod tests {
         row.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
         row.file_id = Some(file_id.to_string());
         row
+    }
+
+    fn file_dml_rows() -> Vec<MaterializedLiveStateRow> {
+        vec![
+            live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            ),
+            live_blob_ref_row("file-readme", "branch-b", "file-readme", &"0".repeat(64), 5),
+        ]
+    }
+
+    fn file_dml_spec(write_ctx: SqlWriteContext) -> LixFileSpec {
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+        LixFileSpec::active_branch_with_write(
+            write_ctx,
+            branch_ref,
+            super::SqlWriteSessionOptions::default(),
+        )
+    }
+
+    fn literal_assignment(
+        column_name: &str,
+        value: ScalarValue,
+    ) -> (String, Arc<dyn PhysicalExpr>) {
+        (
+            column_name.to_string(),
+            Arc::new(Literal::new(value)) as Arc<dyn PhysicalExpr>,
+        )
     }
 
     fn plugin_archive(path_glob: &str, schema_key: &str) -> Vec<u8> {
@@ -5321,6 +5403,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_delete_reuses_single_candidate_scan() {
+        let mut write_context = CapturingWriteContext {
+            rows: file_dml_rows(),
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let planned = spec
+            .plan_delete(write_ctx, &[])
+            .await
+            .expect("plan file delete");
+
+        let source_batch = (planned.source)().await.expect("load delete candidates");
+        assert_eq!(write_context.scan_count, 1);
+        let count = (planned.apply)(source_batch)
+            .await
+            .expect("apply file delete");
+
+        assert_eq!(count, 1);
+        assert_eq!(write_context.scan_count, 1);
+        let TransactionWrite::Rows { rows, .. } = &write_context.writes[0] else {
+            panic!("delete should stage state rows");
+        };
+        assert!(
+            rows.iter()
+                .any(|row| row.schema_key == super::FILE_DESCRIPTOR_SCHEMA_KEY)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.schema_key == super::BLOB_REF_SCHEMA_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn file_update_reuses_source_rows_for_blob_and_path_state() {
+        let mut write_context = CapturingWriteContext {
+            rows: file_dml_rows(),
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let planned = spec
+            .plan_update(
+                write_ctx,
+                vec![literal_assignment(
+                    "name",
+                    ScalarValue::Utf8(Some("README.md".to_string())),
+                )],
+                &[],
+            )
+            .await
+            .expect("plan file update");
+
+        let source_batch = (planned.source)().await.expect("load update candidates");
+        assert_eq!(write_context.scan_count, 1);
+        let count = (planned.apply)(source_batch)
+            .await
+            .expect("apply file update");
+
+        assert_eq!(count, 1);
+        assert_eq!(write_context.scan_count, 1);
+        let TransactionWrite::Rows { rows, .. } = &write_context.writes[0] else {
+            panic!("descriptor update should stage state rows");
+        };
+        let snapshot = rows[0].snapshot.as_ref().expect("updated snapshot").value();
+        assert_eq!(snapshot["name"], "README.md");
+    }
+
+    #[tokio::test]
+    async fn file_data_update_reuses_source_blob_ref_keys() {
+        let mut write_context = CapturingWriteContext {
+            rows: file_dml_rows(),
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let planned = spec
+            .plan_update(
+                write_ctx,
+                vec![literal_assignment(
+                    "data",
+                    ScalarValue::LargeBinary(Some(Vec::new())),
+                )],
+                &[],
+            )
+            .await
+            .expect("plan file data update");
+
+        let source_batch = (planned.source)().await.expect("load update candidates");
+        let count = (planned.apply)(source_batch)
+            .await
+            .expect("apply file data update");
+
+        assert_eq!(count, 1);
+        assert_eq!(write_context.scan_count, 1);
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("data update should stage rows and file data");
+        };
+        assert!(file_data[0].data().is_empty());
+        assert!(
+            rows.iter().any(|row| {
+                row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn file_dml_apply_without_source_state_errors() {
+        let mut write_context = CapturingWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let planned = spec
+            .plan_delete(write_ctx, &[])
+            .await
+            .expect("plan file delete");
+
+        let error = (planned.apply)(RecordBatch::new_empty(super::lix_file_schema()))
+            .await
+            .expect_err("apply without source should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("lix_file DELETE source state missing")
+        );
+        assert_eq!(write_context.scan_count, 0);
+        assert!(write_context.writes.is_empty());
+    }
+
+    #[tokio::test]
     async fn file_insert_sink_stages_file_data_writes() {
         let batch = data_insert_batch();
         let mut write_context = CapturingWriteContext {
@@ -5330,6 +5545,7 @@ mod tests {
                 "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
+            scan_count: 0,
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
@@ -5388,6 +5604,7 @@ mod tests {
                 ),
             ],
             writes: Vec::new(),
+            scan_count: 0,
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
