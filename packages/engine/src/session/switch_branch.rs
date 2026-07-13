@@ -27,8 +27,6 @@ pub struct SwitchBranchReceipt {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Switches the session's active branch selector.
     ///
@@ -46,7 +44,7 @@ where
             .with_write_transaction(|transaction| {
                 Box::pin(async move {
                     {
-                        let reader = transaction.branch_ref_reader();
+                        let reader = transaction.branch_ref_reader().await;
                         BranchLifecycle::new(&reader)
                             .require_existing_commit_id(
                                 &branch_id,

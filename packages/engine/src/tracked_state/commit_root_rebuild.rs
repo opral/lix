@@ -39,7 +39,7 @@ pub(crate) async fn rebuild_commit_root_at<S>(
     commit_id: &str,
 ) -> Result<TrackedStateWriteReport, LixError>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     let plans =
         load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
@@ -65,7 +65,7 @@ async fn load_rebuild_plans_to_nearest_available_root<S>(
     force_head: bool,
 ) -> Result<Vec<CommitRootRebuildPlan>, LixError>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     let mut plans = Vec::new();
     let mut current_commit_id = commit_id.to_string();
@@ -105,7 +105,7 @@ fn load_available_root<'a, S>(
     seen: &'a mut HashSet<String>,
 ) -> Pin<Box<dyn Future<Output = Result<Option<TrackedStateRootId>, LixError>> + 'a>>
 where
-    S: StorageRead + Send + Sync + ?Sized + 'a,
+    S: StorageRead + ?Sized + 'a,
 {
     Box::pin(async move {
         if !seen.insert(commit_id.to_string()) {
@@ -133,7 +133,7 @@ async fn commit_root_tree_is_readable<S>(
     metadata: &TrackedStateCommitRoot,
 ) -> Result<bool, LixError>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     match TrackedStateTree::new()
         .scan(
@@ -155,7 +155,7 @@ async fn commit_root_matches_canonical_rebuild<S>(
     seen: &mut HashSet<String>,
 ) -> Result<bool, LixError>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     let plan = load_commit_root_rebuild_plan(store, commit_id).await?;
     if let Some(parent_commit_id) = plan.parent_commit_id.as_ref() {
@@ -191,7 +191,7 @@ async fn load_commit_root_rebuild_plan<S>(
     commit_id: &str,
 ) -> Result<CommitRootRebuildPlan, LixError>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     let mut reader = ChangelogContext::new().reader(store);
     let commit_ids = [CommitId::parse_lix(
@@ -262,7 +262,7 @@ async fn stage_rebuild_plan_with_writer<S>(
     plan: &CommitRootRebuildPlan,
 ) -> Result<TrackedStateWriteReport, LixError>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     let deltas = plan
         .deltas

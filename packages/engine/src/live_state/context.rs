@@ -1,7 +1,7 @@
 #![allow(clippy::borrow_deref_ref, clippy::clone_on_copy)]
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use futures_util::{StreamExt, TryStreamExt, stream};
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
@@ -21,6 +21,8 @@ use crate::tracked_state::{
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
+
+const BRANCH_READ_CONCURRENCY: usize = 8;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -52,10 +54,10 @@ impl LiveStateContext {
     /// Creates a visible live-state reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> LiveStateStoreReader<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         LiveStateStoreReader {
-            store: Mutex::new(store),
+            store,
             tracked_state: self.tracked_state.clone(),
             untracked_state: self.untracked_state,
             commit_graph: self.commit_graph.clone(),
@@ -65,7 +67,7 @@ impl LiveStateContext {
 
 /// Visible live-state reader backed by a caller-provided KV store.
 pub(crate) struct LiveStateStoreReader<S> {
-    store: Mutex<S>,
+    store: S,
     tracked_state: TrackedStateContext,
     untracked_state: UntrackedStateContext,
     commit_graph: CommitGraphContext,
@@ -73,40 +75,50 @@ pub(crate) struct LiveStateStoreReader<S> {
 
 impl<S> LiveStateStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let store = self.store.lock().await;
-        let scope = scan_scope(&*store, &self.untracked_state, request).await?;
+        let store = &self.store;
+        let scope = scan_scope(store, &self.untracked_state, request).await?;
         let derived_rows =
-            scan_commit_derived_rows(&*store, &self.commit_graph, request, &scope).await?;
+            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut tracked_rows = Vec::new();
         if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
-            for branch_id in &scope.storage_branch_ids {
-                let Some(commit_id) =
-                    load_branch_ref_commit_id(&*store, &self.untracked_state, branch_id).await?
-                else {
-                    continue;
-                };
-                let tracked_request = tracked_scan_request_from_live(request);
-                let source = tracked_source_from_branch_id(branch_id);
-                let store = &*store;
-                tracked_rows.extend(
-                    self.tracked_state
-                        .reader(store)
-                        .scan_rows_at_commit(&commit_id, &tracked_request)
-                        .await?
-                        .into_iter()
-                        .map(|row| project_tracked_row(row, branch_id, source)),
-                );
-            }
+            let tracked_request = tracked_scan_request_from_live(request);
+            let rows = stream::iter(scope.storage_branch_ids.clone().into_iter().enumerate())
+                .map(|(index, branch_id)| {
+                    let tracked_request = tracked_request.clone();
+                    async move {
+                        let Some(commit_id) =
+                            load_branch_ref_commit_id(store, &self.untracked_state, &branch_id)
+                                .await?
+                        else {
+                            return Ok::<_, LixError>((index, Vec::new()));
+                        };
+                        let source = tracked_source_from_branch_id(&branch_id);
+                        let rows = self
+                            .tracked_state
+                            .reader(store)
+                            .scan_rows_at_commit(&commit_id, &tracked_request)
+                            .await?
+                            .into_iter()
+                            .map(|row| project_tracked_row(row, &branch_id, source))
+                            .collect();
+                        Ok((index, rows))
+                    }
+                })
+                .buffer_unordered(BRANCH_READ_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+            let mut rows = rows;
+            rows.sort_by_key(|(index, _)| *index);
+            tracked_rows.extend(rows.into_iter().flat_map(|(_, rows)| rows));
         }
 
         let untracked_rows = if request.filter.untracked != Some(false) {
-            let store = &*store;
             self.untracked_state
                 .reader(store)
                 .scan_rows(&untracked_scan_request_from_live(
@@ -152,8 +164,7 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         {
-            let store = self.store.lock().await;
-            if !branch_ref_exists(&*store, &self.untracked_state, &request.branch_id).await? {
+            if !branch_ref_exists(&self.store, &self.untracked_state, &request.branch_id).await? {
                 return Ok(None);
             }
         }
@@ -178,7 +189,7 @@ where
 #[async_trait]
 impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     async fn scan_rows(
         &self,
@@ -196,7 +207,7 @@ where
 }
 
 async fn scan_commit_derived_rows(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_graph: &CommitGraphContext,
     request: &LiveStateScanRequest,
     scope: &LiveStateScanScope,
@@ -380,7 +391,7 @@ struct LiveStateScanScope {
 }
 
 async fn scan_scope(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     untracked_state: &UntrackedStateContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
@@ -406,7 +417,7 @@ async fn scan_scope(
 }
 
 async fn all_branch_ref_ids(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     untracked_state: &UntrackedStateContext,
 ) -> Result<Vec<String>, LixError> {
     let rows = untracked_state
@@ -426,7 +437,7 @@ async fn all_branch_ref_ids(
 }
 
 async fn load_branch_ref_commit_id(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     untracked_state: &UntrackedStateContext,
     branch_id: &str,
 ) -> Result<Option<String>, LixError> {
@@ -459,7 +470,7 @@ async fn load_branch_ref_commit_id(
 }
 
 async fn branch_ref_exists(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     untracked_state: &UntrackedStateContext,
     branch_id: &str,
 ) -> Result<bool, LixError> {
@@ -538,7 +549,7 @@ mod tests {
 
     async fn write_untracked_rows_to_store(
         storage: &StorageContext,
-        _read: &(impl StorageRead + Send + Sync + ?Sized),
+        _read: &(impl StorageRead + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let mut writes = storage.new_write_set();
@@ -553,12 +564,13 @@ mod tests {
             .expect("untracked rows should write");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("untracked rows should commit");
     }
 
     async fn write_empty_commits_to_store(
         storage: &StorageContext,
-        read: &(impl StorageRead + Send + Sync),
+        read: &impl StorageRead,
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
@@ -611,11 +623,12 @@ mod tests {
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("empty commits should commit");
     }
 
     async fn stage_materialized_live_rows(
-        store: &(impl StorageRead + Send + Sync),
+        store: &impl StorageRead,
         writes: &mut StorageWriteSet,
         json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
@@ -799,6 +812,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
@@ -819,6 +833,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -846,6 +861,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {
@@ -871,6 +887,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
@@ -891,6 +908,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -919,6 +937,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
@@ -939,6 +958,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -964,6 +984,7 @@ mod tests {
                 .expect("delete identity should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
 
@@ -986,6 +1007,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
@@ -1002,6 +1024,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1041,6 +1064,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
@@ -1057,6 +1081,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1097,6 +1122,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [
@@ -1117,6 +1143,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1149,6 +1176,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [
@@ -1169,6 +1197,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1201,6 +1230,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [
@@ -1221,6 +1251,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1255,6 +1286,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [
@@ -1275,6 +1307,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1306,6 +1339,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
@@ -1322,6 +1356,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1355,6 +1390,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
@@ -1371,6 +1407,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1398,6 +1435,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [
@@ -1417,6 +1455,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1449,6 +1488,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         {
             let rows = [
@@ -1468,6 +1508,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1500,6 +1541,7 @@ mod tests {
         let live_state = live_state_context();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         {
@@ -1521,6 +1563,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
         write_untracked_rows_to_store(
@@ -1545,6 +1588,7 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         write_empty_commits_to_store(&storage, &read, &["parent-left"]).await;
         let mut writes = StorageWriteSet::new();
@@ -1555,10 +1599,12 @@ mod tests {
             .expect("first parent tracked root should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("first parent tracked root should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         {
@@ -1583,6 +1629,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
     }
@@ -1593,6 +1640,7 @@ mod tests {
         let tracked_state = TrackedStateContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         {
@@ -1614,6 +1662,7 @@ mod tests {
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("writes should commit");
         }
 
@@ -1652,6 +1701,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {
@@ -1672,6 +1722,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {
@@ -1693,6 +1744,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows(&LiveStateScanRequest {
@@ -1718,6 +1770,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(

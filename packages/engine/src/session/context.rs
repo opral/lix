@@ -24,7 +24,8 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
-use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
+use crate::storage::StorageBackend;
+use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
 use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
@@ -67,8 +68,6 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     pub(crate) async fn open_workspace(
         storage: StorageContext<B>,
@@ -224,7 +223,11 @@ where
     }
 
     pub(super) async fn deterministic_mode_enabled(&self) -> Result<bool, LixError> {
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let live_state = self.live_state.reader(&read);
         crate::functions::deterministic_mode_enabled(&live_state).await
     }
@@ -295,7 +298,11 @@ where
     /// active workspace branch.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let result = self.active_branch_id_from_reader(&read).await;
         match result {
             Ok(branch_id) => Ok(branch_id),
@@ -308,7 +315,8 @@ where
         let _operation_guard = self.begin_waitable_session_operation().await?;
         Ok(self
             .storage
-            .load_mutation_revision()?
+            .load_mutation_revision()
+            .await?
             .map(|revision| revision.to_vec()))
     }
 
@@ -317,7 +325,7 @@ where
         reader: &S,
     ) -> Result<String, LixError>
     where
-        S: StorageRead + Send + Sync + ?Sized,
+        S: StorageRead + ?Sized,
     {
         self.ensure_open()?;
         match &self.mode {
@@ -328,7 +336,7 @@ where
 
     async fn load_workspace_branch_id<S>(&self, reader: &S) -> Result<String, LixError>
     where
-        S: StorageRead + Send + Sync + ?Sized,
+        S: StorageRead + ?Sized,
     {
         let row = self
             .live_state
@@ -491,7 +499,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBacke
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
 where
-    R: crate::storage::StorageBackendRead + Send + 'static,
+    R: crate::storage::StorageBackendRead + 'static,
 {
     type ReadStore = SharedStorageRead<R>;
 
@@ -555,9 +563,9 @@ mod tests {
 
     use crate::Engine;
     use crate::backend::{
-        Backend, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions,
-        WriteOptions,
+        BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions, WriteOptions,
     };
+    use crate::storage::StorageBackend;
     use futures_util::task::noop_waker_ref;
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -877,7 +885,7 @@ mod tests {
         }
     }
 
-    impl Backend for BlockingBeginReadBackend {
+    impl StorageBackend for BlockingBeginReadBackend {
         type Read<'a>
             = InMemoryRead
         where
@@ -887,13 +895,13 @@ mod tests {
             = InMemoryWrite
         where
             Self: 'a;
-        fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             self.gate.maybe_block();
-            self.inner.begin_read(opts)
+            self.inner.begin_read(opts).await
         }
 
-        fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-            self.inner.begin_write(opts)
+        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+            self.inner.begin_write(opts).await
         }
     }
 
@@ -916,7 +924,7 @@ mod tests {
         }
     }
 
-    impl Backend for BlockingBeginWriteBackend {
+    impl StorageBackend for BlockingBeginWriteBackend {
         type Read<'a>
             = InMemoryRead
         where
@@ -926,13 +934,13 @@ mod tests {
             = InMemoryWrite
         where
             Self: 'a;
-        fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-            self.inner.begin_read(opts)
+        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+            self.inner.begin_read(opts).await
         }
 
-        fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
             self.gate.maybe_block();
-            self.inner.begin_write(opts)
+            self.inner.begin_write(opts).await
         }
     }
 

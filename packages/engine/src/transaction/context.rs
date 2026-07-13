@@ -43,9 +43,9 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
+use crate::storage::StorageBackend;
 use crate::storage::{
-    InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
-    StorageWriteSetStats,
+    InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::storage::{
     SharedStorageRead, StorageContext, StorageRead, StorageReadScope, StorageWriteSet,
@@ -151,17 +151,20 @@ impl TransactionCommitBoundary {
         (self.pre_commit_check)()
     }
 
-    fn commit<T>(&self, commit: impl FnOnce() -> Result<T, LixError>) -> Result<T, LixError> {
-        let _gate = self.state.lock_commit();
+    async fn commit<T, F>(&self, commit: impl FnOnce() -> F) -> Result<T, LixError>
+    where
+        F: Future<Output = Result<T, LixError>>,
+    {
+        let _gate = self.state.lock_commit().await;
         self.check()?;
-        commit()
+        commit().await
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct CommitBoundaryState {
     active_count: Arc<AtomicUsize>,
-    commit_gate: Arc<std::sync::Mutex<()>>,
+    commit_gate: Arc<tokio::sync::Mutex<()>>,
     watch: tokio::sync::watch::Sender<usize>,
 }
 
@@ -170,7 +173,7 @@ impl CommitBoundaryState {
         let (watch, _) = tokio::sync::watch::channel(0);
         Self {
             active_count: Arc::new(AtomicUsize::new(0)),
-            commit_gate: Arc::new(std::sync::Mutex::new(())),
+            commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             watch,
         }
     }
@@ -195,20 +198,12 @@ impl CommitBoundaryState {
         self.watch.subscribe()
     }
 
-    pub(crate) fn lock_commit(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.commit_gate
-            .lock()
-            .expect("commit boundary gate should not poison")
+    pub(crate) async fn lock_commit(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.commit_gate.lock().await
     }
 
-    pub(crate) fn try_lock_commit(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        match self.commit_gate.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                panic!("commit boundary gate should not poison")
-            }
-        }
+    pub(crate) fn try_lock_commit(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.commit_gate.try_lock().ok()
     }
 }
 
@@ -237,21 +232,22 @@ fn check_commit_boundary(boundary: Option<&TransactionCommitBoundary>) -> Result
     Ok(())
 }
 
-pub(crate) fn commit_at_boundary<T>(
+pub(crate) async fn commit_at_boundary<T, F>(
     boundary: Option<&TransactionCommitBoundary>,
-    commit: impl FnOnce() -> Result<T, LixError>,
-) -> Result<T, LixError> {
+    commit: impl FnOnce() -> F,
+) -> Result<T, LixError>
+where
+    F: Future<Output = Result<T, LixError>>,
+{
     match boundary {
-        Some(boundary) => boundary.commit(commit),
-        None => commit(),
+        Some(boundary) => boundary.commit(commit).await,
+        None => commit().await,
     }
 }
 
 impl<B> Transaction<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open(
@@ -264,7 +260,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
     ) -> Result<OpenTransaction<B>, LixError> {
-        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let setup_result = async {
             let active_branch_id =
                 resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
@@ -351,7 +347,8 @@ where
         let mut read = SharedStorageRead::new(
             transaction
                 .storage
-                .begin_read(StorageReadOptions::default())?,
+                .begin_read(StorageReadOptions::default())
+                .await?,
         );
         let mut writes = match commit::commit_prepared_writes(
             &transaction.binary_cas,
@@ -368,11 +365,13 @@ where
         writes.extend(transaction.staged_storage_writes);
         let prepared_commit = transaction
             .storage
-            .prepare_write_set(writes, StorageWriteOptions::default())?;
-        let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || {
-            let (_commit, stats) = prepared_commit.commit()?;
+            .prepare_write_set(writes, StorageWriteOptions::default())
+            .await?;
+        let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || async move {
+            let (_commit, stats) = prepared_commit.commit().await?;
             Ok(stats)
-        })?;
+        })
+        .await?;
         Ok(TransactionCommitOutcome { storage_stats })
     }
 
@@ -422,7 +421,11 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let base = self.live_state.reader(read);
         overlay_scan_rows(&base, &staged, request).await
     }
@@ -432,7 +435,11 @@ where
         request: &LiveStateFileScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let base = self.live_state.reader(read);
         overlay_scan_file_rows(&base, &staged, request).await
     }
@@ -642,7 +649,11 @@ where
         &self,
         filesystem: &FilesystemIndex,
     ) -> Result<Vec<InstalledPlugin>, LixError> {
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let blob_reader = self.binary_cas.reader(read);
         load_installed_plugins_from_filesystem(filesystem, &blob_reader).await
     }
@@ -694,7 +705,11 @@ where
     ) -> Result<Vec<PreparedStateRow>, LixError> {
         let row_count = rows.len();
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let live_state = self.live_state.reader(&read);
         let mut rows_by_scope = BTreeMap::<Domain, Vec<(usize, TransactionWriteRow)>>::new();
         for (index, row) in rows.into_iter().enumerate() {
@@ -761,8 +776,11 @@ where
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
             let branch_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
-            let read =
-                SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+            let read = SharedStorageRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
             let live_state = self.live_state.reader(&read);
             let schema_catalog = self
                 .schema_resolver
@@ -795,7 +813,11 @@ where
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
         let branch_ids = transaction_write_branch_ids(write);
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let reader = self.branch_ctx.ref_reader(read);
         for branch_id in branch_ids {
             if branch_id == GLOBAL_BRANCH_ID {
@@ -834,7 +856,7 @@ where
     ) -> Result<SqlQueryResult, LixError> {
         self.prepare_sql_visible_schemas().await?;
         let storage = self.storage.clone();
-        let read = storage.begin_read(StorageReadOptions::default())?;
+        let read = storage.begin_read(StorageReadOptions::default()).await?;
         let active_branch_id = self.active_branch_id.clone();
         let live_state = Arc::clone(&self.live_state);
         let binary_cas = Arc::clone(&self.binary_cas);
@@ -872,7 +894,11 @@ where
         if self.sql_schema_cache.is_prepared() {
             return Ok(());
         }
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let live_state = self.live_state.reader(&read);
         let visible_schemas = self
             .catalog_context
@@ -916,32 +942,35 @@ where
     }
 
     /// Creates a branch-ref reader scoped to this write transaction.
-    pub(crate) fn branch_ref_reader(&mut self) -> impl BranchRefReader + '_ {
+    pub(crate) async fn branch_ref_reader(&mut self) -> impl BranchRefReader + '_ {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("open transaction read scope");
         self.branch_ctx.ref_reader(SharedStorageRead::new(read))
     }
 
     /// Creates a tracked-state reader scoped to this write transaction.
-    pub(crate) fn tracked_state_reader(
+    pub(crate) async fn tracked_state_reader(
         &mut self,
     ) -> TrackedStateStoreReader<SharedStorageRead<B::Read<'_>>> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("open transaction read scope");
         self.tracked_state.reader(SharedStorageRead::new(read))
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
-    pub(crate) fn commit_graph_reader(
+    pub(crate) async fn commit_graph_reader(
         &mut self,
     ) -> CommitGraphStoreReader<SharedStorageRead<B::Read<'_>>> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("open transaction read scope");
         CommitGraphContext::new().reader(SharedStorageRead::new(read))
     }
@@ -962,7 +991,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageB
 
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
 where
-    R: crate::storage::StorageBackendRead + Send + 'static,
+    R: crate::storage::StorageBackendRead + 'static,
 {
     type ReadStore = SharedStorageRead<R>;
 
@@ -1075,7 +1104,7 @@ struct TransactionReadLiveStateReader<R: crate::storage::StorageBackendRead> {
 #[async_trait]
 impl<R> crate::live_state::LiveStateReader for TransactionReadLiveStateReader<R>
 where
-    R: crate::storage::StorageBackendRead + Send + 'static,
+    R: crate::storage::StorageBackendRead + 'static,
 {
     async fn scan_rows(
         &self,
@@ -1130,16 +1159,16 @@ where
 {
     // SAFETY: the widened read is wrapped immediately in `SharedStorageRead`,
     // only passed into this private SQL execution closure, and explicitly
-    // closed before returning. Escaped clones are detected by `close()`.
+    // dropped before returning. Escaped clones are detected by `finish()`.
     let read = unsafe { assume_static_backend_read::<B>(read) };
     let read = SharedStorageRead::new(read);
-    let close = read.clone();
+    let finish = read.clone();
     let result = f(read).await;
-    let close_result = close.close().map_err(LixError::from);
-    match (result, close_result) {
+    let finish_result = finish.finish().map_err(LixError::from);
+    match (result, finish_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (_, Err(close_error)) => Err(close_error),
+        (_, Err(finish_error)) => Err(finish_error),
     }
 }
 
@@ -1253,8 +1282,6 @@ pub(crate) async fn open_transaction<B>(
 ) -> Result<OpenTransaction<B>, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     Transaction::open(
         mode,
@@ -1273,8 +1300,6 @@ where
 impl<B> SqlWriteExecutionContext for Transaction<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
@@ -1293,7 +1318,11 @@ where
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         let base = self.binary_cas.reader(read);
         load_transaction_blob_bytes(&base, &self.staged_writes, hashes).await
     }
@@ -1306,7 +1335,11 @@ where
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
 
         self.branch_ctx
             .ref_reader(read)
@@ -1539,7 +1572,7 @@ async fn resolve_active_branch_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    read: &(impl StorageRead + ?Sized),
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
@@ -1550,7 +1583,7 @@ async fn resolve_active_branch_id(
 async fn load_workspace_branch_id(
     live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    read: &(impl StorageRead + ?Sized),
 ) -> Result<String, LixError> {
     let row = live_state
         .reader(read)
@@ -1675,6 +1708,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {
@@ -1694,6 +1728,7 @@ mod tests {
         let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let changes = changelog_reader
@@ -1716,6 +1751,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id(GLOBAL_BRANCH_ID)
@@ -1727,6 +1763,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_rows_at_commit(
@@ -1752,6 +1789,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&UntrackedStateRowRequest {
@@ -1772,6 +1810,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {
@@ -1791,6 +1830,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .scan_rows_at_commit(
@@ -1893,6 +1933,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id(GLOBAL_BRANCH_ID)
@@ -2195,6 +2236,7 @@ mod tests {
         .expect("schema fixture branch ref should stage");
         let mut read = storage
             .begin_read(crate::storage::StorageReadOptions::default())
+            .await
             .expect("schema fixture read should open");
         crate::test_support::stage_tracked_root_from_materialized(
             &mut read,
@@ -2212,6 +2254,7 @@ mod tests {
             .expect("schema fixture branch ref should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("schema fixture transaction should commit");
     }
 
@@ -2225,6 +2268,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id(GLOBAL_BRANCH_ID)
@@ -2239,6 +2283,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {

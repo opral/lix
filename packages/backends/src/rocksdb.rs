@@ -1,3 +1,9 @@
+#![allow(
+    clippy::manual_async_fn,
+    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+)]
+
+use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -5,9 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rocksdb::Snapshot;
@@ -85,8 +91,8 @@ impl BackendFactory for RocksDbBackendFactory {
 impl BackendFixture for RocksDbBackendFixture {
     type Backend = RocksDbBackend;
 
-    fn open(&self) -> Self::Backend {
-        RocksDbBackend::open(&self.path).expect("open rocksdb backend")
+    fn open(&self) -> impl Future<Output = Self::Backend> + Send {
+        async move { RocksDbBackend::open(&self.path).expect("open rocksdb backend") }
     }
 }
 
@@ -116,24 +122,34 @@ impl Backend for RocksDbBackend {
         = RocksDbWrite
     where
         Self: 'a;
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        Ok(RocksDbRead {
-            snapshot: self.db.snapshot(),
-        })
+    fn begin_read(
+        &self,
+        _opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+        async move {
+            Ok(RocksDbRead {
+                snapshot: self.db.snapshot(),
+            })
+        }
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(RocksDbWrite {
-            db: Arc::clone(&self.db),
-            batch: WriteBatch::default(),
-            staged_put_keys: Vec::new(),
-            stats: WriteStats::default(),
-        })
+    fn begin_write(
+        &self,
+        _opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            Ok(RocksDbWrite {
+                db: Arc::clone(&self.db),
+                batch: WriteBatch::default(),
+                staged_put_keys: Vec::new(),
+                stats: WriteStats::default(),
+            })
+        }
     }
 }
 
 /// RocksDB keeps its single-keyspace layout; spaces are scoped by prefixing
-/// the 4-byte big-endian space id internally. Visitors observe logical keys.
+/// the 4-byte big-endian space id internally. Reads return logical keys.
 fn physical_key(space: SpaceId, key: &Key) -> Key {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
     bytes.extend_from_slice(&space.0.to_be_bytes());
@@ -162,129 +178,57 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 }
 
 impl BackendRead for RocksDbRead<'_> {
-    fn visit_keys<V>(
+    fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        let physical_keys = keys
-            .iter()
-            .map(|key| physical_key(space, key))
-            .collect::<Vec<_>>();
-        for (index, (key, value)) in keys
-            .iter()
-            .zip(
-                self.snapshot
-                    .multi_get(physical_keys.iter().map(|key| key.0.as_ref())),
-            )
-            .enumerate()
-        {
-            let value = value.map_err(rocksdb_error)?;
-            visitor.visit(
-                index,
-                key,
-                value
-                    .as_ref()
-                    .map(|value| project_value_ref(value.as_ref(), opts.projection)),
-            )?;
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        async move {
+            let physical_keys = keys
+                .iter()
+                .map(|key| physical_key(space, key))
+                .collect::<Vec<_>>();
+            let mut values = Vec::with_capacity(keys.len());
+            for value in self
+                .snapshot
+                .multi_get(physical_keys.iter().map(|key| key.0.as_ref()))
+            {
+                let value = value.map_err(rocksdb_error)?;
+                values.push(
+                    value
+                        .as_ref()
+                        .map(|value| project_value(value.as_ref(), opts.projection)),
+                );
+            }
+            Ok(GetManyResult::new(values))
         }
-        Ok(())
     }
 
-    fn scan<V>(
+    fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        if opts.limit_rows == 0 {
-            return Ok(ScanResult {
-                emitted: 0,
-                has_more: false,
-            });
-        }
-        let resume_after = opts.resume_after.map(|key| physical_key(space, key));
-        let bounds = EncodedBounds::new(physical_range(space, range), resume_after.as_ref());
-        let mut emitted = 0usize;
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
-        {
-            let (encoded_key, value) = item.map_err(rocksdb_error)?;
-            let encoded_key = encoded_key.as_ref();
-            if !bounds.after_lower(encoded_key) {
-                continue;
-            }
-            if !bounds.before_upper(encoded_key) {
-                break;
-            }
-            if emitted == opts.limit_rows {
-                return Ok(ScanResult {
-                    emitted,
-                    has_more: true,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        async move {
+            if opts.page_size() == 0 {
+                return Ok(ScanChunk {
+                    entries: Vec::new(),
+                    has_more: false,
                 });
             }
-            match opts.projection {
-                CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(&encoded_key[4..]), ProjectedValueRef::KeyOnly)?;
-                }
-                CoreProjection::FullValue => visitor.visit(
-                    KeyRef(&encoded_key[4..]),
-                    ProjectedValueRef::FullValue(value.as_ref()),
-                )?,
-            }
-            emitted += 1;
-        }
-        Ok(ScanResult {
-            emitted,
-            has_more: false,
-        })
-    }
-}
-
-impl BackendWrite for RocksDbWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        for entry in entries.entries {
-            let key = physical_key(space, &entry.key);
-            let value = stored_value_bytes(entry.value);
-            self.stats.put_entries += 1;
-            self.stats.written_bytes += value.len() as u64;
-            self.staged_put_keys.push(key.clone());
-            self.batch.put(key.0.as_ref(), value.as_ref());
-        }
-        self.stats.backend_calls += 1;
-        Ok(())
-    }
-
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        for key in keys {
-            self.batch.delete(physical_key(space, key).0.as_ref());
-        }
-        self.stats.deleted_entries += keys.len() as u64;
-        self.stats.backend_calls += 1;
-        Ok(())
-    }
-
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        let range = physical_range(space, range);
-        if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
-            self.batch.delete_range(lower.as_slice(), upper.as_slice());
-        } else {
-            let bounds = EncodedBounds::new(range, None);
+            let resume_after = opts
+                .resume_after
+                .as_ref()
+                .map(|key| physical_key(space, key));
+            let bounds = EncodedBounds::new(physical_range(space, range), resume_after.as_ref());
+            let mut entries = Vec::with_capacity(opts.page_size());
             for item in self
-                .db
+                .snapshot
                 .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
             {
-                let (encoded_key, _value) = item.map_err(rocksdb_error)?;
+                let (encoded_key, value) = item.map_err(rocksdb_error)?;
                 let encoded_key = encoded_key.as_ref();
                 if !bounds.after_lower(encoded_key) {
                     continue;
@@ -292,31 +236,110 @@ impl BackendWrite for RocksDbWrite {
                 if !bounds.before_upper(encoded_key) {
                     break;
                 }
-                self.batch.delete(encoded_key);
+                if entries.len() == opts.page_size() {
+                    return Ok(ScanChunk {
+                        entries,
+                        has_more: true,
+                    });
+                }
+                entries.push(ReadEntry {
+                    key: Key(Bytes::copy_from_slice(&encoded_key[4..])),
+                    value: project_value(value.as_ref(), opts.projection),
+                });
             }
+            Ok(ScanChunk {
+                entries,
+                has_more: false,
+            })
+        }
+    }
+}
 
-            for key in &self.staged_put_keys {
-                if bounds.contains(key.0.as_ref()) {
-                    self.batch.delete(key.0.as_ref());
+impl BackendWrite for RocksDbWrite {
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for entry in entries.entries {
+                let key = physical_key(space, &entry.key);
+                let value = stored_value_bytes(entry.value);
+                self.stats.put_entries += 1;
+                self.stats.written_bytes += value.len() as u64;
+                self.staged_put_keys.push(key.clone());
+                self.batch.put(key.0.as_ref(), value.as_ref());
+            }
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for key in keys {
+                self.batch.delete(physical_key(space, key).0.as_ref());
+            }
+            self.stats.deleted_entries += keys.len() as u64;
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            let range = physical_range(space, range);
+            if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
+                self.batch.delete_range(lower.as_slice(), upper.as_slice());
+            } else {
+                let bounds = EncodedBounds::new(range, None);
+                for item in self
+                    .db
+                    .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
+                {
+                    let (encoded_key, _value) = item.map_err(rocksdb_error)?;
+                    let encoded_key = encoded_key.as_ref();
+                    if !bounds.after_lower(encoded_key) {
+                        continue;
+                    }
+                    if !bounds.before_upper(encoded_key) {
+                        break;
+                    }
+                    self.batch.delete(encoded_key);
+                }
+
+                for key in &self.staged_put_keys {
+                    if bounds.contains(key.0.as_ref()) {
+                        self.batch.delete(key.0.as_ref());
+                    }
                 }
             }
+            self.stats.deleted_ranges += 1;
+            self.stats.backend_calls += 1;
+            Ok(())
         }
-
-        self.stats.deleted_ranges += 1;
-        self.stats.backend_calls += 1;
-        Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        self.db.write(self.batch).map_err(rocksdb_error)?;
-        Ok(CommitResult {
-            commit_id: None,
-            stats: self.stats,
-        })
+    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+        async move {
+            self.db.write(self.batch).map_err(rocksdb_error)?;
+            Ok(CommitResult {
+                commit_id: None,
+                stats: self.stats,
+            })
+        }
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
-        Ok(())
+    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -450,10 +473,10 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
     value.bytes
 }
 
-fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
+fn project_value(value: &[u8], projection: CoreProjection) -> ProjectedValue {
     match projection {
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+        CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
     }
 }
 

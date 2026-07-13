@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::storage::{InMemoryStorageBackend, StorageBackend};
+use crate::storage::InMemoryStorageBackend;
+use crate::storage::StorageBackend;
 use tokio::sync::Notify;
 
 use crate::LixError;
@@ -28,8 +29,6 @@ pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
         self.ensure_open()?;
@@ -76,8 +75,6 @@ where
 impl<B> SessionTransaction<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<B>, LixError> {
         self.ensure_session_open()?;

@@ -4,9 +4,10 @@ use std::sync::Arc;
 use crate::branch::BranchRefReader;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql2;
+use crate::storage::StorageBackend;
 use crate::storage::{
-    SharedStorageRead, StorageBackend, StorageContext, StorageReadOptions, StorageReadScope,
-    StorageWriteOptions, StorageWriteSet,
+    SharedStorageRead, StorageContext, StorageReadOptions, StorageReadScope, StorageWriteOptions,
+    StorageWriteSet,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
@@ -310,8 +311,6 @@ pub struct ExecuteOptions {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
@@ -385,7 +384,10 @@ where
         } else {
             None
         };
-        let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
+        let read_scope = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
         let read_result =
             with_static_session_sql_read::<B, _, _, _>(read_scope, |read_store| async move {
                 self.execute_read_statement_with_store(read_store, sql, statement, params)
@@ -437,7 +439,10 @@ where
             .collect::<Result<Vec<_>, LixError>>()?;
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
+        let read_scope = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
         with_static_session_sql_read::<B, _, _, _>(read_scope, |read_store| async move {
             let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
             let active_branch_commit_id = self
@@ -455,7 +460,8 @@ where
                 .commit_id
                 .to_string();
             let storage_mutation_revision =
-                StorageContext::<B>::load_mutation_revision_from_read(&read_store)?
+                StorageContext::<B>::load_mutation_revision_from_read(&read_store)
+                    .await?
                     .map(|revision| revision.to_vec());
             if parsed.is_empty() {
                 return Ok(CoherentReadBatch {
@@ -564,11 +570,13 @@ where
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
         let prepared_commit = self
             .storage
-            .prepare_write_set(writes, StorageWriteOptions::default())?;
-        let stats = commit_at_boundary(Some(&commit_boundary), || {
-            let (_commit, stats) = prepared_commit.commit()?;
+            .prepare_write_set(writes, StorageWriteOptions::default())
+            .await?;
+        let stats = commit_at_boundary(Some(&commit_boundary), || async move {
+            let (_commit, stats) = prepared_commit.commit().await?;
             Ok(stats)
-        })?;
+        })
+        .await?;
         Ok(Some(stats))
     }
 
@@ -626,16 +634,16 @@ where
 {
     // SAFETY: the widened read is wrapped immediately in `SharedStorageRead`,
     // only passed into this private SQL execution closure, and explicitly
-    // closed before returning. Escaped clones are detected by `close()`.
+    // dropped before returning. Escaped clones are detected by `finish()`.
     let read = unsafe { assume_static_backend_read::<B>(read) };
     let read = SharedStorageRead::new(read);
-    let close = read.clone();
+    let finish = read.clone();
     let result = f(read).await;
-    let close_result = close.close().map_err(LixError::from);
-    match (result, close_result) {
+    let finish_result = finish.finish().map_err(LixError::from);
+    match (result, finish_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (_, Err(close_error)) => Err(close_error),
+        (_, Err(finish_error)) => Err(finish_error),
     }
 }
 
@@ -660,8 +668,6 @@ where
 impl<B> SessionTransaction<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one SQL statement inside this transaction.
     ///
@@ -767,8 +773,6 @@ async fn execute_transaction_write_auto<B>(
 ) -> Result<ExecuteResult, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
@@ -791,8 +795,6 @@ async fn execute_transaction_write_with_mode<B>(
 ) -> Result<ExecuteResult, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
@@ -810,8 +812,6 @@ async fn execute_transaction_write_with_mode_and_trace<B>(
 ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;

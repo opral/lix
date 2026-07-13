@@ -3,32 +3,39 @@ use crate::backend::conformance::{
     fixtures::{full_put, key, put_batch, space},
 };
 use crate::backend::{
-    Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions, SpaceId, WriteOptions,
-    get_many as backend_get_many,
+    Backend, BackendRead, BackendWrite, GetOptions, ProjectedValue, ReadOptions, SpaceId,
+    WriteOptions,
 };
 
 /// Single space used by these fixtures; cross-space isolation is pinned
 /// by the baseline cross-space tests.
 const TEST_SPACE: SpaceId = SpaceId(7);
 
-pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
+pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
     F: BackendFactory,
 {
-    report.run("persistence::committed_data_survives_reopen", || {
-        committed_data_survives_reopen(factory)
-    });
-    report.run(
-        "persistence::rolled_back_data_does_not_survive_reopen",
-        || rolled_back_data_does_not_survive_reopen(factory),
-    );
-    report.run(
-        "persistence::overwrite_and_delete_final_state_survives_reopen",
-        || overwrite_and_delete_final_state_survives_reopen(factory),
-    );
+    report
+        .run(
+            "persistence::committed_data_survives_reopen",
+            committed_data_survives_reopen(factory),
+        )
+        .await;
+    report
+        .run(
+            "persistence::rolled_back_data_does_not_survive_reopen",
+            rolled_back_data_does_not_survive_reopen(factory),
+        )
+        .await;
+    report
+        .run(
+            "persistence::overwrite_and_delete_final_state_survives_reopen",
+            overwrite_and_delete_final_state_survives_reopen(factory),
+        )
+        .await;
 }
 
-fn committed_data_survives_reopen<F>(factory: &F) -> ConformanceResult
+async fn committed_data_survives_reopen<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -38,9 +45,10 @@ where
     let beta = key("beta");
 
     {
-        let backend = fixture.open();
+        let backend = fixture.open().await;
         let mut write = backend
             .begin_write(WriteOptions::default())
+            .await
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
             .put_many(
@@ -50,13 +58,15 @@ where
                     full_put(beta.clone(), "persisted-beta"),
                 ]),
             )
+            .await
             .map_err(|error| format!("put_many failed: {error}"))?;
         write
             .commit()
+            .await
             .map_err(|error| format!("commit failed: {error}"))?;
     }
 
-    let reopened = fixture.open();
+    let reopened = fixture.open().await;
     assert_full_values(
         &reopened,
         test_space,
@@ -65,9 +75,10 @@ where
             (beta, Some("persisted-beta")),
         ],
     )
+    .await
 }
 
-fn rolled_back_data_does_not_survive_reopen<F>(factory: &F) -> ConformanceResult
+async fn rolled_back_data_does_not_survive_reopen<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -76,26 +87,29 @@ where
     let rolled_back = key("rolled-back");
 
     {
-        let backend = fixture.open();
+        let backend = fixture.open().await;
         let mut write = backend
             .begin_write(WriteOptions::default())
+            .await
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
             .put_many(
                 TEST_SPACE,
                 put_batch([full_put(rolled_back.clone(), "should-not-persist")]),
             )
+            .await
             .map_err(|error| format!("put_many failed: {error}"))?;
         write
             .rollback()
+            .await
             .map_err(|error| format!("rollback failed: {error}"))?;
     }
 
-    let reopened = fixture.open();
-    assert_full_values(&reopened, test_space, &[(rolled_back, None)])
+    let reopened = fixture.open().await;
+    assert_full_values(&reopened, test_space, &[(rolled_back, None)]).await
 }
 
-fn overwrite_and_delete_final_state_survives_reopen<F>(factory: &F) -> ConformanceResult
+async fn overwrite_and_delete_final_state_survives_reopen<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -105,9 +119,10 @@ where
     let deleted = key("deleted");
 
     {
-        let backend = fixture.open();
+        let backend = fixture.open().await;
         let mut write = backend
             .begin_write(WriteOptions::default())
+            .await
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
             .put_many(
@@ -117,40 +132,47 @@ where
                     full_put(deleted.clone(), "delete-me"),
                 ]),
             )
+            .await
             .map_err(|error| format!("initial put_many failed: {error}"))?;
         write
             .commit()
+            .await
             .map_err(|error| format!("initial commit failed: {error}"))?;
     }
 
     {
-        let backend = fixture.open();
+        let backend = fixture.open().await;
         let mut write = backend
             .begin_write(WriteOptions::default())
+            .await
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
             .put_many(
                 TEST_SPACE,
                 put_batch([full_put(overwritten.clone(), "new")]),
             )
+            .await
             .map_err(|error| format!("overwrite put_many failed: {error}"))?;
         write
             .delete_many(TEST_SPACE, std::slice::from_ref(&deleted))
+            .await
             .map_err(|error| format!("delete_many failed: {error}"))?;
         write
             .commit()
+            .await
             .map_err(|error| format!("final commit failed: {error}"))?;
     }
 
-    let reopened = fixture.open();
+    let reopened = fixture.open().await;
     assert_full_values(
         &reopened,
         test_space,
         &[(overwritten, Some("new")), (deleted, None)],
     )
+    .await
 }
 
-fn assert_full_values<B>(
+async fn assert_full_values<B>(
     backend: &B,
     _test_space: SpaceId,
     expected: &[(crate::backend::Key, Option<&str>)],
@@ -164,8 +186,11 @@ where
         .collect::<Vec<_>>();
     let read = backend
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, TEST_SPACE, &keys, GetOptions::default())
+    let result = read
+        .get_many(TEST_SPACE, &keys, GetOptions::default())
+        .await
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     for (index, (key, expected_value)) in expected.iter().enumerate() {

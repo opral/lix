@@ -155,11 +155,11 @@ impl TransactionFixture {
         }
     }
 
-    pub(crate) fn layout_accounting(&self) -> Vec<TransactionLayoutAccounting> {
+    pub(crate) async fn layout_accounting(&self) -> Vec<TransactionLayoutAccounting> {
         match self {
-            Self::Sqlite(fixture) => fixture.layout_accounting(),
-            Self::RocksDb(fixture) => fixture.layout_accounting(),
-            Self::Redb(fixture) => fixture.layout_accounting(),
+            Self::Sqlite(fixture) => fixture.layout_accounting().await,
+            Self::RocksDb(fixture) => fixture.layout_accounting().await,
+            Self::Redb(fixture) => fixture.layout_accounting().await,
         }
     }
 }

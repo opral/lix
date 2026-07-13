@@ -35,7 +35,8 @@ async fn get_one(
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
     let result = PointReadPlan::new(space, &[StorageKey(Bytes::from(key))])
-        .materialize(store, StorageGetOptions::default())?;
+        .materialize(store, StorageGetOptions::default())
+        .await?;
     Ok(result
         .value
         .into_iter()

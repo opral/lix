@@ -4,7 +4,7 @@ use lix_engine::storage::{
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions, StorageWriteSetStats,
 };
-use lix_engine::{Backend, Key, ProjectedValue, SpaceId};
+use lix_engine::{Backend, Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId};
 
 use crate::backends::{BackendProfile, ProfileBackend, RedbBackend, RocksDbBackend, SqliteBackend};
 use crate::workload::{WorkloadRow, snapshot_value};
@@ -72,7 +72,7 @@ impl KvWriteOutcome {
     }
 }
 
-pub(crate) fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
+pub(crate) async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
     let rows = bench_rows(rows);
     KvFixture {
         storage: profile_storage(profile),
@@ -80,134 +80,138 @@ pub(crate) fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Kv
     }
 }
 
-pub(crate) fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
-    let fixture = empty_fixture(profile, rows);
-    fixture.storage.insert_all(&fixture.rows);
+pub(crate) async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
+    let fixture = empty_fixture(profile, rows).await;
+    fixture.storage.insert_all(&fixture.rows).await;
     fixture
 }
 
 impl KvFixture {
-    pub(crate) fn insert_all(&mut self) -> usize {
-        self.insert_all_accounting().logical_rows
+    pub(crate) async fn insert_all(&mut self) -> usize {
+        self.insert_all_accounting().await.logical_rows
     }
 
     #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn insert_all_accounting(&mut self) -> KvWriteAccounting {
-        self.storage.insert_all(&self.rows).accounting()
+    pub(crate) async fn insert_all_accounting(&mut self) -> KvWriteAccounting {
+        self.storage.insert_all(&self.rows).await.accounting()
     }
 
-    pub(crate) fn read_all(&self) -> usize {
+    pub(crate) async fn read_all(&self) -> usize {
         self.storage
             .read_all(self.rows.len(), StorageCoreProjection::FullValue)
+            .await
     }
 
-    pub(crate) fn read_many_by_pk(&self, count: usize) -> usize {
+    pub(crate) async fn read_many_by_pk(&self, count: usize) -> usize {
         self.storage
             .read_points(&self.rows[..count.min(self.rows.len())])
+            .await
     }
 
-    pub(crate) fn read_one_by_pk(&self) -> usize {
+    pub(crate) async fn read_one_by_pk(&self) -> usize {
         self.storage
             .read_points(std::slice::from_ref(&self.rows[self.rows.len() / 2]))
+            .await
     }
 
-    pub(crate) fn update_all(&mut self) -> usize {
-        self.update_all_accounting().logical_rows
-    }
-
-    #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn update_all_accounting(&mut self) -> KvWriteAccounting {
-        self.storage.update_all(&self.rows).accounting()
-    }
-
-    pub(crate) fn update_one_by_pk(&mut self) -> usize {
-        self.update_one_by_pk_accounting().logical_rows
+    pub(crate) async fn update_all(&mut self) -> usize {
+        self.update_all_accounting().await.logical_rows
     }
 
     #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn update_one_by_pk_accounting(&mut self) -> KvWriteAccounting {
-        self.storage.update_all(&self.rows[..1]).accounting()
+    pub(crate) async fn update_all_accounting(&mut self) -> KvWriteAccounting {
+        self.storage.update_all(&self.rows).await.accounting()
     }
 
-    pub(crate) fn delete_all(&mut self) -> usize {
-        self.delete_all_accounting().logical_rows
-    }
-
-    #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn delete_all_accounting(&mut self) -> KvWriteAccounting {
-        self.storage.delete_all(self.rows.len()).accounting()
-    }
-
-    pub(crate) fn delete_one_by_pk(&mut self) -> usize {
-        self.delete_one_by_pk_accounting().logical_rows
+    pub(crate) async fn update_one_by_pk(&mut self) -> usize {
+        self.update_one_by_pk_accounting().await.logical_rows
     }
 
     #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn delete_one_by_pk_accounting(&mut self) -> KvWriteAccounting {
+    pub(crate) async fn update_one_by_pk_accounting(&mut self) -> KvWriteAccounting {
+        self.storage.update_all(&self.rows[..1]).await.accounting()
+    }
+
+    pub(crate) async fn delete_all(&mut self) -> usize {
+        self.delete_all_accounting().await.logical_rows
+    }
+
+    #[expect(clippy::needless_pass_by_ref_mut)]
+    pub(crate) async fn delete_all_accounting(&mut self) -> KvWriteAccounting {
+        self.storage.delete_all(self.rows.len()).await.accounting()
+    }
+
+    pub(crate) async fn delete_one_by_pk(&mut self) -> usize {
+        self.delete_one_by_pk_accounting().await.logical_rows
+    }
+
+    #[expect(clippy::needless_pass_by_ref_mut)]
+    pub(crate) async fn delete_one_by_pk_accounting(&mut self) -> KvWriteAccounting {
         self.storage
             .delete_one(&self.rows[self.rows.len() / 2])
+            .await
             .accounting()
     }
 
-    pub(crate) fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
-        self.storage.layout_accounting()
+    pub(crate) async fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
+        self.storage.layout_accounting().await
     }
 }
 
 impl ProfileStorage {
-    fn insert_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
+    async fn insert_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => insert_all_storage(storage, rows),
-            Self::RocksDb(storage) => insert_all_storage(storage, rows),
-            Self::Redb(storage) => insert_all_storage(storage, rows),
+            Self::Sqlite(storage) => insert_all_storage(storage, rows).await,
+            Self::RocksDb(storage) => insert_all_storage(storage, rows).await,
+            Self::Redb(storage) => insert_all_storage(storage, rows).await,
         }
     }
 
-    fn update_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
+    async fn update_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => update_all_storage(storage, rows),
-            Self::RocksDb(storage) => update_all_storage(storage, rows),
-            Self::Redb(storage) => update_all_storage(storage, rows),
+            Self::Sqlite(storage) => update_all_storage(storage, rows).await,
+            Self::RocksDb(storage) => update_all_storage(storage, rows).await,
+            Self::Redb(storage) => update_all_storage(storage, rows).await,
         }
     }
 
-    fn delete_all(&self, row_count: usize) -> KvWriteOutcome {
+    async fn delete_all(&self, row_count: usize) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => delete_all_storage(storage, row_count),
-            Self::RocksDb(storage) => delete_all_storage(storage, row_count),
-            Self::Redb(storage) => delete_all_storage(storage, row_count),
+            Self::Sqlite(storage) => delete_all_storage(storage, row_count).await,
+            Self::RocksDb(storage) => delete_all_storage(storage, row_count).await,
+            Self::Redb(storage) => delete_all_storage(storage, row_count).await,
         }
     }
 
-    fn delete_one(&self, row: &BenchRow) -> KvWriteOutcome {
+    async fn delete_one(&self, row: &BenchRow) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => delete_one_storage(storage, row),
-            Self::RocksDb(storage) => delete_one_storage(storage, row),
-            Self::Redb(storage) => delete_one_storage(storage, row),
+            Self::Sqlite(storage) => delete_one_storage(storage, row).await,
+            Self::RocksDb(storage) => delete_one_storage(storage, row).await,
+            Self::Redb(storage) => delete_one_storage(storage, row).await,
         }
     }
 
-    fn read_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
+    async fn read_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
         match self {
-            Self::Sqlite(storage) => read_all_storage(storage, expected_rows, projection),
-            Self::RocksDb(storage) => read_all_storage(storage, expected_rows, projection),
-            Self::Redb(storage) => read_all_storage(storage, expected_rows, projection),
+            Self::Sqlite(storage) => read_all_storage(storage, expected_rows, projection).await,
+            Self::RocksDb(storage) => read_all_storage(storage, expected_rows, projection).await,
+            Self::Redb(storage) => read_all_storage(storage, expected_rows, projection).await,
         }
     }
 
-    fn read_points(&self, rows: &[BenchRow]) -> usize {
+    async fn read_points(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::Sqlite(storage) => read_points_storage(storage, rows),
-            Self::RocksDb(storage) => read_points_storage(storage, rows),
-            Self::Redb(storage) => read_points_storage(storage, rows),
+            Self::Sqlite(storage) => read_points_storage(storage, rows).await,
+            Self::RocksDb(storage) => read_points_storage(storage, rows).await,
+            Self::Redb(storage) => read_points_storage(storage, rows).await,
         }
     }
 
-    fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
+    async fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
         match self {
-            Self::Sqlite(storage) => layout_accounting_storage(storage),
-            Self::RocksDb(storage) => layout_accounting_storage(storage),
-            Self::Redb(storage) => layout_accounting_storage(storage),
+            Self::Sqlite(storage) => layout_accounting_storage(storage).await,
+            Self::RocksDb(storage) => layout_accounting_storage(storage).await,
+            Self::Redb(storage) => layout_accounting_storage(storage).await,
         }
     }
 }
@@ -253,7 +257,7 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
-fn insert_all_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> KvWriteOutcome
+async fn insert_all_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> KvWriteOutcome
 where
     B: Backend,
 {
@@ -263,6 +267,7 @@ where
     }
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
+        .await
         .expect("commit insert rows");
     assert_eq!(stats.staged_puts, rows.len() as u64);
     KvWriteOutcome {
@@ -272,7 +277,7 @@ where
     }
 }
 
-fn update_all_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> KvWriteOutcome
+async fn update_all_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> KvWriteOutcome
 where
     B: Backend,
 {
@@ -282,6 +287,7 @@ where
     }
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
+        .await
         .expect("commit update rows");
     assert_eq!(stats.staged_puts, rows.len() as u64);
     KvWriteOutcome {
@@ -291,12 +297,13 @@ where
     }
 }
 
-fn delete_all_storage<B>(storage: &StorageContext<B>, row_count: usize) -> KvWriteOutcome
+async fn delete_all_storage<B>(storage: &StorageContext<B>, row_count: usize) -> KvWriteOutcome
 where
     B: Backend,
 {
     let _commit = storage
         .clear_space(ROW_SPACE, StorageWriteOptions::default())
+        .await
         .expect("clear tracked-state crud rows");
     let stats = StorageWriteSetStats {
         backend_calls: 1,
@@ -310,7 +317,7 @@ where
     }
 }
 
-fn delete_one_storage<B>(storage: &StorageContext<B>, row: &BenchRow) -> KvWriteOutcome
+async fn delete_one_storage<B>(storage: &StorageContext<B>, row: &BenchRow) -> KvWriteOutcome
 where
     B: Backend,
 {
@@ -318,6 +325,7 @@ where
     writes.delete(ROW_SPACE, row.key.clone());
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
+        .await
         .expect("commit delete row");
     assert_eq!(stats.staged_deletes, 1);
     KvWriteOutcome {
@@ -327,7 +335,7 @@ where
     }
 }
 
-fn read_all_storage<B>(
+async fn read_all_storage<B>(
     storage: &StorageContext<B>,
     expected_rows: usize,
     projection: StorageCoreProjection,
@@ -337,66 +345,124 @@ where
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
+        .await
         .expect("begin read");
-    let page = ScanPlan::prefix(
+    let plan = ScanPlan::prefix(
         ROW_SPACE,
         StoragePrefix {
             bytes: Bytes::new(),
         },
-    )
-    .collect(
-        &read,
-        StorageScanOptions {
-            projection,
-            limit_rows: expected_rows + 1,
-            ..StorageScanOptions::default()
-        },
-    )
-    .expect("scan rows");
-    assert_eq!(page.value.entries.len(), expected_rows);
-    expected_rows
+    );
+    let mut resume_after = None;
+    let mut rows = 0usize;
+    loop {
+        let page = plan
+            .collect(
+                &read,
+                StorageScanOptions {
+                    projection,
+                    limit_rows: MAX_SCAN_PAGE_ROWS,
+                    resume_after,
+                },
+            )
+            .await
+            .expect("scan rows");
+        rows += page.value.entries.len();
+        if !page.value.has_more {
+            break;
+        }
+        resume_after = Some(
+            page.value
+                .entries
+                .last()
+                .expect("non-terminal scan page must not be empty")
+                .key
+                .clone(),
+        );
+    }
+    assert_eq!(rows, expected_rows);
+    rows
 }
 
-fn read_points_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+async fn read_points_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
 where
     B: Backend,
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
+        .await
         .expect("begin read");
     let keys = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
     let result = PointReadPlan::new(ROW_SPACE, &keys)
         .materialize(&read, StorageGetOptions::default())
+        .await
         .expect("point read rows");
     assert_eq!(result.value.len(), rows.len());
     assert!(result.value.iter().all(Option::is_some));
     result.value.len()
 }
 
-fn layout_accounting_storage<B>(storage: &StorageContext<B>) -> Vec<KvLayoutAccounting>
+async fn layout_accounting_storage<B>(storage: &StorageContext<B>) -> Vec<KvLayoutAccounting>
 where
     B: Backend,
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
+        .await
         .expect("begin kv layout accounting read");
-    let result = ScanPlan::prefix(
+    let plan = ScanPlan::prefix(
         ROW_SPACE,
         StoragePrefix {
             bytes: Bytes::new(),
         },
-    )
-    .collect(
-        &read,
-        StorageScanOptions {
-            projection: StorageCoreProjection::FullValue,
-            limit_rows: 1_000_000,
-            ..StorageScanOptions::default()
-        },
-    )
-    .expect("scan kv layout accounting");
+    );
+    let mut resume_after = None;
+    let mut rows = 0u64;
+    let mut key_bytes = 0u64;
+    let mut value_bytes = 0u64;
+    loop {
+        let page = plan
+            .collect(
+                &read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: MAX_SCAN_PAGE_ROWS,
+                    resume_after,
+                },
+            )
+            .await
+            .expect("scan kv layout accounting");
 
-    let rows = result.value.entries.len() as u64;
+        rows += page.value.entries.len() as u64;
+        key_bytes += page
+            .value
+            .entries
+            .iter()
+            .map(|entry| entry.key.0.len() as u64 + 4)
+            .sum::<u64>();
+        value_bytes += page
+            .value
+            .entries
+            .iter()
+            .map(|entry| match &entry.value {
+                ProjectedValue::KeyOnly => 0,
+                ProjectedValue::FullValue(value) => value.len() as u64,
+            })
+            .sum::<u64>();
+
+        if !page.value.has_more {
+            break;
+        }
+        resume_after = Some(
+            page.value
+                .entries
+                .last()
+                .expect("non-terminal accounting page must not be empty")
+                .key
+                .clone(),
+        );
+    }
+
     if rows == 0 {
         return Vec::new();
     }
@@ -405,20 +471,7 @@ where
         space_id: ROW_SPACE.id.0,
         space: ROW_SPACE.name,
         rows,
-        key_bytes: result
-            .value
-            .entries
-            .iter()
-            .map(|entry| entry.key.0.len() as u64 + 4)
-            .sum(),
-        value_bytes: result
-            .value
-            .entries
-            .iter()
-            .map(|entry| match &entry.value {
-                ProjectedValue::KeyOnly => 0,
-                ProjectedValue::FullValue(value) => value.len() as u64,
-            })
-            .sum(),
+        key_bytes,
+        value_bytes,
     }]
 }

@@ -1,12 +1,19 @@
+#![allow(
+    clippy::manual_async_fn,
+    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+)]
+
+use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, PutEntry, ReadOptions,
-    ScanOptions, ScanResult, ScanVisitor, SpaceId, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::ValueRef as SqlValueRef;
@@ -57,7 +64,7 @@ pub struct SqliteBackendOptions {
 
 #[allow(missing_debug_implementations)]
 pub struct SqliteRead {
-    conn: Option<Connection>,
+    conn: Mutex<Option<Connection>>,
     read_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
@@ -108,8 +115,8 @@ impl BackendFactory for SqliteBackendFactory {
 impl BackendFixture for SqliteBackendFixture {
     type Backend = SqliteBackend;
 
-    fn open(&self) -> Self::Backend {
-        SqliteBackend::open(&self.path).expect("open sqlite backend")
+    fn open(&self) -> impl Future<Output = Self::Backend> + Send {
+        async move { SqliteBackend::open(&self.path).expect("open sqlite backend") }
     }
 }
 
@@ -169,170 +176,171 @@ impl Backend for SqliteBackend {
         = SqliteWrite
     where
         Self: 'a;
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        let conn = self
-            .read_pool
-            .lock()
-            .map_err(|error| BackendError::Io(format!("sqlite read pool poisoned: {error}")))?
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(|| self.connect())?;
-        execute_cached(&conn, "BEGIN DEFERRED TRANSACTION")?;
-        pin_read_snapshot(&conn)?;
-        Ok(SqliteRead {
-            conn: Some(conn),
-            read_pool: Arc::clone(&self.read_pool),
-        })
+    fn begin_read(
+        &self,
+        _opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+        async move {
+            let conn = self
+                .read_pool
+                .lock()
+                .map_err(|error| BackendError::Io(format!("sqlite read pool poisoned: {error}")))?
+                .pop()
+                .map(Ok)
+                .unwrap_or_else(|| self.connect())?;
+            execute_cached(&conn, "BEGIN DEFERRED TRANSACTION")?;
+            pin_read_snapshot(&conn)?;
+            Ok(SqliteRead {
+                conn: Mutex::new(Some(conn)),
+                read_pool: Arc::clone(&self.read_pool),
+            })
+        }
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        let conn = self
-            .write_pool
-            .lock()
-            .map_err(|error| BackendError::Io(format!("sqlite write pool poisoned: {error}")))?
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(|| self.connect())?;
-        execute_cached(&conn, "BEGIN IMMEDIATE TRANSACTION")?;
-        Ok(SqliteWrite {
-            conn: Some(conn),
-            write_pool: Arc::clone(&self.write_pool),
-            stats: WriteStats::default(),
-        })
+    fn begin_write(
+        &self,
+        _opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            let conn = self
+                .write_pool
+                .lock()
+                .map_err(|error| BackendError::Io(format!("sqlite write pool poisoned: {error}")))?
+                .pop()
+                .map(Ok)
+                .unwrap_or_else(|| self.connect())?;
+            execute_cached(&conn, "BEGIN IMMEDIATE TRANSACTION")?;
+            Ok(SqliteWrite {
+                conn: Some(conn),
+                write_pool: Arc::clone(&self.write_pool),
+                stats: WriteStats::default(),
+            })
+        }
     }
 }
 
 impl BackendRead for SqliteRead {
-    fn visit_keys<V>(
+    fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let conn = self.conn()?;
-        if !space_table_exists(conn, space)? {
-            for (index, key) in keys.iter().enumerate() {
-                visitor.visit(index, key, None)?;
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        async move {
+            if keys.is_empty() {
+                return Ok(GetManyResult::new(Vec::new()));
             }
-            return Ok(());
+            let conn = self.conn.lock().map_err(|error| {
+                BackendError::Io(format!("sqlite read connection poisoned: {error}"))
+            })?;
+            let conn = conn
+                .as_ref()
+                .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))?;
+            let mut values = vec![None; keys.len()];
+            if !space_table_exists(conn, space)? {
+                return Ok(GetManyResult::new(values));
+            }
+            for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
+                read_points_chunk(
+                    conn,
+                    space,
+                    chunk_index * POINT_READ_CHUNK_KEYS,
+                    chunk,
+                    opts.projection,
+                    &mut values,
+                )?;
+            }
+            Ok(GetManyResult::new(values))
         }
-        for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
-            visit_points_chunk(
-                conn,
-                space,
-                keys,
-                chunk_index * POINT_READ_CHUNK_KEYS,
-                chunk,
-                opts.projection,
-                visitor,
-            )?;
-        }
-        Ok(())
     }
 
-    fn scan<V>(
+    fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        if opts.limit_rows == 0 {
-            return Ok(ScanResult {
-                emitted: 0,
-                has_more: false,
-            });
-        }
-        let conn = self.conn()?;
-        if !space_table_exists(conn, space)? {
-            return Ok(ScanResult {
-                emitted: 0,
-                has_more: false,
-            });
-        }
-
-        let columns = match opts.projection {
-            CoreProjection::KeyOnly => "key",
-            CoreProjection::FullValue => "key, value",
-        };
-        let table = space_table(space);
-        // Predicates appear only when bound: each bound combination is its
-        // own cached statement shape, so the planner always sees seekable
-        // predicates.
-        let mut sql = format!("SELECT {columns} FROM {table} WHERE 1 = 1");
-        let mut binds: Vec<&[u8]> = Vec::with_capacity(3);
-        push_bound(
-            &mut sql,
-            &mut binds,
-            "key >",
-            opts.resume_after.map(|key| key.0.as_ref()),
-        );
-        push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
-        let limit_index = binds.len() + 1;
-        sql.push_str(" ORDER BY key ASC LIMIT ?");
-        sql.push_str(&limit_index.to_string());
-        let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-        for (index, bytes) in binds.iter().enumerate() {
-            stmt.raw_bind_parameter(index + 1, *bytes)
-                .map_err(sqlite_error)?;
-        }
-        // One lookahead row past the limit so has_more is answered by the
-        // same statement; clamp so usize::MAX limits do not wrap.
-        let fetch_limit = i64::try_from(opts.limit_rows.saturating_add(1)).unwrap_or(i64::MAX);
-        stmt.raw_bind_parameter(limit_index, fetch_limit)
-            .map_err(sqlite_error)?;
-
-        let mut rows = stmt.raw_query();
-        let mut emitted = 0usize;
-        while let Some(row) = rows.next().map_err(sqlite_error)? {
-            if emitted == opts.limit_rows {
-                return Ok(ScanResult {
-                    emitted,
-                    has_more: true,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        async move {
+            if opts.page_size() == 0 {
+                return Ok(ScanChunk {
+                    entries: Vec::new(),
+                    has_more: false,
                 });
             }
-            let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
-            match opts.projection {
-                CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?;
-                }
-                CoreProjection::FullValue => {
-                    let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
-                    visitor.visit(KeyRef(key), ProjectedValueRef::FullValue(value))?;
-                }
+            let conn = self.conn.lock().map_err(|error| {
+                BackendError::Io(format!("sqlite read connection poisoned: {error}"))
+            })?;
+            let conn = conn
+                .as_ref()
+                .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))?;
+            if !space_table_exists(conn, space)? {
+                return Ok(ScanChunk {
+                    entries: Vec::new(),
+                    has_more: false,
+                });
             }
-            emitted += 1;
-        }
-        Ok(ScanResult {
-            emitted,
-            has_more: false,
-        })
-    }
 
-    fn close(mut self) -> Result<(), BackendError> {
-        self.finish()
+            let columns = match opts.projection {
+                CoreProjection::KeyOnly => "key",
+                CoreProjection::FullValue => "key, value",
+            };
+            let table = space_table(space);
+            let mut sql = format!("SELECT {columns} FROM {table} WHERE 1 = 1");
+            let mut binds: Vec<&[u8]> = Vec::with_capacity(3);
+            push_bound(
+                &mut sql,
+                &mut binds,
+                "key >",
+                opts.resume_after.as_ref().map(|key| key.0.as_ref()),
+            );
+            push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
+            let limit_index = binds.len() + 1;
+            sql.push_str(" ORDER BY key ASC LIMIT ?");
+            sql.push_str(&limit_index.to_string());
+            let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+            for (index, bytes) in binds.iter().enumerate() {
+                stmt.raw_bind_parameter(index + 1, *bytes)
+                    .map_err(sqlite_error)?;
+            }
+            let fetch_limit = i64::try_from(opts.page_size().saturating_add(1)).unwrap_or(i64::MAX);
+            stmt.raw_bind_parameter(limit_index, fetch_limit)
+                .map_err(sqlite_error)?;
+
+            let mut rows = stmt.raw_query();
+            let mut entries = Vec::with_capacity(opts.page_size());
+            while let Some(row) = rows.next().map_err(sqlite_error)? {
+                if entries.len() == opts.page_size() {
+                    return Ok(ScanChunk {
+                        entries,
+                        has_more: true,
+                    });
+                }
+                let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
+                let value = match opts.projection {
+                    CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                    CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(
+                        blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?,
+                    )),
+                };
+                entries.push(ReadEntry {
+                    key: Key(Bytes::copy_from_slice(key)),
+                    value,
+                });
+            }
+            Ok(ScanChunk {
+                entries,
+                has_more: false,
+            })
+        }
     }
 }
 
 impl SqliteRead {
-    fn conn(&self) -> Result<&Connection, BackendError> {
-        self.conn
-            .as_ref()
-            .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))
-    }
-
     fn finish(&mut self) -> Result<(), BackendError> {
-        let Some(conn) = self.conn.take() else {
+        let conn = self.conn.get_mut().map_err(|error| {
+            BackendError::Io(format!("sqlite read connection poisoned: {error}"))
+        })?;
+        let Some(conn) = conn.take() else {
             return Ok(());
         };
         let result = execute_cached(&conn, "ROLLBACK").or_else(ignore_no_transaction);
@@ -352,91 +360,102 @@ impl Drop for SqliteRead {
 }
 
 impl BackendWrite for SqliteWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        let mut entries = entries.entries;
-        // Sorting keeps the upsert's conflict probe on a near-neighbor B-tree
-        // descent instead of a fresh root-to-leaf seek per row. Batches hold
-        // at most one mutation per key, so apply order does not matter.
-        // Engine write-set lowering already produces sorted batches, making
-        // this a linear verification pass; it stays because the sorted
-        // guarantee is scoped to the engine and other callers may pass
-        // unsorted batches.
-        entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
-        debug_assert!(
-            entries.windows(2).all(|pair| pair[0].key != pair[1].key),
-            "put batches must hold at most one mutation per key"
-        );
-        let put_entries = entries.len() as u64;
-        let written_bytes = entries
-            .iter()
-            .map(|entry| entry.value.bytes.len() as u64)
-            .sum::<u64>();
-        self.ensure_space_table(space)?;
-        self.put_rows(space, &entries)?;
-        self.stats.put_entries += put_entries;
-        self.stats.written_bytes += written_bytes;
-        self.stats.backend_calls += 1;
-        Ok(())
-    }
-
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        if space_table_exists(self.conn(), space)? {
-            let table = space_table(space);
-            let sql = format!("DELETE FROM {table} WHERE key = ?1");
-            let conn = self.conn();
-            let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-            for key in keys {
-                stmt.execute(params![key.0.as_ref()])
-                    .map_err(sqlite_error)?;
-            }
-        }
-        self.stats.deleted_entries += keys.len() as u64;
-        self.stats.backend_calls += 1;
-        Ok(())
-    }
-
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        let deleted = if !space_table_exists(self.conn(), space)? {
-            0
-        } else {
-            let table = space_table(space);
-            let unbounded = matches!(
-                (&range.lower, &range.upper),
-                (Bound::Unbounded, Bound::Unbounded)
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            let mut entries = entries.entries;
+            entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
+            debug_assert!(
+                entries.windows(2).all(|pair| pair[0].key != pair[1].key),
+                "put batches must hold at most one mutation per key"
             );
-            if unbounded {
-                // The whole space is in range: an unqualified DELETE lets
-                // SQLite drop pages instead of walking rows.
-                let sql = format!("DELETE FROM {table}");
-                self.conn().execute(&sql, []).map_err(sqlite_error)?
-            } else {
-                let mut sql = format!("DELETE FROM {table} WHERE 1 = 1");
-                let mut binds: Vec<&[u8]> = Vec::with_capacity(2);
-                push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
-                let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
-                for (index, bytes) in binds.iter().enumerate() {
-                    stmt.raw_bind_parameter(index + 1, *bytes)
+            let put_entries = entries.len() as u64;
+            let written_bytes = entries
+                .iter()
+                .map(|entry| entry.value.bytes.len() as u64)
+                .sum::<u64>();
+            self.ensure_space_table(space)?;
+            self.put_rows(space, &entries)?;
+            self.stats.put_entries += put_entries;
+            self.stats.written_bytes += written_bytes;
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            if space_table_exists(self.conn(), space)? {
+                let table = space_table(space);
+                let sql = format!("DELETE FROM {table} WHERE key = ?1");
+                let conn = self.conn();
+                let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+                for key in keys {
+                    stmt.execute(params![key.0.as_ref()])
                         .map_err(sqlite_error)?;
                 }
-                stmt.raw_execute().map_err(sqlite_error)?
             }
-        };
-        self.stats.deleted_entries += deleted as u64;
-        self.stats.deleted_ranges += 1;
-        self.stats.backend_calls += 1;
-        Ok(())
+            self.stats.deleted_entries += keys.len() as u64;
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
     }
 
-    fn commit(mut self) -> Result<CommitResult, BackendError> {
-        self.finish("COMMIT")?;
-        Ok(CommitResult {
-            commit_id: None,
-            stats: std::mem::take(&mut self.stats),
-        })
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            let deleted = if !space_table_exists(self.conn(), space)? {
+                0
+            } else {
+                let table = space_table(space);
+                let unbounded = matches!(
+                    (&range.lower, &range.upper),
+                    (Bound::Unbounded, Bound::Unbounded)
+                );
+                if unbounded {
+                    let sql = format!("DELETE FROM {table}");
+                    self.conn().execute(&sql, []).map_err(sqlite_error)?
+                } else {
+                    let mut sql = format!("DELETE FROM {table} WHERE 1 = 1");
+                    let mut binds: Vec<&[u8]> = Vec::with_capacity(2);
+                    push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
+                    let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
+                    for (index, bytes) in binds.iter().enumerate() {
+                        stmt.raw_bind_parameter(index + 1, *bytes)
+                            .map_err(sqlite_error)?;
+                    }
+                    stmt.raw_execute().map_err(sqlite_error)?
+                }
+            };
+            self.stats.deleted_entries += deleted as u64;
+            self.stats.deleted_ranges += 1;
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
     }
 
-    fn rollback(mut self) -> Result<(), BackendError> {
-        self.finish("ROLLBACK")
+    fn commit(mut self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+        async move {
+            self.finish("COMMIT")?;
+            Ok(CommitResult {
+                commit_id: None,
+                stats: std::mem::take(&mut self.stats),
+            })
+        }
+    }
+
+    fn rollback(mut self) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move { self.finish("ROLLBACK") }
     }
 }
 
@@ -609,18 +628,14 @@ fn space_table_exists(conn: &Connection, space: SpaceId) -> Result<bool, Backend
 }
 
 #[expect(clippy::cast_possible_wrap)]
-fn visit_points_chunk<V>(
+fn read_points_chunk(
     conn: &Connection,
     space: SpaceId,
-    keys: &[Key],
     offset: usize,
     chunk: &[Key],
     projection: CoreProjection,
-    visitor: &mut V,
-) -> Result<(), BackendError>
-where
-    V: PointVisitor + ?Sized,
-{
+    values: &mut [Option<ProjectedValue>],
+) -> Result<(), BackendError> {
     // No ORDER BY: callers address results by the returned ordinal, never by
     // visit order, and binding by reference avoids an owned copy of every key.
     let projected_column = match projection {
@@ -649,7 +664,7 @@ where
         let index = usize::try_from(index).map_err(|_| {
             BackendError::Corruption(format!("sqlite requested ordinal was negative: {index}"))
         })?;
-        let Some(key) = keys.get(index) else {
+        let Some(slot) = values.get_mut(index) else {
             return Err(BackendError::Corruption(format!(
                 "sqlite requested ordinal out of bounds: {index}"
             )));
@@ -657,9 +672,9 @@ where
         let projected = row.get_ref(1).map_err(sqlite_error)?;
         let value = match (projection, projected) {
             (_, SqlValueRef::Null) => None,
-            (CoreProjection::KeyOnly, SqlValueRef::Blob(_)) => Some(ProjectedValueRef::KeyOnly),
+            (CoreProjection::KeyOnly, SqlValueRef::Blob(_)) => Some(ProjectedValue::KeyOnly),
             (CoreProjection::FullValue, SqlValueRef::Blob(value)) => {
-                Some(ProjectedValueRef::FullValue(value))
+                Some(ProjectedValue::FullValue(Bytes::copy_from_slice(value)))
             }
             (_, other) => {
                 return Err(BackendError::Corruption(format!(
@@ -667,7 +682,7 @@ where
                 )));
             }
         };
-        visitor.visit(index, key, value)?;
+        *slot = value;
     }
     Ok(())
 }

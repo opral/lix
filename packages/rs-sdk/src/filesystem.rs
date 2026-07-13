@@ -1,5 +1,11 @@
+#![allow(
+    clippy::manual_async_fn,
+    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -12,6 +18,7 @@ use lix_engine::{
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
+use tokio::sync::oneshot;
 
 #[cfg(feature = "fs_backend")]
 use lix_fs_backend::RocksDbFilesystemBackend;
@@ -29,8 +36,6 @@ const FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS: usize = 4;
 pub(crate) struct FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     inner: B,
     supervisor: FilesystemSupervisor<B>,
@@ -115,8 +120,6 @@ struct FilesystemPathFilter {
 pub(crate) struct FilesystemWrite<'a, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     inner: B::Write<'a>,
     supervisor: FilesystemSupervisor<B>,
@@ -142,8 +145,6 @@ pub struct FsWrite<'a> {
 struct FilesystemSupervisor<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     inner: Arc<FilesystemSupervisorInner>,
     _marker: PhantomData<fn() -> B>,
@@ -168,8 +169,6 @@ struct FilesystemWatchPath {
 struct FilesystemState<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     session: SessionContext<B>,
     layout: FilesystemLayout,
@@ -320,14 +319,14 @@ struct LixSnapshotRead {
 enum FilesystemEvent {
     DiskChanged,
     SyncDiskToLix {
-        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+        reply_tx: oneshot::Sender<Result<(), LixError>>,
     },
     SyncFromLix {
-        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+        reply_tx: oneshot::Sender<Result<(), LixError>>,
     },
     ImportPaths {
         paths: Vec<String>,
-        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+        reply_tx: oneshot::Sender<Result<(), LixError>>,
     },
     Shutdown,
 }
@@ -379,36 +378,56 @@ impl Backend for FsBackend {
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    fn begin_read(
+        &self,
+        opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
         self.inner.begin_read(opts)
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(FsWrite {
-            inner: self.inner.begin_write(opts)?,
-        })
+    fn begin_write(
+        &self,
+        opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            Ok(FsWrite {
+                inner: self.inner.begin_write(opts).await?,
+            })
+        }
     }
 }
 
 #[cfg(feature = "fs_backend")]
 impl BackendWrite for FsWrite<'_> {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.delete_range(space, range)
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
+    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
         self.inner.commit()
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.rollback()
     }
 }
@@ -416,8 +435,6 @@ impl BackendWrite for FsWrite<'_> {
 impl<B> FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     #[cfg(feature = "fs_backend")]
     async fn open_filesystem(
@@ -446,24 +463,24 @@ where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.supervisor.import_paths_blocking(
-            paths
-                .into_iter()
-                .map(|path| path.as_ref().to_string())
-                .collect(),
-        )
+        self.supervisor
+            .import_paths(
+                paths
+                    .into_iter()
+                    .map(|path| path.as_ref().to_string())
+                    .collect(),
+            )
+            .await
     }
 
     async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
-        self.supervisor.sync_disk_to_lix_blocking()
+        self.supervisor.sync_disk_to_lix().await
     }
 }
 
 impl<B> Backend for FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     type Read<'a>
         = B::Read<'a>
@@ -475,43 +492,63 @@ where
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    fn begin_read(
+        &self,
+        opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
         self.inner.begin_read(opts)
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(FilesystemWrite {
-            inner: self.inner.begin_write(opts)?,
-            supervisor: self.supervisor.clone(),
-        })
+    fn begin_write(
+        &self,
+        opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            Ok(FilesystemWrite {
+                inner: self.inner.begin_write(opts).await?,
+                supervisor: self.supervisor.clone(),
+            })
+        }
     }
 }
 
 impl<B> BackendWrite for FilesystemWrite<'_, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.delete_range(space, range)
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        let result = self.inner.commit()?;
-        self.supervisor.sync_from_lix_blocking()?;
-        Ok(result)
+    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+        async move {
+            let result = self.inner.commit().await?;
+            self.supervisor.sync_from_lix().await?;
+            Ok(result)
+        }
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
         self.inner.rollback()
     }
 }
@@ -519,8 +556,6 @@ where
 impl<B> FilesystemSupervisor<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     async fn open(
         engine: Engine<B>,
@@ -589,8 +624,8 @@ where
         })
     }
 
-    fn sync_disk_to_lix_blocking(&self) -> Result<(), LixError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .event_tx
             .send(FilesystemEvent::SyncDiskToLix { reply_tx })
@@ -599,7 +634,7 @@ where
                     "filesystem sync failed: filesystem worker stopped: {error}"
                 ))
             })?;
-        match reply_rx.recv() {
+        match reply_rx.await {
             Ok(result) => result,
             Err(error) => Err(filesystem_error(format!(
                 "filesystem sync failed: filesystem worker stopped: {error}"
@@ -607,8 +642,8 @@ where
         }
     }
 
-    fn sync_from_lix_blocking(&self) -> Result<(), BackendError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    async fn sync_from_lix(&self) -> Result<(), BackendError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .event_tx
             .send(FilesystemEvent::SyncFromLix { reply_tx })
@@ -617,7 +652,7 @@ where
                     "filesystem sync failed: filesystem worker stopped: {error}"
                 ))
             })?;
-        match reply_rx.recv() {
+        match reply_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(filesystem_sync_backend_error(error)),
             Err(error) => Err(BackendError::Io(format!(
@@ -626,8 +661,8 @@ where
         }
     }
 
-    fn import_paths_blocking(&self, paths: Vec<String>) -> Result<(), LixError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    async fn import_paths(&self, paths: Vec<String>) -> Result<(), LixError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .event_tx
             .send(FilesystemEvent::ImportPaths { paths, reply_tx })
@@ -636,7 +671,7 @@ where
                     "filesystem import failed: filesystem worker stopped: {error}"
                 ))
             })?;
-        match reply_rx.recv() {
+        match reply_rx.await {
             Ok(result) => result,
             Err(error) => Err(filesystem_error(format!(
                 "filesystem import failed: filesystem worker stopped: {error}"
@@ -665,8 +700,6 @@ impl FilesystemSupervisorInner {
 impl<B> FilesystemState<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     fn path_filter(&self) -> FilesystemPathFilter {
         self.path_filter
@@ -1145,8 +1178,6 @@ fn filesystem_worker<B>(
     mut debouncer: Option<FilesystemWatcher>,
 ) where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
         return;
@@ -1247,8 +1278,6 @@ fn drain_filesystem_events<B>(
 ) -> bool
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let mut sync_disk_replies = Vec::new();
     let mut sync_replies = Vec::new();
@@ -1290,14 +1319,12 @@ where
 fn sync_disk_to_lix_for_replies<B>(
     runtime: &tokio::runtime::Runtime,
     state: &Arc<FilesystemState<B>>,
-    replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
+    replies: Vec<oneshot::Sender<Result<(), LixError>>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let result = runtime.block_on(state.sync_disk_to_lix(true));
     if result.is_ok() {
@@ -1312,14 +1339,12 @@ where
 fn import_paths_for_replies<B>(
     runtime: &tokio::runtime::Runtime,
     state: &Arc<FilesystemState<B>>,
-    replies: Vec<(Vec<String>, mpsc::SyncSender<Result<(), LixError>>)>,
+    replies: Vec<(Vec<String>, oneshot::Sender<Result<(), LixError>>)>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let mut first_error = None;
     for (paths, reply) in replies {
@@ -1337,14 +1362,12 @@ where
 fn sync_from_lix_for_replies<B>(
     runtime: &tokio::runtime::Runtime,
     state: &Arc<FilesystemState<B>>,
-    replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
+    replies: Vec<oneshot::Sender<Result<(), LixError>>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> Result<(), LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let result = runtime.block_on(state.sync_from_lix());
     if result.is_ok() {
@@ -1362,8 +1385,6 @@ fn refresh_filesystem_watcher<B>(
     poll_filesystem: &mut bool,
 ) where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let Some(watcher) = debouncer.as_mut() else {
         *poll_filesystem = true;
@@ -2495,8 +2516,6 @@ mod tests {
     ) -> Result<Option<Vec<u8>>, LixError>
     where
         B: Backend + Clone + Send + Sync + 'static,
-        for<'backend> B::Read<'backend>: Send,
-        for<'backend> B::Write<'backend>: Send,
     {
         let result = session
             .execute(
@@ -2519,8 +2538,6 @@ mod tests {
     ) -> Result<(), LixError>
     where
         B: Backend + Clone + Send + Sync + 'static,
-        for<'backend> B::Read<'backend>: Send,
-        for<'backend> B::Write<'backend>: Send,
     {
         session
             .execute(

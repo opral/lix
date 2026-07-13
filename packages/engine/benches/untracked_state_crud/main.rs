@@ -7,9 +7,8 @@ use bytes::Bytes;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use lix_backends::{RedbBackend, RocksDbBackend, SqliteBackend};
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, Key, KeyRange,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    SpaceId, WriteOptions,
+    BackendError, BackendRead, BackendWrite, CommitResult, GetManyResult, GetOptions, Key,
+    KeyRange, ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, WriteOptions,
 };
 use lix_engine::storage::{
     PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions,
@@ -17,7 +16,7 @@ use lix_engine::storage::{
     StorageWriteOptions,
 };
 use lix_engine::storage_bench;
-use lix_engine::{Engine, SessionContext};
+use lix_engine::{Backend, Engine, SessionContext};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
@@ -171,16 +170,16 @@ where
         = CountingWrite<B::Write<'a>>
     where
         Self: 'a;
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(CountingRead {
-            inner: self.inner.begin_read(opts)?,
+            inner: self.inner.begin_read(opts).await?,
             stats: Arc::clone(&self.stats),
         })
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         Ok(CountingWrite {
-            inner: self.inner.begin_write(opts)?,
+            inner: self.inner.begin_write(opts).await?,
             stats: Arc::clone(&self.stats),
         })
     }
@@ -190,75 +189,55 @@ impl<R> BackendRead for CountingRead<R>
 where
     R: BackendRead,
 {
-    fn visit_keys<V>(
+    async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
+        opts: GetOptions,
+    ) -> Result<GetManyResult, BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.get_calls += 1;
             stats.get_keys += keys.len();
             stats.get_key_bytes += keys.iter().map(|key| key.0.len()).sum::<usize>();
         }
-        let mut counting = CountingPointVisitor {
-            inner: visitor,
-            stats: Arc::clone(&self.stats),
-        };
-        self.inner.visit_keys(space, keys, opts, &mut counting)
+        let result = self.inner.get_many(space, keys, opts).await?;
+        {
+            let mut stats = self.stats.lock().expect("io stats mutex");
+            for value in result.values.iter().flatten() {
+                stats.get_values += 1;
+                stats.get_value_bytes += projected_value_len(value);
+            }
+        }
+        Ok(result)
     }
 
-    fn scan<V>(
+    async fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_entry_calls += 1;
         }
-        self.inner.scan(space, range, opts, visitor)
-    }
-
-    fn close(self) -> Result<(), BackendError>
-    where
-        Self: Sized,
-    {
-        self.inner.close()
-    }
-}
-
-struct CountingPointVisitor<'a, V: ?Sized> {
-    inner: &'a mut V,
-    stats: Arc<Mutex<IoStats>>,
-}
-
-impl<V> PointVisitor for CountingPointVisitor<'_, V>
-where
-    V: PointVisitor + ?Sized,
-{
-    fn visit(
-        &mut self,
-        index: usize,
-        key: &Key,
-        value: Option<ProjectedValueRef<'_>>,
-    ) -> Result<(), BackendError> {
-        if let Some(value) = value {
+        let chunk = self.inner.scan(space, range, opts).await?;
+        {
             let mut stats = self.stats.lock().expect("io stats mutex");
-            stats.get_values += 1;
-            stats.get_value_bytes += projected_value_len(value);
+            stats.scan_entries += chunk.entries.len();
+            stats.scan_entry_key_bytes += chunk
+                .entries
+                .iter()
+                .map(|entry| entry.key.0.len())
+                .sum::<usize>();
+            stats.scan_entry_value_bytes += chunk
+                .entries
+                .iter()
+                .map(|entry| projected_value_len(&entry.value))
+                .sum::<usize>();
         }
-        self.inner.visit(index, key, value)
+        Ok(chunk)
     }
 }
 
@@ -266,7 +245,7 @@ impl<W> BackendWrite for CountingWrite<W>
 where
     W: BackendWrite,
 {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
@@ -277,41 +256,41 @@ where
                 .map(|entry| entry.key.0.len() + entry.value.bytes.len())
                 .sum::<usize>();
         }
-        self.inner.put_many(space, entries)
+        self.inner.put_many(space, entries).await
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
             stats.write_deletes += keys.len();
             stats.write_bytes += keys.iter().map(|key| key.0.len()).sum::<usize>();
         }
-        self.inner.delete_many(space, keys)
+        self.inner.delete_many(space, keys).await
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
             stats.write_delete_ranges += 1;
             stats.write_bytes += range_bound_len(&range.lower) + range_bound_len(&range.upper);
         }
-        self.inner.delete_range(space, range)
+        self.inner.delete_range(space, range).await
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError>
+    async fn commit(self) -> Result<CommitResult, BackendError>
     where
         Self: Sized,
     {
-        self.inner.commit()
+        self.inner.commit().await
     }
 
-    fn rollback(self) -> Result<(), BackendError>
+    async fn rollback(self) -> Result<(), BackendError>
     where
         Self: Sized,
     {
-        self.inner.rollback()
+        self.inner.rollback().await
     }
 }
 
@@ -344,18 +323,18 @@ fn untracked_state_crud_benches(c: &mut Criterion) {
         .build()
         .expect("create tokio runtime for session execute benchmarks");
     let rows = fixture_rows();
-    maybe_print_io_report(&rows);
+    maybe_print_io_report(&runtime, &rows);
 
     bench_raw_sqlite(c, &rows, SMOKE_ROWS, "smoke");
-    bench_lix(c, &rows, SMOKE_ROWS, "smoke");
+    bench_lix(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_session_execute_untracked_insert(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
-    bench_lix(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
-    bench_lix_physical_layout(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
+    bench_lix(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
+    bench_lix_physical_layout(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_session_execute_untracked_insert(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
 }
 
-fn maybe_print_io_report(all_rows: &[PointerRow]) {
+fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
     let Ok(mode) = std::env::var("LIX_UNTRACKED_STATE_CRUD_IO") else {
         return;
     };
@@ -393,7 +372,7 @@ fn maybe_print_io_report(all_rows: &[PointerRow]) {
                 "delete_all_rows",
                 "delete_one_by_pk",
             ] {
-                let stats = measure_lix_io(profile, operation, &rows);
+                let stats = runtime.block_on(measure_lix_io(profile, operation, &rows));
                 let logical_rows = operation_logical_rows(operation, row_count);
                 println!(
                     "| {label}/{} | {} | `{operation}` | {logical_rows} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
@@ -506,83 +485,106 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
     group.finish();
 }
 
-fn bench_lix(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize, label: &str) {
+fn bench_lix(
+    c: &mut Criterion,
+    runtime: &Runtime,
+    all_rows: &[PointerRow],
+    row_count: usize,
+    label: &str,
+) {
     let rows = bench_rows(&all_rows[..row_count]);
     for profile in LIX_BACKEND_PROFILES {
         let mut group =
             c.benchmark_group(format!("untracked_state_crud/{}/{label}", profile.name()));
         configure_group(&mut group, row_count);
 
-        bench_lix_profile(&mut group, profile, &rows);
+        bench_lix_profile(&mut group, runtime, profile, &rows);
         group.finish();
     }
 }
 
 fn bench_lix_profile(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    runtime: &Runtime,
     profile: LixBackendProfile,
     rows: &[BenchRow],
 ) {
     group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || profile_storage(profile),
-            |storage| black_box(storage.insert_all(rows)),
+            |storage| black_box(runtime.block_on(storage.insert_all(rows))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("select_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.select_all(rows.len(), StorageCoreProjection::FullValue)),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| {
+                black_box(
+                    runtime
+                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::FullValue)),
+                )
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("select_keys_only/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly)),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| {
+                black_box(
+                    runtime
+                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly)),
+                )
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("select_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.select_points(std::slice::from_ref(&rows[rows.len() / 2]))),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| {
+                black_box(
+                    runtime.block_on(
+                        storage.select_points(std::slice::from_ref(&rows[rows.len() / 2])),
+                    ),
+                )
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("select_all_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.select_points(rows)),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| black_box(runtime.block_on(storage.select_points(rows))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.update_all(rows)),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| black_box(runtime.block_on(storage.update_all(rows))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.update_all(&rows[..1])),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| black_box(runtime.block_on(storage.update_all(&rows[..1]))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.delete_all()),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| black_box(runtime.block_on(storage.delete_all())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
-            || prepare_lix_seeded(profile, rows),
-            |storage| black_box(storage.delete_one(&rows[rows.len() / 2])),
+            || runtime.block_on(prepare_lix_seeded(profile, rows)),
+            |storage| black_box(runtime.block_on(storage.delete_one(&rows[rows.len() / 2]))),
             BatchSize::LargeInput,
         );
     });
@@ -590,6 +592,7 @@ fn bench_lix_profile(
 
 fn bench_lix_physical_layout(
     c: &mut Criterion,
+    runtime: &Runtime,
     all_rows: &[PointerRow],
     row_count: usize,
     label: &str,
@@ -611,7 +614,7 @@ fn bench_lix_physical_layout(
                 |b| {
                     b.iter_batched(
                         || (profile_storage(profile), physical_layout_rows(rows, layout)),
-                        |(storage, rows)| black_box(storage.insert_all(&rows)),
+                        |(storage, rows)| black_box(runtime.block_on(storage.insert_all(&rows))),
                         BatchSize::LargeInput,
                     );
                 },
@@ -652,55 +655,59 @@ fn bench_session_execute_untracked_insert(
     }
 }
 
-fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
+async fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
     match profile {
-        LixBackendProfile::Sqlite => measure_lix_io_for_backend(sqlite_backend(), operation, rows),
-        LixBackendProfile::RocksDb => {
-            measure_lix_io_for_backend(rocksdb_backend(), operation, rows)
+        LixBackendProfile::Sqlite => {
+            measure_lix_io_for_backend(sqlite_backend(), operation, rows).await
         }
-        LixBackendProfile::Redb => measure_lix_io_for_backend(redb_backend(), operation, rows),
+        LixBackendProfile::RocksDb => {
+            measure_lix_io_for_backend(rocksdb_backend(), operation, rows).await
+        }
+        LixBackendProfile::Redb => {
+            measure_lix_io_for_backend(redb_backend(), operation, rows).await
+        }
     }
 }
 
-fn measure_lix_io_for_backend<B>(backend: B, operation: &str, rows: &[BenchRow]) -> IoStats
+async fn measure_lix_io_for_backend<B>(backend: B, operation: &str, rows: &[BenchRow]) -> IoStats
 where
     B: Backend,
 {
     let (backend, stats) = CountingBackend::new(backend);
     let storage = StorageContext::new(backend);
     if !matches!(operation, "insert_all_rows") {
-        lix_insert_all(&storage, rows);
+        lix_insert_all(&storage, rows).await;
         stats.lock().expect("io stats mutex").reset();
     }
     match operation {
         "insert_all_rows" => {
-            lix_insert_all(&storage, rows);
+            lix_insert_all(&storage, rows).await;
         }
         "select_all_rows" => {
-            lix_select_all(&storage, rows.len(), StorageCoreProjection::FullValue);
+            lix_select_all(&storage, rows.len(), StorageCoreProjection::FullValue).await;
             record_scan_result(&stats, rows, true);
         }
         "select_keys_only" => {
-            lix_select_all(&storage, rows.len(), StorageCoreProjection::KeyOnly);
+            lix_select_all(&storage, rows.len(), StorageCoreProjection::KeyOnly).await;
             record_scan_result(&stats, rows, false);
         }
         "select_one_by_pk" => {
-            lix_select_points(&storage, std::slice::from_ref(&rows[rows.len() / 2]));
+            lix_select_points(&storage, std::slice::from_ref(&rows[rows.len() / 2])).await;
         }
         "select_all_by_pk" => {
-            lix_select_points(&storage, rows);
+            lix_select_points(&storage, rows).await;
         }
         "update_all_rows" => {
-            lix_update_all(&storage, rows);
+            lix_update_all(&storage, rows).await;
         }
         "update_one_by_pk" => {
-            lix_update_all(&storage, &rows[..1]);
+            lix_update_all(&storage, &rows[..1]).await;
         }
         "delete_all_rows" => {
-            lix_delete_all(&storage);
+            lix_delete_all(&storage).await;
         }
         "delete_one_by_pk" => {
-            lix_delete_one(&storage, &rows[rows.len() / 2]);
+            lix_delete_one(&storage, &rows[rows.len() / 2]).await;
         }
         _ => unreachable!("unknown operation"),
     }
@@ -717,7 +724,7 @@ fn record_scan_result(stats: &Arc<Mutex<IoStats>>, rows: &[BenchRow], include_va
     }
 }
 
-fn lix_insert_all<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+async fn lix_insert_all<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
 where
     B: Backend,
 {
@@ -727,12 +734,13 @@ where
     }
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
+        .await
         .expect("commit insert rows");
     assert_eq!(stats.staged_puts, rows.len() as u64);
     rows.len()
 }
 
-fn lix_update_all<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+async fn lix_update_all<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
 where
     B: Backend,
 {
@@ -742,12 +750,13 @@ where
     }
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
+        .await
         .expect("commit update rows");
     assert_eq!(stats.staged_puts, rows.len() as u64);
     rows.len()
 }
 
-fn lix_delete_one<B>(storage: &StorageContext<B>, row: &BenchRow) -> usize
+async fn lix_delete_one<B>(storage: &StorageContext<B>, row: &BenchRow) -> usize
 where
     B: Backend,
 {
@@ -755,22 +764,24 @@ where
     writes.delete(ROW_SPACE, row.key.clone());
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
+        .await
         .expect("commit delete row");
     assert_eq!(stats.staged_deletes, 1);
     1
 }
 
-fn lix_delete_all<B>(storage: &StorageContext<B>) -> usize
+async fn lix_delete_all<B>(storage: &StorageContext<B>) -> usize
 where
     B: Backend,
 {
     storage
         .clear_space(ROW_SPACE, StorageWriteOptions::default())
+        .await
         .expect("clear untracked rows");
     1
 }
 
-fn lix_select_all<B>(
+async fn lix_select_all<B>(
     storage: &StorageContext<B>,
     expected_rows: usize,
     projection: StorageCoreProjection,
@@ -780,6 +791,7 @@ where
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
+        .await
         .expect("begin read");
     let plan = ScanPlan::prefix(
         ROW_SPACE,
@@ -796,30 +808,33 @@ where
                 ..StorageScanOptions::default()
             },
         )
+        .await
         .expect("scan rows");
     assert_eq!(page.value.entries.len(), expected_rows);
     expected_rows
 }
 
-fn lix_select_points<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+async fn lix_select_points<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
 where
     B: Backend,
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
+        .await
         .expect("begin read");
     let keys = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
     let result = PointReadPlan::new(ROW_SPACE, &keys)
         .materialize(&read, StorageGetOptions::default())
+        .await
         .expect("point read rows");
     assert_eq!(result.value.len(), rows.len());
     assert!(result.value.iter().all(Option::is_some));
     result.value.len()
 }
 
-fn prepare_lix_seeded(profile: LixBackendProfile, rows: &[BenchRow]) -> ProfileStorage {
+async fn prepare_lix_seeded(profile: LixBackendProfile, rows: &[BenchRow]) -> ProfileStorage {
     let storage = profile_storage(profile);
-    storage.insert_all(rows);
+    storage.insert_all(rows).await;
     storage
 }
 
@@ -861,9 +876,7 @@ async fn prepare_profile_session_empty(profile: LixBackendProfile) -> ProfileSes
 
 async fn prepare_session_empty<B>(backend: B) -> SessionContext<B>
 where
-    B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     Engine::initialize(backend.clone())
         .await
@@ -882,9 +895,7 @@ where
 
 async fn register_json_pointer_schema<B>(session: &SessionContext<B>)
 where
-    B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     let sql = format!(
         "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
@@ -902,9 +913,7 @@ where
 #[expect(clippy::cast_possible_truncation)]
 async fn insert_untracked_json_pointer_rows<B>(session: &SessionContext<B>, rows: &[PointerRow])
 where
-    B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
+    B: Backend + Clone + Send + Sync + 'static,
 {
     for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
         let sql = insert_untracked_json_pointer_sql(chunk);
@@ -918,51 +927,51 @@ where
 }
 
 impl ProfileStorage {
-    fn insert_all(&self, rows: &[BenchRow]) -> usize {
+    async fn insert_all(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::Sqlite(storage) => lix_insert_all(storage, rows),
-            Self::RocksDb(storage) => lix_insert_all(storage, rows),
-            Self::Redb(storage) => lix_insert_all(storage, rows),
+            Self::Sqlite(storage) => lix_insert_all(storage, rows).await,
+            Self::RocksDb(storage) => lix_insert_all(storage, rows).await,
+            Self::Redb(storage) => lix_insert_all(storage, rows).await,
         }
     }
 
-    fn update_all(&self, rows: &[BenchRow]) -> usize {
+    async fn update_all(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::Sqlite(storage) => lix_update_all(storage, rows),
-            Self::RocksDb(storage) => lix_update_all(storage, rows),
-            Self::Redb(storage) => lix_update_all(storage, rows),
+            Self::Sqlite(storage) => lix_update_all(storage, rows).await,
+            Self::RocksDb(storage) => lix_update_all(storage, rows).await,
+            Self::Redb(storage) => lix_update_all(storage, rows).await,
         }
     }
 
-    fn delete_one(&self, row: &BenchRow) -> usize {
+    async fn delete_one(&self, row: &BenchRow) -> usize {
         match self {
-            Self::Sqlite(storage) => lix_delete_one(storage, row),
-            Self::RocksDb(storage) => lix_delete_one(storage, row),
-            Self::Redb(storage) => lix_delete_one(storage, row),
+            Self::Sqlite(storage) => lix_delete_one(storage, row).await,
+            Self::RocksDb(storage) => lix_delete_one(storage, row).await,
+            Self::Redb(storage) => lix_delete_one(storage, row).await,
         }
     }
 
-    fn delete_all(&self) -> usize {
+    async fn delete_all(&self) -> usize {
         match self {
-            Self::Sqlite(storage) => lix_delete_all(storage),
-            Self::RocksDb(storage) => lix_delete_all(storage),
-            Self::Redb(storage) => lix_delete_all(storage),
+            Self::Sqlite(storage) => lix_delete_all(storage).await,
+            Self::RocksDb(storage) => lix_delete_all(storage).await,
+            Self::Redb(storage) => lix_delete_all(storage).await,
         }
     }
 
-    fn select_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
+    async fn select_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
         match self {
-            Self::Sqlite(storage) => lix_select_all(storage, expected_rows, projection),
-            Self::RocksDb(storage) => lix_select_all(storage, expected_rows, projection),
-            Self::Redb(storage) => lix_select_all(storage, expected_rows, projection),
+            Self::Sqlite(storage) => lix_select_all(storage, expected_rows, projection).await,
+            Self::RocksDb(storage) => lix_select_all(storage, expected_rows, projection).await,
+            Self::Redb(storage) => lix_select_all(storage, expected_rows, projection).await,
         }
     }
 
-    fn select_points(&self, rows: &[BenchRow]) -> usize {
+    async fn select_points(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::Sqlite(storage) => lix_select_points(storage, rows),
-            Self::RocksDb(storage) => lix_select_points(storage, rows),
-            Self::Redb(storage) => lix_select_points(storage, rows),
+            Self::Sqlite(storage) => lix_select_points(storage, rows).await,
+            Self::RocksDb(storage) => lix_select_points(storage, rows).await,
+            Self::Redb(storage) => lix_select_points(storage, rows).await,
         }
     }
 }
@@ -1493,10 +1502,10 @@ fn row_label(row_count: usize) -> &'static str {
     }
 }
 
-fn projected_value_len(value: ProjectedValueRef<'_>) -> usize {
+fn projected_value_len(value: &ProjectedValue) -> usize {
     match value {
-        ProjectedValueRef::KeyOnly => 0,
-        ProjectedValueRef::FullValue(value) => value.len(),
+        ProjectedValue::KeyOnly => 0,
+        ProjectedValue::FullValue(value) => value.len(),
     }
 }
 

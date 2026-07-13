@@ -4,10 +4,11 @@ use lix_backends::{
     RedbBackend, RedbRead, RedbWrite, RocksDbBackend, RocksDbRead, RocksDbWrite, SqliteBackend,
     SqliteRead, SqliteWrite,
 };
+use lix_engine::Backend;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
-    InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, WriteOptions,
+    BackendError, BackendRead, BackendWrite, CommitResult, GetManyResult, GetOptions,
+    InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, WriteOptions,
 };
 use tempfile::TempDir;
 
@@ -92,114 +93,118 @@ impl Backend for ChangelogScoreBackend {
         = ChangelogScoreWrite
     where
         Self: 'a;
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         match self {
-            Self::Unit(backend) => backend.begin_read(opts).map(ChangelogScoreRead::Unit),
-            Self::Sqlite { backend, .. } => {
-                backend.begin_read(opts).map(ChangelogScoreRead::Sqlite)
+            Self::Unit(backend) => backend.begin_read(opts).await.map(ChangelogScoreRead::Unit),
+            Self::Sqlite { backend, .. } => backend
+                .begin_read(opts)
+                .await
+                .map(ChangelogScoreRead::Sqlite),
+            Self::RocksDb { backend, .. } => backend
+                .begin_read(opts)
+                .await
+                .map(ChangelogScoreRead::RocksDb),
+            Self::Redb { backend, .. } => {
+                backend.begin_read(opts).await.map(ChangelogScoreRead::Redb)
             }
-            Self::RocksDb { backend, .. } => {
-                backend.begin_read(opts).map(ChangelogScoreRead::RocksDb)
-            }
-            Self::Redb { backend, .. } => backend.begin_read(opts).map(ChangelogScoreRead::Redb),
         }
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         match self {
-            Self::Unit(backend) => backend.begin_write(opts).map(ChangelogScoreWrite::Unit),
-            Self::Sqlite { backend, .. } => {
-                backend.begin_write(opts).map(ChangelogScoreWrite::Sqlite)
-            }
-            Self::RocksDb { backend, .. } => {
-                backend.begin_write(opts).map(ChangelogScoreWrite::RocksDb)
-            }
-            Self::Redb { backend, .. } => backend.begin_write(opts).map(ChangelogScoreWrite::Redb),
+            Self::Unit(backend) => backend
+                .begin_write(opts)
+                .await
+                .map(ChangelogScoreWrite::Unit),
+            Self::Sqlite { backend, .. } => backend
+                .begin_write(opts)
+                .await
+                .map(ChangelogScoreWrite::Sqlite),
+            Self::RocksDb { backend, .. } => backend
+                .begin_write(opts)
+                .await
+                .map(ChangelogScoreWrite::RocksDb),
+            Self::Redb { backend, .. } => backend
+                .begin_write(opts)
+                .await
+                .map(ChangelogScoreWrite::Redb),
         }
     }
 }
 
 impl BackendRead for ChangelogScoreRead<'_> {
-    fn visit_keys<V>(
+    async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
+        opts: GetOptions,
+    ) -> Result<GetManyResult, BackendError> {
         match self {
-            Self::Unit(read) => read.visit_keys(space, keys, opts, visitor),
-            Self::Sqlite(read) => read.visit_keys(space, keys, opts, visitor),
-            Self::RocksDb(read) => read.visit_keys(space, keys, opts, visitor),
-            Self::Redb(read) => read.visit_keys(space, keys, opts, visitor),
+            Self::Unit(read) => read.get_many(space, keys, opts).await,
+            Self::Sqlite(read) => read.get_many(space, keys, opts).await,
+            Self::RocksDb(read) => read.get_many(space, keys, opts).await,
+            Self::Redb(read) => read.get_many(space, keys, opts).await,
         }
     }
 
-    fn scan<V>(
+    async fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, BackendError> {
         match self {
-            Self::Unit(read) => read.scan(space, range, opts, visitor),
-            Self::Sqlite(read) => read.scan(space, range, opts, visitor),
-            Self::RocksDb(read) => read.scan(space, range, opts, visitor),
-            Self::Redb(read) => read.scan(space, range, opts, visitor),
+            Self::Unit(read) => read.scan(space, range, opts).await,
+            Self::Sqlite(read) => read.scan(space, range, opts).await,
+            Self::RocksDb(read) => read.scan(space, range, opts).await,
+            Self::Redb(read) => read.scan(space, range, opts).await,
         }
     }
 }
 
 impl BackendWrite for ChangelogScoreWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.put_many(space, entries),
-            Self::Sqlite(write) => write.put_many(space, entries),
-            Self::RocksDb(write) => write.put_many(space, entries),
-            Self::Redb(write) => write.put_many(space, entries),
+            Self::Unit(write) => write.put_many(space, entries).await,
+            Self::Sqlite(write) => write.put_many(space, entries).await,
+            Self::RocksDb(write) => write.put_many(space, entries).await,
+            Self::Redb(write) => write.put_many(space, entries).await,
         }
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.delete_many(space, keys),
-            Self::Sqlite(write) => write.delete_many(space, keys),
-            Self::RocksDb(write) => write.delete_many(space, keys),
-            Self::Redb(write) => write.delete_many(space, keys),
+            Self::Unit(write) => write.delete_many(space, keys).await,
+            Self::Sqlite(write) => write.delete_many(space, keys).await,
+            Self::RocksDb(write) => write.delete_many(space, keys).await,
+            Self::Redb(write) => write.delete_many(space, keys).await,
         }
     }
 
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.delete_range(space, range),
-            Self::Sqlite(write) => write.delete_range(space, range),
-            Self::RocksDb(write) => write.delete_range(space, range),
-            Self::Redb(write) => write.delete_range(space, range),
+            Self::Unit(write) => write.delete_range(space, range).await,
+            Self::Sqlite(write) => write.delete_range(space, range).await,
+            Self::RocksDb(write) => write.delete_range(space, range).await,
+            Self::Redb(write) => write.delete_range(space, range).await,
         }
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, BackendError> {
         match self {
-            Self::Unit(write) => write.commit(),
-            Self::Sqlite(write) => write.commit(),
-            Self::RocksDb(write) => write.commit(),
-            Self::Redb(write) => write.commit(),
+            Self::Unit(write) => write.commit().await,
+            Self::Sqlite(write) => write.commit().await,
+            Self::RocksDb(write) => write.commit().await,
+            Self::Redb(write) => write.commit().await,
         }
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.rollback(),
-            Self::Sqlite(write) => write.rollback(),
-            Self::RocksDb(write) => write.rollback(),
-            Self::Redb(write) => write.rollback(),
+            Self::Unit(write) => write.rollback().await,
+            Self::Sqlite(write) => write.rollback().await,
+            Self::RocksDb(write) => write.rollback().await,
+            Self::Redb(write) => write.rollback().await,
         }
     }
 }

@@ -1,14 +1,15 @@
+use std::future::Future;
 use std::hint::black_box;
 use std::ops::Bound;
 use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lix_engine::backend::{KeyRef, PutEntry};
+use lix_engine::backend::PutEntry;
 use lix_sdk::{
-    Backend, BackendError, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    SpaceId, SqliteBackend, StoredValue, WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CoreProjection, GetManyResult, GetOptions,
+    Key, KeyRange, ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId,
+    SqliteBackend, StoredValue, WriteOptions,
 };
 use tempfile::TempDir;
 
@@ -28,46 +29,61 @@ struct SqliteFixture {
 }
 
 #[derive(Default)]
-struct CountingPointVisitor {
+struct CountingPointRead {
     visited: usize,
     found: usize,
     bytes: usize,
 }
 
-impl PointVisitor for CountingPointVisitor {
-    fn visit(
-        &mut self,
-        index: usize,
-        key: &Key,
-        value: Option<ProjectedValueRef<'_>>,
-    ) -> Result<(), BackendError> {
-        self.visited += 1;
-        if let Some(value) = value {
-            self.found += 1;
-            if let ProjectedValueRef::FullValue(bytes) = value {
-                self.bytes += bytes.len();
+impl CountingPointRead {
+    fn observe(keys: &[Key], result: &GetManyResult) -> Self {
+        let mut count = Self {
+            visited: result.values.len(),
+            ..Self::default()
+        };
+        for value in result.values.iter().flatten() {
+            count.found += 1;
+            if let ProjectedValue::FullValue(bytes) = value {
+                count.bytes += bytes.len();
             }
         }
-        black_box((index, key));
-        Ok(())
+        assert_eq!(count.visited, keys.len());
+        black_box(keys);
+        count
     }
 }
 
 #[derive(Default)]
-struct CountingScanVisitor {
+struct CountingScanRead {
     rows: usize,
     bytes: usize,
 }
 
-impl ScanVisitor for CountingScanVisitor {
-    fn visit(&mut self, key: KeyRef<'_>, value: ProjectedValueRef<'_>) -> Result<(), BackendError> {
-        self.rows += 1;
-        self.bytes += key.0.len();
-        if let ProjectedValueRef::FullValue(bytes) = value {
-            self.bytes += bytes.len();
+impl CountingScanRead {
+    fn observe(&mut self, chunk: &ScanChunk) {
+        self.rows += chunk.entries.len();
+        for entry in &chunk.entries {
+            self.bytes += entry.key.0.len();
+            if let ProjectedValue::FullValue(bytes) = &entry.value {
+                self.bytes += bytes.len();
+            }
         }
-        Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PagedScanResult {
+    emitted: usize,
+    has_more: bool,
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build benchmark runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(future))
 }
 
 fn bench_sqlite_backend(c: &mut Criterion) {
@@ -113,9 +129,7 @@ fn full_range() -> KeyRange {
 }
 
 fn seed_spaces(backend: &SqliteBackend) {
-    let mut write = backend
-        .begin_write(WriteOptions::default())
-        .expect("begin write");
+    let mut write = block_on(backend.begin_write(WriteOptions::default())).expect("begin write");
     for &(space_id, rows, value_size) in SPACE_MIX {
         let space = SpaceId(space_id);
         let mut entries = (0..rows)
@@ -125,11 +139,9 @@ fn seed_spaces(backend: &SqliteBackend) {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.key.0.cmp(&right.key.0));
-        write
-            .put_many(space, PutBatch { entries })
-            .expect("seed space");
+        block_on(write.put_many(space, PutBatch { entries })).expect("seed space");
     }
-    write.commit().expect("seed commit");
+    block_on(write.commit()).expect("seed commit");
 }
 
 fn multi_space_fixture() -> SqliteFixture {
@@ -148,37 +160,24 @@ fn multi_space_fixture() -> SqliteFixture {
 fn bench_space_prefix_scan(c: &mut Criterion, fixture: &SqliteFixture) {
     let mut group = c.benchmark_group("sqlite_backend/space_prefix_scan");
     configure_group(&mut group);
-    // The engine drives a scan with ONE visit_next call at the caller's
-    // limit; the chunked cells below exercise the synthetic pagination
-    // pattern, this one the engine pattern.
     group.throughput(Throughput::Elements(20_000u64));
-    group.bench_function(
-        BenchmarkId::new("json_store_single_call", 20_000usize),
-        |b| {
-            b.iter(|| {
-                let read = fixture
-                    .backend
-                    .begin_read(ReadOptions::default())
-                    .expect("begin read");
-                let mut visitor = CountingScanVisitor::default();
-                let result = read
-                    .scan(
-                        SpaceId(0x0001_0001),
-                        full_range(),
-                        ScanOptions {
-                            projection: CoreProjection::FullValue,
-                            limit_rows: usize::MAX,
-                            resume_after: None,
-                        },
-                        &mut visitor,
-                    )
-                    .expect("space scan");
-                read.close().expect("close read");
-                assert_eq!(visitor.rows, 20_000);
-                black_box((result, visitor));
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new("json_store_full_scan", 20_000usize), |b| {
+        b.iter(|| {
+            let read =
+                block_on(fixture.backend.begin_read(ReadOptions::default())).expect("begin read");
+            let mut count = CountingScanRead::default();
+            let result = block_on(paged_scan(
+                &read,
+                SpaceId(0x0001_0001),
+                CoreProjection::FullValue,
+                &mut count,
+            ))
+            .expect("space scan");
+            drop(read);
+            assert_eq!(count.rows, 20_000);
+            black_box((result, count));
+        });
+    });
     for (label, space_id, rows) in [
         ("json_store", 0x0001_0001u32, 20_000usize),
         ("tree_chunk", 0x0004_0001, 500),
@@ -186,16 +185,19 @@ fn bench_space_prefix_scan(c: &mut Criterion, fixture: &SqliteFixture) {
         group.throughput(Throughput::Elements(rows as u64));
         group.bench_function(BenchmarkId::new(label, rows), |b| {
             b.iter(|| {
-                let read = fixture
-                    .backend
-                    .begin_read(ReadOptions::default())
+                let read = block_on(fixture.backend.begin_read(ReadOptions::default()))
                     .expect("begin read");
-                let mut visitor = CountingScanVisitor::default();
-                let result =
-                    paged_scan(&read, SpaceId(space_id), &mut visitor).expect("space scan");
-                read.close().expect("close read");
-                assert_eq!(visitor.rows, rows);
-                black_box((result, visitor));
+                let mut count = CountingScanRead::default();
+                let result = block_on(paged_scan(
+                    &read,
+                    SpaceId(space_id),
+                    CoreProjection::FullValue,
+                    &mut count,
+                ))
+                .expect("space scan");
+                drop(read);
+                assert_eq!(count.rows, rows);
+                black_box((result, count));
             });
         });
     }
@@ -212,14 +214,11 @@ fn bench_space_truncate(c: &mut Criterion) {
         b.iter_batched(
             multi_space_fixture,
             |fixture| {
-                let mut write = fixture
-                    .backend
-                    .begin_write(WriteOptions::default())
+                let mut write = block_on(fixture.backend.begin_write(WriteOptions::default()))
                     .expect("begin write");
-                write
-                    .delete_range(SpaceId(0x0001_0001), full_range())
+                block_on(write.delete_range(SpaceId(0x0001_0001), full_range()))
                     .expect("truncate space");
-                write.commit().expect("commit");
+                block_on(write.commit()).expect("commit");
                 fixture
             },
             BatchSize::PerIteration,
@@ -309,20 +308,16 @@ fn bench_txn_begin(c: &mut Criterion, fixture: &SqliteFixture) {
     configure_group(&mut group);
     group.bench_function("read", |b| {
         b.iter(|| {
-            let read = fixture
-                .backend
-                .begin_read(ReadOptions::default())
-                .expect("begin read");
-            read.close().expect("close read");
+            let read =
+                block_on(fixture.backend.begin_read(ReadOptions::default())).expect("begin read");
+            drop(read);
         });
     });
     group.bench_function("write_rollback", |b| {
         b.iter(|| {
-            let write = fixture
-                .backend
-                .begin_write(WriteOptions::default())
+            let write = block_on(fixture.backend.begin_write(WriteOptions::default()))
                 .expect("begin write");
-            write.rollback().expect("rollback write");
+            block_on(write.rollback()).expect("rollback write");
         });
     });
     group.finish();
@@ -336,46 +331,40 @@ fn bench_point_reads(c: &mut Criterion, fixture: &SqliteFixture) {
     let existing_keys = point_keys(0, POINT_KEYS);
     group.bench_function(BenchmarkId::new("existing/full_value", POINT_KEYS), |b| {
         b.iter(|| {
-            let read = fixture
-                .backend
-                .begin_read(ReadOptions::default())
-                .expect("begin read");
-            let mut visitor = CountingPointVisitor::default();
-            read.visit_keys(
+            let read =
+                block_on(fixture.backend.begin_read(ReadOptions::default())).expect("begin read");
+            let keys = black_box(existing_keys.as_slice());
+            let result = block_on(read.get_many(
                 BENCH_SPACE,
-                black_box(existing_keys.as_slice()),
+                keys,
                 GetOptions {
                     projection: CoreProjection::FullValue,
-                    _reserved: std::marker::PhantomData,
                 },
-                &mut visitor,
-            )
-            .expect("visit keys");
-            read.close().expect("close read");
-            black_box(visitor);
+            ))
+            .expect("get keys");
+            let count = CountingPointRead::observe(keys, &result);
+            drop(read);
+            black_box((result, count));
         });
     });
 
     let missing_keys = point_keys(ROWS * 2, POINT_KEYS);
     group.bench_function(BenchmarkId::new("missing/key_only", POINT_KEYS), |b| {
         b.iter(|| {
-            let read = fixture
-                .backend
-                .begin_read(ReadOptions::default())
-                .expect("begin read");
-            let mut visitor = CountingPointVisitor::default();
-            read.visit_keys(
+            let read =
+                block_on(fixture.backend.begin_read(ReadOptions::default())).expect("begin read");
+            let keys = black_box(missing_keys.as_slice());
+            let result = block_on(read.get_many(
                 BENCH_SPACE,
-                black_box(missing_keys.as_slice()),
+                keys,
                 GetOptions {
                     projection: CoreProjection::KeyOnly,
-                    _reserved: std::marker::PhantomData,
                 },
-                &mut visitor,
-            )
-            .expect("visit keys");
-            read.close().expect("close read");
-            black_box(visitor);
+            ))
+            .expect("get keys");
+            let count = CountingPointRead::observe(keys, &result);
+            drop(read);
+            black_box((result, count));
         });
     });
 
@@ -394,25 +383,14 @@ fn bench_range_scans(c: &mut Criterion, fixture: &SqliteFixture) {
         };
         group.bench_function(BenchmarkId::new(name, ROWS), |b| {
             b.iter(|| {
-                let read = fixture
-                    .backend
-                    .begin_read(ReadOptions::default())
+                let read = block_on(fixture.backend.begin_read(ReadOptions::default()))
                     .expect("begin read");
-                let mut visitor = CountingScanVisitor::default();
-                let result = read
-                    .scan(
-                        BENCH_SPACE,
-                        full_range(),
-                        ScanOptions {
-                            projection,
-                            limit_rows: usize::MAX,
-                            resume_after: None,
-                        },
-                        &mut visitor,
-                    )
+                let mut count = CountingScanRead::default();
+                let result = block_on(paged_scan(&read, BENCH_SPACE, projection, &mut count))
                     .expect("range scan");
-                read.close().expect("close read");
-                black_box((result, visitor));
+                drop(read);
+                assert_eq!(count.rows, ROWS);
+                black_box((result, count));
             });
         });
     }
@@ -435,13 +413,10 @@ fn bench_write_batches(c: &mut Criterion) {
                     (backend, temp_dir, put_batch(0, rows, VALUE_SIZE))
                 },
                 |(backend, temp_dir, batch)| {
-                    let mut write = backend
-                        .begin_write(WriteOptions::default())
+                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
                         .expect("begin write");
-                    write
-                        .put_many(BENCH_SPACE, black_box(batch))
-                        .expect("put many");
-                    let result = write.commit().expect("commit");
+                    block_on(write.put_many(BENCH_SPACE, black_box(batch))).expect("put many");
+                    let result = block_on(write.commit()).expect("commit");
                     black_box(result);
                     // Returned so backend teardown (connection close + WAL
                     // checkpoint) drops outside the timed window. The backend
@@ -461,26 +436,21 @@ fn bench_write_batches(c: &mut Criterion) {
                     let temp_dir = tempfile::tempdir().expect("tempdir");
                     let path = temp_dir.path().join("bench.lix");
                     let backend = SqliteBackend::open(path).expect("open backend");
-                    let mut write = backend
-                        .begin_write(WriteOptions::default())
+                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
                         .expect("begin seed write");
-                    write
-                        .put_many(
-                            BENCH_SPACE,
-                            random_put_batch(rows, RANDOM_WRITE_SEED_ROWS, VALUE_SIZE),
-                        )
-                        .expect("seed rows");
-                    write.commit().expect("seed commit");
+                    block_on(write.put_many(
+                        BENCH_SPACE,
+                        random_put_batch(rows, RANDOM_WRITE_SEED_ROWS, VALUE_SIZE),
+                    ))
+                    .expect("seed rows");
+                    block_on(write.commit()).expect("seed commit");
                     (backend, temp_dir, random_put_batch(0, rows, VALUE_SIZE))
                 },
                 |(backend, temp_dir, batch)| {
-                    let mut write = backend
-                        .begin_write(WriteOptions::default())
+                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
                         .expect("begin write");
-                    write
-                        .put_many(BENCH_SPACE, black_box(batch))
-                        .expect("put many");
-                    let result = write.commit().expect("commit");
+                    block_on(write.put_many(BENCH_SPACE, black_box(batch))).expect("put many");
+                    let result = block_on(write.commit()).expect("commit");
                     black_box(result);
                     (backend, temp_dir)
                 },
@@ -494,35 +464,40 @@ fn bench_write_batches(c: &mut Criterion) {
 
 /// Paged scan via resume_after: the pagination pattern the engine uses for
 /// limited scans, one query per page.
-fn paged_scan<R: BackendRead>(
+async fn paged_scan<R: BackendRead>(
     read: &R,
     space: SpaceId,
-    visitor: &mut CountingScanVisitor,
-) -> Result<ScanResult, BackendError> {
-    let mut total = ScanResult::default();
+    projection: CoreProjection,
+    count: &mut CountingScanRead,
+) -> Result<PagedScanResult, BackendError> {
+    let mut total = PagedScanResult::default();
     let mut resume: Option<Key> = None;
     loop {
-        let mut last_key: Option<Key> = None;
-        let mut page = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            last_key = Some(key.to_owned_key());
-            visitor.visit(key, value)
-        };
-        let chunk = read.scan(
-            space,
-            full_range(),
-            ScanOptions {
-                projection: CoreProjection::FullValue,
-                limit_rows: SCAN_CHUNK_ROWS,
-                resume_after: resume.as_ref(),
-            },
-            &mut page,
-        )?;
-        total.emitted += chunk.emitted;
+        let chunk = read
+            .scan(
+                space,
+                full_range(),
+                ScanOptions {
+                    projection,
+                    limit_rows: SCAN_CHUNK_ROWS,
+                    resume_after: resume,
+                },
+            )
+            .await?;
+        count.observe(&chunk);
+        total.emitted += chunk.entries.len();
         total.has_more = chunk.has_more;
         if !chunk.has_more {
             return Ok(total);
         }
-        resume = last_key;
+        resume = Some(
+            chunk
+                .entries
+                .last()
+                .expect("non-terminal scan page must not be empty")
+                .key
+                .clone(),
+        );
     }
 }
 
@@ -530,13 +505,9 @@ fn sqlite_fixture(rows: usize, value_size: usize) -> SqliteFixture {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let path = temp_dir.path().join("bench.lix");
     let backend = SqliteBackend::open(path).expect("open backend");
-    let mut write = backend
-        .begin_write(WriteOptions::default())
-        .expect("begin write");
-    write
-        .put_many(BENCH_SPACE, put_batch(0, rows, value_size))
-        .expect("seed rows");
-    write.commit().expect("seed commit");
+    let mut write = block_on(backend.begin_write(WriteOptions::default())).expect("begin write");
+    block_on(write.put_many(BENCH_SPACE, put_batch(0, rows, value_size))).expect("seed rows");
+    block_on(write.commit()).expect("seed commit");
     SqliteFixture {
         backend,
         _temp_dir: temp_dir,

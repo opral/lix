@@ -20,23 +20,27 @@ pub enum ConformanceStatus {
     Pending,
 }
 
-pub fn run_backend_conformance<F>(factory: &F) -> ConformanceReport
+pub async fn run_backend_conformance<F>(factory: &F) -> ConformanceReport
 where
     F: BackendFactory,
 {
     let mut report = ConformanceReport::default();
 
-    baseline::register(&mut report, factory);
-    model_based::register(&mut report, factory);
+    baseline::register(&mut report, factory).await;
+    model_based::register(&mut report, factory).await;
     if !factory.config().ephemeral {
-        persistence::register(&mut report, factory);
+        persistence::register(&mut report, factory).await;
     }
     report
 }
 
 impl ConformanceReport {
-    pub(crate) fn run(&mut self, name: &'static str, test: impl FnOnce() -> ConformanceResult) {
-        let status = match test() {
+    pub(crate) async fn run(
+        &mut self,
+        name: &'static str,
+        test: impl Future<Output = ConformanceResult>,
+    ) {
+        let status = match test.await {
             Ok(()) => ConformanceStatus::Passed,
             Err(error) => ConformanceStatus::Failed(error),
         };

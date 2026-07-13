@@ -1,6 +1,6 @@
 use crate::backend::{
-    BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId, WriteOptions,
+    BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, WriteOptions,
 };
 
 /// An ordered byte-key entry backend with coherent read views, batched point
@@ -12,7 +12,12 @@ use crate::backend::{
 /// backend may store them as separate tables, trees, or column families).
 /// Spaces come into existence on first write; reading a space that was never
 /// written behaves as empty.
-pub trait Backend {
+///
+/// The future-based boundary lets remote implementations yield while waiting
+/// for I/O and lets callers overlap independent operations on one read view.
+/// Implementations that wrap an asynchronous provider should preserve that
+/// behavior instead of synchronously blocking the caller's executor.
+pub trait Backend: Send + Sync {
     type Read<'a>: BackendRead + 'a
     where
         Self: 'a;
@@ -21,7 +26,10 @@ pub trait Backend {
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError>;
+    fn begin_read(
+        &self,
+        opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send;
 
     /// Opens one backend-owned write transaction.
     ///
@@ -33,143 +41,73 @@ pub trait Backend {
     ///
     /// Lix sessions intentionally do not add a generic per-backend write lock
     /// above this method.
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError>;
+    fn begin_write(
+        &self,
+        opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send;
 }
 
-pub trait BackendRead {
-    /// Visits the requested keys of one space, calling the visitor with each
-    /// key's position in `keys`. Visit order is unspecified; consumers must
-    /// address results by the visited index, which lets backends return
-    /// rows in whatever order their storage produces them.
-    fn visit_keys<V>(
+/// One coherent read view.
+///
+/// Read handles must release snapshots and other resources from `Drop`;
+/// callers are not required to run asynchronous cleanup when a scope ends.
+pub trait BackendRead: Send + Sync {
+    /// Reads the requested keys of one space. The returned values have one
+    /// slot per requested key, in caller order, and preserve duplicates.
+    fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized;
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send;
 
-    /// Streams up to `opts.limit_rows` rows of one space in ascending key
-    /// order to the visitor and reports whether more rows remain. The
-    /// visitor observes logical keys.
+    /// Reads one owned page of a space in ascending logical key order and
+    /// reports whether more rows remain. A page contains at most
+    /// [`crate::backend::MAX_SCAN_PAGE_ROWS`] rows, even when
+    /// `opts.limit_rows` is larger.
     ///
     /// `opts.resume_after` is exclusive and must not widen the range: the
     /// effective lower bound is the maximum of `range.lower` and
     /// `Excluded(resume_after)`. `limit_rows == 0` emits nothing and
     /// reports `has_more: false`.
-    fn scan<V>(
+    fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
-
-    fn close(self) -> Result<(), BackendError>
-    where
-        Self: Sized,
-    {
-        Ok(())
-    }
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send;
 }
 
-pub trait ScanVisitor {
-    fn visit(&mut self, key: KeyRef<'_>, value: ProjectedValueRef<'_>) -> Result<(), BackendError>;
-}
-
-pub trait BackendWrite {
+pub trait BackendWrite: Send {
     /// Applies one batch of upserts to one space.
     ///
     /// Batches hold at most one mutation per key. Engine write-set lowering
     /// produces batches sorted ascending by key; other callers may pass
     /// unsorted batches.
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError>;
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
 
     /// Deletes the given keys of one space. Batches hold at most one
     /// mutation per key; engine write-set lowering produces sorted keys.
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError>;
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
 
     /// Deletes every key of one space within the range. An unbounded range
     /// clears the whole space; backends may fast-path that case (for
     /// example by truncating the space's table).
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError>;
-
-    fn commit(self) -> Result<CommitResult, BackendError>;
-
-    fn rollback(self) -> Result<(), BackendError>;
-}
-
-pub trait PointVisitor {
-    fn visit(
+    fn delete_range(
         &mut self,
-        index: usize,
-        key: &Key,
-        value: Option<ProjectedValueRef<'_>>,
-    ) -> Result<(), BackendError>;
-}
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
 
-pub fn get_many<R>(
-    read: &R,
-    space: SpaceId,
-    keys: &[Key],
-    opts: GetOptions<'_>,
-) -> Result<GetManyResult, BackendError>
-where
-    R: BackendRead + ?Sized,
-{
-    struct MaterializingPointVisitor<'a> {
-        values: &'a mut [Option<ProjectedValue>],
-    }
+    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send;
 
-    impl PointVisitor for MaterializingPointVisitor<'_> {
-        fn visit(
-            &mut self,
-            index: usize,
-            _key: &Key,
-            value: Option<ProjectedValueRef<'_>>,
-        ) -> Result<(), BackendError> {
-            if let Some(slot) = self.values.get_mut(index) {
-                *slot = value.map(ProjectedValueRef::to_owned);
-            }
-            Ok(())
-        }
-    }
-
-    let mut values = vec![None::<ProjectedValue>; keys.len()];
-    read.visit_keys(
-        space,
-        keys,
-        opts,
-        &mut MaterializingPointVisitor {
-            values: values.as_mut_slice(),
-        },
-    )?;
-    Ok(GetManyResult::new(values))
-}
-
-impl<F> ScanVisitor for F
-where
-    F: for<'a> FnMut(KeyRef<'a>, ProjectedValueRef<'a>) -> Result<(), BackendError>,
-{
-    fn visit(&mut self, key: KeyRef<'_>, value: ProjectedValueRef<'_>) -> Result<(), BackendError> {
-        self(key, value)
-    }
-}
-
-impl<F> PointVisitor for F
-where
-    F: for<'a> FnMut(usize, &Key, Option<ProjectedValueRef<'a>>) -> Result<(), BackendError>,
-{
-    fn visit(
-        &mut self,
-        index: usize,
-        key: &Key,
-        value: Option<ProjectedValueRef<'_>>,
-    ) -> Result<(), BackendError> {
-        self(index, key, value)
-    }
+    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send;
 }

@@ -1,11 +1,12 @@
-use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Bound;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -14,16 +15,15 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use lix_backends::{RedbBackend, RocksDbBackend, SqliteBackend};
+use lix_engine::Backend;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
-    ProjectedValueRef, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
-    get_many as backend_get_many,
+    BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, InMemoryBackend, Key, KeyRange, Prefix, ProjectedValue, PutBatch, PutEntry,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::storage::{
-    PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
-    StorageReadStats, StorageSpace, StorageWriteSet, StorageWriteSetStats,
+    PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageReadStats, StorageSpace,
+    StorageWriteSet, StorageWriteSetStats,
 };
 use rustc_hash::FxBuildHasher;
 use tempfile::TempDir;
@@ -87,22 +87,16 @@ struct DirectWriteBatches {
     deletes: Vec<(StorageSpace, Vec<Key>)>,
 }
 
-#[derive(Default)]
-struct CountingPointVisitor {
-    visited: usize,
-}
-
-impl PointVisitor for CountingPointVisitor {
-    fn visit(
-        &mut self,
-        index: usize,
-        key: &Key,
-        value: Option<ProjectedValueRef<'_>>,
-    ) -> Result<(), BackendError> {
-        self.visited += 1;
-        black_box((index, key, value));
-        Ok(())
-    }
+fn block_on<F: Future>(future: F) -> F::Output {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("storage benchmark runtime should build")
+        })
+        .block_on(future)
 }
 
 #[derive(Clone, Copy)]
@@ -110,7 +104,6 @@ struct PointCase {
     name: &'static str,
     requested_keys: usize,
     unique_keys: usize,
-    existing_unique_keys: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -410,43 +403,26 @@ const POINT_CASES: &[PointCase] = &[
         name: "m100_u100",
         requested_keys: 100,
         unique_keys: 100,
-        existing_unique_keys: 100,
     },
     PointCase {
         name: "m1000_u1000",
         requested_keys: 1_000,
         unique_keys: 1_000,
-        existing_unique_keys: 1_000,
     },
     PointCase {
         name: "m1000_u100",
         requested_keys: 1_000,
         unique_keys: 100,
-        existing_unique_keys: 100,
     },
     PointCase {
         name: "m10000_u100",
         requested_keys: 10_000,
         unique_keys: 100,
-        existing_unique_keys: 100,
     },
     PointCase {
         name: "m10000_u10000",
         requested_keys: 10_000,
         unique_keys: 10_000,
-        existing_unique_keys: 10_000,
-    },
-    PointCase {
-        name: "m1000_u100_missing10",
-        requested_keys: 1_000,
-        unique_keys: 100,
-        existing_unique_keys: 90,
-    },
-    PointCase {
-        name: "m1000_u100_missing90",
-        requested_keys: 1_000,
-        unique_keys: 100,
-        existing_unique_keys: 10,
     },
 ];
 
@@ -557,18 +533,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_durable_commit(c, RedbTempBenchBackend::new());
     bench_durable_commit(c, RocksDbTempBenchBackend::new());
     bench_point_request_plan(c);
-    bench_point_read_indexed_lean_backend(c);
-    bench_point_read_planned_lean_backend(c);
-    bench_storage_backend_matrix(c, InMemoryBenchBackend);
-    bench_storage_backend_matrix(c, SqliteTempBenchBackend::new());
-    bench_storage_backend_matrix(c, RedbTempBenchBackend::new());
-    bench_storage_backend_matrix(c, RocksDbTempBenchBackend::new());
     bench_backend_direct_profile(c, InMemoryBenchBackend);
     bench_backend_direct_profile(c, SqliteTempBenchBackend::new());
     bench_backend_direct_profile(c, RedbTempBenchBackend::new());
     bench_backend_direct_profile(c, RocksDbTempBenchBackend::new());
-    bench_in_memory_backend(c);
-    bench_scan_visitor_baseline(c);
     bench_hash_algorithms(c);
 }
 
@@ -807,9 +775,9 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                     (storage, backend, writes)
                 },
                 |(storage, backend, writes)| {
-                    let (_commit, stats) = storage
-                        .commit_write_set(writes, WriteOptions::default())
-                        .expect("commit write set");
+                    let (_commit, stats) =
+                        block_on(storage.commit_write_set(writes, WriteOptions::default()))
+                            .expect("commit write set");
                     let expected_deletes = case.expected_deletes();
                     let expected_puts = case.writes - expected_deletes;
                     assert_eq!(stats.staged_puts, u64::from(expected_puts));
@@ -823,14 +791,14 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                     let expected_revision_put_batches =
                         u64::from((expected_puts + expected_deletes) > 0);
                     assert_eq!(
-                        backend.state.put_many_calls.get(),
+                        backend.state.put_many_calls.load(Ordering::Relaxed),
                         u64::from(case.expected_put_batches()) + expected_revision_put_batches
                     );
                     assert_eq!(
-                        backend.state.delete_many_calls.get(),
+                        backend.state.delete_many_calls.load(Ordering::Relaxed),
                         u64::from(case.expected_delete_batches())
                     );
-                    assert_eq!(backend.state.commit_calls.get(), 1);
+                    assert_eq!(backend.state.commit_calls.load(Ordering::Relaxed), 1);
                     black_box(stats);
                 },
                 BatchSize::LargeInput,
@@ -915,9 +883,9 @@ where
                 },
                 |storage| {
                     let writes = checked_write_set_from_mutations(black_box(&mutations));
-                    let (_commit, stats) = storage
-                        .commit_write_set(writes, WriteOptions::default())
-                        .expect("checked build and commit");
+                    let (_commit, stats) =
+                        block_on(storage.commit_write_set(writes, WriteOptions::default()))
+                            .expect("checked build and commit");
                     assert_eq!(
                         stats.staged_puts,
                         u64::from(case.writes - case.expected_deletes())
@@ -937,9 +905,9 @@ where
                 },
                 |storage| {
                     let writes = canonical_write_set_from_mutations(black_box(&mutations));
-                    let (_commit, stats) = storage
-                        .commit_write_set(writes, WriteOptions::default())
-                        .expect("canonical build and commit");
+                    let (_commit, stats) =
+                        block_on(storage.commit_write_set(writes, WriteOptions::default()))
+                            .expect("canonical build and commit");
                     assert_eq!(
                         stats.staged_puts,
                         u64::from(case.writes - case.expected_deletes())
@@ -983,13 +951,11 @@ where
             b.iter_batched(
                 || (backend_family.open_empty(), batch.clone()),
                 |(backend, batch)| {
-                    let mut write = backend
-                        .begin_write(WriteOptions::default())
+                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
                         .expect("begin direct write-order write");
-                    write
-                        .put_many(SpaceId(1), PutBatch { entries: batch })
+                    block_on(write.put_many(SpaceId(1), PutBatch { entries: batch }))
                         .expect("put direct write-order batch");
-                    let commit = write.commit().expect("commit direct write-order batch");
+                    let commit = block_on(write.commit()).expect("commit direct write-order batch");
                     assert_eq!(commit.stats.put_entries, WRITES as u64);
                     assert_eq!(commit.stats.deleted_entries, 0);
                     assert_eq!(commit.stats.backend_calls, 1);
@@ -1057,12 +1023,12 @@ where
                     StorageContext::new(backend)
                 },
                 |storage| {
-                    let stats = fallback_delete_range(
+                    let stats = block_on(fallback_delete_range(
                         &storage,
                         space(1),
                         point_scan_range(),
                         case.chunk_size,
-                    )
+                    ))
                     .expect("delete range fallback");
                     assert_eq!(stats.scanned, case.rows);
                     assert_eq!(stats.deleted, case.rows);
@@ -1098,13 +1064,11 @@ where
             b.iter_batched(
                 || backend_family.fork_for_write(&seed),
                 |backend| {
-                    let mut write = backend
-                        .begin_write(WriteOptions::default())
+                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
                         .expect("begin native delete_range write");
-                    write
-                        .delete_range(SpaceId(1), point_scan_range())
+                    block_on(write.delete_range(SpaceId(1), point_scan_range()))
                         .expect("native delete_range");
-                    let commit = write.commit().expect("commit native delete_range");
+                    let commit = block_on(write.commit()).expect("commit native delete_range");
                     assert_eq!(commit.stats.deleted_ranges, 1);
                     assert_eq!(commit.stats.backend_calls, 1);
                     black_box((case.rows, commit));
@@ -1146,9 +1110,12 @@ where
                         StorageContext::new(backend)
                     },
                     |storage| {
-                        let commit = storage
-                            .delete_range(space(1), point_scan_range(), WriteOptions::default())
-                            .expect("storage delete_range helper");
+                        let commit = block_on(storage.delete_range(
+                            space(1),
+                            point_scan_range(),
+                            WriteOptions::default(),
+                        ))
+                        .expect("storage delete_range helper");
                         assert_eq!(commit.stats.deleted_ranges, 1);
                         assert_eq!(commit.stats.backend_calls, 1);
                         black_box(commit);
@@ -1168,15 +1135,14 @@ where
                         StorageContext::new(backend)
                     },
                     |storage| {
-                        let commit = storage
-                            .delete_prefix(
-                                space(1),
-                                Prefix {
-                                    bytes: Bytes::from_static(b"point-"),
-                                },
-                                WriteOptions::default(),
-                            )
-                            .expect("storage delete_prefix helper");
+                        let commit = block_on(storage.delete_prefix(
+                            space(1),
+                            Prefix {
+                                bytes: Bytes::from_static(b"point-"),
+                            },
+                            WriteOptions::default(),
+                        ))
+                        .expect("storage delete_prefix helper");
                         assert_eq!(commit.stats.deleted_ranges, 1);
                         assert_eq!(commit.stats.backend_calls, 1);
                         black_box(commit);
@@ -1196,9 +1162,9 @@ where
                         StorageContext::new(backend)
                     },
                     |storage| {
-                        let commit = storage
-                            .clear_space(space(1), WriteOptions::default())
-                            .expect("storage clear_space helper");
+                        let commit =
+                            block_on(storage.clear_space(space(1), WriteOptions::default()))
+                                .expect("storage clear_space helper");
                         assert_eq!(commit.stats.deleted_ranges, 1);
                         assert_eq!(commit.stats.backend_calls, 1);
                         black_box(commit);
@@ -1225,9 +1191,7 @@ where
     }
 
     let seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
-    let read = seed
-        .begin_read(ReadOptions::default())
-        .expect("begin chunked scan read");
+    let read = block_on(seed.begin_read(ReadOptions::default())).expect("begin chunked scan read");
     let scope = StorageReadScope::new(read);
 
     for case in SCAN_CHUNKING_CASES {
@@ -1237,50 +1201,17 @@ where
             case,
             |b, case| {
                 b.iter(|| {
-                    let stats = drain_scan_materialized(
+                    let stats = block_on(drain_scan_materialized(
                         &scope,
                         space(1),
                         case.scan,
                         case.rows,
                         case.chunk_size,
-                    )
+                    ))
                     .expect("drain chunked materialized scan");
                     assert_eq!(stats.scanned, case.rows);
                     assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
                     assert_scan_drain_stats(&stats, case);
-                    black_box(stats);
-                });
-            },
-        );
-
-        group.bench_with_input(BenchmarkId::new("visit", case.name), case, |b, case| {
-            b.iter(|| {
-                let stats =
-                    drain_scan_visit(&scope, space(1), case.scan, case.rows, case.chunk_size)
-                        .expect("drain chunked visitor scan");
-                assert_eq!(stats.scanned, case.rows);
-                assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
-                assert_scan_drain_stats(&stats, case);
-                black_box(stats);
-            });
-        });
-
-        group.bench_with_input(
-            BenchmarkId::new("cursor_visit", case.name),
-            case,
-            |b, case| {
-                b.iter(|| {
-                    let stats = drain_scan_cursor_visit(
-                        &scope,
-                        space(1),
-                        case.scan,
-                        case.rows,
-                        case.chunk_size,
-                    )
-                    .expect("drain cursor chunked visitor scan");
-                    assert_eq!(stats.scanned, case.rows);
-                    assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
-                    assert_cursor_scan_drain_stats(&stats, case);
                     black_box(stats);
                 });
             },
@@ -1320,461 +1251,15 @@ where
                 (storage, writes)
             },
             |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("durable commit");
+                let (_commit, stats) =
+                    block_on(storage.commit_write_set(writes, WriteOptions::default()))
+                        .expect("durable commit");
                 assert_eq!(stats.staged_puts, u64::from(case.writes));
                 assert_eq!(stats.put_batches, u64::from(case.spaces));
                 black_box(stats);
             },
             BatchSize::LargeInput,
         );
-    });
-
-    group.finish();
-}
-
-fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/point_read_indexed_lean_backend");
-
-    for case in POINT_CASES {
-        let keys = point_request_keys(case.requested_keys, case.unique_keys);
-        let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
-        let read = StorageReadScope::new(LeanPointReadBackend::new(case.existing_unique_keys));
-        group.throughput(Throughput::Elements(case.requested_keys as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
-            b.iter(|| {
-                let plan = PointReadPlan::new(space(1), black_box(&keys));
-                let result = plan
-                    .collect(&read, GetOptions::default())
-                    .expect("indexed point read");
-                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
-                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.len(), case.requested_keys);
-                assert_eq!(result.value.unique_values.len(), case.unique_keys);
-                assert_eq!(
-                    result
-                        .value
-                        .unique_values
-                        .iter()
-                        .filter(|value| value.is_none())
-                        .count(),
-                    expected_unique_missing
-                );
-                black_box(result.value);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/point_read_planned_lean_backend");
-
-    for case in POINT_CASES {
-        let keys = point_request_keys(case.requested_keys, case.unique_keys);
-        let plan = PointReadPlan::new(space(1), &keys);
-        let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
-        let read = StorageReadScope::new(LeanPointReadBackend::new(case.existing_unique_keys));
-        group.throughput(Throughput::Elements(case.requested_keys as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
-            b.iter(|| {
-                let result = black_box(&plan)
-                    .collect(&read, GetOptions::default())
-                    .expect("planned indexed point read");
-                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
-                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.len(), case.requested_keys);
-                assert_eq!(result.value.unique_values.len(), case.unique_keys);
-                assert_eq!(
-                    result
-                        .value
-                        .unique_values
-                        .iter()
-                        .filter(|value| value.is_none())
-                        .count(),
-                    expected_unique_missing
-                );
-                black_box(result.value);
-            });
-        });
-
-        let mut buffer = PointReadBuffer::new();
-        group.bench_with_input(BenchmarkId::new("buffered", case.name), case, |b, case| {
-            b.iter(|| {
-                let result = black_box(&plan)
-                    .collect_into(&read, GetOptions::default(), &mut buffer)
-                    .expect("buffered planned indexed point read");
-                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
-                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.len(), case.requested_keys);
-                assert_eq!(result.value.unique_values.len(), case.unique_keys);
-                assert_eq!(
-                    result
-                        .value
-                        .unique_values
-                        .iter()
-                        .filter(|value| value.is_none())
-                        .count(),
-                    expected_unique_missing
-                );
-                black_box(result.value);
-            });
-        });
-
-        group.bench_with_input(
-            BenchmarkId::new("visit_unique", case.name),
-            case,
-            |b, case| {
-                b.iter(|| {
-                    let mut visited = 0usize;
-                    let mut missing = 0usize;
-                    let stats = black_box(&plan)
-                        .visit(
-                            &read,
-                            GetOptions::default(),
-                            &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
-                                visited += 1;
-                                if value.is_none() {
-                                    missing += 1;
-                                }
-                                black_box((index, key, value));
-                                Ok(())
-                            },
-                        )
-                        .expect("planned point visitor");
-                    assert_eq!(stats.requested_keys, case.requested_keys as u64);
-                    assert_eq!(stats.unique_backend_keys, case.unique_keys as u64);
-                    assert_eq!(stats.backend_calls, 1);
-                    assert_eq!(visited, case.unique_keys);
-                    assert_eq!(missing, expected_unique_missing);
-                    black_box(stats);
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-#[expect(clippy::cast_possible_truncation)]
-fn bench_storage_backend_matrix<B>(c: &mut Criterion, backend_family: B)
-where
-    B: StorageBenchBackend,
-{
-    let group_name = format!("storage_v2/backend_matrix/{}", backend_family.name());
-    let mut group = c.benchmark_group(group_name);
-    group.sample_size(10);
-    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
-        group.warm_up_time(Duration::from_millis(100));
-        group.measurement_time(Duration::from_millis(250));
-    }
-
-    let commit_case = WriteCase {
-        name: "commit_puts_k1024_g16_v32",
-        writes: 1_024,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutsOnly,
-    };
-    let commit_mutations = write_mutations(&commit_case);
-    group.throughput(Throughput::Elements(u64::from(commit_case.writes)));
-    group.bench_function(commit_case.name, |b| {
-        b.iter_batched(
-            || {
-                let backend = backend_family.open_empty();
-                let storage = StorageContext::new(backend);
-                let writes = write_set_from_mutations(&storage, &commit_mutations);
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit backend matrix write set");
-                assert_eq!(stats.staged_puts, 1_024);
-                assert_eq!(stats.put_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let mixed_case = WriteCase {
-        name: "mixed80_20_k1024_g16_v32",
-        writes: 1_024,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutDelete80_20,
-    };
-    let mixed_mutations = write_mutations(&mixed_case);
-    group.throughput(Throughput::Elements(u64::from(mixed_case.writes)));
-    group.bench_function(mixed_case.name, |b| {
-        b.iter_batched(
-            || {
-                let backend = backend_family.open_empty();
-                let storage = StorageContext::new(backend);
-                let writes = write_set_from_mutations(&storage, &mixed_mutations);
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit backend matrix mixed write set");
-                assert_eq!(stats.staged_puts, 816);
-                assert_eq!(stats.staged_deletes, 208);
-                assert_eq!(stats.put_batches, 16);
-                assert_eq!(stats.delete_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let touched_case = WriteCase {
-        name: "commit_puts_k128_g16_existing10k_touched_v32",
-        writes: 128,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutsOnly,
-    };
-    let touched_mutations = write_mutations(&touched_case);
-    let touched_seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
-    group.throughput(Throughput::Elements(u64::from(touched_case.writes)));
-    group.bench_function(touched_case.name, |b| {
-        b.iter_batched(
-            || {
-                let backend = backend_family.fork_for_write(&touched_seed);
-                let storage = StorageContext::new(backend);
-                let writes = write_set_from_mutations(&storage, &touched_mutations);
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit backend matrix touched write set");
-                assert_eq!(stats.staged_puts, 128);
-                assert_eq!(stats.put_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
-    let point_read = point_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin backend matrix point read");
-    let point_scope = StorageReadScope::new(point_read);
-    let point_keys = point_request_keys(1_000, 100);
-    let point_plan = PointReadPlan::new(space(1), &point_keys);
-    group.throughput(Throughput::Elements(1_000));
-    group.bench_function("planned_visit_unique_m1000_u100", |b| {
-        b.iter(|| {
-            let mut visited = 0usize;
-            let mut bytes_seen = 0usize;
-            let stats = black_box(&point_plan)
-                .visit(
-                    &point_scope,
-                    GetOptions::default(),
-                    &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
-                        visited += 1;
-                        if let Some(ProjectedValueRef::FullValue(value)) = value {
-                            bytes_seen += value.len();
-                        }
-                        black_box((index, key, value));
-                        Ok(())
-                    },
-                )
-                .expect("backend matrix planned point visitor");
-            assert_eq!(stats.requested_keys, 1_000);
-            assert_eq!(stats.unique_backend_keys, 100);
-            assert_eq!(stats.backend_calls, 1);
-            assert_eq!(visited, 100);
-            assert_eq!(bytes_seen, 3_200);
-            black_box(stats);
-        });
-    });
-
-    group.bench_function("planned_get_many_m1000_u100", |b| {
-        b.iter(|| {
-            let result = black_box(&point_plan)
-                .collect(&point_scope, GetOptions::default())
-                .expect("backend matrix planned point read");
-            assert_eq!(result.stats.requested_keys, 1_000);
-            assert_eq!(result.stats.unique_backend_keys, 100);
-            assert_eq!(result.stats.backend_calls, 1);
-            assert_eq!(result.value.unique_values.len(), 100);
-            black_box(result.value);
-        });
-    });
-
-    let mut point_buffer = PointReadBuffer::new();
-    group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
-        b.iter(|| {
-            let result = black_box(&point_plan)
-                .collect_into(&point_scope, GetOptions::default(), &mut point_buffer)
-                .expect("backend matrix buffered planned point read");
-            assert_eq!(result.stats.requested_keys, 1_000);
-            assert_eq!(result.stats.unique_backend_keys, 100);
-            assert_eq!(result.stats.backend_calls, 1);
-            assert_eq!(result.value.unique_values.len(), 100);
-            black_box(result.value);
-        });
-    });
-
-    for rows in [10usize, 100] {
-        let scan_backend = backend_family.seed_points(SpaceId(1), rows as u32, 32);
-        let scan_read = scan_backend
-            .begin_read(ReadOptions::default())
-            .expect("begin backend matrix small scan read");
-        let scan_scope = StorageReadScope::new(scan_read);
-        group.throughput(Throughput::Elements(rows as u64));
-
-        group.bench_function(format!("scan_range_visit_key_only_q{rows}"), |b| {
-            b.iter(|| {
-                let mut visited = 0usize;
-                let result = ScanPlan::range(space(1), point_scan_range())
-                    .visit(
-                        &scan_scope,
-                        ScanOptions {
-                            limit_rows: rows + 1,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                            visited += 1;
-                            assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                            black_box(key);
-                            Ok(())
-                        },
-                    )
-                    .expect("backend matrix small scan visitor");
-                assert_eq!(visited, rows);
-                assert_eq!(result.value.emitted, rows);
-                assert!(!result.value.has_more);
-                black_box(result);
-            });
-        });
-
-        group.bench_function(format!("scan_range_q{rows}"), |b| {
-            b.iter(|| {
-                let chunk = ScanPlan::range(space(1), point_scan_range())
-                    .collect(
-                        &scan_scope,
-                        ScanOptions {
-                            limit_rows: rows + 1,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                    )
-                    .expect("backend matrix small materialized scan");
-                assert_eq!(chunk.value.entries.len(), rows);
-                assert_eq!(chunk.stats.backend_calls, 1);
-                black_box(chunk.value);
-            });
-        });
-
-        group.bench_function(format!("prefix_scan_q{rows}"), |b| {
-            b.iter(|| {
-                let chunk = ScanPlan::prefix(
-                    space(1),
-                    Prefix {
-                        bytes: Bytes::from_static(b"point-"),
-                    },
-                )
-                .collect(
-                    &scan_scope,
-                    ScanOptions {
-                        limit_rows: rows + 1,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("backend matrix small prefix scan");
-                assert_eq!(chunk.value.entries.len(), rows);
-                assert_eq!(chunk.stats.backend_calls, 1);
-                assert_eq!(chunk.stats.prefix_lowered, 1);
-                black_box(chunk.value);
-            });
-        });
-    }
-
-    let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
-    let scan_read = scan_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin backend matrix scan read");
-    let scan_scope = StorageReadScope::new(scan_read);
-    group.throughput(Throughput::Elements(1_000));
-    group.bench_function("scan_range_visit_key_only_q1000", |b| {
-        b.iter(|| {
-            let mut visited = 0usize;
-            let result = ScanPlan::range(space(1), point_scan_range())
-                .visit(
-                    &scan_scope,
-                    ScanOptions {
-                        limit_rows: 1_001,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                        visited += 1;
-                        assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                        black_box(key);
-                        Ok(())
-                    },
-                )
-                .expect("backend matrix scan visitor");
-            assert_eq!(visited, 1_000);
-            assert_eq!(result.value.emitted, 1_000);
-            assert!(!result.value.has_more);
-            black_box(result);
-        });
-    });
-
-    group.bench_function("scan_range_q1000", |b| {
-        b.iter(|| {
-            let chunk = ScanPlan::range(space(1), point_scan_range())
-                .collect(
-                    &scan_scope,
-                    ScanOptions {
-                        limit_rows: 1_001,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("backend matrix materialized scan");
-            assert_eq!(chunk.value.entries.len(), 1_000);
-            assert_eq!(chunk.stats.backend_calls, 1);
-            black_box(chunk.value);
-        });
-    });
-
-    group.bench_function("prefix_scan_q1000", |b| {
-        b.iter(|| {
-            let chunk = ScanPlan::prefix(
-                space(1),
-                Prefix {
-                    bytes: Bytes::from_static(b"point-"),
-                },
-            )
-            .collect(
-                &scan_scope,
-                ScanOptions {
-                    limit_rows: 1_001,
-                    projection: CoreProjection::KeyOnly,
-                    ..ScanOptions::default()
-                },
-            )
-            .expect("backend matrix prefix scan");
-            assert_eq!(chunk.value.entries.len(), 1_000);
-            assert_eq!(chunk.stats.backend_calls, 1);
-            assert_eq!(chunk.stats.prefix_lowered, 1);
-            black_box(chunk.value);
-        });
     });
 
     group.finish();
@@ -1813,14 +1298,17 @@ where
         let direct_put_mutations = write_mutations(&direct_put_case);
         let direct_put_batches = direct_write_batches_from_mutations(&direct_put_mutations);
         let warm_backend = backend_family.open_empty();
-        commit_direct_write_batches(&warm_backend, direct_put_batches.clone())
-            .expect("warm direct put backend");
+        block_on(commit_direct_write_batches(
+            &warm_backend,
+            direct_put_batches.clone(),
+        ))
+        .expect("warm direct put backend");
         group.throughput(Throughput::Elements(u64::from(direct_put_case.writes)));
         group.bench_function(direct_put_case.name, |b| {
             b.iter_batched(
                 || (backend_family.open_empty(), direct_put_batches.clone()),
                 |(backend, batches)| {
-                    let commit = commit_direct_write_batches(&backend, batches)
+                    let commit = block_on(commit_direct_write_batches(&backend, batches))
                         .expect("direct backend put commit");
                     assert_eq!(commit.stats.put_entries, 1_024);
                     assert_eq!(commit.stats.deleted_entries, 0);
@@ -1844,17 +1332,20 @@ where
         let clean_direct_put_batches =
             direct_write_batches_from_mutations(&clean_direct_put_mutations);
         let backend = backend_family.open_empty();
-        commit_direct_write_batches(&backend, clean_direct_put_batches.clone())
-            .expect("warm reused direct put backend");
+        block_on(commit_direct_write_batches(
+            &backend,
+            clean_direct_put_batches.clone(),
+        ))
+        .expect("warm reused direct put backend");
         group.throughput(Throughput::Elements(u64::from(
             clean_direct_put_case.writes,
         )));
         group.bench_function(clean_direct_put_case.name, |b| {
             b.iter(|| {
-                let commit = commit_direct_write_batches(
+                let commit = block_on(commit_direct_write_batches(
                     &backend,
                     black_box(clean_direct_put_batches.clone()),
-                )
+                ))
                 .expect("direct reused backend put commit");
                 assert_eq!(commit.stats.put_entries, 1_024);
                 assert_eq!(commit.stats.deleted_entries, 0);
@@ -1875,14 +1366,17 @@ where
         let mixed_mutations = write_mutations(&mixed_case);
         let mixed_batches = direct_write_batches_from_mutations(&mixed_mutations);
         let warm_backend = backend_family.open_empty();
-        commit_direct_write_batches(&warm_backend, mixed_batches.clone())
-            .expect("warm direct mixed backend");
+        block_on(commit_direct_write_batches(
+            &warm_backend,
+            mixed_batches.clone(),
+        ))
+        .expect("warm direct mixed backend");
         group.throughput(Throughput::Elements(u64::from(mixed_case.writes)));
         group.bench_function(mixed_case.name, |b| {
             b.iter_batched(
                 || (backend_family.open_empty(), mixed_batches.clone()),
                 |(backend, batches)| {
-                    let commit = commit_direct_write_batches(&backend, batches)
+                    let commit = block_on(commit_direct_write_batches(&backend, batches))
                         .expect("direct backend mixed commit");
                     assert_eq!(commit.stats.put_entries, 816);
                     assert_eq!(commit.stats.deleted_entries, 208);
@@ -1906,8 +1400,11 @@ where
         let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
         let touched_seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
         let warm_backend = backend_family.fork_for_write(&touched_seed);
-        commit_direct_write_batches(&warm_backend, touched_batches.clone())
-            .expect("warm direct touched backend");
+        block_on(commit_direct_write_batches(
+            &warm_backend,
+            touched_batches.clone(),
+        ))
+        .expect("warm direct touched backend");
         group.throughput(Throughput::Elements(u64::from(touched_case.writes)));
         group.bench_function(touched_case.name, |b| {
             b.iter_batched(
@@ -1918,7 +1415,7 @@ where
                     )
                 },
                 |(backend, batches)| {
-                    let commit = commit_direct_write_batches(&backend, batches)
+                    let commit = block_on(commit_direct_write_batches(&backend, batches))
                         .expect("direct backend touched commit");
                     assert_eq!(commit.stats.put_entries, 128);
                     assert_eq!(commit.stats.deleted_entries, 0);
@@ -1930,204 +1427,97 @@ where
         });
     }
 
-    if should_run("direct_get_many_m1000_u100") || should_run("direct_visit_keys_m1000_u100") {
+    if should_run("direct_get_many_m1000_u100") {
         let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 100);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_m1000_u100") {
             group.bench_function("direct_get_many_m1000_u100", |b| {
                 b.iter(|| {
-                    let read = point_backend
-                        .begin_read(ReadOptions::default())
+                    let read = block_on(point_backend.begin_read(ReadOptions::default()))
                         .expect("begin direct point read");
-                    let result = backend_get_many(
-                        &read,
+                    let result = block_on(read.get_many(
                         SpaceId(1),
                         black_box(&point_keys),
                         GetOptions::default(),
-                    )
+                    ))
                     .expect("direct get_many");
                     assert_eq!(result.values.len(), 1_000);
                     assert_eq!(
                         result.values.iter().filter(|value| value.is_some()).count(),
                         1_000
                     );
-                    read.close().expect("close direct point read");
+                    drop(read);
                     black_box(result);
-                });
-            });
-        }
-
-        if should_run("direct_visit_keys_m1000_u100") {
-            group.bench_function("direct_visit_keys_m1000_u100", |b| {
-                b.iter(|| {
-                    let read = point_backend
-                        .begin_read(ReadOptions::default())
-                        .expect("begin direct point visitor read");
-                    let mut visitor = CountingPointVisitor::default();
-                    read.visit_keys(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                        &mut visitor,
-                    )
-                    .expect("direct visit_keys");
-                    assert_eq!(visitor.visited, 1_000);
-                    read.close().expect("close direct point visitor read");
-                    black_box(visitor.visited);
                 });
             });
         }
     }
 
-    if should_run("direct_get_many_unique_u100") || should_run("direct_visit_keys_unique_u100") {
+    if should_run("direct_get_many_unique_u100") {
         let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 100, 100);
         group.throughput(Throughput::Elements(100));
         if should_run("direct_get_many_unique_u100") {
             group.bench_function("direct_get_many_unique_u100", |b| {
                 b.iter(|| {
-                    let read = point_backend
-                        .begin_read(ReadOptions::default())
+                    let read = block_on(point_backend.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
-                    let result = backend_get_many(
-                        &read,
+                    let result = block_on(read.get_many(
                         SpaceId(1),
                         black_box(&point_keys),
                         GetOptions::default(),
-                    )
+                    ))
                     .expect("direct unique get_many");
                     assert_eq!(result.values.len(), 100);
                     assert_eq!(
                         result.values.iter().filter(|value| value.is_some()).count(),
                         100
                     );
-                    read.close().expect("close direct unique point read");
+                    drop(read);
                     black_box(result);
-                });
-            });
-        }
-
-        if should_run("direct_visit_keys_unique_u100") {
-            group.bench_function("direct_visit_keys_unique_u100", |b| {
-                b.iter(|| {
-                    let read = point_backend
-                        .begin_read(ReadOptions::default())
-                        .expect("begin direct unique point visitor read");
-                    let mut visitor = CountingPointVisitor::default();
-                    read.visit_keys(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                        &mut visitor,
-                    )
-                    .expect("direct unique visit_keys");
-                    assert_eq!(visitor.visited, 100);
-                    read.close()
-                        .expect("close direct unique point visitor read");
-                    black_box(visitor.visited);
                 });
             });
         }
     }
 
-    if should_run("direct_get_many_unique_u1000") || should_run("direct_visit_keys_unique_u1000") {
+    if should_run("direct_get_many_unique_u1000") {
         let point_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 1_000);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_unique_u1000") {
             group.bench_function("direct_get_many_unique_u1000", |b| {
                 b.iter(|| {
-                    let read = point_backend
-                        .begin_read(ReadOptions::default())
+                    let read = block_on(point_backend.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
-                    let result = backend_get_many(
-                        &read,
+                    let result = block_on(read.get_many(
                         SpaceId(1),
                         black_box(&point_keys),
                         GetOptions::default(),
-                    )
+                    ))
                     .expect("direct unique get_many");
                     assert_eq!(result.values.len(), 1_000);
                     assert_eq!(
                         result.values.iter().filter(|value| value.is_some()).count(),
                         1_000
                     );
-                    read.close().expect("close direct unique point read");
+                    drop(read);
                     black_box(result);
-                });
-            });
-        }
-
-        if should_run("direct_visit_keys_unique_u1000") {
-            group.bench_function("direct_visit_keys_unique_u1000", |b| {
-                b.iter(|| {
-                    let read = point_backend
-                        .begin_read(ReadOptions::default())
-                        .expect("begin direct unique point visitor read");
-                    let mut visitor = CountingPointVisitor::default();
-                    read.visit_keys(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                        &mut visitor,
-                    )
-                    .expect("direct unique visit_keys");
-                    assert_eq!(visitor.visited, 1_000);
-                    read.close()
-                        .expect("close direct unique point visitor read");
-                    black_box(visitor.visited);
                 });
             });
         }
     }
 
-    if should_run("direct_scan_visit_key_only_q1000")
-        || should_run("direct_scan_materialized_q1000")
-    {
+    if should_run("direct_scan_materialized_q1000") {
         let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
         let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
-        if should_run("direct_scan_visit_key_only_q1000") {
-            group.bench_function("direct_scan_visit_key_only_q1000", |b| {
-                b.iter(|| {
-                    let read = scan_backend
-                        .begin_read(ReadOptions::default())
-                        .expect("begin direct scan visitor read");
-                    let mut visited = 0usize;
-                    let result = &read
-                        .scan(
-                            space(1).id,
-                            scan_range.clone(),
-                            ScanOptions {
-                                limit_rows: 1_001,
-                                projection: CoreProjection::KeyOnly,
-                                ..ScanOptions::default()
-                            },
-                            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                                visited += 1;
-                                assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                                black_box(key);
-                                Ok(())
-                            },
-                        )
-                        .expect("direct scan visitor");
-                    assert_eq!(visited, 1_000);
-                    assert_eq!(result.emitted, 1_000);
-                    assert!(!result.has_more);
-                    read.close().expect("close direct scan visitor read");
-                    black_box(result);
-                });
-            });
-        }
-
         if should_run("direct_scan_materialized_q1000") {
             group.bench_function("direct_scan_materialized_q1000", |b| {
                 b.iter(|| {
-                    let read = scan_backend
-                        .begin_read(ReadOptions::default())
+                    let read = block_on(scan_backend.begin_read(ReadOptions::default()))
                         .expect("begin direct materialized scan read");
-                    let chunk = materialize_backend_scan(
+                    let chunk = block_on(materialize_backend_scan(
                         &read,
                         scan_range.clone(),
                         ScanOptions {
@@ -2135,11 +1525,11 @@ where
                             projection: CoreProjection::KeyOnly,
                             ..ScanOptions::default()
                         },
-                    )
+                    ))
                     .expect("direct materialized scan");
                     assert_eq!(chunk.entries.len(), 1_000);
                     assert!(!chunk.has_more);
-                    read.close().expect("close direct materialized scan read");
+                    drop(read);
                     black_box(chunk);
                 });
             });
@@ -2149,761 +1539,20 @@ where
     group.finish();
 }
 
-fn bench_in_memory_backend(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/in_memory_backend");
-
-    group.throughput(Throughput::Elements(1_024));
-    let commit_case = WriteCase {
-        name: "commit_puts_k1024_g16_v32",
-        writes: 1_024,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutsOnly,
-    };
-    let commit_mutations = write_mutations(&commit_case);
-    group.bench_function("commit_puts_k1024_g16_v32", |b| {
-        b.iter_batched(
-            || {
-                let backend = InMemoryBackend::new();
-                let storage = StorageContext::new(backend);
-                let mut writes = storage.new_write_set();
-                for mutation in &commit_mutations {
-                    match mutation {
-                        WriteMutation::Put(space, key, value) => {
-                            writes.put(*space, key.clone(), value.clone());
-                        }
-                        WriteMutation::Delete(space, key) => {
-                            writes.delete(*space, key.clone());
-                        }
-                    }
-                }
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit write set");
-                assert_eq!(stats.staged_puts, 1_024);
-                assert_eq!(stats.put_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let direct_commit_batches = put_batches_by_space(&commit_mutations);
-    group.bench_function("direct_commit_puts_k1024_g16_v32", |b| {
-        b.iter_batched(
-            || (InMemoryBackend::new(), direct_commit_batches.clone()),
-            |(backend, batches)| {
-                let mut write = backend
-                    .begin_write(WriteOptions::default())
-                    .expect("begin direct in-memory write");
-                for (_space, batch) in batches {
-                    write.put_many(SpaceId(1), batch).expect("put direct batch");
-                }
-                let commit = write.commit().expect("commit direct write");
-                assert_eq!(commit.stats.put_entries, 1_024);
-                assert_eq!(commit.stats.backend_calls, 16);
-                black_box(commit);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.throughput(Throughput::Elements(128));
-    let untouched_existing_commit_case = WriteCase {
-        name: "commit_puts_k128_g16_existing10k_untouched_v32",
-        writes: 128,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutsOnly,
-    };
-    let untouched_existing_commit_mutations = write_mutations(&untouched_existing_commit_case);
-    let untouched_existing_commit_backend =
-        seeded_in_memory_backend_with_value_size(999, 10_000, 32);
-    group.bench_function("commit_puts_k128_g16_existing10k_untouched_v32", |b| {
-        b.iter_batched(
-            || {
-                let backend = untouched_existing_commit_backend
-                    .fork_snapshot()
-                    .expect("fork untouched existing backend");
-                let storage = StorageContext::new(backend);
-                let mut writes = storage.new_write_set();
-                for mutation in &untouched_existing_commit_mutations {
-                    match mutation {
-                        WriteMutation::Put(space, key, value) => {
-                            writes.put(*space, key.clone(), value.clone());
-                        }
-                        WriteMutation::Delete(space, key) => {
-                            writes.delete(*space, key.clone());
-                        }
-                    }
-                }
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit write set");
-                assert_eq!(stats.staged_puts, 128);
-                assert_eq!(stats.put_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let touched_existing_commit_case = WriteCase {
-        name: "commit_puts_k128_g16_existing10k_touched_v32",
-        writes: 128,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutsOnly,
-    };
-    let touched_existing_commit_mutations = write_mutations(&touched_existing_commit_case);
-    let touched_existing_commit_backend = seeded_in_memory_backend_with_value_size(1, 10_000, 32);
-    group.bench_function("commit_puts_k128_g16_existing10k_touched_v32", |b| {
-        b.iter_batched(
-            || {
-                let backend = touched_existing_commit_backend
-                    .fork_snapshot()
-                    .expect("fork touched existing backend");
-                let storage = StorageContext::new(backend);
-                let mut writes = storage.new_write_set();
-                for mutation in &touched_existing_commit_mutations {
-                    match mutation {
-                        WriteMutation::Put(space, key, value) => {
-                            writes.put(*space, key.clone(), value.clone());
-                        }
-                        WriteMutation::Delete(space, key) => {
-                            writes.delete(*space, key.clone());
-                        }
-                    }
-                }
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit write set");
-                assert_eq!(stats.staged_puts, 128);
-                assert_eq!(stats.put_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let direct_touched_existing_batches = put_batches_by_space(&touched_existing_commit_mutations);
-    group.bench_function("direct_commit_puts_k128_g16_existing10k_touched_v32", |b| {
-        b.iter_batched(
-            || {
-                (
-                    touched_existing_commit_backend
-                        .fork_snapshot()
-                        .expect("fork touched direct existing backend"),
-                    direct_touched_existing_batches.clone(),
-                )
-            },
-            |(backend, batches)| {
-                let mut write = backend
-                    .begin_write(WriteOptions::default())
-                    .expect("begin direct touched write");
-                for (_space, batch) in batches {
-                    write
-                        .put_many(SpaceId(1), batch)
-                        .expect("put direct touched batch");
-                }
-                let commit = write.commit().expect("commit direct touched write");
-                assert_eq!(commit.stats.put_entries, 128);
-                assert_eq!(commit.stats.backend_calls, 16);
-                black_box(commit);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    for depth in [0_u32, 1, 8, 32] {
-        let layered_backend = layered_in_memory_backend(1, 1_000, depth, 8);
-        let layered_read = layered_backend
-            .begin_read(ReadOptions::default())
-            .expect("begin layered read");
-        let layered_scope = StorageReadScope::new(layered_read);
-        let layered_keys = point_request_keys(1_000, 100);
-        let layered_plan = PointReadPlan::new(space(1), &layered_keys);
-        group.bench_function(
-            format!("overlay_depth_visit_base_d{depth}_m1000_u100"),
-            |b| {
-                b.iter(|| {
-                    let mut visitor = CountingPointVisitor::default();
-                    let stats = black_box(&layered_plan)
-                        .visit(&layered_scope, GetOptions::default(), &mut visitor)
-                        .expect("visit layered point values");
-                    assert_eq!(stats.unique_backend_keys, 100);
-                    assert_eq!(visitor.visited, 100);
-                    black_box(stats);
-                });
-            },
-        );
-
-        group.bench_function(format!("overlay_depth_scan_base_q1000_d{depth}"), |b| {
-            b.iter(|| {
-                let mut visitor = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                    black_box(key);
-                    Ok(())
-                };
-                let result = ScanPlan::range(space(1), point_scan_range())
-                    .visit(
-                        &layered_scope,
-                        ScanOptions {
-                            limit_rows: 1_001,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                        &mut visitor,
-                    )
-                    .expect("scan layered base range");
-                assert_eq!(result.value.emitted, 1_000);
-                black_box(result);
-            });
-        });
-    }
-
-    group.throughput(Throughput::Elements(1_000));
-    let get_many_backend = seeded_in_memory_backend(1, 100);
-    let get_many_read = get_many_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let get_many_read = StorageReadScope::new(get_many_read);
-    let get_many_keys = point_request_keys(1_000, 100);
-    group.bench_function("get_many_m1000_u100", |b| {
-        b.iter(|| {
-            let result = PointReadPlan::new(space(1), black_box(&get_many_keys))
-                .materialize(&get_many_read, GetOptions::default())
-                .expect("point read");
-            assert_eq!(result.stats.requested_keys, 1_000);
-            assert_eq!(result.stats.unique_backend_keys, 100);
-            assert_eq!(result.stats.backend_calls, 1);
-            assert_eq!(result.value.len(), 1_000);
-            black_box(result.value);
-        });
-    });
-
-    group.throughput(Throughput::Elements(1_000));
-    let planned_get_many_backend = seeded_in_memory_backend(1, 100);
-    let planned_get_many_read = planned_get_many_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let planned_get_many_read = StorageReadScope::new(planned_get_many_read);
-    let planned_get_many_keys = point_request_keys(1_000, 100);
-    let planned_get_many_plan = PointReadPlan::new(space(1), &planned_get_many_keys);
-    group.bench_function("planned_get_many_m1000_u100", |b| {
-        b.iter(|| {
-            let result = black_box(&planned_get_many_plan)
-                .collect(&planned_get_many_read, GetOptions::default())
-                .expect("planned point read");
-            assert_eq!(result.stats.requested_keys, 1_000);
-            assert_eq!(result.stats.unique_backend_keys, 100);
-            assert_eq!(result.stats.backend_calls, 1);
-            assert_eq!(result.value.len(), 1_000);
-            assert_eq!(result.value.unique_values.len(), 100);
-            black_box(result.value);
-        });
-    });
-
-    let mut planned_get_many_buffer = PointReadBuffer::new();
-    group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
-        b.iter(|| {
-            let result = black_box(&planned_get_many_plan)
-                .collect_into(
-                    &planned_get_many_read,
-                    GetOptions::default(),
-                    &mut planned_get_many_buffer,
-                )
-                .expect("buffered planned point read");
-            assert_eq!(result.stats.requested_keys, 1_000);
-            assert_eq!(result.stats.unique_backend_keys, 100);
-            assert_eq!(result.stats.backend_calls, 1);
-            assert_eq!(result.value.len(), 1_000);
-            assert_eq!(result.value.unique_values.len(), 100);
-            black_box(result.value);
-        });
-    });
-
-    group.bench_function("planned_visit_unique_m1000_u100", |b| {
-        b.iter(|| {
-            let mut visited = 0usize;
-            let mut bytes_seen = 0usize;
-            let stats = black_box(&planned_get_many_plan)
-                .visit(
-                    &planned_get_many_read,
-                    GetOptions::default(),
-                    &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
-                        visited += 1;
-                        if let Some(ProjectedValueRef::FullValue(value)) = value {
-                            bytes_seen += value.len();
-                        }
-                        black_box((index, key, value));
-                        Ok(())
-                    },
-                )
-                .expect("planned point visitor");
-            assert_eq!(stats.requested_keys, 1_000);
-            assert_eq!(stats.unique_backend_keys, 100);
-            assert_eq!(stats.backend_calls, 1);
-            assert_eq!(visited, 100);
-            assert_eq!(bytes_seen, 3_200);
-            black_box(stats);
-        });
-    });
-
-    group.throughput(Throughput::Elements(1_000));
-    let scan_backend = seeded_in_memory_backend(1, 1_000);
-    let scan_read = scan_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let scan_range = physical_point_scan_range(1);
-    group.bench_function("scan_range_q1000", |b| {
-        b.iter(|| {
-            let chunk = materialize_backend_scan(
-                &scan_read,
-                scan_range.clone(),
-                ScanOptions {
-                    limit_rows: 1_001,
-                    projection: CoreProjection::KeyOnly,
-                    ..ScanOptions::default()
-                },
-            )
-            .expect("scan range");
-            assert_eq!(chunk.entries.len(), 1_000);
-            black_box(chunk);
-        });
-    });
-
-    group.throughput(Throughput::Elements(1_000));
-    let scan_visit_backend = seeded_in_memory_backend(1, 1_000);
-    let scan_visit_read = scan_visit_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let scan_visit_range = point_scan_range();
-    group.bench_function("scan_range_visit_key_only_q1000", |b| {
-        b.iter(|| {
-            let mut visited = 0usize;
-            let result = scan_visit_read
-                .scan(
-                    SpaceId(1),
-                    scan_visit_range.clone(),
-                    ScanOptions {
-                        limit_rows: 1_001,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                        visited += 1;
-                        assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                        black_box(key);
-                        Ok(())
-                    },
-                )
-                .expect("visit scan range");
-            assert_eq!(visited, 1_000);
-            assert_eq!(result.emitted, 1_000);
-            assert!(!result.has_more);
-            black_box(result);
-        });
-    });
-
-    group.finish();
-}
-
-#[expect(clippy::cast_possible_truncation)]
-fn bench_scan_visitor_baseline(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/scan_visitor_baseline");
-    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_none() {
-        group.warm_up_time(Duration::from_millis(500));
-        group.measurement_time(Duration::from_secs(1));
-    }
-
-    for rows in [0usize, 1, 10, 100, 1_000, 10_000] {
-        let backend = seeded_in_memory_backend_with_value_size(1, rows as u32, 32);
-        let read = backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read");
-        let scan_range = physical_point_scan_range(1);
-        group.throughput(Throughput::Elements(rows as u64));
-        group.bench_function(format!("owned_key_only_q{rows}"), |b| {
-            b.iter(|| {
-                let chunk = materialize_backend_scan(
-                    &read,
-                    scan_range.clone(),
-                    ScanOptions {
-                        limit_rows: rows + 1,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("scan range");
-                assert_eq!(chunk.entries.len(), rows);
-                black_box(chunk);
-            });
-        });
-
-        group.bench_function(format!("visit_key_only_q{rows}"), |b| {
-            b.iter(|| {
-                let mut visited = 0usize;
-                let result = read
-                    .scan(
-                        SpaceId(1),
-                        scan_range.clone(),
-                        ScanOptions {
-                            limit_rows: rows + 1,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                            visited += 1;
-                            assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                            black_box(key);
-                            Ok(())
-                        },
-                    )
-                    .expect("visit scan range");
-                assert_eq!(visited, rows);
-                assert_eq!(result.emitted, rows);
-                assert!(!result.has_more);
-                black_box(result);
-            });
-        });
-    }
-
-    for value_size in [32usize, 1_024, 65_536] {
-        let backend = seeded_in_memory_backend_with_value_size(1, 1_000, value_size);
-        let read = backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read");
-        let scan_range = physical_point_scan_range(1);
-        group.throughput(Throughput::Elements(1_000));
-        group.bench_function(format!("owned_full_value_q1000_v{value_size}"), |b| {
-            b.iter(|| {
-                let chunk = materialize_backend_scan(
-                    &read,
-                    scan_range.clone(),
-                    ScanOptions {
-                        limit_rows: 1_001,
-                        projection: CoreProjection::FullValue,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("scan range");
-                assert_eq!(chunk.entries.len(), 1_000);
-                black_box(chunk);
-            });
-        });
-
-        group.bench_function(format!("visit_full_value_q1000_v{value_size}"), |b| {
-            b.iter(|| {
-                let mut visited = 0usize;
-                let mut bytes_seen = 0usize;
-                let result = read
-                    .scan(
-                        SpaceId(1),
-                        scan_range.clone(),
-                        ScanOptions {
-                            limit_rows: 1_001,
-                            projection: CoreProjection::FullValue,
-                            ..ScanOptions::default()
-                        },
-                        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                            visited += 1;
-                            let ProjectedValueRef::FullValue(value) = value else {
-                                panic!("full value");
-                            };
-                            bytes_seen += value.len();
-                            black_box((key, value));
-                            Ok(())
-                        },
-                    )
-                    .expect("visit scan range");
-                assert_eq!(visited, 1_000);
-                assert_eq!(bytes_seen, value_size * 1_000);
-                assert_eq!(result.emitted, 1_000);
-                assert!(!result.has_more);
-                black_box(result);
-            });
-        });
-    }
-
-    let materialize_backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
-    let materialize_read = materialize_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let storage_materialize_read = StorageReadScope::new(
-        materialize_backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read"),
-    );
-    group.throughput(Throughput::Elements(1_000));
-    group.bench_function("visit_materialize_key_only_q1000", |b| {
-        b.iter(|| {
-            let chunk =
-                materialize_scan_visit(&materialize_read, CoreProjection::KeyOnly, 1_001, None)
-                    .expect("materialize visitor scan");
-            assert_eq!(chunk.entries.len(), 1_000);
-            black_box(chunk);
-        });
-    });
-
-    group.bench_function("storage_buffer_key_only_q1000", |b| {
-        let mut buffer = ScanBuffer::with_capacity(1_001);
-        b.iter(|| {
-            let chunk = ScanPlan::range(space(1), point_scan_range())
-                .collect_into(
-                    &storage_materialize_read,
-                    ScanOptions {
-                        projection: CoreProjection::KeyOnly,
-                        limit_rows: 1_001,
-                        ..ScanOptions::default()
-                    },
-                    &mut buffer,
-                )
-                .expect("storage scan buffer");
-            assert_eq!(chunk.value.entries.len(), 1_000);
-            black_box(chunk.value.entries);
-            black_box(chunk.value.has_more);
-        });
-    });
-
-    group.bench_function("storage_visit_key_only_q1000", |b| {
-        b.iter(|| {
-            let mut visited = 0usize;
-            let result = ScanPlan::range(space(1), point_scan_range())
-                .visit(
-                    &storage_materialize_read,
-                    ScanOptions {
-                        projection: CoreProjection::KeyOnly,
-                        limit_rows: 1_001,
-                        ..ScanOptions::default()
-                    },
-                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                        visited += 1;
-                        assert_eq!(value, ProjectedValueRef::KeyOnly);
-                        black_box(key);
-                        Ok(())
-                    },
-                )
-                .expect("storage visit scan");
-            assert_eq!(visited, 1_000);
-            assert_eq!(result.value.emitted, 1_000);
-            black_box(result);
-        });
-    });
-
-    group.bench_function("visit_materialize_full_value_q1000_v32", |b| {
-        b.iter(|| {
-            let chunk =
-                materialize_scan_visit(&materialize_read, CoreProjection::FullValue, 1_001, None)
-                    .expect("materialize visitor scan");
-            assert_eq!(chunk.entries.len(), 1_000);
-            black_box(chunk);
-        });
-    });
-
-    group.bench_function("storage_visit_full_value_q1000_v32", |b| {
-        b.iter(|| {
-            let mut visited = 0usize;
-            let mut bytes_seen = 0usize;
-            let result = ScanPlan::range(space(1), point_scan_range())
-                .visit(
-                    &storage_materialize_read,
-                    ScanOptions {
-                        projection: CoreProjection::FullValue,
-                        limit_rows: 1_001,
-                        ..ScanOptions::default()
-                    },
-                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                        visited += 1;
-                        let ProjectedValueRef::FullValue(value) = value else {
-                            panic!("expected full value");
-                        };
-                        bytes_seen += value.len();
-                        black_box((key, value));
-                        Ok(())
-                    },
-                )
-                .expect("storage visit scan");
-            assert_eq!(visited, 1_000);
-            assert_eq!(bytes_seen, 32_000);
-            assert_eq!(result.value.emitted, 1_000);
-            black_box(result);
-        });
-    });
-
-    group.bench_function("storage_buffer_full_value_q1000_v32", |b| {
-        let mut buffer = ScanBuffer::with_capacity(1_001);
-        b.iter(|| {
-            let chunk = ScanPlan::range(space(1), point_scan_range())
-                .collect_into(
-                    &storage_materialize_read,
-                    ScanOptions {
-                        projection: CoreProjection::FullValue,
-                        limit_rows: 1_001,
-                        ..ScanOptions::default()
-                    },
-                    &mut buffer,
-                )
-                .expect("storage scan buffer");
-            assert_eq!(chunk.value.entries.len(), 1_000);
-            black_box(chunk.value.entries);
-            black_box(chunk.value.has_more);
-        });
-    });
-
-    for limit_rows in [10usize, 100, 1_000] {
-        let backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
-        let read = backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read");
-        let scan_range = physical_point_scan_range(1);
-        group.throughput(Throughput::Elements(limit_rows as u64));
-        group.bench_function(format!("owned_key_only_q1000_limit{limit_rows}"), |b| {
-            b.iter(|| {
-                let chunk = materialize_backend_scan(
-                    &read,
-                    scan_range.clone(),
-                    ScanOptions {
-                        limit_rows,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("scan range");
-                assert_eq!(chunk.entries.len(), limit_rows);
-                assert_eq!(chunk.has_more, limit_rows < 1_000);
-                black_box(chunk);
-            });
-        });
-
-        group.bench_function(format!("visit_key_only_q1000_limit{limit_rows}"), |b| {
-            b.iter(|| {
-                let mut visited = 0usize;
-                let result = read
-                    .scan(
-                        SpaceId(1),
-                        scan_range.clone(),
-                        ScanOptions {
-                            limit_rows,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                            visited += 1;
-                            assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                            black_box(key);
-                            Ok(())
-                        },
-                    )
-                    .expect("visit scan range");
-                assert_eq!(visited, limit_rows);
-                assert_eq!(result.emitted, limit_rows);
-                assert_eq!(result.has_more, limit_rows < 1_000);
-                black_box(result);
-            });
-        });
-    }
-
-    for chunk_size in [10usize, 100] {
-        let backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
-        let read = backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read");
-        let scan_range = physical_point_scan_range(1);
-        group.throughput(Throughput::Elements(1_000));
-        group.bench_function(
-            format!("owned_drain_key_only_q1000_chunk{chunk_size}"),
-            |b| {
-                b.iter(|| {
-                    let mut emitted = 0usize;
-                    let mut resume_after = None;
-                    loop {
-                        let chunk = materialize_backend_scan(
-                            &read,
-                            scan_range.clone(),
-                            ScanOptions {
-                                limit_rows: chunk_size,
-                                projection: CoreProjection::KeyOnly,
-                                resume_after: resume_after.as_ref(),
-                            },
-                        )
-                        .expect("scan range");
-                        emitted += chunk.entries.len();
-                        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
-                        if !chunk.has_more {
-                            break;
-                        }
-                    }
-                    assert_eq!(emitted, 1_000);
-                    black_box(resume_after);
-                });
-            },
-        );
-
-        group.bench_function(
-            format!("visit_drain_key_only_q1000_chunk{chunk_size}"),
-            |b| {
-                b.iter(|| {
-                    let mut emitted = 0usize;
-                    let mut resume_after = None;
-                    loop {
-                        let mut chunk_last_key = None;
-                        let result = read
-                            .scan(
-                                SpaceId(1),
-                                scan_range.clone(),
-                                ScanOptions {
-                                    limit_rows: chunk_size,
-                                    projection: CoreProjection::KeyOnly,
-                                    resume_after: resume_after.as_ref(),
-                                },
-                                &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                                    chunk_last_key = Some(key.to_owned_key());
-                                    black_box(key);
-                                    Ok(())
-                                },
-                            )
-                            .expect("visit scan range");
-                        emitted += result.emitted;
-                        resume_after = chunk_last_key;
-                        if !result.has_more {
-                            break;
-                        }
-                    }
-                    assert_eq!(emitted, 1_000);
-                    black_box(resume_after);
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
 #[derive(Clone, Default)]
 struct CountingBackend {
-    state: Rc<CountingState>,
+    state: Arc<CountingState>,
 }
 
 #[derive(Default)]
 struct CountingState {
-    commit_calls: Cell<u64>,
-    put_many_calls: Cell<u64>,
-    delete_many_calls: Cell<u64>,
+    commit_calls: AtomicU64,
+    put_many_calls: AtomicU64,
+    delete_many_calls: AtomicU64,
 }
 
 struct CountingWrite {
-    state: Rc<CountingState>,
+    state: Arc<CountingState>,
 }
 
 impl Backend for CountingBackend {
@@ -2916,139 +1565,68 @@ impl Backend for CountingBackend {
         = CountingWrite
     where
         Self: 'a;
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(EmptyRead)
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         Ok(CountingWrite {
-            state: Rc::clone(&self.state),
+            state: Arc::clone(&self.state),
         })
     }
 }
 
 impl BackendWrite for CountingWrite {
-    fn put_many(&mut self, _space: SpaceId, _entries: PutBatch) -> Result<(), BackendError> {
-        self.state
-            .put_many_calls
-            .set(self.state.put_many_calls.get() + 1);
+    async fn put_many(&mut self, _space: SpaceId, _entries: PutBatch) -> Result<(), BackendError> {
+        self.state.put_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
-        self.state
-            .delete_many_calls
-            .set(self.state.delete_many_calls.get() + 1);
+    async fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
+        self.state.delete_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn delete_range(&mut self, _space: SpaceId, _range: KeyRange) -> Result<(), BackendError> {
-        self.state
-            .delete_many_calls
-            .set(self.state.delete_many_calls.get() + 1);
+    async fn delete_range(
+        &mut self,
+        _space: SpaceId,
+        _range: KeyRange,
+    ) -> Result<(), BackendError> {
+        self.state.delete_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        self.state
-            .commit_calls
-            .set(self.state.commit_calls.get() + 1);
+    async fn commit(self) -> Result<CommitResult, BackendError> {
+        self.state.commit_calls.fetch_add(1, Ordering::Relaxed);
         Ok(CommitResult {
             commit_id: None,
             stats: WriteStats::default(),
         })
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), BackendError> {
         Ok(())
     }
 }
 
-#[derive(Clone)]
-struct LeanPointReadBackend {
-    values: Rc<Vec<ReadEntry>>,
-}
-
-impl LeanPointReadBackend {
-    fn new(existing_unique_keys: usize) -> Self {
-        let values = (0..existing_unique_keys)
-            .map(|index| {
-                let key = key(format!("point-{index:04}"));
-                ReadEntry {
-                    key: key.clone(),
-                    value: ProjectedValue::FullValue(key.0),
-                }
-            })
-            .collect();
-        Self {
-            values: Rc::new(values),
-        }
-    }
-}
-
-impl BackendRead for LeanPointReadBackend {
-    fn visit_keys<V>(
-        &self,
-        _space: SpaceId,
-        keys: &[Key],
-        _opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        let found = keys.len().min(self.values.len());
-        for (index, key) in keys.iter().take(found).enumerate() {
-            let value = Some(self.values[index].value.as_ref());
-            visitor.visit(index, key, value)?;
-        }
-        for (index, key) in keys.iter().enumerate().skip(found) {
-            visitor.visit(index, key, None)?;
-        }
-        Ok(())
-    }
-
-    fn scan<V>(
-        &self,
-        _space: SpaceId,
-        _range: KeyRange,
-        _opts: ScanOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        unreachable!("lean point-read benchmark does not scan")
-    }
-}
-
-#[derive(Clone, Copy)]
 struct EmptyRead;
 
 impl BackendRead for EmptyRead {
-    fn visit_keys<V>(
+    async fn get_many(
         &self,
         _space: SpaceId,
         _keys: &[Key],
-        _opts: GetOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
+        _opts: GetOptions,
+    ) -> Result<GetManyResult, BackendError> {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    fn scan<V>(
+    async fn scan(
         &self,
         _space: SpaceId,
         _range: KeyRange,
-        _opts: ScanOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        _opts: ScanOptions,
+    ) -> Result<ScanChunk, BackendError> {
         unreachable!("write-set benchmark does not scan")
     }
 }
@@ -3079,10 +1657,6 @@ impl WriteCase {
             WriteMix::DeletesOnly | WriteMix::PutDelete80_20 => self.spaces,
         }
     }
-}
-
-fn seeded_in_memory_backend(space_id: u32, rows: u32) -> InMemoryBackend {
-    seeded_in_memory_backend_with_value_size(space_id, rows, 32)
 }
 
 fn seeded_in_memory_backend_with_value_size(
@@ -3119,52 +1693,9 @@ fn seed_backend_points<B>(
             value(index, value_size),
         );
     }
-    let (_commit, stats) = storage
-        .commit_write_set(writes, WriteOptions::default())
+    let (_commit, stats) = block_on(storage.commit_write_set(writes, WriteOptions::default()))
         .unwrap_or_else(|error| panic!("seed {backend_name}: {error}"));
     assert_eq!(stats.staged_puts, u64::from(rows));
-}
-
-fn layered_in_memory_backend(
-    space_id: u32,
-    base_rows: u32,
-    overlay_depth: u32,
-    rows_per_layer: u32,
-) -> InMemoryBackend {
-    let backend = seeded_in_memory_backend_with_value_size(space_id, base_rows, 32);
-    for layer in 0..overlay_depth {
-        let entries = (0..rows_per_layer)
-            .map(|index| PutEntry {
-                key: key(format!("zz-layer-{layer:04}-{index:04}")),
-                value: value(layer * rows_per_layer + index, 32),
-            })
-            .collect();
-        let mut write = backend
-            .begin_write(WriteOptions::default())
-            .expect("begin overlay layer write");
-        write
-            .put_many(SpaceId(1), PutBatch { entries })
-            .expect("write overlay layer");
-        let commit = write.commit().expect("commit overlay layer");
-        assert_eq!(commit.stats.put_entries, u64::from(rows_per_layer));
-    }
-    backend
-}
-
-fn put_batches_by_space(mutations: &[WriteMutation]) -> Vec<(StorageSpace, PutBatch)> {
-    let mut batches = BTreeMap::<StorageSpace, Vec<PutEntry>>::new();
-    for mutation in mutations {
-        if let WriteMutation::Put(space, key, value) = mutation {
-            batches.entry(*space).or_default().push(PutEntry {
-                key: key.clone(),
-                value: value.clone(),
-            });
-        }
-    }
-    batches
-        .into_iter()
-        .map(|(space, entries)| (space, PutBatch { entries }))
-        .collect()
 }
 
 fn direct_write_batches_from_mutations(mutations: &[WriteMutation]) -> DirectWriteBatches {
@@ -3192,25 +1723,25 @@ fn direct_write_batches_from_mutations(mutations: &[WriteMutation]) -> DirectWri
     }
 }
 
-fn commit_direct_write_batches<B>(
+async fn commit_direct_write_batches<B>(
     backend: &B,
     batches: DirectWriteBatches,
 ) -> Result<CommitResult, BackendError>
 where
     B: Backend,
 {
-    let mut write = backend.begin_write(WriteOptions::default())?;
+    let mut write = backend.begin_write(WriteOptions::default()).await?;
     for (space, batch) in batches.puts {
-        write.put_many(space.id, batch)?;
+        write.put_many(space.id, batch).await?;
     }
     for (space, keys) in batches.deletes {
-        write.delete_many(space.id, &keys)?;
+        write.delete_many(space.id, &keys).await?;
     }
-    write.commit()
+    write.commit().await
 }
 
 #[expect(clippy::cast_possible_truncation)]
-fn fallback_delete_range<B>(
+async fn fallback_delete_range<B>(
     storage: &StorageContext<B>,
     storage_space: StorageSpace,
     range: KeyRange,
@@ -3221,6 +1752,7 @@ where
 {
     let read = storage
         .begin_read(ReadOptions::default())
+        .await
         .map_err(|error| error.to_string())?;
     let mut keys = Vec::new();
     let mut resume_after = None::<Key>;
@@ -3228,28 +1760,22 @@ where
     let mut chunks = 0usize;
 
     loop {
-        let mut chunk_last_key = None::<Key>;
         let result = ScanPlan::range(storage_space, range.clone())
-            .visit(
+            .collect(
                 &read,
                 ScanOptions {
                     limit_rows: chunk_size,
                     projection: CoreProjection::KeyOnly,
-                    resume_after: resume_after.as_ref(),
-                },
-                &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                    let key = key.to_owned_key();
-                    chunk_last_key = Some(key.clone());
-                    keys.push(key);
-                    Ok(())
+                    resume_after,
                 },
             )
+            .await
             .map_err(|error| error.to_string())?;
 
-        scanned += result.value.emitted;
-        chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
-        resume_after = chunk_last_key;
+        scanned += result.value.entries.len();
+        chunks += usize::from(!result.value.entries.is_empty() || result.value.has_more);
+        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
+        keys.extend(result.value.entries.into_iter().map(|entry| entry.key));
 
         if !result.value.has_more {
             break;
@@ -3264,6 +1790,7 @@ where
 
     let (_commit, write_stats) = storage
         .commit_write_set(writes, WriteOptions::default())
+        .await
         .map_err(|error| error.to_string())?;
     Ok(DeleteRangeFallbackStats {
         scanned,
@@ -3273,7 +1800,7 @@ where
     })
 }
 
-fn drain_scan_materialized<R>(
+async fn drain_scan_materialized<R>(
     read: &StorageReadScope<R>,
     storage_space: StorageSpace,
     scan: ScanChunkingMode,
@@ -3290,7 +1817,7 @@ where
         let opts = ScanOptions {
             limit_rows: chunk_size,
             projection: CoreProjection::KeyOnly,
-            resume_after: resume_after.as_ref(),
+            resume_after,
         };
         let plan = match scan {
             ScanChunkingMode::Range => ScanPlan::range(storage_space, point_scan_range()),
@@ -3301,7 +1828,7 @@ where
                 },
             ),
         };
-        let chunk = plan.collect(read, opts)?;
+        let chunk = plan.collect(read, opts).await?;
 
         let entries = &chunk.value.entries;
         stats.scanned += entries.len();
@@ -3322,172 +1849,7 @@ where
     Ok(stats)
 }
 
-fn drain_scan_visit<R>(
-    read: &StorageReadScope<R>,
-    storage_space: StorageSpace,
-    scan: ScanChunkingMode,
-    expected_rows: usize,
-    chunk_size: usize,
-) -> Result<ScanDrainStats, BackendError>
-where
-    R: BackendRead,
-{
-    let mut resume_after = None::<Key>;
-    let mut stats = ScanDrainStats::default();
-
-    loop {
-        let mut chunk_last_key = None::<Key>;
-        let opts = ScanOptions {
-            limit_rows: chunk_size,
-            projection: CoreProjection::KeyOnly,
-            resume_after: resume_after.as_ref(),
-        };
-        let mut visitor = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            assert!(matches!(value, ProjectedValueRef::KeyOnly));
-            chunk_last_key = Some(key.to_owned_key());
-            Ok(())
-        };
-        let plan = match scan {
-            ScanChunkingMode::Range => ScanPlan::range(storage_space, point_scan_range()),
-            ScanChunkingMode::Prefix => ScanPlan::prefix(
-                storage_space,
-                Prefix {
-                    bytes: Bytes::from_static(b"point-"),
-                },
-            ),
-        };
-        let result = plan.visit(read, opts, &mut visitor)?;
-
-        stats.scanned += result.value.emitted;
-        stats.backend_calls += result.stats.backend_calls;
-        stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
-        stats.read_stats.add(result.stats);
-        resume_after = chunk_last_key;
-
-        if !result.value.has_more {
-            break;
-        }
-    }
-
-    assert_eq!(
-        stats.backend_calls,
-        expected_rows.div_ceil(chunk_size) as u64
-    );
-    Ok(stats)
-}
-
-fn drain_scan_cursor_visit<R>(
-    read: &StorageReadScope<R>,
-    storage_space: StorageSpace,
-    scan: ScanChunkingMode,
-    expected_rows: usize,
-    chunk_size: usize,
-) -> Result<ScanDrainStats, BackendError>
-where
-    R: BackendRead,
-{
-    let opts = ScanOptions {
-        limit_rows: chunk_size,
-        projection: CoreProjection::KeyOnly,
-        resume_after: None,
-    };
-    let mut stats = ScanDrainStats::default();
-
-    let plan = match scan {
-        ScanChunkingMode::Range => ScanPlan::range(storage_space, point_scan_range()),
-        ScanChunkingMode::Prefix => ScanPlan::prefix(
-            storage_space,
-            Prefix {
-                bytes: Bytes::from_static(b"point-"),
-            },
-        ),
-    };
-    drain_storage_plan(&plan, read, opts, chunk_size, &mut stats)?;
-
-    assert_eq!(
-        stats.backend_calls,
-        expected_rows.div_ceil(chunk_size) as u64
-    );
-    Ok(stats)
-}
-
-/// Drains a plan in resume_after pages: the pagination pattern the storage
-/// layer exposes now that scans are one-shot.
-fn drain_storage_plan<R>(
-    plan: &ScanPlan,
-    read: &R,
-    opts: ScanOptions<'_>,
-    chunk_size: usize,
-    stats: &mut ScanDrainStats,
-) -> Result<(), BackendError>
-where
-    R: lix_engine::storage::StorageRead + ?Sized,
-{
-    let mut resume: Option<Key> = None;
-    loop {
-        let mut last_key: Option<Key> = None;
-        let result = plan.visit(
-            read,
-            ScanOptions {
-                limit_rows: chunk_size,
-                resume_after: resume.as_ref(),
-                ..opts
-            },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                last_key = Some(key.to_owned_key());
-                Ok(())
-            },
-        )?;
-
-        stats.scanned += result.value.emitted;
-        stats.backend_calls += result.stats.backend_calls;
-        stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
-        stats.read_stats.add(result.stats);
-
-        if !result.value.has_more {
-            break;
-        }
-        resume = last_key;
-    }
-    Ok(())
-}
-
 fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
-    let expected_chunks = case.rows.div_ceil(case.chunk_size);
-    let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
-    let expected_has_more = expected_chunks.saturating_sub(1) as u64;
-
-    assert_eq!(stats.read_stats.backend_calls, expected_chunks as u64);
-    assert_eq!(stats.read_stats.scan_rows, case.rows as u64);
-    assert_eq!(stats.read_stats.scan_resume_after, expected_resume_after);
-    assert_eq!(stats.read_stats.scan_has_more, expected_has_more);
-    assert_eq!(
-        stats.read_stats.scan_limit_rows_total,
-        (expected_chunks * case.chunk_size) as u64
-    );
-    assert_eq!(stats.read_stats.scan_limit_rows_max, case.chunk_size as u64);
-    assert_eq!(
-        stats.read_stats.scan_key_only_chunks,
-        expected_chunks as u64
-    );
-    assert_eq!(stats.read_stats.scan_full_value_chunks, 0);
-
-    match case.scan {
-        ScanChunkingMode::Range => {
-            assert_eq!(stats.read_stats.range_scan_chunks, expected_chunks as u64);
-            assert_eq!(stats.read_stats.prefix_scan_chunks, 0);
-            assert_eq!(stats.read_stats.prefix_lowered, 0);
-        }
-        ScanChunkingMode::Prefix => {
-            assert_eq!(stats.read_stats.range_scan_chunks, 0);
-            assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
-            assert_eq!(stats.read_stats.prefix_lowered, expected_chunks as u64);
-        }
-    }
-}
-
-fn assert_cursor_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
     let expected_chunks = case.rows.div_ceil(case.chunk_size);
     let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
     let expected_has_more = expected_chunks.saturating_sub(1) as u64;
@@ -3544,69 +1906,15 @@ fn point_scan_range() -> KeyRange {
     }
 }
 
-fn materialize_backend_scan<R>(
+async fn materialize_backend_scan<R>(
     read: &R,
     range: KeyRange,
-    opts: ScanOptions<'_>,
+    opts: ScanOptions,
 ) -> Result<ScanChunk, BackendError>
 where
     R: BackendRead,
 {
-    let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = read.scan(space(1).id, range, opts, &mut |key: KeyRef<'_>,
-                                                            value: ProjectedValueRef<
-        '_,
-    >| {
-        entries.push(ReadEntry {
-            key: key.to_owned_key(),
-            value: value.to_owned(),
-        });
-        Ok(())
-    })?;
-    Ok(ScanChunk {
-        entries,
-        has_more: result.has_more,
-    })
-}
-
-fn materialize_scan_visit(
-    read: &lix_engine::backend::InMemoryRead,
-    projection: CoreProjection,
-    limit_rows: usize,
-    resume_after: Option<&Key>,
-) -> Result<ScanChunk, BackendError> {
-    let mut entries = Vec::with_capacity(limit_rows);
-    let result = read.scan(
-        SpaceId(1),
-        physical_point_scan_range(1),
-        ScanOptions {
-            projection,
-            limit_rows,
-            resume_after,
-        },
-        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            entries.push(ReadEntry {
-                key: key.to_owned_key(),
-                value: value.to_owned(),
-            });
-            Ok(())
-        },
-    )?;
-    Ok(ScanChunk {
-        entries,
-        has_more: result.has_more,
-    })
-}
-
-fn write_set_from_mutations<B>(
-    storage: &StorageContext<B>,
-    mutations: &[WriteMutation],
-) -> StorageWriteSet
-where
-    B: Backend,
-{
-    let _ = storage;
-    canonical_write_set_from_mutations(mutations)
+    read.scan(space(1).id, range, opts).await
 }
 
 fn checked_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWriteSet {

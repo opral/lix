@@ -19,7 +19,7 @@ workspace = true
 
 [features]
 default = []
-rocksdb = ["dep:bytes", "dep:rocksdb", "dep:tempfile"]
+rocksdb = ["dep:bytes", "dep:rocksdb", "dep:tempfile", "dep:tokio"]
 
 [dependencies]
 lix_engine = { workspace = true }
@@ -27,6 +27,7 @@ lix_engine = { workspace = true }
 bytes = { version = "1", optional = true }
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"], optional = true }
 tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 bytes = "1"

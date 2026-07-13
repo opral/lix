@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use crate::GLOBAL_BRANCH_ID;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHead, BranchRefReader};
@@ -32,11 +30,11 @@ impl BranchRefContext {
     /// Creates a branch-ref reader over a caller-provided KV store.
     pub(super) fn reader<S>(&self, store: S) -> BranchRefStoreReader<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         BranchRefStoreReader {
             untracked_state: Arc::clone(&self.untracked_state),
-            store: Mutex::new(store),
+            store,
         }
     }
 
@@ -52,21 +50,20 @@ impl BranchRefContext {
 /// Read side for branch heads.
 pub(super) struct BranchRefStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     untracked_state: Arc<UntrackedStateContext>,
-    store: Mutex<S>,
+    store: S,
 }
 
 impl<S> BranchRefStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        let store = self.store.lock().await;
         let Some(row) = self
             .untracked_state
-            .reader(&*store)
+            .reader(&self.store)
             .load_row(&UntrackedStateRowRequest {
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -89,10 +86,9 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        let store = self.store.lock().await;
         let rows = self
             .untracked_state
-            .reader(&*store)
+            .reader(&self.store)
             .scan_rows(&UntrackedStateScanRequest {
                 filter: UntrackedStateFilter {
                     schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
@@ -120,7 +116,7 @@ where
 #[async_trait::async_trait]
 impl<S> BranchRefReader for BranchRefStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Self::load_head(self, branch_id).await
@@ -195,6 +191,7 @@ mod tests {
         let branch_ref = test_branch_ref();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         let head = branch_ref
@@ -222,10 +219,12 @@ mod tests {
         .expect("branch head should advance");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("branch head should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let head = branch_ref
             .reader(read)
@@ -238,6 +237,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = UntrackedStateContext::new().reader(read);
         let row = reader
@@ -279,10 +279,12 @@ mod tests {
         .expect("branch-a should advance");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("branch heads should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let heads = branch_ref
             .reader(read)

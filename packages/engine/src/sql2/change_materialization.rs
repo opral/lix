@@ -177,6 +177,7 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("begin read");
         let mut json_reader = JsonStoreContext::new().reader(read);
         let row = materialize_commit_graph_change(
@@ -207,6 +208,7 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("begin read");
         let mut json_reader = JsonStoreContext::new().reader(read);
         let missing_ref = JsonRef::for_content(b"missing snapshot");
@@ -244,10 +246,12 @@ mod tests {
             .expect("stage json payloads");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("commit json payloads");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("begin read");
         let mut json_reader = JsonStoreContext::new().reader(read);
         let row = materialize_commit_graph_change(

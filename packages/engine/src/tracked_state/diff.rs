@@ -82,7 +82,7 @@ pub(crate) async fn diff_commits<S>(
     request: &TrackedStateDiffRequest,
 ) -> Result<TrackedStateDiff, LixError>
 where
-    S: crate::storage::StorageRead + Send + Sync,
+    S: crate::storage::StorageRead,
 {
     diff_commits_with_validation(reader, left_commit_id, right_commit_id, request, true, true).await
 }
@@ -96,7 +96,7 @@ pub(crate) async fn diff_commits_with_validation<S>(
     validate_right_root: bool,
 ) -> Result<TrackedStateDiff, LixError>
 where
-    S: crate::storage::StorageRead + Send + Sync,
+    S: crate::storage::StorageRead,
 {
     let scan_request = scan_request_for_diff(request);
     let tree_entries = reader
@@ -455,6 +455,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
@@ -479,6 +480,7 @@ mod tests {
         .await;
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut reader = tracked_state.reader(read);
         let diff = reader
@@ -512,6 +514,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -540,6 +543,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -568,6 +572,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -596,6 +601,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -654,6 +660,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let valid_diff = tracked_state
             .reader(read)
@@ -692,6 +699,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -730,6 +738,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let valid_diff = tracked_state
             .reader(read)
@@ -750,6 +759,7 @@ mod tests {
         let result = {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             let result = crate::tracked_state::tree::TrackedStateTree::new()
@@ -781,6 +791,7 @@ mod tests {
             .expect("metadata should encode");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("corrupt root should commit");
             result
         };
@@ -788,6 +799,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -832,6 +844,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let parent_diff = tracked_state
             .reader(read)
@@ -857,6 +870,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -894,6 +908,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let unrelated_diff = tracked_state
             .reader(read)
@@ -910,6 +925,7 @@ mod tests {
         let result = {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit(
@@ -949,6 +965,7 @@ mod tests {
             .expect("metadata should encode");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("corrupt root should commit");
             result
         };
@@ -956,6 +973,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -991,6 +1009,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let source_diff = tracked_state
             .reader(read)
@@ -1007,6 +1026,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit_with_parents(
@@ -1019,6 +1039,7 @@ mod tests {
             .expect("merge changelog should write");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("merge changelog should commit");
         }
         stage_corrupt_commit_root(
@@ -1034,6 +1055,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1069,6 +1091,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let source_diff = tracked_state
             .reader(read)
@@ -1085,6 +1108,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit_with_parents(
@@ -1097,6 +1121,7 @@ mod tests {
             .expect("merge changelog should write");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("merge changelog should commit");
         }
         stage_corrupt_commit_root(
@@ -1112,6 +1137,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1144,6 +1170,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let source_diff = tracked_state
             .reader(read)
@@ -1160,6 +1187,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_empty_changelog_commit(
@@ -1172,6 +1200,7 @@ mod tests {
             .expect("empty right changelog should write");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("right changelog should commit");
         }
         stage_corrupt_commit_root(
@@ -1187,6 +1216,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1231,6 +1261,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let child_diff = tracked_state
             .reader(read)
@@ -1257,6 +1288,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1301,6 +1333,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let stale_diff = tracked_state
             .reader(read)
@@ -1327,6 +1360,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1362,6 +1396,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
@@ -1418,6 +1453,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_tracked_root_from_materialized_with_parents(
@@ -1433,11 +1469,13 @@ mod tests {
             .expect("merge root should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("merge root should commit");
         }
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
@@ -1480,6 +1518,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let valid_diff = tracked_state
             .reader(read)
@@ -1511,6 +1550,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1552,6 +1592,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let valid_diff = tracked_state
             .reader(read)
@@ -1583,6 +1624,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1630,6 +1672,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let left_diff = tracked_state
             .reader(read)
@@ -1650,6 +1693,7 @@ mod tests {
         let (left_key, left_value) = left_row.into_index_entry();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let right_diff = tracked_state
             .reader(read)
@@ -1691,6 +1735,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1726,6 +1771,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let source_diff = tracked_state
             .reader(read)
@@ -1760,6 +1806,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = tracked_state
             .reader(read)
@@ -1783,6 +1830,7 @@ mod tests {
         let tracked_state = TrackedStateContext::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         write_root_for_test(
@@ -1800,9 +1848,11 @@ mod tests {
         .expect("parent should write");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("parent writes should commit");
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("child read should open");
         let mut writes = storage.new_write_set();
         write_root_for_test(
@@ -1817,10 +1867,12 @@ mod tests {
         .expect("child should write");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
@@ -1851,6 +1903,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
@@ -1881,6 +1934,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
@@ -1909,6 +1963,7 @@ mod tests {
     ) -> TrackedStateDiff {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         tracked_state
             .reader(read)
@@ -1962,6 +2017,7 @@ mod tests {
     ) -> Result<(), LixError> {
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         write_root_for_test(
@@ -1973,12 +2029,14 @@ mod tests {
             rows,
         )
         .await?;
-        storage.commit_write_set(writes, StorageWriteOptions::default())?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await?;
         Ok(())
     }
 
     async fn write_root_for_test(
-        read: &mut (impl crate::storage::StorageRead + Send + Sync + ?Sized),
+        read: &mut (impl crate::storage::StorageRead + ?Sized),
         writes: &mut crate::storage::StorageWriteSet,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
@@ -2002,6 +2060,7 @@ mod tests {
     ) -> TrackedStateRootId {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         crate::tracked_state::storage::load_root(&read, commit_id)
             .await
@@ -2017,6 +2076,7 @@ mod tests {
     ) {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let mutations = entries
@@ -2049,6 +2109,7 @@ mod tests {
         .expect("metadata should encode");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("corrupt root should commit");
     }
 

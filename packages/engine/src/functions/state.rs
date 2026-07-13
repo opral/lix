@@ -191,6 +191,7 @@ mod tests {
         let reader = live_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
 
@@ -219,6 +220,7 @@ mod tests {
         let reader = live_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let mode = load_mode(&reader).await.expect("valid mode should decode");
@@ -239,6 +241,7 @@ mod tests {
         let reader = live_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
 
@@ -264,6 +267,7 @@ mod tests {
         let reader = live_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let sequence = load_sequence(&reader)
@@ -290,11 +294,13 @@ mod tests {
         .expect("sequence should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("sequence should commit");
 
         let reader = live_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let row = reader
@@ -332,6 +338,7 @@ mod tests {
             .expect("test key-value should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("test key-value should commit");
     }
 

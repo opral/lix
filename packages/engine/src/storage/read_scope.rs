@@ -1,23 +1,31 @@
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::backend::{BackendError, BackendRead};
+use crate::backend::{
+    BackendError, BackendRead, GetManyResult, GetOptions, Key, KeyRange, ScanChunk, ScanOptions,
+    SpaceId,
+};
 
-thread_local! {
-    static ACTIVE_SHARED_READS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
-}
-
-pub trait StorageRead {
-    type BackendRead: BackendRead;
-
-    fn with_backend<T>(
+/// The async read capability consumed by engine stores.
+///
+/// Implementations preserve one coherent backend read view while allowing
+/// independent point and scan requests to overlap.
+pub trait StorageRead: Send + Sync {
+    fn get_many(
         &self,
-        f: impl FnOnce(&Self::BackendRead) -> Result<T, BackendError>,
-    ) -> Result<T, BackendError>;
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send;
+
+    fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send;
 }
 
-#[expect(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct StorageReadScope<R> {
     read: R,
 }
@@ -26,26 +34,21 @@ impl<R> StorageReadScope<R> {
     pub fn new(read: R) -> Self {
         Self { read }
     }
+
+    fn into_inner(self) -> R {
+        self.read
+    }
 }
 
-/// Cloneable SQL/DataFusion read bridge for one execution-scoped backend read.
+/// Cloneable SQL/DataFusion bridge for one execution-scoped backend read.
 ///
-/// This is deliberately not a parallel-read abstraction. All clones share one
-/// backend read and `with_backend()` holds a mutex for the whole backend call,
-/// including scan callbacks, so provider clones are serialized through the
-/// original read scope.
+/// Clones share the read handle directly. Concurrency and synchronization are
+/// backend responsibilities; this layer never serializes requests.
 pub(crate) struct SharedStorageRead<R>
 where
     R: BackendRead,
 {
-    state: Arc<Mutex<SharedStorageReadState<R>>>,
-}
-
-struct SharedStorageReadState<R>
-where
-    R: BackendRead,
-{
-    read: Option<StorageReadScope<R>>,
+    read: Arc<R>,
 }
 
 impl<R> SharedStorageRead<R>
@@ -54,27 +57,19 @@ where
 {
     pub(crate) fn new(read: StorageReadScope<R>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(SharedStorageReadState { read: Some(read) })),
+            read: Arc::new(read.into_inner()),
         }
     }
 
-    pub(crate) fn close(self) -> Result<(), BackendError> {
-        let strong_count = Arc::strong_count(&self.state);
-        if strong_count > 1 {
-            return Err(BackendError::Io(format!(
+    pub(crate) fn finish(self) -> Result<(), BackendError> {
+        let read = Arc::try_unwrap(self.read).map_err(|read| {
+            BackendError::Io(format!(
                 "shared storage read still has {} active handles",
-                strong_count - 1
-            )));
-        }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|error| BackendError::Io(format!("shared storage read poisoned: {error}")))?;
-        let Some(read) = state.read.take() else {
-            return Ok(());
-        };
-        drop(state);
-        read.close()
+                Arc::strong_count(&read) - 1
+            ))
+        })?;
+        drop(read);
+        Ok(())
     }
 }
 
@@ -84,90 +79,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            state: Arc::clone(&self.state),
+            read: Arc::clone(&self.read),
         }
-    }
-}
-
-impl<R> Drop for SharedStorageRead<R>
-where
-    R: BackendRead,
-{
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.state) == 1 {
-            let Some(read) = self
-                .state
-                .lock()
-                .ok()
-                .and_then(|mut state| state.read.take())
-            else {
-                return;
-            };
-            let _ = read.close();
-        }
-    }
-}
-
-impl<R> StorageRead for SharedStorageRead<R>
-where
-    R: BackendRead,
-{
-    type BackendRead = R;
-
-    fn with_backend<T>(
-        &self,
-        f: impl FnOnce(&Self::BackendRead) -> Result<T, BackendError>,
-    ) -> Result<T, BackendError> {
-        // This bridge serializes access to one backend read scope. The mutex is
-        // intentionally held while `f` runs because `f` may open a streaming
-        // backend scan over borrowed state.
-        let _active = SharedReadActiveGuard::enter(Arc::as_ptr(&self.state).cast::<()>())?;
-        let state = self
-            .state
-            .lock()
-            .map_err(|error| BackendError::Io(format!("shared storage read poisoned: {error}")))?;
-        let Some(read) = &state.read else {
-            return Err(BackendError::Io(
-                "shared storage read is closed".to_string(),
-            ));
-        };
-        f(&read.read)
-    }
-}
-
-struct SharedReadActiveGuard {
-    key: usize,
-}
-
-impl SharedReadActiveGuard {
-    fn enter(ptr: *const ()) -> Result<Self, BackendError> {
-        let key = ptr as usize;
-        ACTIVE_SHARED_READS.with(|active| {
-            let mut active = active.borrow_mut();
-            if !active.insert(key) {
-                return Err(BackendError::Io(
-                    "shared storage read re-entered from the same thread".to_string(),
-                ));
-            }
-            Ok(Self { key })
-        })
-    }
-}
-
-impl Drop for SharedReadActiveGuard {
-    fn drop(&mut self) {
-        ACTIVE_SHARED_READS.with(|active| {
-            active.borrow_mut().remove(&self.key);
-        });
-    }
-}
-
-impl<R> StorageReadScope<R>
-where
-    R: BackendRead,
-{
-    pub fn close(self) -> Result<(), BackendError> {
-        self.read.close()
     }
 }
 
@@ -175,13 +88,45 @@ impl<R> StorageRead for StorageReadScope<R>
 where
     R: BackendRead,
 {
-    type BackendRead = R;
-
-    fn with_backend<T>(
+    fn get_many(
         &self,
-        f: impl FnOnce(&Self::BackendRead) -> Result<T, BackendError>,
-    ) -> Result<T, BackendError> {
-        f(&self.read)
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        self.read.get_many(space, keys, opts)
+    }
+
+    fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        self.read.scan(space, range, opts)
+    }
+}
+
+impl<R> StorageRead for SharedStorageRead<R>
+where
+    R: BackendRead,
+{
+    fn get_many(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        self.read.get_many(space, keys, opts)
+    }
+
+    fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        self.read.scan(space, range, opts)
     }
 }
 
@@ -189,13 +134,22 @@ impl<T> StorageRead for &T
 where
     T: StorageRead + ?Sized,
 {
-    type BackendRead = T::BackendRead;
-
-    fn with_backend<U>(
+    fn get_many(
         &self,
-        f: impl FnOnce(&Self::BackendRead) -> Result<U, BackendError>,
-    ) -> Result<U, BackendError> {
-        (*self).with_backend(f)
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        (*self).get_many(space, keys, opts)
+    }
+
+    fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        (*self).scan(space, range, opts)
     }
 }
 
@@ -203,12 +157,21 @@ impl<T> StorageRead for &mut T
 where
     T: StorageRead + ?Sized,
 {
-    type BackendRead = T::BackendRead;
-
-    fn with_backend<U>(
+    fn get_many(
         &self,
-        f: impl FnOnce(&Self::BackendRead) -> Result<U, BackendError>,
-    ) -> Result<U, BackendError> {
-        (**self).with_backend(f)
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        (**self).get_many(space, keys, opts)
+    }
+
+    fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        (**self).scan(space, range, opts)
     }
 }

@@ -164,7 +164,7 @@ where
         }
     }
 
-    pub(crate) fn stage_payload(
+    pub(crate) async fn stage_payload(
         &mut self,
         payload: &BlobPayload,
     ) -> Result<BlobWriteReceipt, LixError> {
@@ -177,5 +177,6 @@ where
             payload.bytes(),
             payload.hash(),
         )
+        .await
     }
 }

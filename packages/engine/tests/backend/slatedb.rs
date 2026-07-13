@@ -1,3 +1,8 @@
+#![allow(
+    clippy::manual_async_fn,
+    reason = "test fixtures mirror explicit Send future signatures from BackendFixture"
+)]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
@@ -6,8 +11,8 @@ use lix_backends::{
 };
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange,
-    KeyRef, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadOptions, ScanOptions,
-    SpaceId, StoredValue, WriteOptions, get_many,
+    ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, StoredValue,
+    WriteOptions,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig, run_backend_conformance};
 use object_store::memory::InMemory;
@@ -17,6 +22,7 @@ use object_store::{
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
     Result as ObjectStoreResult,
 };
+use std::future::Future;
 use std::ops::Bound;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -24,38 +30,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, atomic::AtomicBool};
 use tempfile::TempDir;
 
-#[test]
-fn slatedb_backend_passes_backend_conformance() {
+#[tokio::test]
+async fn slatedb_backend_passes_backend_conformance() {
     let factory = SlateDbBackendFactory::new();
 
-    run_backend_conformance(&factory).assert_no_failures();
+    run_backend_conformance(&factory).await.assert_no_failures();
 }
 
-#[test]
-fn cached_slatedb_backend_passes_backend_conformance() {
+#[tokio::test]
+async fn cached_slatedb_backend_passes_backend_conformance() {
     let factory = CachedSlateDbBackendFactory::new();
 
-    run_backend_conformance(&factory).assert_no_failures();
+    run_backend_conformance(&factory).await.assert_no_failures();
 }
 
-#[test]
-fn slatedb_backend_exposes_database_path_and_flushes() {
+#[tokio::test]
+async fn slatedb_backend_exposes_database_path_and_flushes() {
     let temp_dir = tempfile::tempdir().expect("create slatedb backend temp dir");
     let path = temp_dir.path().join("backend.slatedb");
 
     let backend = SlateDbBackend::open(&path).expect("open slatedb backend");
-    backend.flush().expect("flush slatedb backend");
+    backend.flush().await.expect("flush slatedb backend");
 
     assert_eq!(backend.path(), path.as_path());
 }
 
-#[test]
-fn slatedb_backend_rejects_keys_above_physical_limit() {
+#[tokio::test]
+async fn slatedb_backend_rejects_keys_above_physical_limit() {
     let temp_dir = tempfile::tempdir().expect("create slatedb backend temp dir");
     let path = temp_dir.path().join("backend.slatedb");
     let backend = SlateDbBackend::open(path).expect("open slatedb backend");
     let mut write = backend
         .begin_write(WriteOptions::default())
+        .await
         .expect("begin slatedb write");
 
     let too_long_logical_key = Key(Bytes::from(vec![0; u16::MAX as usize - 3]));
@@ -71,18 +78,20 @@ fn slatedb_backend_rejects_keys_above_physical_limit() {
                 }],
             },
         )
+        .await
         .expect_err("oversized physical key should fail");
 
     assert_eq!(error, BackendError::InvalidKey);
 }
 
-#[test]
-fn slatedb_backend_streams_unbounded_scan_limits() {
+#[tokio::test]
+async fn slatedb_backend_streams_unbounded_scan_limits() {
     let temp_dir = tempfile::tempdir().expect("create slatedb backend temp dir");
     let path = temp_dir.path().join("backend.slatedb");
     let backend = SlateDbBackend::open(path).expect("open slatedb backend");
     let mut write = backend
         .begin_write(WriteOptions::default())
+        .await
         .expect("begin slatedb write");
 
     write
@@ -99,13 +108,14 @@ fn slatedb_backend_streams_unbounded_scan_limits() {
                     .collect(),
             },
         )
+        .await
         .expect("put slatedb rows");
-    write.commit().expect("commit slatedb rows");
+    write.commit().await.expect("commit slatedb rows");
 
     let read = backend
         .begin_read(ReadOptions::default())
+        .await
         .expect("begin slatedb read");
-    let mut rows = 0usize;
     let result = read
         .scan(
             SpaceId(1),
@@ -118,21 +128,22 @@ fn slatedb_backend_streams_unbounded_scan_limits() {
                 limit_rows: usize::MAX,
                 resume_after: None,
             },
-            &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                assert_eq!(value, ProjectedValueRef::KeyOnly);
-                rows += 1;
-                Ok(())
-            },
         )
+        .await
         .expect("scan slatedb rows");
 
-    assert_eq!(rows, 10);
-    assert_eq!(result.emitted, 10);
+    assert_eq!(result.entries.len(), 10);
+    assert!(
+        result
+            .entries
+            .iter()
+            .all(|entry| entry.value == ProjectedValue::KeyOnly)
+    );
     assert!(!result.has_more);
 }
 
-#[test]
-fn cached_slatedb_backend_rebuilds_after_local_cache_is_deleted() {
+#[tokio::test]
+async fn cached_slatedb_backend_rebuilds_after_local_cache_is_deleted() {
     let object_store = Arc::new(InMemory::new());
     let db_path = "cached-slatedb-rebuild";
     let cache_parent = tempfile::tempdir().expect("create SlateDB cache parent");
@@ -144,6 +155,7 @@ fn cached_slatedb_backend_rebuilds_after_local_cache_is_deleted() {
             .expect("open uncached seed backend");
         let mut write = backend
             .begin_write(WriteOptions::default())
+            .await
             .expect("begin seed write");
         write
             .put_many(
@@ -160,18 +172,19 @@ fn cached_slatedb_backend_rebuilds_after_local_cache_is_deleted() {
                         .collect(),
                 },
             )
+            .await
             .expect("seed cached backend");
-        write.commit().expect("commit cached seed data");
-        backend.flush().expect("flush cached seed data");
+        write.commit().await.expect("commit cached seed data");
+        backend.flush().await.expect("flush cached seed data");
     }
 
-    assert_cached_rows(object_store.clone(), db_path, cache_path.clone(), space);
+    assert_cached_rows(object_store.clone(), db_path, cache_path.clone(), space).await;
     std::fs::remove_dir_all(&cache_path).expect("delete ephemeral SlateDB cache");
-    assert_cached_rows(object_store, db_path, cache_path, space);
+    assert_cached_rows(object_store, db_path, cache_path, space).await;
 }
 
-#[test]
-fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
+#[tokio::test]
+async fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
     let object_store = Arc::new(InMemory::new());
     let db_path = "cached-slatedb-write-failure";
     let cache_parent = tempfile::tempdir().expect("create SlateDB failure cache parent");
@@ -183,8 +196,10 @@ fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
     {
         let backend = SlateDbBackend::open_object_store(db_path, object_store.clone())
             .expect("open failure-test seed backend");
-        write_one(&backend, space, durable_key.clone(), b"persisted").expect("persist seed value");
-        backend.flush().expect("flush seed value");
+        write_one(&backend, space, durable_key.clone(), b"persisted")
+            .await
+            .expect("persist seed value");
+        backend.flush().await.expect("flush seed value");
     }
 
     let fault_store = Arc::new(FaultStore::new(object_store.clone()));
@@ -200,6 +215,7 @@ fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
         fault_store.fail_writes.store(true, Ordering::Relaxed);
 
         let error = write_one(&backend, space, rejected_key.clone(), b"not-persisted")
+            .await
             .expect_err("remote write failure must fail the backend commit");
         assert!(format!("{error}").contains("not supported"));
     }
@@ -209,14 +225,12 @@ fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
         .expect("reopen failure-test backend from durable store");
     let read = reopened
         .begin_read(ReadOptions::default())
+        .await
         .expect("begin failure-test read");
-    let result = get_many(
-        &read,
-        space,
-        &[durable_key, rejected_key],
-        GetOptions::default(),
-    )
-    .expect("read durable values after failed write");
+    let result = read
+        .get_many(space, &[durable_key, rejected_key], GetOptions::default())
+        .await
+        .expect("read durable values after failed write");
 
     assert_eq!(
         result.values,
@@ -227,8 +241,8 @@ fn cached_slatedb_backend_does_not_acknowledge_failed_remote_writes() {
     );
 }
 
-#[test]
-fn slatedb_commit_flushes_one_wal_write_immediately() {
+#[tokio::test]
+async fn slatedb_commit_flushes_one_wal_write_immediately() {
     let object_store = Arc::new(InMemory::new());
     let counting_store = Arc::new(FaultStore::new(object_store));
     let backend =
@@ -242,10 +256,14 @@ fn slatedb_commit_flushes_one_wal_write_immediately() {
         Key(Bytes::from_static(b"durable")),
         b"value",
     )
+    .await
     .expect("commit immediately durable value");
 
     assert_eq!(counting_store.write_count(), 1);
-    backend.flush().expect("flush already durable backend");
+    backend
+        .flush()
+        .await
+        .expect("flush already durable backend");
     assert_eq!(
         counting_store.write_count(),
         1,
@@ -253,28 +271,30 @@ fn slatedb_commit_flushes_one_wal_write_immediately() {
     );
 }
 
-fn write_one(
+async fn write_one(
     backend: &SlateDbBackend,
     space: SpaceId,
     key: Key,
     value: &'static [u8],
 ) -> Result<(), BackendError> {
-    let mut write = backend.begin_write(WriteOptions::default())?;
-    write.put_many(
-        space,
-        PutBatch {
-            entries: vec![PutEntry {
-                key,
-                value: StoredValue {
-                    bytes: Bytes::from_static(value),
-                },
-            }],
-        },
-    )?;
-    write.commit().map(|_| ())
+    let mut write = backend.begin_write(WriteOptions::default()).await?;
+    write
+        .put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: StoredValue {
+                        bytes: Bytes::from_static(value),
+                    },
+                }],
+            },
+        )
+        .await?;
+    write.commit().await.map(|_| ())
 }
 
-fn assert_cached_rows(
+async fn assert_cached_rows(
     object_store: Arc<InMemory>,
     db_path: &str,
     cache_path: PathBuf,
@@ -290,8 +310,8 @@ fn assert_cached_rows(
     .expect("open cached backend");
     let read = backend
         .begin_read(ReadOptions::default())
+        .await
         .expect("begin cached read");
-    let mut rows = Vec::new();
     let result = read
         .scan(
             space,
@@ -304,17 +324,21 @@ fn assert_cached_rows(
                 limit_rows: usize::MAX,
                 resume_after: None,
             },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                let ProjectedValueRef::FullValue(value) = value else {
-                    panic!("cached scan returned key-only projection");
-                };
-                rows.push((key.to_owned_key(), Bytes::copy_from_slice(value)));
-                Ok(())
-            },
         )
+        .await
         .expect("scan cached rows");
 
-    assert_eq!(result.emitted, 3);
+    assert_eq!(result.entries.len(), 3);
+    let rows = result
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let ProjectedValue::FullValue(value) = entry.value else {
+                panic!("cached scan returned key-only projection");
+            };
+            (entry.key, value)
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         rows,
         vec![
@@ -385,15 +409,17 @@ impl BackendFactory for CachedSlateDbBackendFactory {
 impl BackendFixture for CachedSlateDbBackendFixture {
     type Backend = SlateDbBackend;
 
-    fn open(&self) -> Self::Backend {
-        SlateDbBackend::open_object_store_with_options(
-            self.db_path.clone(),
-            self.object_store.clone(),
-            SlateDbObjectStoreOptions {
-                cache: Some(cache_options(self.cache_path.clone())),
-            },
-        )
-        .expect("open cached SlateDB fixture")
+    fn open(&self) -> impl Future<Output = Self::Backend> + Send {
+        async move {
+            SlateDbBackend::open_object_store_with_options(
+                self.db_path.clone(),
+                self.object_store.clone(),
+                SlateDbObjectStoreOptions {
+                    cache: Some(cache_options(self.cache_path.clone())),
+                },
+            )
+            .expect("open cached SlateDB fixture")
+        }
     }
 }
 

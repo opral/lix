@@ -45,7 +45,7 @@ pub(crate) async fn analyze<S>(
     commits: MergeCommits,
 ) -> Result<MergeAnalysis, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     let request = TrackedStateDiffRequest::default();
     let base_commit_id = commits.base_commit_id.to_string();

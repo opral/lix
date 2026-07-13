@@ -2,10 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use ahash::RandomState;
 
-use crate::backend::{
-    BackendError, BackendRead, GetOptions, Key, PointVisitor, ProjectedValue, ProjectedValueRef,
-    SpaceId,
-};
+use crate::backend::{BackendError, GetOptions, Key, ProjectedValue, SpaceId};
 use crate::storage::{StorageRead, StorageReadResult, StorageReadStats, StorageSpace};
 
 type FastHashBuilder = RandomState;
@@ -20,17 +17,6 @@ pub struct PointReadPlan {
 #[derive(Debug, PartialEq, Eq)]
 pub struct PointValues<'plan> {
     pub unique_values: Vec<Option<ProjectedValue>>,
-    pub requested_to_unique: RequestedToUniqueRef<'plan>,
-}
-
-#[derive(Debug, Default)]
-pub struct PointReadBuffer {
-    unique_values: Vec<Option<ProjectedValue>>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct PointValuesRef<'plan, 'buf> {
-    pub unique_values: &'buf [Option<ProjectedValue>],
     pub requested_to_unique: RequestedToUniqueRef<'plan>,
 }
 
@@ -95,17 +81,18 @@ impl PointReadPlan {
         self.requested_to_unique.as_ref()
     }
 
-    pub fn collect<R>(
+    pub async fn collect<R>(
         &self,
         read: &R,
-        opts: GetOptions<'_>,
+        opts: GetOptions,
     ) -> Result<StorageReadResult<PointValues<'_>>, BackendError>
     where
         R: StorageRead + ?Sized,
     {
-        let unique_values = read.with_backend(|backend_read| {
-            collect_unique_values(backend_read, self.space, &self.logical_unique_keys, opts)
-        })?;
+        let unique_values = read
+            .get_many(self.space, &self.logical_unique_keys, opts)
+            .await?
+            .values;
         Ok(StorageReadResult::new(
             PointValues {
                 unique_values,
@@ -115,63 +102,19 @@ impl PointReadPlan {
         ))
     }
 
-    pub fn materialize<R>(
+    pub async fn materialize<R>(
         &self,
         read: &R,
-        opts: GetOptions<'_>,
+        opts: GetOptions,
     ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError>
     where
         R: StorageRead + ?Sized,
     {
-        let result = self.collect(read, opts)?;
+        let result = self.collect(read, opts).await?;
         Ok(StorageReadResult::new(
             result.value.materialize_caller_order(),
             result.stats,
         ))
-    }
-
-    pub fn collect_into<'plan, 'buf, R>(
-        &'plan self,
-        read: &R,
-        opts: GetOptions<'_>,
-        buffer: &'buf mut PointReadBuffer,
-    ) -> Result<StorageReadResult<PointValuesRef<'plan, 'buf>>, BackendError>
-    where
-        R: StorageRead + ?Sized,
-    {
-        read.with_backend(|backend_read| {
-            collect_unique_values_into(
-                backend_read,
-                self.space,
-                &self.logical_unique_keys,
-                opts,
-                buffer,
-            )
-        })?;
-
-        Ok(StorageReadResult::new(
-            PointValuesRef {
-                unique_values: buffer.unique_values.as_slice(),
-                requested_to_unique: self.requested_to_unique.as_ref(),
-            },
-            self.stats(),
-        ))
-    }
-
-    pub fn visit<R, V>(
-        &self,
-        read: &R,
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<StorageReadStats, BackendError>
-    where
-        R: StorageRead + ?Sized,
-        V: PointVisitor + ?Sized,
-    {
-        read.with_backend(|backend_read| {
-            backend_read.visit_keys(self.space, &self.logical_unique_keys, opts, visitor)
-        })?;
-        Ok(self.stats())
     }
 
     fn from_parts(
@@ -275,105 +218,6 @@ impl PointValues<'_> {
     pub fn materialize_caller_order(self) -> Vec<Option<ProjectedValue>> {
         materialize_caller_order(self.unique_values, self.requested_to_unique)
     }
-}
-
-impl PointReadBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.unique_values.capacity()
-    }
-
-    pub fn clear(&mut self) {
-        self.unique_values.clear();
-    }
-
-    fn reset_for_len(&mut self, len: usize) {
-        self.unique_values.clear();
-        self.unique_values.resize_with(len, || None);
-    }
-}
-
-impl PointValuesRef<'_, '_> {
-    pub fn len(&self) -> usize {
-        self.requested_to_unique.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.requested_to_unique.is_empty()
-    }
-
-    pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
-        let unique_index = self.requested_to_unique.unique_index(requested_index)?;
-        self.unique_values.get(unique_index)?.as_ref()
-    }
-}
-
-fn collect_unique_values<R>(
-    read: &R,
-    space: SpaceId,
-    unique_keys: &[Key],
-    opts: GetOptions<'_>,
-) -> Result<Vec<Option<ProjectedValue>>, BackendError>
-where
-    R: BackendRead,
-{
-    let mut values = vec![None; unique_keys.len()];
-    collect_unique_values_into_slice(read, space, unique_keys, opts, values.as_mut_slice())?;
-    Ok(values)
-}
-
-fn collect_unique_values_into<R>(
-    read: &R,
-    space: SpaceId,
-    unique_keys: &[Key],
-    opts: GetOptions<'_>,
-    buffer: &mut PointReadBuffer,
-) -> Result<(), BackendError>
-where
-    R: BackendRead,
-{
-    buffer.reset_for_len(unique_keys.len());
-    collect_unique_values_into_slice(
-        read,
-        space,
-        unique_keys,
-        opts,
-        buffer.unique_values.as_mut_slice(),
-    )
-}
-
-fn collect_unique_values_into_slice<R>(
-    read: &R,
-    space: SpaceId,
-    unique_keys: &[Key],
-    opts: GetOptions<'_>,
-    values: &mut [Option<ProjectedValue>],
-) -> Result<(), BackendError>
-where
-    R: BackendRead,
-{
-    struct Collector<'a> {
-        values: &'a mut [Option<ProjectedValue>],
-    }
-
-    impl PointVisitor for Collector<'_> {
-        fn visit(
-            &mut self,
-            index: usize,
-            _key: &Key,
-            value: Option<ProjectedValueRef<'_>>,
-        ) -> Result<(), BackendError> {
-            if let Some(slot) = self.values.get_mut(index) {
-                *slot = value.map(ProjectedValueRef::to_owned);
-            }
-            Ok(())
-        }
-    }
-
-    read.visit_keys(space, unique_keys, opts, &mut Collector { values })
 }
 
 fn keys_are_unique(keys: &[Key]) -> bool {

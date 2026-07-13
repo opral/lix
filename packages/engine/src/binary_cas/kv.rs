@@ -152,7 +152,8 @@ async fn get_one(
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
     let result = PointReadPlan::new(space, &[StorageKey(Bytes::from(key))])
-        .materialize(store, StorageGetOptions::default())?;
+        .materialize(store, StorageGetOptions::default())
+        .await?;
     Ok(result
         .value
         .into_iter()
@@ -175,13 +176,15 @@ async fn scan_all_values(
     let mut values = Vec::new();
     let mut resume_after = None;
     loop {
-        let page = plan.collect(
-            store,
-            StorageScanOptions {
-                resume_after: resume_after.as_ref(),
-                ..StorageScanOptions::default()
-            },
-        )?;
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         values.extend(
             page.value
@@ -207,7 +210,8 @@ pub(crate) async fn load_metadata_many(
         store,
         BINARY_CAS_MANIFEST_SPACE,
         hashes.iter().map(|hash| manifest_key(*hash)).collect(),
-    )?;
+    )
+    .await?;
     if rows.len() != hashes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -315,9 +319,10 @@ async fn load_chunk_rows(
         BINARY_CAS_CHUNK_SPACE,
         hashes.iter().map(|hash| chunk_key(*hash)).collect(),
     )
+    .await
 }
 
-fn point_values(
+async fn point_values(
     store: &impl StorageRead,
     space: StorageSpace,
     keys: Vec<Vec<u8>>,
@@ -326,8 +331,9 @@ fn point_values(
         .into_iter()
         .map(|key| StorageKey(Bytes::from(key)))
         .collect::<Vec<_>>();
-    let result =
-        PointReadPlan::new(space, &keys).materialize(store, StorageGetOptions::default())?;
+    let result = PointReadPlan::new(space, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
     Ok(result
         .value
         .into_iter()
@@ -535,7 +541,7 @@ pub(in crate::binary_cas) fn stage_blob_write(
     )
 }
 
-pub(in crate::binary_cas) fn stage_blob_write_skipping_existing_chunks<S>(
+pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
     chunking: BinaryCasChunking,
     store: &S,
     writes: &mut StorageWriteSet,
@@ -553,7 +559,7 @@ where
         return Ok(receipt);
     }
 
-    let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, bytes, &plan)?;
+    let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, bytes, &plan).await?;
     stage_prepared_blob_write(writes, bytes, &plan, |chunk_hash| {
         Ok(chunk_hashes_to_stage.remove(&chunk_hash))
     })?;
@@ -700,7 +706,7 @@ fn stage_prepared_blob_write(
     Ok(())
 }
 
-fn missing_chunk_hashes(
+async fn missing_chunk_hashes(
     store: &(impl StorageRead + ?Sized),
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
@@ -728,7 +734,7 @@ fn missing_chunk_hashes(
         .iter()
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
-    let existing = chunk_keys_exist(store, keys)?;
+    let existing = chunk_keys_exist(store, keys).await?;
     Ok(candidates
         .into_iter()
         .zip(existing)
@@ -749,18 +755,19 @@ fn collect_chunk_lookup_candidate(
     candidates.push((chunk_hash, StorageKey(Bytes::from(key))));
 }
 
-fn chunk_keys_exist(
+async fn chunk_keys_exist(
     store: &(impl StorageRead + ?Sized),
     keys: Vec<StorageKey>,
 ) -> Result<Vec<bool>, LixError> {
     let started = Instant::now();
-    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_SPACE, keys).materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::KeyOnly,
-            ..StorageGetOptions::default()
-        },
-    )?;
+    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_SPACE, keys)
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?;
     let exists = result
         .value
         .into_iter()
@@ -887,11 +894,13 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("manifest writes should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_manifest(&store, blob_hash)
@@ -904,6 +913,7 @@ mod tests {
         );
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             scan_manifest_chunks(&store, blob_hash)
@@ -943,11 +953,13 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("chunk should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_chunk(&store, chunk_hash)
@@ -985,11 +997,13 @@ mod tests {
             writer.stage_bytes(data).expect("blob write should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("blob write should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1000,6 +1014,7 @@ mod tests {
         );
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_manifest(&store, blob_hash)
@@ -1012,6 +1027,7 @@ mod tests {
         );
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             scan_manifest_chunks(&store, blob_hash)
@@ -1037,26 +1053,31 @@ mod tests {
             assert_eq!(writes.stats().staged_puts, 2);
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("initial blob write should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let mut writer =
             BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
         writer
             .stage_payload(&payload)
+            .await
             .expect("repeat blob write should stage");
 
         assert_eq!(writes.stats().staged_puts, 1);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repeat blob write should commit");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1088,18 +1109,21 @@ mod tests {
                 .expect("initial blob write should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("initial blob write should commit");
         }
 
         crate::binary_cas::metrics::reset_binary_cas_write_metrics();
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let mut writer =
             BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
         writer
             .stage_payload(&payload)
+            .await
             .expect("repeat blob write should stage");
 
         assert_eq!(
@@ -1119,10 +1143,12 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("repeat blob write should commit");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1179,11 +1205,13 @@ mod tests {
                 .expect("blob write should stage with payload hash");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("blob write should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1216,6 +1244,7 @@ mod tests {
             writer.stage_bytes(data).expect("blob write should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("blob write should commit");
         }
 
@@ -1232,11 +1261,13 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("corrupt chunk should overwrite");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = load_bytes_many(&store, &[blob_hash])
             .await
@@ -1285,11 +1316,13 @@ mod tests {
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("wrong manifest fixture should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let error = load_bytes_many(&store, &[expected_blob_hash])
             .await
@@ -1313,11 +1346,13 @@ mod tests {
             writer.stage_bytes(data).expect("blob write should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("blob write should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1328,6 +1363,7 @@ mod tests {
         );
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             scan_manifest_chunks(&store, blob_hash)
@@ -1349,11 +1385,13 @@ mod tests {
             writer.stage_bytes(&data).expect("blob write should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("blob write should commit");
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1364,6 +1402,7 @@ mod tests {
         );
         let store = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert!(
             scan_manifest_chunks(&store, blob_hash)

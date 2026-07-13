@@ -26,7 +26,7 @@ pub(crate) async fn materialize_rows_from_index_entries<S>(
     materialization: &TrackedRowMaterialization,
 ) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     if !materialization.snapshot_content && !materialization.metadata {
         return Ok(entries
@@ -124,7 +124,7 @@ pub(crate) async fn load_change_records<S>(
     change_ids: impl Iterator<Item = ChangeId>,
 ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     let mut unique = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -138,7 +138,8 @@ where
         .map(|change_id| crate::storage::StorageKey(bytes::Bytes::from(change_key(*change_id))))
         .collect::<Vec<_>>();
     let result = crate::storage::PointReadPlan::new(CHANGE_SPACE, &keys)
-        .materialize(store, crate::storage::StorageGetOptions::default())?;
+        .materialize(store, crate::storage::StorageGetOptions::default())
+        .await?;
     let mut out = HashMap::with_capacity(unique.len());
     for (change_id, value) in unique.into_iter().zip(result.value) {
         if let Some(crate::storage::StorageProjectedValue::FullValue(bytes)) = value {
@@ -210,7 +211,7 @@ async fn load_materialization_json_values<S>(
     json_refs: &[JsonRef],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     if json_refs.is_empty() {
         return Ok(Vec::new());

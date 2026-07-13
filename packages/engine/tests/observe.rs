@@ -6,9 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    Backend, BackendError, BackendRead, Engine, GetOptions, InMemoryBackend, InMemoryRead,
-    InMemoryWrite, Key, KeyRange, ObserveEvent, PointVisitor, ReadOptions, ScanOptions, ScanResult,
-    ScanVisitor, SessionContext, SpaceId, Value, WriteOptions,
+    Backend, BackendError, BackendRead, Engine, GetManyResult, GetOptions, InMemoryBackend,
+    InMemoryRead, InMemoryWrite, Key, KeyRange, ObserveEvent, ReadOptions, ScanChunk, ScanOptions,
+    SessionContext, SpaceId, Value, WriteOptions,
 };
 use serde_json::json;
 use support::simulation_test::engine::{SimSession, Simulation};
@@ -36,8 +36,6 @@ fn observe_key(session: &SessionContext, key: &str) -> lix_engine::ObserveEvents
 async fn next_event<B>(events: &mut lix_engine::ObserveEvents<B>, label: &str) -> ObserveEvent
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     tokio::time::timeout(NEXT_TIMEOUT, events.next())
         .await
@@ -49,8 +47,6 @@ where
 async fn expect_no_event<B>(events: &mut lix_engine::ObserveEvents<B>, label: &str)
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     match tokio::time::timeout(NO_EVENT_TIMEOUT, events.next()).await {
         Err(_) => {}
@@ -770,13 +766,13 @@ impl Backend for BlockingBeginReadBackend {
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.gate.maybe_block();
-        self.inner.begin_read(opts)
+        self.inner.begin_read(opts).await
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        self.inner.begin_write(opts)
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.inner.begin_write(opts).await
     }
 }
 
@@ -791,13 +787,13 @@ impl Backend for BlockingBeginWriteBackend {
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        self.inner.begin_read(opts)
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts).await
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.gate.maybe_block();
-        self.inner.begin_write(opts)
+        self.inner.begin_write(opts).await
     }
 }
 
@@ -930,46 +926,38 @@ impl Backend for CountingReadBackend {
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(CountingRead {
-            inner: self.inner.begin_read(opts)?,
+            inner: self.inner.begin_read(opts).await?,
             read_count: Arc::clone(&self.read_count),
             counted: AtomicBool::new(false),
         })
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        self.inner.begin_write(opts)
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.inner.begin_write(opts).await
     }
 }
 
 impl BackendRead for CountingRead {
-    fn visit_keys<V>(
+    async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
+        opts: GetOptions,
+    ) -> Result<GetManyResult, BackendError> {
         self.count_user_read(space);
-        self.inner.visit_keys(space, keys, opts, visitor)
+        self.inner.get_many(space, keys, opts).await
     }
 
-    fn scan<V>(
+    async fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, BackendError> {
         self.count_user_read(space);
-        self.inner.scan(space, range, opts, visitor)
+        self.inner.scan(space, range, opts).await
     }
 }
 

@@ -1,11 +1,11 @@
 use lix_backends::{RedbBackend, RedbBackendFactory};
 use lix_engine::run_backend_conformance;
 
-#[test]
-fn redb_backend_passes_backend_conformance() {
+#[tokio::test]
+async fn redb_backend_passes_backend_conformance() {
     let factory = RedbBackendFactory::new();
 
-    run_backend_conformance(&factory).assert_no_failures();
+    run_backend_conformance(&factory).await.assert_no_failures();
 }
 
 #[test]

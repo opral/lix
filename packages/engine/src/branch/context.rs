@@ -25,7 +25,7 @@ impl BranchContext {
     /// Creates a branch-ref reader over a caller-provided KV store.
     pub(crate) fn ref_reader<S>(&self, store: S) -> impl BranchRefReader + use<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         self.refs.reader(store)
     }

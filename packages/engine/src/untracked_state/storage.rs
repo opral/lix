@@ -33,7 +33,7 @@ pub(crate) async fn scan_rows(
     let mut materialized = Vec::new();
 
     for plan in plans {
-        scan_matching_rows(store, request, &projection, &plan, &mut materialized)?;
+        scan_matching_rows(store, request, &projection, &plan, &mut materialized).await?;
         if request
             .limit
             .is_some_and(|limit| materialized.len() >= limit)
@@ -58,7 +58,8 @@ pub(crate) async fn load_row(
             &identity,
         )?))],
     )
-    .materialize(store, StorageGetOptions::default())?;
+    .materialize(store, StorageGetOptions::default())
+    .await?;
     let bytes = result
         .value
         .into_iter()
@@ -100,13 +101,14 @@ pub(super) async fn existing_identities<'a>(
         .map(|(key, _)| StorageKey(Bytes::from(key.clone())))
         .collect::<Vec<_>>();
 
-    let result = PointReadPlan::from_unique_keys(UNTRACKED_STATE_ROW_SPACE, keys).materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::KeyOnly,
-            ..StorageGetOptions::default()
-        },
-    )?;
+    let result = PointReadPlan::from_unique_keys(UNTRACKED_STATE_ROW_SPACE, keys)
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?;
     let exists = result
         .value
         .into_iter()
@@ -169,7 +171,7 @@ where
     Ok(())
 }
 
-fn scan_matching_rows(
+async fn scan_matching_rows(
     store: &impl StorageRead,
     request: &UntrackedStateScanRequest,
     projection: &UntrackedMaterializationProjection,
@@ -184,15 +186,17 @@ fn scan_matching_rows(
         if matches!(remaining_limit, Some(0)) {
             break;
         }
-        let page = plan.collect(
-            store,
-            StorageScanOptions {
-                resume_after: resume_after.as_ref(),
-                limit_rows: remaining_limit
-                    .unwrap_or_else(|| StorageScanOptions::default().limit_rows),
-                ..StorageScanOptions::default()
-            },
-        )?;
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    limit_rows: remaining_limit
+                        .unwrap_or_else(|| StorageScanOptions::default().limit_rows),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
 
         for entry in page.value.entries {
@@ -604,6 +608,7 @@ mod tests {
             .expect("rows should write");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("rows should commit");
     }
 
@@ -618,6 +623,7 @@ mod tests {
         let loaded = {
             let read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut reader = context.reader(read);
             reader
@@ -651,6 +657,7 @@ mod tests {
         let rows = {
             let read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut reader = context.reader(read);
             reader
@@ -690,11 +697,13 @@ mod tests {
             .expect("delete should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let loaded = {
             let read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut reader = context.reader(read);
             reader
@@ -725,11 +734,13 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("legacy row should commit");
 
         let loaded = {
             let read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut reader = context.reader(read);
             reader
@@ -747,6 +758,7 @@ mod tests {
         let rows = {
             let read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open");
             let mut reader = context.reader(read);
             reader

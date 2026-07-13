@@ -27,20 +27,26 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
 
     for (label, row_count) in [("smoke", SMOKE_ROWS), ("real_workload", REAL_WORKLOAD_ROWS)] {
         for profile in BACKEND_PROFILES {
-            bench_kv_layout(c, profile, &rows[..row_count], label);
+            bench_kv_layout(c, &runtime, profile, &rows[..row_count], label);
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
     }
 }
 
-fn bench_kv_layout(c: &mut Criterion, profile: BackendProfile, rows: &[WorkloadRow], label: &str) {
+fn bench_kv_layout(
+    c: &mut Criterion,
+    runtime: &tokio::runtime::Runtime,
+    profile: BackendProfile,
+    rows: &[WorkloadRow],
+    label: &str,
+) {
     let mut group = c.benchmark_group(format!(
         "tracked_state_crud/kv_layout/{}/{label}",
         profile.name()
     ));
     configure_group(&mut group, rows.len());
-    bench_sync_ops(&mut group, profile, rows, "kv_layout", KvOps);
+    bench_async_ops(&mut group, runtime, profile, rows, "kv_layout", KvOps);
     group.finish();
 }
 
@@ -263,69 +269,70 @@ fn bench_sql_session(
     group.finish();
 }
 
-trait SyncOps {
+trait AsyncOps {
     type Fixture;
 
-    fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture;
-    fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture;
-    fn insert_all(fixture: &mut Self::Fixture) -> usize;
-    fn read_all(fixture: &mut Self::Fixture) -> usize;
-    fn read_one_by_pk(fixture: &mut Self::Fixture) -> usize;
-    fn read_many_by_pk(fixture: &mut Self::Fixture, count: usize) -> usize;
-    fn update_all(fixture: &mut Self::Fixture) -> usize;
-    fn update_one_by_pk(fixture: &mut Self::Fixture) -> usize;
-    fn delete_all(fixture: &mut Self::Fixture) -> usize;
-    fn delete_one_by_pk(fixture: &mut Self::Fixture) -> usize;
+    async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture;
+    async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture;
+    async fn insert_all(fixture: &mut Self::Fixture) -> usize;
+    async fn read_all(fixture: &mut Self::Fixture) -> usize;
+    async fn read_one_by_pk(fixture: &mut Self::Fixture) -> usize;
+    async fn read_many_by_pk(fixture: &mut Self::Fixture, count: usize) -> usize;
+    async fn update_all(fixture: &mut Self::Fixture) -> usize;
+    async fn update_one_by_pk(fixture: &mut Self::Fixture) -> usize;
+    async fn delete_all(fixture: &mut Self::Fixture) -> usize;
+    async fn delete_one_by_pk(fixture: &mut Self::Fixture) -> usize;
 }
 
 struct KvOps;
 
-impl SyncOps for KvOps {
+impl AsyncOps for KvOps {
     type Fixture = kv_layout::KvFixture;
 
-    fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture {
-        kv_layout::empty_fixture(profile, rows)
+    async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture {
+        kv_layout::empty_fixture(profile, rows).await
     }
 
-    fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture {
-        kv_layout::seeded_fixture(profile, rows)
+    async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture {
+        kv_layout::seeded_fixture(profile, rows).await
     }
 
-    fn insert_all(fixture: &mut Self::Fixture) -> usize {
-        fixture.insert_all()
+    async fn insert_all(fixture: &mut Self::Fixture) -> usize {
+        fixture.insert_all().await
     }
 
-    fn read_all(fixture: &mut Self::Fixture) -> usize {
-        fixture.read_all()
+    async fn read_all(fixture: &mut Self::Fixture) -> usize {
+        fixture.read_all().await
     }
 
-    fn read_one_by_pk(fixture: &mut Self::Fixture) -> usize {
-        fixture.read_one_by_pk()
+    async fn read_one_by_pk(fixture: &mut Self::Fixture) -> usize {
+        fixture.read_one_by_pk().await
     }
 
-    fn read_many_by_pk(fixture: &mut Self::Fixture, count: usize) -> usize {
-        fixture.read_many_by_pk(count)
+    async fn read_many_by_pk(fixture: &mut Self::Fixture, count: usize) -> usize {
+        fixture.read_many_by_pk(count).await
     }
 
-    fn update_all(fixture: &mut Self::Fixture) -> usize {
-        fixture.update_all()
+    async fn update_all(fixture: &mut Self::Fixture) -> usize {
+        fixture.update_all().await
     }
 
-    fn update_one_by_pk(fixture: &mut Self::Fixture) -> usize {
-        fixture.update_one_by_pk()
+    async fn update_one_by_pk(fixture: &mut Self::Fixture) -> usize {
+        fixture.update_one_by_pk().await
     }
 
-    fn delete_all(fixture: &mut Self::Fixture) -> usize {
-        fixture.delete_all()
+    async fn delete_all(fixture: &mut Self::Fixture) -> usize {
+        fixture.delete_all().await
     }
 
-    fn delete_one_by_pk(fixture: &mut Self::Fixture) -> usize {
-        fixture.delete_one_by_pk()
+    async fn delete_one_by_pk(fixture: &mut Self::Fixture) -> usize {
+        fixture.delete_one_by_pk().await
     }
 }
 
-fn bench_sync_ops<O: SyncOps>(
+fn bench_async_ops<O: AsyncOps>(
     group: &mut BenchmarkGroup<'_, WallTime>,
+    runtime: &tokio::runtime::Runtime,
     profile: BackendProfile,
     rows: &[WorkloadRow],
     _layer: &str,
@@ -334,57 +341,57 @@ fn bench_sync_ops<O: SyncOps>(
     let rows = rows.to_vec();
     group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::empty_fixture(profile, &rows),
-            |fixture| black_box(O::insert_all(fixture)),
+            || runtime.block_on(O::empty_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::insert_all(fixture))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("read_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::read_all(fixture)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::read_all(fixture))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::read_one_by_pk(fixture)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::read_one_by_pk(fixture))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::read_many_by_pk(fixture, READ_MANY_PK_COUNT)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::read_many_by_pk(fixture, READ_MANY_PK_COUNT))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::update_all(fixture)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::update_all(fixture))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::update_one_by_pk(fixture)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::update_one_by_pk(fixture))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::delete_all(fixture)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::delete_all(fixture))),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::delete_one_by_pk(fixture)),
+            || runtime.block_on(O::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(O::delete_one_by_pk(fixture))),
             BatchSize::LargeInput,
         );
     });

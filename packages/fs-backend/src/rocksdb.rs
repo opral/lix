@@ -1,16 +1,23 @@
+#![allow(
+    clippy::manual_async_fn,
+    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+)]
+
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
+    GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 use rocksdb::Snapshot;
 use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -36,7 +43,7 @@ pub struct RocksDbFilesystemRead<'a> {
 #[allow(missing_debug_implementations)]
 pub struct RocksDbFilesystemWrite {
     inner: Arc<RocksDbFilesystemInner>,
-    _writer_permit: WriterPermit,
+    _writer_permit: OwnedMutexGuard<()>,
     batch: WriteBatch,
     staged_put_keys: Vec<Key>,
     stats: WriteStats,
@@ -69,152 +76,87 @@ impl Backend for RocksDbFilesystemBackend {
     where
         Self: 'a;
 
-    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        Ok(RocksDbFilesystemRead {
-            snapshot: self.inner.db.snapshot(),
-        })
+    fn begin_read(
+        &self,
+        _opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+        async move {
+            Ok(RocksDbFilesystemRead {
+                snapshot: self.inner.db.snapshot(),
+            })
+        }
     }
 
-    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        let writer_permit = self.inner.write_gate.acquire()?;
-        Ok(RocksDbFilesystemWrite {
-            inner: Arc::clone(&self.inner),
-            _writer_permit: writer_permit,
-            batch: WriteBatch::default(),
-            staged_put_keys: Vec::new(),
-            stats: WriteStats::default(),
-        })
+    fn begin_write(
+        &self,
+        _opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+        async move {
+            let writer_permit = self.inner.write_gate.acquire().await;
+            Ok(RocksDbFilesystemWrite {
+                inner: Arc::clone(&self.inner),
+                _writer_permit: writer_permit,
+                batch: WriteBatch::default(),
+                staged_put_keys: Vec::new(),
+                stats: WriteStats::default(),
+            })
+        }
     }
 }
 
 impl BackendRead for RocksDbFilesystemRead<'_> {
-    fn visit_keys<V>(
+    fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
-        opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        let physical_keys = keys
-            .iter()
-            .map(|key| physical_key(space, key))
-            .collect::<Vec<_>>();
-        for (index, (key, value)) in keys
-            .iter()
-            .zip(
-                self.snapshot
-                    .multi_get(physical_keys.iter().map(|key| key.0.as_ref())),
-            )
-            .enumerate()
-        {
-            let value = value.map_err(rocksdb_error)?;
-            visitor.visit(
-                index,
-                key,
-                value
-                    .as_ref()
-                    .map(|value| project_value_ref(value.as_ref(), opts.projection)),
-            )?;
+        opts: GetOptions,
+    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        async move {
+            let physical_keys = keys
+                .iter()
+                .map(|key| physical_key(space, key))
+                .collect::<Vec<_>>();
+            let mut values = Vec::with_capacity(keys.len());
+            for value in self
+                .snapshot
+                .multi_get(physical_keys.iter().map(|key| key.0.as_ref()))
+            {
+                let value = value.map_err(rocksdb_error)?;
+                values.push(
+                    value
+                        .as_ref()
+                        .map(|value| project_value(value.as_ref(), opts.projection)),
+                );
+            }
+            Ok(GetManyResult::new(values))
         }
-        Ok(())
     }
 
-    fn scan<V>(
+    fn scan(
         &self,
         space: SpaceId,
         range: KeyRange,
-        opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        if opts.limit_rows == 0 {
-            return Ok(ScanResult {
-                emitted: 0,
-                has_more: false,
-            });
-        }
-
-        let resume_after = opts.resume_after.map(|key| physical_key(space, key));
-        let bounds = EncodedBounds::new(physical_range(space, range), resume_after.as_ref());
-        let mut emitted = 0usize;
-
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
-        {
-            let (encoded_key, value) = item.map_err(rocksdb_error)?;
-            let encoded_key = encoded_key.as_ref();
-            if !bounds.after_lower(encoded_key) {
-                continue;
-            }
-            if !bounds.before_upper(encoded_key) {
-                break;
-            }
-            if emitted == opts.limit_rows {
-                return Ok(ScanResult {
-                    emitted,
-                    has_more: true,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        async move {
+            if opts.page_size() == 0 {
+                return Ok(ScanChunk {
+                    entries: Vec::new(),
+                    has_more: false,
                 });
             }
-            match opts.projection {
-                CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(&encoded_key[4..]), ProjectedValueRef::KeyOnly)?;
-                }
-                CoreProjection::FullValue => visitor.visit(
-                    KeyRef(&encoded_key[4..]),
-                    ProjectedValueRef::FullValue(value.as_ref()),
-                )?,
-            }
-            emitted += 1;
-        }
+            let resume_after = opts
+                .resume_after
+                .as_ref()
+                .map(|key| physical_key(space, key));
+            let bounds = EncodedBounds::new(physical_range(space, range), resume_after.as_ref());
+            let mut entries = Vec::with_capacity(opts.page_size());
 
-        Ok(ScanResult {
-            emitted,
-            has_more: false,
-        })
-    }
-}
-
-impl BackendWrite for RocksDbFilesystemWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        for entry in entries.entries {
-            let key = physical_key(space, &entry.key);
-            let value = stored_value_bytes(entry.value);
-            self.stats.put_entries += 1;
-            self.stats.written_bytes += value.len() as u64;
-            self.staged_put_keys.push(key.clone());
-            self.batch.put(key.0.as_ref(), value.as_ref());
-        }
-        self.stats.backend_calls += 1;
-        Ok(())
-    }
-
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        for key in keys {
-            self.batch.delete(physical_key(space, key).0.as_ref());
-        }
-        self.stats.deleted_entries += keys.len() as u64;
-        self.stats.backend_calls += 1;
-        Ok(())
-    }
-
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        let range = physical_range(space, range);
-        if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
-            self.batch.delete_range(lower.as_slice(), upper.as_slice());
-        } else {
-            let bounds = EncodedBounds::new(range, None);
             for item in self
-                .inner
-                .db
+                .snapshot
                 .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
             {
-                let (encoded_key, _value) = item.map_err(rocksdb_error)?;
+                let (encoded_key, value) = item.map_err(rocksdb_error)?;
                 let encoded_key = encoded_key.as_ref();
                 if !bounds.after_lower(encoded_key) {
                     continue;
@@ -222,31 +164,111 @@ impl BackendWrite for RocksDbFilesystemWrite {
                 if !bounds.before_upper(encoded_key) {
                     break;
                 }
-                self.batch.delete(encoded_key);
+                if entries.len() == opts.page_size() {
+                    return Ok(ScanChunk {
+                        entries,
+                        has_more: true,
+                    });
+                }
+                entries.push(ReadEntry {
+                    key: Key(Bytes::copy_from_slice(&encoded_key[4..])),
+                    value: project_value(value.as_ref(), opts.projection),
+                });
             }
+            Ok(ScanChunk {
+                entries,
+                has_more: false,
+            })
+        }
+    }
+}
 
-            for key in &self.staged_put_keys {
-                if bounds.contains(key.0.as_ref()) {
-                    self.batch.delete(key.0.as_ref());
+impl BackendWrite for RocksDbFilesystemWrite {
+    fn put_many(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for entry in entries.entries {
+                let key = physical_key(space, &entry.key);
+                let value = stored_value_bytes(entry.value);
+                self.stats.put_entries += 1;
+                self.stats.written_bytes += value.len() as u64;
+                self.staged_put_keys.push(key.clone());
+                self.batch.put(key.0.as_ref(), value.as_ref());
+            }
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            for key in keys {
+                self.batch.delete(physical_key(space, key).0.as_ref());
+            }
+            self.stats.deleted_entries += keys.len() as u64;
+            self.stats.backend_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async move {
+            let range = physical_range(space, range);
+            if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
+                self.batch.delete_range(lower.as_slice(), upper.as_slice());
+            } else {
+                let bounds = EncodedBounds::new(range, None);
+                for item in self
+                    .inner
+                    .db
+                    .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
+                {
+                    let (encoded_key, _value) = item.map_err(rocksdb_error)?;
+                    let encoded_key = encoded_key.as_ref();
+                    if !bounds.after_lower(encoded_key) {
+                        continue;
+                    }
+                    if !bounds.before_upper(encoded_key) {
+                        break;
+                    }
+                    self.batch.delete(encoded_key);
+                }
+
+                for key in &self.staged_put_keys {
+                    if bounds.contains(key.0.as_ref()) {
+                        self.batch.delete(key.0.as_ref());
+                    }
                 }
             }
+            self.stats.deleted_ranges += 1;
+            self.stats.backend_calls += 1;
+            Ok(())
         }
-
-        self.stats.deleted_ranges += 1;
-        self.stats.backend_calls += 1;
-        Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        self.inner.db.write(self.batch).map_err(rocksdb_error)?;
-        Ok(CommitResult {
-            commit_id: None,
-            stats: self.stats,
-        })
+    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+        async move {
+            self.inner.db.write(self.batch).map_err(rocksdb_error)?;
+            Ok(CommitResult {
+                commit_id: None,
+                stats: self.stats,
+            })
+        }
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
-        Ok(())
+    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -473,10 +495,10 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
     value.bytes
 }
 
-fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
+fn project_value(value: &[u8], projection: CoreProjection) -> ProjectedValue {
     match projection {
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+        CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
     }
 }
 
@@ -502,19 +524,7 @@ fn rocksdb_open_error(error: rocksdb::Error, path: &Path) -> BackendError {
 #[derive(Default)]
 #[allow(missing_debug_implementations)]
 struct WriteGate {
-    state: Arc<WriteGateState>,
-}
-
-#[derive(Default)]
-#[allow(missing_debug_implementations)]
-struct WriteGateState {
-    active: Mutex<bool>,
-    available: Condvar,
-}
-
-#[allow(missing_debug_implementations)]
-struct WriterPermit {
-    state: Arc<WriteGateState>,
+    state: Arc<AsyncMutex<()>>,
 }
 
 impl WriteGate {
@@ -522,29 +532,8 @@ impl WriteGate {
         Self::default()
     }
 
-    fn acquire(&self) -> Result<WriterPermit, BackendError> {
-        let mut active =
-            self.state.active.lock().map_err(|error| {
-                BackendError::Io(format!("rocksdb writer gate poisoned: {error}"))
-            })?;
-        while *active {
-            active = self.state.available.wait(active).map_err(|error| {
-                BackendError::Io(format!("rocksdb writer gate poisoned: {error}"))
-            })?;
-        }
-        *active = true;
-        Ok(WriterPermit {
-            state: Arc::clone(&self.state),
-        })
-    }
-}
-
-impl Drop for WriterPermit {
-    fn drop(&mut self) {
-        if let Ok(mut active) = self.state.active.lock() {
-            *active = false;
-            self.state.available.notify_one();
-        }
+    async fn acquire(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.state).lock_owned().await
     }
 }
 
@@ -552,11 +541,12 @@ impl Drop for WriterPermit {
 mod tests {
     use bytes::Bytes;
     use lix_engine::backend::{
-        Backend, BackendWrite, GetOptions, Key, PutBatch, PutEntry, ReadOptions, SpaceId,
-        StoredValue, WriteOptions, get_many,
+        Backend, BackendRead, BackendWrite, GetOptions, Key, PutBatch, PutEntry, ReadOptions,
+        SpaceId, StoredValue, WriteOptions,
     };
     use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig, run_backend_conformance};
     use std::env;
+    use std::future::Future;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -610,14 +600,16 @@ mod tests {
     impl BackendFixture for RocksDbFilesystemBackendFixture {
         type Backend = RocksDbFilesystemBackend;
 
-        fn open(&self) -> Self::Backend {
-            RocksDbFilesystemBackend::open(&self.path).expect("open rocksdb fs backend")
+        fn open(&self) -> impl Future<Output = Self::Backend> + Send {
+            async move { RocksDbFilesystemBackend::open(&self.path).expect("open rocksdb fs backend") }
         }
     }
 
     #[test]
     fn passes_backend_conformance() {
-        let report = run_backend_conformance(&RocksDbFilesystemBackendFactory::new());
+        let report = block_on(run_backend_conformance(
+            &RocksDbFilesystemBackendFactory::new(),
+        ));
         report.assert_no_failures();
     }
 
@@ -630,38 +622,32 @@ mod tests {
 
         {
             let backend = RocksDbFilesystemBackend::open(&path).expect("open backend");
-            let mut write = backend
-                .begin_write(WriteOptions::default())
-                .expect("begin write");
-            write
-                .put_many(
-                    SpaceId(0x0005_0003),
-                    PutBatch {
-                        entries: vec![PutEntry {
-                            key: key.clone(),
-                            value: StoredValue {
-                                bytes: value.clone(),
-                            },
-                        }],
-                    },
-                )
-                .expect("put chunk");
-            write.commit().expect("commit write");
+            let mut write =
+                block_on(backend.begin_write(WriteOptions::default())).expect("begin write");
+            block_on(write.put_many(
+                SpaceId(0x0005_0003),
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key.clone(),
+                        value: StoredValue {
+                            bytes: value.clone(),
+                        },
+                    }],
+                },
+            ))
+            .expect("put chunk");
+            block_on(write.commit()).expect("commit write");
             backend.flush().expect("flush backend");
         }
 
         let backend = RocksDbFilesystemBackend::open(&path).expect("reopen backend");
-        let read = backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read");
-        let result = get_many(&read, SpaceId(0x0005_0003), &[key], GetOptions::default())
+        let read = block_on(backend.begin_read(ReadOptions::default())).expect("begin read");
+        let result = block_on(read.get_many(SpaceId(0x0005_0003), &[key], GetOptions::default()))
             .expect("read chunk");
         assert_eq!(result.values.len(), 1);
         assert_eq!(
-            result.values[0].as_ref().map(|value| value.as_ref()),
-            Some(lix_engine::backend::ProjectedValueRef::FullValue(
-                value.as_ref()
-            ))
+            result.values[0],
+            Some(lix_engine::backend::ProjectedValue::FullValue(value))
         );
     }
 
@@ -695,19 +681,17 @@ mod tests {
         let path = temp_dir.path().join("fs.rocksdb");
         let backend_a = RocksDbFilesystemBackend::open(&path).expect("open first backend");
         let backend_b = RocksDbFilesystemBackend::open(&path).expect("open second backend");
-        let write_a = backend_a
-            .begin_write(WriteOptions::default())
-            .expect("begin first write");
+        let write_a =
+            block_on(backend_a.begin_write(WriteOptions::default())).expect("begin first write");
 
         let (attempt_tx, attempt_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
             attempt_tx.send(()).expect("signal write attempt");
-            let write_b = backend_b
-                .begin_write(WriteOptions::default())
+            let write_b = block_on(backend_b.begin_write(WriteOptions::default()))
                 .expect("begin second write");
             acquired_tx.send(()).expect("signal write acquired");
-            write_b.rollback().expect("rollback second write");
+            block_on(write_b.rollback()).expect("rollback second write");
         });
 
         attempt_rx
@@ -720,7 +704,7 @@ mod tests {
             "second write should wait while the first write is active"
         );
 
-        write_a.rollback().expect("rollback first write");
+        block_on(write_a.rollback()).expect("rollback first write");
         acquired_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("second write should acquire after first write closes");
@@ -790,28 +774,25 @@ mod tests {
     }
 
     fn put_one(backend: &RocksDbFilesystemBackend, space: SpaceId, key: Key, value: Bytes) {
-        let mut write = backend
-            .begin_write(WriteOptions::default())
-            .expect("begin write");
-        write
-            .put_many(
-                space,
-                PutBatch {
-                    entries: vec![PutEntry {
-                        key,
-                        value: StoredValue { bytes: value },
-                    }],
-                },
-            )
-            .expect("put one row");
-        write.commit().expect("commit write");
+        let mut write =
+            block_on(backend.begin_write(WriteOptions::default())).expect("begin write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: StoredValue { bytes: value },
+                }],
+            },
+        ))
+        .expect("put one row");
+        block_on(write.commit()).expect("commit write");
     }
 
     fn read_one(backend: &RocksDbFilesystemBackend, space: SpaceId, key: Key) -> Option<Bytes> {
-        let read = backend
-            .begin_read(ReadOptions::default())
-            .expect("begin read");
-        let result = get_many(&read, space, &[key], GetOptions::default()).expect("read one row");
+        let read = block_on(backend.begin_read(ReadOptions::default())).expect("begin read");
+        let result =
+            block_on(read.get_many(space, &[key], GetOptions::default())).expect("read one row");
         result.values[0].clone().map(|value| match value {
             lix_engine::backend::ProjectedValue::FullValue(bytes) => bytes,
             lix_engine::backend::ProjectedValue::KeyOnly => Bytes::new(),
@@ -829,5 +810,12 @@ mod tests {
                     .is_some_and(|extension| extension == "blob")
             })
             .count()
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
     }
 }

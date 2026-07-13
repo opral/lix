@@ -8,7 +8,5 @@ mod backend {
     #[cfg(feature = "slatedb")]
     mod slatedb;
 
-    mod scrambled;
-
     mod sqlite;
 }

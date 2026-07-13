@@ -42,8 +42,6 @@ impl<B> OpenLixOptions<B> {
 pub struct Lix<B = InMemoryBackend>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     _engine: Engine<B>,
     session: SessionContext<B>,
@@ -57,8 +55,6 @@ where
 pub async fn open_lix<B>(options: OpenLixOptions<B>) -> Result<Lix<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     let engine = open_or_initialize_engine(options.backend, options.wasm_runtime).await?;
     let session = engine.open_workspace_session().await?;
@@ -71,8 +67,6 @@ where
 pub async fn open_lix_with_backend<B>(backend: B) -> Result<Lix<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     open_lix(OpenLixOptions::new(backend)).await
 }
@@ -80,8 +74,6 @@ where
 impl<B> Lix<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
@@ -159,8 +151,6 @@ where
 pub struct LixTransaction<B = InMemoryBackend>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     inner: lix_engine::SessionTransaction<B>,
 }
@@ -168,8 +158,6 @@ where
 impl<B> LixTransaction<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one SQL statement inside this transaction.
     ///
@@ -207,8 +195,6 @@ pub(crate) async fn open_or_initialize_engine<B>(
 ) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     match new_engine(backend.clone(), wasm_runtime.clone()).await {
         Ok(engine) => Ok(engine),
@@ -226,8 +212,6 @@ async fn new_engine<B>(
 ) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     match wasm_runtime {
         Some(wasm_runtime) => Engine::new_with_wasm_runtime(backend, wasm_runtime).await,
@@ -239,8 +223,6 @@ where
 async fn new_engine_with_default_runtime<B>(backend: B) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     Engine::new_with_wasm_runtime(backend, crate::default_wasm_runtime::runtime()?).await
 }
@@ -249,8 +231,6 @@ where
 async fn new_engine_with_default_runtime<B>(backend: B) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
 {
     Engine::new(backend).await
 }

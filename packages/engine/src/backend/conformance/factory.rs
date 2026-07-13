@@ -1,6 +1,6 @@
 use crate::backend::{Backend, BackendError, ReadOptions, WriteOptions};
 
-pub trait BackendFactory {
+pub trait BackendFactory: Sync {
     type Backend: Backend;
     type Fixture: BackendFixture<Backend = Self::Backend>;
 
@@ -11,10 +11,10 @@ pub trait BackendFactory {
     }
 }
 
-pub trait BackendFixture {
+pub trait BackendFixture: Send + Sync {
     type Backend: Backend;
 
-    fn open(&self) -> Self::Backend;
+    fn open(&self) -> impl Future<Output = Self::Backend> + Send;
 }
 
 pub(crate) struct OpenBackend<F>
@@ -25,12 +25,12 @@ where
     backend: F::Backend,
 }
 
-pub(crate) fn open_backend<F>(factory: &F) -> OpenBackend<F>
+pub(crate) async fn open_backend<F>(factory: &F) -> OpenBackend<F>
 where
     F: BackendFactory,
 {
     let fixture = factory.create_fixture();
-    let backend = fixture.open();
+    let backend = fixture.open().await;
     OpenBackend {
         _fixture: fixture,
         backend,
@@ -50,11 +50,17 @@ where
     where
         Self: 'a;
 
-    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    fn begin_read(
+        &self,
+        opts: ReadOptions,
+    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
         self.backend.begin_read(opts)
     }
 
-    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    fn begin_write(
+        &self,
+        opts: WriteOptions,
+    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
         self.backend.begin_write(opts)
     }
 }

@@ -38,7 +38,7 @@ pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
     branch_ctx: &BranchContext,
     runtime_functions: Option<&FunctionContext>,
-    read: &mut (impl StorageRead + Send + Sync),
+    read: &mut impl StorageRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<StorageWriteSet, LixError> {
     let mut writes = StorageWriteSet::new();
@@ -47,7 +47,7 @@ pub(crate) async fn commit_prepared_writes(
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
         for write in &prepared_writes.file_data_writes {
-            blob_writer.stage_payload(write.payload())?;
+            blob_writer.stage_payload(write.payload()).await?;
         }
     }
 
@@ -169,7 +169,7 @@ fn json_payloads_from_state_row(
 }
 
 async fn existing_untracked_overlay_delete_identities<'a>(
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    read: &(impl StorageRead + ?Sized),
     identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 ) -> Result<Vec<UntrackedStateIdentity>, LixError> {
     UntrackedStateContext::new()
@@ -223,7 +223,7 @@ struct StagedChangelogCommit {
 }
 
 async fn stage_changelog_commits(
-    read: &mut (impl StorageRead + Send + Sync),
+    read: &mut impl StorageRead,
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
@@ -369,7 +369,7 @@ fn tracked_delta_from_selected_change_ref(
 }
 
 async fn stage_tracked_roots(
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    read: &(impl StorageRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     tracked_row_indices_by_commit: BTreeMap<CommitId, Vec<RowIndex>>,
@@ -610,7 +610,7 @@ async fn finalize_commit_rows(
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     branch_ctx: &BranchContext,
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    read: &(impl StorageRead + ?Sized),
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut branch_heads = Vec::new();
@@ -723,6 +723,7 @@ mod tests {
         let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         let state_rows = vec![tracked_global_row("change-1")];
@@ -746,11 +747,13 @@ mod tests {
         .expect("commit should flush staged rows");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let commits = changelog_reader
@@ -794,6 +797,7 @@ mod tests {
         let mut tracked_reader = TrackedStateContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let commit_id_text = commit_id_text("test-uuid-1");
@@ -821,6 +825,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id(GLOBAL_BRANCH_ID)
@@ -835,6 +840,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut parent_row = tracked_global_row("parent-change");
         parent_row.commit_id = Some(CommitId::for_test_label("parent-commit"));
@@ -871,11 +877,13 @@ mod tests {
         .expect("child-before-parent input should still stage parent first");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should persist");
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let commits = changelog_reader
@@ -899,6 +907,7 @@ mod tests {
         let untracked_state = UntrackedStateContext::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         let state_rows = vec![untracked_global_row("change-untracked")];
@@ -919,12 +928,14 @@ mod tests {
         .expect("commit should flush untracked row");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let loaded = {
             let mut untracked_reader = untracked_state.reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             );
             untracked_reader
@@ -965,10 +976,12 @@ mod tests {
             .expect("untracked seed should write");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("untracked seed should commit");
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let state_rows = vec![tracked_global_row("change-tracked")];
         let writes = commit_prepared_writes(
@@ -991,12 +1004,14 @@ mod tests {
         .expect("tracked commit should flush");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let untracked = {
             let mut untracked_reader = untracked_state.reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             );
             untracked_reader.load_row(&untracked_request()).await
@@ -1008,6 +1023,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&live_state_request())
@@ -1032,6 +1048,7 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("seed read should open");
             let mut writes = storage.new_write_set();
             crate::test_support::stage_tracked_root_from_materialized(
@@ -1056,6 +1073,7 @@ mod tests {
                 .expect("global branch ref should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("global branch ref should commit");
         }
         {
@@ -1090,6 +1108,7 @@ mod tests {
                 .expect("deterministic mode should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("deterministic mode should commit");
         }
         write_batches.store(0, Ordering::SeqCst);
@@ -1097,6 +1116,7 @@ mod tests {
             let reader = live_state.reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             );
             FunctionContext::prepare(&reader)
@@ -1106,6 +1126,7 @@ mod tests {
         runtime_functions.provider().call_uuid_v7();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
 
         let tracked_row = tracked_global_row("change-tracked");
@@ -1138,12 +1159,14 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
         assert_eq!(write_batches.load(Ordering::SeqCst), 1);
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let commits = changelog_reader
@@ -1174,6 +1197,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id(GLOBAL_BRANCH_ID)
@@ -1186,6 +1210,7 @@ mod tests {
             let mut untracked_reader = untracked_state.reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             );
             untracked_reader
@@ -1208,6 +1233,7 @@ mod tests {
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_row(&LiveStateRowRequest {
@@ -1236,6 +1262,7 @@ mod tests {
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let state_rows = vec![tracked_branch_row("branch-a", "change-branch-a")];
         let writes = commit_prepared_writes(
@@ -1258,11 +1285,13 @@ mod tests {
         .expect("branch commit should flush");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("writes should commit");
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let commits = changelog_reader
@@ -1287,6 +1316,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id(GLOBAL_BRANCH_ID)
@@ -1296,6 +1326,7 @@ mod tests {
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
+                    .await
                     .expect("read should open"),
             )
             .load_head_commit_id("branch-a")
@@ -1316,6 +1347,7 @@ mod tests {
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
@@ -1351,6 +1383,7 @@ mod tests {
         let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
@@ -1378,6 +1411,7 @@ mod tests {
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
@@ -1403,6 +1437,7 @@ mod tests {
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
@@ -1547,13 +1582,19 @@ mod tests {
             = CountingWrite
         where
             Self: 'a;
-        fn begin_read(&self, opts: StorageReadOptions) -> Result<Self::Read<'_>, BackendError> {
-            self.inner.begin_read(opts)
+        async fn begin_read(
+            &self,
+            opts: StorageReadOptions,
+        ) -> Result<Self::Read<'_>, BackendError> {
+            self.inner.begin_read(opts).await
         }
 
-        fn begin_write(&self, opts: StorageWriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        async fn begin_write(
+            &self,
+            opts: StorageWriteOptions,
+        ) -> Result<Self::Write<'_>, BackendError> {
             Ok(CountingWrite {
-                inner: self.inner.begin_write(opts)?,
+                inner: self.inner.begin_write(opts).await?,
                 write_batches: Arc::clone(&self.write_batches),
             })
         }
@@ -1565,25 +1606,37 @@ mod tests {
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-            self.inner.put_many(space, entries)
+        async fn put_many(
+            &mut self,
+            space: SpaceId,
+            entries: PutBatch,
+        ) -> Result<(), BackendError> {
+            self.inner.put_many(space, entries).await
         }
 
-        fn delete_many(&mut self, space: SpaceId, keys: &[StorageKey]) -> Result<(), BackendError> {
-            self.inner.delete_many(space, keys)
+        async fn delete_many(
+            &mut self,
+            space: SpaceId,
+            keys: &[StorageKey],
+        ) -> Result<(), BackendError> {
+            self.inner.delete_many(space, keys).await
         }
 
-        fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-            self.inner.delete_range(space, range)
+        async fn delete_range(
+            &mut self,
+            space: SpaceId,
+            range: KeyRange,
+        ) -> Result<(), BackendError> {
+            self.inner.delete_range(space, range).await
         }
 
-        fn commit(self) -> Result<CommitResult, BackendError> {
+        async fn commit(self) -> Result<CommitResult, BackendError> {
             self.write_batches.fetch_add(1, Ordering::SeqCst);
-            self.inner.commit()
+            self.inner.commit().await
         }
 
-        fn rollback(self) -> Result<(), BackendError> {
-            self.inner.rollback()
+        async fn rollback(self) -> Result<(), BackendError> {
+            self.inner.rollback().await
         }
     }
 }
