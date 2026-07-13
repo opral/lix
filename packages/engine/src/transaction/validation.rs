@@ -124,6 +124,35 @@ async fn scan_committed_constraint_rows(
         .collect())
 }
 
+async fn scan_committed_canonical_rows(
+    live_state: &dyn LiveStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    entity_pks: Vec<EntityPk>,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    let rows = live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![schema_key.to_string()],
+                entity_pks: entity_pks.clone(),
+                branch_ids: vec![domain.branch_id().to_string()],
+                file_ids: domain.file_filters(),
+                include_tombstones: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            domain.with_untracked(row.untracked).contains(row)
+                && row.schema_key == schema_key
+                && entity_pks.contains(&row.entity_pk)
+        })
+        .collect())
+}
+
 async fn load_committed_constraint_row(
     live_state: &dyn LiveStateReader,
     domain: &Domain,
@@ -849,14 +878,9 @@ async fn validate_committed_insert_identities(
             .iter()
             .map(|(entity_pk, _)| entity_pk.clone())
             .collect::<Vec<_>>();
-        let committed_rows = scan_committed_constraint_rows(
-            input.live_state,
-            &domain,
-            vec![schema_key.clone()],
-            entity_pks,
-            false,
-        )
-        .await?;
+        let committed_rows =
+            scan_committed_canonical_rows(input.live_state, &domain, &schema_key, entity_pks)
+                .await?;
         let committed_rows_by_entity_pk = committed_rows
             .into_iter()
             .filter(|row| {
@@ -865,8 +889,26 @@ async fn validate_committed_insert_identities(
             .map(|row| (row.entity_pk.clone(), row))
             .collect::<BTreeMap<_, _>>();
         for (entity_pk, origin) in checks {
-            if !committed_rows_by_entity_pk.contains_key(&entity_pk) {
+            let Some(committed_row) = committed_rows_by_entity_pk.get(&entity_pk) else {
                 continue;
+            };
+            if committed_row.untracked != domain.untracked() {
+                let requested = if domain.untracked() {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                let existing = if committed_row.untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "cannot insert {requested} row for schema '{schema_key}' entity_pk {entity_pk:?}: a canonical {existing} row already exists; delete it first"
+                    ),
+                ));
             }
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,

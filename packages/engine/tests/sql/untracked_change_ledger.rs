@@ -84,7 +84,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    deleting_untracked_current_row_does_not_reveal_tracked_history,
+    untracked_insert_rejects_tracked_canonical_row,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -105,25 +105,20 @@ simulation_test!(
             .expect("tracked seed insert should succeed");
         let tracked_head = branch_head(&session, sim.main_branch_id()).await;
 
-        session
+        let error = session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
                  VALUES ('untracked-ledger-delete', 'untracked-current', true)",
                 &[],
             )
             .await
-            .expect("untracked update over tracked history should succeed");
-        let pre_delete_change = current_change_id(&session, "untracked-ledger-delete").await;
-
-        session
-            .execute(
-                "DELETE FROM lix_state \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"untracked-ledger-delete\"]')",
-                &[],
-            )
-            .await
-            .expect("untracked delete should succeed");
+            .expect_err("untracked insert must reject a tracked canonical row");
+        assert!(
+            error
+                .message
+                .contains("a canonical tracked row already exists; delete it first"),
+            "durability collision should have a targeted error: {error:?}"
+        );
 
         let visible = session
             .execute(
@@ -135,56 +130,19 @@ simulation_test!(
             .expect("live state should remain readable");
         assert_eq!(
             visible.len(),
-            0,
-            "deleting untracked live state must not reveal the older tracked value"
+            1,
+            "rejected insert must preserve the tracked row"
         );
         assert_eq!(
             branch_head(&session, sim.main_branch_id()).await,
             tracked_head,
-            "untracked update and delete must not advance the branch head"
-        );
-        let tombstones = session
-            .execute(
-                "SELECT id FROM lix_change \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND lix_json_get_text(entity_pk, 0) = 'untracked-ledger-delete' \
-                   AND snapshot_content IS NULL",
-                &[],
-            )
-            .await
-            .expect("deletion change should read");
-        assert_eq!(
-            tombstones.len(),
-            1,
-            "the deletion must remain as a ledger tombstone"
-        );
-        assert!(
-            !change_exists(&session, &pre_delete_change).await,
-            "the pre-deletion untracked value should be compacted"
-        );
-        let historical = session
-            .execute(
-                &format!(
-                    "SELECT snapshot_content FROM lix_state_history \
-                     WHERE start_commit_id = '{tracked_head}' \
-                       AND schema_key = 'lix_key_value' \
-                       AND lix_json_get_text(entity_pk, 0) = 'untracked-ledger-delete' \
-                       AND depth = 0"
-                ),
-                &[],
-            )
-            .await
-            .expect("tracked history should remain readable");
-        assert_eq!(
-            historical.len(),
-            1,
-            "tracked history must survive current-state replacement"
+            "rejected insert must not advance the branch head"
         );
     }
 );
 
 simulation_test!(
-    tracked_write_after_untracked_becomes_canonical,
+    tracked_insert_rejects_untracked_canonical_row,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -206,21 +164,25 @@ simulation_test!(
             .expect("untracked insert should succeed");
         let untracked_change_id = current_change_id(&session, "untracked-ledger-promote").await;
 
-        session
+        let error = session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
                  VALUES ('untracked-ledger-promote', 'tracked', false)",
                 &[],
             )
             .await
-            .expect("tracked write after untracked state should succeed");
-        let tracked_change_id = current_change_id(&session, "untracked-ledger-promote").await;
-
-        assert_ne!(tracked_change_id, untracked_change_id);
-        assert!(change_exists(&session, &tracked_change_id).await);
+            .expect_err("tracked insert must reject an untracked canonical row");
         assert!(
-            !change_exists(&session, &untracked_change_id).await,
-            "the superseded untracked change should be compacted"
+            error
+                .message
+                .contains("a canonical untracked row already exists; delete it first"),
+            "durability collision should have a targeted error: {error:?}"
+        );
+        assert!(change_exists(&session, &untracked_change_id).await);
+        assert_eq!(
+            branch_head(&session, sim.main_branch_id()).await,
+            head_before,
+            "rejected insert must not advance the branch head"
         );
 
         let row = session
@@ -234,14 +196,9 @@ simulation_test!(
         assert_eq!(
             row.rows()[0].values(),
             &[
-                Value::Json(serde_json::json!("tracked")),
-                Value::Boolean(false)
+                Value::Json(serde_json::json!("draft")),
+                Value::Boolean(true)
             ]
-        );
-        assert_ne!(
-            branch_head(&session, sim.main_branch_id()).await,
-            head_before,
-            "the tracked replacement should advance the branch head"
         );
     }
 );

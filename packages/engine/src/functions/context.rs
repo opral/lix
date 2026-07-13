@@ -66,7 +66,7 @@ impl FunctionContext {
     /// deterministic mode is disabled.
     pub(crate) async fn stage_persist_if_needed(
         &self,
-        read: &(impl StorageRead + Send + Sync + ?Sized),
+        read: &(impl StorageRead + ?Sized),
         writes: &mut StorageWriteSet,
     ) -> Result<(), LixError> {
         let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
@@ -114,7 +114,7 @@ mod tests {
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
-    use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
+    use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
@@ -265,6 +265,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         context
             .stage_persist_if_needed(&read, &mut writes)
@@ -323,6 +324,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         context
             .stage_persist_if_needed(&read, &mut writes)
@@ -353,6 +355,7 @@ mod tests {
         let change_id = ChangeId::for_test_label(&format!("test-key-value-{key}"));
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         {

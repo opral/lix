@@ -9,7 +9,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
-use crate::live_state::index::{
+use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest,
 };
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
@@ -55,7 +55,7 @@ pub(crate) async fn load_sequence(
 /// The row is untracked global `lix_key_value` state: it is a real changelog
 /// fact, but is not retained by commit membership.
 pub(crate) async fn stage_sequence(
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    read: &(impl StorageRead + ?Sized),
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
@@ -213,7 +213,7 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 
 #[cfg(test)]
 mod tests {
-    use crate::live_state::index::LiveStateIndexContext;
+    use crate::live_state::LiveStateIndexContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
@@ -331,6 +331,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         stage_sequence(
             &read,
@@ -385,6 +386,7 @@ mod tests {
         let change_id = ChangeId::for_test_label(&format!("test-key-value-{key}"));
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         {

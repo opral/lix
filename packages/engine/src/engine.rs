@@ -8,8 +8,8 @@ use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
+use crate::live_state::LiveStateIndexContext;
 use crate::live_state::LiveStateRowRequest;
-use crate::live_state::index::LiveStateIndexContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
@@ -256,6 +256,7 @@ mod tests {
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("legacy sidecar bytes should commit");
 
         let engine = Engine::new(backend)

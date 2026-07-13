@@ -1,11 +1,18 @@
 mod context;
-pub(crate) mod index;
+mod index;
 mod reader;
 mod types;
 pub(crate) mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
+#[allow(unused_imports)]
+pub(crate) use index::{
+    LIVE_STATE_INDEX_BRANCH_ROOT_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
+    LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
+    LiveStateIndexStoreReader, LiveStateIndexWriteReport, LiveStateIndexWriter,
+    MaterializedLiveStateIndexRow,
+};
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
 #[allow(unused_imports)]

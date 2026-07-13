@@ -348,6 +348,7 @@ where
         let writes = match commit::commit_prepared_writes(
             &transaction.binary_cas,
             transaction.branch_ctx.as_ref(),
+            transaction.live_state.index(),
             Some(runtime_functions),
             &mut read,
             prepared_writes,
@@ -1644,7 +1645,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
-            crate::live_state::index::LiveStateIndexContext::new(),
+            crate::live_state::LiveStateIndexContext::new(),
             CommitGraphContext::new(),
         )
     }

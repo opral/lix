@@ -13,7 +13,7 @@ pub(crate) const LIVE_STATE_INDEX_BRANCH_ROOT_SPACE: StorageSpace = StorageSpace
     LIVE_STATE_INDEX_BRANCH_ROOT_NAMESPACE,
 );
 
-pub(crate) fn load_branch_root(
+pub(crate) async fn load_branch_root(
     store: &(impl StorageRead + ?Sized),
     branch_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
@@ -21,7 +21,8 @@ pub(crate) fn load_branch_root(
         LIVE_STATE_INDEX_BRANCH_ROOT_SPACE,
         &[branch_root_key(branch_id)],
     )
-    .materialize(store, StorageGetOptions::default())?;
+    .materialize(store, StorageGetOptions::default())
+    .await?;
     let value = result.value.into_iter().next().flatten();
     match value {
         Some(StorageProjectedValue::FullValue(bytes)) => {
@@ -67,25 +68,31 @@ mod tests {
         InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
     };
 
-    #[test]
-    fn branch_root_roundtrips() {
+    #[tokio::test]
+    async fn branch_root_roundtrips() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let root_id = TrackedStateRootId::new([7; 32]);
         let mut writes = storage.new_write_set();
         stage_branch_root(&mut writes, "branch-東京", &root_id).expect("branch root should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("branch root should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         assert_eq!(
-            load_branch_root(&read, "branch-東京").expect("branch root should load"),
+            load_branch_root(&read, "branch-東京")
+                .await
+                .expect("branch root should load"),
             Some(root_id)
         );
         assert_eq!(
-            load_branch_root(&read, "missing").expect("missing branch should load"),
+            load_branch_root(&read, "missing")
+                .await
+                .expect("missing branch should load"),
             None
         );
     }

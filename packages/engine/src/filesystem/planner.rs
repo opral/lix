@@ -20,7 +20,10 @@ use super::keys::{
 };
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
-use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
+use crate::transaction::types::{
+    LogicalPrimaryKey, TransactionFileData, TransactionJson, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteRow,
+};
 
 /// Planned filesystem write output after SQL surface columns have been lowered
 /// into state rows and optional file payload writes.
@@ -554,8 +557,9 @@ impl DirectoryPathResolver {
         if !self.promoted_directory_ids.insert(seed.id.clone()) {
             return;
         }
-        rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
-            id: seed.id,
+        let directory_id = seed.id;
+        let mut row = directory_descriptor_row(DirectoryDescriptorRowInput {
+            id: directory_id.clone(),
             parent_id: seed.parent_id,
             name: seed.name,
             context: FilesystemRowContext {
@@ -563,7 +567,16 @@ impl DirectoryPathResolver {
                 untracked: false,
                 ..context.clone()
             },
-        }));
+        });
+        row.origin = Some(TransactionWriteOrigin {
+            surface: "filesystem path parent".to_string(),
+            operation: TransactionWriteOperation::Update,
+            primary_key: Some(LogicalPrimaryKey {
+                columns: vec!["id".to_string()],
+                values: vec![directory_id],
+            }),
+        });
+        rows.push(row);
     }
 
     fn validate_directory_parent_graph(&self) -> Result<(), LixError> {

@@ -4,7 +4,7 @@ use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::live_state::index::{
+use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest, MaterializedLiveStateIndexRow,
 };
@@ -149,7 +149,7 @@ mod tests {
     use crate::changelog::{
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
     };
-    use crate::live_state::index::{LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
+    use crate::live_state::{LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 

@@ -10,11 +10,11 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
     LiveStateScanRequest,
 };
+use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::session::SessionMode;
 use crate::storage::StorageBackend;
 use crate::storage::{
@@ -348,6 +348,7 @@ where
     let mut read = SharedStorageRead::new(
         storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("deterministic mode read should open"),
     );
     let mut writes = storage.new_write_set();
@@ -478,12 +479,14 @@ async fn seed_visible_schema_rows<B>(
     .await
     .expect("schema fixture rows should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+        .await
         .expect("schema fixture tracked rows should commit");
 
     drop(read);
     let mut read = SharedStorageRead::new(
         storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("schema fixture current read should open"),
     );
     let root_id = crate::tracked_state::load_root(&read, SCHEMA_FIXTURE_COMMIT_ID)
@@ -545,6 +548,7 @@ async fn seed_visible_schema_rows<B>(
         .stage_branch_root_from_existing(BENCH_BRANCH_ID, &root_id)
         .expect("bench branch current root should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+        .await
         .expect("schema fixture current roots should commit");
 }
 
