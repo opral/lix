@@ -8,7 +8,7 @@ pub(crate) mod visibility;
 pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
 #[allow(unused_imports)]
 pub(crate) use index::{
-    LIVE_STATE_INDEX_BRANCH_ROOT_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
+    LIVE_STATE_INDEX_ROW_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
     LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
     LiveStateIndexStoreReader, LiveStateIndexWriteReport, LiveStateIndexWriter,
     MaterializedLiveStateIndexRow,

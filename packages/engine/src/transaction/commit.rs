@@ -105,7 +105,6 @@ pub(crate) async fn commit_prepared_writes(
         &mut writes,
         &state_rows,
         &engine_rows,
-        &commit_rows,
         &insert_identities,
     )
     .await?;
@@ -237,8 +236,14 @@ async fn stage_changelog_commits(
     let mut commits = Vec::with_capacity(commit_rows.len());
     let changes = state_rows
         .iter()
+        .filter(|row| !(row.untracked && row.snapshot.is_none()))
         .map(change_record_from_state_row)
-        .chain(branch_ref_rows.iter().map(|row| Ok(row.change.clone())))
+        .chain(
+            branch_ref_rows
+                .iter()
+                .filter(|row| row.change.snapshot.is_some())
+                .map(|row| Ok(row.change.clone())),
+        )
         .collect::<Result<Vec<_>, _>>()?;
     let mut commit_change_refs = Vec::with_capacity(commit_rows.len());
     let mut staged = BTreeMap::<CommitId, StagedChangelogCommit>::new();
@@ -419,11 +424,8 @@ async fn stage_current_roots(
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     engine_rows: &[EngineCurrentRow],
-    commit_rows: &[FinalizedCommitRow],
     insert_identities: &BTreeSet<PreparedStateRowIdentity>,
 ) -> Result<Vec<ChangeId>, LixError> {
-    let mut referenced_roots = BTreeMap::new();
-    let mut deleted_branch_roots = BTreeSet::new();
     let index_reader = current.reader(read);
     for row in state_rows
         .iter()
@@ -431,12 +433,13 @@ async fn stage_current_roots(
     {
         let branch_id = row.entity_pk.as_single_string_owned()?;
         let Some(snapshot) = row.snapshot.as_ref() else {
-            if index_reader.load_branch_root(&branch_id).await?.is_some()
+            if load_current_branch_ref_commit_id(&index_reader, &branch_id)
+                .await?
+                .is_some()
                 && branch_has_local_untracked_rows(&index_reader, &branch_id).await?
             {
                 return Err(branch_ref_with_untracked_rows_error(&branch_id, true));
             }
-            deleted_branch_roots.insert(branch_id);
             continue;
         };
         let Some(commit_id) = snapshot
@@ -458,7 +461,7 @@ async fn stage_current_roots(
         {
             return Err(branch_ref_with_untracked_rows_error(&branch_id, false));
         }
-        let root_id = crate::tracked_state::load_root(read, commit_id)
+        crate::tracked_state::load_root(read, commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -466,15 +469,12 @@ async fn stage_current_roots(
                     format!("branch ref targets commit '{commit_id}' without a tracked root"),
                 )
             })?;
-        referenced_roots.insert(branch_id, root_id);
     }
 
     let branch_ids = state_rows
         .iter()
         .map(|row| row.branch_id.clone())
         .chain(engine_rows.iter().map(|row| row.branch_id.clone()))
-        .chain(commit_rows.iter().map(|row| row.branch_id.clone()))
-        .chain(referenced_roots.keys().cloned())
         .collect::<BTreeSet<_>>();
     let mut writer = current.writer(read, writes);
     let mut compactable_change_ids = BTreeSet::new();
@@ -489,31 +489,12 @@ async fn stage_current_roots(
             .filter(|row| row.branch_id == *branch_id)
             .map(current_delta_from_engine_row)
             .collect::<Vec<_>>();
-        let selected_deltas = commit_rows
-            .iter()
-            .filter(|row| row.branch_id == *branch_id)
-            .flat_map(|row| {
-                row.selected_change_refs.iter().map(move |change_ref| {
-                    current_delta_from_selected_change_ref(change_ref, row.commit_id)
-                })
-            })
-            .collect::<Vec<_>>();
         let new_deltas = state_deltas
             .into_iter()
             .chain(engine_deltas)
-            .chain(selected_deltas)
             .collect::<Vec<_>>();
 
-        if let Some(root_id) = referenced_roots.get(branch_id) {
-            if new_deltas.is_empty() {
-                writer.stage_branch_root_from_existing(branch_id, root_id)?;
-            } else {
-                let report = writer
-                    .stage_branch_rows_from_existing_root(branch_id, root_id, new_deltas)
-                    .await?;
-                compactable_change_ids.extend(report.superseded_untracked_change_ids);
-            }
-        } else if !new_deltas.is_empty() {
+        if !new_deltas.is_empty() {
             let known_absent = state_rows
                 .iter()
                 .filter(|row| {
@@ -532,9 +513,6 @@ async fn stage_current_roots(
                 .await?;
             compactable_change_ids.extend(report.superseded_untracked_change_ids);
         }
-    }
-    for branch_id in deleted_branch_roots {
-        writer.stage_delete_branch_root(&branch_id);
     }
     let new_ids = state_rows
         .iter()
@@ -608,22 +586,6 @@ fn branch_ref_with_untracked_rows_error(branch_id: &str, deletion: bool) -> LixE
             "cannot {operation} branch '{branch_id}' while it has branch-local untracked current rows; delete or track those rows first"
         ),
     )
-}
-
-fn current_delta_from_selected_change_ref(
-    change_ref: &StagedCommitChangeRef,
-    commit_id: CommitId,
-) -> LiveStateIndexDeltaRef<'_> {
-    LiveStateIndexDeltaRef {
-        schema_key: &change_ref.schema_key,
-        file_id: change_ref.file_id.as_deref(),
-        entity_pk: &change_ref.entity_pk,
-        change_id: change_ref.change_id,
-        commit_id: Some(commit_id),
-        deleted: change_ref.deleted,
-        created_at: change_ref.created_at,
-        updated_at: change_ref.updated_at,
-    }
 }
 
 fn current_delta_from_state_row(
@@ -894,7 +856,6 @@ struct FinalizedCommitRows {
 }
 
 struct FinalizedCommitRow {
-    branch_id: String,
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     created_at: LixTimestamp,
@@ -950,7 +911,6 @@ async fn finalize_commit_rows(
         let parent_commit_id = parent_commit_ids.first().copied();
 
         commit_rows.push(FinalizedCommitRow {
-            branch_id: branch_id.clone(),
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp,
@@ -1172,7 +1132,6 @@ mod tests {
 
         let commits = vec![
             FinalizedCommitRow {
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
                 commit_id: CommitId::for_test_label("child-commit"),
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
                 created_at: ts("2026-01-01T00:00:01Z"),
@@ -1180,7 +1139,6 @@ mod tests {
                 selected_change_refs: Vec::new(),
             },
             FinalizedCommitRow {
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
                 created_at: ts("2026-01-01T00:00:00Z"),

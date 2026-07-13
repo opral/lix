@@ -91,10 +91,34 @@ where
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
         let scope = scan_scope(store, &self.live_index, request).await?;
-        let derived_rows =
-            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut rows = Vec::new();
-        if !is_commit_derived_only_request(request) {
+        if request.filter.untracked != Some(true) {
+            rows.extend(
+                scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
+            );
+            if !is_commit_derived_only_request(request) {
+                for branch_id in &scope.storage_branch_ids {
+                    let Some(commit_id) =
+                        load_branch_ref_commit_id(store, &self.live_index, branch_id).await?
+                    else {
+                        continue;
+                    };
+                    let source = tracked_source_from_branch_id(branch_id);
+                    rows.extend(
+                        self.tracked_state
+                            .reader(store)
+                            .scan_rows_at_commit(
+                                &commit_id,
+                                &tracked_scan_request_from_live(request),
+                            )
+                            .await?
+                            .into_iter()
+                            .map(|row| project_tracked_row(row, branch_id, source)),
+                    );
+                }
+            }
+        }
+        if request.filter.untracked != Some(false) && !is_commit_derived_only_request(request) {
             for branch_id in &scope.storage_branch_ids {
                 rows.extend(
                     self.live_index
@@ -102,17 +126,10 @@ where
                         .scan_rows(&index_scan_request_from_live(request, branch_id))
                         .await?
                         .into_iter()
-                        .map(MaterializedLiveStateRow::from)
-                        .filter(|row| {
-                            request
-                                .filter
-                                .untracked
-                                .is_none_or(|untracked| row.untracked == untracked)
-                        }),
+                        .map(MaterializedLiveStateRow::from),
                 );
             }
         }
-        rows.extend(derived_rows);
         rows = resolve_visible_rows(
             rows,
             Vec::new(),
@@ -1084,62 +1101,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_untracked_row_persists_tombstone_without_revealing_tracked_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let live_state = live_state_context();
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        {
-            let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
-            {
-                stage_materialized_live_rows(
-                    &read,
-                    &mut writes,
-                    &mut json_writer,
-                    &[tracked_row_with_commit(
-                        "tracked-value",
-                        Some("change-tracked"),
-                        "commit-tracked",
-                    )],
-                )
-                .await
-                .expect("tracked row should stage");
-            }
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("writes should commit");
-        }
-        write_untracked_rows_to_store(
-            &storage,
-            &read,
-            &[
-                branch_ref_row("global", "commit-tracked"),
-                untracked_row("untracked-value"),
-            ],
-        )
-        .await;
-        write_untracked_rows_to_store(&storage, &read, &[untracked_tombstone_at("global")]).await;
-
-        let loaded = load_selected_tab(&live_state, &storage)
-            .await
-            .expect("load should succeed");
-        assert_eq!(loaded, None, "the tracked predecessor must stay hidden");
-
-        let rows = scan_selected_tab_at(&live_state, &storage, "global", true)
-            .await
-            .expect("tombstone scan should succeed");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].deleted);
-        assert!(rows[0].untracked);
-        assert!(rows[0].change_id.is_some());
-    }
-
-    #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_branch() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
@@ -1985,15 +1946,6 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             branch_id: branch_id.to_string(),
-        }
-    }
-
-    fn untracked_tombstone_at(branch_id: &str) -> MaterializedUntrackedStateRow {
-        MaterializedUntrackedStateRow {
-            snapshot_content: None,
-            deleted: true,
-            updated_at: "2026-01-02T00:00:00Z".to_string(),
-            ..untracked_row_at(branch_id, "ignored")
         }
     }
 

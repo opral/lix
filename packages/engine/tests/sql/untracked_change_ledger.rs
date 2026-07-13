@@ -84,6 +84,74 @@ simulation_test!(
 );
 
 simulation_test!(
+    deleting_untracked_row_removes_current_entry_and_change,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let head_before = branch_head(&session, sim.main_branch_id()).await;
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('untracked-ledger-physical-delete', 'draft', true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should succeed");
+        let change_id = current_change_id(&session, "untracked-ledger-physical-delete").await;
+
+        session
+            .execute(
+                "DELETE FROM lix_key_value \
+                 WHERE key = 'untracked-ledger-physical-delete'",
+                &[],
+            )
+            .await
+            .expect("untracked delete should succeed");
+
+        let visible = session
+            .execute(
+                "SELECT value FROM lix_key_value \
+                 WHERE key = 'untracked-ledger-physical-delete'",
+                &[],
+            )
+            .await
+            .expect("live state should remain readable");
+        assert_eq!(visible.len(), 0);
+        assert!(
+            !change_exists(&session, &change_id).await,
+            "deleting untracked state must compact its standalone change"
+        );
+        let deletion_changes = session
+            .execute(
+                "SELECT id FROM lix_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND lix_json_get_text(entity_pk, 0) = \
+                       'untracked-ledger-physical-delete'",
+                &[],
+            )
+            .await
+            .expect("change ledger should read");
+        assert_eq!(
+            deletion_changes.len(),
+            0,
+            "untracked deletion must not leave a tombstone ChangeRecord"
+        );
+        assert_eq!(
+            branch_head(&session, sim.main_branch_id()).await,
+            head_before,
+            "untracked insert and delete must not advance the branch head"
+        );
+    }
+);
+
+simulation_test!(
     untracked_insert_rejects_tracked_canonical_row,
     |sim| async move {
         let engine = sim.boot_engine().await;

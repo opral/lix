@@ -247,7 +247,7 @@ where
             created_at: commit_row_change.created_at,
             updated_at: commit_row_change.created_at,
         });
-        let tracked_report = tracked_state
+        tracked_state
             .writer(&read, &mut writes)
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
@@ -256,36 +256,20 @@ where
         index_writer
             .stage_branch_rows(
                 GLOBAL_BRANCH_ID,
-                authored_changes
+                plan.untracked_rows
                     .iter()
-                    .map(|change| LiveStateIndexDeltaRef {
-                        schema_key: &change.schema_key,
-                        file_id: change.file_id.as_deref(),
-                        entity_pk: &change.entity_pk,
-                        change_id: change.change_id,
-                        commit_id: Some(plan.commit.id),
-                        deleted: change.snapshot.is_none(),
-                        created_at: change.created_at,
-                        updated_at: change.created_at,
-                    })
-                    .chain(
-                        plan.untracked_rows
-                            .iter()
-                            .map(|row| LiveStateIndexDeltaRef {
-                                schema_key: &row.schema_key,
-                                file_id: None,
-                                entity_pk: &row.entity_pk,
-                                change_id: row.id,
-                                commit_id: None,
-                                deleted: false,
-                                created_at: row.created_at,
-                                updated_at: row.updated_at,
-                            }),
-                    ),
+                    .map(|row| LiveStateIndexDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: None,
+                        entity_pk: &row.entity_pk,
+                        change_id: row.id,
+                        commit_id: None,
+                        deleted: false,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                    }),
             )
             .await?;
-        index_writer
-            .stage_branch_root_from_existing(&receipt.main_branch_id, &tracked_report.root_id)?;
     }
 
     storage

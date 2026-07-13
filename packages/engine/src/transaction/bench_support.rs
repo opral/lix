@@ -489,10 +489,6 @@ async fn seed_visible_schema_rows<B>(
             .await
             .expect("schema fixture current read should open"),
     );
-    let root_id = crate::tracked_state::load_root(&read, SCHEMA_FIXTURE_COMMIT_ID)
-        .await
-        .expect("schema fixture root should load")
-        .expect("schema fixture root should exist");
     let timestamp = LixTimestamp::expect_parse("timestamp", TIMESTAMP);
     let commit_id = CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID);
     let branch_refs = [GLOBAL_BRANCH_ID, BENCH_BRANCH_ID].map(|branch_id| {
@@ -526,9 +522,8 @@ async fn seed_visible_schema_rows<B>(
     let live_index = LiveStateIndexContext::new();
     let mut current = live_index.writer(&read, &mut writes);
     current
-        .stage_branch_rows_from_existing_root(
+        .stage_branch_rows(
             GLOBAL_BRANCH_ID,
-            &root_id,
             branch_refs
                 .iter()
                 .map(|(_, entity_pk, _, change_id)| LiveStateIndexDeltaRef {
@@ -544,9 +539,6 @@ async fn seed_visible_schema_rows<B>(
         )
         .await
         .expect("global current fixture should stage");
-    current
-        .stage_branch_root_from_existing(BENCH_BRANCH_ID, &root_id)
-        .expect("bench branch current root should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
         .expect("schema fixture current roots should commit");
