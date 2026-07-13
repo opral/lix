@@ -79,18 +79,36 @@ The previously red semantic regressions now pass:
 | Edit one table cell | 1 table-cell row |
 | Change one table column alignment | 1 table-column row |
 | Swap two populated table columns | 1 table-column order row; 0 cells |
+| Paragraph ↔ heading | 1 leaf row; leaf and inline IDs retained |
 | `*em*` to `_em_` | 1 paragraph leaf, `impact=format` |
 | `-` to `*` list markers | 1 list row, `impact=format` |
 | Add/remove final newline | 1 document row, `impact=format` |
 
-The regression suite also proves independent one-cell undo, identity retention
-through a 100-row table header edit, five-item Flashtype-style list rewrites,
+The regression suite also proves independently addressable cell changes,
+identity retention through a 100-row table header edit, five-item
+Flashtype-style list rewrites,
 non-Latin reorders, duplicate insertion, cross-parent moves, and conservative
 copy identity. It covers the order-dependent local-ID-stealing regression,
 whole-table cross-parent moves with durable column references, and table-copy
-versus local-edit ambiguity. Equal and nested sibling order-key collisions
-rebalance without losing IDs; rendering remains deterministic by
-`(order_key, id)`.
+versus local-edit ambiguity. Paragraph/heading conversions retain their leaf and
+nested inline IDs. Contextual inline anchors keep repeated links aligned when
+surrounding text distinguishes them; indistinguishable duplicate runs retain
+the old ID set and mint exactly one ID per insertion. Equal and nested sibling
+order-key collisions rebalance without losing IDs; rendering remains
+deterministic by `(order_key, id)`.
+
+### Granularity boundary
+
+`markdown_node` identity is the structural/leaf alignment and grouping layer.
+Multiple word edits inside one paragraph remain one Lix entity change. Editors
+such as Tiptap should continue to own word-level suggestion ranges and
+Keep/Undo interactions.
+
+The implementation exercises valid direct row updates, but does not yet claim
+that arbitrary externally authored node graphs are safe mutation or review-undo
+operations. Kind-specific graph validation, embedded-ID uniqueness checks, and
+multi-entity mutation grouping belong to the later validation/mutation
+contract.
 
 ## V1 versus v2
 
@@ -106,14 +124,14 @@ rebalance without losing IDs; rendering remains deterministic by
 | Active rows for that list | **2** | 202 |
 | Active rows for that table | **2** | 307 |
 | Move a nested subtree | 1 whole-list rewrite | 1 moved-root parent/order update |
-| Edit two cells independently | 1 inseparable table change | 2 independently reviewable/undoable cell changes |
+| Edit two cells independently | 1 inseparable table change | 2 independently addressable cell changes |
 | Nested stable diff keys | None below the top-level block | Durable structural, leaf, inline-atom, row, cell, and column IDs |
 
 V2 therefore does not reduce the number of durable changes for every operation.
 It reduces the *scope and snapshot size* of each leaf change and makes nested
-review/undo possible, in exchange for a larger active graph that every plugin
-invocation currently receives. Bulk edits inside one v1 block can produce fewer
-rows in v1; those rows remain inseparable.
+alignment and grouping possible, in exchange for a larger active graph that
+every plugin invocation currently receives. Bulk edits inside one v1 block can
+produce fewer rows in v1; those rows remain inseparable.
 
 The following is an apples-to-apples native comparison: median of nine release
 runs of the same generated inputs and benchmark harness, applied to the v1 base

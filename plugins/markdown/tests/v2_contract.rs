@@ -67,7 +67,7 @@ fn editing_large_table_header_retains_all_rows_cells_and_columns() {
 }
 
 #[test]
-fn two_cell_edits_are_two_independently_undoable_rows() {
+fn two_cell_edits_are_two_independently_addressable_rows() {
     let before_source = "| A | B |\n| --- | --- |\n| a0 | b0 |\n| a1 | b1 |\n";
     let both_source = "| A | B |\n| --- | --- |\n| a0 edited | b0 |\n| a1 | b1 edited |\n";
     let expected_source = "| A | B |\n| --- | --- |\n| a0 | b0 |\n| a1 | b1 edited |\n";

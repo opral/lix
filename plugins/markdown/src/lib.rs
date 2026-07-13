@@ -20,7 +20,7 @@ use crate::model::{
 use lix_order_key::OrderKey;
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 pub const ROOT_ENTITY_PK: &str = "root";
@@ -241,7 +241,10 @@ fn reconcile_children(
             .chain(0..search_start)
             .find(|old_index| {
                 !old_used[*old_index]
-                    && old.children[*old_index].node.kind == child.node.kind
+                    && node_kinds_are_identity_compatible(
+                        old.children[*old_index].node.kind,
+                        child.node.kind,
+                    )
                     && !has_available_unique_global_match(
                         child,
                         global_subtrees,
@@ -288,6 +291,14 @@ fn reconcile_children(
     } else {
         assign_sibling_order_keys(&mut new.children, &old_for_new, &old.children)
     }
+}
+
+fn node_kinds_are_identity_compatible(old: NodeKind, new: NodeKind) -> bool {
+    old == new
+        || matches!(
+            (old, new),
+            (NodeKind::Paragraph, NodeKind::Heading) | (NodeKind::Heading, NodeKind::Paragraph)
+        )
 }
 
 fn has_available_unique_global_match(
@@ -679,43 +690,95 @@ fn reconcile_inline_payload(old: &NodeTree, new: &mut NodeTree) -> Result<(), Pl
 }
 
 fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
+    if old.is_empty() || new.is_empty() {
+        return;
+    }
+    if let ([old_inline], [new_inline]) = (old, &mut *new) {
+        if old_inline.signature() == new_inline.signature()
+            || old_inline.kind_tag() == new_inline.kind_tag()
+        {
+            new_inline.id.clone_from(&old_inline.id);
+            if let (Some(old_children), Some(new_children)) =
+                (old_inline.children(), new_inline.children_mut())
+            {
+                reconcile_inline_sequence(old_children, new_children);
+            }
+        }
+        return;
+    }
+
+    let old_signatures = old.iter().map(InlineNode::signature).collect::<Vec<_>>();
+    let new_signatures = new.iter().map(InlineNode::signature).collect::<Vec<_>>();
     let mut old_for_new = vec![None; new.len()];
     let mut old_used = vec![false; old.len()];
-    for index in 0..new.len().min(old.len()) {
-        if new[index].signature() == old[index].signature() {
-            old_for_new[index] = Some(index);
-            old_used[index] = true;
-        }
+    // Unique, non-crossing atoms (including plain text) establish context before
+    // repeated atoms are matched inside each gap. A fully identical run still
+    // has no knowable insertion position, so it uses deterministic local order
+    // while retaining every reusable old ID exactly once.
+    let anchors = unique_non_crossing_inline_anchors(&old_signatures, &new_signatures);
+    for &(old_index, new_index) in &anchors {
+        old_for_new[new_index] = Some(old_index);
+        old_used[old_index] = true;
     }
-    let mut exact = HashMap::<String, Vec<usize>>::new();
-    for (index, inline) in old.iter().enumerate().rev() {
-        if old_used[index] {
-            continue;
-        }
-        exact.entry(inline.signature()).or_default().push(index);
-    }
-    for (new_index, inline) in new.iter().enumerate() {
-        if old_for_new[new_index].is_some() {
-            continue;
-        }
-        if let Some(indices) = exact.get_mut(&inline.signature())
-            && let Some(old_index) = indices.pop()
-        {
-            old_for_new[new_index] = Some(old_index);
-            old_used[old_index] = true;
-        }
-    }
-    for (new_index, inline) in new.iter().enumerate() {
-        if old_for_new[new_index].is_some() {
-            continue;
-        }
-        if let Some(old_index) = old.iter().enumerate().position(|(index, candidate)| {
-            !old_used[index] && candidate.kind_tag() == inline.kind_tag()
-        }) {
-            old_for_new[new_index] = Some(old_index);
-            old_used[old_index] = true;
-        }
-    }
+
+    for_each_inline_gap(
+        old.len(),
+        new.len(),
+        &anchors,
+        |old_start, old_end, new_start, new_end| {
+            match_exact_inlines_in_range(
+                &old_signatures,
+                &new_signatures,
+                old_start,
+                old_end,
+                new_start,
+                new_end,
+                &mut old_for_new,
+                &mut old_used,
+            );
+        },
+    );
+
+    match_exact_inlines_in_range(
+        &old_signatures,
+        &new_signatures,
+        0,
+        old.len(),
+        0,
+        new.len(),
+        &mut old_for_new,
+        &mut old_used,
+    );
+
+    for_each_inline_gap(
+        old.len(),
+        new.len(),
+        &anchors,
+        |old_start, old_end, new_start, new_end| {
+            match_compatible_inlines_in_range(
+                old,
+                new,
+                old_start,
+                old_end,
+                new_start,
+                new_end,
+                &mut old_for_new,
+                &mut old_used,
+            );
+        },
+    );
+
+    match_compatible_inlines_in_range(
+        old,
+        new,
+        0,
+        old.len(),
+        0,
+        new.len(),
+        &mut old_for_new,
+        &mut old_used,
+    );
+
     for (new_index, inline) in new.iter_mut().enumerate() {
         let Some(old_index) = old_for_new[new_index] else {
             continue;
@@ -725,6 +788,156 @@ fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
             (old[old_index].children(), inline.children_mut())
         {
             reconcile_inline_sequence(old_children, new_children);
+        }
+    }
+}
+
+fn unique_non_crossing_inline_anchors(
+    old_signatures: &[String],
+    new_signatures: &[String],
+) -> Vec<(usize, usize)> {
+    let mut old_positions = HashMap::<&str, Vec<usize>>::new();
+    let mut new_positions = HashMap::<&str, Vec<usize>>::new();
+    for (index, signature) in old_signatures.iter().enumerate() {
+        old_positions.entry(signature).or_default().push(index);
+    }
+    for (index, signature) in new_signatures.iter().enumerate() {
+        new_positions.entry(signature).or_default().push(index);
+    }
+
+    let mut candidates = old_positions
+        .into_iter()
+        .filter_map(|(signature, old_indices)| {
+            let new_indices = new_positions.get(&signature)?;
+            (old_indices.len() == 1 && new_indices.len() == 1)
+                .then_some((old_indices[0], new_indices[0]))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(old_index, _)| *old_index);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pile_tops = Vec::<usize>::new();
+    let mut predecessors = vec![None; candidates.len()];
+    for (index, &(_, new_index)) in candidates.iter().enumerate() {
+        let pile = pile_tops.partition_point(|top| candidates[*top].1 < new_index);
+        if pile > 0 {
+            predecessors[index] = Some(pile_tops[pile - 1]);
+        }
+        if pile == pile_tops.len() {
+            pile_tops.push(index);
+        } else {
+            pile_tops[pile] = index;
+        }
+    }
+
+    let mut anchors = Vec::with_capacity(pile_tops.len());
+    let mut current = *pile_tops.last().expect("inline anchor pile must exist");
+    loop {
+        anchors.push(candidates[current]);
+        let Some(previous) = predecessors[current] else {
+            break;
+        };
+        current = previous;
+    }
+    anchors.reverse();
+    anchors
+}
+
+fn for_each_inline_gap(
+    old_len: usize,
+    new_len: usize,
+    anchors: &[(usize, usize)],
+    mut visitor: impl FnMut(usize, usize, usize, usize),
+) {
+    let mut old_start = 0;
+    let mut new_start = 0;
+    for &(old_anchor, new_anchor) in anchors {
+        visitor(old_start, old_anchor, new_start, new_anchor);
+        old_start = old_anchor + 1;
+        new_start = new_anchor + 1;
+    }
+    visitor(old_start, old_len, new_start, new_len);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_exact_inlines_in_range(
+    old_signatures: &[String],
+    new_signatures: &[String],
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+) {
+    let paired = (old_end - old_start).min(new_end - new_start);
+    for offset in 0..paired {
+        let old_index = old_start + offset;
+        let new_index = new_start + offset;
+        if old_for_new[new_index].is_none()
+            && !old_used[old_index]
+            && new_signatures[new_index] == old_signatures[old_index]
+        {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+    }
+
+    let mut exact = HashMap::<&str, Vec<usize>>::new();
+    for old_index in (old_start..old_end).rev() {
+        if old_used[old_index] {
+            continue;
+        }
+        exact
+            .entry(old_signatures[old_index].as_str())
+            .or_default()
+            .push(old_index);
+    }
+    for new_index in new_start..new_end {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        if let Some(indices) = exact.get_mut(new_signatures[new_index].as_str())
+            && let Some(old_index) = indices.pop()
+        {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_compatible_inlines_in_range(
+    old: &[InlineNode],
+    new: &[InlineNode],
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+) {
+    let mut available = HashMap::<&'static str, VecDeque<usize>>::new();
+    for old_index in old_start..old_end {
+        if !old_used[old_index] {
+            available
+                .entry(old[old_index].kind_tag())
+                .or_default()
+                .push_back(old_index);
+        }
+    }
+    for new_index in new_start..new_end {
+        if old_for_new[new_index].is_some() {
+            continue;
+        }
+        if let Some(old_index) = available
+            .get_mut(new[new_index].kind_tag())
+            .and_then(VecDeque::pop_front)
+        {
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
         }
     }
 }

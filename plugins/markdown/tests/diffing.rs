@@ -23,6 +23,51 @@ fn inline_atom_id(
         .expect("inline atom should have a durable id")
 }
 
+fn top_level_inline_atom_ids(
+    state: &[plugin_md_v2::exports::lix::plugin::api::EntityState],
+    leaf_kind: &str,
+    atom_kind: &str,
+) -> Vec<String> {
+    snapshot(rows_of_kind(state, leaf_kind)[0])["payload"]["inline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|inline| inline["type"] == atom_kind)
+        .map(|inline| inline["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn all_inline_atom_ids(
+    state: &[plugin_md_v2::exports::lix::plugin::api::EntityState],
+    leaf_kind: &str,
+) -> BTreeSet<String> {
+    fn collect(value: &Value, output: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(id) = object.get("id").and_then(Value::as_str) {
+                    output.insert(id.to_string());
+                }
+                for child in object.values() {
+                    collect(child, output);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    collect(child, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut output = BTreeSet::new();
+    collect(
+        &snapshot(rows_of_kind(state, leaf_kind)[0])["payload"]["inline"],
+        &mut output,
+    );
+    output
+}
+
 fn upserts_for_kind<'a>(
     delta: &'a [plugin_md_v2::DetectedChange],
     kind: &str,
@@ -282,6 +327,45 @@ fn editing_the_middle_duplicate_targets_its_positional_entity() {
 }
 
 #[test]
+fn paragraph_and_heading_transitions_preserve_leaf_and_inline_ids() {
+    let before = state_from_source("Hello *[link](/target)*\n");
+    let leaf_id = ids_of_kind(&before, "paragraph")[0].clone();
+    let inline_ids = all_inline_atom_ids(&before, "paragraph");
+    let delta = changes(before.clone(), "# Hello *[link](/target)*\n");
+
+    assert_eq!(delta.len(), 1, "{delta:#?}");
+    assert_eq!(delta[0].entity_pk, vec![leaf_id.clone()]);
+    assert_eq!(change_snapshot(&delta[0])["kind"], "heading");
+    let heading = support::apply_changes(before, delta);
+    assert_eq!(ids_of_kind(&heading, "heading"), vec![leaf_id.clone()]);
+    assert_eq!(all_inline_atom_ids(&heading, "heading"), inline_ids);
+
+    let delta = changes(heading.clone(), "Hello *[link](/target)*\n");
+    assert_eq!(delta.len(), 1, "{delta:#?}");
+    assert_eq!(delta[0].entity_pk, vec![leaf_id.clone()]);
+    assert_eq!(change_snapshot(&delta[0])["kind"], "paragraph");
+    let paragraph = support::apply_changes(heading, delta);
+    assert_eq!(ids_of_kind(&paragraph, "paragraph"), vec![leaf_id]);
+    assert_eq!(all_inline_atom_ids(&paragraph, "paragraph"), inline_ids);
+}
+
+#[test]
+fn paragraph_to_heading_transition_targets_the_local_sibling() {
+    let before = state_from_source("Alpha\n\nTarget\n\nOmega\n");
+    let target_id = rows_of_kind(&before, "paragraph")
+        .into_iter()
+        .find(|row| row.snapshot_content.contains("Target"))
+        .unwrap()
+        .entity_pk[0]
+        .clone();
+    let delta = changes(before, "Alpha\n\n# Target\n\nOmega\n");
+
+    assert_eq!(delta.len(), 1, "{delta:#?}");
+    assert_eq!(delta[0].entity_pk, vec![target_id]);
+    assert_eq!(change_snapshot(&delta[0])["kind"], "heading");
+}
+
+#[test]
 fn editing_a_link_destination_preserves_the_inline_atom_id() {
     let before = state_from_source("Before [label](https://example.com) after.\n");
     let link_id = inline_atom_id(&before, "link");
@@ -309,6 +393,75 @@ fn reordering_links_preserves_both_inline_atom_ids() {
         .collect::<BTreeSet<_>>();
 
     assert_eq!(after_ids, before_ids);
+}
+
+#[test]
+fn reordering_three_distinct_links_preserves_each_inline_identity() {
+    let before = state_from_source("[A](/a) then [B](/b) then [C](/c)\n");
+    let before_ids = top_level_inline_atom_ids(&before, "paragraph", "link");
+    let after = evolve(before, "[C](/c) then [A](/a) then [B](/b)\n");
+    let after_ids = top_level_inline_atom_ids(&after, "paragraph", "link");
+
+    assert_eq!(
+        after_ids,
+        vec![
+            before_ids[2].clone(),
+            before_ids[0].clone(),
+            before_ids[1].clone()
+        ]
+    );
+}
+
+#[test]
+fn inserting_an_indistinguishable_link_retains_old_ids_and_mints_one_id() {
+    let before = state_from_source("[x](/a) [x](/a)\n");
+    let before_ids = top_level_inline_atom_ids(&before, "paragraph", "link")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let after = evolve(before, "[x](/a) [x](/a) [x](/a)\n");
+    let after_ids = top_level_inline_atom_ids(&after, "paragraph", "link");
+    let unique_after_ids = after_ids.iter().cloned().collect::<BTreeSet<_>>();
+
+    assert_eq!(after_ids.len(), 3);
+    assert_eq!(unique_after_ids.len(), 3);
+    assert!(before_ids.is_subset(&unique_after_ids));
+
+    let before = state_from_source("[**x**](/a) [**x**](/a)\n");
+    let before_ids = all_inline_atom_ids(&before, "paragraph");
+    let after = evolve(before, "[**x**](/a) [**x**](/a) [**x**](/a)\n");
+    let after_ids = all_inline_atom_ids(&after, "paragraph");
+    assert!(before_ids.is_subset(&after_ids));
+    assert_eq!(after_ids.len(), before_ids.len() + 2);
+}
+
+#[test]
+fn contextual_inline_anchors_keep_existing_duplicate_links_in_place() {
+    let before = state_from_source("start [x](/a) middle [x](/a) end\n");
+    let before_ids = top_level_inline_atom_ids(&before, "paragraph", "link");
+    let after = evolve(
+        before,
+        "start [x](/a) inserted [x](/a) middle [x](/a) end\n",
+    );
+    let after_ids = top_level_inline_atom_ids(&after, "paragraph", "link");
+
+    assert_eq!(after_ids.len(), 3);
+    assert_eq!(after_ids[0], before_ids[0]);
+    assert_eq!(after_ids[2], before_ids[1]);
+    assert!(!before_ids.contains(&after_ids[1]));
+    assert!(changes(after, "start [x](/a) inserted [x](/a) middle [x](/a) end\n").is_empty());
+}
+
+#[test]
+fn contextual_inline_anchors_handle_duplicate_deletion_and_edit() {
+    let before = state_from_source("start [x](/a) inserted [x](/a) middle [x](/a) end\n");
+    let before_ids = top_level_inline_atom_ids(&before, "paragraph", "link");
+    let after = evolve(before, "start [x](/a) middle [x](/b) end\n");
+    let after_ids = top_level_inline_atom_ids(&after, "paragraph", "link");
+
+    assert_eq!(
+        after_ids,
+        vec![before_ids[0].clone(), before_ids[2].clone()]
+    );
 }
 
 #[test]
