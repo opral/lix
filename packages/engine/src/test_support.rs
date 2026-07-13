@@ -105,11 +105,11 @@ pub(crate) async fn seed_branch_head_with_rows(
             .await
             .expect("branch ref change should stage");
     }
-    crate::live_state::index::LiveStateIndexContext::new()
+    crate::live_state::LiveStateIndexContext::new()
         .writer(&read, &mut writes)
         .stage_branch_rows(
             GLOBAL_BRANCH_ID,
-            [crate::live_state::index::LiveStateIndexDeltaRef {
+            [crate::live_state::LiveStateIndexDeltaRef {
                 schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &branch_ref_entity_pk,
@@ -123,7 +123,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             .chain(
                 rows.iter()
                     .filter(|_| branch_id == GLOBAL_BRANCH_ID)
-                    .map(|row| crate::live_state::index::LiveStateIndexDeltaRef {
+                    .map(|row| crate::live_state::LiveStateIndexDeltaRef {
                         schema_key: &row.schema_key,
                         file_id: row.file_id.as_deref(),
                         entity_pk: &row.entity_pk,
@@ -144,12 +144,12 @@ pub(crate) async fn seed_branch_head_with_rows(
         .await
         .expect("branch ref current row should stage");
     if !rows.is_empty() && branch_id != GLOBAL_BRANCH_ID {
-        crate::live_state::index::LiveStateIndexContext::new()
+        crate::live_state::LiveStateIndexContext::new()
             .writer(&read, &mut writes)
             .stage_branch_rows(
                 branch_id,
                 rows.iter()
-                    .map(|row| crate::live_state::index::LiveStateIndexDeltaRef {
+                    .map(|row| crate::live_state::LiveStateIndexDeltaRef {
                         schema_key: &row.schema_key,
                         file_id: row.file_id.as_deref(),
                         entity_pk: &row.entity_pk,

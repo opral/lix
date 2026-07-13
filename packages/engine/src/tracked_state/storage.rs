@@ -204,7 +204,7 @@ mod tests {
     };
     use crate::changelog::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId};
     use crate::json_store::store::JSON_SPACE;
-    use crate::live_state::index::LIVE_STATE_INDEX_BRANCH_ROOT_SPACE;
+    use crate::live_state::LIVE_STATE_INDEX_BRANCH_ROOT_SPACE;
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
     };

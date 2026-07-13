@@ -101,7 +101,7 @@ where
 
 fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
     &[
-        crate::live_state::index::LIVE_STATE_INDEX_BRANCH_ROOT_SPACE,
+        crate::live_state::LIVE_STATE_INDEX_BRANCH_ROOT_SPACE,
         crate::json_store::store::JSON_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
@@ -138,5 +138,45 @@ where
                 StorageProjectedValue::FullValue(value) => value.len() as u64,
             })
             .sum(),
+    }
+}
+
+async fn scan_layout_entries<R>(
+    read: &R,
+    space: crate::storage::StorageSpace,
+) -> Vec<crate::storage::StorageReadEntry>
+where
+    R: StorageRead,
+{
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut entries = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let result = plan
+            .collect(
+                read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    resume_after,
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await
+            .expect("scan complete storage bench layout space");
+        let has_more = result.value.has_more;
+        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
+        entries.extend(result.value.entries);
+        if !has_more {
+            return entries;
+        }
+        assert!(
+            resume_after.is_some(),
+            "storage scan reported more rows without a resume key"
+        );
     }
 }

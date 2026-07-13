@@ -521,7 +521,12 @@ impl TransactionWriteBuffer {
             }
             add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &functions);
             let identity = PreparedStateRowIdentity::from(&row);
-            if mode == Some(TransactionWriteMode::Insert) {
+            let is_insert = mode == Some(TransactionWriteMode::Insert)
+                && !row
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.operation == TransactionWriteOperation::Update);
+            if is_insert {
                 insert_identities_guard.insert(
                     identity.clone(),
                     PreparedInsertIdentity {

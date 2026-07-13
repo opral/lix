@@ -1,8 +1,5 @@
 #![allow(clippy::borrow_deref_ref, clippy::clone_on_copy)]
 
-use async_trait::async_trait;
-use futures_util::{StreamExt, TryStreamExt, stream};
-
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::NullableKeyFilter;
@@ -26,8 +23,7 @@ use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest,
 };
-
-const BRANCH_READ_CONCURRENCY: usize = 8;
+use async_trait::async_trait;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -69,6 +65,10 @@ impl LiveStateContext {
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
         }
+    }
+
+    pub(crate) fn index(&self) -> &LiveStateIndexContext {
+        &self.live_index
     }
 }
 
@@ -431,7 +431,7 @@ struct LiveStateScanScope {
 }
 
 async fn scan_scope(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     live_index: &LiveStateIndexContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
@@ -457,7 +457,7 @@ async fn scan_scope(
 }
 
 async fn all_branch_ref_ids(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     live_index: &LiveStateIndexContext,
 ) -> Result<Vec<String>, LixError> {
     let rows = live_index
@@ -478,7 +478,7 @@ async fn all_branch_ref_ids(
 }
 
 async fn load_branch_ref_commit_id(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     live_index: &LiveStateIndexContext,
     branch_id: &str,
 ) -> Result<Option<String>, LixError> {
@@ -511,7 +511,7 @@ async fn load_branch_ref_commit_id(
 }
 
 async fn branch_ref_exists(
-    store: &(impl StorageRead + Send + Sync + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     live_index: &LiveStateIndexContext,
     branch_id: &str,
 ) -> Result<bool, LixError> {
@@ -608,6 +608,7 @@ mod tests {
     ) {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("current index read should open");
         let mut writes = storage.new_write_set();
         let mut json_writer = JsonStoreContext::new().writer();
@@ -697,6 +698,7 @@ mod tests {
         drop(index_writer);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("current rows should commit");
     }
 

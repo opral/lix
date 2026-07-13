@@ -30,7 +30,7 @@ impl LiveStateIndexContext {
 
     pub(crate) fn reader<S>(&self, store: S) -> LiveStateIndexStoreReader<S>
     where
-        S: StorageRead + Send + Sync,
+        S: StorageRead,
     {
         LiveStateIndexStoreReader {
             store,
@@ -44,7 +44,7 @@ impl LiveStateIndexContext {
         writes: &'a mut StorageWriteSet,
     ) -> LiveStateIndexWriter<'a, S>
     where
-        S: StorageRead + Send + Sync + ?Sized,
+        S: StorageRead + ?Sized,
     {
         LiveStateIndexWriter {
             chunk_overlay: TrackedStateChunkOverlay::new(),
@@ -63,20 +63,20 @@ pub(crate) struct LiveStateIndexStoreReader<S> {
 
 impl<S> LiveStateIndexStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
-    pub(crate) fn load_branch_root(
+    pub(crate) async fn load_branch_root(
         &self,
         branch_id: &str,
     ) -> Result<Option<TrackedStateRootId>, LixError> {
-        load_branch_root(&self.store, branch_id)
+        load_branch_root(&self.store, branch_id).await
     }
 
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateIndexScanRequest,
     ) -> Result<Vec<MaterializedLiveStateIndexRow>, LixError> {
-        let Some(root_id) = self.load_branch_root(&request.branch_id)? else {
+        let Some(root_id) = self.load_branch_root(&request.branch_id).await? else {
             return Ok(Vec::new());
         };
         let entries = self
@@ -109,7 +109,7 @@ where
         &self,
         request: &LiveStateIndexRowRequest,
     ) -> Result<Option<MaterializedLiveStateIndexRow>, LixError> {
-        let Some(root_id) = self.load_branch_root(&request.branch_id)? else {
+        let Some(root_id) = self.load_branch_root(&request.branch_id).await? else {
             return Ok(None);
         };
         let Some((key, value)) = self.load_index_entry(&root_id, request).await? else {
@@ -163,7 +163,7 @@ where
 
         let mut rows = vec![None; requests.len()];
         for (branch_id, indexed_keys) in requests_by_branch {
-            let Some(root_id) = self.load_branch_root(branch_id)? else {
+            let Some(root_id) = self.load_branch_root(branch_id).await? else {
                 continue;
             };
             let keys = indexed_keys
@@ -218,7 +218,7 @@ pub(crate) struct LiveStateIndexWriteReport {
 
 impl<S> LiveStateIndexWriter<'_, S>
 where
-    S: StorageRead + Send + Sync + ?Sized,
+    S: StorageRead + ?Sized,
 {
     /// Deletes the mutable current index pointer for one branch.
     ///
@@ -259,16 +259,14 @@ where
     {
         let base_root = match self.staged_roots.get(branch_id) {
             Some(root_id) => Some(root_id.clone()),
-            None => load_branch_root(self.store, branch_id)?,
+            None => load_branch_root(self.store, branch_id).await?,
         };
         self.stage_branch_rows_with_base(branch_id, base_root, deltas, BTreeSet::new())
             .await
     }
 
-    /// Applies rows while trusting validated insert identities to be absent.
-    ///
-    /// This avoids probing the current tree for SQL inserts whose duplicate
-    /// validation already established that no canonical row exists.
+    /// Applies rows whose SQL insert validation established that no canonical
+    /// row exists, avoiding a redundant current-tree probe.
     pub(crate) async fn stage_branch_rows_with_known_absent<'a, I>(
         &mut self,
         branch_id: &str,
@@ -280,7 +278,7 @@ where
     {
         let base_root = match self.staged_roots.get(branch_id) {
             Some(root_id) => Some(root_id.clone()),
-            None => load_branch_root(self.store, branch_id)?,
+            None => load_branch_root(self.store, branch_id).await?,
         };
         let known_absent = known_absent
             .iter()
@@ -514,6 +512,7 @@ mod tests {
     ) -> LiveStateIndexWriteReport {
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let report = LiveStateIndexContext::new()
@@ -524,6 +523,7 @@ mod tests {
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("current rows should commit");
         report
     }
@@ -568,6 +568,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let reader = LiveStateIndexContext::new().reader(read);
         let rows = reader
@@ -618,6 +619,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let reader = LiveStateIndexContext::new().reader(read);
         let default_rows = reader
@@ -689,11 +691,13 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let reader = LiveStateIndexContext::new().reader(read);
         assert_eq!(
             reader
                 .load_branch_root("branch-a")
+                .await
                 .expect("current root should load"),
             Some(second.root_id.clone())
         );
@@ -742,6 +746,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let reader = LiveStateIndexContext::new().reader(read);
         let row_a = reader
@@ -768,6 +773,7 @@ mod tests {
         let created_at = timestamp("2026-01-01T00:00:00Z");
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         ChangelogContext::new()
@@ -809,10 +815,12 @@ mod tests {
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("current row and change should commit atomically");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let row = LiveStateIndexContext::new()
             .reader(read)
@@ -846,6 +854,7 @@ mod tests {
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let report = LiveStateIndexContext::new()
@@ -855,12 +864,14 @@ mod tests {
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("branch pointer should commit");
         assert_eq!(report.changed_rows, 0);
         assert_eq!(report.root_id, source.root_id);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let row = LiveStateIndexContext::new()
             .reader(read)
@@ -876,6 +887,7 @@ mod tests {
         let overlay_pk = EntityPk::single("overlay");
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
         LiveStateIndexContext::new()
@@ -897,10 +909,12 @@ mod tests {
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
+            .await
             .expect("overlay branch pointer should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let reader = LiveStateIndexContext::new().reader(read);
         assert!(

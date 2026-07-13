@@ -11,7 +11,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
+use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };

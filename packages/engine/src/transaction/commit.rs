@@ -16,7 +16,7 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::live_state::index::{
+use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest,
 };
@@ -38,6 +38,7 @@ type RowIndex = usize;
 pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
     branch_ctx: &BranchContext,
+    live_index: &LiveStateIndexContext,
     runtime_functions: Option<&FunctionContext>,
     read: &mut impl StorageRead,
     prepared_writes: PreparedWriteSet,
@@ -99,6 +100,7 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     let compactable_change_ids = stage_current_roots(
+        live_index,
         read,
         &mut writes,
         &state_rows,
@@ -412,7 +414,8 @@ fn deterministic_sequence_current_row(
 }
 
 async fn stage_current_roots(
-    read: &(impl StorageRead + Send + Sync + ?Sized),
+    current: &LiveStateIndexContext,
+    read: &(impl StorageRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     engine_rows: &[EngineCurrentRow],
@@ -421,7 +424,6 @@ async fn stage_current_roots(
 ) -> Result<Vec<ChangeId>, LixError> {
     let mut referenced_roots = BTreeMap::new();
     let mut deleted_branch_roots = BTreeSet::new();
-    let current = LiveStateIndexContext::new();
     let index_reader = current.reader(read);
     for row in state_rows
         .iter()
@@ -429,7 +431,7 @@ async fn stage_current_roots(
     {
         let branch_id = row.entity_pk.as_single_string_owned()?;
         let Some(snapshot) = row.snapshot.as_ref() else {
-            if index_reader.load_branch_root(&branch_id)?.is_some()
+            if index_reader.load_branch_root(&branch_id).await?.is_some()
                 && branch_has_local_untracked_rows(&index_reader, &branch_id).await?
             {
                 return Err(branch_ref_with_untracked_rows_error(&branch_id, true));
@@ -544,11 +546,11 @@ async fn stage_current_roots(
 }
 
 async fn load_current_branch_ref_commit_id<S>(
-    reader: &crate::live_state::index::LiveStateIndexStoreReader<S>,
+    reader: &crate::live_state::LiveStateIndexStoreReader<S>,
     branch_id: &str,
 ) -> Result<Option<String>, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     let Some(row) = reader
         .load_row(&LiveStateIndexRowRequest {
@@ -577,11 +579,11 @@ where
 }
 
 async fn branch_has_local_untracked_rows<S>(
-    reader: &crate::live_state::index::LiveStateIndexStoreReader<S>,
+    reader: &crate::live_state::LiveStateIndexStoreReader<S>,
     branch_id: &str,
 ) -> Result<bool, LixError>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageRead,
 {
     Ok(reader
         .scan_rows(&LiveStateIndexScanRequest {
@@ -998,8 +1000,8 @@ mod tests {
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
-    use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexRowRequest};
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::live_state::{LiveStateIndexContext, LiveStateIndexRowRequest};
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, InMemoryStorageWrite, StorageContext,
         StorageKey, StorageReadOptions, StorageWriteOptions,
@@ -1050,6 +1052,7 @@ mod tests {
         let writes = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
+            &LiveStateIndexContext::new(),
             None,
             &mut read,
             PreparedWriteSet {
@@ -1237,6 +1240,7 @@ mod tests {
         let writes = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
+            &LiveStateIndexContext::new(),
             None,
             &mut read,
             PreparedWriteSet {
@@ -1275,6 +1279,7 @@ mod tests {
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let changes = changelog_reader
@@ -1310,10 +1315,12 @@ mod tests {
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
+            .await
             .expect("read should open");
         let writes = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
+            &LiveStateIndexContext::new(),
             None,
             &mut read,
             PreparedWriteSet {
@@ -1339,6 +1346,7 @@ mod tests {
         let writes = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
+            &LiveStateIndexContext::new(),
             None,
             &mut read,
             PreparedWriteSet {
@@ -1378,6 +1386,7 @@ mod tests {
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("read should open"),
         );
         let old_untracked = changelog_reader
@@ -1404,12 +1413,14 @@ mod tests {
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("setup head read should open");
             let mut setup_row = tracked_global_row("setup-tracked-change");
             setup_row.commit_id = Some(commit_id("setup-commit"));
             let writes = commit_prepared_writes(
                 &binary_cas,
                 &branch_ctx,
+                &LiveStateIndexContext::new(),
                 None,
                 &mut read,
                 PreparedWriteSet {
@@ -1432,15 +1443,18 @@ mod tests {
             .expect("setup head should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
+                .await
                 .expect("setup head should commit");
         }
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
+                .await
                 .expect("deterministic mode read should open");
             let writes = commit_prepared_writes(
                 &binary_cas,
                 &branch_ctx,
+                &LiveStateIndexContext::new(),
                 None,
                 &mut read,
                 PreparedWriteSet {
@@ -1487,6 +1501,7 @@ mod tests {
         let writes = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
+            &LiveStateIndexContext::new(),
             Some(&runtime_functions),
             &mut read,
             PreparedWriteSet {
@@ -1615,6 +1630,7 @@ mod tests {
         let writes = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
+            &LiveStateIndexContext::new(),
             None,
             &mut read,
             PreparedWriteSet {
