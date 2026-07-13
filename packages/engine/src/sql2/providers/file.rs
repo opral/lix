@@ -2679,20 +2679,6 @@ async fn plugin_render_context_for_lix_file_scan(
     }))
 }
 
-pub(super) async fn load_single_blob_bytes(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    blob_hash: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let hash = BlobHash::from_hex(blob_hash)?;
-    Ok(blob_reader
-        .load_bytes_many(&[hash])
-        .await?
-        .into_vec()
-        .into_iter()
-        .next()
-        .flatten())
-}
-
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
     let fields = match projection {
         Some(indices) => indices
