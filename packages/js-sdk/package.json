@@ -11,6 +11,11 @@
 		".": {
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
+		},
+		"./workerd": {
+			"types": "./dist/workerd.d.ts",
+			"workerd": "./dist/workerd.js",
+			"default": "./dist/workerd.js"
 		}
 	},
 	"imports": {
