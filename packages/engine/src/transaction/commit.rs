@@ -17,8 +17,8 @@ use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::index::{
-    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRow,
-    LiveStateIndexRowRequest, LiveStateIndexScanRequest,
+    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
+    LiveStateIndexScanRequest,
 };
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
@@ -98,19 +98,22 @@ pub(crate) async fn commit_prepared_writes(
         return Ok(writes);
     }
 
+    let compactable_change_ids = stage_current_roots(
+        read,
+        &mut writes,
+        &state_rows,
+        &engine_rows,
+        &commit_rows,
+        &insert_identities,
+    )
+    .await?;
+
     let staged_commits = stage_changelog_commits(
         read,
         &mut writes,
         &state_rows,
         &engine_rows,
-        &compactable_current_change_ids(
-            read,
-            &state_rows,
-            &engine_rows,
-            &commit_rows,
-            &insert_identities,
-        )
-        .await?,
+        &compactable_change_ids,
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
     )
@@ -127,12 +130,9 @@ pub(crate) async fn commit_prepared_writes(
         staged_commits,
     )
     .await?;
-    stage_current_roots(read, &mut writes, &state_rows, &engine_rows, &commit_rows).await?;
-
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
     }
-
     Ok(writes)
 }
 
@@ -411,65 +411,14 @@ fn deterministic_sequence_current_row(
     })
 }
 
-async fn compactable_current_change_ids(
-    read: &(impl StorageRead + Send + Sync + ?Sized),
-    state_rows: &[PreparedStateRow],
-    engine_rows: &[EngineCurrentRow],
-    commit_rows: &[FinalizedCommitRow],
-    insert_identities: &BTreeSet<PreparedStateRowIdentity>,
-) -> Result<Vec<ChangeId>, LixError> {
-    let current = LiveStateIndexContext::new();
-    let reader = current.reader(read);
-    let requests = state_rows
-        .iter()
-        .filter(|row| !insert_identities.contains(&PreparedStateRowIdentity::from(*row)))
-        .map(|row| LiveStateIndexRowRequest {
-            branch_id: row.branch_id.clone(),
-            schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
-            file_id: row.file_id.clone(),
-        })
-        .chain(engine_rows.iter().map(|row| LiveStateIndexRowRequest {
-            branch_id: row.branch_id.clone(),
-            schema_key: row.change.schema_key.clone(),
-            entity_pk: row.change.entity_pk.clone(),
-            file_id: row.change.file_id.clone(),
-        }))
-        .chain(commit_rows.iter().flat_map(|row| {
-            row.selected_change_refs
-                .iter()
-                .map(|change_ref| LiveStateIndexRowRequest {
-                    branch_id: row.branch_id.clone(),
-                    schema_key: change_ref.schema_key.clone(),
-                    entity_pk: change_ref.entity_pk.clone(),
-                    file_id: change_ref.file_id.clone(),
-                })
-        }))
-        .collect::<Vec<_>>();
-    let mut compact = reader
-        .load_index_rows(&requests)
-        .await?
-        .into_iter()
-        .flatten()
-        .filter(LiveStateIndexRow::untracked)
-        .map(|row| row.change_id)
-        .collect::<BTreeSet<_>>();
-    let new_ids = state_rows
-        .iter()
-        .filter_map(|row| row.change_id)
-        .chain(engine_rows.iter().map(|row| row.change.change_id))
-        .collect::<BTreeSet<_>>();
-    compact.retain(|change_id| !new_ids.contains(change_id));
-    Ok(compact.into_iter().collect())
-}
-
 async fn stage_current_roots(
     read: &(impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     engine_rows: &[EngineCurrentRow],
     commit_rows: &[FinalizedCommitRow],
-) -> Result<(), LixError> {
+    insert_identities: &BTreeSet<PreparedStateRowIdentity>,
+) -> Result<Vec<ChangeId>, LixError> {
     let mut referenced_roots = BTreeMap::new();
     let mut deleted_branch_roots = BTreeSet::new();
     let current = LiveStateIndexContext::new();
@@ -526,6 +475,7 @@ async fn stage_current_roots(
         .chain(referenced_roots.keys().cloned())
         .collect::<BTreeSet<_>>();
     let mut writer = current.writer(read, writes);
+    let mut compactable_change_ids = BTreeSet::new();
     for branch_id in &branch_ids {
         let state_deltas = state_rows
             .iter()
@@ -556,18 +506,41 @@ async fn stage_current_roots(
             if new_deltas.is_empty() {
                 writer.stage_branch_root_from_existing(branch_id, root_id)?;
             } else {
-                writer
+                let report = writer
                     .stage_branch_rows_from_existing_root(branch_id, root_id, new_deltas)
                     .await?;
+                compactable_change_ids.extend(report.superseded_untracked_change_ids);
             }
         } else if !new_deltas.is_empty() {
-            writer.stage_branch_rows(branch_id, new_deltas).await?;
+            let known_absent = state_rows
+                .iter()
+                .filter(|row| {
+                    row.branch_id == *branch_id
+                        && insert_identities.contains(&PreparedStateRowIdentity::from(*row))
+                })
+                .map(|row| LiveStateIndexRowRequest {
+                    branch_id: row.branch_id.clone(),
+                    schema_key: row.schema_key.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                    file_id: row.file_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            let report = writer
+                .stage_branch_rows_with_known_absent(branch_id, new_deltas, &known_absent)
+                .await?;
+            compactable_change_ids.extend(report.superseded_untracked_change_ids);
         }
     }
     for branch_id in deleted_branch_roots {
         writer.stage_delete_branch_root(&branch_id);
     }
-    Ok(())
+    let new_ids = state_rows
+        .iter()
+        .filter_map(|row| row.change_id)
+        .chain(engine_rows.iter().map(|row| row.change.change_id))
+        .collect::<BTreeSet<_>>();
+    compactable_change_ids.retain(|change_id| !new_ids.contains(change_id));
+    Ok(compactable_change_ids.into_iter().collect())
 }
 
 async fn load_current_branch_ref_commit_id<S>(

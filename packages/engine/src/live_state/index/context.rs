@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
 use crate::storage::{StorageRead, StorageWriteSet};
@@ -213,6 +213,7 @@ pub(crate) struct LiveStateIndexWriteReport {
     pub(crate) branch_id: String,
     pub(crate) root_id: TrackedStateRootId,
     pub(crate) changed_rows: usize,
+    pub(crate) superseded_untracked_change_ids: Vec<crate::changelog::ChangeId>,
 }
 
 impl<S> LiveStateIndexWriter<'_, S>
@@ -244,6 +245,7 @@ where
             branch_id: branch_id.to_string(),
             root_id: root_id.clone(),
             changed_rows: 0,
+            superseded_untracked_change_ids: Vec::new(),
         })
     }
 
@@ -259,7 +261,36 @@ where
             Some(root_id) => Some(root_id.clone()),
             None => load_branch_root(self.store, branch_id)?,
         };
-        self.stage_branch_rows_with_base(branch_id, base_root, deltas)
+        self.stage_branch_rows_with_base(branch_id, base_root, deltas, BTreeSet::new())
+            .await
+    }
+
+    /// Applies rows while trusting validated insert identities to be absent.
+    ///
+    /// This avoids probing the current tree for SQL inserts whose duplicate
+    /// validation already established that no canonical row exists.
+    pub(crate) async fn stage_branch_rows_with_known_absent<'a, I>(
+        &mut self,
+        branch_id: &str,
+        deltas: I,
+        known_absent: &[LiveStateIndexRowRequest],
+    ) -> Result<LiveStateIndexWriteReport, LixError>
+    where
+        I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
+    {
+        let base_root = match self.staged_roots.get(branch_id) {
+            Some(root_id) => Some(root_id.clone()),
+            None => load_branch_root(self.store, branch_id)?,
+        };
+        let known_absent = known_absent
+            .iter()
+            .map(|request| TrackedStateKey {
+                schema_key: request.schema_key.clone(),
+                file_id: request.file_id.clone(),
+                entity_pk: request.entity_pk.clone(),
+            })
+            .collect();
+        self.stage_branch_rows_with_base(branch_id, base_root, deltas, known_absent)
             .await
     }
 
@@ -278,8 +309,13 @@ where
     where
         I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
     {
-        self.stage_branch_rows_with_base(branch_id, Some(base_root.clone()), deltas)
-            .await
+        self.stage_branch_rows_with_base(
+            branch_id,
+            Some(base_root.clone()),
+            deltas,
+            BTreeSet::new(),
+        )
+        .await
     }
 
     async fn stage_branch_rows_with_base<'a, I>(
@@ -287,6 +323,7 @@ where
         branch_id: &str,
         base_root: Option<TrackedStateRootId>,
         deltas: I,
+        known_absent: BTreeSet<TrackedStateKey>,
     ) -> Result<LiveStateIndexWriteReport, LixError>
     where
         I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
@@ -318,19 +355,35 @@ where
             ));
         }
 
-        let keys = final_deltas.keys().cloned().collect::<Vec<_>>();
-        let prior_values = if let Some(root_id) = base_root.as_ref() {
+        let keys_to_load = final_deltas
+            .keys()
+            .filter(|key| !known_absent.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let loaded_values = if let Some(root_id) = base_root.as_ref() {
             // Current callers stage one final batch per branch. This read also
             // preserves the original created_at across durable overwrites.
-            self.tree.get_many(self.store, root_id, &keys).await?
+            self.tree
+                .get_many(self.store, root_id, &keys_to_load)
+                .await?
         } else {
-            vec![None; keys.len()]
+            vec![None; keys_to_load.len()]
         };
+        let mut prior_values = keys_to_load
+            .into_iter()
+            .zip(loaded_values)
+            .collect::<BTreeMap<_, _>>();
+        let superseded_untracked_change_ids = prior_values
+            .values()
+            .filter_map(Option::as_ref)
+            .filter(|value| value.commit_id.as_uuid().is_nil())
+            .map(|value| value.change_id)
+            .collect::<Vec<_>>();
 
         let mutations = final_deltas
             .into_iter()
-            .zip(prior_values)
-            .map(|((key, delta), prior)| {
+            .map(|(key, delta)| {
+                let prior = prior_values.remove(&key).flatten();
                 let created_at = prior
                     .as_ref()
                     .map(TrackedStateIndexValue::created_at)
@@ -370,6 +423,7 @@ where
             branch_id: branch_id.to_string(),
             root_id: result.root_id,
             changed_rows,
+            superseded_untracked_change_ids,
         })
     }
 }
