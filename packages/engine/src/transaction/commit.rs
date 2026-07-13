@@ -16,8 +16,8 @@ use crate::entity_pk::EntityPk;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::index::{
-    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
-    LiveStateIndexScanRequest,
+    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRow,
+    LiveStateIndexRowRequest, LiveStateIndexScanRequest,
 };
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
@@ -397,8 +397,7 @@ async fn compactable_current_change_ids(
 ) -> Result<Vec<ChangeId>, LixError> {
     let current = LiveStateIndexContext::new();
     let reader = current.reader(read);
-    let mut compact = BTreeSet::new();
-    for request in state_rows
+    let requests = state_rows
         .iter()
         .map(|row| LiveStateIndexRowRequest {
             branch_id: row.branch_id.clone(),
@@ -422,13 +421,15 @@ async fn compactable_current_change_ids(
                     file_id: change_ref.file_id.clone(),
                 })
         }))
-    {
-        if let Some(previous) = reader.load_index_row(&request).await?
-            && previous.untracked()
-        {
-            compact.insert(previous.change_id);
-        }
-    }
+        .collect::<Vec<_>>();
+    let mut compact = reader
+        .load_index_rows(&requests)
+        .await?
+        .into_iter()
+        .flatten()
+        .filter(LiveStateIndexRow::untracked)
+        .map(|row| row.change_id)
+        .collect::<BTreeSet<_>>();
     let new_ids = state_rows
         .iter()
         .filter_map(|row| row.change_id)
