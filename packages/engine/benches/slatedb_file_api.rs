@@ -147,14 +147,14 @@ fn cached_preloaded_request_benches(c: &mut Criterion, runtime: &tokio::runtime:
                 |b, &(delay, stage)| {
                     b.iter_custom(|iterations| {
                         let fixture = runtime.block_on(CachedRequestBenchFixture::seeded(delay));
-                        // Reuse the preloaded backend while starting each sample with
-                        // a fresh Engine to isolate request-serving latency.
+                        // Reuse only the populated disk cache. Each iteration gets a
+                        // fresh backend so its in-memory caches start empty.
                         measure_prepared_iterations(
                             iterations,
-                            || runtime.block_on(fixture.prepare_engine(stage)),
-                            |engine| {
+                            || runtime.block_on(fixture.prepare_request(stage)),
+                            |prepared| {
                                 runtime.block_on(lixray_download_file(
-                                    engine,
+                                    &prepared.engine,
                                     &fixture.main_branch_id,
                                     &fixture.file_id,
                                 ))
@@ -475,10 +475,16 @@ impl CachedRequestStage {
 }
 
 struct CachedRequestBenchFixture {
-    backend: SlateDbBackend,
-    _cache_dir: TempDir,
+    object_store: Arc<DelayedObjectStore>,
+    db_path: String,
+    cache_dir: TempDir,
     main_branch_id: String,
     file_id: String,
+}
+
+struct PreparedCachedRequest {
+    engine: Engine<SlateDbBackend>,
+    _backend: SlateDbBackend,
 }
 
 impl CachedLifecycleBenchFixture {
@@ -550,28 +556,39 @@ impl CachedRequestBenchFixture {
         seeded.object_store.set_delay(delay);
         let cache_dir = tempfile::tempdir().expect("create preloaded request cache directory");
         let backend = SlateDbBackend::open_object_store_with_options(
-            seeded.db_path,
+            seeded.db_path.clone(),
             object_store_handle(&seeded.object_store),
             cached_object_store_options(&cache_dir),
         )
         .expect("open cached preloaded request backend");
+        drop(backend);
 
         Self {
-            backend,
-            _cache_dir: cache_dir,
+            object_store: seeded.object_store,
+            db_path: seeded.db_path,
+            cache_dir,
             main_branch_id: seeded.main_branch_id,
             file_id: seeded.file_id,
         }
     }
 
-    async fn prepare_engine(&self, stage: CachedRequestStage) -> Engine<SlateDbBackend> {
-        let engine = Engine::new(self.backend.clone())
+    async fn prepare_request(&self, stage: CachedRequestStage) -> PreparedCachedRequest {
+        let backend = SlateDbBackend::open_object_store_with_options(
+            self.db_path.clone(),
+            object_store_handle(&self.object_store),
+            cached_object_store_options(&self.cache_dir),
+        )
+        .expect("reopen cached preloaded request backend");
+        let engine = Engine::new(backend.clone())
             .await
             .expect("open cached preloaded request engine");
         if matches!(stage, CachedRequestStage::Second) {
             black_box(lixray_download_file(&engine, &self.main_branch_id, &self.file_id).await);
         }
-        engine
+        PreparedCachedRequest {
+            engine,
+            _backend: backend,
+        }
     }
 }
 
