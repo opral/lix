@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, UInt64Array};
-use datafusion::arrow::compute::{and, filter_record_batch};
+use datafusion::arrow::compute::{SortOptions, and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -25,7 +25,10 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{
+    EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, create_physical_expr,
+};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -76,6 +79,7 @@ pub(super) type InsertApply =
 pub(super) struct PlannedScan {
     pub(super) schema: SchemaRef,
     pub(super) load: RowSource,
+    pub(super) ordering: Option<String>,
 }
 
 /// A planned UPDATE/DELETE: the candidate-row source the filters run against,
@@ -490,8 +494,30 @@ struct SpecScanExec {
 
 impl SpecScanExec {
     fn new(table: Arc<str>, planned: PlannedScan) -> Self {
+        let equivalence_properties = planned
+            .ordering
+            .as_deref()
+            .and_then(|column_name| {
+                planned
+                    .schema
+                    .index_of(column_name)
+                    .ok()
+                    .map(|column_index| {
+                        EquivalenceProperties::new_with_orderings(
+                            Arc::clone(&planned.schema),
+                            [vec![PhysicalSortExpr {
+                                expr: Arc::new(Column::new(column_name, column_index)),
+                                options: SortOptions {
+                                    descending: false,
+                                    nulls_first: false,
+                                },
+                            }]],
+                        )
+                    })
+            })
+            .unwrap_or_else(|| EquivalenceProperties::new(Arc::clone(&planned.schema)));
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&planned.schema)),
+            equivalence_properties,
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,

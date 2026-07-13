@@ -1599,6 +1599,199 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
 });
 
 simulation_test!(
+    lix_file_path_update_by_path_uses_fresh_index,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+             ('file-target', '/docs/target.md', X'746172676574'), \
+             ('file-other', '/docs/other.md', X'6F74686572')",
+                &[],
+            )
+            .await
+            .expect("file fixtures should insert");
+
+        let warm = session
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("exact path lookup should warm the filesystem index");
+        assert_rows_eq(
+            warm,
+            vec![vec![
+                Value::Text("file-target".to_string()),
+                Value::Text("/docs/target.md".to_string()),
+            ]],
+        );
+
+        let update = session
+            .execute(
+                "UPDATE lix_file \
+             SET path = '/archive/renamed.md' \
+             WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("path-filtered file rename should succeed");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let old = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("old path lookup should succeed as a miss");
+        assert_eq!(old.len(), 0);
+
+        let renamed = session
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE path = '/archive/renamed.md'",
+                &[],
+            )
+            .await
+            .expect("renamed path should be visible through a fresh index");
+        assert_rows_eq(
+            renamed,
+            vec![vec![
+                Value::Text("file-target".to_string()),
+                Value::Text("/archive/renamed.md".to_string()),
+                Value::Blob(b"target".to_vec()),
+            ]],
+        );
+
+        let unrelated = session
+            .execute(
+                "SELECT path, data FROM lix_file WHERE id = 'file-other'",
+                &[],
+            )
+            .await
+            .expect("unrelated file should remain unchanged");
+        assert_rows_eq(
+            unrelated,
+            vec![vec![
+                Value::Text("/docs/other.md".to_string()),
+                Value::Blob(b"other".to_vec()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    atelier_current_path_range_and_order_workloads,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+             ('extension-a', '/.lix/app_data/atelier/extensions/demo/a.js', X'61'), \
+             ('extension-b', '/.lix/app_data/atelier/extensions/demo/b.js', X'62'), \
+             ('extension-upper', '/.lix/app_data/atelier/extensions0/out.js', X'78'), \
+             ('unrelated', '/docs/readme.md', X'72')",
+                &[],
+            )
+            .await
+            .expect("Atelier path fixtures should insert");
+
+        let range = session
+            .execute(
+                "SELECT path, data FROM lix_file \
+             WHERE path >= '/.lix/app_data/atelier/extensions/' \
+               AND path < '/.lix/app_data/atelier/extensions0' \
+             ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("Atelier extension prefix range should query");
+        assert_rows_eq(
+            range,
+            vec![
+                vec![
+                    Value::Text("/.lix/app_data/atelier/extensions/demo/a.js".to_string()),
+                    Value::Blob(b"a".to_vec()),
+                ],
+                vec![
+                    Value::Text("/.lix/app_data/atelier/extensions/demo/b.js".to_string()),
+                    Value::Blob(b"b".to_vec()),
+                ],
+            ],
+        );
+
+        let listing = session
+            .execute(
+                "SELECT path, kind FROM (\
+               SELECT path, 'directory' AS kind FROM lix_directory \
+               UNION ALL \
+               SELECT path, 'file' AS kind FROM lix_file\
+             ) ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("Atelier ordered filesystem listing should query");
+        let paths = listing
+            .rows()
+            .iter()
+            .map(|row| match &row.values()[0] {
+                Value::Text(path) => path.clone(),
+                other => panic!("expected text path, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(paths.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(paths.contains(&"/docs/readme.md".to_string()));
+        assert!(paths.contains(&"/.lix/app_data/atelier/extensions0/out.js".to_string()));
+
+        let explain = session
+            .execute(
+                "EXPLAIN SELECT path, kind FROM (\
+                   SELECT path, 'directory' AS kind FROM lix_directory \
+                   UNION ALL \
+                   SELECT path, 'file' AS kind FROM lix_file\
+                 ) ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("Atelier ordered listing should explain");
+        let plan = explain
+            .rows()
+            .iter()
+            .flat_map(|row| row.values().iter())
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !plan.contains("SortExec"),
+            "path-ordered providers should avoid a physical sort:\n{plan}"
+        );
+        assert!(
+            plan.contains("SortPreservingMergeExec"),
+            "the file/directory union should merge ordered inputs:\n{plan}"
+        );
+    }
+);
+
+simulation_test!(
     lix_file_update_rejects_null_data_and_preserves_existing_data,
     |sim| async move {
         let engine = sim.boot_engine().await;

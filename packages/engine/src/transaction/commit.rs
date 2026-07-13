@@ -13,6 +13,7 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
+use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageRead, StorageWriteSet};
@@ -52,6 +53,12 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     let state_rows = prepared_writes.state_rows;
+    let filesystem_paths_changed = state_rows.iter().any(|row| {
+        matches!(
+            row.schema_key.as_str(),
+            "lix_file_descriptor" | "lix_directory_descriptor"
+        )
+    });
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.extra_commit_parents_by_branch,
@@ -137,6 +144,10 @@ pub(crate) async fn commit_prepared_writes(
         let canonical_row =
             prepare_branch_ref_row(&branch_head.branch_id, &branch_head.commit_id, &timestamp)?;
         branch_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
+    }
+
+    if filesystem_paths_changed {
+        stage_path_index_revision(&mut writes);
     }
 
     Ok(writes)

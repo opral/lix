@@ -336,6 +336,7 @@ impl TableSpec for LixStateSpec {
 
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
+            ordering: None,
             load: row_source(
                 (Arc::clone(&self.live_state), schema, request),
                 |(live_state, schema, request)| async move {

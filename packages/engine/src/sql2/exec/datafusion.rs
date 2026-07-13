@@ -1610,6 +1610,12 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
+        fn filesystem_path_index(&self) -> Arc<dyn crate::filesystem::FilesystemPathIndexReader> {
+            Arc::new(crate::filesystem::UncachedFilesystemPathIndexReader::new(
+                Arc::clone(&self.live_state),
+            ))
+        }
+
         fn functions(&self) -> FunctionProviderHandle {
             test_functions()
         }

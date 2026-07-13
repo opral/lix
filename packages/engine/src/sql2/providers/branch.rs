@@ -115,6 +115,7 @@ impl TableSpec for BranchSpec {
         let schema = projected_schema(&lix_branch_schema(), projection);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
+            ordering: None,
             load: row_source(
                 (
                     Arc::clone(&self.live_state),

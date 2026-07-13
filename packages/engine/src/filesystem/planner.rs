@@ -128,6 +128,28 @@ impl FilesystemDescriptorKey {
     pub(crate) fn is_untracked(&self) -> bool {
         self.untracked
     }
+
+    pub(crate) fn branch_id(&self) -> &str {
+        &self.branch_id
+    }
+
+    pub(crate) fn global(&self) -> bool {
+        self.global
+    }
+
+    pub(crate) fn file_id(&self) -> Option<&str> {
+        self.file_id.as_deref()
+    }
+
+    pub(crate) fn descriptor_id(&self) -> &str {
+        &self.descriptor_id
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.branch_id.capacity()
+            + self.file_id.as_ref().map_or(0, String::capacity)
+            + self.descriptor_id.capacity()
+    }
 }
 
 /// Storage identity of a `lix_binary_blob_ref` row for a filesystem file.
@@ -1326,6 +1348,67 @@ pub(crate) async fn directory_path_resolvers_from_live_state(
         })
         .await?;
     let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
+    if let Some(branch_id) = branch_binding {
+        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        resolvers.entry(key).or_default();
+    }
+    Ok(resolvers)
+}
+
+pub(crate) fn directory_path_resolvers_from_path_index(
+    index: &super::path_index::FilesystemPathIndex,
+    branch_binding: Option<&str>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
+    let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
+    for entry in index.entries() {
+        let key = &entry.key;
+        let storage_branch_id = if key.global() {
+            GLOBAL_BRANCH_ID
+        } else {
+            key.branch_id()
+        };
+        let resolver_key = filesystem_storage_scope_key(
+            storage_branch_id,
+            key.global(),
+            key.is_untracked(),
+            key.file_id(),
+        );
+        match entry.kind {
+            super::path_index::FilesystemPathKind::Directory => {
+                directory_rows.entry(resolver_key).or_default().insert(
+                    entry.id().to_string(),
+                    DirectoryDescriptorSeed {
+                        id: entry.id().to_string(),
+                        parent_id: entry.parent_id.clone(),
+                        name: entry.name.clone(),
+                    },
+                );
+            }
+            super::path_index::FilesystemPathKind::File => {
+                file_rows.entry(resolver_key).or_default().push((
+                    entry.parent_id.clone(),
+                    entry.name.clone(),
+                    entry.id().to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut resolvers = BTreeMap::new();
+    for (resolver_key, records) in directory_rows {
+        let files = file_rows.remove(&resolver_key).unwrap_or_default();
+        resolvers.insert(
+            resolver_key,
+            DirectoryPathResolver::from_existing_descriptors(records.into_values(), files)?,
+        );
+    }
+    for (resolver_key, files) in file_rows {
+        resolvers.insert(
+            resolver_key,
+            DirectoryPathResolver::from_existing_descriptors(std::iter::empty(), files)?,
+        );
+    }
     if let Some(branch_id) = branch_binding {
         let key = filesystem_storage_scope_key(branch_id, false, false, None);
         resolvers.entry(key).or_default();

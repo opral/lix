@@ -286,6 +286,7 @@ impl TableSpec for EntitySpec {
             self.plan_scan_parts(projection, filters, limit).await?;
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
+            ordering: None,
             load: row_source(
                 (
                     Arc::clone(&self.spec),

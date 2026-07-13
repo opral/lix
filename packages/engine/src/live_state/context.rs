@@ -9,6 +9,10 @@ use crate::NullableKeyFilter;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
+use crate::filesystem::{
+    FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
+    FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
+};
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
@@ -36,6 +40,7 @@ pub(crate) struct LiveStateContext {
     tracked_state: TrackedStateContext,
     untracked_state: UntrackedStateContext,
     commit_graph: CommitGraphContext,
+    filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
 
 impl LiveStateContext {
@@ -48,6 +53,7 @@ impl LiveStateContext {
             tracked_state,
             untracked_state,
             commit_graph,
+            filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
         }
     }
 
@@ -61,6 +67,7 @@ impl LiveStateContext {
             tracked_state: self.tracked_state.clone(),
             untracked_state: self.untracked_state,
             commit_graph: self.commit_graph.clone(),
+            filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
         }
     }
 }
@@ -71,6 +78,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     tracked_state: TrackedStateContext,
     untracked_state: UntrackedStateContext,
     commit_graph: CommitGraphContext,
+    filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
 
 impl<S> LiveStateStoreReader<S>
@@ -203,6 +211,32 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         Self::load_row(self, request).await
+    }
+}
+
+#[async_trait]
+impl<S> FilesystemPathIndexReader for LiveStateStoreReader<S>
+where
+    S: StorageRead + Send + Sync,
+{
+    async fn path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<std::sync::Arc<FilesystemPathIndex>, LixError> {
+        let revision = {
+            let store = self.store.lock().await;
+            load_path_index_revision(&*store)?
+        };
+        if let Some(index) = self
+            .filesystem_path_index_cache
+            .get(request, revision.as_deref())
+        {
+            return Ok(index);
+        }
+        let index = build_path_index(self, request).await?;
+        Ok(self
+            .filesystem_path_index_cache
+            .insert(request, revision.as_deref(), index))
     }
 }
 

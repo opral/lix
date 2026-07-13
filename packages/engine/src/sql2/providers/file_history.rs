@@ -145,6 +145,7 @@ where
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
+            ordering: None,
             load: row_source(
                 (
                     Arc::clone(&self.commit_graph),

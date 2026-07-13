@@ -14,6 +14,7 @@ use crate::branch::{
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_pk::EntityPk;
+use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
@@ -510,6 +511,12 @@ where
     #[expect(trivial_casts)]
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
+    }
+
+    fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
+        let reader: Arc<dyn FilesystemPathIndexReader> =
+            Arc::new(self.live_state.reader(self.read_store.clone()));
+        reader
     }
 
     fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
