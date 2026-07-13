@@ -563,6 +563,38 @@ test("importPaths validates paths and requires an opened backend", async () => {
 	);
 });
 
+test("fs backend imports files through installed WASM plugins", async () => {
+	const dir = tempFsDir();
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "note.md"), "# Imported\n");
+	const backend = new FsBackend({
+		path: dir,
+		lixDir: tempExternalLixDir(),
+		syncAllFiles: false,
+	});
+	const lix = await openLix({ backend });
+	const markdownPlugin = (await bundledPluginArchives()).find(
+		(plugin) => plugin.key === "plugin_md_v2",
+	);
+	if (!markdownPlugin) throw new Error("expected bundled Markdown plugin");
+
+	await upsertPluginArchive(
+		lix,
+		markdownPlugin.key,
+		markdownPlugin.archiveBytes,
+	);
+	await backend.importPaths(["note.md"]);
+
+	const nodes = await lix.execute(
+		"SELECT kind FROM markdown_node ORDER BY kind",
+	);
+	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
+		"document",
+		"heading",
+	]);
+	await lix.close();
+});
+
 test("fs backend binds to one open lix at a time", async () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });

@@ -7,7 +7,8 @@ use lix_sdk::{
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
-    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, open_lix,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, WasmRuntime,
+    open_lix,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
@@ -777,9 +778,12 @@ fn open_fs_native(
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
     let mut options = FsBackendOpenOptions::new(path, sync_all_files);
     options.lix_dir = lix_dir.map(Into::into);
-    let backend = rt.block_on(FsBackend::open_with_options(options))?;
-    let options = RsOpenLixOptions::new(backend.clone())
-        .with_wasm_runtime(Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch)));
+    let wasm_runtime: Arc<dyn WasmRuntime> = Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch));
+    let backend = rt.block_on(FsBackend::open_with_options_and_wasm_runtime(
+        options,
+        Arc::clone(&wasm_runtime),
+    ))?;
+    let options = RsOpenLixOptions::new(backend.clone()).with_wasm_runtime(wasm_runtime);
     let lix = rt.block_on(open_lix(options))?;
     NativeLix::new(NativeLixInner::Fs(lix, backend))
 }
