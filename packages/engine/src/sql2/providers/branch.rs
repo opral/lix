@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,7 +6,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::physical_expr::PhysicalExpr;
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
@@ -18,6 +19,7 @@ use crate::branch::{
     branch_ref_stage_row, branch_ref_tombstone_row,
 };
 use crate::changelog::CommitId;
+use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
     MaterializedLiveStateRow,
@@ -180,11 +182,11 @@ impl TableSpec for BranchSpec {
     async fn plan_delete(
         &self,
         write_ctx: SqlWriteContext,
-        _filters: &[Expr],
+        filters: &[Expr],
     ) -> Result<PlannedDml> {
         let active_branch_id = write_ctx.active_branch_id();
         Ok(PlannedDml {
-            source: self.full_row_source(),
+            source: self.write_row_source(filters),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let active_branch_id = active_branch_id.clone();
@@ -220,11 +222,11 @@ impl TableSpec for BranchSpec {
         &self,
         write_ctx: SqlWriteContext,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
-        _filters: &[Expr],
+        filters: &[Expr],
     ) -> Result<PlannedDml> {
         let table_schema = lix_branch_schema();
         Ok(PlannedDml {
-            source: self.full_row_source(),
+            source: self.write_row_source(filters),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let assignments = assignments.clone();
@@ -261,13 +263,23 @@ impl TableSpec for BranchSpec {
 
 impl BranchSpec {
     /// Unprojected row source used as the UPDATE/DELETE candidate set.
-    fn full_row_source(&self) -> super::spec::RowSource {
+    fn write_row_source(&self, filters: &[Expr]) -> super::spec::RowSource {
+        let descriptor_scope = BranchDescriptorScope::from_write_filters(filters);
         row_source(
-            (Arc::clone(&self.live_state), Arc::clone(&self.branch_ref)),
-            |(live_state, branch_ref)| async move {
-                let rows = load_branch_rows(live_state, branch_ref, BranchHeadReadStrategy::Point)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+            (
+                Arc::clone(&self.live_state),
+                Arc::clone(&self.branch_ref),
+                descriptor_scope,
+            ),
+            |(live_state, branch_ref, descriptor_scope)| async move {
+                let rows = load_branch_rows_scoped(
+                    live_state,
+                    branch_ref,
+                    BranchHeadReadStrategy::Point,
+                    descriptor_scope,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
                 LIX_BRANCH_COLS
                     .build(lix_branch_schema(), &rows)
                     .map_err(branch_batch_error)
@@ -382,11 +394,44 @@ async fn load_branch_rows(
     branch_ref: Arc<dyn BranchRefReader>,
     head_read_strategy: BranchHeadReadStrategy,
 ) -> Result<Vec<BranchRow>, LixError> {
+    load_branch_rows_scoped(
+        live_state,
+        branch_ref,
+        head_read_strategy,
+        BranchDescriptorScope::All,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchDescriptorScope {
+    All,
+    Ids(BTreeSet<String>),
+}
+
+impl BranchDescriptorScope {
+    fn from_write_filters(filters: &[Expr]) -> Self {
+        exact_branch_ids_from_write_filters(filters).map_or(Self::All, Self::Ids)
+    }
+}
+
+async fn load_branch_rows_scoped(
+    live_state: Arc<dyn LiveStateReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    head_read_strategy: BranchHeadReadStrategy,
+    descriptor_scope: BranchDescriptorScope,
+) -> Result<Vec<BranchRow>, LixError> {
+    let entity_pks = match descriptor_scope {
+        BranchDescriptorScope::All => Vec::new(),
+        BranchDescriptorScope::Ids(ids) if ids.is_empty() => return Ok(Vec::new()),
+        BranchDescriptorScope::Ids(ids) => ids.into_iter().map(EntityPk::single).collect(),
+    };
     let descriptor_rows = live_state
         .scan_rows(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_branch_descriptor".to_string()],
                 branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                entity_pks,
                 ..LiveStateFilter::default()
             },
             projection: LiveStateProjection::default(),
@@ -423,6 +468,88 @@ async fn load_branch_rows(
         BranchHeadReadStrategy::Point => {
             load_branch_rows_with_point_lookups(descriptors, branch_ref).await
         }
+    }
+}
+
+fn exact_branch_ids_from_write_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let mut ids = None::<BTreeSet<String>>;
+    for filter in filters {
+        let filter_ids = exact_branch_ids_from_write_filter(filter)?;
+        ids = Some(match ids {
+            Some(ids) => ids.intersection(&filter_ids).cloned().collect(),
+            None => filter_ids,
+        });
+    }
+    ids
+}
+
+fn exact_branch_ids_from_write_filter(filter: &Expr) -> Option<BTreeSet<String>> {
+    match filter {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            let left = exact_branch_ids_from_write_filter(&binary_expr.left)?;
+            let right = exact_branch_ids_from_write_filter(&binary_expr.right)?;
+            Some(left.intersection(&right).cloned().collect())
+        }
+        // Even an OR made only from id equalities falls back to the full
+        // candidate source. This keeps routing deliberately narrow and avoids
+        // changing behavior for expression trees DataFusion must evaluate.
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => None,
+        Expr::BinaryExpr(binary_expr) => {
+            exact_branch_id_from_binary_filter(binary_expr).map(|id| BTreeSet::from([id]))
+        }
+        Expr::InList(in_list) => exact_branch_ids_from_in_list(in_list),
+        _ => None,
+    }
+}
+
+fn exact_branch_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+    if binary_expr.op != Operator::Eq {
+        return None;
+    }
+    exact_branch_id_from_column_literal(&binary_expr.left, &binary_expr.right)
+        .or_else(|| exact_branch_id_from_column_literal(&binary_expr.right, &binary_expr.left))
+}
+
+fn exact_branch_id_from_column_literal(column_expr: &Expr, literal_expr: &Expr) -> Option<String> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != "id" {
+        return None;
+    }
+    branch_id_string_literal(literal_expr)
+}
+
+fn exact_branch_ids_from_in_list(in_list: &InList) -> Option<BTreeSet<String>> {
+    if in_list.negated {
+        return None;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    if column.name != "id" {
+        return None;
+    }
+    let ids = in_list
+        .list
+        .iter()
+        .map(branch_id_string_literal)
+        .collect::<Option<BTreeSet<_>>>()?;
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn branch_id_string_literal(expr: &Expr) -> Option<String> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
+        _ => None,
     }
 }
 
@@ -784,11 +911,12 @@ pub(super) fn lix_branch_schema() -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::entity_pk::EntityPk;
     use crate::live_state::LiveStateRowRequest;
+    use datafusion::common::Column;
 
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
@@ -817,6 +945,61 @@ mod tests {
         scans: AtomicUsize,
         scan_error: Option<LixError>,
         point_error_branch: Option<String>,
+    }
+
+    struct RoutingLiveStateReader {
+        rows: Vec<MaterializedLiveStateRow>,
+        requests: StdMutex<Vec<LiveStateScanRequest>>,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for RoutingLiveStateReader {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    request.filter.entity_pks.is_empty()
+                        || request.filter.entity_pks.contains(&row.entity_pk)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    struct RoutingBranchRefReader {
+        heads: Vec<BranchHead>,
+        point_read_ids: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BranchRefReader for RoutingBranchRefReader {
+        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+            self.point_read_ids
+                .lock()
+                .unwrap()
+                .push(branch_id.to_string());
+            Ok(self
+                .heads
+                .iter()
+                .find(|head| head.branch_id == branch_id)
+                .cloned())
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
+            panic!("branch write candidates must not scan all branch heads")
+        }
     }
 
     #[async_trait]
@@ -870,6 +1053,123 @@ mod tests {
             branch_id: branch_id.to_string(),
             commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
         }
+    }
+
+    fn string_literal(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
+    }
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(Column::from_name(name))
+    }
+
+    fn eq_filter(column_name: &str, value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column(column_name)),
+            Operator::Eq,
+            Box::new(string_literal(value)),
+        ))
+    }
+
+    fn routing_spec() -> (
+        BranchSpec,
+        Arc<RoutingLiveStateReader>,
+        Arc<RoutingBranchRefReader>,
+    ) {
+        let live_state = Arc::new(RoutingLiveStateReader {
+            rows: vec![
+                descriptor_row("branch-a", "Branch A"),
+                descriptor_row("branch-b", "Branch B"),
+                descriptor_row("branch-c", "Branch C"),
+            ],
+            requests: StdMutex::new(Vec::new()),
+        });
+        let branch_ref = Arc::new(RoutingBranchRefReader {
+            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            point_read_ids: StdMutex::new(Vec::new()),
+        });
+        let spec = BranchSpec {
+            live_state: live_state.clone(),
+            branch_ref: branch_ref.clone(),
+            head_read_strategy: BranchHeadReadStrategy::Point,
+        };
+        (spec, live_state, branch_ref)
+    }
+
+    #[tokio::test]
+    async fn branch_write_id_filter_routes_descriptor_and_head_point_reads() {
+        let (spec, live_state, branch_ref) = routing_spec();
+        let source = spec.write_row_source(&[eq_filter("id", "branch-b")]);
+
+        let batch = source().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        let requests = live_state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![EntityPk::single("branch-b")]
+        );
+        assert_eq!(
+            branch_ref.point_read_ids.lock().unwrap().as_slice(),
+            &["branch-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_write_or_filter_falls_back_to_full_candidate_source() {
+        let (spec, live_state, branch_ref) = routing_spec();
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "branch-a")),
+            Operator::Or,
+            Box::new(eq_filter("id", "branch-b")),
+        ));
+        let source = spec.write_row_source(&[filter]);
+
+        let batch = source().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 3);
+        let requests = live_state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].filter.entity_pks.is_empty());
+        assert_eq!(
+            branch_ref.point_read_ids.lock().unwrap().as_slice(),
+            &[
+                "branch-a".to_string(),
+                "branch-b".to_string(),
+                "branch-c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_write_filter_routing_accepts_exact_in_and_rejects_expressions() {
+        let in_filter = Expr::InList(InList::new(
+            Box::new(column("id")),
+            vec![string_literal("branch-b"), string_literal("branch-a")],
+            false,
+        ));
+        assert_eq!(
+            exact_branch_ids_from_write_filters(&[in_filter]),
+            Some(BTreeSet::from([
+                "branch-a".to_string(),
+                "branch-b".to_string(),
+            ]))
+        );
+
+        let expression_filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column("id")),
+            Operator::Eq,
+            Box::new(column("name")),
+        ));
+        assert_eq!(
+            exact_branch_ids_from_write_filters(&[expression_filter]),
+            None
+        );
+        assert_eq!(
+            exact_branch_ids_from_write_filters(&[eq_filter("name", "Branch A")]),
+            None
+        );
     }
 
     #[tokio::test]
