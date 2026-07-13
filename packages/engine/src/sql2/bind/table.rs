@@ -247,6 +247,19 @@ mod tests {
         assert!(require_public_column(&table, "lixcol_snapshot_content").is_ok());
     }
 
+    #[test]
+    fn dynamic_entity_file_id_is_public_and_insert_only() {
+        let catalog = catalog();
+        let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
+            .expect("entity surface should bind");
+
+        assert!(require_public_column(&table, "lixcol_file_id").is_ok());
+        assert!(require_writable_column(&table, "lixcol_file_id", BoundWriteOp::Insert).is_ok());
+        let error = require_writable_column(&table, "lixcol_file_id", BoundWriteOp::Update)
+            .expect_err("entity file id should remain immutable after insert");
+        assert!(error.message.contains("is not writable"));
+    }
+
     fn catalog() -> PublicCatalog {
         PublicCatalog::from_visible_schemas(&[json!({
             "x-lix-key": "test_state_schema",
