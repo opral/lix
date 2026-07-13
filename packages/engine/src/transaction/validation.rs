@@ -28,7 +28,8 @@ use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 #[cfg(test)]
 use crate::live_state::LiveStateRowIdentity;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 #[cfg(test)]
 use crate::schema::{
@@ -97,16 +98,57 @@ async fn scan_committed_constraint_rows(
     entity_pks: Vec<EntityPk>,
     include_tombstones: bool,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    let request = LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: schema_keys.clone(),
+            entity_pks: entity_pks.clone(),
+            branch_ids: vec![domain.branch_id().to_string()],
+            file_ids: domain.file_filters(),
+            untracked: Some(domain.untracked()),
+            include_tombstones,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let rows = if domain.untracked() {
+        live_state.scan_rows(&request).await?
+    } else {
+        live_state.scan_tracked_rows(&request).await?
+    };
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            domain.contains(row)
+                && (schema_keys.is_empty() || schema_keys.contains(&row.schema_key))
+                && (entity_pks.is_empty() || entity_pks.contains(&row.entity_pk))
+        })
+        .collect())
+}
+
+async fn scan_committed_canonical_rows(
+    live_state: &dyn LiveStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    entity_pks: Vec<EntityPk>,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
     let rows = live_state
         .scan_rows(&LiveStateScanRequest {
             filter: LiveStateFilter {
-                schema_keys: schema_keys.clone(),
+                schema_keys: vec![schema_key.to_string()],
                 entity_pks: entity_pks.clone(),
                 branch_ids: vec![domain.branch_id().to_string()],
                 file_ids: domain.file_filters(),
-                untracked: Some(domain.untracked()),
-                include_tombstones,
+                include_tombstones: false,
                 ..Default::default()
+            },
+            projection: LiveStateProjection {
+                columns: vec![
+                    "schema_key".to_string(),
+                    "entity_pk".to_string(),
+                    "file_id".to_string(),
+                    "deleted".to_string(),
+                    "untracked".to_string(),
+                ],
             },
             ..Default::default()
         })
@@ -114,9 +156,9 @@ async fn scan_committed_constraint_rows(
     Ok(rows
         .into_iter()
         .filter(|row| {
-            domain.contains(row)
-                && (schema_keys.is_empty() || schema_keys.contains(&row.schema_key))
-                && (entity_pks.is_empty() || entity_pks.contains(&row.entity_pk))
+            domain.with_untracked(row.untracked).contains(row)
+                && row.schema_key == schema_key
+                && entity_pks.contains(&row.entity_pk)
         })
         .collect())
 }
@@ -823,9 +865,9 @@ async fn validate_committed_insert_identities(
         .collect::<BTreeSet<_>>();
     let mut checks_by_domain_schema =
         BTreeMap::<(Domain, String), Vec<(EntityPk, Option<TransactionWriteOrigin>)>>::new();
-    for (identity, origin) in input.staged_writes.insert_identities() {
+    for (identity, untracked, origin) in input.staged_writes.insert_identities() {
         let pending_identity = DomainRowIdentity::in_domain(
-            identity.domain(),
+            identity.domain(untracked),
             identity.schema_key().to_string(),
             identity.entity_pk().clone(),
         );
@@ -846,24 +888,35 @@ async fn validate_committed_insert_identities(
             .iter()
             .map(|(entity_pk, _)| entity_pk.clone())
             .collect::<Vec<_>>();
-        let committed_rows = scan_committed_constraint_rows(
-            input.live_state,
-            &domain,
-            vec![schema_key.clone()],
-            entity_pks,
-            false,
-        )
-        .await?;
+        let committed_rows =
+            scan_committed_canonical_rows(input.live_state, &domain, &schema_key, entity_pks)
+                .await?;
         let committed_rows_by_entity_pk = committed_rows
             .into_iter()
-            .filter(|row| {
-                row.snapshot_content.is_some() && !pending_constraints.tombstones_identity(row)
-            })
+            .filter(|row| !row.deleted && !pending_constraints.tombstones_identity(row))
             .map(|row| (row.entity_pk.clone(), row))
             .collect::<BTreeMap<_, _>>();
         for (entity_pk, origin) in checks {
-            if !committed_rows_by_entity_pk.contains_key(&entity_pk) {
+            let Some(committed_row) = committed_rows_by_entity_pk.get(&entity_pk) else {
                 continue;
+            };
+            if committed_row.untracked != domain.untracked() {
+                let requested = if domain.untracked() {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                let existing = if committed_row.untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "cannot insert {requested} row for schema '{schema_key}' entity_pk {entity_pk:?}: a canonical {existing} row already exists; delete it first"
+                    ),
+                ));
             }
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,

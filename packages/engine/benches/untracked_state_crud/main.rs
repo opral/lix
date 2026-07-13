@@ -15,7 +15,6 @@ use lix_engine::storage::{
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions,
 };
-use lix_engine::storage_bench;
 use lix_engine::{Backend, Engine, SessionContext};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
@@ -27,7 +26,7 @@ const REAL_WORKLOAD_ROWS: usize = 10_000;
 const PNPM_LOCK_JSON: &str = include_str!("../fixtures/pnpm-lock.fixture.json");
 const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../fixtures/json_pointer.schema.json");
 const SESSION_INSERT_CHUNK_SIZE: usize = 500;
-const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0001_0002), "untracked_state.row.v1");
+const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x00ff_0001), "bench.untracked_row");
 
 #[derive(Clone)]
 struct PointerRow {
@@ -55,21 +54,6 @@ struct RawUntrackedRow {
     created_at: String,
     updated_at: String,
     global: bool,
-}
-
-#[derive(Clone, Copy)]
-enum PhysicalLayout {
-    FullRowValue,
-    PayloadOnlyValue,
-}
-
-impl PhysicalLayout {
-    fn name(self) -> &'static str {
-        match self {
-            Self::FullRowValue => "full_row_value",
-            Self::PayloadOnlyValue => "payload_only_value",
-        }
-    }
 }
 
 struct RawSqliteFixture {
@@ -142,6 +126,44 @@ struct CountingRead<R> {
 struct CountingWrite<W> {
     inner: W,
     stats: Arc<Mutex<IoStats>>,
+}
+
+#[derive(Clone)]
+struct TempBackend<B> {
+    inner: B,
+    _dir: Arc<TempDir>,
+}
+
+impl<B> TempBackend<B> {
+    fn new(inner: B, dir: TempDir) -> Self {
+        Self {
+            inner,
+            _dir: Arc::new(dir),
+        }
+    }
+}
+
+impl<B> Backend for TempBackend<B>
+where
+    B: Backend,
+{
+    type Read<'a>
+        = B::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = B::Write<'a>
+    where
+        Self: 'a;
+
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts).await
+    }
+
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.inner.begin_write(opts).await
+    }
 }
 
 impl<B> CountingBackend<B> {
@@ -330,7 +352,6 @@ fn untracked_state_crud_benches(c: &mut Criterion) {
     bench_session_execute_untracked_insert(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_lix(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
-    bench_lix_physical_layout(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_session_execute_untracked_insert(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
 }
 
@@ -512,7 +533,11 @@ fn bench_lix_profile(
     group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || profile_storage(profile),
-            |storage| black_box(runtime.block_on(storage.insert_all(rows))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.insert_all(rows))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
@@ -520,10 +545,10 @@ fn bench_lix_profile(
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
             |storage| {
-                black_box(
+                retain_fixture(storage, |storage| {
                     runtime
-                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::FullValue)),
-                )
+                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::FullValue))
+                })
             },
             BatchSize::LargeInput,
         );
@@ -532,10 +557,9 @@ fn bench_lix_profile(
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
             |storage| {
-                black_box(
-                    runtime
-                        .block_on(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly)),
-                )
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly))
+                })
             },
             BatchSize::LargeInput,
         );
@@ -544,11 +568,11 @@ fn bench_lix_profile(
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
             |storage| {
-                black_box(
+                retain_fixture(storage, |storage| {
                     runtime.block_on(
                         storage.select_points(std::slice::from_ref(&rows[rows.len() / 2])),
-                    ),
-                )
+                    )
+                })
             },
             BatchSize::LargeInput,
         );
@@ -556,73 +580,54 @@ fn bench_lix_profile(
     group.bench_function(format!("select_all_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.select_points(rows))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.select_points(rows))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.update_all(rows))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.update_all(rows))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.update_all(&rows[..1]))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.update_all(&rows[..1]))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.delete_all())),
+            |storage| retain_fixture(storage, |storage| runtime.block_on(storage.delete_all())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || runtime.block_on(prepare_lix_seeded(profile, rows)),
-            |storage| black_box(runtime.block_on(storage.delete_one(&rows[rows.len() / 2]))),
+            |storage| {
+                retain_fixture(storage, |storage| {
+                    runtime.block_on(storage.delete_one(&rows[rows.len() / 2]))
+                })
+            },
             BatchSize::LargeInput,
         );
     });
-}
-
-fn bench_lix_physical_layout(
-    c: &mut Criterion,
-    runtime: &Runtime,
-    all_rows: &[PointerRow],
-    row_count: usize,
-    label: &str,
-) {
-    let rows = &all_rows[..row_count];
-    for profile in LIX_BACKEND_PROFILES {
-        let mut group = c.benchmark_group(format!(
-            "untracked_state_crud/physical_layout/{}/{label}",
-            profile.name()
-        ));
-        configure_group(&mut group, row_count);
-
-        for layout in [
-            PhysicalLayout::FullRowValue,
-            PhysicalLayout::PayloadOnlyValue,
-        ] {
-            group.bench_function(
-                format!("insert_all_rows/{}/{}", layout.name(), row_label(row_count)),
-                |b| {
-                    b.iter_batched(
-                        || (profile_storage(profile), physical_layout_rows(rows, layout)),
-                        |(storage, rows)| black_box(runtime.block_on(storage.insert_all(&rows))),
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
-        }
-
-        group.finish();
-    }
 }
 
 fn bench_session_execute_untracked_insert(
@@ -644,8 +649,10 @@ fn bench_session_execute_untracked_insert(
             b.iter_batched(
                 || runtime.block_on(prepare_profile_session_empty(profile)),
                 |session| {
-                    runtime.block_on(session.insert_untracked_json_pointer_rows(&rows));
-                    black_box(rows.len())
+                    retain_fixture(session, |session| {
+                        runtime.block_on(session.insert_untracked_json_pointer_rows(&rows));
+                        rows.len()
+                    })
                 },
                 BatchSize::LargeInput,
             );
@@ -653,6 +660,13 @@ fn bench_session_execute_untracked_insert(
 
         group.finish();
     }
+}
+
+/// Keeps fixture destruction (including recursive TempDir cleanup) outside
+/// Criterion's measured routine interval.
+fn retain_fixture<I, O>(fixture: I, routine: impl FnOnce(&I) -> O) -> (O, I) {
+    let output = routine(&fixture);
+    (output, fixture)
 }
 
 async fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
@@ -849,15 +863,15 @@ fn profile_storage(profile: LixBackendProfile) -> ProfileStorage {
 }
 
 enum ProfileStorage {
-    Sqlite(StorageContext<SqliteBackend>),
-    RocksDb(StorageContext<RocksDbBackend>),
-    Redb(StorageContext<RedbBackend>),
+    Sqlite(StorageContext<TempBackend<SqliteBackend>>),
+    RocksDb(StorageContext<TempBackend<RocksDbBackend>>),
+    Redb(StorageContext<TempBackend<RedbBackend>>),
 }
 
 enum ProfileSession {
-    Sqlite(SessionContext<SqliteBackend>),
-    RocksDb(SessionContext<RocksDbBackend>),
-    Redb(SessionContext<RedbBackend>),
+    Sqlite(SessionContext<TempBackend<SqliteBackend>>),
+    RocksDb(SessionContext<TempBackend<RocksDbBackend>>),
+    Redb(SessionContext<TempBackend<RedbBackend>>),
 }
 
 async fn prepare_profile_session_empty(profile: LixBackendProfile) -> ProfileSession {
@@ -986,22 +1000,25 @@ impl ProfileSession {
     }
 }
 
-fn sqlite_backend() -> SqliteBackend {
+fn sqlite_backend() -> TempBackend<SqliteBackend> {
     let dir = TempDir::new().expect("create sqlite backend tempdir");
-    let path = dir.keep().join("bench.sqlite");
-    SqliteBackend::open(path).expect("open sqlite backend")
+    let path = dir.path().join("bench.sqlite");
+    TempBackend::new(SqliteBackend::open(path).expect("open sqlite backend"), dir)
 }
 
-fn rocksdb_backend() -> RocksDbBackend {
+fn rocksdb_backend() -> TempBackend<RocksDbBackend> {
     let dir = TempDir::new().expect("create rocksdb backend tempdir");
-    let path = dir.keep().join("bench.rocksdb");
-    RocksDbBackend::open(path).expect("open rocksdb backend")
+    let path = dir.path().join("bench.rocksdb");
+    TempBackend::new(
+        RocksDbBackend::open(path).expect("open rocksdb backend"),
+        dir,
+    )
 }
 
-fn redb_backend() -> RedbBackend {
+fn redb_backend() -> TempBackend<RedbBackend> {
     let dir = TempDir::new().expect("create redb backend tempdir");
-    let path = dir.keep().join("bench.redb");
-    RedbBackend::open(path).expect("open redb backend")
+    let path = dir.path().join("bench.redb");
+    TempBackend::new(RedbBackend::open(path).expect("open redb backend"), dir)
 }
 
 fn configure_group(
@@ -1075,37 +1092,6 @@ fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
                 updated_value: StorageValue {
                     bytes: Bytes::from(updated_value),
                 },
-            }
-        })
-        .collect()
-}
-
-fn physical_layout_rows(rows: &[PointerRow], layout: PhysicalLayout) -> Vec<BenchRow> {
-    rows.iter()
-        .map(|row| {
-            let entity_pk = entity_pk(row);
-            let value = snapshot_value(row.path.as_str(), row.value_json.as_str());
-            let updated_value = snapshot_value(row.path.as_str(), row.updated_value_json.as_str());
-            let (key, value) = match layout {
-                PhysicalLayout::FullRowValue => {
-                    storage_bench::untracked_state_full_row_key_value(&entity_pk, &value)
-                }
-                PhysicalLayout::PayloadOnlyValue => {
-                    storage_bench::untracked_state_row_key_value(&entity_pk, &value)
-                }
-            };
-            let (_, updated_value) = match layout {
-                PhysicalLayout::FullRowValue => {
-                    storage_bench::untracked_state_full_row_key_value(&entity_pk, &updated_value)
-                }
-                PhysicalLayout::PayloadOnlyValue => {
-                    storage_bench::untracked_state_row_key_value(&entity_pk, &updated_value)
-                }
-            };
-            BenchRow {
-                key,
-                value,
-                updated_value,
             }
         })
         .collect()

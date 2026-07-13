@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::LixError;
 use musli::{Allocator, Decode, Decoder, Encode, Encoder};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,18 +8,6 @@ pub(crate) struct NormalizedJson(Arc<str>);
 impl NormalizedJson {
     pub(crate) fn from_arc_unchecked(normalized: Arc<str>) -> Self {
         Self(normalized)
-    }
-
-    pub(crate) fn from_value(value: &serde_json::Value, context: &str) -> Result<Self, LixError> {
-        let normalized: Arc<str> = serde_json::to_string(value)
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("{context} failed to serialize as normalized JSON: {error}"),
-                )
-            })?
-            .into();
-        Ok(Self(normalized))
     }
 
     pub(crate) fn as_str(&self) -> &str {

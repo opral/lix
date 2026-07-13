@@ -91,6 +91,17 @@ pub(crate) trait ChangelogReader {
 pub(crate) trait ChangelogWriter {
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError>;
 
+    /// Removes standalone current change records by id.
+    ///
+    /// Callers obtain these ids from current-state rows whose `commit_id` is
+    /// absent. The writer prevents the same transaction from appending or
+    /// retaining a deleted id in a commit; committed history is immutable and
+    /// never feeds this compaction API.
+    async fn stage_delete_standalone_changes(
+        &mut self,
+        change_ids: &[ChangeId],
+    ) -> Result<(), LixError>;
+
     #[cfg(feature = "storage-benches")]
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 }

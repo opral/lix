@@ -1,49 +1,35 @@
-use std::sync::Arc;
-
 use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::storage::{StorageRead, StorageWriteSet};
-use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow,
-    UntrackedStateRowRequest, UntrackedStateScanRequest,
+use crate::live_state::{
+    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
+    LiveStateIndexScanRequest, MaterializedLiveStateIndexRow,
 };
-use crate::{LixError, NullableKeyFilter};
+use crate::storage::StorageRead;
 
-/// Typed access to moving branch heads stored in untracked state.
+/// Typed access to moving branch heads stored in live state.
 ///
 /// Branch refs are one of the inputs used by live_state visibility, so this
-/// context deliberately bypasses live_state and reads the underlying untracked
+/// context deliberately bypasses live_state and reads the canonical current
 /// rows directly. That keeps the dependency acyclic:
-/// untracked_state -> branch_ref -> live_state.
-pub(super) struct BranchRefContext {
-    untracked_state: Arc<UntrackedStateContext>,
-}
+/// live_index -> branch_ref -> live_state.
+pub(super) struct BranchRefContext {}
 
 impl BranchRefContext {
-    pub(super) fn new(untracked_state: Arc<UntrackedStateContext>) -> Self {
-        Self { untracked_state }
+    pub(super) fn new() -> Self {
+        Self {}
     }
 
     /// Creates a branch-ref reader over a caller-provided KV store.
+    #[expect(clippy::unused_self)]
     pub(super) fn reader<S>(&self, store: S) -> BranchRefStoreReader<S>
     where
         S: StorageRead,
     {
-        BranchRefStoreReader {
-            untracked_state: Arc::clone(&self.untracked_state),
-            store,
-        }
-    }
-
-    /// Creates a branch-ref writer over a transaction-local storage write set.
-    pub(super) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> BranchRefWriter<'a> {
-        BranchRefWriter {
-            untracked_state: Arc::clone(&self.untracked_state),
-            writes,
-        }
+        BranchRefStoreReader { store }
     }
 }
 
@@ -52,7 +38,6 @@ pub(super) struct BranchRefStoreReader<S>
 where
     S: StorageRead,
 {
-    untracked_state: Arc<UntrackedStateContext>,
     store: S,
 }
 
@@ -61,14 +46,13 @@ where
     S: StorageRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        let Some(row) = self
-            .untracked_state
+        let Some(row) = LiveStateIndexContext::new()
             .reader(&self.store)
-            .load_row(&UntrackedStateRowRequest {
+            .load_row(&LiveStateIndexRowRequest {
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(branch_id),
-                file_id: NullableKeyFilter::Null,
+                file_id: None,
             })
             .await?
         else {
@@ -86,16 +70,16 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        let rows = self
-            .untracked_state
+        let rows = LiveStateIndexContext::new()
             .reader(&self.store)
-            .scan_rows(&UntrackedStateScanRequest {
-                filter: UntrackedStateFilter {
+            .scan_rows(&LiveStateIndexScanRequest {
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                filter: LiveStateIndexFilter {
                     schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                    ..UntrackedStateFilter::default()
+                    ..LiveStateIndexFilter::default()
                 },
-                ..UntrackedStateScanRequest::default()
+                projection: Vec::new(),
+                limit: None,
             })
             .await?;
         let mut heads = rows
@@ -131,23 +115,9 @@ where
     }
 }
 
-/// Write side for moving branch heads.
-pub(super) struct BranchRefWriter<'a> {
-    untracked_state: Arc<UntrackedStateContext>,
-    writes: &'a mut StorageWriteSet,
-}
-
-impl BranchRefWriter<'_> {
-    pub(crate) fn stage_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
-        self.untracked_state
-            .writer(self.writes)
-            .stage_rows(rows.iter().map(|row| row.as_ref()))
-    }
-}
-
 fn decode_branch_head(
     requested_branch_id: &str,
-    row: &MaterializedUntrackedStateRow,
+    row: &MaterializedLiveStateIndexRow,
 ) -> Result<Option<BranchHead>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
@@ -176,12 +146,12 @@ fn decode_branch_head(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use crate::changelog::{
+        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
+    };
+    use crate::live_state::{LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
+    use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::storage::{StorageContext, StorageWriteSet};
-    use crate::transaction::prepare_branch_ref_row;
-    use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
 
     use super::*;
 
@@ -204,23 +174,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_head_writes_untracked_global_ref() {
+    async fn advance_head_writes_global_current_ref() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let branch_ref = BranchRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let branch_ref = BranchRefContext::new();
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head(
-            &branch_ref,
-            &mut writes,
-            "branch-a",
-            "commit-a",
-            "2026-01-01T00:00:00Z",
-        )
-        .expect("branch head should advance");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
+        stage_branch_head(&storage, "branch-a", "commit-a", "2026-01-01T00:00:00Z")
             .await
-            .expect("branch head should commit");
+            .expect("branch head should advance");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -239,18 +199,17 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mut reader = UntrackedStateContext::new().reader(read);
-        let row = reader
-            .load_row(&UntrackedStateRowRequest {
+        let row = LiveStateIndexContext::new()
+            .reader(read)
+            .load_row(&LiveStateIndexRowRequest {
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single("branch-a"),
-                file_id: NullableKeyFilter::Null,
+                file_id: None,
             })
             .await
             .expect("branch-ref row should load")
             .expect("branch-ref row should exist");
-        assert!(row.global);
         assert_eq!(row.created_at, "2026-01-01T00:00:00.000Z");
         assert_eq!(row.updated_at, "2026-01-01T00:00:00.000Z");
     }
@@ -260,27 +219,12 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let branch_ref = test_branch_ref();
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head(
-            &branch_ref,
-            &mut writes,
-            "branch-b",
-            "commit-b",
-            "2026-01-01T00:00:00Z",
-        )
-        .expect("branch-b should advance");
-        stage_branch_head(
-            &branch_ref,
-            &mut writes,
-            "branch-a",
-            "commit-a",
-            "2026-01-01T00:00:00Z",
-        )
-        .expect("branch-a should advance");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
+        stage_branch_head(&storage, "branch-b", "commit-b", "2026-01-01T00:00:00Z")
             .await
-            .expect("branch heads should commit");
+            .expect("branch-b should advance");
+        stage_branch_head(&storage, "branch-a", "commit-a", "2026-01-01T00:00:00Z")
+            .await
+            .expect("branch-a should advance");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -308,18 +252,65 @@ mod tests {
     }
 
     fn test_branch_ref() -> BranchRefContext {
-        BranchRefContext::new(Arc::new(UntrackedStateContext::new()))
+        BranchRefContext::new()
     }
 
-    fn stage_branch_head(
-        branch_ref: &BranchRefContext,
-        writes: &mut StorageWriteSet,
+    async fn stage_branch_head(
+        storage: &StorageContext,
         branch_id: &str,
         commit_id: &str,
         timestamp: &str,
     ) -> Result<(), LixError> {
         let commit_id = CommitId::parse_lix(commit_id, "test branch head commit_id")?;
-        let canonical_row = prepare_branch_ref_row(branch_id, &commit_id, timestamp)?;
-        branch_ref.writer(writes).stage_rows(&[canonical_row.row])
+        let timestamp = crate::common::LixTimestamp::expect_parse("timestamp", timestamp);
+        let entity_pk = EntityPk::single(branch_id);
+        let snapshot = serde_json::json!({
+            "id": branch_id,
+            "commit_id": commit_id,
+        })
+        .to_string();
+        let change_id = ChangeId::for_test_label(&format!("branch-ref-{branch_id}"));
+        let read = storage.begin_read(StorageReadOptions::default()).await?;
+        let mut writes = storage.new_write_set();
+        {
+            let mut changelog_read = &read;
+            ChangelogContext::new()
+                .writer(&mut changelog_read, &mut writes)
+                .stage_append(ChangelogAppend {
+                    changes: vec![ChangeRecord {
+                        format_version: 2,
+                        change_id,
+                        schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+                        entity_pk: entity_pk.clone(),
+                        file_id: None,
+                        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+                        metadata: crate::json_store::JsonSlot::None,
+                        created_at: timestamp,
+                        origin_key: None,
+                    }],
+                    ..ChangelogAppend::default()
+                })
+                .await?;
+        }
+        LiveStateIndexContext::new()
+            .writer(&read, &mut writes)
+            .stage_branch_rows(
+                GLOBAL_BRANCH_ID,
+                [LiveStateIndexDeltaRef {
+                    schema_key: BRANCH_REF_SCHEMA_KEY,
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id,
+                    commit_id: None,
+                    deleted: false,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                }],
+            )
+            .await?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await?;
+        Ok(())
     }
 }

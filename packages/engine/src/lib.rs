@@ -53,7 +53,6 @@ pub(crate) mod tracked_state;
 pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
-pub(crate) mod untracked_state;
 pub mod wasm;
 
 pub use schema::{

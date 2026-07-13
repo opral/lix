@@ -11,6 +11,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
@@ -18,7 +19,6 @@ use crate::storage::SharedStorageRead;
 use crate::storage::StorageBackend;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
-use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
@@ -58,6 +58,7 @@ struct InitSeedChange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedLiveRow {
+    id: ChangeId,
     entity_pk: EntityPk,
     schema_key: String,
     snapshot_content: String,
@@ -128,18 +129,21 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         created_at: timestamp,
     };
     let global_branch_ref_row = untracked_row(
+        functions.call_uuid_v7(),
         EntityPk::single(GLOBAL_BRANCH_ID),
         BRANCH_REF_SCHEMA_KEY,
         branch_ref_snapshot(GLOBAL_BRANCH_ID, &initial_commit_id)?,
         timestamp,
     );
     let main_branch_ref_row = untracked_row(
+        functions.call_uuid_v7(),
         EntityPk::single(&main_branch_id),
         BRANCH_REF_SCHEMA_KEY,
         branch_ref_snapshot(&main_branch_id, &initial_commit_id)?,
         timestamp,
     );
     let workspace_branch_row = untracked_row(
+        functions.call_uuid_v7(),
         EntityPk::single(WORKSPACE_BRANCH_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(WORKSPACE_BRANCH_KEY, &main_branch_id)?,
@@ -179,7 +183,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 pub(crate) async fn initialize<B>(
     storage: StorageContext<B>,
     tracked_state: &TrackedStateContext,
-    untracked_state: &UntrackedStateContext,
+    live_index: &LiveStateIndexContext,
 ) -> Result<InitReceipt, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
@@ -194,26 +198,31 @@ where
             .await?,
     );
     let mut writes = StorageWriteSet::new();
-
     let authored_changes = plan
         .changes
         .iter()
         .map(seed_change_to_change_record)
         .collect::<Vec<_>>();
-
-    stage_init_json_payloads(&mut writes, &plan)?;
-    stage_init_changelog_commit(&mut read, &mut writes, &plan, authored_changes.clone()).await?;
-
-    let untracked_rows = plan
+    let untracked_changes = plan
         .untracked_rows
         .iter()
-        .map(untracked_state_row_from_seed)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(seed_untracked_change_to_change_record)
+        .collect::<Vec<_>>();
+
+    stage_init_json_payloads(&mut writes, &plan)?;
+    stage_init_changelog_commit(
+        &mut read,
+        &mut writes,
+        &plan,
+        authored_changes
+            .iter()
+            .chain(&untracked_changes)
+            .cloned()
+            .collect(),
+    )
+    .await?;
 
     {
-        untracked_state
-            .writer(&mut writes)
-            .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
         let commit_row_change = seed_commit_row_change_record(&plan.commit)?;
         let mut deltas = authored_changes
             .iter()
@@ -238,9 +247,28 @@ where
             created_at: commit_row_change.created_at,
             updated_at: commit_row_change.created_at,
         });
-        let mut writer = tracked_state.writer(&read, &mut writes);
-        writer
+        tracked_state
+            .writer(&read, &mut writes)
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
+            .await?;
+
+        let mut index_writer = live_index.writer(&read, &mut writes);
+        index_writer
+            .stage_branch_rows(
+                GLOBAL_BRANCH_ID,
+                plan.untracked_rows
+                    .iter()
+                    .map(|row| LiveStateIndexDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: None,
+                        entity_pk: &row.entity_pk,
+                        change_id: row.id,
+                        commit_id: None,
+                        deleted: false,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                    }),
+            )
             .await?;
     }
 
@@ -260,6 +288,20 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: change.created_at,
+        origin_key: None,
+    }
+}
+
+fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord {
+    ChangeRecord {
+        format_version: 2,
+        change_id: row.id,
+        entity_pk: row.entity_pk.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&row.snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
+        created_at: row.updated_at,
         origin_key: None,
     }
 }
@@ -291,10 +333,14 @@ fn stage_init_json_payloads(
         JsonWritePlacementRef::OutOfBand,
         plan.changes
             .iter()
-            .filter(|change| {
-                change.snapshot_content.len() > crate::json_store::JSON_INLINE_MAX_BYTES
-            })
-            .map(|change| NormalizedJsonRef::new(change.snapshot_content.as_str())),
+            .map(|change| change.snapshot_content.as_str())
+            .chain(
+                plan.untracked_rows
+                    .iter()
+                    .map(|row| row.snapshot_content.as_str()),
+            )
+            .filter(|snapshot| snapshot.len() > crate::json_store::JSON_INLINE_MAX_BYTES)
+            .map(NormalizedJsonRef::new),
     )?;
     Ok(())
 }
@@ -331,27 +377,15 @@ fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
     crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
-fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedStateRow, LixError> {
-    Ok(UntrackedStateRow {
-        entity_pk: row.entity_pk.clone(),
-        schema_key: row.schema_key.clone(),
-        file_id: None,
-        snapshot_content: Some(row.snapshot_content.clone()),
-        metadata: None,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        global: row.global,
-        branch_id: row.branch_id.clone(),
-    })
-}
-
 fn untracked_row(
+    id: uuid::Uuid,
     entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
     timestamp: LixTimestamp,
 ) -> InitSeedLiveRow {
     InitSeedLiveRow {
+        id: ChangeId::from(id),
         entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
@@ -425,7 +459,6 @@ mod tests {
     use crate::storage::InMemoryStorageBackend;
     use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateContext;
-    use crate::untracked_state::UntrackedStateContext;
 
     #[test]
     fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
@@ -559,9 +592,9 @@ mod tests {
         let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend);
         let tracked_state = TrackedStateContext::new();
-        let untracked_state = UntrackedStateContext::new();
+        let live_index = LiveStateIndexContext::new();
 
-        let receipt = initialize(storage.clone(), &tracked_state, &untracked_state)
+        let receipt = initialize(storage.clone(), &tracked_state, &live_index)
             .await
             .expect("engine should initialize");
         let mut reader = ChangelogContext::new().reader(

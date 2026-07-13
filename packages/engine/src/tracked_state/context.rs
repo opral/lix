@@ -151,9 +151,8 @@ where
                 &tree_scan_request_from_tracked(request),
             )
             .await?;
-        let materialization = crate::tracked_state::TrackedRowMaterialization::from_columns(
-            &request.read_columns.columns,
-        );
+        let materialization =
+            crate::changelog::ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let mut rows =
             materialize_rows_from_index_entries(&self.store, rows, &materialization).await?;
         if !request.filter.include_tombstones {
@@ -186,7 +185,7 @@ where
         let materialized = materialize_rows_from_index_entries(
             &self.store,
             entries,
-            &crate::tracked_state::TrackedRowMaterialization::full(),
+            &crate::changelog::ChangeRecordProjection::full(),
         )
         .await?;
         let mut rows = vec![None; keys.len()];
@@ -804,11 +803,8 @@ where
         HashMap<ChangeId, (crate::json_store::JsonSlot, crate::json_store::JsonSlot)>,
         LixError,
     > {
-        let records = crate::tracked_state::row_materialization::load_change_records(
-            &self.store,
-            change_ids.iter().copied(),
-        )
-        .await?;
+        let records =
+            crate::changelog::load_change_records(&self.store, change_ids.iter().copied()).await?;
         Ok(records
             .into_iter()
             .map(|(change_id, record)| (change_id, (record.snapshot, record.metadata)))

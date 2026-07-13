@@ -113,6 +113,7 @@ mod sql {
     mod metadata;
     mod read_only;
     mod udfs;
+    mod untracked_change_ledger;
 
     use lix_engine::ExecuteResult;
     use lix_engine::Value;

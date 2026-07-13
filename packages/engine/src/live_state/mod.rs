@@ -1,11 +1,17 @@
 mod context;
-mod overlay;
+mod index;
 mod reader;
 mod types;
 pub(crate) mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
+#[allow(unused_imports)]
+pub(crate) use index::{
+    LIVE_STATE_INDEX_ROW_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
+    LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
+    LiveStateIndexStoreReader, LiveStateIndexWriter, MaterializedLiveStateIndexRow,
+};
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
 #[allow(unused_imports)]
@@ -17,5 +23,5 @@ pub(crate) use types::{
 #[allow(unused_imports)]
 pub(crate) use visibility::{
     StagedLiveStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    overlay_scan_file_rows, overlay_scan_rows, resolve_visible_rows,
+    overlay_scan_file_rows, overlay_scan_rows, overlay_scan_tracked_rows, resolve_visible_rows,
 };

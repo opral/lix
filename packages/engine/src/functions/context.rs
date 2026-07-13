@@ -1,10 +1,12 @@
 use crate::LixError;
+use crate::changelog::ChangeId;
 use crate::common::LixTimestamp;
 use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
 use crate::live_state::LiveStateReader;
+use crate::storage::StorageRead;
 use crate::storage::StorageWriteSet;
 
 /// Execution-scoped runtime function context.
@@ -64,6 +66,7 @@ impl FunctionContext {
     /// deterministic mode is disabled.
     pub(crate) async fn stage_persist_if_needed(
         &self,
+        read: &(impl StorageRead + ?Sized),
         writes: &mut StorageWriteSet,
     ) -> Result<(), LixError> {
         let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
@@ -71,20 +74,47 @@ impl FunctionContext {
             return Ok(());
         };
         state::stage_sequence(
+            read,
             writes,
             DeterministicSequence { highest_seen },
             self.bookkeeping_timestamp,
+            deterministic_sequence_change_id(highest_seen),
         )
         .await
     }
+
+    pub(crate) fn deterministic_sequence_checkpoint(
+        &self,
+    ) -> Option<(i64, LixTimestamp, ChangeId)> {
+        let highest_seen = self
+            .functions
+            .deterministic_sequence_persist_highest_seen()?;
+        Some((
+            highest_seen,
+            self.bookkeeping_timestamp,
+            deterministic_sequence_change_id(highest_seen),
+        ))
+    }
+}
+
+fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
+    let hash = blake3::hash(format!("lix-deterministic-sequence:{highest_seen}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ChangeId::from(uuid::Uuid::from_bytes(bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
+    use crate::changelog::{ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter};
+    use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
+    use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
@@ -93,7 +123,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
-            crate::untracked_state::UntrackedStateContext::new(),
+            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
     }
@@ -233,8 +263,12 @@ mod tests {
         context.provider().call_uuid_v7();
 
         let mut writes = storage.new_write_set();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
         context
-            .stage_persist_if_needed(&mut writes)
+            .stage_persist_if_needed(&read, &mut writes)
             .await
             .expect("sequence should stage");
         storage
@@ -259,7 +293,7 @@ mod tests {
             &crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: crate::NullableKeyFilter::Null,
             },
         )
@@ -288,8 +322,12 @@ mod tests {
             .expect("runtime context should prepare");
 
         let mut writes = storage.new_write_set();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
         context
-            .stage_persist_if_needed(&mut writes)
+            .stage_persist_if_needed(&read, &mut writes)
             .await
             .expect("persist should no-op");
         assert!(writes.is_empty());
@@ -312,22 +350,52 @@ mod tests {
             "value": value,
         }))
         .expect("snapshot should serialize");
+        let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
+        let entity_pk = EntityPk::single(key);
+        let change_id = ChangeId::for_test_label(&format!("test-key-value-{key}"));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
         let mut writes = storage.new_write_set();
-        let row = crate::untracked_state::UntrackedStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(key),
-            schema_key: "lix_key_value".to_string(),
-            file_id: None,
-            snapshot_content: Some(snapshot_content),
-            metadata: None,
-            created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
-            updated_at: LixTimestamp::expect_parse("updated_at", "1970-01-01T00:00:00.000Z"),
-            global: true,
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-        };
-        crate::untracked_state::UntrackedStateContext::new()
-            .writer(&mut writes)
-            .stage_rows(std::iter::once(row.as_ref()))
-            .expect("test key-value should stage");
+        {
+            let mut changelog_read = &read;
+            ChangelogContext::new()
+                .writer(&mut changelog_read, &mut writes)
+                .stage_append(ChangelogAppend {
+                    changes: vec![ChangeRecord {
+                        format_version: 2,
+                        change_id,
+                        schema_key: "lix_key_value".to_string(),
+                        entity_pk: entity_pk.clone(),
+                        file_id: None,
+                        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+                        metadata: crate::json_store::JsonSlot::None,
+                        created_at: timestamp,
+                        origin_key: None,
+                    }],
+                    ..ChangelogAppend::default()
+                })
+                .await
+                .expect("test key-value change should stage");
+        }
+        LiveStateIndexContext::new()
+            .writer(&read, &mut writes)
+            .stage_branch_rows(
+                GLOBAL_BRANCH_ID,
+                [LiveStateIndexDeltaRef {
+                    schema_key: "lix_key_value",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id,
+                    commit_id: None,
+                    deleted: false,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                }],
+            )
+            .await
+            .expect("test key-value current row should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

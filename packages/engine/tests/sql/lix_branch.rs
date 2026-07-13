@@ -328,6 +328,186 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    lix_branch_destructive_ref_changes_reject_branch_local_untracked_state,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-local-untracked', 'Local Untracked')",
+                &[],
+            )
+            .await
+            .expect("branch insert should succeed");
+        let original_head = select_single_text(
+            &session,
+            "SELECT commit_id FROM lix_branch \
+             WHERE id = 'sql-branch-local-untracked'",
+        )
+        .await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value_by_branch \
+                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
+                 VALUES ('sql-branch-local-untracked-key', 'draft', \
+                         'sql-branch-local-untracked', false, true)",
+                &[],
+            )
+            .await
+            .expect("branch-local untracked row should insert");
+
+        session
+            .execute(
+                &format!(
+                    "UPDATE lix_branch SET commit_id = '{original_head}' \
+                     WHERE id = 'sql-branch-local-untracked'"
+                ),
+                &[],
+            )
+            .await
+            .expect("assigning the existing head should preserve local state");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('sql-branch-repoint-head', 'new-head')",
+                &[],
+            )
+            .await
+            .expect("tracked write should create another head");
+        let new_head = select_single_text(
+            &session,
+            &format!(
+                "SELECT commit_id FROM lix_branch WHERE id = '{}'",
+                sim.main_branch_id()
+            ),
+        )
+        .await;
+
+        let repoint_error = session
+            .execute(
+                &format!(
+                    "UPDATE lix_branch SET commit_id = '{new_head}' \
+                     WHERE id = 'sql-branch-local-untracked'"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("repoint should reject branch-local untracked state");
+        assert_eq!(repoint_error.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            repoint_error
+                .message
+                .contains("cannot repoint branch 'sql-branch-local-untracked'"),
+            "unexpected repoint error: {repoint_error:?}"
+        );
+
+        let delete_error = session
+            .execute(
+                "DELETE FROM lix_branch WHERE id = 'sql-branch-local-untracked'",
+                &[],
+            )
+            .await
+            .expect_err("delete should reject branch-local untracked state");
+        assert_eq!(delete_error.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            delete_error
+                .message
+                .contains("cannot delete branch 'sql-branch-local-untracked'"),
+            "unexpected delete error: {delete_error:?}"
+        );
+        assert_eq!(
+            select_single_text(
+                &session,
+                "SELECT commit_id FROM lix_branch \
+                 WHERE id = 'sql-branch-local-untracked'",
+            )
+            .await,
+            original_head
+        );
+    }
+);
+
+simulation_test!(
+    lix_branch_delete_then_recreate_does_not_restore_old_current_root,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-recreate', 'Before Delete')",
+                &[],
+            )
+            .await
+            .expect("branch insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value_by_branch \
+                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
+                 VALUES ('sql-branch-recreate-key', 'old', \
+                         'sql-branch-recreate', false, false)",
+                &[],
+            )
+            .await
+            .expect("tracked branch-local row should insert");
+        assert_eq!(
+            count_rows(
+                &session,
+                "SELECT COUNT(*) FROM lix_key_value_by_branch \
+                 WHERE key = 'sql-branch-recreate-key' \
+                   AND lixcol_branch_id = 'sql-branch-recreate'",
+            )
+            .await,
+            1
+        );
+
+        session
+            .execute(
+                "DELETE FROM lix_branch WHERE id = 'sql-branch-recreate'",
+                &[],
+            )
+            .await
+            .expect("branch without untracked local state should delete");
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-recreate', 'After Delete')",
+                &[],
+            )
+            .await
+            .expect("deleted branch id should be reusable");
+
+        assert_eq!(
+            count_rows(
+                &session,
+                "SELECT COUNT(*) FROM lix_key_value_by_branch \
+                 WHERE key = 'sql-branch-recreate-key' \
+                   AND lixcol_branch_id = 'sql-branch-recreate'",
+            )
+            .await,
+            0,
+            "recreated branch must not reuse the deleted current-state root"
+        );
+    }
+);
+
 simulation_test!(lix_branch_duplicate_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

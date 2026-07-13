@@ -153,6 +153,27 @@ impl StorageWriteSet {
             });
     }
 
+    /// Stages a content-addressed put, coalescing an identical put already in
+    /// this write set.
+    ///
+    /// A same-key, different-value mutation is still staged twice so normal
+    /// duplicate validation rejects the hash/key invariant violation.
+    pub(crate) fn put_content_addressed(
+        &mut self,
+        space: StorageSpace,
+        key: Key,
+        value: StoredValue,
+    ) {
+        let already_staged = self
+            .group_mut(space)
+            .puts
+            .iter()
+            .any(|put| put.key == key && put.value == value);
+        if !already_staged {
+            self.put(space, key, value);
+        }
+    }
+
     pub fn delete<S, K>(&mut self, space: S, key: K)
     where
         S: IntoStorageSpace,

@@ -5,12 +5,16 @@ use serde_json::{Value as JsonValue, json};
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::BranchContext;
 use crate::catalog::CatalogContext;
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::{
+    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
+};
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
     LiveStateScanRequest,
 };
+use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::session::SessionMode;
 use crate::storage::StorageBackend;
 use crate::storage::{
@@ -18,7 +22,6 @@ use crate::storage::{
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::untracked_state::UntrackedStateContext;
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";
@@ -77,18 +80,19 @@ where
         storage: StorageContext<B>,
         rows: Vec<BenchTransactionRow>,
     ) -> Self {
-        seed_deterministic_mode(storage.clone()).await;
-        Self::new(storage, rows).await
+        let fixture = Self::new(storage.clone(), rows).await;
+        seed_deterministic_mode(storage).await;
+        fixture
     }
 
     pub async fn new(storage: StorageContext<B>, rows: Vec<BenchTransactionRow>) -> Self {
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
-            UntrackedStateContext::new(),
+            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         ));
-        let branch_ctx = Arc::new(BranchContext::new(Arc::new(UntrackedStateContext::new())));
+        let branch_ctx = Arc::new(BranchContext::new());
         seed_visible_schema_rows(storage.clone(), tracked_state.as_ref()).await;
         Self {
             storage,
@@ -331,34 +335,58 @@ where
 async fn seed_deterministic_mode<B>(storage: StorageContext<B>)
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
 {
     let snapshot_content = serde_json::to_string(&json!({
         "key": crate::functions::DETERMINISTIC_MODE_KEY,
         "value": { "enabled": true },
     }))
     .expect("deterministic mode snapshot should serialize");
+    let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
+    let entity_pk = EntityPk::single(crate::functions::DETERMINISTIC_MODE_KEY);
+    let change_id = ChangeId::for_test_label("bench-deterministic-mode");
+    let mut read = SharedStorageRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("deterministic mode read should open"),
+    );
     let mut writes = storage.new_write_set();
-    let row = crate::untracked_state::UntrackedStateRow {
-        entity_pk: EntityPk::single(crate::functions::DETERMINISTIC_MODE_KEY),
-        schema_key: "lix_key_value".to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
-        created_at: crate::common::LixTimestamp::expect_parse(
-            "created_at",
-            "1970-01-01T00:00:00.000Z",
-        ),
-        updated_at: crate::common::LixTimestamp::expect_parse(
-            "updated_at",
-            "1970-01-01T00:00:00.000Z",
-        ),
-        global: true,
-        branch_id: GLOBAL_BRANCH_ID.to_string(),
-    };
-    UntrackedStateContext::new()
-        .writer(&mut writes)
-        .stage_rows(std::iter::once(row.as_ref()))
-        .expect("deterministic mode row should stage");
+    ChangelogContext::new()
+        .writer(&mut read, &mut writes)
+        .stage_append(ChangelogAppend {
+            changes: vec![ChangeRecord {
+                format_version: 2,
+                change_id,
+                entity_pk: entity_pk.clone(),
+                schema_key: "lix_key_value".to_string(),
+                file_id: None,
+                snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+                metadata: crate::json_store::JsonSlot::None,
+                created_at: timestamp,
+                origin_key: None,
+            }],
+            ..ChangelogAppend::default()
+        })
+        .await
+        .expect("deterministic mode change should stage");
+    LiveStateIndexContext::new()
+        .writer(&read, &mut writes)
+        .stage_branch_rows(
+            GLOBAL_BRANCH_ID,
+            [LiveStateIndexDeltaRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk: &entity_pk,
+                change_id,
+                commit_id: None,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+            }],
+        )
+        .await
+        .expect("deterministic mode current row should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
         .expect("deterministic mode row should commit");
@@ -434,18 +462,6 @@ async fn seed_visible_schema_rows<B>(
             }
         })
         .collect::<Vec<_>>();
-    let global_branch_ref_row = crate::transaction::prepare_branch_ref_row(
-        GLOBAL_BRANCH_ID,
-        &CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
-        TIMESTAMP,
-    )
-    .expect("schema fixture branch ref should stage");
-    let bench_branch_ref_row = crate::transaction::prepare_branch_ref_row(
-        BENCH_BRANCH_ID,
-        &CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
-        TIMESTAMP,
-    )
-    .expect("bench fixture branch ref should stage");
     let mut read = SharedStorageRead::new(
         storage
             .begin_read(StorageReadOptions::default())
@@ -462,16 +478,70 @@ async fn seed_visible_schema_rows<B>(
     )
     .await
     .expect("schema fixture rows should stage");
-    UntrackedStateContext::new()
-        .writer(&mut writes)
-        .stage_rows([
-            global_branch_ref_row.row.as_ref(),
-            bench_branch_ref_row.row.as_ref(),
-        ])
-        .expect("schema fixture branch ref should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
-        .expect("schema fixture transaction should commit");
+        .expect("schema fixture tracked rows should commit");
+
+    drop(read);
+    let mut read = SharedStorageRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("schema fixture current read should open"),
+    );
+    let timestamp = LixTimestamp::expect_parse("timestamp", TIMESTAMP);
+    let commit_id = CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID);
+    let branch_refs = [GLOBAL_BRANCH_ID, BENCH_BRANCH_ID].map(|branch_id| {
+        let entity_pk = EntityPk::single(branch_id);
+        let snapshot = json!({"id": branch_id, "commit_id": commit_id}).to_string();
+        let change_id = ChangeId::for_test_label(&format!("bench-branch-ref-{branch_id}"));
+        (branch_id, entity_pk, snapshot, change_id)
+    });
+    let mut writes = StorageWriteSet::new();
+    ChangelogContext::new()
+        .writer(&mut read, &mut writes)
+        .stage_append(ChangelogAppend {
+            changes: branch_refs
+                .iter()
+                .map(|(_, entity_pk, snapshot, change_id)| ChangeRecord {
+                    format_version: 2,
+                    change_id: *change_id,
+                    entity_pk: entity_pk.clone(),
+                    schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
+                    file_id: None,
+                    snapshot: crate::json_store::JsonSlot::from_json(snapshot),
+                    metadata: crate::json_store::JsonSlot::None,
+                    created_at: timestamp,
+                    origin_key: None,
+                })
+                .collect(),
+            ..ChangelogAppend::default()
+        })
+        .await
+        .expect("schema fixture branch-ref changes should stage");
+    let live_index = LiveStateIndexContext::new();
+    let mut current = live_index.writer(&read, &mut writes);
+    current
+        .stage_branch_rows(
+            GLOBAL_BRANCH_ID,
+            branch_refs
+                .iter()
+                .map(|(_, entity_pk, _, change_id)| LiveStateIndexDeltaRef {
+                    schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY,
+                    file_id: None,
+                    entity_pk,
+                    change_id: *change_id,
+                    commit_id: None,
+                    deleted: false,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                }),
+        )
+        .await
+        .expect("global current fixture should stage");
+    crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+        .await
+        .expect("schema fixture flat current rows should commit");
 }
 
 fn json_pointer_schema() -> JsonValue {

@@ -978,7 +978,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_tracked_path_insert_promotes_untracked_directory,
+    lix_directory_tracked_path_insert_rejects_untracked_directory,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -997,10 +997,16 @@ simulation_test!(
             )
             .await
             .expect("untracked directory insert should succeed");
-        session
+        let error = session
             .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
             .await
-            .expect("tracked directory insert should promote same path id");
+            .expect_err("tracked directory insert must not replace an untracked directory");
+        assert!(
+            error
+                .message
+                .contains("a canonical untracked row already exists; delete it first"),
+            "durability collision should have a targeted error: {error:?}"
+        );
 
         let result = session
             .execute(
@@ -1016,7 +1022,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("dir-docs".to_string()),
                 Value::Text("/docs/".to_string()),
-                Value::Boolean(false),
+                Value::Boolean(true),
             ]],
         );
     }

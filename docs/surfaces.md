@@ -11,7 +11,7 @@ Two ergonomic axes:
 - **Grain.** Typed columns for one schema vs. raw JSON across all schemas vs. file bytes.
 - **Scope.** The active version, all versions side-by-side, or history walked through commits.
 
-A third surface, `lix_change`, sits outside the grid as the immutable global change journal: every write across every schema and every version, ordered by `created_at`.
+A third surface, `lix_change`, sits outside the grid as the global change ledger: retained tracked history plus the latest compactable untracked change for each current identity, ordered by `created_at`.
 
 ## The grid
 
@@ -22,7 +22,7 @@ A third surface, `lix_change`, sits outside the grid as the immutable global cha
 | **Files (bytes)**            | `lix_file`                     | `lix_file_by_version`                     | `lix_file_history`                     |
 | **Directories**              | `lix_directory`                | `lix_directory_by_version`                | `lix_directory_history`                |
 
-Plus: `lix_change`, the global change journal (no version filter).
+Plus: `lix_change`, the global change ledger (no version filter).
 
 Pick the row by what you're querying; pick the column by which version(s) and which time. Same data underneath, different ergonomics.
 
@@ -37,6 +37,8 @@ Schema-agnostic, JSON-shaped reads across every registered schema.
 | `lix_state_history` | State walked back through the commit graph from a given commit. |
 
 Common columns (`lix_state` and `lix_state_by_version`): `entity_pk` (JSON array of primary-key values), `schema_key`, `file_id`, `snapshot_content` (JSON), `metadata` (JSON), `schema_version`, `change_id`, `commit_id`. `lix_state_by_version` adds `version_id`.
+
+Every canonical current row has a `change_id`, including rows written with `lixcol_untracked = true`. Untracked current rows have no `commit_id`; tracked rows reference the commit that retained their change. Deleting an untracked row physically removes its flat current-index entry and standalone ChangeRecord; no untracked tombstone is retained. Valid writes reject tracked and untracked rows with the same canonical identity.
 
 `lix_state_history` shares `entity_pk` (JSON array of primary-key values), `schema_key`, `file_id`, `snapshot_content`, `metadata`, `schema_version`, `change_id`, and instead of `commit_id` exposes `start_commit_id`, `observed_commit_id`, `commit_created_at`, and `depth` (commit-graph distance from `start_commit_id`; `0` is the freshest observation, higher values walk back, and intermediate commits that didn't touch the entity are skipped).
 

@@ -195,19 +195,22 @@ where
 {
     let mut catalog_rows = Vec::new();
     for schema_domain in domain.schema_catalog_domains() {
-        let rows = live_state
-            .scan_rows(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                    branch_ids: vec![schema_domain.branch_id().to_string()],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(schema_domain.untracked()),
-                    include_tombstones: false,
-                    ..LiveStateFilter::default()
-                },
-                ..LiveStateScanRequest::default()
-            })
-            .await?;
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                branch_ids: vec![schema_domain.branch_id().to_string()],
+                file_ids: vec![NullableKeyFilter::Null],
+                untracked: Some(schema_domain.untracked()),
+                include_tombstones: false,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        };
+        let rows = if schema_domain.untracked() {
+            live_state.scan_rows(&request).await?
+        } else {
+            live_state.scan_tracked_rows(&request).await?
+        };
         catalog_rows.extend(
             rows.into_iter()
                 .filter(|row| row_belongs_to_schema_catalog_domain(row, &schema_domain))

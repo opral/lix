@@ -1,9 +1,3 @@
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::sync::Arc;
-
-#[cfg(test)]
-use crate::branch::BranchContext;
 use crate::changelog::CommitId;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader,
@@ -17,12 +11,7 @@ use crate::storage::StorageWriteSet;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
 };
-#[cfg(test)]
-use crate::transaction::prepare_branch_ref_row;
-#[cfg(test)]
-use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRow,
-};
+use std::collections::BTreeMap;
 
 fn prepare_json_ref(value: &str) -> JsonRef {
     JsonRef::for_content(value.as_bytes())
@@ -76,13 +65,7 @@ pub(crate) async fn seed_branch_head_with_rows(
         .begin_read(crate::storage::StorageReadOptions::default())
         .await
         .expect("seed read should open");
-    let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
     let mut writes = StorageWriteSet::new();
-    let canonical_row = prepare_branch_ref_row(branch_id, &commit_id, TEST_TIMESTAMP)
-        .expect("branch ref should canonicalize");
-    branch_ctx
-        .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])
-        .expect("branch ref should stage");
     stage_tracked_root_from_materialized(
         &mut read,
         &mut writes,
@@ -93,6 +76,99 @@ pub(crate) async fn seed_branch_head_with_rows(
     )
     .await
     .expect("tracked root should write");
+
+    let branch_ref_change_id = test_change_id(&format!("branch-ref-{branch_id}"));
+    let branch_ref_entity_pk = crate::entity_pk::EntityPk::single(branch_id);
+    let branch_ref_snapshot = serde_json::json!({
+        "id": branch_id,
+        "commit_id": commit_id,
+    })
+    .to_string();
+    {
+        let mut changelog_read = &mut read;
+        ChangelogContext::new()
+            .writer(&mut changelog_read, &mut writes)
+            .stage_append(ChangelogAppend {
+                changes: vec![ChangeRecord {
+                    format_version: 2,
+                    change_id: branch_ref_change_id,
+                    entity_pk: branch_ref_entity_pk.clone(),
+                    schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
+                    file_id: None,
+                    snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
+                    metadata: crate::json_store::JsonSlot::None,
+                    created_at: test_timestamp(),
+                    origin_key: None,
+                }],
+                ..ChangelogAppend::default()
+            })
+            .await
+            .expect("branch ref change should stage");
+    }
+    crate::live_state::LiveStateIndexContext::new()
+        .writer(&read, &mut writes)
+        .stage_branch_rows(
+            GLOBAL_BRANCH_ID,
+            [crate::live_state::LiveStateIndexDeltaRef {
+                schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY,
+                file_id: None,
+                entity_pk: &branch_ref_entity_pk,
+                change_id: branch_ref_change_id,
+                commit_id: None,
+                deleted: false,
+                created_at: test_timestamp(),
+                updated_at: test_timestamp(),
+            }]
+            .into_iter()
+            .chain(
+                rows.iter()
+                    .filter(|_| branch_id == GLOBAL_BRANCH_ID)
+                    .map(|row| crate::live_state::LiveStateIndexDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        entity_pk: &row.entity_pk,
+                        change_id: row.change_id,
+                        commit_id: Some(row.commit_id),
+                        deleted: row.deleted,
+                        created_at: crate::common::LixTimestamp::expect_parse(
+                            "created_at",
+                            &row.created_at,
+                        ),
+                        updated_at: crate::common::LixTimestamp::expect_parse(
+                            "updated_at",
+                            &row.updated_at,
+                        ),
+                    }),
+            ),
+        )
+        .await
+        .expect("branch ref current row should stage");
+    if !rows.is_empty() && branch_id != GLOBAL_BRANCH_ID {
+        crate::live_state::LiveStateIndexContext::new()
+            .writer(&read, &mut writes)
+            .stage_branch_rows(
+                branch_id,
+                rows.iter()
+                    .map(|row| crate::live_state::LiveStateIndexDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        entity_pk: &row.entity_pk,
+                        change_id: row.change_id,
+                        commit_id: Some(row.commit_id),
+                        deleted: row.deleted,
+                        created_at: crate::common::LixTimestamp::expect_parse(
+                            "created_at",
+                            &row.created_at,
+                        ),
+                        updated_at: crate::common::LixTimestamp::expect_parse(
+                            "updated_at",
+                            &row.updated_at,
+                        ),
+                    }),
+            )
+            .await
+            .expect("branch current rows should stage");
+    }
     storage
         .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
         .await
@@ -483,24 +559,5 @@ pub(crate) fn tracked_change_from_materialized(
             }),
         created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.updated_at),
         origin_key: None,
-    })
-}
-
-#[expect(clippy::unnecessary_wraps)]
-#[cfg(test)]
-pub(crate) fn untracked_state_row_from_materialized(
-    _writes: &mut StorageWriteSet,
-    row: &MaterializedUntrackedStateRow,
-) -> Result<UntrackedStateRow, crate::LixError> {
-    Ok(UntrackedStateRow {
-        entity_pk: row.entity_pk.clone(),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot_content: row.snapshot_content.clone(),
-        metadata: row.metadata.as_deref().map(crate::serialize_row_metadata),
-        created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
-        updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
-        global: row.global,
-        branch_id: row.branch_id.clone(),
     })
 }

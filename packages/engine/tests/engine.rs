@@ -370,9 +370,9 @@ simulation_test!(
                 .execute("SELECT lix_uuid_v7()", &[])
                 .await
                 .expect("uuid after deterministic write should continue"),
-            // The tracked write consumes deterministic values for row
-            // metadata and commit metadata.
-            "01920000-0000-7000-8000-000000000008",
+            // The tracked write consumes deterministic values for row and
+            // commit metadata, including the branch-ref ChangeRecord ID.
+            "01920000-0000-7000-8000-000000000009",
         );
     }
 );

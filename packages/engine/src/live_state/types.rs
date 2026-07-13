@@ -1,9 +1,7 @@
 use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
+use crate::live_state::index::MaterializedLiveStateIndexRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
-use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
-};
 use crate::{NullableKeyFilter, Value};
 
 /// Durable row visible through live_state reads.
@@ -27,19 +25,20 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) branch_id: String,
 }
 
-impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
-    fn from(row: MaterializedUntrackedStateRow) -> Self {
+impl From<MaterializedLiveStateIndexRow> for MaterializedLiveStateRow {
+    fn from(row: MaterializedLiveStateIndexRow) -> Self {
+        let global = row.branch_id == crate::GLOBAL_BRANCH_ID;
         Self {
             entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
-            deleted: row.deleted,
+            deleted: false,
             created_at: row.created_at,
             updated_at: row.updated_at,
-            global: row.global,
-            change_id: None,
+            global,
+            change_id: Some(row.change_id),
             commit_id: None,
             untracked: true,
             branch_id: row.branch_id,
@@ -82,23 +81,6 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
             change_id,
             commit_id,
         })
-    }
-}
-
-impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
-    fn from(row: &MaterializedLiveStateRow) -> Self {
-        Self {
-            entity_pk: row.entity_pk.clone(),
-            schema_key: row.schema_key.clone(),
-            file_id: row.file_id.clone(),
-            snapshot_content: row.snapshot_content.clone(),
-            metadata: row.metadata.clone(),
-            deleted: row.deleted,
-            created_at: row.created_at.clone(),
-            updated_at: row.updated_at.clone(),
-            global: row.global,
-            branch_id: row.branch_id.clone(),
-        }
     }
 }
 
@@ -160,17 +142,6 @@ pub(crate) enum LiveStateRowFilter {
     #[default]
     All,
     None,
-}
-
-impl From<LiveStateFilter> for UntrackedStateFilter {
-    fn from(filter: LiveStateFilter) -> Self {
-        Self {
-            schema_keys: filter.schema_keys,
-            entity_pks: filter.entity_pks,
-            branch_ids: filter.branch_ids,
-            file_ids: filter.file_ids,
-        }
-    }
 }
 
 /// Requested property set for a live-state scan.
@@ -238,17 +209,6 @@ pub(crate) struct LiveStateRowRequest {
     pub(crate) branch_id: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: NullableKeyFilter<String>,
-}
-
-impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
-    fn from(request: &LiveStateRowRequest) -> Self {
-        Self {
-            schema_key: request.schema_key.clone(),
-            branch_id: request.branch_id.clone(),
-            entity_pk: request.entity_pk.clone(),
-            file_id: request.file_id.clone(),
-        }
-    }
 }
 
 /// Stable visible-row identity used for overlay composition.

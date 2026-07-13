@@ -65,7 +65,7 @@ impl Default for TrackedStateTreeOptions {
 
 /// Content-addressed tracked-state tree operations.
 ///
-/// This type owns tracked-state tree mechanics only. Branch refs, untracked overlay,
+/// This type owns immutable tree mechanics only. Branch refs, mutable live state,
 /// and SQL visibility remain outside the tree.
 #[derive(Debug, Clone)]
 pub(crate) struct TrackedStateTree {
