@@ -5,9 +5,9 @@ use crate::binary_cas::codec::{BinaryCasManifest, decode_binary_cas_manifest};
 use crate::binary_cas::kv::{
     BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
 };
-use crate::storage::{
-    StorageBackendError, StorageCoreProjection, StorageKeyRange, StorageProjectedValue,
-    StorageRead, StorageScanOptions, StorageSpaceId,
+use crate::storage_adapter::{
+    StorageAdapterRead, StorageCoreProjection, StorageError, StorageKeyRange,
+    StorageProjectedValue, StorageScanOptions, StorageSpaceId,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub(crate) async fn collect_binary_cas_storage_stats<R>(
     read: &R,
 ) -> Result<BinaryCasStorageStats, LixError>
 where
-    R: StorageRead + ?Sized,
+    R: StorageAdapterRead + ?Sized,
 {
     let mut stats = BinaryCasStorageStats::default();
     stats.manifest_rows = scan_space(
@@ -35,12 +35,12 @@ where
         StorageCoreProjection::FullValue,
         |value| {
             let StorageProjectedValue::FullValue(bytes) = value else {
-                return Err(StorageBackendError::Corruption(
+                return Err(StorageError::Corruption(
                     "binary CAS manifest scan returned key-only value".to_string(),
                 ));
             };
             let manifest = decode_binary_cas_manifest(&bytes).map_err(|error| {
-                StorageBackendError::Corruption(format!("invalid binary CAS manifest: {error}"))
+                StorageError::Corruption(format!("invalid binary CAS manifest: {error}"))
             })?;
             stats.logical_blob_bytes += manifest.size_bytes();
             match manifest {
@@ -63,9 +63,9 @@ where
     Ok(stats)
 }
 
-async fn count_space<R>(read: &R, space: StorageSpaceId) -> Result<u64, StorageBackendError>
+async fn count_space<R>(read: &R, space: StorageSpaceId) -> Result<u64, StorageError>
 where
-    R: StorageRead + ?Sized,
+    R: StorageAdapterRead + ?Sized,
 {
     scan_space(read, space, StorageCoreProjection::KeyOnly, |_| Ok(())).await
 }
@@ -75,10 +75,10 @@ async fn scan_space<R, F>(
     space: StorageSpaceId,
     projection: StorageCoreProjection,
     mut visit: F,
-) -> Result<u64, StorageBackendError>
+) -> Result<u64, StorageError>
 where
-    R: StorageRead + ?Sized,
-    F: FnMut(StorageProjectedValue) -> Result<(), StorageBackendError>,
+    R: StorageAdapterRead + ?Sized,
+    F: FnMut(StorageProjectedValue) -> Result<(), StorageError>,
 {
     let range = StorageKeyRange {
         lower: Bound::Unbounded,
@@ -121,14 +121,12 @@ mod tests {
     use crate::binary_cas::kv::{
         KvBlobManifestChunk, stage_chunk, stage_manifest, stage_manifest_chunk,
     };
-    use crate::storage::{
-        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
-    };
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     #[tokio::test]
     async fn counts_binary_cas_storage_rows() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend);
+        let storage = Memory::new();
+        let storage = StorageAdapter::new(storage);
         let mut writes = storage.new_write_set();
 
         let empty_hash = BlobHash::from_content(b"empty");

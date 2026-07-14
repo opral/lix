@@ -1,12 +1,11 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, FsBackend,
-    FsBackendOpenOptions, InMemoryBackend, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
-    OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
+    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, LocalFilesystem, LocalFilesystemOpenOptions, Memory,
+    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
+    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
+    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, SQLite, SQLiteOptions,
     SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, WasmRuntime,
     open_lix,
 };
@@ -32,21 +31,21 @@ pub struct NativeLix {
 }
 
 enum NativeLixInner {
-    Memory(RsLix<InMemoryBackend>),
-    Sqlite(RsLix<SqliteBackend>),
-    Fs(RsLix<FsBackend>, FsBackend),
+    Memory(RsLix<Memory>),
+    SQLite(RsLix<SQLite>),
+    LocalFilesystem(RsLix<LocalFilesystem>, LocalFilesystem),
 }
 
 enum NativeLixTransactionInner {
-    Memory(RsLixTransaction<InMemoryBackend>),
-    Sqlite(RsLixTransaction<SqliteBackend>),
-    Fs(RsLixTransaction<FsBackend>),
+    Memory(RsLixTransaction<Memory>),
+    SQLite(RsLixTransaction<SQLite>),
+    LocalFilesystem(RsLixTransaction<LocalFilesystem>),
 }
 
 enum NativeObserveEventsInner {
-    Memory(RsObserveEvents<InMemoryBackend>),
-    Sqlite(RsObserveEvents<SqliteBackend>),
-    Fs(RsObserveEvents<FsBackend>),
+    Memory(RsObserveEvents<Memory>),
+    SQLite(RsObserveEvents<SQLite>),
+    LocalFilesystem(RsObserveEvents<LocalFilesystem>),
 }
 
 #[napi(object)]
@@ -490,8 +489,8 @@ impl NativeLixInner {
     ) -> std::result::Result<RsExecuteResult, LixError> {
         match self {
             Self::Memory(lix) => lix.execute_with_options(sql, params, options).await,
-            Self::Sqlite(lix) => lix.execute_with_options(sql, params, options).await,
-            Self::Fs(lix, _) => lix.execute_with_options(sql, params, options).await,
+            Self::SQLite(lix) => lix.execute_with_options(sql, params, options).await,
+            Self::LocalFilesystem(lix, _) => lix.execute_with_options(sql, params, options).await,
         }
     }
 
@@ -500,10 +499,10 @@ impl NativeLixInner {
             Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
                 lix.begin_transaction().await?,
             )),
-            Self::Sqlite(lix) => Ok(NativeLixTransactionInner::Sqlite(
+            Self::SQLite(lix) => Ok(NativeLixTransactionInner::SQLite(
                 lix.begin_transaction().await?,
             )),
-            Self::Fs(lix, _) => Ok(NativeLixTransactionInner::Fs(
+            Self::LocalFilesystem(lix, _) => Ok(NativeLixTransactionInner::LocalFilesystem(
                 lix.begin_transaction().await?,
             )),
         }
@@ -516,16 +515,18 @@ impl NativeLixInner {
     ) -> std::result::Result<NativeObserveEventsInner, LixError> {
         match self {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
-            Self::Sqlite(lix) => Ok(NativeObserveEventsInner::Sqlite(lix.observe(sql, params)?)),
-            Self::Fs(lix, _) => Ok(NativeObserveEventsInner::Fs(lix.observe(sql, params)?)),
+            Self::SQLite(lix) => Ok(NativeObserveEventsInner::SQLite(lix.observe(sql, params)?)),
+            Self::LocalFilesystem(lix, _) => Ok(NativeObserveEventsInner::LocalFilesystem(
+                lix.observe(sql, params)?,
+            )),
         }
     }
 
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
-            Self::Sqlite(lix) => lix.active_branch_id().await,
-            Self::Fs(lix, _) => lix.active_branch_id().await,
+            Self::SQLite(lix) => lix.active_branch_id().await,
+            Self::LocalFilesystem(lix, _) => lix.active_branch_id().await,
         }
     }
 
@@ -535,8 +536,8 @@ impl NativeLixInner {
     ) -> std::result::Result<CreateBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
-            Self::Sqlite(lix) => lix.create_branch(options).await,
-            Self::Fs(lix, _) => lix.create_branch(options).await,
+            Self::SQLite(lix) => lix.create_branch(options).await,
+            Self::LocalFilesystem(lix, _) => lix.create_branch(options).await,
         }
     }
 
@@ -546,8 +547,8 @@ impl NativeLixInner {
     ) -> std::result::Result<SwitchBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
-            Self::Sqlite(lix) => lix.switch_branch(options).await,
-            Self::Fs(lix, _) => lix.switch_branch(options).await,
+            Self::SQLite(lix) => lix.switch_branch(options).await,
+            Self::LocalFilesystem(lix, _) => lix.switch_branch(options).await,
         }
     }
 
@@ -556,10 +557,10 @@ impl NativeLixInner {
         paths: Vec<String>,
     ) -> std::result::Result<(), LixError> {
         match self {
-            Self::Fs(_, backend) => backend.import_paths(paths).await,
-            Self::Memory(_) | Self::Sqlite(_) => Err(LixError::new(
-                "LIX_UNSUPPORTED_BACKEND",
-                "importFilesystemPaths requires a filesystem backend",
+            Self::LocalFilesystem(_, storage) => storage.import_paths(paths).await,
+            Self::Memory(_) | Self::SQLite(_) => Err(LixError::new(
+                "LIX_UNSUPPORTED_STORAGE",
+                "importFilesystemPaths requires a filesystem storage",
             )),
         }
     }
@@ -570,8 +571,8 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchPreview, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
-            Self::Sqlite(lix) => lix.merge_branch_preview(options).await,
-            Self::Fs(lix, _) => lix.merge_branch_preview(options).await,
+            Self::SQLite(lix) => lix.merge_branch_preview(options).await,
+            Self::LocalFilesystem(lix, _) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -581,17 +582,17 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
-            Self::Sqlite(lix) => lix.merge_branch(options).await,
-            Self::Fs(lix, _) => lix.merge_branch(options).await,
+            Self::SQLite(lix) => lix.merge_branch(options).await,
+            Self::LocalFilesystem(lix, _) => lix.merge_branch(options).await,
         }
     }
 
     async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
         match self {
-            Self::Fs(_, backend) => backend.sync_disk_to_lix().await,
-            Self::Memory(_) | Self::Sqlite(_) => Err(LixError::new(
-                "LIX_UNSUPPORTED_BACKEND",
-                "syncDiskToLix requires a filesystem backend",
+            Self::LocalFilesystem(_, storage) => storage.sync_disk_to_lix().await,
+            Self::Memory(_) | Self::SQLite(_) => Err(LixError::new(
+                "LIX_UNSUPPORTED_STORAGE",
+                "syncDiskToLix requires a filesystem storage",
             )),
         }
     }
@@ -599,8 +600,8 @@ impl NativeLixInner {
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(lix) => lix.close().await,
-            Self::Sqlite(lix) => lix.close().await,
-            Self::Fs(lix, _) => lix.close().await,
+            Self::SQLite(lix) => lix.close().await,
+            Self::LocalFilesystem(lix, _) => lix.close().await,
         }
     }
 }
@@ -616,26 +617,28 @@ impl NativeLixTransactionInner {
             Self::Memory(transaction) => {
                 transaction.execute_with_options(sql, params, options).await
             }
-            Self::Sqlite(transaction) => {
+            Self::SQLite(transaction) => {
                 transaction.execute_with_options(sql, params, options).await
             }
-            Self::Fs(transaction) => transaction.execute_with_options(sql, params, options).await,
+            Self::LocalFilesystem(transaction) => {
+                transaction.execute_with_options(sql, params, options).await
+            }
         }
     }
 
     async fn commit(self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(transaction) => transaction.commit().await,
-            Self::Sqlite(transaction) => transaction.commit().await,
-            Self::Fs(transaction) => transaction.commit().await,
+            Self::SQLite(transaction) => transaction.commit().await,
+            Self::LocalFilesystem(transaction) => transaction.commit().await,
         }
     }
 
     async fn rollback(self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(transaction) => transaction.rollback().await,
-            Self::Sqlite(transaction) => transaction.rollback().await,
-            Self::Fs(transaction) => transaction.rollback().await,
+            Self::SQLite(transaction) => transaction.rollback().await,
+            Self::LocalFilesystem(transaction) => transaction.rollback().await,
         }
     }
 }
@@ -644,22 +647,22 @@ impl NativeObserveEventsInner {
     async fn next(&mut self) -> std::result::Result<Option<RsObserveEvent>, LixError> {
         match self {
             Self::Memory(events) => events.next().await,
-            Self::Sqlite(events) => events.next().await,
-            Self::Fs(events) => events.next().await,
+            Self::SQLite(events) => events.next().await,
+            Self::LocalFilesystem(events) => events.next().await,
         }
     }
 
     fn close(&mut self) {
         match self {
             Self::Memory(events) => events.close(),
-            Self::Sqlite(events) => events.close(),
-            Self::Fs(events) => events.close(),
+            Self::SQLite(events) => events.close(),
+            Self::LocalFilesystem(events) => events.close(),
         }
     }
 }
 
 #[expect(missing_debug_implementations)]
-pub struct OpenFsTask {
+pub struct OpenLocalFilesystemTask {
     path: String,
     lix_dir: Option<String>,
     sync_all_files: bool,
@@ -672,18 +675,18 @@ pub struct OpenMemoryTask {
 }
 
 #[expect(missing_debug_implementations)]
-pub struct OpenSqliteTask {
+pub struct OpenSQLiteTask {
     path: String,
     wasm_runtime_dispatch: Option<SharedJsWasmRuntimeDispatch>,
 }
 
-impl Task for OpenFsTask {
+impl Task for OpenLocalFilesystemTask {
     type Output = std::result::Result<NativeLix, LixError>;
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
         let wasm_runtime_dispatch = take_wasm_runtime_dispatch(&mut self.wasm_runtime_dispatch)?;
-        Ok(open_fs_native(
+        Ok(open_local_filesystem_native(
             std::mem::take(&mut self.path),
             self.lix_dir.take(),
             std::mem::take(&mut self.sync_all_files),
@@ -710,7 +713,7 @@ impl Task for OpenMemoryTask {
     }
 }
 
-impl Task for OpenSqliteTask {
+impl Task for OpenSQLiteTask {
     type Output = std::result::Result<NativeLix, LixError>;
     type JsValue = NativeLix;
 
@@ -759,14 +762,14 @@ fn open_sqlite_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let backend = SqliteBackend::new(SqliteBackendOptions { path: path.into() })?;
-    let options = RsOpenLixOptions::new(backend)
+    let storage = SQLite::new(SQLiteOptions { path: path.into() })?;
+    let options = RsOpenLixOptions::new(storage)
         .with_wasm_runtime(Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch)));
     let lix = rt.block_on(open_lix(options))?;
-    NativeLix::new(NativeLixInner::Sqlite(lix))
+    NativeLix::new(NativeLixInner::SQLite(lix))
 }
 
-fn open_fs_native(
+fn open_local_filesystem_native(
     path: String,
     lix_dir: Option<String>,
     sync_all_files: bool,
@@ -776,16 +779,16 @@ fn open_fs_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let mut options = FsBackendOpenOptions::new(path, sync_all_files);
+    let mut options = LocalFilesystemOpenOptions::new(path, sync_all_files);
     options.lix_dir = lix_dir.map(Into::into);
     let wasm_runtime: Arc<dyn WasmRuntime> = Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch));
-    let backend = rt.block_on(FsBackend::open_with_options_and_wasm_runtime(
+    let storage = rt.block_on(LocalFilesystem::open_with_options_and_wasm_runtime(
         options,
         Arc::clone(&wasm_runtime),
     ))?;
-    let options = RsOpenLixOptions::new(backend.clone()).with_wasm_runtime(wasm_runtime);
+    let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(wasm_runtime);
     let lix = rt.block_on(open_lix(options))?;
-    NativeLix::new(NativeLixInner::Fs(lix, backend))
+    NativeLix::new(NativeLixInner::LocalFilesystem(lix, storage))
 }
 
 #[napi]
@@ -799,25 +802,25 @@ impl NativeLix {
         })
     }
 
-    #[napi(js_name = "openSqlite")]
+    #[napi(js_name = "openSQLite")]
     pub fn open_sqlite(
         path: String,
         wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
-    ) -> AsyncTask<OpenSqliteTask> {
-        AsyncTask::new(OpenSqliteTask {
+    ) -> AsyncTask<OpenSQLiteTask> {
+        AsyncTask::new(OpenSQLiteTask {
             path,
             wasm_runtime_dispatch: Some(wasm_runtime_dispatch),
         })
     }
 
-    #[napi(js_name = "openFs")]
-    pub fn open_fs(
+    #[napi(js_name = "openLocalFilesystem")]
+    pub fn open_local_filesystem(
         path: String,
         lix_dir: Option<String>,
         sync_all_files: bool,
         wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
-    ) -> AsyncTask<OpenFsTask> {
-        AsyncTask::new(OpenFsTask {
+    ) -> AsyncTask<OpenLocalFilesystemTask> {
+        AsyncTask::new(OpenLocalFilesystemTask {
             path,
             lix_dir,
             sync_all_files,

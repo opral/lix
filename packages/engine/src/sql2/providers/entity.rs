@@ -41,7 +41,7 @@ use super::spec::{
     row_source,
 };
 use super::values::string_expr_literal;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
@@ -53,7 +53,7 @@ pub(crate) async fn register_entity_providers<S>(
     catalog: &PublicCatalog,
 ) -> Result<(), LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     for surface in catalog.surfaces() {
         match &surface.kind {

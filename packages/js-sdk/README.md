@@ -11,7 +11,7 @@ npm install @lix-js/sdk
 
 ## Usage
 
-The default in-memory backend works in browsers and Node.js:
+The default in-memory storage works in browsers and Node.js:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -22,13 +22,13 @@ console.log(result.rows[0]?.get("message"));
 await lix.close();
 ```
 
-Filesystem and SQLite backends use native Node.js dependencies:
+Filesystem sync and SQLite persistence use native Node.js dependencies:
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: "./workspace",
 		syncAllFiles: true,
 	}),
@@ -89,19 +89,19 @@ try {
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new FsBackend({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
-- Pass `new FsBackend({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
-- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `backend.importPaths(["notes/today.md"])` on the `FsBackend` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
-- Use `new SqliteBackend({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
+- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
+- Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
+- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
+- Use `new SQLite({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 - In browsers, `openLix()` loads the Rust engine as WebAssembly and uses the
-  in-memory backend.
-- `FsBackend` and `SqliteBackend` are Node.js-only. Constructing them is safe in
+  in-memory storage.
+- `LocalFilesystem` and `SQLite` are Node.js-only. Constructing them is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
 - The package uses conditional ESM imports internally: Node.js resolves the
   native N-API binding, while browsers and other runtimes resolve the portable
   WebAssembly binding. Vite follows this split without consumer configuration.
-- Every `openLix()` owns one dedicated worker. The engine, storage backend, and
+- Every `openLix()` owns one dedicated worker. The engine, storage, and
   installed WASM plugin components all run in that worker in both Node.js and
   browsers, so database and plugin work does not block the page's main thread.
 - Installed WASM plugin components are transpiled with JCO and executed by the

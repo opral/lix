@@ -15,7 +15,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         from_scope: "catalog",
         reason: "catalog is the semantic owner for public named relations and must not depend on lowering, orchestration, or sidecar owners",
         forbidden_scopes: &[
-            "backend",
+            "storage",
             "canonical",
             "api",
             "execution",
@@ -26,8 +26,8 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         ],
     },
     ForbiddenDependencyRule {
-        from_scope: "backend",
-        reason: "backend is a lower persistence owner; it owns raw prepared statement DTOs but must not grow dependencies on higher workflow or sidecar roots",
+        from_scope: "storage",
+        reason: "storage is a lower persistence owner; it owns raw prepared statement DTOs but must not grow dependencies on higher workflow or sidecar roots",
         forbidden_scopes: &["services"],
     },
     ForbiddenDependencyRule {
@@ -35,7 +35,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         reason: "services are leaf sidecar capabilities and may depend only on neutral foundations like common, not on engine composition or semantic owner roots",
         forbidden_scopes: &[
             "api",
-            "backend",
+            "storage",
             "canonical",
             "catalog",
             "diagnostics",
@@ -76,7 +76,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
 ];
 
-const TARGET_CORE_MODULES: &[&str] = &["backend", "live_state", "session", "sql2", "transaction"];
+const TARGET_CORE_MODULES: &[&str] = &["storage", "live_state", "session", "sql2", "transaction"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
@@ -110,7 +110,7 @@ struct RawSqlExecutionViolation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RawBackendTypeViolation {
+struct RawStorageTypeViolation {
     file: String,
     type_name: &'static str,
 }
@@ -1745,7 +1745,7 @@ fn render_grouped_raw_sql_execution_violations(violations: &[RawSqlExecutionViol
     rendered
 }
 
-fn render_grouped_raw_backend_type_violations(violations: &[RawBackendTypeViolation]) -> String {
+fn render_grouped_raw_storage_type_violations(violations: &[RawStorageTypeViolation]) -> String {
     let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
 
     for violation in violations {
@@ -2004,7 +2004,7 @@ fn contains_identifier(source: &str, identifier: &str) -> bool {
     false
 }
 
-fn current_engine_owned_persistence_raw_backend_type_violations() -> Vec<RawBackendTypeViolation> {
+fn current_engine_owned_persistence_raw_storage_type_violations() -> Vec<RawStorageTypeViolation> {
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
@@ -2014,12 +2014,12 @@ fn current_engine_owned_persistence_raw_backend_type_violations() -> Vec<RawBack
 
         let masked_source = mask_rust_source(&source);
         for type_name in [
-            "Backend",
-            "BackendReadTransaction",
-            "BackendWriteTransaction",
+            "Storage",
+            "StorageAdapterReadTransaction",
+            "StorageAdapterWriteTransaction",
         ] {
             if contains_identifier(&masked_source, type_name) {
-                violations.insert(RawBackendTypeViolation {
+                violations.insert(RawStorageTypeViolation {
                     file: relative_path.clone(),
                     type_name,
                 });
@@ -2040,7 +2040,7 @@ fn is_owner_sql_adapter_path(relative_path: &str) -> bool {
     relative_path.ends_with("/store_sql.rs") || relative_path.ends_with("/storage.rs")
 }
 
-fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportPathViolation> {
+fn current_owner_persistence_storage_root_dependency_violations() -> Vec<ImportPathViolation> {
     let module_set = top_level_module_set();
     let mut violations = BTreeSet::new();
 
@@ -2052,9 +2052,9 @@ fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportP
         }
 
         let masked_source = mask_rust_source(&source);
-        if !contains_identifier(&masked_source, "Backend")
-            && !contains_identifier(&masked_source, "BackendReadTransaction")
-            && !contains_identifier(&masked_source, "BackendWriteTransaction")
+        if !contains_identifier(&masked_source, "Storage")
+            && !contains_identifier(&masked_source, "StorageAdapterReadTransaction")
+            && !contains_identifier(&masked_source, "StorageAdapterWriteTransaction")
         {
             continue;
         }
@@ -2063,7 +2063,7 @@ fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportP
         for imported_path in
             collect_module_paths_from_source(&source, &current_module_path, &module_set)
         {
-            if imported_path.first().is_none_or(|root| root != "backend") {
+            if imported_path.first().is_none_or(|root| root != "storage") {
                 continue;
             }
 
@@ -2077,12 +2077,12 @@ fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportP
     violations.into_iter().collect()
 }
 
-fn current_backend_import_outside_storage_violations() -> Vec<ImportPathViolation> {
+fn current_storage_import_outside_storage_adapter_violations() -> Vec<ImportPathViolation> {
     let module_set = top_level_module_set();
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if relative_path.starts_with("backend/") || relative_path.starts_with("storage/") {
+        if relative_path.starts_with("storage/") || relative_path.starts_with("storage_adapter/") {
             continue;
         }
 
@@ -2090,7 +2090,7 @@ fn current_backend_import_outside_storage_violations() -> Vec<ImportPathViolatio
         for imported_path in
             collect_module_paths_from_source(&source, &current_module_path, &module_set)
         {
-            if imported_path.first().is_none_or(|root| root != "backend") {
+            if imported_path.first().is_none_or(|root| root != "storage") {
                 continue;
             }
 
@@ -2175,8 +2175,6 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
     is_owner_local_storage_path(relative_path)
         || relative_path.starts_with("sql/")
         || relative_path.starts_with("execution/")
-        || relative_path.starts_with("backend/")
-        || relative_path == "transaction/backend.rs"
         || relative_path == "transaction/buffered_write_transaction.rs"
         || relative_path == "transaction/live_state_write_transaction.rs"
 }
@@ -2192,12 +2190,9 @@ fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations()
 
         let masked_source = mask_rust_source(&source);
         for pattern in [
-            "backend.execute(",
             "transaction.execute(",
             "executor.execute(",
             "self.base.execute(",
-            "self.backend.execute(",
-            "self.backend_transaction.execute(",
         ] {
             if masked_source.contains(pattern) {
                 violations.insert(RawSqlExecutionViolation {
@@ -2570,7 +2565,7 @@ fn services_direct_children_do_not_import_sibling_services() {
 }
 
 // Engine-owned persistence modules should execute through owner-local adapters
-// rather than calling raw backend SQL directly.
+// rather than calling a SQL executor directly.
 #[test]
 fn engine_owned_persistence_modules_do_not_execute_raw_sql_directly() {
     let violations = current_engine_owned_persistence_raw_sql_execution_violations();
@@ -2583,38 +2578,38 @@ fn engine_owned_persistence_modules_do_not_execute_raw_sql_directly() {
 }
 
 // Engine-owned persistence modules should depend on owner-local store
-// interfaces rather than raw backend handle types.
+// interfaces rather than raw storage handle types.
 #[test]
-fn engine_owned_persistence_modules_do_not_import_raw_backend_types() {
-    let violations = current_engine_owned_persistence_raw_backend_type_violations();
+fn engine_owned_persistence_modules_do_not_import_raw_storage_types() {
+    let violations = current_engine_owned_persistence_raw_storage_type_violations();
 
     assert!(
         violations.is_empty(),
-        "engine-owned persistence modules must not depend on raw backend types outside owner-local adapter files.\n\nCurrent violations:\n{}",
-        render_grouped_raw_backend_type_violations(&violations),
+        "engine-owned persistence modules must not depend on raw storage types outside owner-local adapter files.\n\nCurrent violations:\n{}",
+        render_grouped_raw_storage_type_violations(&violations),
     );
 }
 
 // Owner persistence code should speak in owner-local store terms, not import
-// lower `backend/*` helpers directly outside SQL adapter files.
+// lower `storage/*` helpers directly outside SQL adapter files.
 #[test]
-fn owner_persistence_modules_do_not_depend_on_backend_root_outside_sql_adapters() {
-    let violations = current_owner_persistence_backend_root_dependency_violations();
+fn owner_persistence_modules_do_not_depend_on_storage_root_outside_sql_adapters() {
+    let violations = current_owner_persistence_storage_root_dependency_violations();
 
     assert!(
         violations.is_empty(),
-        "owner persistence modules must not depend on `backend/*` outside owner-local SQL adapter files.\n\nCurrent violations:\n{}",
+        "owner persistence modules must not depend on `storage/*` outside owner-local SQL adapter files.\n\nCurrent violations:\n{}",
         render_grouped_import_path_violations(&violations),
     );
 }
 
 #[test]
-fn backend_imports_are_limited_to_storage_boundary() {
-    let violations = current_backend_import_outside_storage_violations();
+fn storage_imports_are_limited_to_storage_adapter() {
+    let violations = current_storage_import_outside_storage_adapter_violations();
 
     assert!(
         violations.is_empty(),
-        "`backend/*` may only be imported by `storage/*`; other engine modules must depend on storage-facing APIs.\n\nCurrent violations:\n{}",
+        "`storage/*` may only be imported by `storage_adapter/*`; other engine modules must depend on adapter-facing APIs.\n\nCurrent violations:\n{}",
         render_grouped_import_path_violations(&violations),
     );
 }
@@ -2635,7 +2630,7 @@ fn store_sql_modules_are_not_imported_outside_their_owning_root() {
 // Owner persistence modules may perform work inside a caller-owned transaction,
 // but must not decide when transactions begin or end. Transaction lifecycle
 // policy belongs to session/runtime, while owner-local SQL adapters may still
-// contain low-level backend transaction calls during the MVP.
+// contain low-level storage transaction calls during the MVP.
 #[test]
 fn owner_persistence_modules_do_not_own_transaction_lifecycle() {
     let violations = current_owner_persistence_transaction_lifecycle_violations();
@@ -2648,12 +2643,12 @@ fn owner_persistence_modules_do_not_own_transaction_lifecycle() {
 }
 
 #[test]
-fn raw_backend_execute_is_only_used_in_owner_storage_or_public_sql_layers() {
+fn raw_sql_execute_is_only_used_in_owner_storage_or_public_sql_layers() {
     let violations = current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations();
 
     assert!(
         violations.is_empty(),
-        "raw backend / transaction SQL execution may only appear in owner-local `storage.rs`, `sql/*`, `execution/*`, or backend glue.\n\nCurrent violations:\n{}",
+        "raw SQL execution may only appear in owner-local `storage.rs`, `sql/*`, `execution/*`, or transaction glue.\n\nCurrent violations:\n{}",
         render_grouped_raw_sql_execution_violations(&violations),
     );
 }

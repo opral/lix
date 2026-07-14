@@ -8,7 +8,7 @@ use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest, MaterializedLiveStateIndexRow,
 };
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 /// Typed access to moving branch heads stored in live state.
 ///
@@ -27,7 +27,7 @@ impl BranchRefContext {
     #[expect(clippy::unused_self)]
     pub(super) fn reader<S>(&self, store: S) -> BranchRefStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         BranchRefStoreReader { store }
     }
@@ -36,14 +36,14 @@ impl BranchRefContext {
 /// Read side for branch heads.
 pub(super) struct BranchRefStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     store: S,
 }
 
 impl<S> BranchRefStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         let Some(row) = LiveStateIndexContext::new()
@@ -100,7 +100,7 @@ where
 #[async_trait::async_trait]
 impl<S> BranchRefReader for BranchRefStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Self::load_head(self, branch_id).await
@@ -150,14 +150,14 @@ mod tests {
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
     };
     use crate::live_state::{LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
     #[tokio::test]
     async fn load_head_returns_none_when_missing() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ref = test_branch_ref();
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_head_writes_global_current_ref() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ref = BranchRefContext::new();
 
         stage_branch_head(&storage, "branch-a", "commit-a", "2026-01-01T00:00:00Z")
@@ -216,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_heads_returns_sorted_branch_heads() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ref = test_branch_ref();
 
         stage_branch_head(&storage, "branch-b", "commit-b", "2026-01-01T00:00:00Z")
@@ -256,7 +256,7 @@ mod tests {
     }
 
     async fn stage_branch_head(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         branch_id: &str,
         commit_id: &str,
         timestamp: &str,

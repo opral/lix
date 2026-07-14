@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobPayload, BlobWriteReceipt};
-use crate::storage::{StorageRead, StorageWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use std::collections::HashSet;
 
 #[async_trait]
@@ -14,7 +14,7 @@ pub(crate) trait BlobDataReader: Send + Sync {
 /// Long-lived Binary CAS context factory.
 ///
 /// The context does not own storage. Callers explicitly provide a KV store via
-/// `reader(...)` or `writer(...)`, keeping backend and transaction ownership at
+/// `reader(...)` or `writer(...)`, keeping storage and transaction ownership at
 /// the execution layer.
 pub(crate) struct BinaryCasContext {
     chunking: BinaryCasChunking,
@@ -34,7 +34,7 @@ impl BinaryCasContext {
     #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         BinaryCasStoreReader { store }
     }
@@ -50,7 +50,7 @@ impl BinaryCasContext {
         writes: &'a mut StorageWriteSet,
     ) -> ExistingChunkAwareBinaryCasWriter<'a, S>
     where
-        S: StorageRead + ?Sized,
+        S: StorageAdapterRead + ?Sized,
     {
         ExistingChunkAwareBinaryCasWriter::new(store, writes, self.chunking)
     }
@@ -59,7 +59,7 @@ impl BinaryCasContext {
 #[async_trait]
 impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
-    S: StorageRead + Clone + Send + Sync,
+    S: StorageAdapterRead + Clone + Send + Sync,
 {
     async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         let mut reader = Self {
@@ -76,7 +76,7 @@ pub(crate) struct BinaryCasStoreReader<S> {
 
 impl<S> BinaryCasStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn load_bytes_many(
@@ -103,7 +103,7 @@ pub(crate) struct BinaryCasWriter<'a> {
 /// in the backing store.
 pub(crate) struct ExistingChunkAwareBinaryCasWriter<'a, S>
 where
-    S: StorageRead + ?Sized,
+    S: StorageAdapterRead + ?Sized,
 {
     store: &'a S,
     writes: &'a mut StorageWriteSet,
@@ -152,7 +152,7 @@ impl<'a> BinaryCasWriter<'a> {
 
 impl<'a, S> ExistingChunkAwareBinaryCasWriter<'a, S>
 where
-    S: StorageRead + ?Sized,
+    S: StorageAdapterRead + ?Sized,
 {
     fn new(store: &'a S, writes: &'a mut StorageWriteSet, chunking: BinaryCasChunking) -> Self {
         Self {

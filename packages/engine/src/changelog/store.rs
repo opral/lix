@@ -6,7 +6,7 @@ use super::types::{
 #[cfg(feature = "storage-benches")]
 use super::types::{GcPlan, GcRoot};
 use crate::common::LixError;
-use crate::storage::{StorageSpace, StorageSpaceId};
+use crate::storage_adapter::{StorageSpace, StorageSpaceId};
 use async_trait::async_trait;
 
 pub(crate) const COMMIT_NAMESPACE: &str = "changelog.commit";

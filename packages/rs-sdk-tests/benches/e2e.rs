@@ -1,7 +1,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lix_sdk::{
-    Backend, InMemoryBackend, LixError, OpenLixOptions, SqliteBackend, Value,
-    WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, open_lix,
+    LixError, Memory, OpenLixOptions, SQLite, Storage, Value, WasmPluginDetectedChange,
+    WasmPluginEntityState, WasmPluginFile, open_lix,
 };
 use plugin_csv::exports::lix::plugin::api::EntityState as CsvEntityState;
 use plugin_csv::exports::lix::plugin::api::Guest as _;
@@ -367,12 +367,12 @@ fn bench_e2e(c: &mut Criterion) {
 }
 
 enum BenchLix {
-    Sqlite {
-        lix: lix_sdk::Lix<SqliteBackend>,
+    SQLite {
+        lix: lix_sdk::Lix<SQLite>,
         _temp_dir: TempDir,
     },
     InMemory {
-        lix: lix_sdk::Lix<InMemoryBackend>,
+        lix: lix_sdk::Lix<Memory>,
     },
 }
 
@@ -383,7 +383,7 @@ impl BenchLix {
         params: &[Value],
     ) -> Result<lix_sdk::ExecuteResult, LixError> {
         match self {
-            Self::Sqlite { lix, .. } => lix.execute(sql, params).await,
+            Self::SQLite { lix, .. } => lix.execute(sql, params).await,
             Self::InMemory { lix } => lix.execute(sql, params).await,
         }
     }
@@ -413,7 +413,7 @@ impl BenchLix {
 
     async fn close(&self) -> Result<(), LixError> {
         match self {
-            Self::Sqlite { lix, .. } => lix.close().await,
+            Self::SQLite { lix, .. } => lix.close().await,
             Self::InMemory { lix } => lix.close().await,
         }
     }
@@ -499,14 +499,14 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
     let temp_dir = tempfile::tempdir().expect("failed to create sqlite bench tempdir");
     let path = temp_dir.path().join("bench.lix");
     let lix = open_lix(OpenLixOptions::new(
-        SqliteBackend::open(path).expect("failed to open sqlite bench backend"),
+        SQLite::open(path).expect("failed to open sqlite bench storage"),
     ))
     .await
     .unwrap();
 
     install_plugin(&lix, "plugin_csv", plugin).await.unwrap();
 
-    BenchLix::Sqlite {
+    BenchLix::SQLite {
         lix,
         _temp_dir: temp_dir,
     }
@@ -520,9 +520,13 @@ async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
     BenchLix::InMemory { lix }
 }
 
-async fn install_plugin<B>(lix: &lix_sdk::Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
+async fn install_plugin<StorageImpl>(
+    lix: &lix_sdk::Lix<StorageImpl>,
+    key: &str,
+    archive: &[u8],
+) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \

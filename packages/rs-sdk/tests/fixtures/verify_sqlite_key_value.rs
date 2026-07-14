@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use lix_sdk::{SqliteBackend, Value, open_lix_with_backend};
+use lix_sdk::{SQLite, Value, open_lix_with_storage};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -19,10 +19,9 @@ async fn main() {
         .and_then(|value| value.into_string().ok())
         .expect("usage: verify_sqlite_key_value <path> <key> <value>");
 
-    let lix =
-        open_lix_with_backend(SqliteBackend::open(&path).expect("sqlite backend should open"))
-            .await
-            .expect("lix should open on sqlite backend");
+    let lix = open_lix_with_storage(SQLite::open(&path).expect("sqlite storage should open"))
+        .await
+        .expect("lix should open on sqlite storage");
     let result = lix
         .execute(
             "SELECT value FROM lix_key_value WHERE key = $1",

@@ -16,7 +16,7 @@ use crate::changelog::{
     CommitLoadRequest, CommitProjection, CommitRecord,
 };
 use crate::entity_pk::EntityPk;
-use crate::storage::{StorageRead, StorageWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{
     TrackedStateDiff, TrackedStateDiffRequest, TrackedStateDiffRow, diff_commits,
@@ -62,7 +62,7 @@ impl TrackedStateContext {
     /// Creates a commit-id-addressed tracked-state reader.
     pub(crate) fn reader<S>(&self, store: S) -> TrackedStateStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         TrackedStateStoreReader {
             store,
@@ -77,7 +77,7 @@ impl TrackedStateContext {
         writes: &'a mut StorageWriteSet,
     ) -> TrackedStateWriter<'a, S>
     where
-        S: StorageRead + ?Sized,
+        S: StorageAdapterRead + ?Sized,
     {
         TrackedStateWriter {
             chunk_overlay: storage::TrackedStateChunkOverlay::new(),
@@ -98,7 +98,7 @@ impl TrackedStateContext {
         writes: &'a mut StorageWriteSet,
     ) -> TrackedStateRootRebuilder<'a, S>
     where
-        S: StorageRead + ?Sized,
+        S: StorageAdapterRead + ?Sized,
     {
         let _ = self;
         TrackedStateRootRebuilder { store, writes }
@@ -133,7 +133,7 @@ impl DiffCommitRootValidationCache {
 
 impl<S> TrackedStateStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     pub(crate) async fn scan_rows_at_commit(
         &mut self,
@@ -883,7 +883,7 @@ pub(crate) struct TrackedStateRootRebuilder<'a, S: ?Sized> {
 
 impl<S> TrackedStateRootRebuilder<'_, S>
 where
-    S: StorageRead + ?Sized,
+    S: StorageAdapterRead + ?Sized,
 {
     pub(crate) async fn rebuild_commit_root_at(
         &mut self,
@@ -895,7 +895,7 @@ where
 
 impl<S> TrackedStateWriter<'_, S>
 where
-    S: StorageRead + ?Sized,
+    S: StorageAdapterRead + ?Sized,
 {
     pub(crate) async fn stage_commit_root<'a, I>(
         &mut self,
@@ -1164,11 +1164,11 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
-    fn commit_root_key(label: &str) -> crate::storage::StorageKey {
-        crate::storage::StorageKey(bytes::Bytes::copy_from_slice(
+    fn commit_root_key(label: &str) -> crate::storage_adapter::StorageKey {
+        crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
             CommitId::for_test_label(label).as_uuid().as_bytes(),
         ))
     }
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_commit_root_requires_parent_commit_root() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         {
             let mut read = storage
@@ -1214,7 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_commit_root_writes_commit_root_metadata() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_repairs_missing_child_root_from_nearest_parent() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_allows_repaired_root_with_rebuilt_ancestor_chain() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -1575,7 +1575,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_repairs_missing_ancestor_chain() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -1661,7 +1661,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_errors_on_first_parent_cycle() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         {
             let mut read = storage
@@ -1707,7 +1707,7 @@ mod tests {
             let commit_b = CommitId::for_test_label("commit-b");
             writes.put(
                 crate::changelog::COMMIT_SPACE,
-                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(
+                crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_repairs_missing_head_root_chunk() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -1821,7 +1821,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_repairs_corrupt_head_root_chunk() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -1881,7 +1881,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_repairs_stale_root_missing_commit_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let row = row_with_value("entity-a", "change-a", "commit-1", "value");
         write_root_for_test(
@@ -1940,7 +1940,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rebuild_repairs_stale_root_missing_inherited_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let inherited = row_with_value("entity-a", "change-base", "base", "base");
         let child = row_with_value("entity-b", "change-child", "child", "child");
@@ -2000,7 +2000,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_filters_by_file() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut file_a = row("entity-a", "change-a", "commit-1");
         file_a.file_id = Some("file-a.json".to_string());
@@ -2049,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_filtered_header_scan_fetches_primary_payload_only_when_requested() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut row = row("entity-a", "change-a", "commit-1");
         row.file_id = Some("file-a.json".to_string());
@@ -2106,7 +2106,7 @@ mod tests {
 
     #[tokio::test]
     async fn null_file_rows_match_null_file_filter() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let row = row("entity-a", "change-a", "commit-1");
         write_root_for_test(
@@ -2152,7 +2152,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_null_and_concrete_file_scan_uses_primary_tree() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let null_row = row("entity-null", "change-null", "commit-1");
         let mut file_row = row("entity-file", "change-file", "commit-2");
@@ -2210,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_filtered_header_scan_filters_tombstones_without_payload_sentinel() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut live = row("entity-live", "change-live", "commit-1");
         live.file_id = Some("file-a.json".to_string());
@@ -2255,7 +2255,7 @@ mod tests {
 
     #[tokio::test]
     async fn child_root_tombstone_hides_materialized_base_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let base = row("entity-a", "change-base", "base");
         let delete = tombstone("entity-a", "change-delete", "child");
@@ -2308,7 +2308,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_scan_keeps_last_mutation_for_duplicate_key() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -2359,7 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_limit_applies_after_tombstone_visibility() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
             &storage,
@@ -2407,7 +2407,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_filtered_scan_limit_applies_after_tombstone_visibility() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut deleted = tombstone("entity-a", "change-delete", "commit-1");
         deleted.file_id = Some("file-a.json".to_string());
@@ -2452,7 +2452,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_resolve_large_payload_refs_via_change_records() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
@@ -2497,7 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_change_record_for_live_row_errors_clearly() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let row = row("entity-a", "change-a", "commit-1");
         write_root_for_test(
@@ -2515,7 +2515,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         writes.delete(
             crate::changelog::CHANGE_SPACE,
-            crate::storage::StorageKey(bytes::Bytes::from(crate::changelog::change_key(
+            crate::storage_adapter::StorageKey(bytes::Bytes::from(crate::changelog::change_key(
                 row.change_id,
             ))),
         );
@@ -2542,7 +2542,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_rows_materialize_key_derived_snapshots() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let row = row("entity-a", "change-a", "commit-1");
         write_root_for_test(
@@ -2597,7 +2597,7 @@ mod tests {
     async fn inline_threshold_boundary_routes_payloads_deterministically() {
         // 256 bytes inlines into the change record; 257 takes the
         // json_store ref path. Both must read back identically.
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         // row_with_value wraps values as {"value":"<v>"} (12 framing bytes);
         // size the inner strings so the stored payloads land exactly at the
@@ -2646,7 +2646,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_root_cache_uses_seen_updated_at_not_change_created_at() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut row = row("entity-a", "change-a", "commit-1");
         row.created_at = "2026-01-01T00:00:00Z".to_string();
@@ -2688,7 +2688,7 @@ mod tests {
 
     #[tokio::test]
     async fn updates_preserve_first_visible_created_at_across_rebuild() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut parent = row("entity-a", "change-parent", "parent");
         parent.created_at = "2026-01-01T00:00:00Z".to_string();
@@ -2784,7 +2784,7 @@ mod tests {
 
     #[tokio::test]
     async fn selected_column_scans_do_not_materialize_snapshot_when_snapshot_content_is_omitted() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
@@ -2829,8 +2829,8 @@ mod tests {
         base_rows: &[MaterializedTrackedStateRow],
         target_rows: &[MaterializedTrackedStateRow],
         source_rows: &[MaterializedTrackedStateRow],
-    ) -> (StorageContext, TrackedStateContext) {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+    ) -> (StorageAdapter, TrackedStateContext) {
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(&storage, &tracked_state, "base", None, base_rows)
             .await
@@ -2883,7 +2883,7 @@ mod tests {
     }
 
     async fn write_root_for_test(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
@@ -2909,7 +2909,7 @@ mod tests {
         Ok(())
     }
 
-    async fn delete_root_chunk_for_test(storage: &StorageContext, commit_id: &str) {
+    async fn delete_root_chunk_for_test(storage: &StorageAdapter, commit_id: &str) {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -2921,7 +2921,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         writes.delete(
             storage::TRACKED_STATE_TREE_CHUNK_SPACE,
-            crate::storage::StorageKey(bytes::Bytes::copy_from_slice(root_id.as_bytes())),
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(root_id.as_bytes())),
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2929,7 +2929,7 @@ mod tests {
             .expect("root chunk delete should commit");
     }
 
-    async fn corrupt_root_chunk_for_test(storage: &StorageContext, commit_id: &str) {
+    async fn corrupt_root_chunk_for_test(storage: &StorageAdapter, commit_id: &str) {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -2941,7 +2941,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         writes.put(
             storage::TRACKED_STATE_TREE_CHUNK_SPACE,
-            crate::storage::StorageKey(bytes::Bytes::copy_from_slice(root_id.as_bytes())),
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(root_id.as_bytes())),
             b"corrupt tracked-state root chunk".as_slice(),
         );
         storage
@@ -2951,7 +2951,7 @@ mod tests {
     }
 
     async fn overwrite_root_without_commit_row_for_test(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         commit_id: &str,
         rows: &[MaterializedTrackedStateRow],
     ) {

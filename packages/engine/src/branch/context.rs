@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::BranchRefReader;
 use super::refs::BranchRefContext;
@@ -24,7 +24,7 @@ impl BranchContext {
     /// Creates a branch-ref reader over a caller-provided KV store.
     pub(crate) fn ref_reader<S>(&self, store: S) -> impl BranchRefReader + use<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         self.refs.reader(store)
     }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use lix_sdk::SqliteBackend;
+use lix_sdk::SQLite;
 
 fn main() {
     let path = std::env::args_os()
@@ -8,8 +8,8 @@ fn main() {
         .map(PathBuf::from)
         .expect("usage: create_sqlite_fixture <path>");
 
-    let backend = SqliteBackend::open(&path).expect("sqlite backend should create fixture");
-    backend
+    let storage = SQLite::open(&path).expect("sqlite storage should create fixture");
+    storage
         .checkpoint()
-        .expect("sqlite backend fixture should checkpoint");
+        .expect("sqlite storage fixture should checkpoint");
 }

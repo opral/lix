@@ -17,7 +17,7 @@ use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
 };
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest,
@@ -60,7 +60,7 @@ impl LiveStateContext {
     /// Creates a visible live-state reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> LiveStateStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         LiveStateStoreReader {
             store,
@@ -87,7 +87,7 @@ pub(crate) struct LiveStateStoreReader<S> {
 
 impl<S> LiveStateStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     pub(crate) async fn scan_rows(
         &self,
@@ -226,7 +226,7 @@ where
 #[async_trait]
 impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     async fn scan_rows(
         &self,
@@ -253,7 +253,7 @@ where
 #[async_trait]
 impl<S> FilesystemPathIndexReader for LiveStateStoreReader<S>
 where
-    S: StorageRead + Send + Sync,
+    S: StorageAdapterRead + Send + Sync,
 {
     async fn path_index(
         &self,
@@ -274,7 +274,7 @@ where
 }
 
 async fn scan_commit_derived_rows(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     commit_graph: &CommitGraphContext,
     request: &LiveStateScanRequest,
     scope: &LiveStateScanScope,
@@ -460,7 +460,7 @@ struct LiveStateScanScope {
 }
 
 async fn scan_scope(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     live_index: &LiveStateIndexContext,
     request: &LiveStateScanRequest,
     resolve_branch_heads: bool,
@@ -521,7 +521,7 @@ async fn scan_scope(
 }
 
 async fn load_branch_ref_commit_ids(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     live_index: &LiveStateIndexContext,
     branch_ids: &[String],
 ) -> Result<BranchCommitIds, LixError> {
@@ -549,14 +549,14 @@ async fn load_branch_ref_commit_ids(
 }
 
 async fn all_branch_ref_ids(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     live_index: &LiveStateIndexContext,
 ) -> Result<Vec<String>, LixError> {
     load_branch_ref_ids(store, live_index, &[]).await
 }
 
 async fn load_branch_ref_ids(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     live_index: &LiveStateIndexContext,
     branch_ids: &[String],
 ) -> Result<Vec<String>, LixError> {
@@ -640,8 +640,8 @@ mod tests {
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::LiveStateFilter;
     use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::storage::{StorageContext, StorageWriteSet};
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
     use serde_json::json;
 
@@ -677,8 +677,8 @@ mod tests {
     }
 
     async fn write_untracked_rows_to_store(
-        storage: &StorageContext,
-        _read: &(impl StorageRead + ?Sized),
+        storage: &StorageAdapter,
+        _read: &(impl StorageAdapterRead + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let read = storage
@@ -778,8 +778,8 @@ mod tests {
     }
 
     async fn write_empty_commits_to_store(
-        storage: &StorageContext,
-        read: &impl StorageRead,
+        storage: &StorageAdapter,
+        read: &impl StorageAdapterRead,
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
@@ -837,7 +837,7 @@ mod tests {
     }
 
     async fn stage_materialized_live_rows(
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         writes: &mut StorageWriteSet,
         json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
@@ -1034,7 +1034,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_state_serves_untracked_change_from_flat_index() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_row_is_visible_from_commit_root() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1139,7 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_branch() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_sees_global_row_by_reading_global_root_separately() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_prefers_requested_branch_over_global() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1308,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_override_hides_global_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_overlays_requested_branch_over_global() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1415,7 +1415,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_projects_global_row_into_requested_branch() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1466,7 +1466,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_does_not_project_global_rows_into_missing_branch() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1511,7 +1511,7 @@ mod tests {
 
     #[tokio::test]
     async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1564,7 +1564,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_tombstone_hides_global_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
         let read = storage
@@ -1618,7 +1618,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_allows_commit_fact_to_share_the_touched_branch_commit_id() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -1666,7 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_uses_first_parent_as_merge_root_base() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_global_root_does_not_store_global_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -1776,7 +1776,7 @@ mod tests {
 
     async fn load_selected_tab(
         live_state: &LiveStateContext,
-        storage: &StorageContext,
+        storage: &StorageAdapter,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
             .reader(
@@ -1796,7 +1796,7 @@ mod tests {
 
     async fn load_selected_tab_at(
         live_state: &LiveStateContext,
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         branch_id: &str,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
@@ -1817,7 +1817,7 @@ mod tests {
 
     async fn scan_selected_tab_at(
         live_state: &LiveStateContext,
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         branch_id: &str,
         include_tombstones: bool,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
@@ -1844,7 +1844,7 @@ mod tests {
 
     async fn scan_tracked_root(
         tracked_state: &TrackedStateContext,
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         commit_id: &str,
     ) -> Vec<MaterializedTrackedStateRow> {
         tracked_state

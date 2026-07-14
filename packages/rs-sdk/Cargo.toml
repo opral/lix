@@ -17,9 +17,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-lix_backends = { workspace = true, optional = true }
 lix_engine = { workspace = true }
-lix_fs_backend = { workspace = true, optional = true }
+lix_local_filesystem = { workspace = true, optional = true }
+lix_sqlite_storage = { workspace = true, optional = true }
 
 async-trait = "0.1"
 bytes = "1"
@@ -41,8 +41,8 @@ zip = { version = "8", default-features = false }
 [features]
 default = ["default_wasm_runtime"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
-fs_backend = ["dep:lix_fs_backend", "lix_fs_backend/rocksdb"]
-sqlite = ["dep:lix_backends", "lix_backends/sqlite", "dep:rusqlite", "dep:tempfile"]
+local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
+sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
 
 [[example]]
 name = "create_sqlite_fixture"
@@ -68,10 +68,10 @@ required-features = ["sqlite"]
 [[example]]
 name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
-required-features = ["fs_backend"]
+required-features = ["local_filesystem"]
 
 [[bench]]
-name = "sqlite_backend"
-path = "benches/sqlite_backend.rs"
+name = "sqlite"
+path = "benches/sqlite.rs"
 harness = false
 required-features = ["sqlite"]

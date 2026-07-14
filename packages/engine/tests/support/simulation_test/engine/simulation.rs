@@ -1,4 +1,4 @@
-use lix_engine::backend::InMemoryBackend;
+use lix_engine::storage::Memory;
 use lix_engine::{
     CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InitReceipt,
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
@@ -18,7 +18,7 @@ use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 )]
 pub struct Simulation {
     mode: SimulationMode,
-    backend: InMemoryBackend,
+    storage: Memory,
     engine: Engine,
     receipt: InitReceipt,
     rebuild_tracked_state: RebuildTrackedStateSimulation,
@@ -33,18 +33,18 @@ impl Simulation {
     pub(super) async fn from_bootstrap(
         mode: SimulationMode,
         options: SimulationOptions,
-        backend: InMemoryBackend,
+        storage: Memory,
         receipt: InitReceipt,
         assertions: SimulationAssertions,
     ) -> Result<Self, LixError> {
-        let engine = Engine::new(backend.clone()).await?;
+        let engine = Engine::new(storage.clone()).await?;
         if options.deterministic {
             super::macro_runtime::enable_deterministic_mode(&engine, &receipt, mode).await?;
         }
         assertions.start_mode(mode);
         Ok(Self {
             mode,
-            backend,
+            storage,
             engine,
             receipt,
             rebuild_tracked_state: RebuildTrackedStateSimulation::new(mode),
@@ -57,13 +57,13 @@ impl Simulation {
         self.engine.clone()
     }
 
-    /// Boots a fresh engine from the current backend snapshot.
+    /// Boots a fresh engine from the current storage snapshot.
     ///
     /// This is the simulation equivalent of closing the app and reopening the
     /// same repository. It lets tests distinguish persisted workspace state
     /// from in-memory session state.
     pub async fn reboot_engine_from_current_snapshot(&self) -> Result<Engine, LixError> {
-        Engine::new(self.backend.clone()).await
+        Engine::new(self.storage.clone()).await
     }
 
     /// Wraps a normal engine session with simulation hooks.
@@ -76,10 +76,10 @@ impl Simulation {
         }
     }
 
-    /// Returns a fresh, empty backend for lifecycle tests.
+    /// Returns a fresh, empty storage for lifecycle tests.
     #[expect(clippy::unused_self)]
-    pub fn uninitialized_backend(&self) -> InMemoryBackend {
-        InMemoryBackend::new()
+    pub fn uninitialized_storage(&self) -> Memory {
+        Memory::new()
     }
 
     /// Returns the initialized Lix id.

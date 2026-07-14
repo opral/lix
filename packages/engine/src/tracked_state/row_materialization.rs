@@ -5,7 +5,7 @@ use crate::changelog::{
     ChangeId, ChangeRecordProjection, MaterializedChangePayload, materialize_change_payloads,
 };
 use crate::entity_pk::EntityPk;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
 
@@ -23,7 +23,7 @@ pub(crate) async fn materialize_rows_from_index_entries<S>(
     materialization: &ChangeRecordProjection,
 ) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     if !materialization.snapshot_content && !materialization.metadata {
         return Ok(entries

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::observe_coordinator::{ObserveQueryKey, ObserveQueryState, ObserveSessionScope};
-use crate::storage::InMemoryStorageBackend;
-use crate::storage::StorageBackend;
+use crate::storage_adapter::Memory;
+use crate::storage_adapter::Storage;
 use crate::{ExecuteResult, LixError, Value, sql2};
 
 use super::{SessionContext, SessionMode};
@@ -38,11 +38,11 @@ pub struct ObserveEvent {
 }
 
 #[expect(missing_debug_implementations)]
-pub struct ObserveEvents<B = InMemoryStorageBackend>
+pub struct ObserveEvents<StorageImpl = Memory>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    session: SessionContext<B>,
+    session: SessionContext<StorageImpl>,
     query: ObserveQuery,
     receiver: watch::Receiver<u64>,
     sequence: u64,
@@ -50,9 +50,9 @@ where
     closed: bool,
 }
 
-impl<B> ObserveEvents<B>
+impl<StorageImpl> ObserveEvents<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
         if self.closed || self.session.is_closed() {
@@ -158,20 +158,24 @@ where
     }
 }
 
-impl<B> Drop for ObserveEvents<B>
+impl<StorageImpl> Drop for ObserveEvents<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub fn observe(&self, sql: &str, params: &[Value]) -> Result<ObserveEvents<B>, LixError> {
+    pub fn observe(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ObserveEvents<StorageImpl>, LixError> {
         self.ensure_observe_registration_allowed()?;
         if sql.trim().is_empty() {
             return Err(LixError::new(

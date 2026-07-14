@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::LixError;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphStoreReader, ReachableCommitGraphCommit};
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 /// Walks parent links from `head_commit_id` and returns reachable commits
 /// nearest-first.
@@ -18,7 +18,7 @@ pub(crate) async fn walk_reachable_commits<S>(
     head_commit_id: &CommitId,
 ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let mut loader = CommitTraversalLoader::new(reader);
     let mut visiting = BTreeSet::new();
@@ -70,7 +70,7 @@ pub(crate) async fn best_common_ancestors<S>(
     right_commit_id: &CommitId,
 ) -> Result<Vec<CommitGraphCommit>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let left_reachable = walk_reachable_commits(reader, left_commit_id).await?;
     let right_reachable = walk_reachable_commits(reader, right_commit_id).await?;
@@ -107,7 +107,7 @@ async fn has_descendant_in_set<S>(
     candidate_descendant_ids: &BTreeSet<CommitId>,
 ) -> Result<bool, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     for candidate_descendant_id in candidate_descendant_ids {
         if candidate_descendant_id == commit_id {
@@ -126,7 +126,7 @@ where
 
 struct CommitTraversalLoader<'a, S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     reader: &'a mut CommitGraphStoreReader<S>,
     loaded: BTreeMap<CommitId, CommitGraphCommit>,
@@ -134,7 +134,7 @@ where
 
 impl<'a, S> CommitTraversalLoader<'a, S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     fn new(reader: &'a mut CommitGraphStoreReader<S>) -> Self {
         Self {
@@ -230,8 +230,8 @@ mod tests {
     };
     use crate::commit_graph::CommitGraphChange;
     use crate::commit_graph::CommitGraphContext;
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -263,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_returns_commits_nearest_first() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -306,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_errors_on_missing_parent_commit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let error = append_changes_result(
             &storage,
             &[commit_change(
@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_errors_on_cycle() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -355,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_dedupes_shared_ancestors_in_diamond() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -401,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_keeps_nearest_depth_for_multiple_paths() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -449,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_orders_same_depth_commits_by_id() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -490,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_errors_on_missing_head_commit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -509,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_nearest_common_commit_in_simple_graph() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -545,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_shared_fork_in_diamond_graph() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -592,7 +592,7 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_parent_when_one_side_is_ancestor() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -627,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_multiple_bases_for_criss_cross_graph() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -674,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_base_returns_single_best_common_ancestor() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -704,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_base_errors_when_histories_have_no_common_commit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -732,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_base_errors_when_best_common_ancestor_is_ambiguous() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -803,14 +803,14 @@ mod tests {
         parent_commit_ids: Vec<CommitId>,
     }
 
-    async fn append_changes(storage: &StorageContext, changes: &[TestCommitChange]) {
+    async fn append_changes(storage: &StorageAdapter, changes: &[TestCommitChange]) {
         append_changes_result(storage, changes)
             .await
             .expect("changelog fixture should append");
     }
 
     async fn append_changes_result(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         changes: &[TestCommitChange],
     ) -> Result<(), LixError> {
         let mut read = storage

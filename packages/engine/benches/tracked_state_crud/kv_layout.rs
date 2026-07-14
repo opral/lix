@@ -1,12 +1,12 @@
 use bytes::Bytes;
-use lix_engine::storage::{
-    PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions,
+use lix_engine::storage_adapter::{
+    PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions, StorageWriteSetStats,
 };
-use lix_engine::{Backend, Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId};
+use lix_engine::{Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, Storage};
 
-use crate::backends::{BackendProfile, ProfileBackend, RedbBackend, RocksDbBackend, SqliteBackend};
+use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};
 
 const ROW_SPACE: StorageSpace =
@@ -20,9 +20,8 @@ struct BenchRow {
 }
 
 enum ProfileStorage {
-    Sqlite(StorageContext<SqliteBackend>),
-    RocksDb(StorageContext<RocksDbBackend>),
-    Redb(StorageContext<RedbBackend>),
+    SQLite(StorageAdapter<SQLite>),
+    RocksDB(StorageAdapter<RocksDB>),
 }
 
 pub(crate) struct KvFixture {
@@ -36,7 +35,7 @@ pub(crate) struct KvWriteAccounting {
     pub(crate) staged_deletes: u64,
     pub(crate) range_deletes: u64,
     pub(crate) touched_spaces: u64,
-    pub(crate) backend_calls: u64,
+    pub(crate) storage_calls: u64,
     pub(crate) put_batches: u64,
     pub(crate) delete_batches: u64,
     pub(crate) written_bytes: u64,
@@ -64,7 +63,7 @@ impl KvWriteOutcome {
             staged_deletes: self.stats.staged_deletes,
             range_deletes: self.range_deletes,
             touched_spaces: self.stats.touched_spaces,
-            backend_calls: self.stats.backend_calls,
+            storage_calls: self.stats.storage_calls,
             put_batches: self.stats.put_batches,
             delete_batches: self.stats.delete_batches,
             written_bytes: self.stats.written_bytes,
@@ -72,7 +71,7 @@ impl KvWriteOutcome {
     }
 }
 
-pub(crate) async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
+pub(crate) async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> KvFixture {
     let rows = bench_rows(rows);
     KvFixture {
         storage: profile_storage(profile),
@@ -80,7 +79,7 @@ pub(crate) async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow])
     }
 }
 
-pub(crate) async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
+pub(crate) async fn seeded_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> KvFixture {
     let fixture = empty_fixture(profile, rows).await;
     fixture.storage.insert_all(&fixture.rows).await;
     fixture
@@ -161,66 +160,60 @@ impl KvFixture {
 impl ProfileStorage {
     async fn insert_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => insert_all_storage(storage, rows).await,
-            Self::RocksDb(storage) => insert_all_storage(storage, rows).await,
-            Self::Redb(storage) => insert_all_storage(storage, rows).await,
+            Self::SQLite(storage) => insert_all_storage(storage, rows).await,
+            Self::RocksDB(storage) => insert_all_storage(storage, rows).await,
         }
     }
 
     async fn update_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => update_all_storage(storage, rows).await,
-            Self::RocksDb(storage) => update_all_storage(storage, rows).await,
-            Self::Redb(storage) => update_all_storage(storage, rows).await,
+            Self::SQLite(storage) => update_all_storage(storage, rows).await,
+            Self::RocksDB(storage) => update_all_storage(storage, rows).await,
         }
     }
 
     async fn delete_all(&self, row_count: usize) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => delete_all_storage(storage, row_count).await,
-            Self::RocksDb(storage) => delete_all_storage(storage, row_count).await,
-            Self::Redb(storage) => delete_all_storage(storage, row_count).await,
+            Self::SQLite(storage) => delete_all_storage(storage, row_count).await,
+            Self::RocksDB(storage) => delete_all_storage(storage, row_count).await,
         }
     }
 
     async fn delete_one(&self, row: &BenchRow) -> KvWriteOutcome {
         match self {
-            Self::Sqlite(storage) => delete_one_storage(storage, row).await,
-            Self::RocksDb(storage) => delete_one_storage(storage, row).await,
-            Self::Redb(storage) => delete_one_storage(storage, row).await,
+            Self::SQLite(storage) => delete_one_storage(storage, row).await,
+            Self::RocksDB(storage) => delete_one_storage(storage, row).await,
         }
     }
 
     async fn read_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
         match self {
-            Self::Sqlite(storage) => read_all_storage(storage, expected_rows, projection).await,
-            Self::RocksDb(storage) => read_all_storage(storage, expected_rows, projection).await,
-            Self::Redb(storage) => read_all_storage(storage, expected_rows, projection).await,
+            Self::SQLite(storage) => read_all_storage(storage, expected_rows, projection).await,
+            Self::RocksDB(storage) => read_all_storage(storage, expected_rows, projection).await,
         }
     }
 
     async fn read_points(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::Sqlite(storage) => read_points_storage(storage, rows).await,
-            Self::RocksDb(storage) => read_points_storage(storage, rows).await,
-            Self::Redb(storage) => read_points_storage(storage, rows).await,
+            Self::SQLite(storage) => read_points_storage(storage, rows).await,
+            Self::RocksDB(storage) => read_points_storage(storage, rows).await,
         }
     }
 
     async fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
         match self {
-            Self::Sqlite(storage) => layout_accounting_storage(storage).await,
-            Self::RocksDb(storage) => layout_accounting_storage(storage).await,
-            Self::Redb(storage) => layout_accounting_storage(storage).await,
+            Self::SQLite(storage) => layout_accounting_storage(storage).await,
+            Self::RocksDB(storage) => layout_accounting_storage(storage).await,
         }
     }
 }
 
-fn profile_storage(profile: BackendProfile) -> ProfileStorage {
-    match profile.backend() {
-        ProfileBackend::Sqlite(backend) => ProfileStorage::Sqlite(StorageContext::new(backend)),
-        ProfileBackend::RocksDb(backend) => ProfileStorage::RocksDb(StorageContext::new(backend)),
-        ProfileBackend::Redb(backend) => ProfileStorage::Redb(StorageContext::new(backend)),
+fn profile_storage(profile: StorageProfile) -> ProfileStorage {
+    match profile.storage() {
+        RawProfileStorage::SQLite(storage) => ProfileStorage::SQLite(StorageAdapter::new(storage)),
+        RawProfileStorage::RocksDB(storage) => {
+            ProfileStorage::RocksDB(StorageAdapter::new(storage))
+        }
     }
 }
 
@@ -257,9 +250,12 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
-async fn insert_all_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> KvWriteOutcome
+async fn insert_all_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    rows: &[BenchRow],
+) -> KvWriteOutcome
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let mut writes = storage.new_write_set();
     for row in rows {
@@ -277,9 +273,12 @@ where
     }
 }
 
-async fn update_all_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> KvWriteOutcome
+async fn update_all_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    rows: &[BenchRow],
+) -> KvWriteOutcome
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let mut writes = storage.new_write_set();
     for row in rows {
@@ -297,16 +296,19 @@ where
     }
 }
 
-async fn delete_all_storage<B>(storage: &StorageContext<B>, row_count: usize) -> KvWriteOutcome
+async fn delete_all_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    row_count: usize,
+) -> KvWriteOutcome
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let _commit = storage
         .clear_space(ROW_SPACE, StorageWriteOptions::default())
         .await
         .expect("clear tracked-state crud rows");
     let stats = StorageWriteSetStats {
-        backend_calls: 1,
+        storage_calls: 1,
         delete_batches: 1,
         ..StorageWriteSetStats::default()
     };
@@ -317,9 +319,12 @@ where
     }
 }
 
-async fn delete_one_storage<B>(storage: &StorageContext<B>, row: &BenchRow) -> KvWriteOutcome
+async fn delete_one_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    row: &BenchRow,
+) -> KvWriteOutcome
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let mut writes = storage.new_write_set();
     writes.delete(ROW_SPACE, row.key.clone());
@@ -335,13 +340,13 @@ where
     }
 }
 
-async fn read_all_storage<B>(
-    storage: &StorageContext<B>,
+async fn read_all_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
     expected_rows: usize,
     projection: StorageCoreProjection,
 ) -> usize
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
@@ -384,9 +389,12 @@ where
     rows
 }
 
-async fn read_points_storage<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+async fn read_points_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    rows: &[BenchRow],
+) -> usize
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let read = storage
         .begin_read(StorageReadOptions::default())
@@ -402,9 +410,11 @@ where
     result.value.len()
 }
 
-async fn layout_accounting_storage<B>(storage: &StorageContext<B>) -> Vec<KvLayoutAccounting>
+async fn layout_accounting_storage<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Vec<KvLayoutAccounting>
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let read = storage
         .begin_read(StorageReadOptions::default())

@@ -20,7 +20,7 @@ use crate::sql2::history_route::{
     load_history_entries, parse_history_filter,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
@@ -32,7 +32,7 @@ pub(super) async fn register_history_provider<S>(
     query_source: SqlHistoryQuerySource<S>,
 ) -> Result<(), LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     register_spec_table(
         session,
@@ -57,7 +57,7 @@ struct StateHistorySpec<S> {
 #[async_trait]
 impl<S> TableSpec for StateHistorySpec<S>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     #[expect(clippy::unnecessary_literal_bound)]
     fn table_name(&self) -> &str {
@@ -222,7 +222,7 @@ async fn load_state_history_rows<S>(
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<StateHistorySqlRow>, LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let entries = load_history_entries(
         HistoryViewDescriptor {

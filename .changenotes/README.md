@@ -5,7 +5,7 @@ Changenotes are release-note fragments for user-facing changes in core Lix packa
 Add one Markdown file per change to this folder. Use a short descriptive filename, for example:
 
 ```text
-.changenotes/fix-sqlite-backend-reads.md
+.changenotes/fix-sqlite-storage-reads.md
 ```
 
 Use this format:
@@ -15,9 +15,9 @@ Use this format:
 type: patch
 ---
 
-Improved SQLite backend read performance and native backend snapshot support.
+Improved SQLite read performance and native storage snapshot support.
 
-The SQLite backend now avoids loading values for key-only point reads and uses native backend read snapshots more directly.
+SQLite now avoids loading values for key-only point reads and uses native storage snapshots more directly.
 ```
 
 ## Fields

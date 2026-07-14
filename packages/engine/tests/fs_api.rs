@@ -10,7 +10,7 @@ use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
-use lix_engine::{Engine, ExecuteResult, InMemoryBackend, LixError, SessionContext, Value};
+use lix_engine::{Engine, ExecuteResult, LixError, Memory, SessionContext, Value};
 
 simulation_test!(
     sql_file_write_read_and_readdir_roundtrip,
@@ -105,11 +105,11 @@ simulation_test!(
 
 #[tokio::test]
 async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
         .open_workspace_session()
         .await
@@ -152,11 +152,11 @@ async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
 
 #[tokio::test]
 async fn sql_plugin_archive_plain_insert_reuses_deterministic_file_id() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
         .open_workspace_session()
         .await
@@ -187,11 +187,11 @@ async fn sql_plugin_archive_plain_insert_reuses_deterministic_file_id() {
 
 #[tokio::test]
 async fn sql_plugin_archive_path_must_match_manifest_key() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
         .open_workspace_session()
         .await
@@ -209,11 +209,11 @@ async fn sql_plugin_archive_path_must_match_manifest_key() {
 
 #[tokio::test]
 async fn sql_update_path_to_plugin_storage_rejects_plugin_archive_rename() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
         .open_workspace_session()
         .await
@@ -242,11 +242,11 @@ async fn sql_update_path_to_plugin_storage_rejects_plugin_archive_rename() {
 
 #[tokio::test]
 async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
         .open_workspace_session()
         .await
@@ -273,11 +273,11 @@ async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
 
 #[tokio::test]
 async fn sql_delete_rejects_installed_plugin_storage() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
         .open_workspace_session()
         .await
@@ -329,12 +329,12 @@ async fn sql_delete_rejects_installed_plugin_storage() {
 
 #[tokio::test]
 async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
+        .expect("storage should initialize");
     let runtime = Arc::new(SentinelPluginRuntime::default());
-    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
+    let engine = Engine::new_with_wasm_runtime(storage, runtime.clone())
         .await
         .expect("engine should open with plugin runtime");
     let session = engine
@@ -372,12 +372,12 @@ async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
 
 #[tokio::test]
 async fn plugin_detect_changes_receives_descriptor_filename() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
+        .expect("storage should initialize");
     let runtime = Arc::new(SentinelPluginRuntime::default());
-    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
+    let engine = Engine::new_with_wasm_runtime(storage, runtime.clone())
         .await
         .expect("engine should open with plugin runtime");
     let session = engine
@@ -404,12 +404,12 @@ async fn plugin_detect_changes_receives_descriptor_filename() {
 
 #[tokio::test]
 async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
+        .expect("storage should initialize");
     let runtime = Arc::new(SentinelPluginRuntime::default());
-    let engine = Engine::new_with_wasm_runtime(backend, runtime)
+    let engine = Engine::new_with_wasm_runtime(storage, runtime)
         .await
         .expect("engine should open with plugin runtime");
     let session = engine

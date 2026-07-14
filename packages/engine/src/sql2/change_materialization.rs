@@ -1,7 +1,7 @@
 use crate::changelog::ChangeRecord;
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
 
 /// Read-boundary view of a changelog change with JSON refs resolved.
@@ -45,7 +45,7 @@ pub(crate) async fn materialize_located_history_change<S>(
     change: crate::commit_graph::CommitGraphChange,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     materialize_commit_graph_change(json_reader, change, ChangePayloadProjection::ALL).await
 }
@@ -56,7 +56,7 @@ pub(crate) async fn materialize_changelog_change_record<S>(
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     materialize_commit_graph_change(
         json_reader,
@@ -81,7 +81,7 @@ pub(crate) async fn materialize_commit_graph_change<S>(
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let snapshot_content = if payload_projection.snapshot_content {
         load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
@@ -114,7 +114,7 @@ async fn load_changelog_json_slot<S>(
     field: &str,
 ) -> Result<Option<String>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let json_ref = match slot {
         crate::json_store::JsonSlot::None => return Ok(None),
@@ -153,9 +153,7 @@ mod tests {
     use crate::json_store::{
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
     };
-    use crate::storage::{
-        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
-    };
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::{ChangePayloadProjection, materialize_commit_graph_change};
 
@@ -174,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn unprojected_json_refs_are_not_loaded() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -205,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn projected_json_ref_still_reports_missing_payload() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -229,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn projected_json_refs_are_materialized() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let snapshot = "{\"value\":1}";
         let metadata = "{\"source\":\"test\"}";
         let mut writes = storage.new_write_set();

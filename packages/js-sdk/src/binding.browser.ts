@@ -1,5 +1,5 @@
 import type {
-	LixBackendConfig,
+	LixStorageConfig,
 	LixBinding,
 	PluginRuntimeDispatch,
 } from "./binding-types.js";
@@ -15,12 +15,12 @@ function initializeWasm(): Promise<unknown> {
 }
 
 export async function openLixBinding(
-	backend: LixBackendConfig,
+	storage: LixStorageConfig,
 	dispatch: PluginRuntimeDispatch,
 ): Promise<LixBinding> {
-	if (backend.kind !== "memory") {
+	if (storage.kind !== "memory") {
 		throw new Error(
-			`${backend.kind === "fs" ? "FsBackend" : "SqliteBackend"} is only available in Node.js`,
+			`${storage.kind === "localFilesystem" ? "LocalFilesystem" : "SQLite"} is only available in Node.js`,
 		);
 	}
 	await initializeWasm();

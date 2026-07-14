@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use lix_backends::SqliteBackend;
-use lix_engine::{Backend, Engine, InMemoryBackend, ObserveEvent, ObserveEvents, Value};
+use lix_engine::{Engine, Memory, ObserveEvent, ObserveEvents, Storage, Value};
+use lix_sqlite_storage::SQLite;
 use serde_json::json;
 
 const NEXT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -9,31 +9,37 @@ const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
 const KEY_VALUE_SQL: &str = "SELECT key, value FROM lix_key_value WHERE key = $1 ORDER BY key";
 
 async fn open_two_engines() -> (Engine, Engine) {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let observer_engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let observer_engine = Engine::new(storage.clone())
         .await
         .expect("observer engine should open");
-    let writer_engine = Engine::new(backend)
+    let writer_engine = Engine::new(storage)
         .await
         .expect("writer engine should open");
     (observer_engine, writer_engine)
 }
 
-fn observe_key<B>(session: &lix_engine::SessionContext<B>, key: &str) -> ObserveEvents<B>
+fn observe_key<StorageImpl>(
+    session: &lix_engine::SessionContext<StorageImpl>,
+    key: &str,
+) -> ObserveEvents<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     session
         .observe(KEY_VALUE_SQL, &[Value::Text(key.to_string())])
         .expect("observe should open")
 }
 
-async fn next_event<B>(events: &mut ObserveEvents<B>, label: &str) -> ObserveEvent
+async fn next_event<StorageImpl>(
+    events: &mut ObserveEvents<StorageImpl>,
+    label: &str,
+) -> ObserveEvent
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     tokio::time::timeout(NEXT_TIMEOUT, events.next())
         .await
@@ -42,9 +48,9 @@ where
         .unwrap_or_else(|| panic!("observe closed before event: {label}"))
 }
 
-async fn expect_no_event<B>(events: &mut ObserveEvents<B>, label: &str)
+async fn expect_no_event<StorageImpl>(events: &mut ObserveEvents<StorageImpl>, label: &str)
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match tokio::time::timeout(NO_EVENT_TIMEOUT, events.next()).await {
         Err(_) => {}
@@ -245,18 +251,18 @@ async fn observe_external_writes_can_coalesce_to_latest_snapshot() {
 }
 
 #[tokio::test]
-async fn observe_emits_when_independently_opened_sqlite_backend_commits() {
+async fn observe_emits_when_independently_opened_sqlite_commits() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let path = tempdir.path().join("repo.sqlite");
-    Engine::initialize(SqliteBackend::open(&path).expect("init backend should open"))
+    Engine::initialize(SQLite::open(&path).expect("init storage should open"))
         .await
-        .expect("backend should initialize");
+        .expect("storage should initialize");
     let observer_engine =
-        Engine::new(SqliteBackend::open(&path).expect("observer sqlite backend should open"))
+        Engine::new(SQLite::open(&path).expect("observer sqlite storage should open"))
             .await
             .expect("observer engine should open");
     let writer_engine =
-        Engine::new(SqliteBackend::open(&path).expect("writer sqlite backend should open"))
+        Engine::new(SQLite::open(&path).expect("writer sqlite storage should open"))
             .await
             .expect("writer engine should open");
     let observer_session = observer_engine
@@ -280,7 +286,7 @@ async fn observe_emits_when_independently_opened_sqlite_backend_commits() {
         .await
         .expect("external sqlite insert should commit");
 
-    let update = next_event(&mut events, "external sqlite backend commit").await;
+    let update = next_event(&mut events, "external sqlite storage commit").await;
     assert_eq!(update.sequence, 1);
     assert_key_value_row(&update, "mutation-revision-sqlite", "v0");
 }

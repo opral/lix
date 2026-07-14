@@ -1,18 +1,18 @@
-// Cold-open profiling harness for the filesystem backend.
+// Cold-open profiling harness for the filesystem storage.
 //
 // Usage:
-//   cargo run --release --example profile_fs_open --features fs_backend -- \
+//   cargo run --release --example profile_fs_open --features local_filesystem -- \
 //     <src_dir>
 //
 // Copies <src_dir> (sans any existing .lix) into a fresh temp dir, then times
-// FsBackend::open on the cold workspace. Pass --keep-workspace to preserve the
+// LocalFilesystem::open on the cold workspace. Pass --keep-workspace to preserve the
 // copied temp workspace for inspection.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lix_engine::Value;
-use lix_sdk::{FsBackend, open_lix_with_backend};
+use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 
 #[derive(Debug)]
 #[expect(clippy::struct_excessive_bools)]
@@ -116,9 +116,9 @@ fn duration_ms(duration: Duration) -> u128 {
     duration.as_micros() / 1000
 }
 
-async fn open_with_timing(path: &Path) -> (FsBackend, Duration) {
+async fn open_with_timing(path: &Path) -> (LocalFilesystem, Duration) {
     let started = Instant::now();
-    let opened = FsBackend::open(path).await.unwrap();
+    let opened = LocalFilesystem::open(path).await.unwrap();
     let elapsed = started.elapsed();
     (opened, elapsed)
 }
@@ -130,11 +130,11 @@ fn collect_profile_stats(workspace: &Path) -> ProfileStats {
     stats
 }
 
-async fn run_read_benchmark(backend: &FsBackend, workspace: &Path) -> ReadBenchStats {
+async fn run_read_benchmark(storage: &LocalFilesystem, workspace: &Path) -> ReadBenchStats {
     let files = collect_bench_files(workspace);
     let largest = files.iter().take(4).collect::<Vec<_>>();
     let small_sample = select_small_sample(&files, 16);
-    let lix = open_lix_with_backend(backend.clone())
+    let lix = open_lix_with_storage(storage.clone())
         .await
         .expect("profile read benchmark should open lix");
 
@@ -182,7 +182,7 @@ async fn run_read_benchmark(backend: &FsBackend, workspace: &Path) -> ReadBenchS
     }
 }
 
-async fn time_read_paths(lix: &lix_sdk::Lix<FsBackend>, files: &[&BenchFile]) -> (u128, u64) {
+async fn time_read_paths(lix: &lix_sdk::Lix<LocalFilesystem>, files: &[&BenchFile]) -> (u128, u64) {
     let started = Instant::now();
     let mut bytes = 0u64;
     for file in files {
@@ -567,15 +567,15 @@ async fn main() {
     let src = Path::new(&args.src);
 
     if args.in_place {
-        let (backend, open_elapsed) = open_with_timing(src).await;
+        let (storage, open_elapsed) = open_with_timing(src).await;
         eprintln!("in-place open: {open_elapsed:?}");
         let read_bench = if args.read_bench {
-            Some(run_read_benchmark(&backend, src).await)
+            Some(run_read_benchmark(&storage, src).await)
         } else {
             None
         };
         let stats = collect_profile_stats(src);
-        drop(backend);
+        drop(storage);
         print_result(
             &args,
             None,
@@ -601,20 +601,20 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    let (backend, open_elapsed) = open_with_timing(&work).await;
+    let (storage, open_elapsed) = open_with_timing(&work).await;
     eprintln!("cold open: {open_elapsed:?}");
-    drop(backend);
+    drop(storage);
 
     // Warm reopen (now .lix exists).
-    let (backend, warm_elapsed) = open_with_timing(&work).await;
+    let (storage, warm_elapsed) = open_with_timing(&work).await;
     eprintln!("warm reopen: {warm_elapsed:?}");
     let read_bench = if args.read_bench {
-        Some(run_read_benchmark(&backend, &work).await)
+        Some(run_read_benchmark(&storage, &work).await)
     } else {
         None
     };
     let stats = collect_profile_stats(&work);
-    drop(backend);
+    drop(storage);
 
     // Repeated cold opens into fresh temp dirs for profiling sample density.
     for i in 0..repeat {
@@ -622,12 +622,12 @@ async fn main() {
         let work_i = tmp_i.path().join("workspace");
         copy_dir(src, &work_i);
         let t = Instant::now();
-        let backend = FsBackend::open(&work_i).await.unwrap();
+        let storage = LocalFilesystem::open(&work_i).await.unwrap();
         if i == repeat - 1 {
             let elapsed = t.elapsed();
             eprintln!("cold open (repeat {repeat}): {elapsed:?}");
         }
-        drop(backend);
+        drop(storage);
     }
 
     let workspace_path = args.keep_workspace.then_some(work.as_path());

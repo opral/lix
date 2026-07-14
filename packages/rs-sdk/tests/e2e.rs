@@ -1,12 +1,12 @@
 use lix_sdk::{
-    Backend, CreateBranchOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
-    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, Lix, LixError, Memory, MergeBranchOptions, MergeBranchOutcome,
+    OpenLixOptions, Storage, SwitchBranchOptions, Value, open_lix,
 };
-#[cfg(feature = "fs_backend")]
-use lix_sdk::{FsBackend, FsBackendOpenOptions, open_lix_with_backend};
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
+use lix_sdk::{LocalFilesystem, LocalFilesystemOpenOptions, open_lix_with_storage};
+#[cfg(feature = "local_filesystem")]
 use std::path::Path;
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -94,7 +94,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 #[tokio::test]
 async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     let lix = open_lix(OpenLixOptions {
-        backend: InMemoryBackend::new(),
+        storage: Memory::new(),
         ..Default::default()
     })
     .await
@@ -118,9 +118,9 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
 
 #[tokio::test]
 async fn rs_sdk_close_does_not_destroy_committed_data() {
-    let backend = InMemoryBackend::new();
+    let storage = Memory::new();
     let first = open_lix(OpenLixOptions {
-        backend: backend.clone(),
+        storage: storage.clone(),
         ..Default::default()
     })
     .await
@@ -145,7 +145,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     assert_closed(error);
 
     let second = open_lix(OpenLixOptions {
-        backend,
+        storage,
         ..Default::default()
     })
     .await
@@ -166,9 +166,9 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 }
 
 #[tokio::test]
-async fn failed_write_validation_does_not_poison_backend_transaction() {
+async fn failed_write_validation_does_not_poison_storage_transaction() {
     let lix = open_lix(OpenLixOptions {
-        backend: InMemoryBackend::new(),
+        storage: Memory::new(),
         ..Default::default()
     })
     .await
@@ -434,7 +434,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
@@ -459,7 +459,7 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_initialization_wipes_legacy_sqlite_internal_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
     let internal_dir = tempdir.path().join(".lix/.internal");
@@ -488,7 +488,7 @@ async fn filesystem_initialization_wipes_legacy_sqlite_internal_metadata() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix_dir = tempdir.path().join(".lix");
@@ -530,18 +530,21 @@ async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata(
     lix.close().await.unwrap();
 }
 
-#[cfg(feature = "fs_backend")]
-async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
-    let backend = FsBackend::open(path).await.unwrap();
-    open_lix_with_backend(backend).await.unwrap()
+#[cfg(feature = "local_filesystem")]
+async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {
+    let storage = LocalFilesystem::open(path).await.unwrap();
+    open_lix_with_storage(storage).await.unwrap()
 }
 
-#[cfg(feature = "fs_backend")]
-async fn open_lix_with_on_demand_filesystem(path: &Path, file_paths: &[&str]) -> Lix<FsBackend> {
-    let options = FsBackendOpenOptions::new(path.to_path_buf(), false);
-    let backend = FsBackend::open_with_options(options).await.unwrap();
-    let lix = open_lix_with_backend(backend.clone()).await.unwrap();
-    backend
+#[cfg(feature = "local_filesystem")]
+async fn open_lix_with_on_demand_filesystem(
+    path: &Path,
+    file_paths: &[&str],
+) -> Lix<LocalFilesystem> {
+    let options = LocalFilesystemOpenOptions::new(path.to_path_buf(), false);
+    let storage = LocalFilesystem::open_with_options(options).await.unwrap();
+    let lix = open_lix_with_storage(storage.clone()).await.unwrap();
+    storage
         .import_paths(file_paths.iter().copied())
         .await
         .unwrap();
@@ -549,19 +552,19 @@ async fn open_lix_with_on_demand_filesystem(path: &Path, file_paths: &[&str]) ->
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
-async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
+#[cfg(feature = "local_filesystem")]
+async fn rocksdb_filesystem_storage_allows_same_process_multi_open() {
     let tempdir = tempfile::tempdir().unwrap();
-    let backend_a = FsBackend::open(tempdir.path())
+    let storage_a = LocalFilesystem::open(tempdir.path())
         .await
-        .expect("first rocksdb fs backend opens");
-    let backend_b = FsBackend::open(tempdir.path())
+        .expect("first rocksdb fs storage opens");
+    let storage_b = LocalFilesystem::open(tempdir.path())
         .await
-        .expect("second rocksdb fs backend reuses process-local DB");
-    let lix_a = open_lix_with_backend(backend_a)
+        .expect("second rocksdb fs storage reuses process-local DB");
+    let lix_a = open_lix_with_storage(storage_a)
         .await
         .expect("first lix opens");
-    let lix_b = open_lix_with_backend(backend_b)
+    let lix_b = open_lix_with_storage(storage_b)
         .await
         .expect("second lix opens");
 
@@ -585,9 +588,12 @@ async fn rocksdb_filesystem_backend_allows_same_process_multi_open() {
     lix_b.close().await.unwrap();
 }
 
-async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
+async fn read_file<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
@@ -602,9 +608,13 @@ where
         .transpose()
 }
 
-async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
+async fn write_file<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+    data: Vec<u8>,
+) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -615,9 +625,9 @@ where
     Ok(())
 }
 
-async fn mkdir<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
+async fn mkdir<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
@@ -627,9 +637,9 @@ where
     Ok(())
 }
 
-async fn rm<B>(lix: &Lix<B>, path: &str) -> Result<(), LixError>
+async fn rm<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "DELETE FROM lix_directory WHERE path = $1",
@@ -639,9 +649,12 @@ where
     Ok(())
 }
 
-async fn readdir<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<String>>, LixError>
+async fn readdir<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+) -> Result<Option<Vec<String>>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     if path == "/" {
         let entries = lix
@@ -691,7 +704,7 @@ where
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_creates_gitignore_files_for_lix_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
 
@@ -711,7 +724,7 @@ async fn filesystem_creates_gitignore_files_for_lix_metadata() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_initial_import_ignores_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join(".git/objects")).unwrap();
@@ -743,7 +756,7 @@ async fn filesystem_initial_import_ignores_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     let seed = open_lix_with_filesystem(tempdir.path()).await;
@@ -765,7 +778,7 @@ async fn filesystem_reconciliation_removes_previously_imported_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let tempdir = tempfile::tempdir().unwrap();
     let seed = open_lix_with_filesystem(tempdir.path()).await;
@@ -787,7 +800,7 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -854,7 +867,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn on_demand_filesystem_materializes_lix_created_file_outside_initial_imports() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
@@ -869,7 +882,7 @@ async fn on_demand_filesystem_materializes_lix_created_file_outside_initial_impo
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn on_demand_filesystem_watches_nested_lix_created_file_after_materialization() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
@@ -887,7 +900,7 @@ async fn on_demand_filesystem_watches_nested_lix_created_file_after_materializat
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
@@ -915,7 +928,7 @@ async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("old.md"), b"old").unwrap();
@@ -944,7 +957,7 @@ async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_materializes_untracked_sdk_sql_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -979,7 +992,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -1002,7 +1015,7 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_watcher_ignores_git_entries_created_after_open() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -1021,7 +1034,7 @@ async fn filesystem_watcher_ignores_git_entries_created_after_open() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_materialization_skips_git_entries() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
@@ -1047,7 +1060,7 @@ async fn filesystem_materialization_skips_git_entries() {
 }
 
 #[tokio::test]
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 async fn filesystem_imports_opaque_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
@@ -1071,7 +1084,7 @@ async fn filesystem_imports_opaque_lix_path_names() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
+#[cfg(all(unix, feature = "local_filesystem"))]
 async fn filesystem_rejects_symlink_root() {
     use std::os::unix::fs::symlink;
 
@@ -1079,7 +1092,7 @@ async fn filesystem_rejects_symlink_root() {
     std::fs::create_dir(tempdir.path().join("real-root")).unwrap();
     symlink("real-root", tempdir.path().join("linked-root")).unwrap();
 
-    let Err(error) = FsBackend::open(tempdir.path().join("linked-root")).await else {
+    let Err(error) = LocalFilesystem::open(tempdir.path().join("linked-root")).await else {
         panic!("symlink root should fail");
     };
 
@@ -1087,7 +1100,7 @@ async fn filesystem_rejects_symlink_root() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
+#[cfg(all(unix, feature = "local_filesystem"))]
 async fn filesystem_ignores_symlinks_on_initial_import() {
     use std::os::unix::fs::symlink;
 
@@ -1130,7 +1143,7 @@ async fn filesystem_ignores_symlinks_on_initial_import() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
+#[cfg(all(unix, feature = "local_filesystem"))]
 async fn filesystem_ignores_special_and_invalid_utf8_entries() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -1168,7 +1181,7 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
+#[cfg(all(unix, feature = "local_filesystem"))]
 async fn filesystem_watcher_ignores_symlinks_created_after_open() {
     use std::os::unix::fs::symlink;
 
@@ -1190,7 +1203,7 @@ async fn filesystem_watcher_ignores_symlinks_created_after_open() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
+#[cfg(all(unix, feature = "local_filesystem"))]
 async fn filesystem_materialization_skips_symlink_collisions() {
     use std::os::unix::fs::symlink;
 
@@ -1257,7 +1270,7 @@ async fn filesystem_materialization_skips_symlink_collisions() {
 }
 
 #[tokio::test]
-#[cfg(all(unix, feature = "fs_backend"))]
+#[cfg(all(unix, feature = "local_filesystem"))]
 async fn filesystem_materialization_skips_special_file_collisions() {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
@@ -1290,13 +1303,13 @@ async fn filesystem_materialization_skips_special_file_collisions() {
     lix.close().await.unwrap();
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 #[track_caller]
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     wait_for_disk_file_with_timeout(path, expected, Duration::from_secs(5));
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 #[track_caller]
 fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -1314,8 +1327,8 @@ fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout
     }
 }
 
-#[cfg(feature = "fs_backend")]
-async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
+#[cfg(feature = "local_filesystem")]
+async fn wait_for_lix_file(lix: &Lix<LocalFilesystem>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let actual = read_file(lix, path).await.unwrap();
@@ -1330,8 +1343,8 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
     }
 }
 
-#[cfg(feature = "fs_backend")]
-async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
+#[cfg(feature = "local_filesystem")]
+async fn wait_for_lix_directory(lix: &Lix<LocalFilesystem>, path: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let actual = readdir(lix, path).await.unwrap().is_some();

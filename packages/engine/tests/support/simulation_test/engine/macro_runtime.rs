@@ -2,7 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use lix_engine::LixError;
-use lix_engine::backend::InMemoryBackend;
+use lix_engine::storage::Memory;
 use lix_engine::{Engine, InitReceipt};
 
 use super::expect_same::{
@@ -81,7 +81,7 @@ async fn run_single_simulation_test_with_case<F, Fut>(
     let sim = Simulation::from_bootstrap(
         mode,
         options,
-        bootstrap.backend,
+        bootstrap.storage,
         bootstrap.receipt,
         SimulationAssertions::shared(expect_same),
     )
@@ -93,15 +93,15 @@ async fn run_single_simulation_test_with_case<F, Fut>(
 
 #[derive(Clone)]
 struct Bootstrap {
-    backend: InMemoryBackend,
+    storage: Memory,
     receipt: InitReceipt,
 }
 
 impl Bootstrap {
     async fn create() -> Result<Self, LixError> {
-        let backend = InMemoryBackend::new();
-        let receipt = Engine::initialize(backend.clone()).await?;
-        Ok(Self { backend, receipt })
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone()).await?;
+        Ok(Self { storage, receipt })
     }
 }
 

@@ -1,21 +1,20 @@
 use std::fmt::Write as _;
 
-use lix_engine::{Backend, Engine, ExecuteResult, SessionContext, Value};
+use lix_engine::{Engine, ExecuteResult, SessionContext, Storage, Value};
 
-use crate::backends::{BackendProfile, ProfileBackend, RedbBackend, RocksDbBackend, SqliteBackend};
+use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, sql_string};
 
 const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 
 pub(crate) enum SqlFixture {
-    Sqlite(GenericSqlFixture<SqliteBackend>),
-    RocksDb(GenericSqlFixture<RocksDbBackend>),
-    Redb(GenericSqlFixture<RedbBackend>),
+    SQLite(GenericSqlFixture<SQLite>),
+    RocksDB(GenericSqlFixture<RocksDB>),
 }
 
-pub(crate) struct GenericSqlFixture<B: Backend> {
-    session: SessionContext<B>,
+pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
+    session: SessionContext<StorageImpl>,
     row_count: usize,
     insert_sql_chunks: Vec<String>,
     select_all_sql: String,
@@ -27,21 +26,18 @@ pub(crate) struct GenericSqlFixture<B: Backend> {
     delete_one_by_pk_sql: String,
 }
 
-pub(crate) async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> SqlFixture {
-    match profile.backend() {
-        ProfileBackend::Sqlite(backend) => {
-            SqlFixture::Sqlite(fixture_for_session(prepare_session(backend).await, rows))
+pub(crate) async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
+    match profile.storage() {
+        ProfileStorage::SQLite(storage) => {
+            SqlFixture::SQLite(fixture_for_session(prepare_session(storage).await, rows))
         }
-        ProfileBackend::RocksDb(backend) => {
-            SqlFixture::RocksDb(fixture_for_session(prepare_session(backend).await, rows))
-        }
-        ProfileBackend::Redb(backend) => {
-            SqlFixture::Redb(fixture_for_session(prepare_session(backend).await, rows))
+        ProfileStorage::RocksDB(storage) => {
+            SqlFixture::RocksDB(fixture_for_session(prepare_session(storage).await, rows))
         }
     }
 }
 
-pub(crate) async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> SqlFixture {
+pub(crate) async fn seeded_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
     let fixture = empty_fixture(profile, rows).await;
     fixture.insert_all().await;
     fixture
@@ -50,72 +46,64 @@ pub(crate) async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]
 impl SqlFixture {
     pub(crate) async fn insert_all(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.insert_all().await,
-            Self::RocksDb(fixture) => fixture.insert_all().await,
-            Self::Redb(fixture) => fixture.insert_all().await,
+            Self::SQLite(fixture) => fixture.insert_all().await,
+            Self::RocksDB(fixture) => fixture.insert_all().await,
         }
     }
 
     pub(crate) async fn read_all(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.read_all().await,
-            Self::RocksDb(fixture) => fixture.read_all().await,
-            Self::Redb(fixture) => fixture.read_all().await,
+            Self::SQLite(fixture) => fixture.read_all().await,
+            Self::RocksDB(fixture) => fixture.read_all().await,
         }
     }
 
     pub(crate) async fn read_many_by_pk(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.read_many_by_pk().await,
-            Self::RocksDb(fixture) => fixture.read_many_by_pk().await,
-            Self::Redb(fixture) => fixture.read_many_by_pk().await,
+            Self::SQLite(fixture) => fixture.read_many_by_pk().await,
+            Self::RocksDB(fixture) => fixture.read_many_by_pk().await,
         }
     }
 
     pub(crate) async fn read_one_by_pk(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.read_one_by_pk().await,
-            Self::RocksDb(fixture) => fixture.read_one_by_pk().await,
-            Self::Redb(fixture) => fixture.read_one_by_pk().await,
+            Self::SQLite(fixture) => fixture.read_one_by_pk().await,
+            Self::RocksDB(fixture) => fixture.read_one_by_pk().await,
         }
     }
 
     pub(crate) async fn update_all(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.update_all().await,
-            Self::RocksDb(fixture) => fixture.update_all().await,
-            Self::Redb(fixture) => fixture.update_all().await,
+            Self::SQLite(fixture) => fixture.update_all().await,
+            Self::RocksDB(fixture) => fixture.update_all().await,
         }
     }
 
     pub(crate) async fn update_one_by_pk(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.update_one_by_pk().await,
-            Self::RocksDb(fixture) => fixture.update_one_by_pk().await,
-            Self::Redb(fixture) => fixture.update_one_by_pk().await,
+            Self::SQLite(fixture) => fixture.update_one_by_pk().await,
+            Self::RocksDB(fixture) => fixture.update_one_by_pk().await,
         }
     }
 
     pub(crate) async fn delete_all(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.delete_all().await,
-            Self::RocksDb(fixture) => fixture.delete_all().await,
-            Self::Redb(fixture) => fixture.delete_all().await,
+            Self::SQLite(fixture) => fixture.delete_all().await,
+            Self::RocksDB(fixture) => fixture.delete_all().await,
         }
     }
 
     pub(crate) async fn delete_one_by_pk(&self) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.delete_one_by_pk().await,
-            Self::RocksDb(fixture) => fixture.delete_one_by_pk().await,
-            Self::Redb(fixture) => fixture.delete_one_by_pk().await,
+            Self::SQLite(fixture) => fixture.delete_one_by_pk().await,
+            Self::RocksDB(fixture) => fixture.delete_one_by_pk().await,
         }
     }
 }
 
-impl<B> GenericSqlFixture<B>
+impl<StorageImpl> GenericSqlFixture<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
@@ -183,9 +171,12 @@ where
     }
 }
 
-fn fixture_for_session<B>(session: SessionContext<B>, rows: &[WorkloadRow]) -> GenericSqlFixture<B>
+fn fixture_for_session<StorageImpl>(
+    session: SessionContext<StorageImpl>,
+    rows: &[WorkloadRow],
+) -> GenericSqlFixture<StorageImpl>
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let mid = rows.len() / 2;
     GenericSqlFixture {
@@ -205,14 +196,14 @@ where
     }
 }
 
-async fn prepare_session<B>(backend: B) -> SessionContext<B>
+async fn prepare_session<StorageImpl>(storage: StorageImpl) -> SessionContext<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(backend.clone())
+    Engine::initialize(storage.clone())
         .await
-        .expect("initialize tracked-state crud backend");
-    let engine = Engine::new(backend)
+        .expect("initialize tracked-state crud storage");
+    let engine = Engine::new(storage)
         .await
         .expect("open tracked-state crud engine");
     let session = engine
@@ -223,9 +214,9 @@ where
     session
 }
 
-async fn register_json_pointer_schema<B>(session: &SessionContext<B>)
+async fn register_json_pointer_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
         "x-lix-key": "json_pointer",
@@ -251,9 +242,9 @@ where
     assert_eq!(affected, 1);
 }
 
-async fn execute<B>(session: &SessionContext<B>, sql: &str) -> ExecuteResult
+async fn execute<StorageImpl>(session: &SessionContext<StorageImpl>, sql: &str) -> ExecuteResult
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     session
         .execute(sql, &[])

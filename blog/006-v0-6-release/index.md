@@ -3,7 +3,7 @@ date: "2026-06-01"
 authors: ["samuelstroschein"]
 og:description: "Lix v0.6 is the first usable release of the embeddable SDK: open Lix in-process, use in-memory or SQLite storage, branch app state, and query history."
 og:image: "./cover.svg"
-og:image:alt: "Lix v0.6 release cover announcing embeddable version control with pluggable backends"
+og:image:alt: "Lix v0.6 release cover announcing embeddable version control with pluggable storage implementations"
 ---
 
 # Lix v0.6 Release: Ready to Embed
@@ -13,7 +13,7 @@ og:image:alt: "Lix v0.6 release cover announcing embeddable version control with
 **TL;DR**
 
 - `@lix-js/sdk` v0.6 is the first usable release of the embeddable SDK.
-- Apps open Lix in-process, pass a backend, and version app state without a Git sidecar.
+- Apps open Lix in-process, pass a storage, and version app state without a Git sidecar.
 - What ships today: in-memory storage, SQLite persistence, branches, transactions, file bytes, merge preview, merge, and SQL-queryable history.
 
 ## What shipped
@@ -25,10 +25,10 @@ npm install @lix-js/sdk
 The product surface is small on purpose:
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: new SqliteBackend({ path: "app.lix" }),
+  storage: new SQLite({ path: "app.lix" }),
 });
 
 await lix.fs.writeFile("/hello.md", new TextEncoder().encode("Hello World"));
@@ -54,11 +54,11 @@ That works for code repositories. It gets awkward when every agent run needs app
 - LFS for blobs
 - transaction coordination with the rest of your data
 
-Lix moves those primitives into the application process. Commits go through the backend instead of a separate Git repository.
+Lix moves those primitives into the application process. Commits go through the storage instead of a separate Git repository.
 
 ## Ready to embed
 
-The important change since the [April update](/blog/april-2026-update): the backend boundary is explicit enough to build against.
+The important change since the [April update](/blog/april-2026-update): the storage boundary is explicit enough to build against.
 
 ```plain
   App / agent
@@ -73,16 +73,16 @@ The important change since the [April update](/blog/april-2026-update): the back
       └── SQL queries
       │
       ▼
-  Backend
+  Storage
       │
       ├── in-memory
       ├── SQLite
-      └── custom synchronous backend
+      └── custom synchronous storage
 ```
 
-In-memory and SQLite ship today. Anything else implements the backend interface. Postgres, S3/R2, IndexedDB, and Cloudflare-style storage are the direction, not built-in adapters in this release.
+In-memory and SQLite ship today. Anything else implements the storage interface. Postgres, S3/R2, IndexedDB, and Cloudflare-style storage are the direction, not built-in adapters in this release.
 
-SQLite is the local default, but not the product boundary. The product boundary is the backend interface: Lix owns the version-control model, the backend owns persistence.
+SQLite is the local default, but not the product boundary. The product boundary is the storage interface: Lix owns the version-control model, the storage owns persistence.
 
 ## What Lix gives agents
 
@@ -101,5 +101,5 @@ That keeps agent context grounded in the actual version history.
 - **Agent workspaces without Git worktrees.** Give each agent a branch, let it edit state, then inspect and merge the result from inside your app.
 - **Review flows for AI changes.** Query what changed and show humans a review screen before merging.
 - **Versioned app state.** Add branches, history, transaction rollback, and merge to an editor, CMS, internal tool, or AI product.
-- **Local-first versioned storage.** Start with SQLite for a local agent runtime while keeping the Lix API separate from the physical backend.
-- **Custom backend experiments.** Put the same versioning model on another synchronous transactional store by implementing the backend interface.
+- **Local-first versioned storage.** Start with SQLite for a local agent runtime while keeping the Lix API separate from the physical storage.
+- **Custom storage experiments.** Put the same versioning model on another synchronous transactional store by implementing the storage interface.

@@ -39,7 +39,7 @@ The same `openLix()` powers three different shapes:
 
 **Inside an AI workflow.** Every agent task gets an isolated workspace; humans or policies review the diff and merge or discard. See [Lix for AI Agents](./lix-for-ai-agents.md).
 
-**As the version-control backend for file-based products.** Build a versioned filesystem, an artifact or model registry, a configuration service, a branchable database, or a domain-specific CLI. Lix is the version-control core; you ship the surface.
+**As the version-control core for file-based products.** Build a versioned filesystem, an artifact or model registry, a configuration service, a branchable database, or a domain-specific CLI. Lix is the version-control core; you ship the surface.
 
 ## Why this matters
 
@@ -50,7 +50,7 @@ Lix gives those files version-control primitives directly:
 - **Any file format** can be represented through parser plugins or custom schemas.
 - **Semantic changes** are stored per entity instead of only as whole-file snapshots.
 - **SQL** is the query interface for application code, AI agents, and tools.
-- **Pluggable storage.** Run in-memory, sync a filesystem workspace with `FsBackend`, use a `.lix` SQLite file as an application file format, or implement the [backend interface](./backend.md) to put Lix on Postgres, S3, Cloudflare, IndexedDB, OPFS, or anything transactional and key-value-shaped.
+- **Pluggable storage.** Run in-memory, sync a filesystem workspace with `LocalFilesystem`, use a `.lix` SQLite file as an application file format, or implement the [storage interface](./storage.md) to put Lix on Postgres, S3, Cloudflare, IndexedDB, OPFS, or anything transactional and key-value-shaped.
 - **ACID transactions** work across files and entities.
 
 No daemon, no protocol, no remote.

@@ -1,6 +1,6 @@
 #![allow(
     clippy::manual_async_fn,
-    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+    reason = "explicit future signatures mirror Storage traits and keep Send guarantees visible"
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,15 +14,15 @@ use std::time::Duration;
 
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, BackendError, BackendWrite, CommitResult, Engine, Key, KeyRange, LixError, PutBatch,
-    ReadOptions, SessionContext, SpaceId, Value, WriteOptions,
+    CommitResult, Engine, Key, KeyRange, LixError, PutBatch, ReadOptions, SessionContext, SpaceId,
+    Storage, StorageError, StorageWrite, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::oneshot;
 
-#[cfg(feature = "fs_backend")]
-use lix_fs_backend::RocksDbFilesystemBackend;
+#[cfg(feature = "local_filesystem")]
+use lix_local_filesystem::RocksDBFilesystem;
 
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
@@ -34,12 +34,12 @@ const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
 const FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS: usize = 4;
 
 #[derive(Clone)]
-pub(crate) struct FilesystemSync<B>
+pub(crate) struct FilesystemSync<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: B,
-    supervisor: FilesystemSupervisor<B>,
+    inner: StorageImpl,
+    supervisor: FilesystemSupervisor<StorageImpl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,17 +90,17 @@ impl FilesystemLayout {
     }
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct FsBackendOpenOptions {
+pub struct LocalFilesystemOpenOptions {
     pub root: PathBuf,
     pub lix_dir: Option<PathBuf>,
     pub sync_all_files: bool,
 }
 
-#[cfg(feature = "fs_backend")]
-impl FsBackendOpenOptions {
+#[cfg(feature = "local_filesystem")]
+impl LocalFilesystemOpenOptions {
     pub fn new<P>(root: P, sync_all_files: bool) -> Self
     where
         P: Into<PathBuf>,
@@ -118,37 +118,37 @@ struct FilesystemPathFilter {
     include_files: Option<BTreeSet<String>>,
 }
 
-pub(crate) struct FilesystemWrite<'a, B>
+pub(crate) struct FilesystemWrite<'a, StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: B::Write<'a>,
-    supervisor: FilesystemSupervisor<B>,
+    inner: StorageImpl::Write<'a>,
+    supervisor: FilesystemSupervisor<StorageImpl>,
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct FsBackend {
-    inner: FilesystemSync<RocksDbFilesystemBackend>,
+pub struct LocalFilesystem {
+    inner: FilesystemSync<RocksDBFilesystem>,
 }
 
-#[cfg(feature = "fs_backend")]
-pub type FsRead<'a> = lix_fs_backend::RocksDbFilesystemRead<'a>;
+#[cfg(feature = "local_filesystem")]
+pub type LocalFilesystemRead<'a> = lix_local_filesystem::RocksDBFilesystemRead<'a>;
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 #[expect(missing_debug_implementations)]
-pub struct FsWrite<'a> {
-    inner: FilesystemWrite<'a, RocksDbFilesystemBackend>,
+pub struct LocalFilesystemWrite<'a> {
+    inner: FilesystemWrite<'a, RocksDBFilesystem>,
 }
 
 #[derive(Clone)]
-struct FilesystemSupervisor<B>
+struct FilesystemSupervisor<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     inner: Arc<FilesystemSupervisorInner>,
-    _marker: PhantomData<fn() -> B>,
+    _marker: PhantomData<fn() -> StorageImpl>,
 }
 
 struct FilesystemSupervisorInner {
@@ -167,11 +167,11 @@ struct FilesystemWatchPath {
     recursive: bool,
 }
 
-struct FilesystemState<B>
+struct FilesystemState<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    session: SessionContext<B>,
+    session: SessionContext<StorageImpl>,
     layout: FilesystemLayout,
     path_filter: Mutex<FilesystemPathFilter>,
     sync_lock: tokio::sync::Mutex<()>,
@@ -332,13 +332,13 @@ enum FilesystemEvent {
     Shutdown,
 }
 
-#[cfg(feature = "fs_backend")]
-impl FsBackend {
+#[cfg(feature = "local_filesystem")]
+impl LocalFilesystem {
     pub async fn open<P>(dir: P) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
     {
-        Self::open_with_options(FsBackendOpenOptions {
+        Self::open_with_options(LocalFilesystemOpenOptions {
             root: dir.as_ref().to_path_buf(),
             lix_dir: None,
             sync_all_files: true,
@@ -346,28 +346,28 @@ impl FsBackend {
         .await
     }
 
-    pub async fn open_with_options(options: FsBackendOpenOptions) -> Result<Self, LixError> {
+    pub async fn open_with_options(options: LocalFilesystemOpenOptions) -> Result<Self, LixError> {
         Self::open_with_options_and_runtime(options, None).await
     }
 
-    /// Opens a filesystem backend whose disk-sync supervisor uses the same
+    /// Opens a filesystem storage whose disk-sync supervisor uses the same
     /// component runtime as the Lix session that owns it.
     pub async fn open_with_options_and_wasm_runtime(
-        options: FsBackendOpenOptions,
+        options: LocalFilesystemOpenOptions,
         wasm_runtime: Arc<dyn WasmRuntime>,
     ) -> Result<Self, LixError> {
         Self::open_with_options_and_runtime(options, Some(wasm_runtime)).await
     }
 
     async fn open_with_options_and_runtime(
-        options: FsBackendOpenOptions,
+        options: LocalFilesystemOpenOptions,
         wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     ) -> Result<Self, LixError> {
         let layout = prepare_filesystem_layout(&options.root, options.lix_dir.as_deref())?;
-        let backend = open_filesystem_rocksdb_backend(&layout)?;
-        let engine = crate::lix::open_or_initialize_engine(backend.clone(), wasm_runtime).await?;
+        let storage = open_filesystem_rocksdb(&layout)?;
+        let engine = crate::lix::open_or_initialize_engine(storage.clone(), wasm_runtime).await?;
         let inner =
-            FilesystemSync::open_with_engine(backend, engine, layout, options.sync_all_files)
+            FilesystemSync::open_with_engine(storage, engine, layout, options.sync_all_files)
                 .await?;
         Ok(Self { inner })
     }
@@ -385,44 +385,44 @@ impl FsBackend {
     }
 }
 
-#[cfg(feature = "fs_backend")]
-impl Backend for FsBackend {
+#[cfg(feature = "local_filesystem")]
+impl Storage for LocalFilesystem {
     type Read<'a>
-        = FsRead<'a>
+        = LocalFilesystemRead<'a>
     where
         Self: 'a;
 
     type Write<'a>
-        = FsWrite<'a>
+        = LocalFilesystemWrite<'a>
     where
         Self: 'a;
 
     fn begin_read(
         &self,
         opts: ReadOptions,
-    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+    ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         self.inner.begin_read(opts)
     }
 
     fn begin_write(
         &self,
         opts: WriteOptions,
-    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+    ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
-            Ok(FsWrite {
+            Ok(LocalFilesystemWrite {
                 inner: self.inner.begin_write(opts).await?,
             })
         }
     }
 }
 
-#[cfg(feature = "fs_backend")]
-impl BackendWrite for FsWrite<'_> {
+#[cfg(feature = "local_filesystem")]
+impl StorageWrite for LocalFilesystemWrite<'_> {
     fn put_many(
         &mut self,
         space: SpaceId,
         entries: PutBatch,
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.put_many(space, entries)
     }
 
@@ -430,7 +430,7 @@ impl BackendWrite for FsWrite<'_> {
         &mut self,
         space: SpaceId,
         keys: &[Key],
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_many(space, keys)
     }
 
@@ -438,31 +438,31 @@ impl BackendWrite for FsWrite<'_> {
         &mut self,
         space: SpaceId,
         range: KeyRange,
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_range(space, range)
     }
 
-    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+    fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         self.inner.commit()
     }
 
-    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
+    fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.rollback()
     }
 }
 
-impl<B> FilesystemSync<B>
+impl<StorageImpl> FilesystemSync<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     async fn open_with_engine(
-        backend: B,
-        engine: Engine<B>,
+        storage: StorageImpl,
+        engine: Engine<StorageImpl>,
         layout: FilesystemLayout,
         sync_all_files: bool,
     ) -> Result<Self, LixError> {
         Ok(Self {
-            inner: backend,
+            inner: storage,
             supervisor: FilesystemSupervisor::open(engine, layout, sync_all_files).await?,
         })
     }
@@ -487,31 +487,31 @@ where
     }
 }
 
-impl<B> Backend for FilesystemSync<B>
+impl<StorageImpl> Storage for FilesystemSync<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     type Read<'a>
-        = B::Read<'a>
+        = StorageImpl::Read<'a>
     where
         Self: 'a;
 
     type Write<'a>
-        = FilesystemWrite<'a, B>
+        = FilesystemWrite<'a, StorageImpl>
     where
         Self: 'a;
 
     fn begin_read(
         &self,
         opts: ReadOptions,
-    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+    ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         self.inner.begin_read(opts)
     }
 
     fn begin_write(
         &self,
         opts: WriteOptions,
-    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+    ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             Ok(FilesystemWrite {
                 inner: self.inner.begin_write(opts).await?,
@@ -521,15 +521,15 @@ where
     }
 }
 
-impl<B> BackendWrite for FilesystemWrite<'_, B>
+impl<StorageImpl> StorageWrite for FilesystemWrite<'_, StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     fn put_many(
         &mut self,
         space: SpaceId,
         entries: PutBatch,
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.put_many(space, entries)
     }
 
@@ -537,7 +537,7 @@ where
         &mut self,
         space: SpaceId,
         keys: &[Key],
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_many(space, keys)
     }
 
@@ -545,11 +545,11 @@ where
         &mut self,
         space: SpaceId,
         range: KeyRange,
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_range(space, range)
     }
 
-    fn commit(self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+    fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
             let result = self.inner.commit().await?;
             self.supervisor.sync_from_lix().await?;
@@ -557,17 +557,17 @@ where
         }
     }
 
-    fn rollback(self) -> impl Future<Output = Result<(), BackendError>> + Send {
+    fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.rollback()
     }
 }
 
-impl<B> FilesystemSupervisor<B>
+impl<StorageImpl> FilesystemSupervisor<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     async fn open(
-        engine: Engine<B>,
+        engine: Engine<StorageImpl>,
         layout: FilesystemLayout,
         sync_all_files: bool,
     ) -> Result<Self, LixError> {
@@ -651,20 +651,20 @@ where
         }
     }
 
-    async fn sync_from_lix(&self) -> Result<(), BackendError> {
+    async fn sync_from_lix(&self) -> Result<(), StorageError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .event_tx
             .send(FilesystemEvent::SyncFromLix { reply_tx })
             .map_err(|error| {
-                BackendError::Io(format!(
+                StorageError::Io(format!(
                     "filesystem sync failed: filesystem worker stopped: {error}"
                 ))
             })?;
         match reply_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(filesystem_sync_backend_error(error)),
-            Err(error) => Err(BackendError::Io(format!(
+            Ok(Err(error)) => Err(filesystem_sync_storage_error(error)),
+            Err(error) => Err(StorageError::Io(format!(
                 "filesystem sync failed: filesystem worker stopped: {error}"
             ))),
         }
@@ -706,9 +706,9 @@ impl FilesystemSupervisorInner {
     }
 }
 
-impl<B> FilesystemState<B>
+impl<StorageImpl> FilesystemState<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     fn path_filter(&self) -> FilesystemPathFilter {
         self.path_filter
@@ -1180,13 +1180,13 @@ where
     }
 }
 
-fn filesystem_worker<B>(
-    state: Arc<FilesystemState<B>>,
+fn filesystem_worker<StorageImpl>(
+    state: Arc<FilesystemState<StorageImpl>>,
     event_rx: mpsc::Receiver<FilesystemEvent>,
     mut poll_filesystem: bool,
     mut debouncer: Option<FilesystemWatcher>,
 ) where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
         return;
@@ -1277,16 +1277,16 @@ fn filesystem_worker<B>(
     }
 }
 
-fn drain_filesystem_events<B>(
+fn drain_filesystem_events<StorageImpl>(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<B>>,
+    state: &Arc<FilesystemState<StorageImpl>>,
     event_rx: &mpsc::Receiver<FilesystemEvent>,
     mut sync_disk: bool,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> bool
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let mut sync_disk_replies = Vec::new();
     let mut sync_replies = Vec::new();
@@ -1325,15 +1325,15 @@ where
     false
 }
 
-fn sync_disk_to_lix_for_replies<B>(
+fn sync_disk_to_lix_for_replies<StorageImpl>(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<B>>,
+    state: &Arc<FilesystemState<StorageImpl>>,
     replies: Vec<oneshot::Sender<Result<(), LixError>>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = runtime.block_on(state.sync_disk_to_lix(true));
     if result.is_ok() {
@@ -1345,15 +1345,15 @@ where
     result
 }
 
-fn import_paths_for_replies<B>(
+fn import_paths_for_replies<StorageImpl>(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<B>>,
+    state: &Arc<FilesystemState<StorageImpl>>,
     replies: Vec<(Vec<String>, oneshot::Sender<Result<(), LixError>>)>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let mut first_error = None;
     for (paths, reply) in replies {
@@ -1368,15 +1368,15 @@ where
     first_error.map_or(Ok(()), Err)
 }
 
-fn sync_from_lix_for_replies<B>(
+fn sync_from_lix_for_replies<StorageImpl>(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<B>>,
+    state: &Arc<FilesystemState<StorageImpl>>,
     replies: Vec<oneshot::Sender<Result<(), LixError>>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = runtime.block_on(state.sync_from_lix());
     if result.is_ok() {
@@ -1388,12 +1388,12 @@ where
     result
 }
 
-fn refresh_filesystem_watcher<B>(
-    state: &Arc<FilesystemState<B>>,
+fn refresh_filesystem_watcher<StorageImpl>(
+    state: &Arc<FilesystemState<StorageImpl>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
 ) where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let Some(watcher) = debouncer.as_mut() else {
         *poll_filesystem = true;
@@ -2230,15 +2230,15 @@ fn io_error(operation: &str, path: &Path, error: std::io::Error) -> LixError {
     )
 }
 
-fn filesystem_sync_backend_error(error: LixError) -> BackendError {
-    BackendError::Io(format!("filesystem sync failed: {}", error.format()))
+fn filesystem_sync_storage_error(error: LixError) -> StorageError {
+    StorageError::Io(format!("filesystem sync failed: {}", error.format()))
 }
 
 fn filesystem_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_FILESYSTEM_ERROR", message)
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn prepare_filesystem_layout(
     root: &Path,
     lix_dir: Option<&Path>,
@@ -2283,7 +2283,7 @@ fn prepare_filesystem_layout(
     })
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn absolute_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -2294,7 +2294,7 @@ fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn normalize_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -2311,15 +2311,13 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
-#[cfg(feature = "fs_backend")]
-fn open_filesystem_rocksdb_backend(
-    layout: &FilesystemLayout,
-) -> Result<RocksDbFilesystemBackend, LixError> {
+#[cfg(feature = "local_filesystem")]
+fn open_filesystem_rocksdb(layout: &FilesystemLayout) -> Result<RocksDBFilesystem, LixError> {
     let metadata_dir = ensure_filesystem_rocksdb_metadata_directory(layout)?;
-    RocksDbFilesystemBackend::open(metadata_dir).map_err(rocksdb_backend_error)
+    RocksDBFilesystem::open(metadata_dir).map_err(rocksdb_error)
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn ensure_filesystem_rocksdb_metadata_directory(
     layout: &FilesystemLayout,
 ) -> Result<PathBuf, LixError> {
@@ -2337,13 +2335,13 @@ fn ensure_filesystem_rocksdb_metadata_directory(
     Ok(metadata_dir)
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn remove_legacy_filesystem_root_metadata(root: &Path, lix_dir: &Path) -> Result<(), LixError> {
     remove_legacy_filesystem_lix_metadata(lix_dir)?;
     remove_legacy_metadata_path(&root.join(".lix_system"))
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn remove_legacy_filesystem_lix_metadata(lix_dir: &Path) -> Result<(), LixError> {
     for name in LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES {
         remove_legacy_metadata_file(&lix_dir.join(name))?;
@@ -2351,7 +2349,7 @@ fn remove_legacy_filesystem_lix_metadata(lix_dir: &Path) -> Result<(), LixError>
     Ok(())
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn reset_legacy_filesystem_internal_directory(internal_dir: &Path) -> Result<(), LixError> {
     if internal_dir.join("rocksdb").exists() {
         return Ok(());
@@ -2389,14 +2387,14 @@ fn reset_legacy_filesystem_internal_directory(internal_dir: &Path) -> Result<(),
     })
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn legacy_filesystem_sqlite_metadata_exists(internal_dir: &Path) -> bool {
     LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES
         .iter()
         .any(|name| internal_dir.join(name).exists())
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn remove_legacy_metadata_file(path: &Path) -> Result<(), LixError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2425,7 +2423,7 @@ fn remove_legacy_metadata_file(path: &Path) -> Result<(), LixError> {
         .map_err(|error| io_error("remove legacy filesystem metadata file", path, error))
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn remove_legacy_metadata_path(path: &Path) -> Result<(), LixError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2458,7 +2456,7 @@ fn remove_legacy_metadata_path(path: &Path) -> Result<(), LixError> {
     )))
 }
 
-#[cfg(feature = "fs_backend")]
+#[cfg(feature = "local_filesystem")]
 fn ensure_metadata_directory(path: &Path, label: &str) -> Result<(), LixError> {
     match std::fs::create_dir(path) {
         Ok(()) => {}
@@ -2504,27 +2502,27 @@ const LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES: &[&str] = &[
     "db.sqlite-journal",
 ];
 
-#[cfg(feature = "fs_backend")]
-fn rocksdb_backend_error(error: BackendError) -> LixError {
+#[cfg(feature = "local_filesystem")]
+fn rocksdb_error(error: StorageError) -> LixError {
     LixError::new(
         LixError::CODE_STORAGE_ERROR,
-        format!("failed to open filesystem RocksDB backend: {error}"),
+        format!("failed to open filesystem RocksDB storage: {error}"),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     use lix_engine::Value;
 
-    #[cfg(feature = "fs_backend")]
-    async fn lix_read_file<B>(
-        session: &SessionContext<B>,
+    #[cfg(feature = "local_filesystem")]
+    async fn lix_read_file<StorageImpl>(
+        session: &SessionContext<StorageImpl>,
         path: &str,
     ) -> Result<Option<Vec<u8>>, LixError>
     where
-        B: Backend + Clone + Send + Sync + 'static,
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
         let result = session
             .execute(
@@ -2539,14 +2537,14 @@ mod tests {
             .transpose()
     }
 
-    #[cfg(feature = "fs_backend")]
-    async fn lix_write_file<B>(
-        session: &SessionContext<B>,
+    #[cfg(feature = "local_filesystem")]
+    async fn lix_write_file<StorageImpl>(
+        session: &SessionContext<StorageImpl>,
         path: &str,
         data: Vec<u8>,
     ) -> Result<(), LixError>
     where
-        B: Backend + Clone + Send + Sync + 'static,
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
         session
             .execute(
@@ -2558,13 +2556,13 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     async fn open_test_filesystem_state(
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
-    ) -> FilesystemState<RocksDbFilesystemBackend> {
-        let backend = open_filesystem_rocksdb_backend(&layout).unwrap();
-        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None)
+    ) -> FilesystemState<RocksDBFilesystem> {
+        let storage = open_filesystem_rocksdb(&layout).unwrap();
+        let engine = crate::lix::open_or_initialize_engine(storage.clone(), None)
             .await
             .unwrap();
         FilesystemState {
@@ -2755,7 +2753,7 @@ mod tests {
         assert_eq!(lix_file_upsert_chunk_end(&files, 0, 10, 8), 1);
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
     async fn disk_sync_remembers_canonical_snapshot_for_idle_skip() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -2775,7 +2773,7 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
     async fn disk_sync_does_not_reimport_unchanged_materialized_file_deleted_in_lix() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -2816,7 +2814,7 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
     async fn disk_sync_does_not_skip_lix_side_file_data_change() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -2846,7 +2844,7 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
     async fn disk_sync_materialization_preserves_file_changed_after_import() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -2896,29 +2894,29 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
-    async fn fs_backend_sync_disk_to_lix_respects_include_paths() {
+    async fn local_filesystem_sync_disk_to_lix_respects_include_paths() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"ignored").unwrap();
 
-        let backend = FsBackend::open_with_options(FsBackendOpenOptions {
+        let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
             root: tempdir.path().to_path_buf(),
             lix_dir: None,
             sync_all_files: false,
         })
         .await
         .unwrap();
-        let lix = crate::lix::open_lix_with_backend(backend.clone())
+        let lix = crate::lix::open_lix_with_storage(storage.clone())
             .await
             .unwrap();
-        backend.import_paths(["tracked.md"]).await.unwrap();
+        storage.import_paths(["tracked.md"]).await.unwrap();
 
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"changed").unwrap();
 
-        backend.sync_disk_to_lix().await.unwrap();
+        storage.sync_disk_to_lix().await.unwrap();
 
         let tracked = lix
             .execute(
@@ -2949,29 +2947,29 @@ mod tests {
         lix.close().await.unwrap();
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
-    async fn fs_backend_sync_disk_to_lix_outlives_lix_session() {
+    async fn local_filesystem_sync_disk_to_lix_outlives_lix_session() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
 
-        let backend = FsBackend::open_with_options(FsBackendOpenOptions {
+        let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
             root: tempdir.path().to_path_buf(),
             lix_dir: None,
             sync_all_files: true,
         })
         .await
         .unwrap();
-        let lix = crate::lix::open_lix_with_backend(backend.clone())
+        let lix = crate::lix::open_lix_with_storage(storage.clone())
             .await
             .unwrap();
 
         lix.close().await.unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
 
-        backend.sync_disk_to_lix().await.unwrap();
+        storage.sync_disk_to_lix().await.unwrap();
 
-        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
+        let lix = crate::lix::open_lix_with_storage(storage).await.unwrap();
         let tracked = lix
             .execute(
                 "SELECT data FROM lix_file WHERE path = $1",
@@ -2991,21 +2989,21 @@ mod tests {
         lix.close().await.unwrap();
     }
 
-    #[cfg(feature = "fs_backend")]
+    #[cfg(feature = "local_filesystem")]
     #[tokio::test]
     async fn external_lix_dir_stores_rocksdb_and_lix_files_outside_root() {
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let lix_dir = external.path().join(".lix");
 
-        let backend = FsBackend::open_with_options(FsBackendOpenOptions {
+        let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
             root: root.path().to_path_buf(),
             lix_dir: Some(lix_dir.clone()),
             sync_all_files: true,
         })
         .await
         .unwrap();
-        let lix = crate::lix::open_lix_with_backend(backend).await.unwrap();
+        let lix = crate::lix::open_lix_with_storage(storage).await.unwrap();
 
         lix.execute(
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",

@@ -64,11 +64,11 @@ export type ObserveEventsBinding = {
 
 export type PluginRuntimeDispatch = (request: unknown) => Promise<unknown>;
 
-export type LixBackendConfig =
+export type LixStorageConfig =
 	| { kind: "memory" }
 	| { kind: "sqlite"; path: string }
 	| {
-			kind: "fs";
+			kind: "localFilesystem";
 			path: string;
 			lixDir?: string;
 			syncAllFiles: boolean;

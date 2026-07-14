@@ -19,7 +19,7 @@ use crate::commit_graph::{
     CommitGraphCommit, CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
 };
 use crate::entity_pk::EntityPk;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
@@ -39,7 +39,7 @@ impl CommitGraphContext {
     /// Creates a graph reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> CommitGraphStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         CommitGraphStoreReader { store }
     }
@@ -48,14 +48,14 @@ impl CommitGraphContext {
 /// Commit-graph reader that resolves changelog entities at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     store: S,
 }
 
 impl<S> CommitGraphStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     /// Loads and parses a `lix_commit` canonical change by commit id.
     pub(crate) async fn load_commit(
@@ -303,7 +303,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
 #[async_trait::async_trait]
 impl<S> CommitGraphReader for CommitGraphStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     async fn load_commit(
         &mut self,
@@ -389,8 +389,8 @@ mod tests {
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -420,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -457,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_commit_returns_none_for_missing_commit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let graph = CommitGraphContext::new();
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -476,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_commits_returns_parsed_commits_sorted_by_id() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -510,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn commit_edges_are_derived_from_parent_commit_ids() {
         let graph = CommitGraphContext::new();
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -542,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_history_from_commit_reports_matching_canonical_changes_with_depth() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -607,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_history_from_commit_filters_depth_entity_file_and_tombstones() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -666,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_history_from_commit_includes_tombstones_when_requested() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
@@ -786,7 +786,7 @@ mod tests {
         }
     }
 
-    async fn append_changes(storage: &StorageContext, changes: &[TestChange]) {
+    async fn append_changes(storage: &StorageAdapter, changes: &[TestChange]) {
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await

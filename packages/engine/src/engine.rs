@@ -14,17 +14,17 @@ use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
 use crate::session::SessionContext;
-use crate::storage::StorageBackend;
-use crate::storage::{SharedStorageRead, StorageReadOptions, StorageWriteOptions};
-use crate::storage::{StorageContext, StorageWriteSet};
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
+use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
-    storage: StorageContext<B>,
+pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
+    storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     branch_ctx: Arc<BranchContext>,
@@ -36,17 +36,17 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     plugin_host: PluginRuntimeHost,
 }
 
-impl<B> Engine<B>
+impl<StorageImpl> Engine<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    /// Seeds an empty backend with the engine repository bootstrap facts.
+    /// Seeds an empty storage with the engine repository bootstrap facts.
     ///
     /// Initialization is a storage lifecycle operation, separate from runtime
     /// construction. Call this before `Engine::new(...)` for a brand-new
-    /// backend.
-    pub async fn initialize(backend: B) -> Result<InitReceipt, LixError> {
-        let storage = StorageContext::new(backend);
+    /// storage.
+    pub async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
+        let storage = StorageAdapter::new(storage);
 
         crate::init::initialize(
             storage,
@@ -56,24 +56,24 @@ where
         .await
     }
 
-    /// Creates a clean DataFusion-first engine over an initialized backend.
+    /// Creates a clean DataFusion-first engine over an initialized storage.
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
     /// instance instead of being hidden behind initialization side effects.
     ///
     /// Deterministic runtime sequencing is serialized within this Engine
     /// context. Independently constructing multiple Engine values over the same
-    /// cloned backend is outside that MVP runtime-sharing boundary.
-    pub async fn new(backend: B) -> Result<Self, LixError> {
-        Self::new_with_wasm_runtime(backend, Arc::new(UnsupportedWasmRuntime)).await
+    /// cloned storage is outside that MVP runtime-sharing boundary.
+    pub async fn new(storage: StorageImpl) -> Result<Self, LixError> {
+        Self::new_with_wasm_runtime(storage, Arc::new(UnsupportedWasmRuntime)).await
     }
 
     /// Creates an engine with a WASM component runtime for installed plugins.
     pub async fn new_with_wasm_runtime(
-        backend: B,
+        storage: StorageImpl,
         wasm_runtime: Arc<dyn WasmRuntime>,
     ) -> Result<Self, LixError> {
-        let storage = StorageContext::new(backend);
+        let storage = StorageAdapter::new(storage);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_index = LiveStateIndexContext::new();
@@ -104,7 +104,7 @@ where
         })
     }
 
-    pub(crate) fn storage(&self) -> StorageContext<B> {
+    pub(crate) fn storage(&self) -> StorageAdapter<StorageImpl> {
         self.storage.clone()
     }
 
@@ -117,7 +117,7 @@ where
         &self,
         branch_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -134,7 +134,7 @@ where
     pub async fn open_session(
         &self,
         active_branch_id: impl Into<String>,
-    ) -> Result<SessionContext<B>, LixError> {
+    ) -> Result<SessionContext<StorageImpl>, LixError> {
         SessionContext::open(
             active_branch_id.into(),
             self.storage(),
@@ -151,7 +151,7 @@ where
         .await
     }
 
-    pub async fn open_workspace_session(&self) -> Result<SessionContext<B>, LixError> {
+    pub async fn open_workspace_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
         SessionContext::open_workspace(
             self.storage(),
             Arc::clone(&self.live_state),
@@ -185,7 +185,8 @@ where
                 )
             })?;
         let storage = self.storage();
-        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let read =
+            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let mut writes = StorageWriteSet::new();
         let rebuild_result = self
             .tracked_state
@@ -201,14 +202,15 @@ where
     }
 }
 
-async fn assert_initialized<B>(
-    storage: StorageContext<B>,
+async fn assert_initialized<StorageImpl>(
+    storage: StorageAdapter<StorageImpl>,
     live_state: &LiveStateContext,
 ) -> Result<(), LixError>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+    let read =
+        SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
     let reader = live_state.reader(read);
     let initialized = reader
         .load_row(&LiveStateRowRequest {
@@ -226,7 +228,7 @@ where
 
     Err(LixError::new(
         "LIX_ERROR_NOT_INITIALIZED",
-        "engine backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
+        "engine storage is not initialized; call Engine::initialize(...) before Engine::new(...)",
     ))
 }
 
@@ -235,19 +237,19 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::storage::{
-        InMemoryStorageBackend, PointReadPlan, StorageGetOptions, StorageKey,
-        StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue,
+    use crate::storage_adapter::{
+        Memory, PointReadPlan, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
+        StorageSpaceId, StorageValue,
     };
 
     #[tokio::test]
     async fn engine_ignores_predecessor_state_bytes_and_leaves_them_untouched() {
-        let backend = InMemoryStorageBackend::new();
-        let receipt = Engine::initialize(backend.clone())
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
-        let storage = StorageContext::new(backend.clone());
-        let mut writes = storage.new_write_set();
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
         let predecessor_spaces = [
             StorageSpace::new(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
             StorageSpace::new(
@@ -264,12 +266,12 @@ mod tests {
                 },
             );
         }
-        storage
+        storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("legacy sidecar bytes should commit");
 
-        let engine = Engine::new(backend)
+        let engine = Engine::new(storage)
             .await
             .expect("legacy sidecar bytes must not affect engine open");
         assert_eq!(
@@ -279,7 +281,7 @@ mod tests {
                 .expect("branch head should load"),
             Some(receipt.initial_commit_id)
         );
-        let read = storage
+        let read = storage_adapter
             .begin_read(StorageReadOptions::default())
             .await
             .expect("legacy verification read should open");
@@ -306,15 +308,15 @@ mod tests {
 
     #[tokio::test]
     async fn predecessor_only_repository_is_uninitialized_and_untouched() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
+        let storage = Memory::new();
+        let storage_adapter = StorageAdapter::new(storage.clone());
         let predecessor_space = StorageSpace::new(
             StorageSpaceId(0x0004_0005),
             "live_state.index.branch_root.v1",
         );
         let predecessor_key = StorageKey(Bytes::from_static(b"legacy-current-root"));
         let predecessor_value = Bytes::from_static(b"legacy-root-bytes");
-        let mut writes = storage.new_write_set();
+        let mut writes = storage_adapter.new_write_set();
         writes.put(
             predecessor_space,
             predecessor_key.clone(),
@@ -322,17 +324,17 @@ mod tests {
                 bytes: predecessor_value.clone(),
             },
         );
-        storage
+        storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("predecessor bytes should commit");
 
-        let Err(error) = Engine::new(backend).await else {
+        let Err(error) = Engine::new(storage).await else {
             panic!("predecessor-only repository must not open");
         };
         assert_eq!(error.code, "LIX_ERROR_NOT_INITIALIZED");
 
-        let read = storage
+        let read = storage_adapter
             .begin_read(StorageReadOptions::default())
             .await
             .expect("verification read should open");

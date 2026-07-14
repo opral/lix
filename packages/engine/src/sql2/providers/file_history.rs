@@ -43,7 +43,7 @@ use crate::sql2::providers::filesystem_history_path::{
     HistoryDirectoryPathRecord, resolve_history_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history::entity_pk_json_array;
@@ -62,7 +62,7 @@ pub(super) async fn register_lix_file_history_surface<S>(
     plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     register_spec_table(
         session,
@@ -92,7 +92,7 @@ struct LixFileHistorySpec<S> {
 #[async_trait]
 impl<S> TableSpec for LixFileHistorySpec<S>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     #[expect(clippy::unnecessary_literal_bound)]
     fn table_name(&self) -> &str {
@@ -437,7 +437,7 @@ async fn load_file_history_rows<S>(
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<FileHistoryOutputRow>, LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     if !route.schema_keys.is_empty()
         && !route
@@ -661,7 +661,7 @@ async fn load_file_history_filesystem_context<S>(
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryFilesystemContext, LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let filesystem_schema_keys = file_history_filesystem_schema_keys();
     let (event_entries, context_entries) =
@@ -711,7 +711,7 @@ async fn load_file_history_plugin_state<S>(
     LixError,
 >
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let (event_entries, context_entries) =
         load_file_history_entry_sets(event_route, context_route, move |route| {

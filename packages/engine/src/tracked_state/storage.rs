@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use crate::changelog::CommitId;
-use crate::storage::{PointReadPlan, StorageRead, StorageSpace, StorageWriteSet};
-use crate::storage::{
+use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, StorageWriteSet};
+use crate::storage_adapter::{
     StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId, StorageValue,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
@@ -30,7 +30,7 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
 );
 
 async fn get_one(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
@@ -46,7 +46,7 @@ async fn get_one(
 }
 
 pub(crate) async fn load_root(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
     Ok(load_commit_root(store, commit_id)
@@ -61,7 +61,7 @@ fn commit_root_key(commit_id: CommitId) -> Vec<u8> {
 }
 
 pub(crate) async fn load_commit_root(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateCommitRoot>, LixError> {
     // parse_lix canonicalizes test labels to the same synthetic UUID the
@@ -102,7 +102,7 @@ pub(crate) fn stage_commit_root(
 }
 
 pub(crate) async fn read_chunk(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     hash: &[u8; TRACKED_STATE_HASH_BYTES],
 ) -> Result<Option<Vec<u8>>, LixError> {
     get_one(store, TRACKED_STATE_TREE_CHUNK_SPACE, hash.to_vec()).await

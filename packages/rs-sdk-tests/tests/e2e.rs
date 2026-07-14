@@ -1,5 +1,5 @@
-use lix_sdk::{Backend, Lix, LixError};
-use lix_sdk::{FsBackend, open_lix_with_backend};
+use lix_sdk::{Lix, LixError, Storage};
+use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -539,14 +539,18 @@ async fn file_changes(lix: &Lix, file_id: &str) -> Vec<FileChange> {
         .collect()
 }
 
-async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
-    let backend = FsBackend::open(path).await.unwrap();
-    open_lix_with_backend(backend).await.unwrap()
+async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {
+    let storage = LocalFilesystem::open(path).await.unwrap();
+    open_lix_with_storage(storage).await.unwrap()
 }
 
-async fn install_plugin<B>(lix: &Lix<B>, key: &str, archive: &[u8]) -> Result<(), LixError>
+async fn install_plugin<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    key: &str,
+    archive: &[u8],
+) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     write_file(
         lix,
@@ -556,9 +560,13 @@ where
     .await
 }
 
-async fn write_file<B>(lix: &Lix<B>, path: &str, data: Vec<u8>) -> Result<(), LixError>
+async fn write_file<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+    data: Vec<u8>,
+) -> Result<(), LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -569,9 +577,12 @@ where
     Ok(())
 }
 
-async fn read_file<B>(lix: &Lix<B>, path: &str) -> Result<Option<Vec<u8>>, LixError>
+async fn read_file<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
@@ -592,9 +603,9 @@ struct InstalledPluginInfo {
     schema_keys: Vec<String>,
 }
 
-async fn list_installed_plugins<B>(lix: &Lix<B>) -> Vec<InstalledPluginInfo>
+async fn list_installed_plugins<StorageImpl>(lix: &Lix<StorageImpl>) -> Vec<InstalledPluginInfo>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let archives = lix
         .execute("SELECT path, data FROM lix_file ORDER BY path", &[])

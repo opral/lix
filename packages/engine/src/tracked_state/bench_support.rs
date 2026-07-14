@@ -1,8 +1,8 @@
 use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
-use crate::storage::StorageBackend;
-use crate::storage::{
-    SharedStorageRead, StorageContext, StorageReadOptions, StorageWriteOptions,
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{
+    SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
     StorageWriteSetStats,
 };
 use crate::tracked_state::{
@@ -20,8 +20,8 @@ pub struct BenchTrackedRow {
 }
 
 #[expect(missing_debug_implementations)]
-pub struct BenchTrackedFixture<B: StorageBackend> {
-    storage: StorageContext<B>,
+pub struct BenchTrackedFixture<StorageImpl: Storage> {
+    storage: StorageAdapter<StorageImpl>,
     context: TrackedStateContext,
     rows: Vec<BenchTrackedRow>,
     current_commit_id: Option<String>,
@@ -34,7 +34,7 @@ pub struct BenchWriteAccounting {
     pub staged_puts: u64,
     pub staged_deletes: u64,
     pub touched_spaces: u64,
-    pub backend_calls: u64,
+    pub storage_calls: u64,
     pub put_batches: u64,
     pub delete_batches: u64,
     pub written_bytes: u64,
@@ -61,7 +61,7 @@ impl BenchWriteOutcome {
             staged_puts: self.stats.staged_puts,
             staged_deletes: self.stats.staged_deletes,
             touched_spaces: self.stats.touched_spaces,
-            backend_calls: self.stats.backend_calls,
+            storage_calls: self.stats.storage_calls,
             put_batches: self.stats.put_batches,
             delete_batches: self.stats.delete_batches,
             written_bytes: self.stats.written_bytes,
@@ -69,11 +69,11 @@ impl BenchWriteOutcome {
     }
 }
 
-impl<B> BenchTrackedFixture<B>
+impl<StorageImpl> BenchTrackedFixture<StorageImpl>
 where
-    B: StorageBackend,
+    StorageImpl: Storage,
 {
-    pub fn new(storage: StorageContext<B>, rows: Vec<BenchTrackedRow>) -> Self {
+    pub fn new(storage: StorageAdapter<StorageImpl>, rows: Vec<BenchTrackedRow>) -> Self {
         Self {
             storage,
             context: TrackedStateContext::new(),
@@ -159,7 +159,7 @@ where
     }
 
     pub async fn read_all(&self) -> usize {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -192,7 +192,7 @@ where
     }
 
     async fn read_by_pk(&self, keys: &[TrackedStateKey]) -> usize {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -238,7 +238,7 @@ where
             .collect::<Vec<_>>();
         let deltas = owned.iter().map(OwnedDelta::as_ref).collect::<Vec<_>>();
         {
-            let read = SharedStorageRead::new(
+            let read = SharedStorageAdapterRead::new(
                 self.storage
                     .begin_read(StorageReadOptions::default())
                     .await
@@ -267,7 +267,7 @@ where
     }
 
     pub async fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -315,7 +315,7 @@ impl OwnedDelta {
         commit_id: &str,
         index: usize,
         deleted: bool,
-        _writes: &mut crate::storage::StorageWriteSet,
+        _writes: &mut crate::storage_adapter::StorageWriteSet,
     ) -> Self {
         let change_id = format!("tracked-crud-change-{commit_id}-{index}");
         Self {

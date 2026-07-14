@@ -47,7 +47,7 @@ pub struct ExpGitReplayArgs {
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub profile_json: Option<PathBuf>,
 
-    /// Write backend SQL tracing data as JSON.
+    /// Write SQL tracing data as JSON.
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub trace_sql_json: Option<PathBuf>,
 

@@ -31,7 +31,7 @@ use crate::sql2::history_route::{
 use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot,
 };
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
@@ -44,7 +44,7 @@ pub(super) fn register_entity_history_surface<S>(
     query_source: SqlHistoryQuerySource<S>,
 ) -> Result<(), LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     register_spec_table(
         session,
@@ -76,7 +76,7 @@ struct EntityHistorySpec<S> {
 #[async_trait]
 impl<S> TableSpec for EntityHistorySpec<S>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn table_name(&self) -> &str {
         &self.surface_name
@@ -157,7 +157,7 @@ async fn load_entity_history_rows<S>(
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<EntityHistoryRow>, LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let history_view_name = format!("{}_history", spec.schema_key);
     let entries = load_history_entries(

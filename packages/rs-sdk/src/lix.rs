@@ -1,32 +1,31 @@
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteOptions, ExecuteResult,
-    InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, ObserveEvents, SessionContext, SwitchBranchOptions, SwitchBranchReceipt,
-    Value,
+    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteOptions, ExecuteResult, LixError,
+    Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ObserveEvents, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
 /// Options for opening a Lix workspace session.
 #[expect(missing_debug_implementations)]
-pub struct OpenLixOptions<B = InMemoryBackend> {
-    pub backend: B,
+pub struct OpenLixOptions<StorageImpl = Memory> {
+    pub storage: StorageImpl,
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 }
 
-impl Default for OpenLixOptions<InMemoryBackend> {
+impl Default for OpenLixOptions<Memory> {
     fn default() -> Self {
         Self {
-            backend: InMemoryBackend::new(),
+            storage: Memory::new(),
             wasm_runtime: None,
         }
     }
 }
 
-impl<B> OpenLixOptions<B> {
-    pub fn new(backend: B) -> Self {
+impl<StorageImpl> OpenLixOptions<StorageImpl> {
+    pub fn new(storage: StorageImpl) -> Self {
         Self {
-            backend,
+            storage,
             wasm_runtime: None,
         }
     }
@@ -39,24 +38,26 @@ impl<B> OpenLixOptions<B> {
 
 /// Workspace-session handle for a Lix repository.
 #[expect(missing_debug_implementations)]
-pub struct Lix<B = InMemoryBackend>
+pub struct Lix<StorageImpl = Memory>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    _engine: Engine<B>,
-    session: SessionContext<B>,
+    _engine: Engine<StorageImpl>,
+    session: SessionContext<StorageImpl>,
 }
 
 /// Opens a Lix workspace session.
 ///
-/// `OpenLixOptions::default()` opens a fresh in-memory backend. Pass a
-/// concrete backend in `OpenLixOptions<B>` to open SQLite or custom backends
+/// `OpenLixOptions::default()` opens a fresh in-memory storage. Pass a
+/// concrete storage in `OpenLixOptions<StorageImpl>` to open SQLite or custom storage implementations
 /// with the same runtime configuration path.
-pub async fn open_lix<B>(options: OpenLixOptions<B>) -> Result<Lix<B>, LixError>
+pub async fn open_lix<StorageImpl>(
+    options: OpenLixOptions<StorageImpl>,
+) -> Result<Lix<StorageImpl>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = open_or_initialize_engine(options.backend, options.wasm_runtime).await?;
+    let engine = open_or_initialize_engine(options.storage, options.wasm_runtime).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
@@ -64,16 +65,18 @@ where
     })
 }
 
-pub async fn open_lix_with_backend<B>(backend: B) -> Result<Lix<B>, LixError>
+pub async fn open_lix_with_storage<StorageImpl>(
+    storage: StorageImpl,
+) -> Result<Lix<StorageImpl>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    open_lix(OpenLixOptions::new(backend)).await
+    open_lix(OpenLixOptions::new(storage)).await
 }
 
-impl<B> Lix<B>
+impl<StorageImpl> Lix<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
@@ -99,11 +102,15 @@ where
             .await
     }
 
-    pub fn observe(&self, sql: &str, params: &[Value]) -> Result<ObserveEvents<B>, LixError> {
+    pub fn observe(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ObserveEvents<StorageImpl>, LixError> {
         self.session.observe(sql, params)
     }
 
-    pub async fn begin_transaction(&self) -> Result<LixTransaction<B>, LixError> {
+    pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
         Ok(LixTransaction {
             inner: self.session.begin_transaction().await?,
         })
@@ -148,16 +155,16 @@ where
 }
 
 #[expect(missing_debug_implementations)]
-pub struct LixTransaction<B = InMemoryBackend>
+pub struct LixTransaction<StorageImpl = Memory>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: lix_engine::SessionTransaction<B>,
+    inner: lix_engine::SessionTransaction<StorageImpl>,
 }
 
-impl<B> LixTransaction<B>
+impl<StorageImpl> LixTransaction<StorageImpl>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Executes one SQL statement inside this transaction.
     ///
@@ -189,48 +196,52 @@ where
     }
 }
 
-pub(crate) async fn open_or_initialize_engine<B>(
-    backend: B,
+pub(crate) async fn open_or_initialize_engine<StorageImpl>(
+    storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
-) -> Result<Engine<B>, LixError>
+) -> Result<Engine<StorageImpl>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    match new_engine(backend.clone(), wasm_runtime.clone()).await {
+    match new_engine(storage.clone(), wasm_runtime.clone()).await {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
-            Engine::initialize(backend.clone()).await?;
-            new_engine(backend, wasm_runtime).await
+            Engine::initialize(storage.clone()).await?;
+            new_engine(storage, wasm_runtime).await
         }
         Err(error) => Err(error),
     }
 }
 
-async fn new_engine<B>(
-    backend: B,
+async fn new_engine<StorageImpl>(
+    storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
-) -> Result<Engine<B>, LixError>
+) -> Result<Engine<StorageImpl>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match wasm_runtime {
-        Some(wasm_runtime) => Engine::new_with_wasm_runtime(backend, wasm_runtime).await,
-        None => new_engine_with_default_runtime(backend).await,
+        Some(wasm_runtime) => Engine::new_with_wasm_runtime(storage, wasm_runtime).await,
+        None => new_engine_with_default_runtime(storage).await,
     }
 }
 
 #[cfg(feature = "default_wasm_runtime")]
-async fn new_engine_with_default_runtime<B>(backend: B) -> Result<Engine<B>, LixError>
+async fn new_engine_with_default_runtime<StorageImpl>(
+    storage: StorageImpl,
+) -> Result<Engine<StorageImpl>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::new_with_wasm_runtime(backend, crate::default_wasm_runtime::runtime()?).await
+    Engine::new_with_wasm_runtime(storage, crate::default_wasm_runtime::runtime()?).await
 }
 
 #[cfg(not(feature = "default_wasm_runtime"))]
-async fn new_engine_with_default_runtime<B>(backend: B) -> Result<Engine<B>, LixError>
+async fn new_engine_with_default_runtime<StorageImpl>(
+    storage: StorageImpl,
+) -> Result<Engine<StorageImpl>, LixError>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::new(backend).await
+    Engine::new(storage).await
 }

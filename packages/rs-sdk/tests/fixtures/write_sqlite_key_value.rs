@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use lix_sdk::{SqliteBackend, Value, open_lix_with_backend};
+use lix_sdk::{SQLite, Value, open_lix_with_storage};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -19,10 +19,10 @@ async fn main() {
         .and_then(|value| value.into_string().ok())
         .expect("usage: write_sqlite_key_value <path> <key> <value>");
 
-    let backend = SqliteBackend::open(&path).expect("sqlite backend should open");
-    let lix = open_lix_with_backend(backend.clone())
+    let storage = SQLite::open(&path).expect("sqlite storage should open");
+    let lix = open_lix_with_storage(storage.clone())
         .await
-        .expect("lix should open on sqlite backend");
+        .expect("lix should open on sqlite storage");
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
         &[Value::Text(key), Value::Text(value)],
@@ -30,7 +30,7 @@ async fn main() {
     .await
     .expect("key/value write should succeed");
     lix.close().await.expect("lix should close");
-    backend
+    storage
         .checkpoint()
-        .expect("sqlite backend should checkpoint fixture");
+        .expect("sqlite storage should checkpoint fixture");
 }

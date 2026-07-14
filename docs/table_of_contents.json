@@ -14,7 +14,7 @@
   ],
   "Guides": [
     { "path": "./persistence.md", "label": "Persistence" },
-    { "path": "./backend.md", "label": "Backends" }
+    { "path": "./storage.md", "label": "Storage" }
   ],
   "Reference": [
     { "path": "./js-api-reference.md", "label": "JavaScript API" },

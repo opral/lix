@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::storage::StorageBackend;
-use crate::storage::{
-    ScanPlan, StorageCoreProjection, StoragePrefix, StorageProjectedValue, StorageRead,
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{
+    ScanPlan, StorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageProjectedValue,
     StorageScanOptions, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
 };
 
@@ -48,12 +48,12 @@ pub struct StorageLayoutAccounting {
     pub value_bytes: u64,
 }
 
-pub(crate) async fn commit_write_set_for_bench<B>(
-    storage: &crate::storage::StorageContext<B>,
+pub(crate) async fn commit_write_set_for_bench<StorageImpl>(
+    storage: &crate::storage_adapter::StorageAdapter<StorageImpl>,
     writes: StorageWriteSet,
-) -> Result<crate::storage::StorageWriteSetStats, StorageWriteSetError>
+) -> Result<crate::storage_adapter::StorageWriteSetStats, StorageWriteSetError>
 where
-    B: StorageBackend,
+    StorageImpl: Storage,
 {
     let (_commit, stats) = storage
         .commit_write_set(writes, StorageWriteOptions::default())
@@ -63,7 +63,7 @@ where
 
 pub async fn layout_accounting<R>(read: &R) -> Vec<StorageLayoutAccounting>
 where
-    R: StorageRead,
+    R: StorageAdapterRead,
 {
     let mut accounting = Vec::with_capacity(native_storage_spaces().len());
     for space in native_storage_spaces() {
@@ -78,7 +78,7 @@ where
 /// must be complete; the function asserts it observed every row.
 pub async fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)>
 where
-    R: StorageRead,
+    R: StorageAdapterRead,
 {
     let space = *native_storage_spaces()
         .iter()
@@ -99,7 +99,7 @@ where
         .collect()
 }
 
-fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
+fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     &[
         crate::live_state::LIVE_STATE_INDEX_ROW_SPACE,
         crate::json_store::store::JSON_SPACE,
@@ -116,10 +116,10 @@ fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
 
 async fn scan_layout_space<R>(
     read: &R,
-    space: crate::storage::StorageSpace,
+    space: crate::storage_adapter::StorageSpace,
 ) -> StorageLayoutAccounting
 where
-    R: StorageRead,
+    R: StorageAdapterRead,
 {
     let entries = scan_layout_entries(read, space).await;
 
@@ -143,10 +143,10 @@ where
 
 async fn scan_layout_entries<R>(
     read: &R,
-    space: crate::storage::StorageSpace,
-) -> Vec<crate::storage::StorageReadEntry>
+    space: crate::storage_adapter::StorageSpace,
+) -> Vec<crate::storage_adapter::StorageReadEntry>
 where
-    R: StorageRead,
+    R: StorageAdapterRead,
 {
     let plan = ScanPlan::prefix(
         space,

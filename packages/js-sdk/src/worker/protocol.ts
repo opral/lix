@@ -1,6 +1,6 @@
 import type {
 	BindingParam,
-	LixBackendConfig,
+	LixStorageConfig,
 } from "../binding-types.js";
 import type {
 	CreateBranchOptions,
@@ -15,7 +15,7 @@ export type WorkerRequest = {
 };
 
 export type WorkerOperation =
-	| { kind: "open"; backend: LixBackendConfig }
+	| { kind: "open"; storage: LixStorageConfig }
 	| {
 			kind: "execute";
 			sql: string;

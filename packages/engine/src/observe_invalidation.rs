@@ -11,10 +11,10 @@ use tokio::sync::watch;
 #[cfg(not(target_family = "wasm"))]
 use crate::LixError;
 #[cfg(not(target_family = "wasm"))]
-use crate::storage::StorageBackend;
+use crate::storage_adapter::Storage;
 #[cfg(not(target_family = "wasm"))]
-use crate::storage::StorageContext;
-use crate::storage::StorageWriteSetStats;
+use crate::storage_adapter::StorageAdapter;
+use crate::storage_adapter::StorageWriteSetStats;
 
 #[cfg(not(target_family = "wasm"))]
 const EXTERNAL_MUTATION_REVISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -55,12 +55,12 @@ impl ObserveInvalidation {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) async fn ensure_external_watcher<B>(
+    pub(crate) async fn ensure_external_watcher<StorageImpl>(
         self: &Arc<Self>,
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
     ) -> Result<(), LixError>
     where
-        B: StorageBackend + Clone + Send + Sync + 'static,
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
         if self
             .external_watcher_started

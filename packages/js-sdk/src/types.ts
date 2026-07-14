@@ -1,17 +1,17 @@
-export type SqliteBackendOptions = {
+export type SQLiteOptions = {
 	path: string;
 };
 
-export type FsBackendOptions = {
+export type LocalFilesystemOptions = {
 	path: string;
 	lixDir?: string;
 	syncAllFiles: boolean;
 };
 
 export type OpenLixOptions = {
-	backend?:
-		| import("./open-lix.js").SqliteBackend
-		| import("./open-lix.js").FsBackend;
+	storage?:
+		| import("./open-lix.js").SQLite
+		| import("./open-lix.js").LocalFilesystem;
 };
 
 export type LixValue =

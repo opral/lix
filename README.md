@@ -13,7 +13,7 @@
 
 Lix tracks, reviews, branches, merges, and rolls back changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom file formats.
 
-Use Lix standalone or as the change-control backend for editors, knowledge bases, AI workflows, and file-based products. Lix stores files, tracks semantic changes, exposes history through SQL, and brings version control workflows beyond source code.
+Use Lix standalone or as the change-control layer for editors, knowledge bases, AI workflows, and file-based products. Lix stores files, tracks semantic changes, exposes history through SQL, and brings version control workflows beyond source code.
 
 - 📌 **Supports any file format.** Create drafts, branches, checkpoints, and releases for Markdown, DOCX, XLSX, JSON, PDFs, and custom formats.
 - 🔍 **Track semantic changes.** See the paragraph, cell, property, clause, or custom entity that changed.
@@ -42,10 +42,10 @@ npm install @lix-js/sdk
 ```
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "./workspace" }),
+	storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
 });
 
 await lix.execute(
@@ -90,10 +90,10 @@ Lix is built for those files. Plugins translate file updates into semantic chang
 Import Lix and open it inside your worker, service, CLI, browser, desktop app, or server-side runtime. No daemon, no protocol.
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "./workspace" }),
+	storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
 });
 ```
 
@@ -222,20 +222,20 @@ Use Lix standalone or plug it into the infrastructure your product already runs.
 <p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://api.iconify.design/logos:aws-s3.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({ path: "./workspace" }),
+	storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
 });
 ```
 
-Use `SqliteBackend` when a single `.lix` SQLite file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
+Use `SQLite` when a single `.lix` SQLite file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 
 ## How Lix works
 
 Lix runs in-process inside your runtime.
 
-It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. Use it standalone with `FsBackend` for filesystem workspaces, use SQLite for single-file application formats, or plug it into whatever backend you need: in-memory, Postgres, S3, Cloudflare, or your own adapter.
+It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. Use it standalone with `LocalFilesystem` for filesystem workspaces, use SQLite for single-file application formats, or plug it into whatever storage you need: in-memory, Postgres, S3, Cloudflare, or your own adapter.
 
 SQL is the query interface on top. Products, scripts, and agents can ask what changed without rereading whole files.
 
@@ -252,7 +252,7 @@ SQL is the query interface on top. Products, scripts, and agents can ask what ch
 └────────────────────────┼────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────┐
-│                    Backend                      │
+│                    Storage                      │
 │      SQLite, Postgres, S3, Cloudflare, custom   │
 └─────────────────────────────────────────────────┘
 ```

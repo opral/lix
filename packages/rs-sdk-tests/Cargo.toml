@@ -10,7 +10,7 @@ rust-version = "1.93"
 publish = false
 
 [dependencies]
-lix_sdk = { path = "../rs-sdk", version = "0.8.1", default-features = false, features = ["default_wasm_runtime", "fs_backend", "sqlite"] }
+lix_sdk = { path = "../rs-sdk", version = "0.8.1", default-features = false, features = ["default_wasm_runtime", "local_filesystem", "sqlite"] }
 
 [dev-dependencies]
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }

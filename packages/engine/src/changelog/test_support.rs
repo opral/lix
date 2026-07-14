@@ -2,15 +2,12 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, CommitChangeRefSet, CommitId, CommitRecord,
 };
 use crate::entity_pk::EntityPk;
-use crate::storage::{InMemoryStorageBackend, StorageContext};
+use crate::storage_adapter::{Memory, StorageAdapter};
 
 use super::ChangelogContext;
 
-pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageContext) {
-    (
-        ChangelogContext::new(),
-        StorageContext::new(InMemoryStorageBackend::new()),
-    )
+pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageAdapter) {
+    (ChangelogContext::new(), StorageAdapter::new(Memory::new()))
 }
 
 pub(crate) fn test_append() -> ChangelogAppend {

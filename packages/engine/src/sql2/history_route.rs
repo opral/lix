@@ -14,7 +14,7 @@ use crate::entity_pk::EntityPk;
 
 use super::SqlJsonReader;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
@@ -250,7 +250,7 @@ pub(crate) async fn load_history_entries<S>(
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<HistoryEntry>, LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     if route.is_contradictory() {
         return Ok(Vec::new());
@@ -646,9 +646,8 @@ mod tests {
     };
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
-    use crate::storage::{
-        InMemoryStorageBackend, InMemoryStorageRead, SharedStorageRead, StorageContext,
-        StorageReadOptions,
+    use crate::storage_adapter::{
+        Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
     };
 
     use super::{
@@ -873,14 +872,14 @@ mod tests {
         crate::common::LixTimestamp::expect_parse("commit timestamp", "2026-07-12T00:00:00Z")
     }
 
-    async fn empty_json_reader()
-    -> crate::sql2::SqlJsonReader<SharedStorageRead<InMemoryStorageRead>> {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+    async fn empty_json_reader() -> crate::sql2::SqlJsonReader<SharedStorageAdapterRead<MemoryRead>>
+    {
+        let storage = StorageAdapter::new(Memory::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        JsonStoreContext::new().reader(SharedStorageRead::new(read_scope))
+        JsonStoreContext::new().reader(SharedStorageAdapterRead::new(read_scope))
     }
 
     fn and(left: Expr, right: Expr) -> Expr {
