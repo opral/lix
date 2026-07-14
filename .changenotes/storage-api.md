@@ -1,5 +1,5 @@
 ---
-type: major
+type: patch
 ---
 
 Renamed the Lix backend API to storage across Rust, JavaScript, packages, and documentation.
