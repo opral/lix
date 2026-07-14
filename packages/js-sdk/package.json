@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.8.1",
+	"version": "1.0.0",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -53,10 +53,10 @@
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"optionalDependencies": {
-		"@lix-js/sdk-darwin-arm64": "0.8.1",
-		"@lix-js/sdk-linux-arm64": "0.8.1",
-		"@lix-js/sdk-linux-x64": "0.8.1",
-		"@lix-js/sdk-win32-x64": "0.8.1"
+		"@lix-js/sdk-darwin-arm64": "1.0.0",
+		"@lix-js/sdk-linux-arm64": "1.0.0",
+		"@lix-js/sdk-linux-x64": "1.0.0",
+		"@lix-js/sdk-win32-x64": "1.0.0"
 	},
 	"devDependencies": {
 		"@vitest/browser-playwright": "4.0.18",
