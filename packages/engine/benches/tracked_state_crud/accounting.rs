@@ -1,5 +1,5 @@
-use crate::backends::{BACKEND_PROFILES, BackendProfile};
 use crate::kv_layout::{self, KvLayoutAccounting, KvWriteAccounting};
+use crate::storage::{STORAGE_PROFILES, StorageProfile};
 use crate::transaction_api::{self, TransactionLayoutAccounting, TransactionWriteAccounting};
 use crate::workload::{WorkloadRow, row_label};
 
@@ -27,13 +27,13 @@ fn print_write_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow
     println!("### Write amplification");
     println!();
     println!(
-        "| Layer | Backend | Operation | Logical rows | Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Put batches | Delete batches | Written bytes | Put amp | Delete amp |"
+        "| Layer | Storage | Operation | Logical rows | Puts | Point deletes | Range deletes | Touched spaces | Storage calls | Put batches | Delete batches | Written bytes | Put amp | Delete amp |"
     );
     println!(
         "| ----- | ------- | --------- | -----------: | ---: | ------------: | ------------: | -------------: | ------------: | ----------: | -------------: | ------------: | ------: | ---------: |"
     );
 
-    for profile in BACKEND_PROFILES {
+    for profile in STORAGE_PROFILES {
         let mut kv_insert = runtime.block_on(kv_layout::empty_fixture(profile, rows));
         print_kv_write(
             profile,
@@ -124,10 +124,10 @@ fn print_write_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow
 fn print_layout_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
     println!("### Layout footprint after insert_all");
     println!();
-    println!("| Layer | Backend | Space id | Space | Rows | Key bytes | Value bytes |");
+    println!("| Layer | Storage | Space id | Space | Rows | Key bytes | Value bytes |");
     println!("| ----- | ------- | -------: | ----- | ---: | --------: | ----------: |");
 
-    for profile in BACKEND_PROFILES {
+    for profile in STORAGE_PROFILES {
         let kv = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         for row in runtime.block_on(kv.layout_accounting()) {
             print_kv_layout(profile, "kv_layout", row);
@@ -141,7 +141,7 @@ fn print_layout_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRo
 }
 
 fn print_kv_write(
-    profile: BackendProfile,
+    profile: StorageProfile,
     layer: &str,
     operation: &str,
     accounting: KvWriteAccounting,
@@ -156,7 +156,7 @@ fn print_kv_write(
             staged_deletes: accounting.staged_deletes,
             range_deletes: accounting.range_deletes,
             touched_spaces: accounting.touched_spaces,
-            backend_calls: accounting.backend_calls,
+            storage_calls: accounting.storage_calls,
             put_batches: accounting.put_batches,
             delete_batches: accounting.delete_batches,
             written_bytes: accounting.written_bytes,
@@ -165,7 +165,7 @@ fn print_kv_write(
 }
 
 fn print_transaction_write(
-    profile: BackendProfile,
+    profile: StorageProfile,
     layer: &str,
     operation: &str,
     accounting: TransactionWriteAccounting,
@@ -180,7 +180,7 @@ fn print_transaction_write(
             staged_deletes: accounting.staged_deletes,
             range_deletes: 0,
             touched_spaces: accounting.touched_spaces,
-            backend_calls: accounting.backend_calls,
+            storage_calls: accounting.storage_calls,
             put_batches: accounting.put_batches,
             delete_batches: accounting.delete_batches,
             written_bytes: accounting.written_bytes,
@@ -194,13 +194,13 @@ struct WriteRow {
     staged_deletes: u64,
     range_deletes: u64,
     touched_spaces: u64,
-    backend_calls: u64,
+    storage_calls: u64,
     put_batches: u64,
     delete_batches: u64,
     written_bytes: u64,
 }
 
-fn print_write_row(profile: BackendProfile, layer: &str, operation: &str, row: WriteRow) {
+fn print_write_row(profile: StorageProfile, layer: &str, operation: &str, row: WriteRow) {
     println!(
         "| {layer} | {} | {operation} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         profile.name(),
@@ -209,7 +209,7 @@ fn print_write_row(profile: BackendProfile, layer: &str, operation: &str, row: W
         row.staged_deletes,
         row.range_deletes,
         row.touched_spaces,
-        row.backend_calls,
+        row.storage_calls,
         row.put_batches,
         row.delete_batches,
         row.written_bytes,
@@ -218,7 +218,7 @@ fn print_write_row(profile: BackendProfile, layer: &str, operation: &str, row: W
     );
 }
 
-fn print_kv_layout(profile: BackendProfile, layer: &str, row: KvLayoutAccounting) {
+fn print_kv_layout(profile: StorageProfile, layer: &str, row: KvLayoutAccounting) {
     print_layout_row(
         profile,
         layer,
@@ -233,7 +233,7 @@ fn print_kv_layout(profile: BackendProfile, layer: &str, row: KvLayoutAccounting
 }
 
 fn print_transaction_layout(
-    profile: BackendProfile,
+    profile: StorageProfile,
     layer: &str,
     row: TransactionLayoutAccounting,
 ) {
@@ -258,7 +258,7 @@ struct LayoutRow {
     value_bytes: u64,
 }
 
-fn print_layout_row(profile: BackendProfile, layer: &str, row: LayoutRow) {
+fn print_layout_row(profile: StorageProfile, layer: &str, row: LayoutRow) {
     println!(
         "| {layer} | {} | `0x{:08x}` | `{}` | {} | {} | {} |",
         profile.name(),

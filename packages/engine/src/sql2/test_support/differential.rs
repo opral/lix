@@ -11,7 +11,7 @@ mod tests {
         DifferentialSqlCase, ExpectedExecution, deterministic_repro_cases, generated_dml_cases,
     };
     use crate::sql2::{WriteExecutorMode, WriteExecutorPath};
-    use crate::storage::InMemoryStorageBackend;
+    use crate::storage_adapter::Memory;
     use crate::{Engine, ExecuteResult, LixError, Value};
 
     #[derive(Debug, Clone)]
@@ -261,13 +261,13 @@ mod tests {
     }
 
     async fn open_initialized_engine() -> Engine {
-        let backend = InMemoryStorageBackend::new();
-        Engine::initialize(backend.clone())
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
             .await
-            .expect("unit backend should initialize");
-        Engine::new(backend)
+            .expect("unit storage should initialize");
+        Engine::new(storage)
             .await
-            .expect("engine should open over initialized unit backend")
+            .expect("engine should open over initialized unit storage")
     }
 
     async fn create_probe_branches(session: &crate::SessionContext) {

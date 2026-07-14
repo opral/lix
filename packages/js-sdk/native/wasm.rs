@@ -11,9 +11,9 @@ use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Function, Promise, Reflect};
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, ExecuteOptions as RsExecuteOptions,
-    ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SwitchBranchOptions as RsSwitchBranchOptions, Value,
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime, open_lix,
@@ -23,14 +23,14 @@ use serde_bytes::ByteBuf;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-type BrowserLix = RsLix<InMemoryBackend>;
-type BrowserTransaction = RsLixTransaction<InMemoryBackend>;
-type BrowserObserveEvents = RsObserveEvents<InMemoryBackend>;
+type BrowserLix = RsLix<Memory>;
+type BrowserTransaction = RsLixTransaction<Memory>;
+type BrowserObserveEvents = RsObserveEvents<Memory>;
 
 #[wasm_bindgen]
 pub struct WasmLix {
     inner: BrowserLix,
-    backend: InMemoryBackend,
+    storage: Memory,
 }
 
 #[wasm_bindgen]
@@ -57,21 +57,22 @@ pub async fn open_memory_from_snapshot(
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
     let runtime = Arc::new(BrowserJsWasmRuntime::new(plugin_runtime_dispatch));
-    let backend = match snapshot {
-        Some(snapshot) => InMemoryBackend::from_snapshot(&snapshot)
-            .map_err(|error| lix_error_to_js(error.into()))?,
-        None => InMemoryBackend::new(),
+    let storage = match snapshot {
+        Some(snapshot) => {
+            Memory::from_snapshot(&snapshot).map_err(|error| lix_error_to_js(error.into()))?
+        }
+        None => Memory::new(),
     };
-    let options = RsOpenLixOptions::new(backend.clone()).with_wasm_runtime(runtime);
+    let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(runtime);
     let inner = open_lix(options).await.map_err(lix_error_to_js)?;
-    Ok(WasmLix { inner, backend })
+    Ok(WasmLix { inner, storage })
 }
 
 #[wasm_bindgen]
 impl WasmLix {
     #[wasm_bindgen(js_name = exportSnapshot)]
     pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        self.backend
+        self.storage
             .export_snapshot()
             .map_err(|error| lix_error_to_js(error.into()))
     }

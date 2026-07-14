@@ -21,9 +21,11 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 lix_cli = { path = "packages/cli", version = "0.8.1" }
-lix_backends = { path = "packages/backends", version = "0.8.1", default-features = false }
 lix_engine = { path = "packages/engine", version = "0.8.1" }
-lix_fs_backend = { path = "packages/fs-backend", version = "0.8.1", default-features = false }
+lix_local_filesystem = { path = "packages/local-filesystem", version = "0.8.1", default-features = false }
+lix_rocksdb_storage = { path = "packages/rocksdb-storage", version = "0.8.1" }
+lix_slatedb_storage = { path = "packages/slatedb-storage", version = "0.8.1" }
+lix_sqlite_storage = { path = "packages/sqlite-storage", version = "0.8.1" }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.8.1" }
 lix_order_key = { path = "plugins/order-key", version = "0.8.1" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.8.1" }

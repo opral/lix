@@ -42,15 +42,15 @@ test("loadChanges preserves changelog summary and explainer paragraphs", () => {
 	mkdirSync(join(root, ".changenotes"));
 	writeFileSync(
 		join(root, ".changenotes", "sqlite-reads.md"),
-		`---\ntype: patch\n---\n\nImproved SQLite backend read performance.\n\nThe backend now avoids loading values for key-only reads.\nWrapped lines stay in the same paragraph.\n`,
+		`---\ntype: patch\n---\n\nImproved SQLite storage read performance.\n\nThe storage now avoids loading values for key-only reads.\nWrapped lines stay in the same paragraph.\n`,
 	);
 	assert.deepEqual(loadChanges(root), [
 		{
 			path: ".changenotes/sqlite-reads.md",
 			type: "patch",
-			body: "Improved SQLite backend read performance.\n\nThe backend now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph.",
-			summary: "Improved SQLite backend read performance.",
-			details: ["The backend now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph."],
+			body: "Improved SQLite storage read performance.\n\nThe storage now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph.",
+			summary: "Improved SQLite storage read performance.",
+			details: ["The storage now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph."],
 		},
 	]);
 });
@@ -85,10 +85,10 @@ test("changelogEntry groups entries by type", () => {
 			},
 			{
 				type: "patch",
-				body: "Improved SQLite backend read performance.\n\nThe backend now avoids loading values for key-only reads.",
+				body: "Improved SQLite storage read performance.\n\nThe storage now avoids loading values for key-only reads.",
 			},
 		]),
-		`## 0.7.0 - 2026-05-29\n\n### Minor\n\n- Added branch merge preview support.\n\n### Patch\n\n- Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)\n- Improved SQLite backend read performance.\n\n  The backend now avoids loading values for key-only reads.\n\n`,
+		`## 0.7.0 - 2026-05-29\n\n### Minor\n\n- Added branch merge preview support.\n\n### Patch\n\n- Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)\n- Improved SQLite storage read performance.\n\n  The storage now avoids loading values for key-only reads.\n\n`,
 	);
 });
 
@@ -127,7 +127,7 @@ test("updateCargoToml bumps internal path dependency versions", () => {
 	mkdirSync(join(root, "packages", "rs-sdk-tests"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
-		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_backends = { path = "packages/backends", version = "0.6.2", default-features = false }\nlix_engine = { path = "packages/engine", version = "0.6.2" }\n`,
+		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_sqlite_storage = { path = "packages/sqlite-storage", version = "0.6.2" }\nlix_rocksdb_storage = { path = "packages/rocksdb-storage", version = "0.6.2" }\nlix_slatedb_storage = { path = "packages/slatedb-storage", version = "0.6.2" }\nlix_engine = { path = "packages/engine", version = "0.6.2" }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
@@ -140,7 +140,10 @@ test("updateCargoToml bumps internal path dependency versions", () => {
 
 	updateCargoToml(root, "0.7.0");
 
-	assert.match(readFileSync(join(root, "Cargo.toml"), "utf8"), /lix_backends = \{ path = "packages\/backends", version = "0\.7\.0"/);
+	const rootCargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
+	assert.match(rootCargoToml, /lix_sqlite_storage = \{ path = "packages\/sqlite-storage", version = "0\.7\.0"/);
+	assert.match(rootCargoToml, /lix_rocksdb_storage = \{ path = "packages\/rocksdb-storage", version = "0\.7\.0"/);
+	assert.match(rootCargoToml, /lix_slatedb_storage = \{ path = "packages\/slatedb-storage", version = "0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /version = "0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);

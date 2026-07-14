@@ -16,9 +16,10 @@ use crate::live_state::{
 };
 use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::session::SessionMode;
-use crate::storage::StorageBackend;
-use crate::storage::{
-    SharedStorageRead, StorageContext, StorageReadOptions, StorageWriteSet, StorageWriteSetStats,
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{
+    SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteSet,
+    StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
@@ -38,8 +39,8 @@ pub struct BenchTransactionRow {
 }
 
 #[expect(missing_debug_implementations)]
-pub struct BenchTransactionFixture<B: StorageBackend> {
-    storage: StorageContext<B>,
+pub struct BenchTransactionFixture<StorageImpl: Storage> {
+    storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -54,7 +55,7 @@ pub struct BenchWriteAccounting {
     pub staged_puts: u64,
     pub staged_deletes: u64,
     pub touched_spaces: u64,
-    pub backend_calls: u64,
+    pub storage_calls: u64,
     pub put_batches: u64,
     pub delete_batches: u64,
     pub written_bytes: u64,
@@ -69,15 +70,15 @@ pub struct BenchLayoutAccounting {
     pub value_bytes: u64,
 }
 
-impl<B> BenchTransactionFixture<B>
+impl<StorageImpl> BenchTransactionFixture<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Like [`Self::new`], but enables the engine's deterministic functions
     /// before any transaction runs, so ids and timestamps are
     /// sequence-derived and two fixtures produce byte-identical storage.
     pub async fn new_deterministic(
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
         rows: Vec<BenchTransactionRow>,
     ) -> Self {
         let fixture = Self::new(storage.clone(), rows).await;
@@ -85,7 +86,7 @@ where
         fixture
     }
 
-    pub async fn new(storage: StorageContext<B>, rows: Vec<BenchTransactionRow>) -> Self {
+    pub async fn new(storage: StorageAdapter<StorageImpl>, rows: Vec<BenchTransactionRow>) -> Self {
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
@@ -164,7 +165,7 @@ where
     }
 
     pub async fn read_all(&self) -> usize {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -213,9 +214,9 @@ where
 
     /// Returns every visible row's identity and snapshot content, sorted by
     /// identity. Unlike the timed read helpers this materializes contents,
-    /// so equivalence tests can compare logical state across backends.
+    /// so equivalence tests can compare logical state across storage implementations.
     pub async fn read_all_contents(&self) -> Vec<(String, String)> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -252,7 +253,7 @@ where
     }
 
     async fn read_one(&self, row: &BenchTransactionRow) -> usize {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -332,10 +333,10 @@ where
     }
 }
 
-async fn seed_deterministic_mode<B>(storage: StorageContext<B>)
+async fn seed_deterministic_mode<StorageImpl>(storage: StorageAdapter<StorageImpl>)
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    for<'storage> StorageImpl::Read<'storage>: Send,
 {
     let snapshot_content = serde_json::to_string(&json!({
         "key": crate::functions::DETERMINISTIC_MODE_KEY,
@@ -345,7 +346,7 @@ where
     let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
     let entity_pk = EntityPk::single(crate::functions::DETERMINISTIC_MODE_KEY);
     let change_id = ChangeId::for_test_label("bench-deterministic-mode");
-    let mut read = SharedStorageRead::new(
+    let mut read = SharedStorageAdapterRead::new(
         storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -398,7 +399,7 @@ fn write_accounting(logical_rows: usize, stats: StorageWriteSetStats) -> BenchWr
         staged_puts: stats.staged_puts,
         staged_deletes: stats.staged_deletes,
         touched_spaces: stats.touched_spaces,
-        backend_calls: stats.backend_calls,
+        storage_calls: stats.storage_calls,
         put_batches: stats.put_batches,
         delete_batches: stats.delete_batches,
         written_bytes: stats.written_bytes,
@@ -429,11 +430,11 @@ fn transaction_delete_row(row: &BenchTransactionRow) -> TransactionWriteRow {
     out
 }
 
-async fn seed_visible_schema_rows<B>(
-    storage: StorageContext<B>,
+async fn seed_visible_schema_rows<StorageImpl>(
+    storage: StorageAdapter<StorageImpl>,
     tracked_state: &TrackedStateContext,
 ) where
-    B: StorageBackend + Clone,
+    StorageImpl: Storage + Clone,
 {
     let mut writes = StorageWriteSet::new();
     let mut schemas = crate::schema::seed_schema_definitions()
@@ -462,7 +463,7 @@ async fn seed_visible_schema_rows<B>(
             }
         })
         .collect::<Vec<_>>();
-    let mut read = SharedStorageRead::new(
+    let mut read = SharedStorageAdapterRead::new(
         storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -483,7 +484,7 @@ async fn seed_visible_schema_rows<B>(
         .expect("schema fixture tracked rows should commit");
 
     drop(read);
-    let mut read = SharedStorageRead::new(
+    let mut read = SharedStorageAdapterRead::new(
         storage
             .begin_read(StorageReadOptions::default())
             .await

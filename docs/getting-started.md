@@ -12,7 +12,7 @@ This walks through opening Lix, registering a schema, writing a row, isolating a
 npm install @lix-js/sdk
 ```
 
-`openLix()` with no arguments opens an in-memory Lix, enough for tests and demos. For persistent local files, use `FsBackend`; see [Persistence](./persistence.md).
+`openLix()` with no arguments opens an in-memory Lix, enough for tests and demos. For persistent local files, use `LocalFilesystem`; see [Persistence](./persistence.md).
 
 ## Open Lix
 
@@ -23,10 +23,10 @@ const lix = await openLix();
 ```
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: "./workspace",
 		syncAllFiles: true,
 	}),

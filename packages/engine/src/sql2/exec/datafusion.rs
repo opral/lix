@@ -1473,9 +1473,9 @@ mod tests {
         execute_write_logical_plan, execute_write_logical_plan_with_mode_and_trace,
         parse_statement, plan_write,
     };
-    use crate::storage::{
-        InMemoryStorageBackend, InMemoryStorageRead, SharedStorageRead, StorageContext,
-        StorageReadOptions, StorageReadScope,
+    use crate::storage_adapter::{
+        Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope,
+        StorageReadOptions,
     };
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
@@ -1501,9 +1501,7 @@ mod tests {
     }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
-    fn test_read_scope(
-        storage: &StorageContext<InMemoryStorageBackend>,
-    ) -> StorageReadScope<InMemoryStorageRead> {
+    fn test_read_scope(storage: &StorageAdapter<Memory>) -> StorageAdapterReadScope<MemoryRead> {
         storage
             .begin_read(StorageReadOptions::default())
             .now_or_never()
@@ -1600,7 +1598,7 @@ mod tests {
     }
 
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
-        type ReadStore = SharedStorageRead<InMemoryStorageRead>;
+        type ReadStore = SharedStorageAdapterRead<MemoryRead>;
 
         fn active_branch_id(&self) -> &str {
             self.active_branch_id
@@ -1625,16 +1623,16 @@ mod tests {
         }
 
         fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
-            let storage = StorageContext::new(InMemoryStorageBackend::new());
-            let read_scope = SharedStorageRead::new(test_read_scope(&storage));
+            let storage = StorageAdapter::new(Memory::new());
+            let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             HistoryQuerySource {
                 json_reader: JsonStoreContext::new().reader(read_scope),
             }
         }
 
         fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
-            let storage = StorageContext::new(InMemoryStorageBackend::new());
-            let read_scope = SharedStorageRead::new(test_read_scope(&storage));
+            let storage = StorageAdapter::new(Memory::new());
+            let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             ChangelogQuerySource {
                 store: read_scope.clone(),
                 json_reader: JsonStoreContext::new().reader(read_scope),
@@ -2271,9 +2269,9 @@ mod tests {
     }
 
     async fn setup_engine_history_fixture() -> Result<(SessionContext, String), LixError> {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone()).await?;
-        let engine = Engine::new(backend).await?;
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone()).await?;
+        let engine = Engine::new(storage).await?;
         let session = engine.open_session(init_receipt.main_branch_id).await?;
 
         session
@@ -2325,11 +2323,11 @@ mod tests {
 
     #[tokio::test]
     async fn lix_file_path_predicates_preserve_literal_values_like_writes() {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone())
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(backend).await.expect("engine should open");
+        let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_branch_id)
             .await
@@ -2385,11 +2383,11 @@ mod tests {
 
     #[tokio::test]
     async fn lix_directory_path_predicates_preserve_literal_values_like_writes() {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone())
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(backend).await.expect("engine should open");
+        let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_branch_id)
             .await

@@ -75,10 +75,10 @@ describe("resolveDocsMarkdownHref", () => {
     relativePath: "./persistence.md",
   };
   const docsByRelativePath = {
-    "./backend.md": {
-      slug: "backend",
+    "./storage.md": {
+      slug: "storage",
       content: "",
-      relativePath: "./backend.md",
+      relativePath: "./storage.md",
     },
     "./versions.md": {
       slug: "versions",
@@ -89,18 +89,18 @@ describe("resolveDocsMarkdownHref", () => {
 
   test("resolves portable markdown links to clean docs routes", () => {
     expect(
-      resolveDocsMarkdownHref("./backend.md", currentDoc, docsByRelativePath),
-    ).toBe("/docs/backend");
+      resolveDocsMarkdownHref("./storage.md", currentDoc, docsByRelativePath),
+    ).toBe("/docs/storage");
   });
 
   test("resolves page-url based markdown links to clean docs routes", () => {
     expect(
       resolveDocsMarkdownHref(
-        "/docs/persistence/backend.md",
+        "/docs/persistence/storage.md",
         currentDoc,
         docsByRelativePath,
       ),
-    ).toBe("/docs/backend");
+    ).toBe("/docs/storage");
   });
 
   test("preserves heading hashes", () => {

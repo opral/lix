@@ -6,36 +6,32 @@
 
 #[cfg(feature = "default_wasm_runtime")]
 mod default_wasm_runtime;
-#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
+#[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
 mod filesystem;
 mod lix;
 #[cfg(feature = "sqlite")]
-mod sqlite_backend;
+mod sqlite;
 
-#[cfg(all(not(target_family = "wasm"), feature = "fs_backend"))]
-pub use filesystem::{FsBackend, FsBackendOpenOptions};
-pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
+#[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
+pub use filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
+pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_storage};
 pub use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
 pub use lix_engine::{
-    Backend, BackendConformanceReport, BackendConformanceResult, BackendConformanceStatus,
-    BackendConformanceTest, BackendError, BackendFactory, BackendFixture, BackendRead,
-    BackendTestConfig, BackendWrite, CommitResult, CoreProjection, CreateBranchOptions,
-    CreateBranchReceipt, CreateBranchReceipt as CreateBranchResult, ExecuteOptions, ExecuteResult,
-    GetManyResult, GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange,
-    LixError, LixNotice, MAX_SCAN_PAGE_ROWS, MergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeBranchReceipt as MergeBranchResult, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent, ObserveEvents,
-    ProjectedValue, PutBatch, ReadEntry, ReadOptions, Row, ScanChunk, ScanOptions, SpaceId,
-    SqlQueryResult, StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
-    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, Value, WriteOptions, WriteStats,
-    run_backend_conformance,
+    CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
+    CreateBranchReceipt as CreateBranchResult, ExecuteOptions, ExecuteResult, GetManyResult,
+    GetOptions, Key, KeyRange, LixError, LixNotice, MAX_SCAN_PAGE_ROWS, Memory, MemoryRead,
+    MemoryWrite, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    ObserveEvent, ObserveEvents, ProjectedValue, PutBatch, ReadEntry, ReadOptions, Row, ScanChunk,
+    ScanOptions, SpaceId, SqlQueryResult, Storage, StorageConformanceReport,
+    StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
+    StorageFactory, StorageFixture, StorageRead, StorageTestConfig, StorageWrite, StoredValue,
+    SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
+    TryFromValue, Value, WriteOptions, WriteStats, run_storage_conformance,
 };
 #[cfg(feature = "sqlite")]
-pub use sqlite_backend::{
-    SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory, SqliteBackendFixture,
-    SqliteBackendOptions,
-};
+pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

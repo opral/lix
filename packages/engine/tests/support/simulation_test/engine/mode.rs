@@ -17,7 +17,7 @@ impl SimulationMode {
 /// Options for `simulation_test!`.
 ///
 /// Deterministic mode is enabled by default so the base and rebuild runs can be
-/// compared exactly without per-backend result normalization.
+/// compared exactly without per-storage result normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimulationOptions {
     pub deterministic: bool,

@@ -1,5 +1,9 @@
 # Tracked CRUD Optimization Log
 
+> This is a historical measurement log. Storage implementations and runnable
+> commands reflect the repository at the date of each entry; Redb has since
+> been removed from the current benchmark matrix.
+
 ## Baseline: 2026-05-19 corrected fixture setup
 
 Command used for the regular scorecard:
@@ -38,8 +42,8 @@ Notes:
   the transaction layer. It bypasses SQL/DataFusion but still exercises
   normalization, validation, changelog segments/indexes, commit visibility,
   branch refs, and tracked-state commit roots.
-- `sql_session` runs on `InMemoryStorageBackend`; the copied SQLite/RocksDB/redb
-  backend support modules do not satisfy the SQL session read bounds.
+- `sql_session` runs on `Memory`; the copied SQLite/RocksDB/redb
+  storage support modules do not satisfy the SQL session read bounds.
 - SQL update benches are gated behind `LIX_TRACKED_STATE_CRUD_SQL_UPDATE=1`.
   The supported per-row `UPDATE ... WHERE path = ...` shape is functionally
   valid but too slow for the default scorecard; Criterion estimated about
@@ -51,7 +55,7 @@ Times below use Criterion point estimates from the corrected fixture rerun.
 
 ### Direct KV Layout
 
-| Backend | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    4.21 ms |   656 us |         510 us |        1.63 ms |    3.80 ms |     946 us |    1.96 ms |     663 us |
 | RocksDB |     537 us |   176 us |        7.27 us |         532 us |     586 us |    18.0 us |    31.8 us |    10.5 us |
@@ -61,7 +65,7 @@ Times below use Criterion point estimates from the corrected fixture rerun.
 
 Direct transaction API, bypassing SQL.
 
-| Backend | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   34.07 ms | 18.92 ms |        8.40 ms |         8.79 s |  102.24 ms |   65.75 ms |  104.40 ms |   66.72 ms |
 | RocksDB |   29.09 ms | 18.42 ms |        8.43 ms |         8.08 s |   93.32 ms |   64.16 ms |   87.40 ms |   63.03 ms |
@@ -69,7 +73,7 @@ Direct transaction API, bypassing SQL.
 
 ### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   73.88 ms | 22.69 ms |        6.15 ms |       29.78 ms |   excluded |   excluded |  104.21 ms |   83.30 ms |
 
@@ -81,10 +85,10 @@ layout footprint.
 
 ### Write Amplification
 
-These counts are backend-independent for the current logical layout; the same
+These counts are storage-independent for the current logical layout; the same
 numbers were observed for SQLite, RocksDB, and redb.
 
-| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Put batches | Delete batches | Written bytes | Put amp |
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Storage calls | Put batches | Delete batches | Written bytes | Put amp |
 | ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ----------: | -------------: | ------------: | ------: |
 | kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |           1 |              0 |       396,363 |   1.00x |
 | kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |           1 |              0 |       482,607 |   1.00x |
@@ -99,7 +103,7 @@ numbers were observed for SQLite, RocksDB, and redb.
 
 ### Layout Footprint After Insert
 
-These counts are also backend-independent for the current fixture content. The
+These counts are also storage-independent for the current fixture content. The
 transaction table inventories every native storage space.
 
 | Layer       |     Space id | Space                                  |  Rows | Key bytes | Value bytes |
@@ -132,14 +136,14 @@ Change:
 - Readers still verify through current `commit_visibility(commit_id)` and
   segment membership before treating a change as visible.
 - Routine smoke replaced `read_all_by_pk/1k` with `read_many_by_pk/10`; the old
-  serial 1,000-key benchmark took about 80-90 seconds per backend group and was
+  serial 1,000-key benchmark took about 80-90 seconds per storage group and was
   not a useful CRUD smoke signal.
 
 Smoke scorecard after this change. `read_many_by_pk` reads 10 primary keys:
 
 ### Direct KV Layout
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    2.32 ms |   473 us |         295 us |          352 us |    2.62 ms |     670 us |    1.13 ms |     501 us |
 | RocksDB |     448 us |   158 us |        3.12 us |         9.14 us |     483 us |    9.34 us |    5.82 us |    12.2 us |
@@ -149,7 +153,7 @@ Smoke scorecard after this change. `read_many_by_pk` reads 10 primary keys:
 
 Direct transaction API, bypassing SQL.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   34.77 ms | 18.09 ms |        8.86 ms |        85.40 ms |  100.97 ms |   68.25 ms |   91.43 ms |   68.17 ms |
 | RocksDB |   30.27 ms | 17.68 ms |        8.21 ms |        83.35 ms |   90.37 ms |   66.39 ms |   88.94 ms |   64.31 ms |
@@ -157,7 +161,7 @@ Direct transaction API, bypassing SQL.
 
 ### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   70.25 ms | 20.34 ms |        5.81 ms |         9.27 ms |   excluded |   excluded |  101.20 ms |   82.01 ms |
 
@@ -212,7 +216,7 @@ Smoke scorecard after this change. `read_many_by_pk` reads 10 primary keys:
 
 ### Direct KV Layout
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    2.24 ms |   500 us |         286 us |          351 us |    2.53 ms |     618 us |    1.22 ms |     552 us |
 | RocksDB |     438 us |   161 us |        5.94 us |         19.5 us |     549 us |    14.4 us |    6.96 us |    6.63 us |
@@ -222,7 +226,7 @@ Smoke scorecard after this change. `read_many_by_pk` reads 10 primary keys:
 
 Direct transaction API, bypassing SQL.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   33.07 ms | 17.95 ms |        8.81 ms |        86.18 ms |   97.71 ms |   65.77 ms |   95.75 ms |   68.97 ms |
 | RocksDB |   30.49 ms | 17.64 ms |        8.59 ms |        83.26 ms |   92.16 ms |   64.95 ms |   88.70 ms |   64.81 ms |
@@ -230,7 +234,7 @@ Direct transaction API, bypassing SQL.
 
 ### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   70.48 ms | 20.16 ms |        6.25 ms |         6.90 ms |   excluded |   excluded |  110.40 ms |   86.32 ms |
 
@@ -300,7 +304,7 @@ Purpose:
 
 ### Direct KV Layout
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    2.47 ms |   561 us |         342 us |          391 us |    2.81 ms |     703 us |    1.25 ms |     555 us |
 | RocksDB |     489 us |   173 us |        6.26 us |         14.5 us |     536 us |    12.7 us |    7.69 us |    7.37 us |
@@ -310,7 +314,7 @@ Purpose:
 
 Direct transaction API, bypassing SQL.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   35.54 ms | 18.93 ms |        9.69 ms |        89.16 ms |  100.36 ms |   72.15 ms |   96.67 ms |   67.77 ms |
 | RocksDB |   30.25 ms | 17.97 ms |        8.42 ms |        86.40 ms |   96.97 ms |   66.33 ms |   89.20 ms |   65.77 ms |
@@ -318,7 +322,7 @@ Direct transaction API, bypassing SQL.
 
 ### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   76.84 ms | 21.72 ms |        6.68 ms |         7.75 ms |   excluded |   excluded |  111.17 ms |   87.64 ms |
 
@@ -353,8 +357,8 @@ Notes:
 - This run is after the physical-layout hard cut to direct
   `changelog.commit`, direct `changelog.change`,
   `changelog.commit_change_ref_chunk`, and `tracked_state.commit_root`.
-- The scorecard also required finishing the backend support `open(path)` API so
-  the bench backends own their persistence handles internally.
+- The scorecard also required finishing the storage support `open(path)` API so
+  the bench storage implementations own their persistence handles internally.
 - Criterion: 10 samples, 250 ms warmup, 1 s measurement for smoke groups.
 - Values below are Criterion point estimates.
 
@@ -362,7 +366,7 @@ Notes:
 
 #### Direct KV Layout
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    2.29 ms |   501 us |         329 us |          333 us |    2.75 ms |     614 us |    1.17 ms |     520 us |
 | RocksDB |     438 us |   158 us |        2.84 us |         9.55 us |     569 us |    13.6 us |    5.72 us |    6.90 us |
@@ -372,7 +376,7 @@ Notes:
 
 Direct transaction API, bypassing SQL.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   12.74 ms |  3.20 ms |         181 us |          668 us |   15.13 ms |    2.27 ms |   12.87 ms |    2.24 ms |
 | RocksDB |   10.39 ms |  2.87 ms |        86.2 us |          420 us |   12.70 ms |    1.93 ms |   11.41 ms |    1.73 ms |
@@ -380,7 +384,7 @@ Direct transaction API, bypassing SQL.
 
 #### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   17.61 ms |  6.22 ms |        1.30 ms |         1.35 ms |   excluded |   excluded |   14.48 ms |    6.52 ms |
 
@@ -388,7 +392,7 @@ Direct transaction API, bypassing SQL.
 
 The logical write counts were identical across SQLite, RocksDB, and redb.
 
-| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Storage calls | Written bytes | Put amp | Delete amp |
 | ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
 | kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
 | kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
@@ -446,7 +450,7 @@ Notes:
 
 Transaction layer, direct transaction API, Criterion point estimates:
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   12.83 ms |  3.06 ms |         188 us |          657 us |   14.79 ms |    2.26 ms |   14.09 ms |    2.24 ms |
 | RocksDB |   11.44 ms |  2.96 ms |        67.1 us |          436 us |   12.43 ms |    2.00 ms |   11.49 ms |    1.62 ms |
@@ -454,7 +458,7 @@ Transaction layer, direct transaction API, Criterion point estimates:
 
 SQL session:
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   16.89 ms |  5.68 ms |        1.31 ms |         1.48 ms |   excluded |   excluded |   14.19 ms |    6.25 ms |
 
@@ -463,7 +467,7 @@ SQL session:
 The logical write counts were unchanged. Written bytes dropped because the
 `changelog.commit_change_ref_chunk` values are smaller.
 
-| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Storage calls | Written bytes | Put amp | Delete amp |
 | ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
 | kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
 | kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
@@ -532,7 +536,7 @@ Notes:
 Transaction layer, direct transaction API, Criterion point estimates after the
 incremental estimator fix:
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   13.12 ms |  3.17 ms |         191 us |          747 us |   15.17 ms |    2.30 ms |   13.94 ms |    2.35 ms |
 | RocksDB |   10.20 ms |  2.90 ms |        61.9 us |          402 us |   11.86 ms |    1.57 ms |   11.42 ms |    1.64 ms |
@@ -540,7 +544,7 @@ incremental estimator fix:
 
 SQL session:
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | in-memory |   17.43 ms |  5.58 ms |        1.26 ms |         1.37 ms |   excluded |   excluded |   14.56 ms |    6.42 ms |
 
@@ -626,7 +630,7 @@ Notes:
 
 Criterion point estimates:
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   12.99 ms |  3.18 ms |         190 us |          658 us |   16.72 ms |    1.95 ms |   14.69 ms |    2.03 ms |
 | RocksDB |   10.40 ms |  2.90 ms |        62.7 us |          413 us |   11.22 ms |    1.47 ms |   13.39 ms |    1.64 ms |
@@ -634,7 +638,7 @@ Criterion point estimates:
 
 ### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
 | in-memory |   17.92 ms |  5.75 ms |        1.22 ms |         1.32 ms |   14.38 ms |    6.33 ms |
 
@@ -655,7 +659,7 @@ The previous full smoke was the bounded-chunk regression fix entry.
 
 Criterion flagged SQLite update-all and RocksDB delete-all as regressions, but
 the changes do not line up with this patch's direct insert target and are likely
-smoke-run variance or unrelated backend noise. The direct transaction insert
+smoke-run variance or unrelated storage noise. The direct transaction insert
 path remains effectively stable in the full scorecard after the focused
 SQLite-only run showed a significant local improvement against Criterion's
 cached baseline.
@@ -674,7 +678,7 @@ Notes:
   wraps only the transaction operation.
 - Fixture setup and teardown are now outside the returned Criterion duration.
   This keeps SQLite connection close/drop out of the transaction insert timing.
-- Added a write-connection pool to the SQLite benchmark/test backend, matching
+- Added a write-connection pool to the SQLite benchmark/test storage, matching
   the existing read-pool shape, so committed write handles can be reused.
 - Storage accounting is unchanged. This is a measurement-harness cleanup, not a
   physical-layout change.
@@ -683,7 +687,7 @@ Notes:
 
 Criterion point estimates:
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    1.64 ms |   329 us |         150 us |          202 us |    1.55 ms |    89.9 us |     513 us |    48.1 us |
 | RocksDB |     449 us |   164 us |        4.20 us |         10.7 us |     487 us |    16.4 us |    6.63 us |    4.69 us |
@@ -693,7 +697,7 @@ Criterion point estimates:
 
 Criterion point estimates:
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   13.66 ms |  3.28 ms |         246 us |          695 us |   15.39 ms |    1.96 ms |   13.71 ms |    2.23 ms |
 | RocksDB |   10.22 ms |  2.90 ms |        63.7 us |          406 us |   11.58 ms |    1.46 ms |   11.18 ms |    1.55 ms |
@@ -701,7 +705,7 @@ Criterion point estimates:
 
 ### SQL Session
 
-| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| Storage   | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
 | in-memory |   17.27 ms |  5.73 ms |        1.35 ms |         1.45 ms |   14.74 ms |    6.54 ms |
 
@@ -743,10 +747,10 @@ Notes:
 - Fresh baseline on branch `fable-5-optimization` (HEAD `e554c557`) before a
   new round of optimization and bug squashing. No code changes in this entry.
 - The harness has changed since the last log entry: SQL session benches now
-  run on the real `lix_sqlite`, `lix_rocksdb`, and `lix_redb` backends instead
-  of a single in-memory backend, so SQL session numbers are not directly
+  run on the real `lix_sqlite`, `lix_rocksdb`, and `lix_redb` storage implementations instead
+  of a single in-memory storage, so SQL session numbers are not directly
   comparable to earlier entries.
-- The accounting report now also emits per-backend rows; logical write counts
+- The accounting report now also emits per-storage rows; logical write counts
   and layout footprint were identical across SQLite, RocksDB, and redb.
 - Criterion: 10 samples, 250 ms warmup, 1 s measurement. Values are Criterion
   point estimates.
@@ -755,7 +759,7 @@ Notes:
 
 #### Direct KV Layout
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    1.76 ms |   304 us |         130 us |          192 us |    1.56 ms |    68.0 us |     422 us |    54.0 us |
 | RocksDB |     428 us |   161 us |        2.32 us |         7.98 us |     490 us |    8.60 us |    17.9 us |    4.96 us |
@@ -765,7 +769,7 @@ Notes:
 
 Direct transaction API, bypassing SQL.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   10.91 ms |  2.84 ms |         189 us |          679 us |   14.01 ms |    1.57 ms |   12.94 ms |    1.62 ms |
 | RocksDB |    9.15 ms |  2.65 ms |        93.0 us |          298 us |    9.82 ms |    1.35 ms |    9.44 ms |    1.34 ms |
@@ -773,10 +777,10 @@ Direct transaction API, bypassing SQL.
 
 #### SQL Session
 
-Now runs on the real backends; SQL updates remain gated behind
+Now runs on the real storage implementations; SQL updates remain gated behind
 `LIX_TRACKED_STATE_CRUD_SQL_UPDATE=1` and excluded.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
 | SQLite  |   17.97 ms |  6.59 ms |        1.29 ms |         1.53 ms |   18.25 ms |    7.85 ms |
 | RocksDB |   16.40 ms |  5.78 ms |        1.05 ms |         1.24 ms |   12.69 ms |    6.37 ms |
@@ -786,7 +790,7 @@ Now runs on the real backends; SQL updates remain gated behind
 
 Logical write counts were identical across SQLite, RocksDB, and redb.
 
-| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Storage calls | Written bytes | Put amp | Delete amp |
 | ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
 | kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
 | kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
@@ -840,7 +844,7 @@ reference is the bounded-chunk/codec-cut entries. Intervening mainline commits
 | `commit_change_ref_chunk` value bytes  |  101,325 |   71,882 | -29.1% |
 
 SQL session numbers have no comparable previous entry because the harness moved
-from the in-memory backend to the three real backends.
+from the in-memory storage to the three real storage implementations.
 
 ## Optimization Run: compiled schema catalog cache
 
@@ -893,7 +897,7 @@ Change:
 
 Direct transaction API, bypassing SQL. Criterion point estimates:
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   10.57 ms |  3.00 ms |         194 us |          666 us |   14.30 ms |    1.06 ms |   11.86 ms |    1.25 ms |
 | RocksDB |    9.00 ms |  2.77 ms |        41.8 us |          271 us |    8.43 ms |     623 us |    8.08 ms |     613 us |
@@ -901,7 +905,7 @@ Direct transaction API, bypassing SQL. Criterion point estimates:
 
 #### SQL Session
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
 | SQLite  |   17.84 ms |  6.60 ms |        1.32 ms |         1.48 ms |   15.52 ms |    6.91 ms |
 | RocksDB |   15.77 ms |  5.69 ms |        1.04 ms |         1.18 ms |   12.54 ms |    5.61 ms |
@@ -912,7 +916,7 @@ Direct transaction API, bypassing SQL. Criterion point estimates:
 Control group; this patch does not touch the KV layout path. Movement here is
 run-to-run noise on microsecond-scale benches.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    1.52 ms |   301 us |         168 us |          175 us |    1.58 ms |    70.4 us |     432 us |    52.6 us |
 | RocksDB |     437 us |   161 us |        2.73 us |         10.0 us |     470 us |    9.10 us |    4.69 us |    4.33 us |
@@ -1001,7 +1005,7 @@ group stayed within historical variance.
 
 #### Transaction Layer
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |   10.79 ms |  2.88 ms |         202 us |          688 us |   13.26 ms |     885 us |   11.83 ms |     947 us |
 | RocksDB |    8.16 ms |  2.65 ms |        41.7 us |          260 us |    8.46 ms |     420 us |    8.08 ms |     493 us |
@@ -1009,7 +1013,7 @@ group stayed within historical variance.
 
 #### SQL Session
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
 | SQLite  |   17.50 ms |  6.33 ms |        1.27 ms |         1.47 ms |   15.80 ms |    6.67 ms |
 | RocksDB |   14.30 ms |  5.49 ms |        1.11 ms |         1.15 ms |   12.14 ms |    5.54 ms |
@@ -1019,7 +1023,7 @@ group stayed within historical variance.
 
 Control group; untouched by this patch.
 
-| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| Storage | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
 | SQLite  |    1.51 ms |   303 us |         158 us |          189 us |    1.57 ms |    74.1 us |     485 us |    43.7 us |
 | RocksDB |     425 us |   156 us |        2.61 us |         7.29 us |     477 us |    8.53 us |    4.64 us |    5.08 us |
@@ -1039,7 +1043,7 @@ Control group; untouched by this patch.
 | redb transaction update_one_by_pk    |  5.14 ms |  5.19 ms |  +1.0% |
 
 redb single-row ops are dominated by redb's fixed per-commit durability cost,
-so the catalog-path savings do not move them; that cost is a backend
+so the catalog-path savings do not move them; that cost is a storage
 characteristic, not an engine overhead.
 
 Cumulative since the 2026-06-09 baseline (both catalog cache rounds):
@@ -1053,7 +1057,7 @@ storage state, which needs an invalidation story; deferred. The validation
 fast-path (unconsumable fk_target bookkeeping, jsonschema is_valid) remains
 the next bulk-op target.
 
-## Backend Contract: sorted batch lowering and unspecified visit order
+## Storage Contract: sorted batch lowering and unspecified visit order
 
 Date: 2026-06-10
 
@@ -1064,6 +1068,9 @@ LIX_WRITE_SET_ORDER_STATS=1 LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p l
 cargo test -p lix_engine --features storage-benches
 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'kv_layout/lix_redb/smoke/update_all_rows'
 ```
+
+The final command above targeted the since-removed Redb implementation and is
+retained only to document that historical measurement.
 
 Measurement (env-gated `LIX_WRITE_SET_ORDER_STATS` probe in write-set
 lowering):
@@ -1077,21 +1084,21 @@ lowering):
 
 Changes:
 
-- `StorageWriteSet` lowering now delivers each space batch to the backend
+- `StorageWriteSet` lowering now delivers each space batch to the storage
   sorted by key ascending (skipping the sort when the batch is already
   sorted, which is the common case for changelog/tree spaces; the
   sortedness check itself is a read-only scan). Within a group all keys
   share the space prefix, so logical order equals physical order. The
   order probe reports natural order before the sort and covers puts and
   deletes.
-- `BackendWrite::put_many`/`delete_many` document the contract: at most one
+- `StorageWrite::put_many`/`delete_many` document the contract: at most one
   mutation per key, engine-produced batches sorted ascending.
-- `BackendRead::visit_keys` order is now actively enforced as unspecified: a
-  new order-scrambling backend decorator (`tests/backend/scrambled.rs`)
+- `StorageRead::visit_keys` order is now actively enforced as unspecified: a
+  new order-scrambling storage decorator (`tests/storage/scrambled.rs`)
   replays point-read visits in a seeded-shuffled order and must pass both
-  the backend conformance suite and a full transaction CRUD equivalence
+  the storage conformance suite and a full transaction CRUD equivalence
   test (identical row contents and identical per-space layout accounting at
-  every stage versus the plain in-memory backend; byte-exact physical
+  every stage versus the plain in-memory storage; byte-exact physical
   comparison is impossible because commit/change ids differ per run). Both
   pass.
 
@@ -1118,7 +1125,7 @@ delete_all investigation used the single-binary toggle. All engine test
 targets pass; accounting is unchanged (sorting only reorders within a
 batch).
 
-The rs-sdk SQLite backend keeps its internal sort as a cheap verification
+The rs-sdk SQLite storage keeps its internal sort as a cheap verification
 pass; with engine-sorted input it degenerates to a single ascending-run
 detection.
 
@@ -1155,7 +1162,7 @@ Change (hard cut, no migration):
 - Scan `start_after` tokens now parse as UUIDs, so a malformed resume token
   errors instead of silently scanning from an arbitrary text position.
 
-### Storage A/B (1k insert footprint, identical on all three backends)
+### Storage A/B (1k insert footprint, identical on all three storage implementations)
 
 | Space                               | Key bytes before | after  |  Delta |
 | ----------------------------------- | ---------------: | -----: | -----: |
@@ -1220,7 +1227,7 @@ Change (hard cut):
   Property tests cover representative shapes, 512 generated heavy-prefix
   keys, determinism, and malformed-byte rejection.
 
-### Storage A/B (1k insert footprint, identical across backends)
+### Storage A/B (1k insert footprint, identical across storage implementations)
 
 | Metric                              |  Before |   After |  Delta |
 | ----------------------------------- | ------: | ------: | -----: |
@@ -1308,7 +1315,7 @@ dictionaried path (its fixture values are full tracked-state encodings) but
 compares the two fixtures against each other, so it catches order-dependent
 bugs only; deterministic codec bugs are the round-trip/golden suites' job.
 
-### Storage A/B (1k insert footprint, identical across backends)
+### Storage A/B (1k insert footprint, identical across storage implementations)
 
 | Metric                                | Before  | After   | Delta  |
 | ------------------------------------- | ------: | ------: | -----: |
@@ -1375,7 +1382,7 @@ content-prefix sharing. Lesson recorded: front-coding through a
 length-prefixed encoding is structurally crippled; check the byte layout
 before estimating.
 
-### Storage A/B (1k insert footprint, identical across backends)
+### Storage A/B (1k insert footprint, identical across storage implementations)
 
 | Metric                                 | Before  | After   | Delta  |
 | -------------------------------------- | ------: | ------: | -----: |
@@ -1448,7 +1455,7 @@ Date: 2026-06-10
 Command:
 
 ```sh
-LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite_backend -- 'space_prefix_scan|space_truncate'
+LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite -- 'space_prefix_scan|space_truncate'
 ```
 
 Preparation for the per-space-tables format cut. The rs-sdk bench
@@ -1483,9 +1490,9 @@ Date: 2026-06-10
 Commands:
 
 ```sh
-cargo bench -p lix_sdk --features sqlite --bench sqlite_backend
+cargo bench -p lix_sdk --features sqlite --bench sqlite
 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke'
-LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite_backend -- 'no_match'
+LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite -- 'no_match'
 cargo test -p lix_sdk --features sqlite && cargo test -p lix_engine --features storage-benches
 ```
 
@@ -1515,7 +1522,7 @@ a clear no-migration error):
   with no self-referential borrows, no re-queries, and has_more answered
   by stepping the already-open cursor one row ahead.
 - The engine test-support copy
-  (`packages/engine/tests/backend/support/sqlite_backend.rs`) is
+  (`packages/engine/tests/storage/support/sqlite.rs`) is
   byte-identical (the engine cannot depend on lix_sdk); both files carry a
   sync note.
 
@@ -1575,16 +1582,16 @@ v1: 1 table, 3,331 pages, 13,643,776 bytes. v2: 6 tables, 3,339 pages,
   e2e, usize::MAX-limit regression). `cargo test -p lix_engine
   --features storage-benches`: 1,568 passed. clippy zero across both.
 
-## Space-Aware Backend Interface + Per-Space SQLite Tables
+## Space-Aware Storage Interface + Per-Space SQLite Tables
 
 Date: 2026-06-10
 
-Hard cut of the Backend trait and the SQLite file format (v2), replacing
+Hard cut of the Storage trait and the SQLite file format (v2), replacing
 the prefixed-key keyspace with an explicit, typed interface:
 
 - Every read/write method takes `space: SpaceId`; keys are logical bytes.
   `scan(space, range, opts, visitor) -> ScanResult` replaces the
-  cursor API (`BackendRangeScan`, `with_range_scan`, `visit_next`) - git
+  cursor API (`StorageRangeScan`, `with_range_scan`, `visit_next`) - git
   archaeology showed every production caller made exactly one visit_next
   call per cursor, with pagination via resume_after.
 - The engine's physical-key codec (encode/decode of the 4-byte space
@@ -1595,8 +1602,8 @@ the prefixed-key keyspace with an explicit, typed interface:
   order proofs, sqlite_master listings, and the commit-gated existence
   cache from the first partitioned design are all deleted: writes run
   CREATE TABLE IF NOT EXISTS unconditionally (~us of DDL parse), reads
-  probe once per call. redb, RocksDB, the in-memory backend, and the CLI
-  file backend keep single-keyspace layouts and prefix internally in ~30
+  probe once per call. redb, RocksDB, the in-memory storage, and the CLI
+  file storage keep single-keyspace layouts and prefix internally in ~30
   private lines each.
 - Conformance tests the spaces contract; the bench fixtures and the
   scrambled equivalence decorator are space-aware.
@@ -1687,7 +1694,7 @@ store row it replaced, so even the single-row-update write path
 improves despite carrying neighbors.
 
 e2e merge_10k (stash-alternating, two pairs): 195.9/200.5 ms baseline →
-194.1/188.8 ms, ≈ −3.4% end to end from halved backend puts and the
+194.1/188.8 ms, ≈ −3.4% end to end from halved storage puts and the
 deleted per-row point read.
 
 Open cost, recorded deliberately: changelog.change values grow +94 KB
@@ -1862,7 +1869,7 @@ free was rejected because empty id strings are currently legal
 marker ambiguous. Real workloads key on lix_uuid_v7() defaults.
 
 No version gate: shipped inside the open SQLITE_FORMAT_VERSION = 3
-window (the backend gate in sqlite_backend.rs) on the premise that no
+window (the storage gate in sqlite.rs) on the premise that no
 v3 file with the old record encoding exists outside this branch. A
 pre-packing record read by the new decoder fails loudly ("unknown id
 string tag 36"). Suites: engine 972 lib + integration all green, sdk

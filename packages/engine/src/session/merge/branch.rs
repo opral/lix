@@ -2,7 +2,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::storage::StorageBackend;
+use crate::storage_adapter::Storage;
 
 use super::analysis::{MergeCommits, MergeOutcome, analyze};
 use super::conflicts::{
@@ -100,9 +100,9 @@ pub enum MergeBranchOutcome {
     MergeCommitted,
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Previews merging `source_branch_id` into this session's active branch
     /// without advancing refs, staging changes, or creating commits.

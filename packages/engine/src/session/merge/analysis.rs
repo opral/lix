@@ -1,6 +1,6 @@
 use crate::LixError;
 use crate::changelog::CommitId;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStateStoreReader,
     plan_merge,
@@ -45,7 +45,7 @@ pub(crate) async fn analyze<S>(
     commits: MergeCommits,
 ) -> Result<MergeAnalysis, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let request = TrackedStateDiffRequest::default();
     let base_commit_id = commits.base_commit_id.to_string();

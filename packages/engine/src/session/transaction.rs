@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::storage::InMemoryStorageBackend;
-use crate::storage::StorageBackend;
+use crate::storage_adapter::Memory;
+use crate::storage_adapter::Storage;
 use tokio::sync::Notify;
 
 use crate::LixError;
@@ -17,8 +17,8 @@ use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
 
 #[expect(missing_debug_implementations)]
-pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
-    pub(super) transaction: Option<Transaction<B>>,
+pub struct SessionTransaction<StorageImpl: Storage = Memory> {
+    pub(super) transaction: Option<Transaction<StorageImpl>>,
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,
     observe_invalidation: Arc<ObserveInvalidation>,
@@ -26,11 +26,11 @@ pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
     write_access: Option<SessionWriteAccess>,
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
+    pub async fn begin_transaction(&self) -> Result<SessionTransaction<StorageImpl>, LixError> {
         self.ensure_open()?;
         let write_access = self.begin_explicit_session_write_access().await?;
         let deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
@@ -72,11 +72,11 @@ where
     }
 }
 
-impl<B> SessionTransaction<B>
+impl<StorageImpl> SessionTransaction<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<B>, LixError> {
+    pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<StorageImpl>, LixError> {
         self.ensure_session_open()?;
         self.transaction
             .as_mut()

@@ -449,7 +449,7 @@ async fn load_branch_rows_scoped(
         BranchHeadReadStrategy::Batch => {
             // A read session has already resolved and cached the active branch.
             // Keep the zero-to-two-descriptor case on point lookup: the active
-            // head is already cached, so at most one backend read remains.
+            // head is already cached, so at most one storage read remains.
             // Batch once there is actual fanout to collapse.
             if descriptors.len() <= 2 {
                 return load_branch_rows_with_point_lookups(descriptors, branch_ref).await;

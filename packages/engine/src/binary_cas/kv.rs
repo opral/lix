@@ -11,8 +11,10 @@ use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
     BlobWriteReceipt,
 };
-use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
-use crate::storage::{
+use crate::storage_adapter::{
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
+};
+use crate::storage_adapter::{
     StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
     StorageScanOptions, StorageSpaceId, StorageValue,
 };
@@ -56,7 +58,7 @@ pub(crate) struct KvChunk {
 
 #[cfg(test)]
 async fn load_manifest(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     blob_hash: BlobHash,
 ) -> Result<Option<BinaryCasManifest>, LixError> {
     let Some(bytes) = get_one(store, BINARY_CAS_MANIFEST_SPACE, manifest_key(blob_hash)).await?
@@ -79,7 +81,7 @@ pub(crate) fn stage_manifest(
 }
 
 pub(crate) async fn scan_manifest_chunks(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     blob_hash: BlobHash,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
     scan_all_values(
@@ -117,7 +119,7 @@ pub(crate) fn stage_manifest_chunk(
 
 #[cfg(test)]
 async fn load_chunk(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     chunk_hash: BlobHash,
 ) -> Result<Option<KvChunk>, LixError> {
     let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_SPACE, chunk_key(chunk_hash)).await? else {
@@ -147,7 +149,7 @@ pub(crate) fn stage_chunk(
 
 #[cfg(test)]
 async fn get_one(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
@@ -163,7 +165,7 @@ async fn get_one(
 }
 
 async fn scan_all_values(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     space: StorageSpace,
     prefix: Vec<u8>,
 ) -> Result<Vec<Vec<u8>>, LixError> {
@@ -200,7 +202,7 @@ async fn scan_all_values(
 }
 
 pub(crate) async fn load_metadata_many(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     hashes: &[BlobHash],
 ) -> Result<BlobMetadataBatch, LixError> {
     if hashes.is_empty() {
@@ -237,7 +239,7 @@ pub(crate) async fn load_metadata_many(
 }
 
 pub(crate) async fn load_bytes_many(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     hashes: &[BlobHash],
 ) -> Result<BlobBytesBatch, LixError> {
     let metadata = load_metadata_many(store, hashes).await?.into_vec();
@@ -308,7 +310,7 @@ pub(crate) async fn load_bytes_many(
 }
 
 async fn load_chunk_rows(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     hashes: &[BlobHash],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
     if hashes.is_empty() {
@@ -323,7 +325,7 @@ async fn load_chunk_rows(
 }
 
 async fn point_values(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     space: StorageSpace,
     keys: Vec<Vec<u8>>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
@@ -551,7 +553,7 @@ pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
     precomputed_hash: Option<BlobHash>,
 ) -> Result<BlobWriteReceipt, LixError>
 where
-    S: StorageRead + ?Sized,
+    S: StorageAdapterRead + ?Sized,
 {
     let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
     let receipt = plan.receipt.clone();
@@ -707,7 +709,7 @@ fn stage_prepared_blob_write(
 }
 
 async fn missing_chunk_hashes(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
     plan: &BlobWritePlan,
@@ -756,7 +758,7 @@ fn collect_chunk_lookup_candidate(
 }
 
 async fn chunk_keys_exist(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     keys: Vec<StorageKey>,
 ) -> Result<Vec<bool>, LixError> {
     let started = Instant::now();
@@ -852,14 +854,14 @@ mod tests {
     }
     use crate::binary_cas::BinaryCasContext;
     use crate::binary_cas::BlobPayload;
-    use crate::storage::StorageContext;
-    use crate::storage::{
-        InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{
+        Memory, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
     };
 
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let blob_hash = BlobHash::from_content(b"blob-a");
         let chunk_a_hash = BlobHash::from_content(b"chunk-a").into_bytes();
         let chunk_b_hash = BlobHash::from_content(b"chunk-b").into_bytes();
@@ -934,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn stores_encoded_chunks_by_chunk_hash() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let chunk = KvChunk {
             codec: BinaryChunkCodec::Raw,
             uncompressed_len: 5,
@@ -987,7 +989,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_blob_bytes() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = b"hello chunked kv cas";
         let blob_hash = BlobHash::from_content(data);
 
@@ -1039,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_chunk_aware_writer_skips_persisted_chunk_payloads() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = b"hello chunked kv cas";
         let payload = BlobPayload::from_bytes(data.to_vec());
         let blob_hash = payload.hash().expect("payload should have a hash");
@@ -1090,7 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_chunk_aware_writer_batches_persisted_chunk_checks() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
         let blob_hash = payload.hash().expect("payload should have a hash");
@@ -1190,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_accepts_precomputed_blob_hash() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = b"hello precomputed hash";
         let payload = BlobPayload::from_bytes(data.to_vec());
         let blob_hash = payload
@@ -1233,7 +1235,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_rejects_chunk_bytes_that_do_not_match_manifest_hash() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = b"same length";
         let corrupted = b"SAME length";
         let blob_hash = BlobHash::from_content(data);
@@ -1281,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_rejects_manifest_that_assembles_wrong_blob_hash() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let expected = b"expected bytes";
         let substituted = b"different byte";
         assert_eq!(expected.len(), substituted.len());
@@ -1336,7 +1338,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_empty_blob() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = b"";
         let blob_hash = BlobHash::from_content(data);
 
@@ -1375,7 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_multi_chunk_blob() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let data = definitely_multi_chunk_blob_bytes();
         let blob_hash = BlobHash::from_content(&data);
 

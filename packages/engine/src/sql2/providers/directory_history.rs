@@ -31,7 +31,7 @@ use crate::sql2::providers::filesystem_history_path::{
     HistoryDirectoryPathRecord, resolve_history_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history::entity_pk_json_array;
@@ -46,7 +46,7 @@ pub(super) async fn register_lix_directory_history_surface<S>(
     query_source: SqlHistoryQuerySource<S>,
 ) -> Result<(), LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     register_spec_table(
         session,
@@ -69,7 +69,7 @@ struct LixDirectoryHistorySpec<S> {
 #[async_trait]
 impl<S> TableSpec for LixDirectoryHistorySpec<S>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     #[expect(clippy::unnecessary_literal_bound)]
     fn table_name(&self) -> &str {
@@ -198,7 +198,7 @@ async fn load_directory_history_rows<S>(
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError>
 where
-    S: StorageRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let event_route = route.traversal_only();
     let event_entries = load_history_entries(

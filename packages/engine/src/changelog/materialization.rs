@@ -4,7 +4,9 @@ use crate::LixError;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
 };
-use crate::storage::{PointReadPlan, StorageGetOptions, StorageProjectedValue, StorageRead};
+use crate::storage_adapter::{
+    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageProjectedValue,
+};
 
 use super::{CHANGE_SPACE, ChangeId, ChangeRecord, change_key, decode_change_record};
 
@@ -57,7 +59,7 @@ pub(crate) async fn load_change_records<S>(
     change_ids: impl Iterator<Item = ChangeId>,
 ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -71,7 +73,9 @@ where
     }
     let keys = unique
         .iter()
-        .map(|change_id| crate::storage::StorageKey(bytes::Bytes::from(change_key(*change_id))))
+        .map(|change_id| {
+            crate::storage_adapter::StorageKey(bytes::Bytes::from(change_key(*change_id)))
+        })
         .collect::<Vec<_>>();
     let result = PointReadPlan::new(CHANGE_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
@@ -94,7 +98,7 @@ pub(crate) async fn materialize_change_payloads<S>(
     owner: &str,
 ) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -193,7 +197,7 @@ async fn load_json_values<S>(
     json_refs: &[JsonRef],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     if json_refs.is_empty() {
         return Ok(Vec::new());

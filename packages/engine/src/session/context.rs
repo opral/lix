@@ -25,9 +25,9 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
-use crate::storage::StorageBackend;
-use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
-use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{Memory, StorageReadOptions};
+use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
 use crate::{LixError, NullableKeyFilter};
@@ -51,9 +51,9 @@ pub(crate) enum SessionMode {
 /// transaction handle.
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
+pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) mode: SessionMode,
-    pub(super) storage: StorageContext<B>,
+    pub(super) storage: StorageAdapter<StorageImpl>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
@@ -66,12 +66,12 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     transaction_manager: SessionTransactionManager,
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     pub(crate) async fn open_workspace(
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -101,7 +101,7 @@ where
 
     pub(crate) async fn open(
         active_branch_id: String,
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -131,7 +131,7 @@ where
 
     pub(super) fn new(
         mode: SessionMode,
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -160,7 +160,7 @@ where
 
     pub(super) fn new_with_transaction_manager(
         mode: SessionMode,
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -224,7 +224,7 @@ where
     }
 
     pub(super) async fn deterministic_mode_enabled(&self) -> Result<bool, LixError> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -291,7 +291,7 @@ where
     ///
     /// This is a read-path helper. Write flows must resolve the active branch
     /// through the transaction capability so the read is scoped to the
-    /// same backend transaction as the writes it influences.
+    /// same storage transaction as the writes it influences.
     ///
     /// Pinned sessions are pure in-memory views over one branch. Workspace
     /// sessions read the shared workspace selector from untracked global
@@ -299,7 +299,7 @@ where
     /// active workspace branch.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -326,7 +326,7 @@ where
         reader: &S,
     ) -> Result<String, LixError>
     where
-        S: StorageRead + ?Sized,
+        S: StorageAdapterRead + ?Sized,
     {
         self.ensure_open()?;
         match &self.mode {
@@ -337,7 +337,7 @@ where
 
     async fn load_workspace_branch_id<S>(&self, reader: &S) -> Result<String, LixError>
     where
-        S: StorageRead + ?Sized,
+        S: StorageAdapterRead + ?Sized,
     {
         let row = self
             .live_state
@@ -394,7 +394,7 @@ where
     pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>
     where
         F: for<'tx> FnOnce(
-            &'tx mut Transaction<B>,
+            &'tx mut Transaction<StorageImpl>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
@@ -409,7 +409,7 @@ where
     ) -> Result<T, LixError>
     where
         F: for<'tx> FnOnce(
-            &'tx mut Transaction<B>,
+            &'tx mut Transaction<StorageImpl>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         let _deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
@@ -458,9 +458,9 @@ where
     }
 }
 
-impl<B> PluginComponentHost for SessionContext<B>
+impl<StorageImpl> PluginComponentHost for SessionContext<StorageImpl>
 where
-    B: StorageBackend,
+    StorageImpl: Storage,
 {
     fn plugin_component_cache(
         &self,
@@ -487,9 +487,9 @@ pub(super) fn closed_error() -> LixError {
 ///
 /// Write statements re-plan against `Transaction`; this context intentionally
 /// has no write stager.
-pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBackendRead> {
+pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::StorageRead> {
     pub(super) active_branch_id: &'a str,
-    pub(super) read_store: SharedStorageRead<R>,
+    pub(super) read_store: SharedStorageAdapterRead<R>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
@@ -500,9 +500,9 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBacke
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
 where
-    R: crate::storage::StorageBackendRead + 'static,
+    R: crate::storage_adapter::StorageRead + 'static,
 {
-    type ReadStore = SharedStorageRead<R>;
+    type ReadStore = SharedStorageAdapterRead<R>;
 
     fn active_branch_id(&self) -> &str {
         self.active_branch_id
@@ -569,10 +569,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::Engine;
-    use crate::backend::{
-        BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions, WriteOptions,
+    use crate::storage::{
+        Memory, MemoryRead, MemoryWrite, ReadOptions, StorageError, WriteOptions,
     };
-    use crate::storage::StorageBackend;
+    use crate::storage_adapter::Storage;
     use futures_util::task::noop_waker_ref;
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -617,14 +617,14 @@ mod tests {
         }
     }
 
-    async fn open_session() -> std::sync::Arc<super::SessionContext<InMemoryBackend>> {
-        let backend = InMemoryBackend::default();
-        let _receipt = Engine::initialize(backend.clone())
+    async fn open_session() -> std::sync::Arc<super::SessionContext<Memory>> {
+        let storage = Memory::default();
+        let _receipt = Engine::initialize(storage.clone())
             .await
-            .expect("backend should initialize");
-        let engine = Engine::new(backend)
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
             .await
-            .expect("initialized backend should create engine");
+            .expect("initialized storage should create engine");
         std::sync::Arc::new(
             engine
                 .open_workspace_session()
@@ -634,17 +634,17 @@ mod tests {
     }
 
     async fn open_blocking_read_session() -> (
-        std::sync::Arc<super::SessionContext<BlockingBeginReadBackend>>,
+        std::sync::Arc<super::SessionContext<BlockingBeginReadStorage>>,
         BlockingGate,
     ) {
-        let backend = BlockingBeginReadBackend::new();
-        let gate = backend.gate();
-        let _receipt = Engine::initialize(backend.clone())
+        let storage = BlockingBeginReadStorage::new();
+        let gate = storage.gate();
+        let _receipt = Engine::initialize(storage.clone())
             .await
-            .expect("backend should initialize");
-        let engine = Engine::new(backend)
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
             .await
-            .expect("initialized backend should create engine");
+            .expect("initialized storage should create engine");
         (
             std::sync::Arc::new(
                 engine
@@ -657,17 +657,17 @@ mod tests {
     }
 
     async fn open_blocking_write_session() -> (
-        std::sync::Arc<super::SessionContext<BlockingBeginWriteBackend>>,
+        std::sync::Arc<super::SessionContext<BlockingBeginWriteStorage>>,
         BlockingGate,
     ) {
-        let backend = BlockingBeginWriteBackend::new();
-        let gate = backend.gate();
-        let _receipt = Engine::initialize(backend.clone())
+        let storage = BlockingBeginWriteStorage::new();
+        let gate = storage.gate();
+        let _receipt = Engine::initialize(storage.clone())
             .await
-            .expect("backend should initialize");
-        let engine = Engine::new(backend)
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
             .await
-            .expect("initialized backend should create engine");
+            .expect("initialized storage should create engine");
         (
             std::sync::Arc::new(
                 engine
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_waits_for_session_read_blocked_in_backend_read() {
+    async fn close_waits_for_session_read_blocked_in_storage_read() {
         let (session, gate) = open_blocking_read_session().await;
 
         gate.block_next();
@@ -798,13 +798,13 @@ mod tests {
 
         gate.release();
         let error = join_thread(reader, "blocked reader")
-            .expect_err("read should observe close after backend read resumes");
+            .expect_err("read should observe close after storage read resumes");
         assert_eq!(error.code, crate::LixError::CODE_CLOSED);
         assert_close_finishes(close.as_mut(), "close after blocked read exits").await;
     }
 
     #[tokio::test]
-    async fn close_rejects_active_transaction_read_blocked_in_backend_read() {
+    async fn close_rejects_active_transaction_read_blocked_in_storage_read() {
         let (session, gate) = open_blocking_read_session().await;
         let mut transaction = session
             .begin_transaction()
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_waits_for_explicit_transaction_blocked_in_backend_commit() {
+    async fn close_waits_for_explicit_transaction_blocked_in_storage_commit() {
         let (session, gate) = open_blocking_write_session().await;
         let mut transaction = session
             .begin_transaction()
@@ -874,15 +874,15 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct BlockingBeginReadBackend {
-        inner: InMemoryBackend,
+    struct BlockingBeginReadStorage {
+        inner: Memory,
         gate: BlockingGate,
     }
 
-    impl BlockingBeginReadBackend {
+    impl BlockingBeginReadStorage {
         fn new() -> Self {
             Self {
-                inner: InMemoryBackend::default(),
+                inner: Memory::default(),
                 gate: BlockingGate::new(),
             }
         }
@@ -892,36 +892,36 @@ mod tests {
         }
     }
 
-    impl StorageBackend for BlockingBeginReadBackend {
+    impl Storage for BlockingBeginReadStorage {
         type Read<'a>
-            = InMemoryRead
+            = MemoryRead
         where
             Self: 'a;
 
         type Write<'a>
-            = InMemoryWrite
+            = MemoryWrite
         where
             Self: 'a;
-        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.gate.maybe_block();
             self.inner.begin_read(opts).await
         }
 
-        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(opts).await
         }
     }
 
     #[derive(Clone)]
-    struct BlockingBeginWriteBackend {
-        inner: InMemoryBackend,
+    struct BlockingBeginWriteStorage {
+        inner: Memory,
         gate: BlockingGate,
     }
 
-    impl BlockingBeginWriteBackend {
+    impl BlockingBeginWriteStorage {
         fn new() -> Self {
             Self {
-                inner: InMemoryBackend::default(),
+                inner: Memory::default(),
                 gate: BlockingGate::new(),
             }
         }
@@ -931,21 +931,21 @@ mod tests {
         }
     }
 
-    impl StorageBackend for BlockingBeginWriteBackend {
+    impl Storage for BlockingBeginWriteStorage {
         type Read<'a>
-            = InMemoryRead
+            = MemoryRead
         where
             Self: 'a;
 
         type Write<'a>
-            = InMemoryWrite
+            = MemoryWrite
         where
             Self: 'a;
-        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(opts).await
         }
 
-        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
             self.gate.maybe_block();
             self.inner.begin_write(opts).await
         }

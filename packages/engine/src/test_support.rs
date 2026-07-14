@@ -5,9 +5,9 @@ use crate::changelog::{
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 #[cfg(test)]
-use crate::storage::StorageContext;
-use crate::storage::StorageRead;
-use crate::storage::StorageWriteSet;
+use crate::storage_adapter::StorageAdapter;
+use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::StorageWriteSet;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
 };
@@ -41,20 +41,20 @@ fn test_change_id(value: &str) -> ChangeId {
 /// the serving state. This helper keeps that invariant in one place while
 /// still letting low-level tests use synthetic commit ids.
 #[cfg(test)]
-pub(crate) async fn seed_branch_head(storage: StorageContext, branch_id: &str, commit_id: &str) {
+pub(crate) async fn seed_branch_head(storage: StorageAdapter, branch_id: &str, commit_id: &str) {
     seed_branch_head_with_rows(storage, branch_id, commit_id, &[]).await;
 }
 
 /// Seeds the global branch head to an empty tracked root for unit tests.
 #[cfg(test)]
-pub(crate) async fn seed_global_branch_head(storage: StorageContext) {
+pub(crate) async fn seed_global_branch_head(storage: StorageAdapter) {
     seed_branch_head(storage, GLOBAL_BRANCH_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
 }
 
 /// Seeds a branch head and writes the tracked root contents for its commit.
 #[cfg(test)]
 pub(crate) async fn seed_branch_head_with_rows(
-    storage: StorageContext,
+    storage: StorageAdapter,
     branch_id: &str,
     commit_id: &str,
     rows: &[MaterializedTrackedStateRow],
@@ -62,7 +62,7 @@ pub(crate) async fn seed_branch_head_with_rows(
     let commit_id = test_commit_id(commit_id);
     let commit_id_text = commit_id.to_string();
     let mut read = storage
-        .begin_read(crate::storage::StorageReadOptions::default())
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
         .await
         .expect("seed read should open");
     let mut writes = StorageWriteSet::new();
@@ -170,13 +170,16 @@ pub(crate) async fn seed_branch_head_with_rows(
             .expect("branch current rows should stage");
     }
     storage
-        .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+        .commit_write_set(
+            writes,
+            crate::storage_adapter::StorageWriteOptions::default(),
+        )
         .await
         .expect("seed should commit");
 }
 
 pub(crate) async fn stage_tracked_root_from_materialized(
-    read: &mut (impl StorageRead + ?Sized),
+    read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     tracked_state: &TrackedStateContext,
     commit_id: &str,
@@ -249,7 +252,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
 
 #[cfg(test)]
 pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
-    read: &mut (impl StorageRead + ?Sized),
+    read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     tracked_state: &TrackedStateContext,
     commit_id: &str,
@@ -328,7 +331,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
 
 #[cfg(test)]
 pub(crate) async fn stage_empty_changelog_commit(
-    read: &mut (impl StorageRead + ?Sized),
+    read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: &str,
     parent_commit_id: Option<&str>,
@@ -355,7 +358,7 @@ pub(crate) async fn stage_empty_changelog_commit(
 
 #[cfg(test)]
 pub(crate) async fn stage_empty_changelog_commit_with_parents(
-    read: &mut (impl StorageRead + ?Sized),
+    read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: &str,
     parent_ids: &[String],
@@ -380,7 +383,7 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
 }
 
 async fn stage_test_changelog_commit(
-    mut read: &mut (impl StorageRead + ?Sized),
+    mut read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: &str,
     commit_change_id: &str,
@@ -453,7 +456,7 @@ struct TestStagedChangelogCommit {
 }
 
 async fn load_existing_changelog_change_ids(
-    read: &mut (impl StorageRead + ?Sized),
+    read: &mut (impl StorageAdapterRead + ?Sized),
     change_ids: &[ChangeId],
 ) -> Result<std::collections::BTreeSet<ChangeId>, crate::LixError> {
     if change_ids.is_empty() {

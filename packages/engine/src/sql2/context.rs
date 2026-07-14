@@ -21,7 +21,7 @@ use crate::live_state::{
     LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::PluginRuntimeHost;
-use crate::storage::StorageRead;
+use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::wasm::UnsupportedWasmRuntime;
 
@@ -50,7 +50,7 @@ pub(crate) struct ChangelogQuerySource<S> {
 /// the transaction capability instead of flowing through committed read
 /// sources.
 pub(crate) trait SqlExecutionContext {
-    type ReadStore: StorageRead + Clone + Send + Sync + 'static;
+    type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
 
     fn active_branch_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
@@ -73,7 +73,7 @@ pub(crate) trait SqlExecutionContext {
 /// Write-capable SQL runtime boundary.
 ///
 /// Providers that mutate engine state should target this shape instead of
-/// reaching through session/backend escape hatches. The request and write
+/// reaching through session/storage escape hatches. The request and write
 /// payloads stay in the existing engine forms so this boundary centralizes
 /// authority without adding another translation layer.
 #[async_trait]

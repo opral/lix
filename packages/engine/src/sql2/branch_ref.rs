@@ -8,7 +8,7 @@ use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
 
 /// Statement-scoped branch-ref reader that avoids resolving the same branch
-/// head through the backend more than once.
+/// head through the storage more than once.
 pub(super) struct CachingBranchRefReader {
     inner: Arc<dyn BranchRefReader>,
     heads: Mutex<HashMap<String, Option<BranchHead>>>,

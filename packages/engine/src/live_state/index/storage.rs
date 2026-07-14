@@ -4,9 +4,10 @@ use crate::NullableKeyFilter;
 use crate::changelog::ChangeId;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::storage::{
-    PointReadPlan, ScanPlan, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
-    StorageRead, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+use crate::storage_adapter::{
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
+    StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -96,7 +97,7 @@ impl FlatIdentity {
 }
 
 pub(super) async fn load_value(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     identity: &FlatIdentity,
 ) -> Result<Option<FlatValue>, LixError> {
     let result = PointReadPlan::new(
@@ -115,7 +116,7 @@ pub(super) async fn load_value(
 }
 
 pub(super) async fn load_values(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     identities: &[FlatIdentity],
 ) -> Result<Vec<Option<FlatValue>>, LixError> {
     if identities.is_empty() {
@@ -136,7 +137,7 @@ pub(super) async fn load_values(
 }
 
 pub(super) async fn scan_values(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     filter: &LiveStateIndexFilter,
     limit: Option<usize>,
@@ -356,9 +357,7 @@ fn matches_filter(identity: &FlatIdentity, filter: &LiveStateIndexFilter) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{
-        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
-    };
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     fn identity(
         branch_id: &str,
@@ -438,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn scans_isolate_branches_and_nullable_file_filters_then_delete_physically() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let rows = [
             (
                 identity("branch-a", "schema", &["one"], None),

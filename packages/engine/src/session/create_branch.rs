@@ -3,7 +3,7 @@ use crate::branch::{
     BranchLifecycle, BranchOperation, BranchReferenceRole, branch_descriptor_stage_row,
     branch_ref_stage_row,
 };
-use crate::storage::StorageBackend;
+use crate::storage_adapter::Storage;
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 use super::context::SessionContext;
@@ -29,9 +29,9 @@ pub struct CreateBranchReceipt {
     pub commit_id: String,
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Creates a new branch from this session's current branch head.
     ///

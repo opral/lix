@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type {
-	LixBackendConfig,
+	LixStorageConfig,
 	LixBinding,
 	PluginRuntimeDispatch,
 } from "./binding-types.js";
@@ -10,11 +10,11 @@ import type {
 type NativeAddon = {
 	Lix: {
 		openMemory(dispatch: PluginRuntimeDispatch): Promise<LixBinding>;
-		openSqlite(
+		openSQLite(
 			path: string,
 			dispatch: PluginRuntimeDispatch,
 		): Promise<LixBinding>;
-		openFs(
+		openLocalFilesystem(
 			path: string,
 			lixDir: string | undefined,
 			syncAllFiles: boolean,
@@ -65,19 +65,19 @@ try {
 }
 
 export function openLixBinding(
-	backend: LixBackendConfig,
+	storage: LixStorageConfig,
 	dispatch: PluginRuntimeDispatch,
 ): Promise<LixBinding> {
-	switch (backend.kind) {
+	switch (storage.kind) {
 		case "memory":
 			return addon.Lix.openMemory(dispatch);
 		case "sqlite":
-			return addon.Lix.openSqlite(backend.path, dispatch);
-		case "fs":
-			return addon.Lix.openFs(
-				backend.path,
-				backend.lixDir,
-				backend.syncAllFiles,
+			return addon.Lix.openSQLite(storage.path, dispatch);
+		case "localFilesystem":
+			return addon.Lix.openLocalFilesystem(
+				storage.path,
+				storage.lixDir,
+				storage.syncAllFiles,
 				dispatch,
 			);
 	}

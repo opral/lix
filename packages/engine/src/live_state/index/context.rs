@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
 use crate::changelog::{ChangeId, ChangeRecordProjection, materialize_change_payloads};
-use crate::storage::{StorageRead, StorageWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 
 use super::storage::{
     FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_value, load_values, scan_values,
@@ -25,7 +25,7 @@ impl LiveStateIndexContext {
     #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> LiveStateIndexStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         LiveStateIndexStoreReader { store }
     }
@@ -37,7 +37,7 @@ impl LiveStateIndexContext {
         writes: &'a mut StorageWriteSet,
     ) -> LiveStateIndexWriter<'a, S>
     where
-        S: StorageRead + ?Sized,
+        S: StorageAdapterRead + ?Sized,
     {
         LiveStateIndexWriter {
             store,
@@ -53,7 +53,7 @@ pub(crate) struct LiveStateIndexStoreReader<S> {
 
 impl<S> LiveStateIndexStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     pub(crate) async fn scan_rows(
         &self,
@@ -136,7 +136,7 @@ pub(crate) struct LiveStateIndexWriter<'a, S: ?Sized> {
 
 impl<S> LiveStateIndexWriter<'_, S>
 where
-    S: StorageRead + ?Sized,
+    S: StorageAdapterRead + ?Sized,
 {
     pub(crate) async fn stage_branch_rows<'a, I>(
         &mut self,
@@ -240,7 +240,7 @@ async fn materialize_entries<S>(
     projection: &[String],
 ) -> Result<Vec<MaterializedLiveStateIndexRow>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let materialization = ChangeRecordProjection::from_columns(projection);
     let mut payloads = materialize_change_payloads(
@@ -314,9 +314,7 @@ fn index_row(identity: FlatIdentity, value: FlatValue) -> LiveStateIndexRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{
-        InMemoryStorageBackend, StorageContext, StorageReadOptions, StorageWriteOptions,
-    };
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("test timestamp", value)
@@ -333,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_preserves_created_at_and_reports_superseded_change() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let identity = FlatIdentity::from_request(&request());
         let old_change = ChangeId::for_test_label("old");
         let new_change = ChangeId::for_test_label("new");
@@ -397,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_change_record_has_flat_index_error() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let identity = FlatIdentity::from_request(&request());
         let mut writes = StorageWriteSet::new();
         stage_put(

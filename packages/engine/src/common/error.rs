@@ -83,7 +83,7 @@ impl LixError {
     /// that the current engine target cannot execute safely.
     pub const CODE_UNSUPPORTED_SQL_RUNTIME_PLAN: &'static str = "LIX_UNSUPPORTED_SQL_RUNTIME_PLAN";
 
-    /// Storage/backend IO failed while executing an operation.
+    /// Storage I/O failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
     /// An internal engine invariant failed.
@@ -276,14 +276,14 @@ impl LixError {
     }
 }
 
-impl From<crate::storage::StorageBackendError> for LixError {
-    fn from(error: crate::storage::StorageBackendError) -> Self {
+impl From<crate::storage_adapter::StorageError> for LixError {
+    fn from(error: crate::storage_adapter::StorageError) -> Self {
         Self::new(Self::CODE_STORAGE_ERROR, error.to_string())
     }
 }
 
-impl From<crate::storage::StorageWriteSetError> for LixError {
-    fn from(error: crate::storage::StorageWriteSetError) -> Self {
+impl From<crate::storage_adapter::StorageWriteSetError> for LixError {
+    fn from(error: crate::storage_adapter::StorageWriteSetError) -> Self {
         Self::new(Self::CODE_STORAGE_ERROR, error.to_string())
     }
 }

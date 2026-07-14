@@ -82,7 +82,7 @@ pub(crate) async fn diff_commits<S>(
     request: &TrackedStateDiffRequest,
 ) -> Result<TrackedStateDiff, LixError>
 where
-    S: crate::storage::StorageRead,
+    S: crate::storage_adapter::StorageAdapterRead,
 {
     diff_commits_with_validation(reader, left_commit_id, right_commit_id, request, true, true).await
 }
@@ -96,7 +96,7 @@ pub(crate) async fn diff_commits_with_validation<S>(
     validate_right_root: bool,
 ) -> Result<TrackedStateDiff, LixError>
 where
-    S: crate::storage::StorageRead,
+    S: crate::storage_adapter::StorageAdapterRead,
 {
     let scan_request = scan_request_for_diff(request);
     let tree_entries = reader
@@ -295,8 +295,8 @@ impl TrackedStateDiffEntry {
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateMutation,
         TrackedStateRootId,
@@ -620,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_update_with_arbitrary_forged_created_at() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -715,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_validates_same_payload_rows_before_classification_drops_them() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
             &storage,
@@ -818,7 +818,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_stale_ancestor_row_that_is_not_root_winner() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -886,7 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_valid_change_from_unreachable_commit_root() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -989,7 +989,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_second_parent_row_without_commit_root_proof() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_second_parent_row_with_forged_commit_root_parent() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_unrelated_row_with_forged_commit_root_parent() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_forged_parent_metadata_even_for_current_winner_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -1304,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_stale_grandparent_row_with_forged_commit_root_parent() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -1376,7 +1376,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_allows_rows_reachable_through_parent_commit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
             .await
@@ -1412,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_allows_source_update_with_source_created_at() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
             .await
@@ -1495,7 +1495,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_omitted_inherited_row_even_when_diff_is_non_empty() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
             &storage,
@@ -1566,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_omitted_updated_row_even_when_diff_is_non_empty() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
             &storage,
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_rejects_shared_omitted_row_even_when_diff_is_non_empty() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
             &storage,
@@ -1751,7 +1751,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_validates_roots_even_when_tree_diff_is_empty() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
             &storage,
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_between_delta_parent_and_child_reports_suffix_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     async fn diff(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         tracked_state: &TrackedStateContext,
     ) -> TrackedStateDiff {
         let read = storage
@@ -1975,8 +1975,8 @@ mod tests {
     async fn seed_roots(
         left_rows: &[MaterializedTrackedStateRow],
         right_rows: &[MaterializedTrackedStateRow],
-    ) -> (StorageContext, TrackedStateContext) {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+    ) -> (StorageAdapter, TrackedStateContext) {
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, left_rows)
             .await
@@ -1990,8 +1990,8 @@ mod tests {
     async fn seed_parent_child_delta(
         parent_rows: &[MaterializedTrackedStateRow],
         child_rows: &[MaterializedTrackedStateRow],
-    ) -> (StorageContext, TrackedStateContext) {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+    ) -> (StorageAdapter, TrackedStateContext) {
+        let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "parent", None, parent_rows)
             .await
@@ -2009,7 +2009,7 @@ mod tests {
     }
 
     async fn write_root_committed_for_test(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
@@ -2036,8 +2036,8 @@ mod tests {
     }
 
     async fn write_root_for_test(
-        read: &mut (impl crate::storage::StorageRead + ?Sized),
-        writes: &mut crate::storage::StorageWriteSet,
+        read: &mut (impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+        writes: &mut crate::storage_adapter::StorageWriteSet,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
@@ -2055,7 +2055,7 @@ mod tests {
     }
 
     async fn tracked_state_root_id(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         commit_id: &str,
     ) -> TrackedStateRootId {
         let read = storage
@@ -2069,7 +2069,7 @@ mod tests {
     }
 
     async fn stage_corrupt_commit_root(
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         commit_id: &str,
         entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
         parent_roots: Vec<TrackedStateCommitRootParent>,

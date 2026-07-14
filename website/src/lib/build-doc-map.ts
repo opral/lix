@@ -71,11 +71,11 @@ export function buildDocMaps(entries: Record<string, string>) {
 /**
  * Resolves portable markdown file links to clean docs routes.
  *
- * Markdown files stay portable with links like `./backend.md`, while the site
- * renders them as `/docs/backend`.
+ * Markdown files stay portable with links like `./storage.md`, while the site
+ * renders them as `/docs/storage`.
  *
  * @example
- * resolveDocsMarkdownHref("./backend.md", { slug: "persistence", content: "", relativePath: "./persistence.md" }, { "./backend.md": { slug: "backend", content: "", relativePath: "./backend.md" } })
+ * resolveDocsMarkdownHref("./storage.md", { slug: "persistence", content: "", relativePath: "./persistence.md" }, { "./storage.md": { slug: "storage", content: "", relativePath: "./storage.md" } })
  */
 export function resolveDocsMarkdownHref(
   href: string,

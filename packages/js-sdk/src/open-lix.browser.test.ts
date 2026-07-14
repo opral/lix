@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
-import { registerMemoryBackendContract } from "../tests/memory-backend-contract.js";
+import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
 
-registerMemoryBackendContract({
+registerMemoryStorageContract({
 	name: "browser WASM",
 	loadSdk: async () => await import("@lix-js/sdk"),
 	operationTimeoutMs: 30_000,

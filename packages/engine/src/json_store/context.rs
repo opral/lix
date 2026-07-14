@@ -3,7 +3,7 @@ use crate::json_store::store;
 use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
-use crate::storage::{StorageKey, StorageRead, StorageValue, StorageWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StorageKey, StorageValue, StorageWriteSet};
 use bytes::Bytes;
 use std::collections::HashSet;
 
@@ -18,7 +18,7 @@ impl JsonStoreContext {
     #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> JsonStoreReader<S>
     where
-        S: StorageRead,
+        S: StorageAdapterRead,
     {
         JsonStoreReader { store }
     }
@@ -30,7 +30,7 @@ impl JsonStoreContext {
 
     pub(crate) async fn load_bytes_many(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         request: JsonLoadRequestRef<'_>,
     ) -> Result<JsonLoadBatch, LixError> {
         store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
@@ -56,7 +56,7 @@ where
 
 impl<S> JsonStoreReader<S>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn load_bytes_many(

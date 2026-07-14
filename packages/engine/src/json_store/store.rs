@@ -2,8 +2,10 @@ use crate::LixError;
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::{JsonReadScopeRef, JsonRef};
-use crate::storage::{PointReadPlan, StorageRead, StorageSpace};
-use crate::storage::{StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId};
+use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace};
+use crate::storage_adapter::{
+    StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId,
+};
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::Entry};
@@ -95,7 +97,7 @@ pub(crate) fn encode_direct_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<
 
 #[cfg(test)]
 async fn load_json_bytes_direct(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     json_ref: &JsonRef,
 ) -> Result<Option<Vec<u8>>, LixError> {
     let result = load_values(store, JSON_SPACE, vec![json_ref.as_hash_bytes().to_vec()])
@@ -112,7 +114,7 @@ async fn load_json_bytes_direct(
 }
 
 pub(crate) async fn load_json_bytes_many_in_scope(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
@@ -127,7 +129,7 @@ pub(crate) async fn load_json_bytes_many_in_scope(
 
 #[cfg(test)]
 pub(crate) async fn verify_json_bytes_many_in_scope(
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
@@ -136,7 +138,7 @@ pub(crate) async fn verify_json_bytes_many_in_scope(
 }
 
 async fn load_json_bytes_many_in_scope_with_hash_check(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef,
     hash_check: JsonHashCheck,
@@ -248,7 +250,7 @@ fn json_values_in_request_order(
 }
 
 async fn load_values(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
     keys: Vec<Vec<u8>>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
@@ -368,14 +370,14 @@ fn decode_json_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::StorageContext;
-    use crate::storage::{
-        InMemoryStorageBackend, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{
+        Memory, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
     };
 
     #[tokio::test]
     async fn json_roundtrips_raw_payload() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let json = "{\"value\":\"small\"}";
         let encoded = encode_json(json).expect("json should encode");
         assert_eq!(encoded.codec, JsonCodec::Raw);
@@ -407,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_batch_load_roundtrips_in_request_order() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
         let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
 
@@ -455,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn verified_batch_load_rejects_hash_mismatch() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let requested_ref = JsonRef::for_content(br#"{"value":"requested"}"#);
         let stored = encode_json("{\"value\":\"different\"}").expect("stored json should encode");
 

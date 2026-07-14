@@ -12,7 +12,7 @@
 //! frames appear that the bench's in-process setup absorbs. Profile shapes are
 //! comparable; absolute times are not.
 
-use lix_sdk::{OpenLixOptions, SqliteBackend, Value, open_lix};
+use lix_sdk::{OpenLixOptions, SQLite, Value, open_lix};
 use std::io::{Cursor, Write as _};
 use std::path::Path;
 use std::time::Instant;
@@ -51,7 +51,7 @@ fn main() {
         "setup" => runtime.block_on(async {
             let plugin = build_csv_plugin();
             let lix = open_lix(OpenLixOptions::new(
-                SqliteBackend::open(&lix_path).expect("open sqlite backend"),
+                SQLite::open(&lix_path).expect("open sqlite storage"),
             ))
             .await
             .unwrap();
@@ -70,7 +70,7 @@ fn main() {
                 0x6449_2c6f_179d_31b5,
             ));
             let lix = open_lix(OpenLixOptions::new(
-                SqliteBackend::open(&lix_path).expect("open sqlite backend"),
+                SQLite::open(&lix_path).expect("open sqlite storage"),
             ))
             .await
             .unwrap();
@@ -98,16 +98,16 @@ fn main() {
 }
 
 #[inline(never)]
-async fn profile_merge_phase(lix: &lix_sdk::Lix<SqliteBackend>, updated_csv: Vec<u8>) {
+async fn profile_merge_phase(lix: &lix_sdk::Lix<SQLite>, updated_csv: Vec<u8>) {
     write_file(lix, CSV_PATH, updated_csv).await;
 }
 
-async fn install_plugin(lix: &lix_sdk::Lix<SqliteBackend>, key: &str, archive: &[u8]) {
+async fn install_plugin(lix: &lix_sdk::Lix<SQLite>, key: &str, archive: &[u8]) {
     let path = format!("/.lix/plugins/{key}.lixplugin");
     write_file(lix, &path, archive.to_vec()).await;
 }
 
-async fn write_file(lix: &lix_sdk::Lix<SqliteBackend>, path: &str, data: Vec<u8>) {
+async fn write_file(lix: &lix_sdk::Lix<SQLite>, path: &str, data: Vec<u8>) {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",

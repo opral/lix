@@ -11,12 +11,12 @@ use super::types::{
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonRef, JsonSlot};
-use crate::storage::StorageBackend;
-use crate::storage::{StorageContext, StorageReadOptions, StorageWriteSetStats};
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{StorageAdapter, StorageReadOptions, StorageWriteSetStats};
 
-pub trait BenchBackend: StorageBackend + Clone {}
+pub trait BenchStorage: Storage + Clone {}
 
-impl<T> BenchBackend for T where T: StorageBackend + Clone {}
+impl<T> BenchStorage for T where T: Storage + Clone {}
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
@@ -113,12 +113,12 @@ impl BenchCorpus {
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct BenchStore<B = crate::storage::InMemoryStorageBackend>
+pub struct BenchStore<StorageImpl = crate::storage_adapter::Memory>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     context: ChangelogContext,
-    storage: StorageContext<B>,
+    storage: StorageAdapter<StorageImpl>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -353,35 +353,35 @@ pub fn validate_publication_closure(append: &BenchAppend) -> Result<usize, LixEr
     Ok(append.change_count())
 }
 
-pub async fn stage_append_raw_once<B>(
-    backend: B,
+pub async fn stage_append_raw_once<StorageImpl>(
+    storage: StorageImpl,
     append: &BenchAppend,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    stage_append_once(backend, append).await
+    stage_append_once(storage, append).await
 }
 
-pub async fn stage_append_once<B>(
-    backend: B,
+pub async fn stage_append_once<StorageImpl>(
+    storage: StorageImpl,
     append: &BenchAppend,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    let store = BenchStore::new(backend);
+    let store = BenchStore::new(storage);
     stage_append_in_store(&store, &append.append).await
 }
 
-pub async fn stage_corpus_once<B>(
-    backend: B,
+pub async fn stage_corpus_once<StorageImpl>(
+    storage: StorageImpl,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    let store = BenchStore::new(backend);
+    let store = BenchStore::new(storage);
     let mut total = BenchWriteStats::default();
     for append in corpus.append_batches() {
         total += stage_append_in_store(&store, &append.append).await?;
@@ -389,35 +389,38 @@ where
     Ok(total)
 }
 
-pub async fn prepare_store<B>(backend: B, append: &BenchAppend) -> Result<BenchStore<B>, LixError>
+pub async fn prepare_store<StorageImpl>(
+    storage: StorageImpl,
+    append: &BenchAppend,
+) -> Result<BenchStore<StorageImpl>, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    let store = BenchStore::new(backend);
+    let store = BenchStore::new(storage);
     stage_append_in_store(&store, &append.append).await?;
     Ok(store)
 }
 
-pub async fn prepare_corpus_store<B>(
-    backend: B,
+pub async fn prepare_corpus_store<StorageImpl>(
+    storage: StorageImpl,
     corpus: &BenchCorpus,
-) -> Result<BenchStore<B>, LixError>
+) -> Result<BenchStore<StorageImpl>, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    let store = BenchStore::new(backend);
+    let store = BenchStore::new(storage);
     for append in corpus.append_batches() {
         stage_append_in_store(&store, &append.append).await?;
     }
     Ok(store)
 }
 
-pub async fn stage_first_commit_noop_in_store<B>(
-    _store: &BenchStore<B>,
+pub async fn stage_first_commit_noop_in_store<StorageImpl>(
+    _store: &BenchStore<StorageImpl>,
     append: &BenchAppend,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     Ok(BenchWriteStats {
         puts: append.commit_count(),
@@ -426,96 +429,96 @@ where
     })
 }
 
-pub async fn load_commits_direct_by_id<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+pub async fn load_commits_direct_by_id<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     commit_ids: &[S],
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Full).await
 }
 
-pub async fn load_commits_direct<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+pub async fn load_commits_direct<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     commit_ids: &[S],
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Header).await
 }
 
-pub async fn load_commits_direct_with_lookup<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+pub async fn load_commits_direct_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     commit_ids: &[S],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     load_commits_with_lookup(store, commit_ids, projection).await
 }
 
-pub async fn load_changes_direct_by_id<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+pub async fn load_changes_direct_by_id<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     change_ids: &[S],
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::DirectKey).await
 }
 
-pub async fn load_changes_direct<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+pub async fn load_changes_direct<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     change_ids: &[S],
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::Record).await
 }
 
-pub async fn load_changes_direct_with_lookup<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+pub async fn load_changes_direct_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     change_ids: &[S],
     lookup: BenchChangeLookup,
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     load_changes_with_lookup(store, change_ids, lookup).await
 }
 
-pub async fn prepare_rebuild_store<B>(
-    backend: B,
+pub async fn prepare_rebuild_store<StorageImpl>(
+    storage: StorageImpl,
     corpus: &BenchCorpus,
     _mode: BenchRebuildMode,
-) -> Result<BenchStore<B>, LixError>
+) -> Result<BenchStore<StorageImpl>, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    prepare_corpus_store(backend, corpus).await
+    prepare_corpus_store(storage, corpus).await
 }
 
-pub async fn rebuild_mandatory_indexes<B>(
-    _store: &BenchStore<B>,
+pub async fn rebuild_mandatory_indexes<StorageImpl>(
+    _store: &BenchStore<StorageImpl>,
 ) -> Result<BenchRebuildStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     Ok(RebuildIndexStats::default().into())
 }
 
-pub async fn prepare_gc_store<B>(
-    backend: B,
+pub async fn prepare_gc_store<StorageImpl>(
+    storage: StorageImpl,
     live_percent: usize,
     dead_percent: usize,
     changes_per_commit: usize,
-) -> Result<(BenchStore<B>, String), LixError>
+) -> Result<(BenchStore<StorageImpl>, String), LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     let commit_count = (live_percent + dead_percent).max(1);
     let corpus = BenchCorpus::from_append_batches(
@@ -528,16 +531,16 @@ where
     let root_commit_id = corpus
         .first_commit_id()
         .unwrap_or_else(|| "bench-gc-0-commit-0".to_string());
-    let store = prepare_corpus_store(backend, &corpus).await?;
+    let store = prepare_corpus_store(storage, &corpus).await?;
     Ok((store, root_commit_id))
 }
 
-pub async fn plan_gc<B>(
-    store: &BenchStore<B>,
+pub async fn plan_gc<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
     root_commit_id: &str,
 ) -> Result<BenchGcStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     let read = store
         .storage
@@ -550,15 +553,15 @@ where
     Ok(plan.into())
 }
 
-pub async fn collect_garbage<B>(
-    store: &BenchStore<B>,
+pub async fn collect_garbage<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
     root_commit_id: &str,
 ) -> Result<BenchGcStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     let mut transaction = store.storage.begin_write_transaction().await?;
-    let mut writes = crate::storage::StorageWriteSet::new();
+    let mut writes = crate::storage_adapter::StorageWriteSet::new();
     let plan = {
         let mut writer = store.context.writer(&mut *transaction, &mut writes);
         writer
@@ -660,27 +663,27 @@ impl BenchCorpus {
     }
 }
 
-impl<B> BenchStore<B>
+impl<StorageImpl> BenchStore<StorageImpl>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
-    fn new(backend: B) -> Self {
+    fn new(storage: StorageImpl) -> Self {
         Self {
             context: ChangelogContext::new(),
-            storage: StorageContext::new(backend),
+            storage: StorageAdapter::new(storage),
         }
     }
 }
 
-async fn stage_append_in_store<B>(
-    store: &BenchStore<B>,
+async fn stage_append_in_store<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
     append: &ChangelogAppend,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     let mut transaction = store.storage.begin_write_transaction().await?;
-    let mut writes = crate::storage::StorageWriteSet::new();
+    let mut writes = crate::storage_adapter::StorageWriteSet::new();
     {
         let mut writer = store.context.writer(&mut *transaction, &mut writes);
         writer.stage_append(append.clone()).await?;
@@ -690,13 +693,13 @@ where
     Ok(stats.into())
 }
 
-async fn load_commits_with_lookup<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+async fn load_commits_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     commit_ids: &[S],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     let read = store
         .storage
@@ -716,13 +719,13 @@ where
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-async fn load_changes_with_lookup<B, S: AsRef<str> + Sync>(
-    store: &BenchStore<B>,
+async fn load_changes_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
+    store: &BenchStore<StorageImpl>,
     change_ids: &[S],
     _lookup: BenchChangeLookup,
 ) -> Result<usize, LixError>
 where
-    B: BenchBackend + Sync,
+    StorageImpl: BenchStorage + Sync,
 {
     let read = store
         .storage

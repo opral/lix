@@ -12,15 +12,15 @@
 
 ### Minor
 
-- Added `FsBackend.syncDiskToLix()` as an awaitable filesystem sync barrier.
+- Added `LocalFilesystem.syncDiskToLix()` as an awaitable filesystem sync barrier.
 
-  The filesystem backend picks up disk edits in the background with debouncing. `backend.syncDiskToLix()` flushes pending on-disk changes into Lix and resolves once they are materialized, so subsequent queries reflect the current disk state.
-- Added a `lixDir` option to `FsBackend` for storing lix state outside the workspace.
+  The filesystem storage picks up disk edits in the background with debouncing. `storage.syncDiskToLix()` flushes pending on-disk changes into Lix and resolves once they are materialized, so subsequent queries reflect the current disk state.
+- Added a `lixDir` option to `LocalFilesystem` for storing lix state outside the workspace.
 
   By default, state lives in `<workspace>/.lix`. Passing `lixDir` keeps repository metadata in an external `.lix` directory and writes no `.lix` directory into the workspace. Pointing `lixDir` at a temporary directory gives ephemeral filesystem sync: workspace files are imported and watched without persisting lix state.
-- `FsBackend` now requires an explicit `syncAllFiles` option and supports on-demand file sync.
+- `LocalFilesystem` now requires an explicit `syncAllFiles` option and supports on-demand file sync.
 
-  `new FsBackend({ path, syncAllFiles: true })` syncs the full workspace as before. With `syncAllFiles: false`, the lix opens without workspace files and `backend.importPaths(["notes/today.md"])` syncs selected files on demand. Imported paths are exact workspace-relative file paths, not directories or globs. In Rust, use `FsBackendOpenOptions::new(root, sync_all_files)` and `FsBackend::import_paths()`.
+  `new LocalFilesystem({ path, syncAllFiles: true })` syncs the full workspace as before. With `syncAllFiles: false`, the lix opens without workspace files and `storage.importPaths(["notes/today.md"])` syncs selected files on demand. Imported paths are exact workspace-relative file paths, not directories or globs. In Rust, use `LocalFilesystemOpenOptions::new(root, sync_all_files)` and `LocalFilesystem::import_paths()`.
 - Added optional origin keys for tagging Lix writes.
 
   `lix.execute(sql, params, { originKey })` in JavaScript and `execute_with_options(sql, params, options)` in Rust stamp the change records a write produces. The key is exposed as `origin_key` on `lix_change` and as `lixcol_origin_key` on state, file, and history surfaces; writes without an origin key stay `NULL`.
@@ -57,7 +57,7 @@
   The Rust and JavaScript SDKs can now create observe streams that emit an initial result and re-run after Lix mutations, making it possible to build reactive views without manual polling.
 - Rebuilt the storage engine's physical layout: merges run 1.8x faster, point reads 2.2x faster, and commits write 47% fewer bytes.
 
-  Measured on the repository benchmarks: merge_10k through the e2e CSV plugin pipeline 347.8 ms to 190.0 ms, read_one_by_pk 213.1 us to 96.2 us, bytes written per 1k-row insert commit 827,460 to 436,472, backend puts per commit 2,031 to 1,074. Payloads are now stored exactly once, each engine keyspace maps to its own SQLite table, and keys use binary UUIDs with front-coded chunk encoding. The SQLite file format version moves to 3; v0.7 opens fresh files only and rejects older files with an explicit error.
+  Measured on the repository benchmarks: merge_10k through the e2e CSV plugin pipeline 347.8 ms to 190.0 ms, read_one_by_pk 213.1 us to 96.2 us, bytes written per 1k-row insert commit 827,460 to 436,472, storage puts per commit 2,031 to 1,074. Payloads are now stored exactly once, each engine keyspace maps to its own SQLite table, and keys use binary UUIDs with front-coded chunk encoding. The SQLite file format version moves to 3; v0.7 opens fresh files only and rejects older files with an explicit error.
 
 ## 0.6.2 - 2026-06-02
 
@@ -75,4 +75,4 @@
 
 ### Patch
 
-- lix-sdk, engine: Improved SQLite backend read performance and native backend snapshot support.
+- lix-sdk, engine: Improved SQLite storage read performance and native storage snapshot support.

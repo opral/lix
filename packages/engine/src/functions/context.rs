@@ -6,8 +6,8 @@ use crate::functions::{
     SystemFunctionProvider, state,
 };
 use crate::live_state::LiveStateReader;
-use crate::storage::StorageRead;
-use crate::storage::StorageWriteSet;
+use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::StorageWriteSet;
 
 /// Execution-scoped runtime function context.
 ///
@@ -66,7 +66,7 @@ impl FunctionContext {
     /// deterministic mode is disabled.
     pub(crate) async fn stage_persist_if_needed(
         &self,
-        read: &(impl StorageRead + ?Sized),
+        read: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
     ) -> Result<(), LixError> {
         let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
@@ -115,8 +115,8 @@ mod tests {
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
     use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
@@ -130,7 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_uses_system_functions_when_mode_missing() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let reader = live_state.reader(
             storage
@@ -153,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_starts_deterministic_functions_at_sequence_zero() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
@@ -194,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_continues_from_persisted_sequence() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
@@ -237,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
@@ -309,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_if_needed_is_noop_for_system_functions() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let reader = live_state.reader(
             storage
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(sequence, DeterministicSequence::uninitialized());
     }
 
-    async fn write_key_value(storage: StorageContext, key: &str, value: serde_json::Value) {
+    async fn write_key_value(storage: StorageAdapter, key: &str, value: serde_json::Value) {
         let snapshot_content = serde_json::to_string(&serde_json::json!({
             "key": key,
             "value": value,

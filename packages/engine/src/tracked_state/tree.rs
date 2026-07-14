@@ -2,7 +2,7 @@
     test,
     allow(
         clippy::manual_async_fn,
-        reason = "test readers mirror explicit Send future signatures from BackendRead"
+        reason = "test readers mirror explicit Send future signatures from StorageRead"
     )
 )]
 
@@ -17,7 +17,7 @@ use std::{
 
 use lru::LruCache;
 
-use crate::storage::{StorageRead, StorageWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
     ChildSummary, ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef,
     EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite, boundary_trigger,
@@ -95,7 +95,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn load_root(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         commit_id: &str,
     ) -> Result<Option<TrackedStateRootId>, LixError> {
         storage::load_root(store, commit_id).await
@@ -104,7 +104,7 @@ impl TrackedStateTree {
     #[cfg(test)]
     pub(crate) async fn get(
         &self,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         root_id: &TrackedStateRootId,
         key: &TrackedStateKey,
     ) -> Result<Option<TrackedStateIndexValue>, LixError> {
@@ -140,7 +140,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn get_many(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         root_id: &TrackedStateRootId,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
@@ -163,7 +163,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn scan(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
@@ -188,7 +188,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn diff(
         &self,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         left_root: Option<&TrackedStateRootId>,
         right_root: Option<&TrackedStateRootId>,
         request: &TrackedStateTreeScanRequest,
@@ -232,7 +232,7 @@ impl TrackedStateTree {
     #[cfg(test)]
     pub(crate) async fn apply_mutations(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         base_root: Option<&TrackedStateRootId>,
         mutations: Vec<TrackedStateMutation>,
@@ -252,7 +252,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn apply_mutations_with_overlay(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         base_root: Option<&TrackedStateRootId>,
@@ -317,7 +317,7 @@ impl TrackedStateTree {
 
     async fn apply_single_mutation(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
@@ -466,7 +466,7 @@ impl TrackedStateTree {
         out: &'a mut Vec<TrackedStateTreeDiffEntry>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + 'a>>
     where
-        S: StorageRead + 'a,
+        S: StorageAdapterRead + 'a,
     {
         Box::pin(async move {
             if left_hash == right_hash {
@@ -507,7 +507,7 @@ impl TrackedStateTree {
 
     async fn diff_leaf_summary_cursors(
         &self,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         left_hash: [u8; TRACKED_STATE_HASH_BYTES],
         right_hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &TrackedStateTreeScanRequest,
@@ -565,7 +565,7 @@ impl TrackedStateTree {
 
     async fn diff_leaf_summary_window(
         &self,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         left_leaves: &[ChildSummary],
         right_leaves: &[ChildSummary],
         request: &TrackedStateTreeScanRequest,
@@ -681,7 +681,7 @@ impl TrackedStateTree {
     #[expect(clippy::cast_possible_truncation)]
     async fn apply_sorted_mutations_chunker(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
@@ -849,7 +849,7 @@ impl TrackedStateTree {
     #[expect(clippy::cast_possible_truncation)]
     async fn apply_single_mutation_from_seek_path(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
@@ -1375,7 +1375,7 @@ impl TrackedStateTree {
     #[cfg(test)]
     async fn collect_leaf_entries(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         let overlay = storage::TrackedStateChunkOverlay::new();
@@ -1385,7 +1385,7 @@ impl TrackedStateTree {
 
     async fn collect_leaf_entries_with_overlay(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
@@ -1408,7 +1408,7 @@ impl TrackedStateTree {
 
     async fn collect_filtered_entries(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
@@ -1425,7 +1425,7 @@ impl TrackedStateTree {
         rows: &'a mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
-        S: StorageRead + ?Sized + 'a,
+        S: StorageAdapterRead + ?Sized + 'a,
     {
         Box::pin(async move {
             let bytes = self.load_node_bytes(store, &hash).await?;
@@ -1497,7 +1497,7 @@ impl TrackedStateTree {
         values: &'a mut [Option<TrackedStateIndexValue>],
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
-        S: StorageRead + ?Sized + 'a,
+        S: StorageAdapterRead + ?Sized + 'a,
     {
         Box::pin(async move {
             if encoded_keys.is_empty() {
@@ -1558,7 +1558,7 @@ impl TrackedStateTree {
 
     async fn collect_entries_from_leaf_summaries(
         &self,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         leaves: &[ChildSummary],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         let mut entries = Vec::new();
@@ -1570,7 +1570,7 @@ impl TrackedStateTree {
 
     async fn collect_summary_levels_with_overlay(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<Vec<ChildSummary>>, LixError> {
@@ -1593,7 +1593,7 @@ impl TrackedStateTree {
         levels: &'a mut Vec<Vec<ChildSummary>>,
     ) -> Pin<Box<dyn Future<Output = Result<(ChildSummary, usize), LixError>> + 'a>>
     where
-        S: StorageRead + ?Sized + 'a,
+        S: StorageAdapterRead + ?Sized + 'a,
     {
         Box::pin(async move {
             match self.load_node_with_overlay(store, overlay, &hash).await? {
@@ -1645,7 +1645,7 @@ impl TrackedStateTree {
 
     async fn load_leaf_entries(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         match self.load_node(store, hash).await? {
@@ -1659,7 +1659,7 @@ impl TrackedStateTree {
 
     async fn load_leaf_entries_with_overlay(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
@@ -1674,7 +1674,7 @@ impl TrackedStateTree {
 
     async fn load_node(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
         let bytes = self.load_node_bytes(store, hash).await?;
@@ -1683,7 +1683,7 @@ impl TrackedStateTree {
 
     async fn load_node_bytes(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Arc<[u8]>, LixError> {
         let cached = {
@@ -1714,7 +1714,7 @@ impl TrackedStateTree {
 
     async fn load_node_with_overlay(
         &self,
-        store: &(impl StorageRead + ?Sized),
+        store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
@@ -1798,7 +1798,7 @@ struct LeafSummaryCursorFrame {
 impl LeafSummaryCursor {
     async fn new(
         tree: &TrackedStateTree,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         root_hash: [u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Self, LixError> {
         let mut cursor = Self {
@@ -1831,7 +1831,7 @@ impl LeafSummaryCursor {
     async fn advance(
         &mut self,
         tree: &TrackedStateTree,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
     ) -> Result<(), LixError> {
         self.current = None;
         while let Some(frame) = self.stack.last_mut() {
@@ -1856,7 +1856,7 @@ impl LeafSummaryCursor {
     async fn descend_to_leaf(
         &mut self,
         tree: &TrackedStateTree,
-        store: &impl StorageRead,
+        store: &impl StorageAdapterRead,
         mut summary: ChildSummary,
     ) -> Result<(), LixError> {
         loop {
@@ -2155,7 +2155,7 @@ fn internal_boundaries_match(left: &[ChildSummary], right: &[ChildSummary]) -> b
 
 async fn child_summaries_are_leaves(
     tree: &TrackedStateTree,
-    store: &impl StorageRead,
+    store: &impl StorageAdapterRead,
     children: &[ChildSummary],
 ) -> Result<bool, LixError> {
     let Some(first_child) = children.first() else {
@@ -2426,33 +2426,33 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::backend::{
-        BackendError, BackendRead, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-        ScanChunk, ScanOptions, SpaceId,
-    };
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::storage::{StorageContext, StorageReadScope};
+    use crate::storage::{
+        GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ScanChunk, ScanOptions, SpaceId,
+        StorageError, StorageRead,
+    };
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
     use crate::tracked_state::codec::{encode_value, hash_bytes};
 
     struct CountingChunkRead {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         bytes: Vec<u8>,
-        backend_reads: Arc<AtomicUsize>,
+        storage_reads: Arc<AtomicUsize>,
         corrupt_first_read: bool,
     }
 
-    impl BackendRead for CountingChunkRead {
+    impl StorageRead for CountingChunkRead {
         fn get_many(
             &self,
             space: SpaceId,
             keys: &[Key],
             _opts: GetOptions,
-        ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+        ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
             async move {
                 assert_eq!(space, storage::TRACKED_STATE_TREE_CHUNK_SPACE.id);
-                let read_index = self.backend_reads.fetch_add(1, Ordering::Relaxed);
+                let read_index = self.storage_reads.fetch_add(1, Ordering::Relaxed);
                 let bytes = if self.corrupt_first_read && read_index == 0 {
                     Bytes::from_static(b"corrupt tracked-state node")
                 } else {
@@ -2474,20 +2474,20 @@ mod tests {
             _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions,
-        ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+        ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
             async { unreachable!("tracked-state node cache test only performs point reads") }
         }
     }
 
     #[tokio::test]
-    async fn repeated_node_loads_from_tree_clones_avoid_backend_reads() {
+    async fn repeated_node_loads_from_tree_clones_avoid_storage_reads() {
         let bytes = encode_leaf_node(&[]);
         let hash = hash_bytes(&bytes);
-        let backend_reads = Arc::new(AtomicUsize::new(0));
-        let store = StorageReadScope::new(CountingChunkRead {
+        let storage_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
             hash,
             bytes,
-            backend_reads: Arc::clone(&backend_reads),
+            storage_reads: Arc::clone(&storage_reads),
             corrupt_first_read: false,
         });
         let tree = TrackedStateTree::new();
@@ -2507,7 +2507,7 @@ mod tests {
             DecodedNode::Leaf(_)
         ));
 
-        assert_eq!(backend_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(storage_reads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -2515,11 +2515,11 @@ mod tests {
         let bytes = encode_leaf_node(&[]);
         assert!(bytes.len() > 1, "test node must have an encoded body");
         let hash = hash_bytes(&bytes);
-        let backend_reads = Arc::new(AtomicUsize::new(0));
-        let store = StorageReadScope::new(CountingChunkRead {
+        let storage_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
             hash,
             bytes: bytes.clone(),
-            backend_reads: Arc::clone(&backend_reads),
+            storage_reads: Arc::clone(&storage_reads),
             corrupt_first_read: false,
         });
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
@@ -2535,18 +2535,18 @@ mod tests {
             .await
             .expect("second oversized node load should succeed");
 
-        assert_eq!(backend_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(storage_reads.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
     async fn corrupt_node_miss_does_not_poison_cache() {
         let bytes = encode_leaf_node(&[]);
         let hash = hash_bytes(&bytes);
-        let backend_reads = Arc::new(AtomicUsize::new(0));
-        let store = StorageReadScope::new(CountingChunkRead {
+        let storage_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
             hash,
             bytes,
-            backend_reads: Arc::clone(&backend_reads),
+            storage_reads: Arc::clone(&storage_reads),
             corrupt_first_read: true,
         });
         let tree = TrackedStateTree::new();
@@ -2563,12 +2563,12 @@ mod tests {
             .await
             .expect("validated node should be cached");
 
-        assert_eq!(backend_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(storage_reads.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_applied_root() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
         let value = value("change-1", Some("{}"));
@@ -2591,7 +2591,7 @@ mod tests {
 
     #[tokio::test]
     async fn latest_mutation_for_key_wins() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
         let old_value = value("change-old", Some("{\"v\":1}"));
@@ -2621,7 +2621,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_by_index_key_without_materializing_tombstones() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let result = apply_mutations_for_test(
             &tree,
@@ -2680,7 +2680,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_by_schema_entity_and_file() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let result = apply_mutations_for_test(
             &tree,
@@ -2742,7 +2742,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_schema_file_prefix_honors_tombstones_and_limit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let result = apply_mutations_for_test(
             &tree,
@@ -2804,7 +2804,7 @@ mod tests {
 
     #[tokio::test]
     async fn applying_to_base_root_reuses_existing_rows_and_overwrites_changed_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let unchanged_key = key("schema", None, "unchanged");
         let changed_key = key("schema", None, "changed");
@@ -2857,7 +2857,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_commit_roots_can_share_unchanged_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let shared_key = key("schema", None, "shared");
         let branch_a_key = key("schema", None, "branch-a");
@@ -2926,7 +2926,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_update_matches_full_canonical_rebuild() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2982,7 +2982,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_insert_matches_full_canonical_rebuild() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -3039,7 +3039,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_update_matches_full_canonical_rebuild() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -3104,7 +3104,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_insert_matches_full_canonical_rebuild() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -3193,7 +3193,7 @@ mod tests {
 
     async fn apply_mutations_for_test(
         tree: &TrackedStateTree,
-        storage: &StorageContext,
+        storage: &StorageAdapter,
         base_root: Option<&TrackedStateRootId>,
         mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,

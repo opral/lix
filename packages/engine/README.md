@@ -11,7 +11,7 @@ The engine owns:
 - logical Lix state, schemas, transactions, branches, commits, and queries
 - logical Lix paths such as `/docs/readme.md`
 - binary CAS data after bytes have been imported into Lix
-- the storage backend contract for ordered key/value reads and writes
+- the storage contract for ordered key/value reads and writes
 
 System APIs are out of scope for the engine. In particular, engine code should
 not depend on:
@@ -22,11 +22,11 @@ not depend on:
 - symlink, case-sensitivity, permissions, or platform path policy
 - OS-specific storage locations or folder layout
 
-Those responsibilities belong in backend or SDK adapters, such as `FsBackend`.
+Those responsibilities belong in storage or SDK adapters, such as `LocalFilesystem`.
 Adapters may map host resources into logical Lix paths, hydrate bytes on demand,
 watch external changes, and materialize writes. The engine should only see the
 logical Lix data and any narrow adapter capability needed to retrieve external
 payloads.
 
 Keeping this boundary lets the engine stay deterministic, portable, and easy to
-test with simulated or in-memory backends.
+test with simulated or in-memory storage implementations.

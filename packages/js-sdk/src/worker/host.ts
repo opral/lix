@@ -76,7 +76,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			case "open":
 				if (lix) throw workerStateError("Lix worker is already open");
 				lix = await openLixBinding(
-					operation.backend,
+					operation.storage,
 					createPluginRuntimeDispatch() as PluginRuntimeDispatch,
 				);
 				return undefined;

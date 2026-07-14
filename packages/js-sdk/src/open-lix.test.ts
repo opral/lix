@@ -15,16 +15,16 @@ import { promisify } from "node:util";
 import { expect, test } from "vitest";
 import {
 	bundledPluginArchives,
-	FsBackend,
+	LocalFilesystem,
 	openLix,
-	SqliteBackend,
+	SQLite,
 	Value,
 	type ExecuteResult,
 	type Lix,
 } from "./index.js";
-import { registerMemoryBackendContract } from "../tests/memory-backend-contract.js";
+import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
 
-registerMemoryBackendContract({
+registerMemoryStorageContract({
 	name: "Node native",
 	loadSdk: async () => await import("./index.js"),
 });
@@ -130,7 +130,7 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 
 test("committed writes survive close and reopen", async () => {
 	const path = tempLixPath();
-	const first = await openLix({ backend: new SqliteBackend({ path }) });
+	const first = await openLix({ storage: new SQLite({ path }) });
 
 	await registerCrmTaskSchema(first);
 	await first.execute(
@@ -139,7 +139,7 @@ test("committed writes survive close and reopen", async () => {
 	);
 	await first.close();
 
-	const second = await openLix({ backend: new SqliteBackend({ path }) });
+	const second = await openLix({ storage: new SQLite({ path }) });
 	expect(await taskTitle(second, "persistent-task")).toBe(
 		"Persist before close",
 	);
@@ -191,13 +191,13 @@ test("observe remains usable after next rejects", async () => {
 test.each([
 	[
 		"sqlite",
-		() => openLix({ backend: new SqliteBackend({ path: tempLixPath() }) }),
+		() => openLix({ storage: new SQLite({ path: tempLixPath() }) }),
 	],
 	[
 		"fs",
 		() =>
 			openLix({
-				backend: new FsBackend({
+				storage: new LocalFilesystem({
 					path: tempFsDir(),
 					syncAllFiles: true,
 				}),
@@ -210,7 +210,7 @@ test.each([
 			mkdirSync(dir, { recursive: true });
 			writeFileSync(join(dir, "matrix.md"), "matrix");
 			return openLix({
-				backend: new FsBackend({
+				storage: new LocalFilesystem({
 					path: dir,
 					lixDir: tempExternalLixDir(),
 					syncAllFiles: true,
@@ -218,7 +218,7 @@ test.each([
 			});
 		},
 	],
-] as const)("core native flow works with %s backend", async (_name, open) => {
+] as const)("core native flow works with %s storage", async (_name, open) => {
 	const lix = await open();
 
 	await registerCrmTaskSchema(lix);
@@ -304,13 +304,13 @@ test("an idle open Lix worker does not keep Node.js alive", async () => {
 	expect(stdout.trim()).toBe("42");
 });
 
-test("fs backend imports local files and materializes lix_file writes", async () => {
+test("fs storage imports local files and materializes lix_file writes", async () => {
 	const dir = tempFsDir();
 	mkdirSync(join(dir, "docs"), { recursive: true });
 	writeFileSync(join(dir, "docs", "readme.md"), "local");
 
 	const lix = await openLix({
-		backend: new FsBackend({ path: dir, syncAllFiles: true }),
+		storage: new LocalFilesystem({ path: dir, syncAllFiles: true }),
 	});
 	expect(statSync(join(dir, ".lix")).isDirectory()).toBe(true);
 	expect(
@@ -334,7 +334,7 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	await lix.close();
 
 	const reopened = await openLix({
-		backend: new FsBackend({ path: dir, syncAllFiles: true }),
+		storage: new LocalFilesystem({ path: dir, syncAllFiles: true }),
 	});
 	const persisted = await reopened.execute(
 		"SELECT data FROM lix_file WHERE directory_id IS NULL AND name = $1",
@@ -411,7 +411,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	await lix.close();
 });
 
-test("fs backend with external lixDir imports the directory and writes normal files back", async () => {
+test("fs storage with external lixDir imports the directory and writes normal files back", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
 	const siblingPath = join(dir, "sibling.md");
@@ -420,7 +420,7 @@ test("fs backend with external lixDir imports the directory and writes normal fi
 	writeFileSync(siblingPath, "sibling");
 
 	const lix = await openLix({
-		backend: new FsBackend({
+		storage: new LocalFilesystem({
 			path: dir,
 			lixDir: tempExternalLixDir(),
 			syncAllFiles: true,
@@ -463,7 +463,7 @@ test("fs backend with external lixDir imports the directory and writes normal fi
 	await lix.close();
 });
 
-test("fs backend on-demand sync imports selected paths and lix-created files", async () => {
+test("fs storage on-demand sync imports selected paths and lix-created files", async () => {
 	const dir = tempFsDir();
 	const includedPath = join(dir, "docs", "note.md");
 	const excludedPath = join(dir, "docs", "sibling.md");
@@ -472,13 +472,13 @@ test("fs backend on-demand sync imports selected paths and lix-created files", a
 	writeFileSync(includedPath, "included");
 	writeFileSync(excludedPath, "excluded");
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await backend.importPaths(["docs/note.md"]);
+	const lix = await openLix({ storage });
+	await storage.importPaths(["docs/note.md"]);
 
 	const files = await lix.execute(
 		"SELECT path FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
@@ -511,22 +511,22 @@ test("fs backend on-demand sync imports selected paths and lix-created files", a
 	await lix.close();
 });
 
-test("fs backend imports existing files into a filtered filesystem", async () => {
+test("fs storage imports existing files into a filtered filesystem", async () => {
 	const dir = tempFsDir();
 	const importedPath = join(dir, "docs", "opened.md");
 	mkdirSync(join(dir, "docs"), { recursive: true });
 	writeFileSync(importedPath, "opened");
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
+	const lix = await openLix({ storage });
 
 	expect(await readFile(lix, "/docs/opened.md")).toBeUndefined();
 
-	await backend.importPaths(["docs/opened.md"]);
+	await storage.importPaths(["docs/opened.md"]);
 	expect(
 		new TextDecoder().decode((await readFile(lix, "/docs/opened.md"))!),
 	).toBe("opened");
@@ -540,39 +540,39 @@ test("fs backend imports existing files into a filtered filesystem", async () =>
 	await lix.close();
 });
 
-test("importPaths validates paths and requires an opened backend", async () => {
-	const unopened = new FsBackend({ path: tempFsDir(), syncAllFiles: false });
+test("importPaths validates paths and requires an opened storage", async () => {
+	const unopened = new LocalFilesystem({ path: tempFsDir(), syncAllFiles: false });
 	await expect(unopened.importPaths(["note.md"])).rejects.toThrow(
 		"opened with openLix()",
 	);
 
 	const dir = tempFsDir();
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await expect(backend.importPaths([""])).rejects.toThrow("non-empty strings");
-	await expect(backend.importPaths(["docs/"])).rejects.toThrow(
+	const lix = await openLix({ storage });
+	await expect(storage.importPaths([""])).rejects.toThrow("non-empty strings");
+	await expect(storage.importPaths(["docs/"])).rejects.toThrow(
 		"file paths, not directory paths",
 	);
 	await lix.close();
-	await expect(backend.importPaths(["note.md"])).rejects.toThrow(
+	await expect(storage.importPaths(["note.md"])).rejects.toThrow(
 		"opened with openLix()",
 	);
 });
 
-test("fs backend imports files through installed WASM plugins", async () => {
+test("fs storage imports files through installed WASM plugins", async () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "# Imported\n");
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
+	const lix = await openLix({ storage });
 	const markdownPlugin = (await bundledPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_md_v2",
 	);
@@ -583,7 +583,7 @@ test("fs backend imports files through installed WASM plugins", async () => {
 		markdownPlugin.key,
 		markdownPlugin.archiveBytes,
 	);
-	await backend.importPaths(["note.md"]);
+	await storage.importPaths(["note.md"]);
 
 	const nodes = await lix.execute(
 		"SELECT kind FROM markdown_node ORDER BY kind",
@@ -595,49 +595,49 @@ test("fs backend imports files through installed WASM plugins", async () => {
 	await lix.close();
 });
 
-test("fs backend binds to one open lix at a time", async () => {
+test("fs storage binds to one open lix at a time", async () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "note");
 
-	const backend = new FsBackend({ path: dir, syncAllFiles: true });
-	const lix = await openLix({ backend });
-	await expect(openLix({ backend })).rejects.toThrow("already open");
+	const storage = new LocalFilesystem({ path: dir, syncAllFiles: true });
+	const lix = await openLix({ storage });
+	await expect(openLix({ storage })).rejects.toThrow("already open");
 
-	await backend.syncDiskToLix();
+	await storage.syncDiskToLix();
 
 	await lix.close();
-	const reopened = await openLix({ backend });
-	await backend.syncDiskToLix();
+	const reopened = await openLix({ storage });
+	await storage.syncDiskToLix();
 	await reopened.close();
 });
 
-test("fs backend syncAllFiles validates option shape", () => {
+test("fs storage syncAllFiles validates option shape", () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 
-	expect(() => new FsBackend({ path: dir } as never)).toThrow(
-		"FsBackend syncAllFiles must be a boolean",
+	expect(() => new LocalFilesystem({ path: dir } as never)).toThrow(
+		"LocalFilesystem syncAllFiles must be a boolean",
 	);
-	expect(() => new FsBackend({ path: dir, syncAllFiles: true })).not.toThrow();
-	expect(() => new FsBackend({ path: dir, syncAllFiles: false })).not.toThrow();
+	expect(() => new LocalFilesystem({ path: dir, syncAllFiles: true })).not.toThrow();
+	expect(() => new LocalFilesystem({ path: dir, syncAllFiles: false })).not.toThrow();
 	expect(
 		() =>
-			new FsBackend({
+			new LocalFilesystem({
 				path: dir,
 				syncAllFiles: {} as boolean,
 			}),
-	).toThrow("FsBackend syncAllFiles must be a boolean");
+	).toThrow("LocalFilesystem syncAllFiles must be a boolean");
 });
 
-test("fs backend on-demand sync imports no regular workspace files initially", async () => {
+test("fs storage on-demand sync imports no regular workspace files initially", async () => {
 	const dir = tempFsDir();
 	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "excluded");
 
 	const lix = await openLix({
-		backend: new FsBackend({
+		storage: new LocalFilesystem({
 			path: dir,
 			lixDir,
 			syncAllFiles: false,
@@ -658,19 +658,19 @@ test("fs backend on-demand sync imports no regular workspace files initially", a
 	await lix.close();
 });
 
-test("fs backend on-demand sync treats paths as exact filenames", async () => {
+test("fs storage on-demand sync treats paths as exact filenames", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, " spaced.md");
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(filePath, "literal whitespace");
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await backend.importPaths([" spaced.md"]);
+	const lix = await openLix({ storage });
+	await storage.importPaths([" spaced.md"]);
 
 	const bytes = await readFile(lix, "/ spaced.md");
 	expect(bytes ? new TextDecoder().decode(bytes) : undefined).toBe(
@@ -680,17 +680,17 @@ test("fs backend on-demand sync treats paths as exact filenames", async () => {
 	await lix.close();
 });
 
-test("fs backend on-demand sync does not create directories for missing imports", async () => {
+test("fs storage on-demand sync does not create directories for missing imports", async () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await backend.importPaths(["missing/note.md"]);
+	const lix = await openLix({ storage });
+	await storage.importPaths(["missing/note.md"]);
 
 	const directories = await lix.execute(
 		"SELECT path FROM lix_directory WHERE path = $1",
@@ -702,19 +702,19 @@ test("fs backend on-demand sync does not create directories for missing imports"
 	await lix.close();
 });
 
-test("fs backend on-demand sync propagates deletion of imported files", async () => {
+test("fs storage on-demand sync propagates deletion of imported files", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(filePath, "local");
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await backend.importPaths(["note.md"]);
+	const lix = await openLix({ storage });
+	await storage.importPaths(["note.md"]);
 
 	expect(await readFile(lix, "/note.md")).toBeDefined();
 
@@ -724,19 +724,19 @@ test("fs backend on-demand sync propagates deletion of imported files", async ()
 	await lix.close();
 });
 
-test("fs backend on-demand sync does not delete excluded files through parent directories", async () => {
+test("fs storage on-demand sync does not delete excluded files through parent directories", async () => {
 	const dir = tempFsDir();
 	const includedPath = join(dir, "docs", "note.md");
 	mkdirSync(join(dir, "docs"), { recursive: true });
 	writeFileSync(includedPath, "local");
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await backend.importPaths(["docs/note.md"]);
+	const lix = await openLix({ storage });
+	await storage.importPaths(["docs/note.md"]);
 
 	await writeFile(
 		lix,
@@ -756,7 +756,7 @@ test("fs backend on-demand sync does not delete excluded files through parent di
 	await lix.close();
 });
 
-test("fs backend on-demand sync matches directory paths by segment boundaries", async () => {
+test("fs storage on-demand sync matches directory paths by segment boundaries", async () => {
 	const dir = tempFsDir();
 	const excludedPath = join(dir, "foo", "file.md");
 	const includedPath = join(dir, "foo-bar", "note.md");
@@ -765,13 +765,13 @@ test("fs backend on-demand sync matches directory paths by segment boundaries", 
 	writeFileSync(excludedPath, "outside filter");
 	writeFileSync(includedPath, "local");
 
-	const backend = new FsBackend({
+	const storage = new LocalFilesystem({
 		path: dir,
 		lixDir: tempExternalLixDir(),
 		syncAllFiles: false,
 	});
-	const lix = await openLix({ backend });
-	await backend.importPaths(["foo-bar/note.md"]);
+	const lix = await openLix({ storage });
+	await storage.importPaths(["foo-bar/note.md"]);
 
 	expect(await readFile(lix, "/foo/file.md")).toBeUndefined();
 	expect(readFileSync(excludedPath, "utf8")).toBe("outside filter");
@@ -780,14 +780,14 @@ test("fs backend on-demand sync matches directory paths by segment boundaries", 
 	await lix.close();
 });
 
-test("fs backend with external lixDir materializes lix storage outside the workspace", async () => {
+test("fs storage with external lixDir materializes lix storage outside the workspace", async () => {
 	const dir = tempFsDir();
 	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "note");
 
 	const lix = await openLix({
-		backend: new FsBackend({ path: dir, lixDir, syncAllFiles: true }),
+		storage: new LocalFilesystem({ path: dir, lixDir, syncAllFiles: true }),
 	});
 
 	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
@@ -802,14 +802,14 @@ test("fs backend with external lixDir materializes lix storage outside the works
 	await lix.close();
 });
 
-test("fs backend with external lixDir persists lix storage when reused", async () => {
+test("fs storage with external lixDir persists lix storage when reused", async () => {
 	const dir = tempFsDir();
 	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "first");
 
 	const lix = await openLix({
-		backend: new FsBackend({ path: dir, lixDir, syncAllFiles: true }),
+		storage: new LocalFilesystem({ path: dir, lixDir, syncAllFiles: true }),
 	});
 	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
 		new TextEncoder().encode("second"),
@@ -822,7 +822,7 @@ test("fs backend with external lixDir persists lix storage when reused", async (
 	await lix.close();
 
 	const reopened = await openLix({
-		backend: new FsBackend({ path: dir, lixDir, syncAllFiles: true }),
+		storage: new LocalFilesystem({ path: dir, lixDir, syncAllFiles: true }),
 	});
 	const bytes = await readFile(reopened, "/note.md");
 	expect(bytes ? new TextDecoder().decode(bytes) : undefined).toBe("second");
@@ -835,13 +835,13 @@ test("fs backend with external lixDir persists lix storage when reused", async (
 	await reopened.close();
 });
 
-test("fs backend with a fresh external lixDir reimports disk state without old lix storage", async () => {
+test("fs storage with a fresh external lixDir reimports disk state without old lix storage", async () => {
 	const dir = tempFsDir();
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "note.md"), "first");
 
 	const lix = await openLix({
-		backend: new FsBackend({
+		storage: new LocalFilesystem({
 			path: dir,
 			lixDir: tempExternalLixDir(),
 			syncAllFiles: true,
@@ -858,7 +858,7 @@ test("fs backend with a fresh external lixDir reimports disk state without old l
 	await lix.close();
 
 	const reopened = await openLix({
-		backend: new FsBackend({
+		storage: new LocalFilesystem({
 			path: dir,
 			lixDir: tempExternalLixDir(),
 			syncAllFiles: true,
@@ -874,7 +874,7 @@ test("fs backend with a fresh external lixDir reimports disk state without old l
 });
 
 test.skipIf(process.platform === "win32")(
-	"fs backend ignores symlinks",
+	"fs storage ignores symlinks",
 	async () => {
 		const dir = tempFsDir();
 		mkdirSync(join(dir, "docs"), { recursive: true });
@@ -884,7 +884,7 @@ test.skipIf(process.platform === "win32")(
 		symlinkSync("docs", join(dir, "linked-docs"));
 
 		const lix = await openLix({
-			backend: new FsBackend({ path: dir, syncAllFiles: true }),
+			storage: new LocalFilesystem({ path: dir, syncAllFiles: true }),
 		});
 		const files = await lix.execute(
 			"SELECT path FROM lix_file WHERE path IN ($1, $2, $3) ORDER BY path",
@@ -1377,8 +1377,11 @@ test("execute rejects invalid runtime arguments before native call", async () =>
 	};
 
 	await expect(
-		openLix({ backend: { path: tempLixPath() } } as never),
+		openLix({ storage: { path: tempLixPath() } } as never),
 	).rejects.toThrow(/openLix\(\) requires/);
+	await expect(
+		openLix({ backend: new SQLite({ path: tempLixPath() }) } as never),
+	).rejects.toThrow(/option 'backend' was removed; use 'storage'/);
 	await expect(openLix(null as never)).rejects.toThrow(
 		/options must be an object/,
 	);

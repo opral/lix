@@ -294,9 +294,9 @@ async function execute(sql: string): Promise<string> {
 
 1.  **Complexity of SQL Rewriting**: The preprocessor must correctly parse and rewrite potentially complex SQL statements, including handling edge cases.
 
-### Bonus: Using Postgres or any other SQL database as backend
+### Bonus: Using Postgres or any other SQL database as the execution provider
 
-Relying purely on preprocessing rather than SQLite (WASM build) specific APIs, enables lix to use any SQL database as backend e.g. PostgreSQL, Turso, or MySQL.
+Relying purely on preprocessing rather than SQLite (WASM build) specific APIs enables Lix to delegate rewritten SQL to PostgreSQL, Turso, MySQL, or another SQL database.
 
 ```ts
 const lix = await openLix({

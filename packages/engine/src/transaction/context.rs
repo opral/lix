@@ -44,11 +44,13 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
-use crate::storage::StorageBackend;
-use crate::storage::{
-    InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{
+    Memory, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
 };
-use crate::storage::{SharedStorageRead, StorageContext, StorageRead, StorageReadScope};
+use crate::storage_adapter::{
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
+};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -73,16 +75,16 @@ pub(crate) struct TransactionCommitOutcome {
 
 /// One execution-scoped transaction capability for engine write paths.
 ///
-/// This is intentionally not a session-wide kitchen sink. It owns the backend
+/// This is intentionally not a session-wide kitchen sink. It owns the storage
 /// write transaction for one `SessionContext::execute(...)` call and projects
 /// accepted SQL/provider writes back into the SQL DAG through an engine-local live-state
 /// overlay.
 ///
 /// Transaction invariant: this is the capability for engine operations
 /// that may write. Write-relevant reads must be exposed from this transaction,
-/// after the backend write transaction has begun, rather than from session-level
+/// after the storage write transaction has begun, rather than from session-level
 /// helpers.
-pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
+pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     active_branch_id: String,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
@@ -92,7 +94,7 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     catalog_context: Arc<CatalogContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
-    storage: StorageContext<B>,
+    storage: StorageAdapter<StorageImpl>,
     sql_schema_cache: SqlSchemaCache,
     functions: FunctionProviderHandle,
     commit_boundary: Option<TransactionCommitBoundary>,
@@ -242,22 +244,23 @@ where
     }
 }
 
-impl<B> Transaction<B>
+impl<StorageImpl> Transaction<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open(
         mode: &SessionMode,
-        storage: StorageContext<B>,
+        storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
-    ) -> Result<OpenTransaction<B>, LixError> {
-        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+    ) -> Result<OpenTransaction<StorageImpl>, LixError> {
+        let read =
+            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let setup_result = async {
             let active_branch_id =
                 resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
@@ -318,11 +321,11 @@ where
         })
     }
 
-    /// Commits prepared writes, runtime function state, and the backend transaction.
+    /// Commits prepared writes, runtime function state, and the storage transaction.
     ///
     /// Commit owns the execution boundary: prepared rows become changelog
     /// facts, branch-ref updates, and visible live_state rows before the
-    /// backend transaction is committed.
+    /// storage transaction is committed.
     pub(crate) async fn commit(
         self,
         runtime_functions: &FunctionContext,
@@ -340,7 +343,7 @@ where
         transaction
             .validate_prepared_writes_by_branch(&prepared_writes)
             .await?;
-        let mut read = SharedStorageRead::new(
+        let mut read = SharedStorageAdapterRead::new(
             transaction
                 .storage
                 .begin_read(StorageReadOptions::default())
@@ -375,7 +378,7 @@ where
         self.commit_boundary = Some(boundary);
     }
 
-    /// Rolls back the backend transaction.
+    /// Rolls back the storage transaction.
     ///
     /// This is the explicit failure path for a write execution. Dropping the
     /// buffered transaction without commit is not the API we want callers to
@@ -417,7 +420,7 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -431,7 +434,7 @@ where
         request: &LiveStateFileScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -645,7 +648,7 @@ where
         &self,
         filesystem: &FilesystemIndex,
     ) -> Result<Vec<InstalledPlugin>, LixError> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -701,7 +704,7 @@ where
     ) -> Result<Vec<PreparedStateRow>, LixError> {
         let row_count = rows.len();
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -772,7 +775,7 @@ where
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
             let branch_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
-            let read = SharedStorageRead::new(
+            let read = SharedStorageAdapterRead::new(
                 self.storage
                     .begin_read(StorageReadOptions::default())
                     .await?,
@@ -809,7 +812,7 @@ where
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
         let branch_ids = transaction_write_branch_ids(write);
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -863,7 +866,7 @@ where
         let staged_writes = Arc::clone(&self.staged_writes);
         let plugin_host = self.plugin_host.clone();
 
-        with_static_transaction_sql_read::<B, _, _>(read, |read_store| async move {
+        with_static_transaction_sql_read::<StorageImpl, _, _>(read, |read_store| async move {
             let read_ctx = TransactionSqlReadExecutionContext {
                 active_branch_id,
                 read_store,
@@ -890,7 +893,7 @@ where
         if self.sql_schema_cache.is_prepared() {
             return Ok(());
         }
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -946,37 +949,39 @@ where
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open transaction read scope");
-        self.branch_ctx.ref_reader(SharedStorageRead::new(read))
+        self.branch_ctx
+            .ref_reader(SharedStorageAdapterRead::new(read))
     }
 
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) async fn tracked_state_reader(
         &mut self,
-    ) -> TrackedStateStoreReader<SharedStorageRead<B::Read<'_>>> {
+    ) -> TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open transaction read scope");
-        self.tracked_state.reader(SharedStorageRead::new(read))
+        self.tracked_state
+            .reader(SharedStorageAdapterRead::new(read))
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) async fn commit_graph_reader(
         &mut self,
-    ) -> CommitGraphStoreReader<SharedStorageRead<B::Read<'_>>> {
+    ) -> CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open transaction read scope");
-        CommitGraphContext::new().reader(SharedStorageRead::new(read))
+        CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
 }
 
-pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageBackendRead> {
+pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::StorageRead> {
     active_branch_id: String,
-    read_store: SharedStorageRead<R>,
+    read_store: SharedStorageAdapterRead<R>,
     live_state: Arc<LiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     branch_ctx: Arc<BranchContext>,
@@ -989,9 +994,9 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageB
 
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
 where
-    R: crate::storage::StorageBackendRead + 'static,
+    R: crate::storage_adapter::StorageRead + 'static,
 {
-    type ReadStore = SharedStorageRead<R>;
+    type ReadStore = SharedStorageAdapterRead<R>;
 
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
@@ -1101,15 +1106,15 @@ async fn load_transaction_blob_bytes(
     Ok(BlobBytesBatch::new(entries))
 }
 
-struct TransactionReadLiveStateReader<R: crate::storage::StorageBackendRead> {
-    base: crate::live_state::LiveStateStoreReader<SharedStorageRead<R>>,
+struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
+    base: crate::live_state::LiveStateStoreReader<SharedStorageAdapterRead<R>>,
     staged: crate::transaction::staging::PreparedStateRowOverlay,
 }
 
 #[async_trait]
 impl<R> crate::live_state::LiveStateReader for TransactionReadLiveStateReader<R>
 where
-    R: crate::storage::StorageBackendRead + 'static,
+    R: crate::storage_adapter::StorageRead + 'static,
 {
     async fn scan_rows(
         &self,
@@ -1150,7 +1155,7 @@ where
 #[async_trait]
 impl<R> FilesystemPathIndexReader for TransactionReadLiveStateReader<R>
 where
-    R: crate::storage::StorageBackendRead + Send + 'static,
+    R: crate::storage_adapter::StorageRead + Send + 'static,
 {
     async fn path_index(
         &self,
@@ -1160,26 +1165,26 @@ where
     }
 }
 
-/// Runs one transaction SQL read using a widened backend-read lifetime.
+/// Runs one transaction SQL read using a widened storage-read lifetime.
 ///
 /// DataFusion requires provider state to be `'static`, but transaction reads
-/// are scoped to the current backend snapshot. Keep this bridge private to
+/// are scoped to the current storage snapshot. Keep this bridge private to
 /// transaction SQL execution so no crate-level API can receive the widened
-/// backend read handle.
-async fn with_static_transaction_sql_read<B, F, Fut>(
-    read: StorageReadScope<B::Read<'_>>,
+/// storage read handle.
+async fn with_static_transaction_sql_read<StorageImpl, F, Fut>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     f: F,
 ) -> Result<SqlQueryResult, LixError>
 where
-    B: StorageBackend + 'static,
-    F: FnOnce(SharedStorageRead<B::Read<'static>>) -> Fut,
+    StorageImpl: Storage + 'static,
+    F: FnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
     Fut: Future<Output = Result<SqlQueryResult, LixError>>,
 {
-    // SAFETY: the widened read is wrapped immediately in `SharedStorageRead`,
+    // SAFETY: the widened read is wrapped immediately in `SharedStorageAdapterRead`,
     // only passed into this private SQL execution closure, and explicitly
     // dropped before returning. Escaped clones are detected by `finish()`.
-    let read = unsafe { assume_static_backend_read::<B>(read) };
-    let read = SharedStorageRead::new(read);
+    let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+    let read = SharedStorageAdapterRead::new(read);
     let finish = read.clone();
     let result = f(read).await;
     let finish_result = finish.finish().map_err(LixError::from);
@@ -1190,21 +1195,24 @@ where
     }
 }
 
-/// Erases the backend borrow lifetime for scoped transaction SQL execution.
+/// Erases the storage borrow lifetime for scoped transaction SQL execution.
 ///
 /// # Safety
 ///
-/// The returned read scope must not outlive the backend value that produced
+/// The returned read scope must not outlive the storage value that produced
 /// `read`, and it must be dropped before the enclosing SQL execution returns.
-unsafe fn assume_static_backend_read<B>(
-    read: StorageReadScope<B::Read<'_>>,
-) -> StorageReadScope<B::Read<'static>>
+unsafe fn assume_static_storage_read<StorageImpl>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
+) -> StorageAdapterReadScope<StorageImpl::Read<'static>>
 where
-    B: StorageBackend + 'static,
+    StorageImpl: Storage + 'static,
 {
     let read = std::mem::ManuallyDrop::new(read);
     unsafe {
-        std::ptr::read(std::ptr::from_ref(&*read).cast::<StorageReadScope<B::Read<'static>>>())
+        std::ptr::read(
+            std::ptr::from_ref(&*read)
+                .cast::<StorageAdapterReadScope<StorageImpl::Read<'static>>>(),
+        )
     }
 }
 
@@ -1274,23 +1282,23 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
     })
 }
 
-pub(crate) struct OpenTransaction<B: StorageBackend = InMemoryStorageBackend> {
-    pub(crate) transaction: Transaction<B>,
+pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
+    pub(crate) transaction: Transaction<StorageImpl>,
     pub(crate) runtime_functions: FunctionContext,
 }
 
-pub(crate) async fn open_transaction<B>(
+pub(crate) async fn open_transaction<StorageImpl>(
     mode: &SessionMode,
-    storage: StorageContext<B>,
+    storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
-) -> Result<OpenTransaction<B>, LixError>
+) -> Result<OpenTransaction<StorageImpl>, LixError>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     Transaction::open(
         mode,
@@ -1306,9 +1314,9 @@ where
 }
 
 #[async_trait]
-impl<B> SqlWriteExecutionContext for Transaction<B>
+impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
@@ -1327,7 +1335,7 @@ where
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -1348,7 +1356,7 @@ where
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         if !self.staged_writes.has_staged_filesystem_descriptors()? {
-            let read = SharedStorageRead::new(
+            let read = SharedStorageAdapterRead::new(
                 self.storage
                     .begin_read(StorageReadOptions::default())
                     .await?,
@@ -1362,7 +1370,7 @@ where
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -1599,7 +1607,7 @@ async fn resolve_active_branch_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
-    read: &(impl StorageRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
@@ -1610,7 +1618,7 @@ async fn resolve_active_branch_id(
 async fn load_workspace_branch_id(
     live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
-    read: &(impl StorageRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     let row = live_state
         .reader(read)
@@ -1677,7 +1685,7 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::branch::BranchContext;
     use crate::changelog::ChangelogReader;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
+    use crate::storage_adapter::{Memory, StorageReadOptions};
     use crate::tracked_state::{TrackedStateKey, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
 
@@ -1693,8 +1701,8 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
+        let storage = Memory::new();
+        let storage = StorageAdapter::new(storage.clone());
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
@@ -1874,9 +1882,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_accepts_lossy_iso_timestamps_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("lossy-timestamp", "value", true);
         row.created_at = Some("1969-12-31T23:59:59.999999Z".to_string());
@@ -1915,8 +1923,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_validates_staged_rows_before_persistence() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
+        let storage = Memory::new();
+        let storage = StorageAdapter::new(storage.clone());
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
@@ -1976,10 +1984,10 @@ mod tests {
 
     #[tokio::test]
     async fn commit_rejects_non_object_metadata_without_sql() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
+        let storage = Memory::new();
         let (live_state, _binary_cas, branch_ref, runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
+        let storage = StorageAdapter::new(storage);
 
         let mut row = key_value_stage_row("invalid-metadata", "value", false);
         row.metadata = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
@@ -2009,9 +2017,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_key_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("unknown-schema", "value", false);
         row.schema_key = "missing_schema".to_string();
@@ -2032,9 +2040,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_missing_branch_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("ghost-branch-row", "value", false);
         row.branch_id = "ghost-branch".to_string();
@@ -2056,9 +2064,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_invalid_storage_scope_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("invalid-storage-scope", "value", false);
         row.branch_id = GLOBAL_BRANCH_ID.to_string();
@@ -2078,9 +2086,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("invalid-json", "value", false);
         row.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
@@ -2099,10 +2107,10 @@ mod tests {
 
     #[tokio::test]
     async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
+        let storage = Memory::new();
         let (live_state, _binary_cas, branch_ref, runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
+        let storage = StorageAdapter::new(storage);
 
         let mut row = key_value_stage_row("schema-mismatch", "value", false);
         row.snapshot = Some(TransactionJson::from_value_for_test(
@@ -2134,9 +2142,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
         row.schema_key = "lix_registered_schema".to_string();
@@ -2168,9 +2176,9 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_primary_key_entity_pk_mismatch_without_sql() {
-        let backend = InMemoryStorageBackend::new();
+        let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
+            open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("right-id", "value", false);
         row.entity_pk = Some(EntityPk::single("wrong-id"));
@@ -2190,7 +2198,7 @@ mod tests {
     }
 
     async fn open_test_transaction(
-        backend: &InMemoryStorageBackend,
+        storage: &Memory,
     ) -> (
         Arc<LiveStateContext>,
         Arc<BinaryCasContext>,
@@ -2198,7 +2206,7 @@ mod tests {
         FunctionContext,
         Transaction,
     ) {
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageAdapter::new(storage.clone());
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
@@ -2230,7 +2238,7 @@ mod tests {
         )
     }
 
-    async fn seed_visible_schema_rows(storage: StorageContext) {
+    async fn seed_visible_schema_rows(storage: StorageAdapter) {
         let rows = crate::schema::seed_schema_definitions()
             .into_iter()
             .map(|schema| {
@@ -2265,7 +2273,7 @@ mod tests {
     }
 
     async fn assert_no_persistence_after_validation_failure(
-        storage: StorageContext,
+        storage: StorageAdapter,
         live_state: &LiveStateContext,
         branch_ctx: &BranchContext,
         rejected_entity_pk: &str,

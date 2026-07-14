@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::storage::StorageBackend;
+use crate::storage_adapter::Storage;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 
 use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
@@ -24,9 +24,9 @@ pub struct SwitchBranchReceipt {
     pub branch_id: String,
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Switches the session's active branch selector.
     ///

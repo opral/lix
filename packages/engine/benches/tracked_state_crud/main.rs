@@ -4,14 +4,14 @@ use criterion::measurement::WallTime;
 use criterion::{BatchSize, BenchmarkGroup, Criterion, black_box, criterion_group, criterion_main};
 
 mod accounting;
-mod backends;
 mod io_stats;
 mod kv_layout;
 mod sql_session;
+mod storage;
 mod transaction_api;
 mod workload;
 
-use backends::{BACKEND_PROFILES, BackendProfile};
+use storage::{STORAGE_PROFILES, StorageProfile};
 use workload::{REAL_WORKLOAD_ROWS, SMOKE_ROWS, WorkloadRow, fixture_rows, row_label};
 
 const READ_MANY_PK_COUNT: usize = 10;
@@ -26,7 +26,7 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
     accounting::maybe_print_accounting_report(&runtime, &rows[..SMOKE_ROWS]);
 
     for (label, row_count) in [("smoke", SMOKE_ROWS), ("real_workload", REAL_WORKLOAD_ROWS)] {
-        for profile in BACKEND_PROFILES {
+        for profile in STORAGE_PROFILES {
             bench_kv_layout(c, &runtime, profile, &rows[..row_count], label);
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
@@ -37,7 +37,7 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
 fn bench_kv_layout(
     c: &mut Criterion,
     runtime: &tokio::runtime::Runtime,
-    profile: BackendProfile,
+    profile: StorageProfile,
     rows: &[WorkloadRow],
     label: &str,
 ) {
@@ -53,7 +53,7 @@ fn bench_kv_layout(
 fn bench_transaction_api(
     c: &mut Criterion,
     runtime: &tokio::runtime::Runtime,
-    profile: BackendProfile,
+    profile: StorageProfile,
     rows: &[WorkloadRow],
     label: &str,
 ) {
@@ -166,7 +166,7 @@ impl TransactionBenchOp {
 fn bench_transaction_op(
     group: &mut BenchmarkGroup<'_, WallTime>,
     runtime: &tokio::runtime::Runtime,
-    profile: BackendProfile,
+    profile: StorageProfile,
     rows: &[WorkloadRow],
     name: String,
     op: TransactionBenchOp,
@@ -197,7 +197,7 @@ fn bench_transaction_op(
 fn bench_sql_session(
     c: &mut Criterion,
     runtime: &tokio::runtime::Runtime,
-    profile: BackendProfile,
+    profile: StorageProfile,
     rows: &[WorkloadRow],
     label: &str,
 ) {
@@ -272,8 +272,8 @@ fn bench_sql_session(
 trait AsyncOps {
     type Fixture;
 
-    async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture;
-    async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture;
+    async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> Self::Fixture;
+    async fn seeded_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> Self::Fixture;
     async fn insert_all(fixture: &mut Self::Fixture) -> usize;
     async fn read_all(fixture: &mut Self::Fixture) -> usize;
     async fn read_one_by_pk(fixture: &mut Self::Fixture) -> usize;
@@ -289,11 +289,11 @@ struct KvOps;
 impl AsyncOps for KvOps {
     type Fixture = kv_layout::KvFixture;
 
-    async fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture {
+    async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> Self::Fixture {
         kv_layout::empty_fixture(profile, rows).await
     }
 
-    async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> Self::Fixture {
+    async fn seeded_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> Self::Fixture {
         kv_layout::seeded_fixture(profile, rows).await
     }
 
@@ -333,7 +333,7 @@ impl AsyncOps for KvOps {
 fn bench_async_ops<O: AsyncOps>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     runtime: &tokio::runtime::Runtime,
-    profile: BackendProfile,
+    profile: StorageProfile,
     rows: &[WorkloadRow],
     _layer: &str,
     _ops: O,

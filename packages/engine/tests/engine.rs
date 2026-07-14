@@ -7,9 +7,9 @@ use lix_engine::{
 };
 use serde_json::json;
 
-simulation_test!(engine_new_rejects_uninitialized_backend, |sim| async move {
-    match Engine::new(sim.uninitialized_backend()).await {
-        Ok(_) => panic!("uninitialized backend should not create an engine"),
+simulation_test!(engine_new_rejects_uninitialized_storage, |sim| async move {
+    match Engine::new(sim.uninitialized_storage()).await {
+        Ok(_) => panic!("uninitialized storage should not create an engine"),
         Err(error) => assert_eq!(error.code, "LIX_ERROR_NOT_INITIALIZED"),
     }
 });
@@ -22,14 +22,14 @@ simulation_test!(
             engine
                 .open_session("global")
                 .await
-                .expect("initialized backend should open global session"),
+                .expect("initialized storage should open global session"),
             &engine,
         );
         let main_session = sim.wrap_session(
             engine
                 .open_workspace_session()
                 .await
-                .expect("initialized backend should open main session"),
+                .expect("initialized storage should open main session"),
             &engine,
         );
 
@@ -107,7 +107,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open a session"),
+                .expect("storage should open a session"),
             &engine,
         );
 
@@ -160,7 +160,7 @@ simulation_test!(
         let session = engine
             .open_workspace_session()
             .await
-            .expect("backend should open a session");
+            .expect("storage should open a session");
 
         register_poison_task_schema(&session).await;
 
@@ -200,7 +200,7 @@ simulation_test!(
         let session = engine
             .open_workspace_session()
             .await
-            .expect("backend should open a session");
+            .expect("storage should open a session");
 
         session.close().await.expect("first close should succeed");
         session.close().await.expect("second close should succeed");
@@ -279,7 +279,7 @@ simulation_test!(
         let session = engine
             .open_workspace_session()
             .await
-            .expect("backend should open a session");
+            .expect("storage should open a session");
         let (switched_session, _) = session
             .switch_branch(SwitchBranchOptions {
                 branch_id: sim.main_branch_id().to_string(),
@@ -309,7 +309,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open first session"),
+                .expect("storage should open first session"),
             &engine,
         );
 
@@ -343,7 +343,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open second session"),
+                .expect("storage should open second session"),
             &engine,
         );
         assert_single_text(
@@ -388,7 +388,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open a session"),
+                .expect("storage should open a session"),
             &engine,
         );
 
@@ -449,7 +449,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open first session"),
+                .expect("storage should open first session"),
             &engine,
         );
         session
@@ -466,7 +466,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open second session"),
+                .expect("storage should open second session"),
             &engine,
         );
 
@@ -507,7 +507,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open first session"),
+                .expect("storage should open first session"),
             &engine,
         );
         session
@@ -523,7 +523,7 @@ simulation_test!(
             engine
                 .open_workspace_session()
                 .await
-                .expect("backend should open second session"),
+                .expect("storage should open second session"),
             &engine,
         );
 

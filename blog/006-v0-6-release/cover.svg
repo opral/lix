@@ -8,7 +8,7 @@
   <text x="272" y="174" fill="#FAFAF7" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="28" font-weight="700">@lix-js/sdk v0.6</text>
   <text x="134" y="282" fill="#0A0A0A" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="58" font-weight="760">Embeddable version control</text>
   <text x="134" y="352" fill="#0A0A0A" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="58" font-weight="760">for AI agents</text>
-  <text x="138" y="420" fill="#2B2B2B" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="27">Import version control as a library. Bring your own backend.</text>
+  <text x="138" y="420" fill="#2B2B2B" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="27">Import version control as a library. Bring your own storage.</text>
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="22" font-weight="600">
     <rect x="138" y="468" width="134" height="46" rx="23" fill="#ECFBFD" stroke="#9BE7F4"/>
     <text x="172" y="498" fill="#066F86">SQLite</text>

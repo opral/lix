@@ -14,17 +14,18 @@ use bytes::Bytes;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use lix_backends::{RedbBackend, RocksDbBackend, SqliteBackend};
-use lix_engine::Backend;
-use lix_engine::backend::{
-    BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
-    GetOptions, InMemoryBackend, Key, KeyRange, Prefix, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
-};
+use lix_engine::Storage;
 use lix_engine::storage::{
-    PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageReadStats, StorageSpace,
-    StorageWriteSet, StorageWriteSetStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Memory, Prefix,
+    ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError,
+    StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
+use lix_engine::storage_adapter::{
+    PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterReadScope, StorageReadStats,
+    StorageSpace, StorageWriteSet, StorageWriteSetStats,
+};
+use lix_rocksdb_storage::RocksDB;
+use lix_sqlite_storage::SQLite;
 use rustc_hash::FxBuildHasher;
 use tempfile::TempDir;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
@@ -139,53 +140,53 @@ struct DeleteRangeFallbackStats {
 struct ScanDrainStats {
     scanned: usize,
     chunks: usize,
-    backend_calls: u64,
+    storage_calls: u64,
     read_stats: StorageReadStats,
 }
 
-trait StorageBenchBackend {
-    type Backend: Backend;
+trait StorageBenchStorage {
+    type Storage: Storage;
 
     fn name(&self) -> &'static str;
 
-    fn open_empty(&self) -> Self::Backend;
+    fn open_empty(&self) -> Self::Storage;
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend;
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage;
 
-    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend;
+    fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage;
 }
 
 #[derive(Clone, Copy)]
-struct InMemoryBenchBackend;
+struct InMemoryBenchStorage;
 
-impl StorageBenchBackend for InMemoryBenchBackend {
-    type Backend = InMemoryBackend;
+impl StorageBenchStorage for InMemoryBenchStorage {
+    type Storage = Memory;
 
     fn name(&self) -> &'static str {
         "in_memory"
     }
 
-    fn open_empty(&self) -> Self::Backend {
-        InMemoryBackend::new()
+    fn open_empty(&self) -> Self::Storage {
+        Memory::new()
     }
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
-        seeded_in_memory_backend_with_value_size(space.0, rows, value_size)
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
+        seeded_memory_with_value_size(space.0, rows, value_size)
     }
 
-    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
-        backend
+    fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
+        storage
             .fork_snapshot()
-            .expect("fork in-memory bench backend")
+            .expect("fork in-memory bench storage")
     }
 }
 
-struct SqliteTempBenchBackend {
+struct SQLiteTempBenchStorage {
     temp_dir: TempDir,
     next_database_id: AtomicU64,
 }
 
-impl SqliteTempBenchBackend {
+impl SQLiteTempBenchStorage {
     fn new() -> Self {
         Self {
             temp_dir: tempfile::tempdir().expect("create sqlite bench matrix temp dir"),
@@ -201,87 +202,42 @@ impl SqliteTempBenchBackend {
     }
 }
 
-impl StorageBenchBackend for SqliteTempBenchBackend {
-    type Backend = SqliteBackend;
+impl StorageBenchStorage for SQLiteTempBenchStorage {
+    type Storage = SQLite;
 
     fn name(&self) -> &'static str {
         "sqlite_temp"
     }
 
-    fn open_empty(&self) -> Self::Backend {
-        SqliteBackend::open(self.next_path()).expect("open empty sqlite bench backend")
+    fn open_empty(&self) -> Self::Storage {
+        SQLite::open(self.next_path()).expect("open empty sqlite bench storage")
     }
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
-        let backend = self.open_empty();
-        seed_backend_points(&backend, space, rows, value_size, "sqlite bench backend");
-        backend
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
+        let storage = self.open_empty();
+        seed_storage_points(&storage, space, rows, value_size, "sqlite bench storage");
+        storage
             .checkpoint()
-            .expect("checkpoint seeded sqlite bench backend");
-        backend
+            .expect("checkpoint seeded sqlite bench storage");
+        storage
     }
 
-    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
-        backend
+    fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
+        storage
             .checkpoint()
             .expect("checkpoint sqlite bench seed before fork");
         let fork_path = self.next_path();
-        fs::copy(backend.path(), &fork_path).expect("copy sqlite bench seed database");
-        SqliteBackend::open(fork_path).expect("open sqlite bench fork")
+        fs::copy(storage.path(), &fork_path).expect("copy sqlite bench seed database");
+        SQLite::open(fork_path).expect("open sqlite bench fork")
     }
 }
 
-struct RedbTempBenchBackend {
+struct RocksDBTempBenchStorage {
     temp_dir: TempDir,
     next_database_id: AtomicU64,
 }
 
-impl RedbTempBenchBackend {
-    fn new() -> Self {
-        Self {
-            temp_dir: tempfile::tempdir().expect("create redb bench matrix temp dir"),
-            next_database_id: AtomicU64::new(0),
-        }
-    }
-
-    fn next_path(&self) -> PathBuf {
-        let database_id = self.next_database_id.fetch_add(1, Ordering::Relaxed);
-        self.temp_dir
-            .path()
-            .join(format!("storage-v2-matrix-{database_id}.redb"))
-    }
-}
-
-impl StorageBenchBackend for RedbTempBenchBackend {
-    type Backend = RedbBackend;
-
-    fn name(&self) -> &'static str {
-        "redb_temp"
-    }
-
-    fn open_empty(&self) -> Self::Backend {
-        RedbBackend::open(self.next_path()).expect("open empty redb bench backend")
-    }
-
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
-        let backend = self.open_empty();
-        seed_backend_points(&backend, space, rows, value_size, "redb bench backend");
-        backend
-    }
-
-    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
-        let fork_path = self.next_path();
-        fs::copy(backend.path(), &fork_path).expect("copy redb bench seed database");
-        RedbBackend::open(fork_path).expect("open redb bench fork")
-    }
-}
-
-struct RocksDbTempBenchBackend {
-    temp_dir: TempDir,
-    next_database_id: AtomicU64,
-}
-
-impl RocksDbTempBenchBackend {
+impl RocksDBTempBenchStorage {
     fn new() -> Self {
         Self {
             temp_dir: tempfile::tempdir().expect("create rocksdb bench matrix temp dir"),
@@ -297,31 +253,31 @@ impl RocksDbTempBenchBackend {
     }
 }
 
-impl StorageBenchBackend for RocksDbTempBenchBackend {
-    type Backend = RocksDbBackend;
+impl StorageBenchStorage for RocksDBTempBenchStorage {
+    type Storage = RocksDB;
 
     fn name(&self) -> &'static str {
         "rocksdb_temp"
     }
 
-    fn open_empty(&self) -> Self::Backend {
-        RocksDbBackend::open(self.next_path()).expect("open empty rocksdb bench backend")
+    fn open_empty(&self) -> Self::Storage {
+        RocksDB::open(self.next_path()).expect("open empty rocksdb bench storage")
     }
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
-        let backend = self.open_empty();
-        seed_backend_points(&backend, space, rows, value_size, "rocksdb bench backend");
-        backend.flush().expect("flush seeded rocksdb bench backend");
-        backend
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
+        let storage = self.open_empty();
+        seed_storage_points(&storage, space, rows, value_size, "rocksdb bench storage");
+        storage.flush().expect("flush seeded rocksdb bench storage");
+        storage
     }
 
-    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
-        backend
+    fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
+        storage
             .flush()
             .expect("flush rocksdb bench seed before fork");
         let fork_path = self.next_path();
-        copy_dir_recursive(backend.path(), &fork_path).expect("copy rocksdb bench seed database");
-        RocksDbBackend::open(fork_path).expect("open rocksdb bench fork")
+        copy_dir_recursive(storage.path(), &fork_path).expect("copy rocksdb bench seed database");
+        RocksDB::open(fork_path).expect("open rocksdb bench fork")
     }
 }
 
@@ -485,17 +441,15 @@ const SCAN_CHUNKING_CASES: &[ScanChunkingCase] = &[
 
 fn storage_v2_benches(c: &mut Criterion) {
     if std::env::var_os("STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY").is_some() {
-        match std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND").as_deref() {
-            Ok("in_memory") => bench_backend_direct_profile(c, InMemoryBenchBackend),
-            Ok("sqlite_temp") => bench_backend_direct_profile(c, SqliteTempBenchBackend::new()),
-            Ok("redb_temp") => bench_backend_direct_profile(c, RedbTempBenchBackend::new()),
-            Ok("rocksdb_temp") => bench_backend_direct_profile(c, RocksDbTempBenchBackend::new()),
-            Ok(other) => panic!("unknown direct profile backend: {other}"),
+        match std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_STORAGE").as_deref() {
+            Ok("in_memory") => bench_storage_direct_profile(c, InMemoryBenchStorage),
+            Ok("sqlite_temp") => bench_storage_direct_profile(c, SQLiteTempBenchStorage::new()),
+            Ok("rocksdb_temp") => bench_storage_direct_profile(c, RocksDBTempBenchStorage::new()),
+            Ok(other) => panic!("unknown direct profile storage: {other}"),
             Err(_) => {
-                bench_backend_direct_profile(c, InMemoryBenchBackend);
-                bench_backend_direct_profile(c, SqliteTempBenchBackend::new());
-                bench_backend_direct_profile(c, RedbTempBenchBackend::new());
-                bench_backend_direct_profile(c, RocksDbTempBenchBackend::new());
+                bench_storage_direct_profile(c, InMemoryBenchStorage);
+                bench_storage_direct_profile(c, SQLiteTempBenchStorage::new());
+                bench_storage_direct_profile(c, RocksDBTempBenchStorage::new());
             }
         }
         return;
@@ -503,40 +457,32 @@ fn storage_v2_benches(c: &mut Criterion) {
 
     bench_write_set_lowering(c);
     bench_write_set_construction(c);
-    bench_write_set_build_and_commit(c, InMemoryBenchBackend);
-    bench_write_set_build_and_commit(c, SqliteTempBenchBackend::new());
-    bench_write_set_build_and_commit(c, RedbTempBenchBackend::new());
-    bench_write_set_build_and_commit(c, RocksDbTempBenchBackend::new());
-    bench_direct_write_order(c, InMemoryBenchBackend);
-    bench_direct_write_order(c, SqliteTempBenchBackend::new());
-    bench_direct_write_order(c, RedbTempBenchBackend::new());
-    bench_direct_write_order(c, RocksDbTempBenchBackend::new());
+    bench_write_set_build_and_commit(c, InMemoryBenchStorage);
+    bench_write_set_build_and_commit(c, SQLiteTempBenchStorage::new());
+    bench_write_set_build_and_commit(c, RocksDBTempBenchStorage::new());
+    bench_direct_write_order(c, InMemoryBenchStorage);
+    bench_direct_write_order(c, SQLiteTempBenchStorage::new());
+    bench_direct_write_order(c, RocksDBTempBenchStorage::new());
     bench_write_batch_seal_sort(c);
-    bench_delete_range_fallback(c, InMemoryBenchBackend);
-    bench_delete_range_fallback(c, SqliteTempBenchBackend::new());
-    bench_delete_range_fallback(c, RedbTempBenchBackend::new());
-    bench_delete_range_fallback(c, RocksDbTempBenchBackend::new());
-    bench_delete_range_native(c, InMemoryBenchBackend);
-    bench_delete_range_native(c, SqliteTempBenchBackend::new());
-    bench_delete_range_native(c, RedbTempBenchBackend::new());
-    bench_delete_range_native(c, RocksDbTempBenchBackend::new());
-    bench_delete_range_storage_helpers(c, InMemoryBenchBackend);
-    bench_delete_range_storage_helpers(c, SqliteTempBenchBackend::new());
-    bench_delete_range_storage_helpers(c, RedbTempBenchBackend::new());
-    bench_delete_range_storage_helpers(c, RocksDbTempBenchBackend::new());
-    bench_scan_chunking_matrix(c, InMemoryBenchBackend);
-    bench_scan_chunking_matrix(c, SqliteTempBenchBackend::new());
-    bench_scan_chunking_matrix(c, RedbTempBenchBackend::new());
-    bench_scan_chunking_matrix(c, RocksDbTempBenchBackend::new());
-    bench_durable_commit(c, InMemoryBenchBackend);
-    bench_durable_commit(c, SqliteTempBenchBackend::new());
-    bench_durable_commit(c, RedbTempBenchBackend::new());
-    bench_durable_commit(c, RocksDbTempBenchBackend::new());
+    bench_delete_range_fallback(c, InMemoryBenchStorage);
+    bench_delete_range_fallback(c, SQLiteTempBenchStorage::new());
+    bench_delete_range_fallback(c, RocksDBTempBenchStorage::new());
+    bench_delete_range_native(c, InMemoryBenchStorage);
+    bench_delete_range_native(c, SQLiteTempBenchStorage::new());
+    bench_delete_range_native(c, RocksDBTempBenchStorage::new());
+    bench_delete_range_storage_helpers(c, InMemoryBenchStorage);
+    bench_delete_range_storage_helpers(c, SQLiteTempBenchStorage::new());
+    bench_delete_range_storage_helpers(c, RocksDBTempBenchStorage::new());
+    bench_scan_chunking_matrix(c, InMemoryBenchStorage);
+    bench_scan_chunking_matrix(c, SQLiteTempBenchStorage::new());
+    bench_scan_chunking_matrix(c, RocksDBTempBenchStorage::new());
+    bench_durable_commit(c, InMemoryBenchStorage);
+    bench_durable_commit(c, SQLiteTempBenchStorage::new());
+    bench_durable_commit(c, RocksDBTempBenchStorage::new());
     bench_point_request_plan(c);
-    bench_backend_direct_profile(c, InMemoryBenchBackend);
-    bench_backend_direct_profile(c, SqliteTempBenchBackend::new());
-    bench_backend_direct_profile(c, RedbTempBenchBackend::new());
-    bench_backend_direct_profile(c, RocksDbTempBenchBackend::new());
+    bench_storage_direct_profile(c, InMemoryBenchStorage);
+    bench_storage_direct_profile(c, SQLiteTempBenchStorage::new());
+    bench_storage_direct_profile(c, RocksDBTempBenchStorage::new());
     bench_hash_algorithms(c);
 }
 
@@ -644,16 +590,16 @@ fn bench_hash_algorithm<S>(
         b.iter(|| {
             let mut seen =
                 HashSet::with_capacity_and_hasher(point_keys.len(), build_hasher.clone());
-            let mut backend_keys = Vec::with_capacity(point_keys.len());
+            let mut storage_keys = Vec::with_capacity(point_keys.len());
             for key in black_box(point_keys) {
                 if seen.insert(key) {
-                    backend_keys.push(key.clone());
+                    storage_keys.push(key.clone());
                 }
             }
 
             let mut found =
-                HashMap::with_capacity_and_hasher(backend_keys.len(), build_hasher.clone());
-            for key in &backend_keys {
+                HashMap::with_capacity_and_hasher(storage_keys.len(), build_hasher.clone());
+            for key in &storage_keys {
                 found.insert(key.clone(), ProjectedValue::FullValue(key.0.clone()));
             }
 
@@ -662,7 +608,7 @@ fn bench_hash_algorithm<S>(
                 values.push(found.get(key).cloned());
             }
 
-            assert_eq!(backend_keys.len(), 100);
+            assert_eq!(storage_keys.len(), 100);
             assert_eq!(values.len(), point_keys.len());
             black_box(values);
         });
@@ -673,16 +619,16 @@ fn bench_hash_algorithm<S>(
         b.iter(|| {
             let mut seen =
                 HashSet::with_capacity_and_hasher(unique_keys.len(), build_hasher.clone());
-            let mut backend_keys = Vec::with_capacity(unique_keys.len());
+            let mut storage_keys = Vec::with_capacity(unique_keys.len());
             for key in black_box(unique_keys) {
                 if seen.insert(key) {
-                    backend_keys.push(key.clone());
+                    storage_keys.push(key.clone());
                 }
             }
 
             let mut found =
-                HashMap::with_capacity_and_hasher(backend_keys.len(), build_hasher.clone());
-            for key in &backend_keys {
+                HashMap::with_capacity_and_hasher(storage_keys.len(), build_hasher.clone());
+            for key in &storage_keys {
                 found.insert(key.clone(), ProjectedValue::FullValue(key.0.clone()));
             }
 
@@ -691,7 +637,7 @@ fn bench_hash_algorithm<S>(
                 values.push(found.get(key).cloned());
             }
 
-            assert_eq!(backend_keys.len(), unique_keys.len());
+            assert_eq!(storage_keys.len(), unique_keys.len());
             assert_eq!(values.len(), unique_keys.len());
             black_box(values);
         });
@@ -769,12 +715,12 @@ fn bench_write_set_lowering(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
                 || {
-                    let backend = CountingBackend::default();
-                    let storage = StorageContext::new(backend.clone());
+                    let storage_impl = CountingStorage::default();
+                    let storage = StorageAdapter::new(storage_impl.clone());
                     let writes = canonical_write_set_from_mutations(&mutations);
-                    (storage, backend, writes)
+                    (storage, storage_impl, writes)
                 },
-                |(storage, backend, writes)| {
+                |(storage, storage_impl, writes)| {
                     let (_commit, stats) =
                         block_on(storage.commit_write_set(writes, WriteOptions::default()))
                             .expect("commit write set");
@@ -791,14 +737,14 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                     let expected_revision_put_batches =
                         u64::from((expected_puts + expected_deletes) > 0);
                     assert_eq!(
-                        backend.state.put_many_calls.load(Ordering::Relaxed),
+                        storage_impl.state.put_many_calls.load(Ordering::Relaxed),
                         u64::from(case.expected_put_batches()) + expected_revision_put_batches
                     );
                     assert_eq!(
-                        backend.state.delete_many_calls.load(Ordering::Relaxed),
+                        storage_impl.state.delete_many_calls.load(Ordering::Relaxed),
                         u64::from(case.expected_delete_batches())
                     );
-                    assert_eq!(backend.state.commit_calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(storage_impl.state.commit_calls.load(Ordering::Relaxed), 1);
                     black_box(stats);
                 },
                 BatchSize::LargeInput,
@@ -853,13 +799,13 @@ fn bench_write_set_construction(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_write_set_build_and_commit<B>(c: &mut Criterion, backend_family: B)
+fn bench_write_set_build_and_commit<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
     let group_name = format!(
         "storage_v2/write_set_build_and_commit/{}",
-        backend_family.name()
+        storage_family.name()
     );
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
@@ -878,8 +824,8 @@ where
         group.bench_with_input(BenchmarkId::new("checked", case.name), case, |b, case| {
             b.iter_batched(
                 || {
-                    let backend = backend_family.open_empty();
-                    StorageContext::new(backend)
+                    let storage = storage_family.open_empty();
+                    StorageAdapter::new(storage)
                 },
                 |storage| {
                     let writes = checked_write_set_from_mutations(black_box(&mutations));
@@ -900,8 +846,8 @@ where
         group.bench_with_input(BenchmarkId::new("canonical", case.name), case, |b, case| {
             b.iter_batched(
                 || {
-                    let backend = backend_family.open_empty();
-                    StorageContext::new(backend)
+                    let storage = storage_family.open_empty();
+                    StorageAdapter::new(storage)
                 },
                 |storage| {
                     let writes = canonical_write_set_from_mutations(black_box(&mutations));
@@ -923,11 +869,11 @@ where
     group.finish();
 }
 
-fn bench_direct_write_order<B>(c: &mut Criterion, backend_family: B)
+fn bench_direct_write_order<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
-    let group_name = format!("storage_v2/direct_write_order/{}", backend_family.name());
+    let group_name = format!("storage_v2/direct_write_order/{}", storage_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -949,16 +895,16 @@ where
         group.throughput(Throughput::Elements(WRITES as u64));
         group.bench_function(order.name(), |b| {
             b.iter_batched(
-                || (backend_family.open_empty(), batch.clone()),
-                |(backend, batch)| {
-                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
+                || (storage_family.open_empty(), batch.clone()),
+                |(storage, batch)| {
+                    let mut write = block_on(storage.begin_write(WriteOptions::default()))
                         .expect("begin direct write-order write");
                     block_on(write.put_many(SpaceId(1), PutBatch { entries: batch }))
                         .expect("put direct write-order batch");
                     let commit = block_on(write.commit()).expect("commit direct write-order batch");
                     assert_eq!(commit.stats.put_entries, WRITES as u64);
                     assert_eq!(commit.stats.deleted_entries, 0);
-                    assert_eq!(commit.stats.backend_calls, 1);
+                    assert_eq!(commit.stats.storage_calls, 1);
                     black_box(commit);
                 },
                 BatchSize::LargeInput,
@@ -1001,11 +947,11 @@ fn bench_write_batch_seal_sort(c: &mut Criterion) {
 }
 
 #[expect(clippy::cast_possible_truncation)]
-fn bench_delete_range_fallback<B>(c: &mut Criterion, backend_family: B)
+fn bench_delete_range_fallback<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
-    let group_name = format!("storage_v2/delete_range_fallback/{}", backend_family.name());
+    let group_name = format!("storage_v2/delete_range_fallback/{}", storage_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -1014,13 +960,13 @@ where
     }
 
     for case in DELETE_RANGE_CASES {
-        let seed = backend_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        let seed = storage_family.seed_points(SpaceId(1), case.rows as u32, 32);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
                 || {
-                    let backend = backend_family.fork_for_write(&seed);
-                    StorageContext::new(backend)
+                    let storage = storage_family.fork_for_write(&seed);
+                    StorageAdapter::new(storage)
                 },
                 |storage| {
                     let stats = block_on(fallback_delete_range(
@@ -1045,11 +991,11 @@ where
 }
 
 #[expect(clippy::cast_possible_truncation)]
-fn bench_delete_range_native<B>(c: &mut Criterion, backend_family: B)
+fn bench_delete_range_native<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
-    let group_name = format!("storage_v2/delete_range_native/{}", backend_family.name());
+    let group_name = format!("storage_v2/delete_range_native/{}", storage_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -1058,19 +1004,19 @@ where
     }
 
     for case in DELETE_RANGE_CASES {
-        let seed = backend_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        let seed = storage_family.seed_points(SpaceId(1), case.rows as u32, 32);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
-                || backend_family.fork_for_write(&seed),
-                |backend| {
-                    let mut write = block_on(backend.begin_write(WriteOptions::default()))
+                || storage_family.fork_for_write(&seed),
+                |storage| {
+                    let mut write = block_on(storage.begin_write(WriteOptions::default()))
                         .expect("begin native delete_range write");
                     block_on(write.delete_range(SpaceId(1), point_scan_range()))
                         .expect("native delete_range");
                     let commit = block_on(write.commit()).expect("commit native delete_range");
                     assert_eq!(commit.stats.deleted_ranges, 1);
-                    assert_eq!(commit.stats.backend_calls, 1);
+                    assert_eq!(commit.stats.storage_calls, 1);
                     black_box((case.rows, commit));
                 },
                 BatchSize::LargeInput,
@@ -1082,13 +1028,13 @@ where
 }
 
 #[expect(clippy::cast_possible_truncation)]
-fn bench_delete_range_storage_helpers<B>(c: &mut Criterion, backend_family: B)
+fn bench_delete_range_storage_helpers<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
     let group_name = format!(
         "storage_v2/delete_range_storage_helpers/{}",
-        backend_family.name()
+        storage_family.name()
     );
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
@@ -1098,7 +1044,7 @@ where
     }
 
     for case in DELETE_RANGE_CASES {
-        let seed = backend_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        let seed = storage_family.seed_points(SpaceId(1), case.rows as u32, 32);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(
             BenchmarkId::new("delete_range", case.name),
@@ -1106,8 +1052,8 @@ where
             |b, _case| {
                 b.iter_batched(
                     || {
-                        let backend = backend_family.fork_for_write(&seed);
-                        StorageContext::new(backend)
+                        let storage = storage_family.fork_for_write(&seed);
+                        StorageAdapter::new(storage)
                     },
                     |storage| {
                         let commit = block_on(storage.delete_range(
@@ -1117,7 +1063,7 @@ where
                         ))
                         .expect("storage delete_range helper");
                         assert_eq!(commit.stats.deleted_ranges, 1);
-                        assert_eq!(commit.stats.backend_calls, 1);
+                        assert_eq!(commit.stats.storage_calls, 1);
                         black_box(commit);
                     },
                     BatchSize::LargeInput,
@@ -1131,8 +1077,8 @@ where
             |b, _case| {
                 b.iter_batched(
                     || {
-                        let backend = backend_family.fork_for_write(&seed);
-                        StorageContext::new(backend)
+                        let storage = storage_family.fork_for_write(&seed);
+                        StorageAdapter::new(storage)
                     },
                     |storage| {
                         let commit = block_on(storage.delete_prefix(
@@ -1144,7 +1090,7 @@ where
                         ))
                         .expect("storage delete_prefix helper");
                         assert_eq!(commit.stats.deleted_ranges, 1);
-                        assert_eq!(commit.stats.backend_calls, 1);
+                        assert_eq!(commit.stats.storage_calls, 1);
                         black_box(commit);
                     },
                     BatchSize::LargeInput,
@@ -1158,15 +1104,15 @@ where
             |b, _case| {
                 b.iter_batched(
                     || {
-                        let backend = backend_family.fork_for_write(&seed);
-                        StorageContext::new(backend)
+                        let storage = storage_family.fork_for_write(&seed);
+                        StorageAdapter::new(storage)
                     },
                     |storage| {
                         let commit =
                             block_on(storage.clear_space(space(1), WriteOptions::default()))
                                 .expect("storage clear_space helper");
                         assert_eq!(commit.stats.deleted_ranges, 1);
-                        assert_eq!(commit.stats.backend_calls, 1);
+                        assert_eq!(commit.stats.storage_calls, 1);
                         black_box(commit);
                     },
                     BatchSize::LargeInput,
@@ -1178,11 +1124,11 @@ where
     group.finish();
 }
 
-fn bench_scan_chunking_matrix<B>(c: &mut Criterion, backend_family: B)
+fn bench_scan_chunking_matrix<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
-    let group_name = format!("storage_v2/scan_chunking/{}", backend_family.name());
+    let group_name = format!("storage_v2/scan_chunking/{}", storage_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -1190,9 +1136,9 @@ where
         group.measurement_time(Duration::from_millis(250));
     }
 
-    let seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
+    let seed = storage_family.seed_points(SpaceId(1), 10_000, 32);
     let read = block_on(seed.begin_read(ReadOptions::default())).expect("begin chunked scan read");
-    let scope = StorageReadScope::new(read);
+    let scope = StorageAdapterReadScope::new(read);
 
     for case in SCAN_CHUNKING_CASES {
         group.throughput(Throughput::Elements(case.rows as u64));
@@ -1221,11 +1167,11 @@ where
     group.finish();
 }
 
-fn bench_durable_commit<B>(c: &mut Criterion, backend_family: B)
+fn bench_durable_commit<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
-    let group_name = format!("storage_v2/durable_commit/{}", backend_family.name());
+    let group_name = format!("storage_v2/durable_commit/{}", storage_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -1245,8 +1191,8 @@ where
     group.bench_function(BenchmarkId::new("durable", case.name), |b| {
         b.iter_batched(
             || {
-                let backend = backend_family.open_empty();
-                let storage = StorageContext::new(backend);
+                let storage = storage_family.open_empty();
+                let storage = StorageAdapter::new(storage);
                 let writes = canonical_write_set_from_mutations(&mutations);
                 (storage, writes)
             },
@@ -1265,9 +1211,9 @@ where
     group.finish();
 }
 
-fn bench_backend_direct_profile<B>(c: &mut Criterion, backend_family: B)
+fn bench_storage_direct_profile<StorageImpl>(c: &mut Criterion, storage_family: StorageImpl)
 where
-    B: StorageBenchBackend,
+    StorageImpl: StorageBenchStorage,
 {
     let selected_case = std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_CASE").ok();
     let should_run = |case_name: &str| {
@@ -1277,8 +1223,8 @@ where
     };
 
     let group_name = format!(
-        "storage_v2/backend_direct_profile/{}",
-        backend_family.name()
+        "storage_v2/storage_direct_profile/{}",
+        storage_family.name()
     );
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
@@ -1297,22 +1243,22 @@ where
     if should_run(direct_put_case.name) {
         let direct_put_mutations = write_mutations(&direct_put_case);
         let direct_put_batches = direct_write_batches_from_mutations(&direct_put_mutations);
-        let warm_backend = backend_family.open_empty();
+        let warm_storage = storage_family.open_empty();
         block_on(commit_direct_write_batches(
-            &warm_backend,
+            &warm_storage,
             direct_put_batches.clone(),
         ))
-        .expect("warm direct put backend");
+        .expect("warm direct put storage");
         group.throughput(Throughput::Elements(u64::from(direct_put_case.writes)));
         group.bench_function(direct_put_case.name, |b| {
             b.iter_batched(
-                || (backend_family.open_empty(), direct_put_batches.clone()),
-                |(backend, batches)| {
-                    let commit = block_on(commit_direct_write_batches(&backend, batches))
-                        .expect("direct backend put commit");
+                || (storage_family.open_empty(), direct_put_batches.clone()),
+                |(storage, batches)| {
+                    let commit = block_on(commit_direct_write_batches(&storage, batches))
+                        .expect("direct storage put commit");
                     assert_eq!(commit.stats.put_entries, 1_024);
                     assert_eq!(commit.stats.deleted_entries, 0);
-                    assert_eq!(commit.stats.backend_calls, 16);
+                    assert_eq!(commit.stats.storage_calls, 16);
                     black_box(commit);
                 },
                 BatchSize::LargeInput,
@@ -1321,7 +1267,7 @@ where
     }
 
     let clean_direct_put_case = WriteCase {
-        name: "direct_commit_puts_reused_backend_k1024_g16_v32",
+        name: "direct_commit_puts_reused_storage_k1024_g16_v32",
         writes: 1_024,
         spaces: 16,
         value_size: 32,
@@ -1331,25 +1277,25 @@ where
         let clean_direct_put_mutations = write_mutations(&clean_direct_put_case);
         let clean_direct_put_batches =
             direct_write_batches_from_mutations(&clean_direct_put_mutations);
-        let backend = backend_family.open_empty();
+        let storage = storage_family.open_empty();
         block_on(commit_direct_write_batches(
-            &backend,
+            &storage,
             clean_direct_put_batches.clone(),
         ))
-        .expect("warm reused direct put backend");
+        .expect("warm reused direct put storage");
         group.throughput(Throughput::Elements(u64::from(
             clean_direct_put_case.writes,
         )));
         group.bench_function(clean_direct_put_case.name, |b| {
             b.iter(|| {
                 let commit = block_on(commit_direct_write_batches(
-                    &backend,
+                    &storage,
                     black_box(clean_direct_put_batches.clone()),
                 ))
-                .expect("direct reused backend put commit");
+                .expect("direct reused storage put commit");
                 assert_eq!(commit.stats.put_entries, 1_024);
                 assert_eq!(commit.stats.deleted_entries, 0);
-                assert_eq!(commit.stats.backend_calls, 16);
+                assert_eq!(commit.stats.storage_calls, 16);
                 black_box(commit);
             });
         });
@@ -1365,22 +1311,22 @@ where
     if should_run(mixed_case.name) {
         let mixed_mutations = write_mutations(&mixed_case);
         let mixed_batches = direct_write_batches_from_mutations(&mixed_mutations);
-        let warm_backend = backend_family.open_empty();
+        let warm_storage = storage_family.open_empty();
         block_on(commit_direct_write_batches(
-            &warm_backend,
+            &warm_storage,
             mixed_batches.clone(),
         ))
-        .expect("warm direct mixed backend");
+        .expect("warm direct mixed storage");
         group.throughput(Throughput::Elements(u64::from(mixed_case.writes)));
         group.bench_function(mixed_case.name, |b| {
             b.iter_batched(
-                || (backend_family.open_empty(), mixed_batches.clone()),
-                |(backend, batches)| {
-                    let commit = block_on(commit_direct_write_batches(&backend, batches))
-                        .expect("direct backend mixed commit");
+                || (storage_family.open_empty(), mixed_batches.clone()),
+                |(storage, batches)| {
+                    let commit = block_on(commit_direct_write_batches(&storage, batches))
+                        .expect("direct storage mixed commit");
                     assert_eq!(commit.stats.put_entries, 816);
                     assert_eq!(commit.stats.deleted_entries, 208);
-                    assert_eq!(commit.stats.backend_calls, 32);
+                    assert_eq!(commit.stats.storage_calls, 32);
                     black_box(commit);
                 },
                 BatchSize::LargeInput,
@@ -1398,28 +1344,28 @@ where
     if should_run(touched_case.name) {
         let touched_mutations = write_mutations(&touched_case);
         let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
-        let touched_seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
-        let warm_backend = backend_family.fork_for_write(&touched_seed);
+        let touched_seed = storage_family.seed_points(SpaceId(1), 10_000, 32);
+        let warm_storage = storage_family.fork_for_write(&touched_seed);
         block_on(commit_direct_write_batches(
-            &warm_backend,
+            &warm_storage,
             touched_batches.clone(),
         ))
-        .expect("warm direct touched backend");
+        .expect("warm direct touched storage");
         group.throughput(Throughput::Elements(u64::from(touched_case.writes)));
         group.bench_function(touched_case.name, |b| {
             b.iter_batched(
                 || {
                     (
-                        backend_family.fork_for_write(&touched_seed),
+                        storage_family.fork_for_write(&touched_seed),
                         touched_batches.clone(),
                     )
                 },
-                |(backend, batches)| {
-                    let commit = block_on(commit_direct_write_batches(&backend, batches))
-                        .expect("direct backend touched commit");
+                |(storage, batches)| {
+                    let commit = block_on(commit_direct_write_batches(&storage, batches))
+                        .expect("direct storage touched commit");
                     assert_eq!(commit.stats.put_entries, 128);
                     assert_eq!(commit.stats.deleted_entries, 0);
-                    assert_eq!(commit.stats.backend_calls, 16);
+                    assert_eq!(commit.stats.storage_calls, 16);
                     black_box(commit);
                 },
                 BatchSize::LargeInput,
@@ -1428,13 +1374,13 @@ where
     }
 
     if should_run("direct_get_many_m1000_u100") {
-        let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
+        let point_storage = storage_family.seed_points(SpaceId(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 100);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_m1000_u100") {
             group.bench_function("direct_get_many_m1000_u100", |b| {
                 b.iter(|| {
-                    let read = block_on(point_backend.begin_read(ReadOptions::default()))
+                    let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct point read");
                     let result = block_on(read.get_many(
                         SpaceId(1),
@@ -1455,13 +1401,13 @@ where
     }
 
     if should_run("direct_get_many_unique_u100") {
-        let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
+        let point_storage = storage_family.seed_points(SpaceId(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 100, 100);
         group.throughput(Throughput::Elements(100));
         if should_run("direct_get_many_unique_u100") {
             group.bench_function("direct_get_many_unique_u100", |b| {
                 b.iter(|| {
-                    let read = block_on(point_backend.begin_read(ReadOptions::default()))
+                    let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
                     let result = block_on(read.get_many(
                         SpaceId(1),
@@ -1482,13 +1428,13 @@ where
     }
 
     if should_run("direct_get_many_unique_u1000") {
-        let point_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+        let point_storage = storage_family.seed_points(SpaceId(1), 1_000, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 1_000);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_unique_u1000") {
             group.bench_function("direct_get_many_unique_u1000", |b| {
                 b.iter(|| {
-                    let read = block_on(point_backend.begin_read(ReadOptions::default()))
+                    let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
                     let result = block_on(read.get_many(
                         SpaceId(1),
@@ -1509,15 +1455,15 @@ where
     }
 
     if should_run("direct_scan_materialized_q1000") {
-        let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+        let scan_storage = storage_family.seed_points(SpaceId(1), 1_000, 32);
         let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_scan_materialized_q1000") {
             group.bench_function("direct_scan_materialized_q1000", |b| {
                 b.iter(|| {
-                    let read = block_on(scan_backend.begin_read(ReadOptions::default()))
+                    let read = block_on(scan_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct materialized scan read");
-                    let chunk = block_on(materialize_backend_scan(
+                    let chunk = block_on(materialize_storage_scan(
                         &read,
                         scan_range.clone(),
                         ScanOptions {
@@ -1540,7 +1486,7 @@ where
 }
 
 #[derive(Clone, Default)]
-struct CountingBackend {
+struct CountingStorage {
     state: Arc<CountingState>,
 }
 
@@ -1555,7 +1501,7 @@ struct CountingWrite {
     state: Arc<CountingState>,
 }
 
-impl Backend for CountingBackend {
+impl Storage for CountingStorage {
     type Read<'a>
         = EmptyRead
     where
@@ -1565,24 +1511,24 @@ impl Backend for CountingBackend {
         = CountingWrite
     where
         Self: 'a;
-    async fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(EmptyRead)
     }
 
-    async fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         Ok(CountingWrite {
             state: Arc::clone(&self.state),
         })
     }
 }
 
-impl BackendWrite for CountingWrite {
-    async fn put_many(&mut self, _space: SpaceId, _entries: PutBatch) -> Result<(), BackendError> {
+impl StorageWrite for CountingWrite {
+    async fn put_many(&mut self, _space: SpaceId, _entries: PutBatch) -> Result<(), StorageError> {
         self.state.put_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
+    async fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), StorageError> {
         self.state.delete_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1591,12 +1537,12 @@ impl BackendWrite for CountingWrite {
         &mut self,
         _space: SpaceId,
         _range: KeyRange,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), StorageError> {
         self.state.delete_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, StorageError> {
         self.state.commit_calls.fetch_add(1, Ordering::Relaxed);
         Ok(CommitResult {
             commit_id: None,
@@ -1604,20 +1550,20 @@ impl BackendWrite for CountingWrite {
         })
     }
 
-    async fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), StorageError> {
         Ok(())
     }
 }
 
 struct EmptyRead;
 
-impl BackendRead for EmptyRead {
+impl StorageRead for EmptyRead {
     async fn get_many(
         &self,
         _space: SpaceId,
         _keys: &[Key],
         _opts: GetOptions,
-    ) -> Result<GetManyResult, BackendError> {
+    ) -> Result<GetManyResult, StorageError> {
         unreachable!("write-set benchmark does not point-read")
     }
 
@@ -1626,7 +1572,7 @@ impl BackendRead for EmptyRead {
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions,
-    ) -> Result<ScanChunk, BackendError> {
+    ) -> Result<ScanChunk, StorageError> {
         unreachable!("write-set benchmark does not scan")
     }
 }
@@ -1659,32 +1605,28 @@ impl WriteCase {
     }
 }
 
-fn seeded_in_memory_backend_with_value_size(
-    space_id: u32,
-    rows: u32,
-    value_size: usize,
-) -> InMemoryBackend {
-    let backend = InMemoryBackend::new();
-    seed_backend_points(
-        &backend,
+fn seeded_memory_with_value_size(space_id: u32, rows: u32, value_size: usize) -> Memory {
+    let storage = Memory::new();
+    seed_storage_points(
+        &storage,
         SpaceId(space_id),
         rows,
         value_size,
-        "in-memory backend",
+        "in-memory storage",
     );
-    backend
+    storage
 }
 
-fn seed_backend_points<B>(
-    backend: &B,
+fn seed_storage_points<StorageImpl>(
+    storage: &StorageImpl,
     space_id: SpaceId,
     rows: u32,
     value_size: usize,
-    backend_name: &str,
+    storage_name: &str,
 ) where
-    B: Backend + Clone,
+    StorageImpl: Storage + Clone,
 {
-    let storage = StorageContext::new(backend.clone());
+    let storage = StorageAdapter::new(storage.clone());
     let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
     for index in 0..rows {
         writes.put(
@@ -1694,7 +1636,7 @@ fn seed_backend_points<B>(
         );
     }
     let (_commit, stats) = block_on(storage.commit_write_set(writes, WriteOptions::default()))
-        .unwrap_or_else(|error| panic!("seed {backend_name}: {error}"));
+        .unwrap_or_else(|error| panic!("seed {storage_name}: {error}"));
     assert_eq!(stats.staged_puts, u64::from(rows));
 }
 
@@ -1723,14 +1665,14 @@ fn direct_write_batches_from_mutations(mutations: &[WriteMutation]) -> DirectWri
     }
 }
 
-async fn commit_direct_write_batches<B>(
-    backend: &B,
+async fn commit_direct_write_batches<StorageImpl>(
+    storage: &StorageImpl,
     batches: DirectWriteBatches,
-) -> Result<CommitResult, BackendError>
+) -> Result<CommitResult, StorageError>
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
-    let mut write = backend.begin_write(WriteOptions::default()).await?;
+    let mut write = storage.begin_write(WriteOptions::default()).await?;
     for (space, batch) in batches.puts {
         write.put_many(space.id, batch).await?;
     }
@@ -1741,14 +1683,14 @@ where
 }
 
 #[expect(clippy::cast_possible_truncation)]
-async fn fallback_delete_range<B>(
-    storage: &StorageContext<B>,
+async fn fallback_delete_range<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
     storage_space: StorageSpace,
     range: KeyRange,
     chunk_size: usize,
 ) -> Result<DeleteRangeFallbackStats, String>
 where
-    B: Backend,
+    StorageImpl: Storage,
 {
     let read = storage
         .begin_read(ReadOptions::default())
@@ -1801,14 +1743,14 @@ where
 }
 
 async fn drain_scan_materialized<R>(
-    read: &StorageReadScope<R>,
+    read: &StorageAdapterReadScope<R>,
     storage_space: StorageSpace,
     scan: ScanChunkingMode,
     expected_rows: usize,
     chunk_size: usize,
-) -> Result<ScanDrainStats, BackendError>
+) -> Result<ScanDrainStats, StorageError>
 where
-    R: BackendRead,
+    R: StorageRead,
 {
     let mut resume_after = None::<Key>;
     let mut stats = ScanDrainStats::default();
@@ -1832,7 +1774,7 @@ where
 
         let entries = &chunk.value.entries;
         stats.scanned += entries.len();
-        stats.backend_calls += chunk.stats.backend_calls;
+        stats.storage_calls += chunk.stats.storage_calls;
         stats.chunks += usize::from(!entries.is_empty() || chunk.value.has_more);
         stats.read_stats.add(chunk.stats);
         resume_after = entries.last().map(|entry| entry.key.clone());
@@ -1843,7 +1785,7 @@ where
     }
 
     assert_eq!(
-        stats.backend_calls,
+        stats.storage_calls,
         expected_rows.div_ceil(chunk_size) as u64
     );
     Ok(stats)
@@ -1854,7 +1796,7 @@ fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
     let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
     let expected_has_more = expected_chunks.saturating_sub(1) as u64;
 
-    assert_eq!(stats.read_stats.backend_calls, expected_chunks as u64);
+    assert_eq!(stats.read_stats.storage_calls, expected_chunks as u64);
     assert_eq!(stats.read_stats.scan_rows, case.rows as u64);
     assert_eq!(stats.read_stats.scan_resume_after, expected_resume_after);
     assert_eq!(stats.read_stats.scan_has_more, expected_has_more);
@@ -1906,13 +1848,13 @@ fn point_scan_range() -> KeyRange {
     }
 }
 
-async fn materialize_backend_scan<R>(
+async fn materialize_storage_scan<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions,
-) -> Result<ScanChunk, BackendError>
+) -> Result<ScanChunk, StorageError>
 where
-    R: BackendRead,
+    R: StorageRead,
 {
     read.scan(space(1).id, range, opts).await
 }
@@ -2073,7 +2015,7 @@ fn physical_point_request_keys(
     unique_keys: usize,
 ) -> Vec<Key> {
     // Keys are logical under the space-aware interface; the space travels
-    // as a parameter on the backend calls.
+    // as a parameter on the storage calls.
     point_request_keys(requested_keys, unique_keys)
 }
 

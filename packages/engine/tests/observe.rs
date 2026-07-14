@@ -6,9 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    Backend, BackendError, BackendRead, Engine, GetManyResult, GetOptions, InMemoryBackend,
-    InMemoryRead, InMemoryWrite, Key, KeyRange, ObserveEvent, ReadOptions, ScanChunk, ScanOptions,
-    SessionContext, SpaceId, Value, WriteOptions,
+    Engine, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
+    ObserveEvent, ReadOptions, ScanChunk, ScanOptions, SessionContext, SpaceId, Storage,
+    StorageError, StorageRead, Value, WriteOptions,
 };
 use serde_json::json;
 use support::simulation_test::engine::{SimSession, Simulation};
@@ -33,9 +33,12 @@ fn observe_key(session: &SessionContext, key: &str) -> lix_engine::ObserveEvents
         .expect("observe should open")
 }
 
-async fn next_event<B>(events: &mut lix_engine::ObserveEvents<B>, label: &str) -> ObserveEvent
+async fn next_event<StorageImpl>(
+    events: &mut lix_engine::ObserveEvents<StorageImpl>,
+    label: &str,
+) -> ObserveEvent
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     tokio::time::timeout(NEXT_TIMEOUT, events.next())
         .await
@@ -44,9 +47,11 @@ where
         .unwrap_or_else(|| panic!("observe closed before event: {label}"))
 }
 
-async fn expect_no_event<B>(events: &mut lix_engine::ObserveEvents<B>, label: &str)
-where
-    B: Backend + Clone + Send + Sync + 'static,
+async fn expect_no_event<StorageImpl>(
+    events: &mut lix_engine::ObserveEvents<StorageImpl>,
+    label: &str,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match tokio::time::timeout(NO_EVENT_TIMEOUT, events.next()).await {
         Err(_) => {}
@@ -87,12 +92,12 @@ simulation_test!(observe_next_returns_initial_snapshot, |sim| async move {
 
 #[tokio::test]
 async fn observe_initial_next_waits_without_rejecting_same_session_write() {
-    let backend = BlockingBeginReadBackend::new();
-    let gate = backend.gate();
-    Engine::initialize(backend.clone())
+    let storage = BlockingBeginReadStorage::new();
+    let gate = storage.gate();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -148,12 +153,12 @@ async fn observe_initial_next_waits_without_rejecting_same_session_write() {
 
 #[tokio::test]
 async fn observe_registration_allows_automatic_write_instead_of_rejecting() {
-    let backend = BlockingBeginWriteBackend::new();
-    let gate = backend.gate();
-    Engine::initialize(backend.clone())
+    let storage = BlockingBeginWriteStorage::new();
+    let gate = storage.gate();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -197,12 +202,12 @@ async fn observe_registration_allows_automatic_write_instead_of_rejecting() {
 
 #[tokio::test]
 async fn observe_initial_next_waits_for_automatic_write_instead_of_rejecting() {
-    let backend = BlockingBeginWriteBackend::new();
-    let gate = backend.gate();
-    Engine::initialize(backend.clone())
+    let storage = BlockingBeginWriteStorage::new();
+    let gate = storage.gate();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend).await.expect("engine should open");
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -515,11 +520,11 @@ simulation_test!(
 
 #[tokio::test]
 async fn observe_identical_queries_share_one_evaluation_per_generation() {
-    let backend = CountingReadBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = CountingReadStorage::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
     let session = engine
@@ -543,7 +548,7 @@ async fn observe_identical_queries_share_one_evaluation_per_generation() {
         )
         .await
         .expect("insert should commit");
-    backend.reset_read_count();
+    storage.reset_read_count();
 
     let (first_update, second_update) = tokio::join!(
         next_event(&mut first, "first update"),
@@ -553,7 +558,7 @@ async fn observe_identical_queries_share_one_evaluation_per_generation() {
     assert_key_value_row(&first_update, "observe-singleflight", "v0");
     assert_key_value_row(&second_update, "observe-singleflight", "v0");
     assert_eq!(
-        backend.read_count(),
+        storage.read_count(),
         1,
         "identical observers should share the same query evaluation for one invalidation generation"
     );
@@ -712,27 +717,27 @@ simulation_test!(
 );
 
 #[derive(Clone)]
-struct CountingReadBackend {
-    inner: InMemoryBackend,
+struct CountingReadStorage {
+    inner: Memory,
     read_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
-struct BlockingBeginReadBackend {
-    inner: InMemoryBackend,
+struct BlockingBeginReadStorage {
+    inner: Memory,
     gate: BlockingReadGate,
 }
 
 #[derive(Clone)]
-struct BlockingBeginWriteBackend {
-    inner: InMemoryBackend,
+struct BlockingBeginWriteStorage {
+    inner: Memory,
     gate: BlockingReadGate,
 }
 
-impl BlockingBeginReadBackend {
+impl BlockingBeginReadStorage {
     fn new() -> Self {
         Self {
-            inner: InMemoryBackend::new(),
+            inner: Memory::new(),
             gate: BlockingReadGate::new(),
         }
     }
@@ -742,10 +747,10 @@ impl BlockingBeginReadBackend {
     }
 }
 
-impl BlockingBeginWriteBackend {
+impl BlockingBeginWriteStorage {
     fn new() -> Self {
         Self {
-            inner: InMemoryBackend::new(),
+            inner: Memory::new(),
             gate: BlockingReadGate::new(),
         }
     }
@@ -755,43 +760,43 @@ impl BlockingBeginWriteBackend {
     }
 }
 
-impl Backend for BlockingBeginReadBackend {
+impl Storage for BlockingBeginReadStorage {
     type Read<'a>
-        = InMemoryRead
+        = MemoryRead
     where
         Self: 'a;
 
     type Write<'a>
-        = InMemoryWrite
+        = MemoryWrite
     where
         Self: 'a;
 
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.gate.maybe_block();
         self.inner.begin_read(opts).await
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.inner.begin_write(opts).await
     }
 }
 
-impl Backend for BlockingBeginWriteBackend {
+impl Storage for BlockingBeginWriteStorage {
     type Read<'a>
-        = InMemoryRead
+        = MemoryRead
     where
         Self: 'a;
 
     type Write<'a>
-        = InMemoryWrite
+        = MemoryWrite
     where
         Self: 'a;
 
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.gate.maybe_block();
         self.inner.begin_write(opts).await
     }
@@ -893,15 +898,15 @@ struct BlockingReadState {
 }
 
 struct CountingRead {
-    inner: InMemoryRead,
+    inner: MemoryRead,
     read_count: Arc<AtomicUsize>,
     counted: AtomicBool,
 }
 
-impl CountingReadBackend {
+impl CountingReadStorage {
     fn new() -> Self {
         Self {
-            inner: InMemoryBackend::new(),
+            inner: Memory::new(),
             read_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -915,18 +920,18 @@ impl CountingReadBackend {
     }
 }
 
-impl Backend for CountingReadBackend {
+impl Storage for CountingReadStorage {
     type Read<'a>
         = CountingRead
     where
         Self: 'a;
 
     type Write<'a>
-        = InMemoryWrite
+        = MemoryWrite
     where
         Self: 'a;
 
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(CountingRead {
             inner: self.inner.begin_read(opts).await?,
             read_count: Arc::clone(&self.read_count),
@@ -934,18 +939,18 @@ impl Backend for CountingReadBackend {
         })
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.inner.begin_write(opts).await
     }
 }
 
-impl BackendRead for CountingRead {
+impl StorageRead for CountingRead {
     async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions,
-    ) -> Result<GetManyResult, BackendError> {
+    ) -> Result<GetManyResult, StorageError> {
         self.count_user_read(space);
         self.inner.get_many(space, keys, opts).await
     }
@@ -955,7 +960,7 @@ impl BackendRead for CountingRead {
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions,
-    ) -> Result<ScanChunk, BackendError> {
+    ) -> Result<ScanChunk, StorageError> {
         self.count_user_read(space);
         self.inner.scan(space, range, opts).await
     }

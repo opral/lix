@@ -1,6 +1,6 @@
 #![allow(
     clippy::manual_async_fn,
-    reason = "explicit future signatures mirror Backend traits and keep Send guarantees visible"
+    reason = "explicit future signatures mirror Storage traits and keep Send guarantees visible"
 )]
 
 use crate::app::AppContext;
@@ -8,9 +8,10 @@ use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_sdk::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetManyResult,
-    GetOptions, Key, KeyRange, Lix, LixError, ProjectedValue, PutBatch, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats, open_lix_with_backend,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Lix, LixError,
+    ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
+    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    open_lix_with_storage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,7 +21,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub type FileLix = Lix<FileBackend>;
+pub type FileLix = Lix<FileStorage>;
 
 pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
     if let Some(path) = &context.lix_path {
@@ -59,9 +60,9 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
 }
 
 pub fn open_lix_at(path: &Path) -> Result<FileLix, CliError> {
-    let backend = FileBackend::from_path(path)?;
+    let storage = FileStorage::from_path(path)?;
 
-    block_on(open_lix_with_backend(backend))
+    block_on(open_lix_with_storage(storage))
         .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
 }
 
@@ -94,8 +95,8 @@ pub fn destroy_lix_at(path: &Path) -> Result<(), CliError> {
 
 /// Prepares a `.lix` output target for initialization.
 ///
-/// The CLI delegates storage-backed cleanup to the backend boundary so command
-/// code does not need to know how a backend represents its physical artifacts.
+/// The CLI delegates storage-backed cleanup to the storage boundary so command
+/// code does not need to know how a storage represents its physical artifacts.
 pub fn prepare_lix_output_path(path: &Path, force: bool) -> Result<(), CliError> {
     validate_lix_file_path(path)?;
 
@@ -177,22 +178,22 @@ fn remove_sidecar(path: &Path, suffix: &str) -> Result<(), CliError> {
 
 type KvMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
-// TODO: Replace this custom whole-file KV backend with SQLite for the CLI.
-// This backend exists only as a transitional local `.lix` file adapter. It
+// TODO: Replace this custom whole-file KV storage with SQLite for the CLI.
+// This storage exists only as a transitional local `.lix` file adapter. It
 // snapshots the entire file into memory and rewrites it on commit, so it is not
-// a real concurrent storage backend. The instance-local write gate below only
+// a real concurrent storage implementation. The instance-local write gate below only
 // rejects overlapping writes through the same opened handle; separate handles
 // or processes can still overwrite each other. SQLite should own CLI durability
 // and write concurrency instead.
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct FileBackend {
+pub struct FileStorage {
     path: Arc<PathBuf>,
     kv: Arc<Mutex<KvMap>>,
     write_active: Arc<Mutex<bool>>,
 }
 
-impl FileBackend {
+impl FileStorage {
     fn from_path(path: &Path) -> Result<Self, CliError> {
         let kv = read_kv_file(path)?;
         Ok(Self {
@@ -205,12 +206,12 @@ impl FileBackend {
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct FileBackendRead {
+pub struct FileStorageRead {
     kv: KvMap,
 }
 
 #[allow(missing_debug_implementations)]
-pub struct FileBackendWrite {
+pub struct FileStorageWrite {
     path: Arc<PathBuf>,
     parent: Arc<Mutex<KvMap>>,
     write_active: Arc<Mutex<bool>>,
@@ -219,26 +220,26 @@ pub struct FileBackendWrite {
     closed: bool,
 }
 
-impl Backend for FileBackend {
+impl Storage for FileStorage {
     type Read<'a>
-        = FileBackendRead
+        = FileStorageRead
     where
         Self: 'a;
 
     type Write<'a>
-        = FileBackendWrite
+        = FileStorageWrite
     where
         Self: 'a;
     fn begin_read(
         &self,
         _opts: ReadOptions,
-    ) -> impl Future<Output = Result<Self::Read<'_>, BackendError>> + Send {
+    ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
-            Ok(FileBackendRead {
+            Ok(FileStorageRead {
                 kv: self
                     .kv
                     .lock()
-                    .map_err(|_| backend_lock_error("cli file backend kv"))?
+                    .map_err(|_| storage_lock_error("cli file storage kv"))?
                     .clone(),
             })
         }
@@ -247,16 +248,16 @@ impl Backend for FileBackend {
     fn begin_write(
         &self,
         _opts: WriteOptions,
-    ) -> impl Future<Output = Result<Self::Write<'_>, BackendError>> + Send {
+    ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             {
                 let mut active = self
                     .write_active
                     .lock()
-                    .map_err(|_| backend_lock_error("cli file backend write gate"))?;
+                    .map_err(|_| storage_lock_error("cli file storage write gate"))?;
                 if *active {
-                    return Err(BackendError::Io(
-                        "cli file backend write transaction already active".to_string(),
+                    return Err(StorageError::Io(
+                        "cli file storage write transaction already active".to_string(),
                     ));
                 }
                 *active = true;
@@ -264,7 +265,7 @@ impl Backend for FileBackend {
             let kv = match self
                 .kv
                 .lock()
-                .map_err(|_| backend_lock_error("cli file backend kv"))
+                .map_err(|_| storage_lock_error("cli file storage kv"))
                 .map(|parent| parent.clone())
             {
                 Ok(kv) => kv,
@@ -273,7 +274,7 @@ impl Backend for FileBackend {
                     return Err(error);
                 }
             };
-            Ok(FileBackendWrite {
+            Ok(FileStorageWrite {
                 path: Arc::clone(&self.path),
                 parent: Arc::clone(&self.kv),
                 write_active: Arc::clone(&self.write_active),
@@ -285,7 +286,7 @@ impl Backend for FileBackend {
     }
 }
 
-impl FileBackend {
+impl FileStorage {
     fn clear_write_active(&self) {
         if let Ok(mut active) = self.write_active.lock() {
             *active = false;
@@ -293,7 +294,7 @@ impl FileBackend {
     }
 }
 
-/// The CLI file backend keeps one flat map; spaces are scoped by prefixing
+/// The CLI file storage keeps one flat map; spaces are scoped by prefixing
 /// the 4-byte big-endian space id internally. Reads return logical keys.
 fn physical_key(space: SpaceId, key: &Key) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
@@ -322,13 +323,13 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
     }
 }
 
-impl BackendRead for FileBackendRead {
+impl StorageRead for FileStorageRead {
     fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions,
-    ) -> impl Future<Output = Result<GetManyResult, BackendError>> + Send {
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
             Ok(GetManyResult::new(
                 keys.iter()
@@ -347,7 +348,7 @@ impl BackendRead for FileBackendRead {
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, BackendError>> + Send {
+    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         async move {
             if opts.page_size() == 0 {
                 return Ok(ScanChunk {
@@ -380,12 +381,12 @@ impl BackendRead for FileBackendRead {
     }
 }
 
-impl BackendWrite for FileBackendWrite {
+impl StorageWrite for FileStorageWrite {
     fn put_many(
         &mut self,
         space: SpaceId,
         entries: PutBatch,
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             for entry in entries.entries {
                 self.stats.put_entries += 1;
@@ -395,7 +396,7 @@ impl BackendWrite for FileBackendWrite {
                     stored_value_bytes(entry.value),
                 );
             }
-            self.stats.backend_calls += 1;
+            self.stats.storage_calls += 1;
             Ok(())
         }
     }
@@ -404,13 +405,13 @@ impl BackendWrite for FileBackendWrite {
         &mut self,
         space: SpaceId,
         keys: &[Key],
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             for key in keys {
                 self.kv.remove(physical_key(space, key).as_slice());
             }
             self.stats.deleted_entries += keys.len() as u64;
-            self.stats.backend_calls += 1;
+            self.stats.storage_calls += 1;
             Ok(())
         }
     }
@@ -419,7 +420,7 @@ impl BackendWrite for FileBackendWrite {
         &mut self,
         space: SpaceId,
         range: KeyRange,
-    ) -> impl Future<Output = Result<(), BackendError>> + Send {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             let range = physical_range(space, range);
             let before = self.kv.len();
@@ -427,18 +428,18 @@ impl BackendWrite for FileBackendWrite {
                 .retain(|key, _| !key_matches_range(key, &range, None));
             self.stats.deleted_entries += (before - self.kv.len()) as u64;
             self.stats.deleted_ranges += 1;
-            self.stats.backend_calls += 1;
+            self.stats.storage_calls += 1;
             Ok(())
         }
     }
 
-    fn commit(mut self) -> impl Future<Output = Result<CommitResult, BackendError>> + Send {
+    fn commit(mut self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
-            write_kv_file(&self.path, &self.kv).map_err(lix_to_backend_error)?;
+            write_kv_file(&self.path, &self.kv).map_err(lix_to_storage_error)?;
             *self
                 .parent
                 .lock()
-                .map_err(|_| backend_lock_error("cli file backend kv"))? = self.kv.clone();
+                .map_err(|_| storage_lock_error("cli file storage kv"))? = self.kv.clone();
             self.closed = true;
             self.clear_write_active();
             Ok(CommitResult {
@@ -448,7 +449,7 @@ impl BackendWrite for FileBackendWrite {
         }
     }
 
-    fn rollback(mut self) -> impl Future<Output = Result<(), BackendError>> + Send {
+    fn rollback(mut self) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             self.closed = true;
             self.clear_write_active();
@@ -457,7 +458,7 @@ impl BackendWrite for FileBackendWrite {
     }
 }
 
-impl FileBackendWrite {
+impl FileStorageWrite {
     fn clear_write_active(&self) {
         if let Ok(mut active) = self.write_active.lock() {
             *active = false;
@@ -465,7 +466,7 @@ impl FileBackendWrite {
     }
 }
 
-impl Drop for FileBackendWrite {
+impl Drop for FileStorageWrite {
     fn drop(&mut self) {
         if !self.closed {
             self.clear_write_active();
@@ -575,12 +576,12 @@ fn decode_bytes(value: &str) -> Result<Vec<u8>, CliError> {
         .map_err(|error| CliError::msg(format!("failed to decode lix file bytes: {error}")))
 }
 
-fn backend_lock_error(name: &str) -> BackendError {
-    BackendError::Io(format!("{name} mutex was poisoned"))
+fn storage_lock_error(name: &str) -> StorageError {
+    StorageError::Io(format!("{name} mutex was poisoned"))
 }
 
-fn lix_to_backend_error(error: LixError) -> BackendError {
-    BackendError::Io(error.to_string())
+fn lix_to_storage_error(error: LixError) -> StorageError {
+    StorageError::Io(error.to_string())
 }
 
 #[cfg(test)]

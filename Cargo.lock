@@ -3124,23 +3124,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "lix_backends"
-version = "0.8.1"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "lix_engine",
- "object_store 0.14.0",
- "redb",
- "rocksdb",
- "rusqlite",
- "slatedb",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "lix_cli"
 version = "0.8.1"
 dependencies = [
@@ -3176,14 +3159,14 @@ dependencies = [
  "iref",
  "jiff",
  "jsonschema",
- "lix_backends",
+ "lix_rocksdb_storage",
+ "lix_slatedb_storage",
+ "lix_sqlite_storage",
  "lru",
  "musli",
  "object_store 0.14.0",
  "paste",
  "precis-profiles",
- "redb",
- "rocksdb",
  "rusqlite",
  "rustc-hash",
  "ruzstd",
@@ -3197,17 +3180,6 @@ dependencies = [
  "xxhash-rust",
  "zip",
  "zstd",
-]
-
-[[package]]
-name = "lix_fs_backend"
-version = "0.8.1"
-dependencies = [
- "bytes",
- "lix_engine",
- "rocksdb",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -3232,8 +3204,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lix_local_filesystem"
+version = "0.8.1"
+dependencies = [
+ "bytes",
+ "lix_engine",
+ "rocksdb",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lix_order_key"
 version = "0.8.1"
+
+[[package]]
+name = "lix_rocksdb_storage"
+version = "0.8.1"
+dependencies = [
+ "bytes",
+ "lix_engine",
+ "rocksdb",
+ "tempfile",
+]
 
 [[package]]
 name = "lix_sdk"
@@ -3242,9 +3235,9 @@ dependencies = [
  "async-trait",
  "bytes",
  "codspeed-criterion-compat",
- "lix_backends",
  "lix_engine",
- "lix_fs_backend",
+ "lix_local_filesystem",
+ "lix_sqlite_storage",
  "notify-debouncer-full",
  "rusqlite",
  "tempfile",
@@ -3269,6 +3262,30 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "zip",
+]
+
+[[package]]
+name = "lix_slatedb_storage"
+version = "0.8.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "lix_engine",
+ "object_store 0.14.0",
+ "slatedb",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "lix_sqlite_storage"
+version = "0.8.1"
+dependencies = [
+ "bytes",
+ "lix_engine",
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]
@@ -4294,15 +4311,6 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
-]
-
-[[package]]
-name = "redb"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
-dependencies = [
- "libc",
 ]
 
 [[package]]

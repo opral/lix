@@ -4,7 +4,7 @@ description: "Reference for the JavaScript SDK Lix instance, transactions, execu
 
 # JavaScript API Reference
 
-The JavaScript SDK exports `openLix()`, `SqliteBackend`, and `FsBackend` from `@lix-js/sdk`.
+The JavaScript SDK exports `openLix()`, `SQLite`, and `LocalFilesystem` from `@lix-js/sdk`.
 `openLix()` returns a `Lix` instance: an in-process handle to one Lix
 repository.
 
@@ -24,16 +24,16 @@ Options:
 
 | Option    | Type                         | Description                                                          |
 | --------- | ---------------------------- | -------------------------------------------------------------------- |
-| `backend` | `FsBackend \| SqliteBackend` | Optional storage backend. Omit it for the default in-memory backend. |
+| `storage` | `LocalFilesystem \| SQLite` | Optional storage implementation. Omit it for the default in-memory storage. |
 
-Use `FsBackend` for a filesystem workspace directory backed by RocksDB at
+Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
 `<workspace>/.lix/.internal/rocksdb`:
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: "./workspace",
 		syncAllFiles: true,
 	}),
@@ -45,7 +45,7 @@ Pass `lixDir` for filesystem sync with repository metadata in an external
 
 ```ts
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: "./workspace",
 		lixDir: "/tmp/session/.lix",
 		syncAllFiles: true,
@@ -54,30 +54,30 @@ const lix = await openLix({
 ```
 
 Set `syncAllFiles: false` to start filesystem sync with no regular workspace
-files, then import selected files with `backend.importPaths()`. Imported paths are
+files, then import selected files with `storage.importPaths()`. Imported paths are
 exact workspace-relative file paths, not directories or globs. They may be
 written with or without a leading slash, for example `"notes/today.md"` or
 `"/notes/today.md"`. This scopes disk import, file watching, and
 materialization; it does not filter unrelated Lix SQL state.
 
 ```ts
-const backend = new FsBackend({
+const storage = new LocalFilesystem({
 	path: "./workspace",
 	syncAllFiles: false,
 });
-const lix = await openLix({ backend });
-await backend.importPaths(["notes/today.md"]);
+const lix = await openLix({ storage });
+await storage.importPaths(["notes/today.md"]);
 ```
 
-Use `SqliteBackend` when a single `.lix` SQLite file is the application document
+Use `SQLite` when a single `.lix` SQLite file is the application document
 itself, for example when defining a new file format and using Lix as the
 application file format:
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new SqliteBackend({ path: "app.lix" }),
+	storage: new SQLite({ path: "app.lix" }),
 });
 ```
 
@@ -278,7 +278,7 @@ type MergeConflict = {
 await lix.close();
 ```
 
-Closes the Lix handle and its backend resources.
+Closes the Lix handle and its storage resources.
 
 ## Transaction
 

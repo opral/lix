@@ -3,7 +3,7 @@ date: "2026-05-11"
 authors: ["samuelstroschein"]
 og:description: "The new DataFusion path runs the core Lix MVP flow. April did not hit the 10k inserts target, but it clarified why Lix needs control from incoming query down to storage."
 og:image: "./cover.svg"
-og:image:alt: "Lix April 2026 Update cover showing DataFusion planning queries, Lix owning the storage abstraction, and SQLite, RocksDB, S3/R2, and OPFS as backends"
+og:image:alt: "Lix April 2026 Update cover showing DataFusion planning queries, Lix owning the storage abstraction, and SQLite, RocksDB, S3/R2, and OPFS as storage implementations"
 ---
 
 # April 2026 Update: Adopting DataFusion
@@ -13,7 +13,7 @@ og:image:alt: "Lix April 2026 Update cover showing DataFusion planning queries, 
 **TL;DR**
 
 - Benchmarking exposed that SQLite gives too little control over Lix's versioned storage model to keep improving incrementally.
-- Decision: move query execution to DataFusion while keeping SQLite as a possible physical storage backend.
+- Decision: move query execution to DataFusion while keeping SQLite as a possible physical storage implementation.
 - May goal: Release `v0.6` MVP with focus on CRUD with branching and merging on the optimized semantic write path that the file API will use next.
 
 ## What works now
@@ -23,12 +23,11 @@ The important April result is that the core API works on the new path.
 The shape is the MVP API:
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "app.lix" }),
-  // Later: swap this for a RocksDB/S3/OPFS backend
+  storage: new SQLite({ path: "app.lix" }),
+  // Later: swap this for a RocksDB/S3/OPFS storage
   // without changing the Lix API below.
 });
 
@@ -134,9 +133,9 @@ DataFusion is an Apache Arrow SQL query engine. It gives Lix SQL parsing, planni
 
 The decision is not "SQLite bad, custom database good." Reusing a query engine is still the right idea. The mistake would be building one from scratch when DataFusion exists.
 
-That is the control Lix needs: from incoming query, through `lix_state`, versions, history, branch visibility, merge inputs, and file projections, down to the raw storage backend.
+That is the control Lix needs: from incoming query, through `lix_state`, versions, history, branch visibility, merge inputs, and file projections, down to the raw storage layer.
 
-SQLite does not go away. It can still be the physical storage backend. The change is that SQLite no longer defines the query and storage shape of Lix state.
+SQLite does not go away. It can still provide physical storage. The change is that SQLite no longer defines the query and storage shape of Lix state.
 
 ```plain
   DataFusion-centered architecture
@@ -163,7 +162,7 @@ SQLite does not go away. It can still be the physical storage backend. The chang
 
 Lix does not need to invent physical storage. Existing systems should still handle durability, transactions, files, pages, object storage, and the other hard parts of persistence. The prolly-tree direction from March is now part of this storage abstraction work: make branching cheap by sharing unchanged state, while keeping CRUD operations fast enough for the MVP.
 
-This also changes the portability story. Earlier posts framed portability as "any SQL database." With DataFusion, portability moves one layer down: any backend that can satisfy Lix's storage abstraction. Postgres can still be a backend later, but not because Lix delegates SQL execution to Postgres.
+This also changes the portability story. Earlier posts framed portability as "any SQL database." With DataFusion, portability moves one layer down: any storage that can satisfy Lix's storage abstraction. Postgres can still be a storage later, but not because Lix delegates SQL execution to Postgres.
 
 ## What happened to March's goals
 

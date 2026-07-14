@@ -4,10 +4,10 @@ use std::sync::Arc;
 use crate::branch::BranchRefReader;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql2;
-use crate::storage::StorageBackend;
-use crate::storage::{
-    SharedStorageRead, StorageContext, StorageReadOptions, StorageReadScope, StorageWriteOptions,
-    StorageWriteSet,
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
+    StorageWriteOptions, StorageWriteSet,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
@@ -308,9 +308,9 @@ pub struct ExecuteOptions {
     pub origin_key: Option<String>,
 }
 
-impl<B> SessionContext<B>
+impl<StorageImpl> SessionContext<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
@@ -388,11 +388,13 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let read_result =
-            with_static_session_sql_read::<B, _, _, _>(read_scope, |read_store| async move {
+        let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
+            read_scope,
+            |read_store| async move {
                 self.execute_read_statement_with_store(read_store, sql, statement, params)
                     .await
-            });
+            },
+        );
         let read_result = match read_result.await {
             Ok(result) => result,
             Err(error) => {
@@ -443,7 +445,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        with_static_session_sql_read::<B, _, _, _>(read_scope, |read_store| async move {
+        with_static_session_sql_read::<StorageImpl, _, _, _>(read_scope, |read_store| async move {
             let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
             let active_branch_commit_id = self
                 .branch_ctx
@@ -460,7 +462,7 @@ where
                 .commit_id
                 .to_string();
             let storage_mutation_revision =
-                StorageContext::<B>::load_mutation_revision_from_read(&read_store)
+                StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read_store)
                     .await?
                     .map(|revision| revision.to_vec());
             if parsed.is_empty() {
@@ -552,9 +554,9 @@ where
         &self,
         runtime_functions: &FunctionContext,
         runtime_write_access: Option<&SessionWriteAccess>,
-    ) -> Result<Option<crate::storage::StorageWriteSetStats>, LixError> {
+    ) -> Result<Option<crate::storage_adapter::StorageWriteSetStats>, LixError> {
         let mut writes = StorageWriteSet::new();
-        let read = SharedStorageRead::new(
+        let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
@@ -587,7 +589,7 @@ where
 
     async fn execute_read_statement_with_store(
         &self,
-        read_store: SharedStorageRead<B::Read<'static>>,
+        read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
         sql: &str,
         statement: datafusion::sql::parser::Statement,
         params: &[Value],
@@ -622,26 +624,26 @@ where
     }
 }
 
-/// Runs one session SQL read using a widened backend-read lifetime.
+/// Runs one session SQL read using a widened storage-read lifetime.
 ///
 /// DataFusion requires providers and plans to be `'static`, while engine
-/// backends such as RocksDB/redb naturally expose borrowed read snapshots. Keep
+/// storage implementations such as RocksDB naturally expose borrowed read snapshots. Keep
 /// the lifetime erasure private to session SQL execution so callers cannot
 /// receive the widened read as a general crate capability.
-async fn with_static_session_sql_read<B, F, Fut, T>(
-    read: StorageReadScope<B::Read<'_>>,
+async fn with_static_session_sql_read<StorageImpl, F, Fut, T>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     f: F,
 ) -> Result<T, LixError>
 where
-    B: StorageBackend + 'static,
-    F: FnOnce(SharedStorageRead<B::Read<'static>>) -> Fut,
+    StorageImpl: Storage + 'static,
+    F: FnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
     Fut: Future<Output = Result<T, LixError>>,
 {
-    // SAFETY: the widened read is wrapped immediately in `SharedStorageRead`,
+    // SAFETY: the widened read is wrapped immediately in `SharedStorageAdapterRead`,
     // only passed into this private SQL execution closure, and explicitly
     // dropped before returning. Escaped clones are detected by `finish()`.
-    let read = unsafe { assume_static_backend_read::<B>(read) };
-    let read = SharedStorageRead::new(read);
+    let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+    let read = SharedStorageAdapterRead::new(read);
     let finish = read.clone();
     let result = f(read).await;
     let finish_result = finish.finish().map_err(LixError::from);
@@ -652,27 +654,30 @@ where
     }
 }
 
-/// Erases the backend borrow lifetime for scoped session SQL execution.
+/// Erases the storage borrow lifetime for scoped session SQL execution.
 ///
 /// # Safety
 ///
-/// The returned read scope must not outlive the backend value that produced
+/// The returned read scope must not outlive the storage value that produced
 /// `read`, and it must be dropped before the enclosing SQL execution returns.
-unsafe fn assume_static_backend_read<B>(
-    read: StorageReadScope<B::Read<'_>>,
-) -> StorageReadScope<B::Read<'static>>
+unsafe fn assume_static_storage_read<StorageImpl>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
+) -> StorageAdapterReadScope<StorageImpl::Read<'static>>
 where
-    B: StorageBackend + 'static,
+    StorageImpl: Storage + 'static,
 {
     let read = std::mem::ManuallyDrop::new(read);
     unsafe {
-        std::ptr::read(std::ptr::from_ref(&*read).cast::<StorageReadScope<B::Read<'static>>>())
+        std::ptr::read(
+            std::ptr::from_ref(&*read)
+                .cast::<StorageAdapterReadScope<StorageImpl::Read<'static>>>(),
+        )
     }
 }
 
-impl<B> SessionTransaction<B>
+impl<StorageImpl> SessionTransaction<StorageImpl>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     /// Executes one SQL statement inside this transaction.
     ///
@@ -762,7 +767,7 @@ where
     ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
         let _operation_guard = self.begin_session_operation()?;
         let transaction = self.transaction_mut()?;
-        <crate::transaction::Transaction<B> as sql2::SqlWriteExecutionContext>::scan_live_state(
+        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state(
             transaction,
             request,
         )
@@ -770,14 +775,14 @@ where
     }
 }
 
-async fn execute_transaction_write_auto<B>(
-    transaction: &mut crate::transaction::Transaction<B>,
+async fn execute_transaction_write_auto<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     options: ExecuteOptions,
 ) -> Result<ExecuteResult, LixError>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
@@ -792,14 +797,14 @@ where
 }
 
 #[cfg(test)]
-async fn execute_transaction_write_with_mode<B>(
-    transaction: &mut crate::transaction::Transaction<B>,
+async fn execute_transaction_write_with_mode<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     mode: sql2::WriteExecutorMode,
 ) -> Result<ExecuteResult, LixError>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
@@ -809,14 +814,14 @@ where
 }
 
 #[cfg(test)]
-async fn execute_transaction_write_with_mode_and_trace<B>(
-    transaction: &mut crate::transaction::Transaction<B>,
+async fn execute_transaction_write_with_mode_and_trace<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     mode: sql2::WriteExecutorMode,
 ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
@@ -855,16 +860,16 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Engine, InMemoryBackend};
+    use crate::{Engine, Memory};
 
-    async fn open_session() -> SessionContext<InMemoryBackend> {
-        let backend = InMemoryBackend::default();
-        Engine::initialize(backend.clone())
+    async fn open_session() -> SessionContext<Memory> {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
             .await
-            .expect("backend should initialize");
-        let engine = Engine::new(backend)
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
             .await
-            .expect("initialized backend should create engine");
+            .expect("initialized storage should create engine");
         engine
             .open_workspace_session()
             .await

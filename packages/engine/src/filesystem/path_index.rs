@@ -14,9 +14,9 @@ use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::storage::{
-    PointReadPlan, StorageCoreProjection, StorageGetOptions, StorageKey, StorageProjectedValue,
-    StorageRead, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+use crate::storage_adapter::{
+    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
+    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
@@ -506,7 +506,7 @@ impl FilesystemPathIndexCache {
 }
 
 pub(crate) async fn load_path_index_revision(
-    store: &(impl StorageRead + ?Sized),
+    store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Option<Vec<u8>>, LixError> {
     let result = PointReadPlan::new(
         FILESYSTEM_PATH_REVISION_SPACE,

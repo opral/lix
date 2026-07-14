@@ -4,17 +4,16 @@
 //! - Engine/session APIs coordinate session lifecycle and commit boundaries.
 //! - Explicit transactions serialize with implicit session writes on the same
 //!   handle. The MVP does not promise multi-branch snapshot isolation across
-//!   concurrent sessions beyond each backend read snapshot.
+//!   concurrent sessions beyond each storage read snapshot.
 //! - `SessionContext::close()` is a lifecycle boundary. It waits for in-flight
 //!   reads, rejects live explicit transactions, cancels queued or pre-boundary
 //!   writes, and waits once a commit has entered the durable point-of-no-return.
-//! - Crash durability is delegated to the backend. The MVP does not add an
-//!   engine WAL, fsync policy, or recovery protocol above backend commits.
-//! - `backend` and `storage` are low-level surfaces. Code that bypasses
+//! - Crash durability is delegated to the storage. The MVP does not add an
+//!   engine WAL, fsync policy, or recovery protocol above storage commits.
+//! - `storage` and `storage_adapter` are low-level surfaces. Code that bypasses
 //!   `Engine`/`SessionContext` also bypasses session lifecycle accounting and
-//!   relies on backend-provided serialization.
+//!   relies on storage-provided serialization.
 
-pub mod backend;
 mod binary_cas;
 pub(crate) mod branch;
 pub(crate) mod catalog;
@@ -38,8 +37,9 @@ pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
-#[allow(unused_imports)]
 pub mod storage;
+#[allow(unused_imports)]
+pub mod storage_adapter;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
@@ -60,19 +60,6 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
-pub use backend::conformance::{
-    BackendFactory, BackendFixture, BackendTestConfig,
-    ConformanceReport as BackendConformanceReport, ConformanceResult as BackendConformanceResult,
-    ConformanceStatus as BackendConformanceStatus, ConformanceTest as BackendConformanceTest,
-    run_backend_conformance,
-};
-pub use backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, Durability,
-    GetManyResult, GetOptions, InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture,
-    InMemoryRead, InMemoryWrite, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue,
-    PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SnapshotRef, SpaceId, StoredValue, WriteOptions, WriteStats,
-};
 pub use common::LixError;
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
@@ -89,6 +76,18 @@ pub use session::{
     MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
     MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+};
+pub use storage::conformance::{
+    ConformanceReport as StorageConformanceReport, ConformanceResult as StorageConformanceResult,
+    ConformanceStatus as StorageConformanceStatus, ConformanceTest as StorageConformanceTest,
+    StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
+};
+pub use storage::{
+    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange,
+    MAX_SCAN_PAGE_ROWS, Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix,
+    ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+    StoredValue, WriteOptions, WriteStats,
 };
 
 pub(crate) const GLOBAL_BRANCH_ID: &str = "global";

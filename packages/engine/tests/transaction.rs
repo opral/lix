@@ -4,10 +4,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::Engine;
-use lix_engine::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetManyResult, GetOptions,
-    InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
-    ScanOptions, SpaceId, WriteOptions,
+use lix_engine::storage::{
+    CommitResult, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
+    PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
+    StorageWrite, WriteOptions,
 };
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,13 +32,13 @@ fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
 
 #[tokio::test]
 async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = engine
         .open_workspace_session()
         .await
@@ -53,7 +53,7 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
         .await
         .expect("test should corrupt workspace selector");
 
-    let before = backend.stats();
+    let before = storage.stats();
     let error = session
         .execute("SELECT 1", &[])
         .await
@@ -63,7 +63,7 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
         "unexpected error: {error:?}"
     );
 
-    let delta = backend.stats().delta_since(&before);
+    let delta = storage.stats().delta_since(&before);
     assert_eq!(delta.read_opened, 1, "read SQL should open one read tx");
     assert_eq!(
         delta.write_opened, 0,
@@ -72,14 +72,14 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
 }
 
 #[tokio::test]
-async fn write_setup_failure_does_not_open_backend_write() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+async fn write_setup_failure_does_not_open_storage_write() {
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = engine
         .open_workspace_session()
         .await
@@ -94,7 +94,7 @@ async fn write_setup_failure_does_not_open_backend_write() {
         .await
         .expect("test should corrupt workspace selector");
 
-    let before = backend.stats();
+    let before = storage.stats();
     let error = session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('after-corrupt-selector', 'value')",
@@ -104,10 +104,10 @@ async fn write_setup_failure_does_not_open_backend_write() {
         .expect_err("missing active branch should fail write open");
     assert_eq!(error.code, "LIX_BRANCH_NOT_FOUND");
 
-    let delta = backend.stats().delta_since(&before);
+    let delta = storage.stats().delta_since(&before);
     assert_eq!(
         delta.write_opened, 0,
-        "write setup failure should not open a backend write"
+        "write setup failure should not open a storage write"
     );
     assert_eq!(
         delta.write_committed, 0,
@@ -117,16 +117,16 @@ async fn write_setup_failure_does_not_open_backend_write() {
 
 #[tokio::test]
 async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
-    let backend = RecordingBackend::new();
-    let receipt = Engine::initialize(backend.clone())
+    let storage = RecordingStorage::new();
+    let receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
 
-    backend.fail_read_namespace("changelog.commit");
-    let before = backend.stats();
+    storage.fail_read_namespace("changelog.commit");
+    let before = storage.stats();
     let error = engine
         .rebuild_tracked_state_for_branch(&receipt.main_branch_id)
         .await
@@ -136,30 +136,30 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
         "unexpected error: {error:?}"
     );
 
-    let delta = backend.stats().delta_since(&before);
+    let delta = storage.stats().delta_since(&before);
     assert_eq!(
         delta.write_opened, 0,
-        "failed rebuild should not open a backend write"
+        "failed rebuild should not open a storage write"
     );
     assert_eq!(delta.write_committed, 0, "failed rebuild must not commit");
 }
 
 #[tokio::test]
-async fn write_changelog_commit_failure_does_not_commit_backend_write() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+async fn write_changelog_commit_failure_does_not_commit_storage_write() {
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = engine
         .open_workspace_session()
         .await
         .expect("workspace session should open");
 
-    backend.fail_write_namespace("changelog.commit");
-    let before = backend.stats();
+    storage.fail_write_namespace("changelog.commit");
+    let before = storage.stats();
     let error = session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('changelog-commit-write-failure', 'value')",
@@ -172,8 +172,8 @@ async fn write_changelog_commit_failure_does_not_commit_backend_write() {
         "unexpected error: {error:?}"
     );
 
-    let delta = backend.stats().delta_since(&before);
-    assert_eq!(delta.write_opened, 1, "write should open a backend write");
+    let delta = storage.stats().delta_since(&before);
+    assert_eq!(delta.write_opened, 1, "write should open a storage write");
     assert_eq!(
         delta.write_committed, 0,
         "failed changelog commit write must not commit"
@@ -182,13 +182,13 @@ async fn write_changelog_commit_failure_does_not_commit_backend_write() {
 
 #[tokio::test]
 async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = engine
         .open_workspace_session()
         .await
@@ -240,13 +240,13 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
 
 #[tokio::test]
 async fn transaction_read_can_query_history_surfaces() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = engine
         .open_workspace_session()
         .await
@@ -286,13 +286,13 @@ async fn transaction_read_can_query_history_surfaces() {
 
 #[tokio::test]
 async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -350,13 +350,13 @@ async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
 
 #[tokio::test]
 async fn closed_session_still_allows_active_transaction_rollback() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -384,44 +384,44 @@ async fn closed_session_still_allows_active_transaction_rollback() {
 }
 
 #[tokio::test]
-async fn closed_session_active_branch_id_does_not_open_backend_read() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
+async fn closed_session_active_branch_id_does_not_open_storage_read() {
+    let storage = RecordingStorage::new();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = engine
         .open_workspace_session()
         .await
         .expect("workspace session should open");
 
     session.close().await.expect("session close should succeed");
-    let before = backend.stats();
+    let before = storage.stats();
     let error = session
         .active_branch_id()
         .await
         .expect_err("active_branch_id should reject a closed session");
     assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
 
-    let delta = backend.stats().delta_since(&before);
+    let delta = storage.stats().delta_since(&before);
     assert_eq!(
         delta.read_opened, 0,
-        "closed active_branch_id must reject before backend IO"
+        "closed active_branch_id must reject before storage IO"
     );
 }
 
 #[tokio::test]
 async fn close_during_transaction_open_rejects_opened_transaction() {
-    let backend = BlockingBeginReadBackend::new();
-    let gate = backend.gate();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = BlockingBeginReadStorage::new();
+    let gate = storage.gate();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -463,14 +463,14 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
 
 #[tokio::test]
 async fn close_during_transaction_commit_waits_after_commit_boundary() {
-    let backend = BlockingBeginReadBackend::new();
-    let gate = backend.gate();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = BlockingBeginReadStorage::new();
+    let gate = storage.gate();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -490,7 +490,7 @@ async fn close_during_transaction_commit_waits_after_commit_boundary() {
     .expect("staging before close should succeed");
 
     gate.block_next_write();
-    let before = backend.stats();
+    let before = storage.stats();
     let committer = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -516,31 +516,31 @@ async fn close_during_transaction_commit_waits_after_commit_boundary() {
     join_thread(closer, "close while commit waits after commit boundary")
         .expect("session close should succeed after commit exits");
 
-    let delta = backend.stats().delta_since(&before);
+    let delta = storage.stats().delta_since(&before);
     assert_eq!(
         delta.write_opened, 1,
-        "commit preparation should open a backend write"
+        "commit preparation should open a storage write"
     );
     assert_eq!(
         delta.write_committed, 1,
-        "commit past the boundary should commit backend writes"
+        "commit past the boundary should commit storage writes"
     );
     assert_eq!(
         delta.write_rolled_back, 0,
-        "commit past the boundary should not roll back backend writes"
+        "commit past the boundary should not roll back storage writes"
     );
 }
 
 #[tokio::test]
-async fn close_waits_for_transaction_blocked_in_backend_commit() {
-    let backend = BlockingCommitBackend::new();
-    let gate = backend.gate();
-    let _receipt = Engine::initialize(backend.clone())
+async fn close_waits_for_transaction_blocked_in_storage_commit() {
+    let storage = BlockingCommitStorage::new();
+    let gate = storage.gate();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend.clone())
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -553,14 +553,14 @@ async fn close_waits_for_transaction_blocked_in_backend_commit() {
         .await
         .expect("transaction should begin");
     tx.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('blocked-backend-commit', 'value')",
+        "INSERT INTO lix_key_value (key, value) VALUES ('blocked-storage-commit', 'value')",
         &[],
     )
     .await
     .expect("staging before blocked commit should succeed");
 
     gate.block_next_write();
-    let before = backend.stats();
+    let before = storage.stats();
     let committer = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -570,33 +570,33 @@ async fn close_waits_for_transaction_blocked_in_backend_commit() {
 
     gate.wait_until_blocked();
     let closer = spawn_close_waiter(Arc::clone(&session));
-    wait_until("close to wait on blocked backend commit", || {
+    wait_until("close to wait on blocked storage commit", || {
         !closer.is_finished()
     });
     assert!(
         !closer.is_finished(),
-        "close should wait for backend commit to unblock"
+        "close should wait for storage commit to unblock"
     );
 
     gate.release();
-    join_thread(committer, "committer blocked in backend commit")
-        .expect("commit at backend commit boundary should finish");
-    join_thread(closer, "close after backend commit unblocks")
-        .expect("session close should succeed after backend commit exits");
+    join_thread(committer, "committer blocked in storage commit")
+        .expect("commit at storage commit boundary should finish");
+    join_thread(closer, "close after storage commit unblocks")
+        .expect("session close should succeed after storage commit exits");
 
-    let delta = backend.stats().delta_since(&before);
-    assert_eq!(delta.write_opened, 1, "commit should open a backend write");
+    let delta = storage.stats().delta_since(&before);
+    assert_eq!(delta.write_opened, 1, "commit should open a storage write");
     assert_eq!(
         delta.write_committed, 1,
-        "blocked backend commit should eventually commit"
+        "blocked storage commit should eventually commit"
     );
 }
 
-fn spawn_close_waiter<B>(
-    session: Arc<lix_engine::SessionContext<B>>,
+fn spawn_close_waiter<StorageImpl>(
+    session: Arc<lix_engine::SessionContext<StorageImpl>>,
 ) -> thread::JoinHandle<Result<(), lix_engine::LixError>>
 where
-    B: Backend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -608,14 +608,14 @@ where
 
 #[tokio::test]
 async fn begin_transaction_cannot_race_with_opening_session_write() {
-    let backend = BlockingBeginWriteBackend::new();
-    let gate = backend.gate();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = BlockingBeginWriteStorage::new();
+    let gate = storage.gate();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -665,14 +665,14 @@ async fn begin_transaction_cannot_race_with_opening_session_write() {
 
 #[tokio::test]
 async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
-    let backend = BlockingBeginWriteBackend::new();
-    let gate = backend.gate();
-    let _receipt = Engine::initialize(backend.clone())
+    let storage = BlockingBeginWriteStorage::new();
+    let gate = storage.gate();
+    let _receipt = Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
         .await
-        .expect("initialized backend should create an engine");
+        .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
             .open_workspace_session()
@@ -721,35 +721,35 @@ async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
 }
 
 #[derive(Clone, Default)]
-struct RecordingBackend {
-    inner: InMemoryBackend,
+struct RecordingStorage {
+    inner: Memory,
     stats: Arc<TransactionStats>,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
     fail_write_namespace: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
-struct BlockingBeginWriteBackend {
-    inner: RecordingBackend,
+struct BlockingBeginWriteStorage {
+    inner: RecordingStorage,
     gate: BlockingBeginWriteGate,
 }
 
 #[derive(Clone)]
-struct BlockingBeginReadBackend {
-    inner: RecordingBackend,
+struct BlockingBeginReadStorage {
+    inner: RecordingStorage,
     gate: BlockingBeginWriteGate,
 }
 
 #[derive(Clone)]
-struct BlockingCommitBackend {
-    inner: RecordingBackend,
+struct BlockingCommitStorage {
+    inner: RecordingStorage,
     gate: BlockingBeginWriteGate,
 }
 
-impl BlockingBeginWriteBackend {
+impl BlockingBeginWriteStorage {
     fn new() -> Self {
         Self {
-            inner: RecordingBackend::new(),
+            inner: RecordingStorage::new(),
             gate: BlockingBeginWriteGate::new(),
         }
     }
@@ -759,10 +759,10 @@ impl BlockingBeginWriteBackend {
     }
 }
 
-impl BlockingBeginReadBackend {
+impl BlockingBeginReadStorage {
     fn new() -> Self {
         Self {
-            inner: RecordingBackend::new(),
+            inner: RecordingStorage::new(),
             gate: BlockingBeginWriteGate::new(),
         }
     }
@@ -776,10 +776,10 @@ impl BlockingBeginReadBackend {
     }
 }
 
-impl BlockingCommitBackend {
+impl BlockingCommitStorage {
     fn new() -> Self {
         Self {
-            inner: RecordingBackend::new(),
+            inner: RecordingStorage::new(),
             gate: BlockingBeginWriteGate::new(),
         }
     }
@@ -793,49 +793,49 @@ impl BlockingCommitBackend {
     }
 }
 
-impl Backend for BlockingBeginWriteBackend {
+impl Storage for BlockingBeginWriteStorage {
     type Read<'a>
-        = <RecordingBackend as Backend>::Read<'a>
+        = <RecordingStorage as Storage>::Read<'a>
     where
         Self: 'a;
 
     type Write<'a>
-        = <RecordingBackend as Backend>::Write<'a>
+        = <RecordingStorage as Storage>::Write<'a>
     where
         Self: 'a;
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.gate.maybe_block();
         self.inner.begin_write(opts).await
     }
 }
 
-impl Backend for BlockingBeginReadBackend {
+impl Storage for BlockingBeginReadStorage {
     type Read<'a>
-        = <RecordingBackend as Backend>::Read<'a>
+        = <RecordingStorage as Storage>::Read<'a>
     where
         Self: 'a;
 
     type Write<'a>
-        = <RecordingBackend as Backend>::Write<'a>
+        = <RecordingStorage as Storage>::Write<'a>
     where
         Self: 'a;
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.gate.maybe_block();
         self.inner.begin_read(opts).await
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.inner.begin_write(opts).await
     }
 }
 
-impl Backend for BlockingCommitBackend {
+impl Storage for BlockingCommitStorage {
     type Read<'a>
-        = <RecordingBackend as Backend>::Read<'a>
+        = <RecordingStorage as Storage>::Read<'a>
     where
         Self: 'a;
 
@@ -843,11 +843,11 @@ impl Backend for BlockingCommitBackend {
         = BlockingCommitWrite
     where
         Self: 'a;
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         Ok(BlockingCommitWrite {
             inner: self.inner.begin_write(opts).await?,
             gate: self.gate.clone(),
@@ -860,25 +860,25 @@ struct BlockingCommitWrite {
     gate: BlockingBeginWriteGate,
 }
 
-impl BackendWrite for BlockingCommitWrite {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+impl StorageWrite for BlockingCommitWrite {
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
         self.inner.put_many(space, entries).await
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
         self.inner.delete_many(space, keys).await
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
         self.inner.delete_range(space, range).await
     }
 
-    async fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, StorageError> {
         self.gate.maybe_block();
         self.inner.commit().await
     }
 
-    async fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), StorageError> {
         self.inner.rollback().await
     }
 }
@@ -966,7 +966,7 @@ struct BlockingBeginWriteState {
     released: bool,
 }
 
-impl RecordingBackend {
+impl RecordingStorage {
     fn new() -> Self {
         Self::default()
     }
@@ -990,7 +990,7 @@ impl RecordingBackend {
     }
 }
 
-impl Backend for RecordingBackend {
+impl Storage for RecordingStorage {
     type Read<'a>
         = RecordingRead
     where
@@ -1000,7 +1000,7 @@ impl Backend for RecordingBackend {
         = RecordingWrite
     where
         Self: 'a;
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {
             inner: self.inner.begin_read(opts).await?,
@@ -1008,7 +1008,7 @@ impl Backend for RecordingBackend {
         })
     }
 
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.stats.write_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingWrite {
             inner: self.inner.begin_write(opts).await?,
@@ -1020,23 +1020,23 @@ impl Backend for RecordingBackend {
 
 #[derive(Clone)]
 struct RecordingRead {
-    inner: InMemoryRead,
+    inner: MemoryRead,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
 }
 
 struct RecordingWrite {
-    inner: InMemoryWrite,
+    inner: MemoryWrite,
     stats: Arc<TransactionStats>,
     fail_write_namespace: Arc<Mutex<Option<String>>>,
 }
 
-impl BackendRead for RecordingRead {
+impl StorageRead for RecordingRead {
     async fn get_many(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions,
-    ) -> Result<GetManyResult, BackendError> {
+    ) -> Result<GetManyResult, StorageError> {
         self.fail_if_space_matches(space)?;
         self.inner.get_many(space, keys, opts).await
     }
@@ -1046,39 +1046,39 @@ impl BackendRead for RecordingRead {
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions,
-    ) -> Result<ScanChunk, BackendError> {
+    ) -> Result<ScanChunk, StorageError> {
         self.fail_if_space_matches(space)?;
         self.inner.scan(space, range, opts).await
     }
 }
 
-impl BackendWrite for RecordingWrite {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+impl StorageWrite for RecordingWrite {
+    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
         self.fail_if_space_matches(space)?;
         self.inner.put_many(space, entries).await
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
         self.inner.delete_many(space, keys).await
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
         self.inner.delete_range(space, range).await
     }
 
-    async fn commit(self) -> Result<CommitResult, BackendError> {
+    async fn commit(self) -> Result<CommitResult, StorageError> {
         self.stats.write_committed.fetch_add(1, Ordering::SeqCst);
         self.inner.commit().await
     }
 
-    async fn rollback(self) -> Result<(), BackendError> {
+    async fn rollback(self) -> Result<(), StorageError> {
         self.stats.write_rolled_back.fetch_add(1, Ordering::SeqCst);
         self.inner.rollback().await
     }
 }
 
 impl RecordingWrite {
-    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), BackendError> {
+    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), StorageError> {
         if let Some(namespace) = self.fail_write_namespace() {
             if let Some(failing) = namespace_space(&namespace) {
                 if space == failing {
@@ -1098,7 +1098,7 @@ impl RecordingWrite {
 }
 
 impl RecordingRead {
-    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), BackendError> {
+    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), StorageError> {
         if let Some(namespace) = self.fail_read_namespace() {
             if let Some(failing) = namespace_space(&namespace) {
                 if space == failing {
@@ -1126,12 +1126,12 @@ fn namespace_space(namespace: &str) -> Option<SpaceId> {
     }
 }
 
-fn forced_read_failure(namespace: &str) -> BackendError {
-    BackendError::Io(format!("forced read failure for namespace {namespace}"))
+fn forced_read_failure(namespace: &str) -> StorageError {
+    StorageError::Io(format!("forced read failure for namespace {namespace}"))
 }
 
-fn forced_write_failure(namespace: &str) -> BackendError {
-    BackendError::Io(format!("forced write failure for namespace {namespace}"))
+fn forced_write_failure(namespace: &str) -> StorageError {
+    StorageError::Io(format!("forced write failure for namespace {namespace}"))
 }
 
 #[derive(Default)]

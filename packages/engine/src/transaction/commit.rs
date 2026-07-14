@@ -20,7 +20,7 @@ use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest,
 };
-use crate::storage::{StorageRead, StorageWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::staging::{PreparedStateRowIdentity, PreparedWriteSet};
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
@@ -40,7 +40,7 @@ pub(crate) async fn commit_prepared_writes(
     branch_ctx: &BranchContext,
     live_index: &LiveStateIndexContext,
     runtime_functions: Option<&FunctionContext>,
-    read: &mut impl StorageRead,
+    read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<StorageWriteSet, LixError> {
     let mut writes = StorageWriteSet::new();
@@ -225,7 +225,7 @@ struct StagedChangelogCommit {
 }
 
 async fn stage_changelog_commits(
-    read: &mut impl StorageRead,
+    read: &mut impl StorageAdapterRead,
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     branch_ref_rows: &[EngineCurrentRow],
@@ -420,7 +420,7 @@ fn deterministic_sequence_current_row(
 
 async fn stage_flat_current_rows(
     current: &LiveStateIndexContext,
-    read: &(impl StorageRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     engine_rows: &[EngineCurrentRow],
@@ -532,7 +532,7 @@ async fn load_current_branch_ref_commit_id<S>(
     branch_id: &str,
 ) -> Result<Option<String>, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     let Some(row) = reader
         .load_row(&LiveStateIndexRowRequest {
@@ -565,7 +565,7 @@ async fn branch_has_local_untracked_rows<S>(
     branch_id: &str,
 ) -> Result<bool, LixError>
 where
-    S: StorageRead,
+    S: StorageAdapterRead,
 {
     Ok(!reader
         .scan_index_rows(&LiveStateIndexScanRequest {
@@ -666,7 +666,7 @@ fn tracked_delta_from_selected_change_ref(
 }
 
 async fn stage_tracked_roots(
-    read: &(impl StorageRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     tracked_row_indices_by_commit: BTreeMap<CommitId, Vec<RowIndex>>,
@@ -879,7 +879,7 @@ async fn finalize_commit_rows(
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     branch_ctx: &BranchContext,
-    read: &(impl StorageRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut branch_heads = Vec::new();
@@ -954,17 +954,17 @@ mod tests {
     };
 
     use super::*;
-    use crate::backend::{
-        Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch, SpaceId,
-    };
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::live_state::{LiveStateIndexContext, LiveStateIndexRowRequest};
     use crate::storage::{
-        InMemoryStorageBackend, InMemoryStorageRead, InMemoryStorageWrite, StorageContext,
-        StorageKey, StorageReadOptions, StorageWriteOptions,
+        CommitResult, KeyRange, PutBatch, SpaceId, Storage, StorageError, StorageWrite,
+    };
+    use crate::storage_adapter::{
+        Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageKey, StorageReadOptions,
+        StorageWriteOptions,
     };
     use crate::transaction::types::PreparedRowFacts;
     use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_staged_writes_appends_changelog_and_updates_commit_root() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
         let mut read = storage
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_changelog_commits_orders_staged_parents_before_children() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let mut writes = StorageWriteSet::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_with_only_untracked_writes_does_not_create_lix_commit() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
         let mut read = storage
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_write_replaces_matching_untracked_current_row() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let live_state = Arc::new(live_state_context());
         let branch_ctx = BranchContext::new();
@@ -1360,10 +1360,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_staged_writes_applies_cross_subsystem_rows_as_one_backend_batch() {
-        let counting_backend = CountingBackend::new();
-        let write_batches = counting_backend.write_batches();
-        let storage = StorageContext::new(counting_backend);
+    async fn commit_staged_writes_applies_cross_subsystem_rows_as_one_storage_batch() {
+        let counting_storage = CountingStorage::new();
+        let write_batches = counting_storage.write_batches();
+        let storage = StorageAdapter::new(counting_storage);
         let binary_cas = BinaryCasContext::new();
         let live_state = Arc::new(live_state_context());
         let branch_ctx = BranchContext::new();
@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(
             write_batches.load(Ordering::SeqCst),
             0,
-            "prepared writes should not touch the backend before the write set is committed"
+            "prepared writes should not touch the storage before the write set is committed"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -1571,7 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_branch() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
@@ -1659,7 +1659,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_branch_ref() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "initial-commit")
             .await;
@@ -1698,7 +1698,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ctx = BranchContext::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -1722,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_branch_ref_as_parent() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
             .await;
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), "branch-a", "target-head").await;
 
@@ -1903,15 +1903,15 @@ mod tests {
         }
     }
 
-    struct CountingBackend {
-        inner: InMemoryStorageBackend,
+    struct CountingStorage {
+        inner: Memory,
         write_batches: Arc<AtomicUsize>,
     }
 
-    impl CountingBackend {
+    impl CountingStorage {
         fn new() -> Self {
             Self {
-                inner: InMemoryStorageBackend::new(),
+                inner: Memory::new(),
                 write_batches: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -1921,9 +1921,9 @@ mod tests {
         }
     }
 
-    impl Backend for CountingBackend {
+    impl Storage for CountingStorage {
         type Read<'a>
-            = InMemoryStorageRead
+            = MemoryRead
         where
             Self: 'a;
 
@@ -1934,14 +1934,14 @@ mod tests {
         async fn begin_read(
             &self,
             opts: StorageReadOptions,
-        ) -> Result<Self::Read<'_>, BackendError> {
+        ) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(opts).await
         }
 
         async fn begin_write(
             &self,
             opts: StorageWriteOptions,
-        ) -> Result<Self::Write<'_>, BackendError> {
+        ) -> Result<Self::Write<'_>, StorageError> {
             Ok(CountingWrite {
                 inner: self.inner.begin_write(opts).await?,
                 write_batches: Arc::clone(&self.write_batches),
@@ -1950,16 +1950,16 @@ mod tests {
     }
 
     struct CountingWrite {
-        inner: InMemoryStorageWrite,
+        inner: MemoryWrite,
         write_batches: Arc<AtomicUsize>,
     }
 
-    impl BackendWrite for CountingWrite {
+    impl StorageWrite for CountingWrite {
         async fn put_many(
             &mut self,
             space: SpaceId,
             entries: PutBatch,
-        ) -> Result<(), BackendError> {
+        ) -> Result<(), StorageError> {
             self.inner.put_many(space, entries).await
         }
 
@@ -1967,7 +1967,7 @@ mod tests {
             &mut self,
             space: SpaceId,
             keys: &[StorageKey],
-        ) -> Result<(), BackendError> {
+        ) -> Result<(), StorageError> {
             self.inner.delete_many(space, keys).await
         }
 
@@ -1975,16 +1975,16 @@ mod tests {
             &mut self,
             space: SpaceId,
             range: KeyRange,
-        ) -> Result<(), BackendError> {
+        ) -> Result<(), StorageError> {
             self.inner.delete_range(space, range).await
         }
 
-        async fn commit(self) -> Result<CommitResult, BackendError> {
+        async fn commit(self) -> Result<CommitResult, StorageError> {
             self.write_batches.fetch_add(1, Ordering::SeqCst);
             self.inner.commit().await
         }
 
-        async fn rollback(self) -> Result<(), BackendError> {
+        async fn rollback(self) -> Result<(), StorageError> {
             self.inner.rollback().await
         }
     }

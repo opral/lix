@@ -1,10 +1,10 @@
 export {
-	FsBackend,
+	LocalFilesystem,
 	Lix,
 	LixTransaction,
 	ObserveEvents,
 	openLix,
-	SqliteBackend,
+	SQLite,
 } from "./open-lix.js";
 export {
 	bundledPluginArchives,
@@ -17,7 +17,7 @@ export type {
 	CreateBranchReceipt,
 	ExecuteOptions,
 	ExecuteResult,
-	FsBackendOptions,
+	LocalFilesystemOptions,
 	JsonValue,
 	LixValue,
 	MergeBranchOptions,
@@ -30,7 +30,7 @@ export type {
 	ObserveEvent,
 	OpenLixOptions,
 	SqlParam,
-	SqliteBackendOptions,
+	SQLiteOptions,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 } from "./types.js";

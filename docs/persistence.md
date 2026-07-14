@@ -1,10 +1,10 @@
 ---
-description: Open Lix in memory for tests, persist a filesystem workspace with FsBackend, or use SqliteBackend for a single .lix application file.
+description: Open Lix in memory for tests, persist a filesystem workspace with LocalFilesystem, or use SQLite for a single .lix application file.
 ---
 
 # Persistence
 
-`openLix()` with no arguments opens an in-memory Lix that vanishes when the process exits. For anything that should survive a restart, pass a backend. For local files and directories, `FsBackend` is the recommended backend.
+`openLix()` with no arguments opens an in-memory Lix that vanishes when the process exits. For anything that should survive a restart, pass a storage. For local files and directories, `LocalFilesystem` is the recommended storage.
 
 ## In-memory (tests, demos)
 
@@ -18,17 +18,17 @@ await lix.close();
 
 ## Filesystem workspace (persistent mode)
 
-Persist a directory as a Lix workspace using `FsBackend`:
+Persist a directory as a Lix workspace using `LocalFilesystem`:
 
 ```bash
 npm install @lix-js/sdk
 ```
 
 ```ts
-import { FsBackend, openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: "/var/data/workspace",
 		syncAllFiles: true,
 	}),
@@ -38,11 +38,11 @@ const lix = await openLix({
 await lix.close();
 ```
 
-Reopening the same path resumes existing RocksDB filesystem backend state. Lix stores its private repository data in `<workspace>/.lix/.internal/rocksdb` and syncs workspace files through Lix.
+Reopening the same path resumes existing RocksDB filesystem storage state. Lix stores its private repository data in `<workspace>/.lix/.internal/rocksdb` and syncs workspace files through Lix.
 
-Older SQLite filesystem backend metadata is not migrated. If Lix detects the
+Older SQLite filesystem storage metadata is not migrated. If Lix detects the
 old SQLite metadata files in `<workspace>/.lix/.internal` before a RocksDB store
-exists, it clears `.lix/.internal` and initializes a fresh RocksDB backend.
+exists, it clears `.lix/.internal` and initializes a fresh RocksDB storage.
 
 ## Filesystem workspace (external `.lix` directory)
 
@@ -51,7 +51,7 @@ the workspace directory:
 
 ```ts
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: "/var/data/workspace",
 		lixDir: "/tmp/session/.lix",
 		syncAllFiles: true,
@@ -73,7 +73,7 @@ import path from "node:path";
 
 const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-	backend: new FsBackend({
+	storage: new LocalFilesystem({
 		path: path.join(dir, "workspace"),
 		syncAllFiles: true,
 	}),
@@ -81,30 +81,30 @@ const lix = await openLix({
 ```
 
 Set `syncAllFiles: false` when filesystem sync should start with no regular
-workspace files, then import selected files with `backend.importPaths()`. Imported paths
+workspace files, then import selected files with `storage.importPaths()`. Imported paths
 are exact workspace-relative file paths, not directories or globs. They may be
 written with or without a leading slash, for example `"notes/today.md"` or
 `"/notes/today.md"`. This scopes disk import, file watching, and
 materialization; it does not filter unrelated Lix SQL state.
 
 ```ts
-const backend = new FsBackend({
+const storage = new LocalFilesystem({
 	path: "/Users/me/Downloads",
 	syncAllFiles: false,
 });
-const lix = await openLix({ backend });
-await backend.importPaths(["notes/today.md"]);
+const lix = await openLix({ storage });
+await storage.importPaths(["notes/today.md"]);
 ```
 
 ## Single .lix application file
 
-Use `SqliteBackend` when the `.lix` SQLite file is the application document itself. This is useful if you are defining a new file format and want Lix to be the application's file format: a single portable file that contains the app's versioned state.
+Use `SQLite` when the `.lix` SQLite file is the application document itself. This is useful if you are defining a new file format and want Lix to be the application's file format: a single portable file that contains the app's versioned state.
 
 ```ts
-import { openLix, SqliteBackend } from "@lix-js/sdk";
+import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new SqliteBackend({ path: "/var/data/app.lix" }),
+	storage: new SQLite({ path: "/var/data/app.lix" }),
 });
 ```
 
@@ -116,6 +116,6 @@ Always `await lix.close()` in scripts and tests. Long-lived servers can hold a s
 
 ## Other storage targets
 
-Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, and other transactional key-value storage targets beyond the shipped backends are not shipped by the Lix team.
+Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, and other transactional key-value storage targets beyond the shipped storage implementations are not shipped by the Lix team.
 
-The storage interface is public and small enough to implement yourself. The [Backends](./backend.md) page documents the full contract.
+The storage interface is public and small enough to implement yourself. The [Storage](./storage.md) page documents the full contract.

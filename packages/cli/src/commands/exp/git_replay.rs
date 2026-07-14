@@ -182,7 +182,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     }
     if trace_sql_json_path.is_some() {
         return Err(CliError::msg(
-            "--trace-sql-json is not available with the current lix-sdk backend API",
+            "--trace-sql-json is not available with the current lix-sdk storage API",
         ));
     }
     if args.trace_commit.is_some() && trace_sql_json_path.is_none() {

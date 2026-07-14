@@ -37,21 +37,21 @@ export function invalidParam(
 	return error;
 }
 
-export function fsBackendNotOpen(operation: string): LixJsError {
+export function localFilesystemNotOpen(operation: string): LixJsError {
 	const error = new Error(
-		`FsBackend.${operation}() requires the backend to be opened with openLix() first`,
+		`LocalFilesystem.${operation}() requires the storage to be opened with openLix() first`,
 	) as LixJsError;
 	error.name = "LixError";
-	error.code = "LIX_FS_BACKEND_NOT_OPEN";
+	error.code = "LIX_LOCAL_FILESYSTEM_NOT_OPEN";
 	error.details = { operation };
 	return error;
 }
 
-export function fsBackendAlreadyOpen(): LixJsError {
+export function localFilesystemAlreadyOpen(): LixJsError {
 	const error = new Error(
-		"openLix() FsBackend is already open; close the existing Lix or create a new FsBackend",
+		"openLix() LocalFilesystem is already open; close the existing Lix or create a new LocalFilesystem",
 	) as LixJsError;
 	error.name = "LixError";
-	error.code = "LIX_FS_BACKEND_IN_USE";
+	error.code = "LIX_LOCAL_FILESYSTEM_IN_USE";
 	return error;
 }

@@ -8,7 +8,7 @@
 //!
 //! MVP boundary: session close can cancel queued or pre-boundary writes until
 //! the durable commit point-of-no-return. After that point, close waits for
-//! commit completion. Durability itself is the backend's responsibility.
+//! commit completion. Durability itself is the storage's responsibility.
 
 mod context;
 mod create_branch;

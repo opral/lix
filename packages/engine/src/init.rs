@@ -15,9 +15,9 @@ use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
-use crate::storage::SharedStorageRead;
-use crate::storage::StorageBackend;
-use crate::storage::{StorageContext, StorageWriteSet};
+use crate::storage_adapter::SharedStorageAdapterRead;
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use serde_json::json;
 
@@ -174,27 +174,27 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     })
 }
 
-/// Initializes an empty engine repository in one backend transaction.
+/// Initializes an empty engine repository in one storage transaction.
 ///
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
 /// changelog for tracked changes, and live_state for the serving state
 /// plus untracked moving refs.
-pub(crate) async fn initialize<B>(
-    storage: StorageContext<B>,
+pub(crate) async fn initialize<StorageImpl>(
+    storage: StorageAdapter<StorageImpl>,
     tracked_state: &TrackedStateContext,
     live_index: &LiveStateIndexContext,
 ) -> Result<InitReceipt, LixError>
 where
-    B: StorageBackend + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let functions = FunctionProviderHandle::system();
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
-    let mut read = SharedStorageRead::new(
+    let mut read = SharedStorageAdapterRead::new(
         storage
-            .begin_read(crate::storage::StorageReadOptions::default())
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await?,
     );
     let mut writes = StorageWriteSet::new();
@@ -273,7 +273,10 @@ where
     }
 
     storage
-        .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+        .commit_write_set(
+            writes,
+            crate::storage_adapter::StorageWriteOptions::default(),
+        )
         .await?;
     Ok(receipt)
 }
@@ -346,7 +349,7 @@ fn stage_init_json_payloads(
 }
 
 async fn stage_init_changelog_commit(
-    read: &mut impl crate::storage::StorageRead,
+    read: &mut impl crate::storage_adapter::StorageAdapterRead,
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
     changes: Vec<ChangeRecord>,
@@ -456,8 +459,8 @@ mod tests {
     use super::*;
     use crate::changelog::ChangelogReader;
     use crate::functions::FunctionProvider;
-    use crate::storage::InMemoryStorageBackend;
-    use crate::storage::StorageContext;
+    use crate::storage_adapter::Memory;
+    use crate::storage_adapter::StorageAdapter;
     use crate::tracked_state::TrackedStateContext;
 
     #[test]
@@ -589,8 +592,8 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_writes_initial_commit_through_changelog() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend);
+        let storage = Memory::new();
+        let storage = StorageAdapter::new(storage);
         let tracked_state = TrackedStateContext::new();
         let live_index = LiveStateIndexContext::new();
 
@@ -599,7 +602,7 @@ mod tests {
             .expect("engine should initialize");
         let mut reader = ChangelogContext::new().reader(
             storage
-                .begin_read(crate::storage::StorageReadOptions::default())
+                .begin_read(crate::storage_adapter::StorageReadOptions::default())
                 .await
                 .expect("read should open"),
         );
@@ -655,7 +658,7 @@ mod tests {
         assert!(matches!(missing_derivable.entries.as_slice(), [None]));
         {
             let read = storage
-                .begin_read(crate::storage::StorageReadOptions::default())
+                .begin_read(crate::storage_adapter::StorageReadOptions::default())
                 .await
                 .expect("read should open");
             let mut writes = storage.new_write_set();
@@ -666,13 +669,16 @@ mod tests {
                 .expect("initial commit root should rebuild from changelog refs");
             drop(read);
             storage
-                .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+                .commit_write_set(
+                    writes,
+                    crate::storage_adapter::StorageWriteOptions::default(),
+                )
                 .await
                 .expect("rebuilt initial commit root should commit");
         }
         let mut tracked_reader = tracked_state.reader(
             storage
-                .begin_read(crate::storage::StorageReadOptions::default())
+                .begin_read(crate::storage_adapter::StorageReadOptions::default())
                 .await
                 .expect("read should open"),
         );

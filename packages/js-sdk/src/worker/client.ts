@@ -1,5 +1,5 @@
 import { createWorkerConnection } from "#worker-factory";
-import type { LixBackendConfig } from "../binding-types.js";
+import type { LixStorageConfig } from "../binding-types.js";
 import {
 	deserializeWorkerError,
 	type WorkerConnection,
@@ -14,12 +14,12 @@ type PendingRequest = {
 };
 
 export async function openLixWorker(
-	backend: LixBackendConfig,
+	storage: LixStorageConfig,
 	onDisposed?: () => void,
 ): Promise<LixWorkerClient> {
 	const client = new LixWorkerClient(onDisposed);
 	try {
-		await client.request({ kind: "open", backend });
+		await client.request({ kind: "open", storage });
 		return client;
 	} catch (error) {
 		await client.terminate();

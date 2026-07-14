@@ -7,7 +7,7 @@ use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
-use lix_engine::{Engine, InMemoryBackend, LixError};
+use lix_engine::{Engine, LixError, Memory};
 use serde_json::json;
 
 use super::assert_rows_eq;
@@ -292,11 +292,11 @@ simulation_test!(
 
 #[tokio::test]
 async fn lix_file_history_renders_plugin_state_at_each_depth() {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(backend.clone())
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
         .await
-        .expect("backend should initialize");
-    let engine = Engine::new_with_wasm_runtime(backend, Arc::new(HistoryRenderPluginRuntime))
+        .expect("storage should initialize");
+    let engine = Engine::new_with_wasm_runtime(storage, Arc::new(HistoryRenderPluginRuntime))
         .await
         .expect("engine should open with plugin runtime");
     let session = engine

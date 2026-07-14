@@ -11,8 +11,8 @@ use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
 use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
-use crate::storage::StorageRead;
-use crate::storage::StorageWriteSet;
+use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::StorageWriteSet;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
@@ -53,7 +53,7 @@ pub(crate) async fn load_sequence(
 /// The row is untracked global `lix_key_value` state: it is a real changelog
 /// fact, but is not retained by commit membership.
 pub(crate) async fn stage_sequence(
-    read: &(impl StorageRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
@@ -213,8 +213,8 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 mod tests {
     use crate::live_state::LiveStateIndexContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageAdapter;
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
@@ -228,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_mode_is_disabled() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let reader = live_state.reader(
             storage
@@ -246,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_mode_decodes_flags() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_test_key_value(
@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_sequence_is_uninitialized() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let reader = live_state.reader(
             storage
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_sequence_decodes_highest_seen() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_test_key_value(
@@ -322,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_sequence_persists_untracked_global_key_value() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
 
@@ -374,7 +374,7 @@ mod tests {
         );
     }
 
-    async fn write_test_key_value(storage: StorageContext, key: &str, value: JsonValue) {
+    async fn write_test_key_value(storage: StorageAdapter, key: &str, value: JsonValue) {
         let snapshot_content = serde_json::to_string(&serde_json::json!({
             "key": key,
             "value": value,

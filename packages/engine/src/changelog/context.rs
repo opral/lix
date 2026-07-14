@@ -31,11 +31,11 @@ use crate::changelog::{
 #[cfg(feature = "storage-benches")]
 use crate::changelog::{GcPlan, GcRoot};
 use crate::json_store::JsonSlot;
-use crate::storage::StorageBackend;
-use crate::storage::{
-    PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StoragePrefix, StorageProjectedValue, StorageRead, StorageReadOptions, StorageScanOptions,
-    StorageSpace, StorageWriteSet,
+use crate::storage_adapter::Storage;
+use crate::storage_adapter::{
+    PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions,
+    StorageScanOptions, StorageSpace, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -118,7 +118,7 @@ pub(crate) trait ChangelogStorageRead {
 #[async_trait]
 impl<T> ChangelogStorageRead for T
 where
-    T: StorageRead + Send,
+    T: StorageAdapterRead + Send,
 {
     async fn changelog_get_many(
         &mut self,
@@ -141,9 +141,9 @@ where
 }
 
 #[async_trait]
-impl<B> ChangelogStorageRead for StorageContext<B>
+impl<StorageImpl> ChangelogStorageRead for StorageAdapter<StorageImpl>
 where
-    B: StorageBackend + Send,
+    StorageImpl: Storage + Send,
 {
     async fn changelog_get_many(
         &mut self,
@@ -975,7 +975,7 @@ async fn native_get_many<R>(
     keys: Vec<Vec<u8>>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
-    R: StorageRead + ?Sized,
+    R: StorageAdapterRead + ?Sized,
 {
     let keys = keys
         .into_iter()
@@ -1004,7 +1004,7 @@ async fn native_scan<R>(
     projection: StorageCoreProjection,
 ) -> Result<ChangelogScanPage, LixError>
 where
-    R: StorageRead + ?Sized,
+    R: StorageAdapterRead + ?Sized,
 {
     let after_key = after.map(|key| StorageKey(Bytes::from(key)));
     let opts = StorageScanOptions {

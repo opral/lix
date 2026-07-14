@@ -1,6 +1,6 @@
 import {
-	fsBackendAlreadyOpen,
-	fsBackendNotOpen,
+	localFilesystemAlreadyOpen,
+	localFilesystemNotOpen,
 	invalidArgument,
 } from "./errors.js";
 import type {
@@ -15,14 +15,14 @@ import type {
 	CreateBranchReceipt,
 	ExecuteOptions,
 	ExecuteResult,
-	FsBackendOptions,
+	LocalFilesystemOptions,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	ObserveEvent,
 	OpenLixOptions,
 	SqlParam,
-	SqliteBackendOptions,
+	SQLiteOptions,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 } from "./types.js";
@@ -42,44 +42,44 @@ const observeFinalizer = new FinalizationRegistry<{
 	});
 });
 
-export class SqliteBackend {
+export class SQLite {
 	readonly path: string;
 
-	constructor(options: SqliteBackendOptions) {
+	constructor(options: SQLiteOptions) {
 		if (
 			!options ||
 			typeof options.path !== "string" ||
 			options.path.length === 0
 		) {
-			throw new TypeError("SqliteBackend requires a non-empty path");
+			throw new TypeError("SQLite requires a non-empty path");
 		}
 		this.path = options.path;
 	}
 }
 
-const openFsBackends = new WeakMap<FsBackend, LixWorkerClient | null>();
+const openLocalFilesystems = new WeakMap<LocalFilesystem, LixWorkerClient | null>();
 
-export class FsBackend {
+export class LocalFilesystem {
 	readonly path: string;
 	readonly lixDir: string | undefined;
 	readonly syncAllFiles: boolean;
 
-	constructor(options: FsBackendOptions) {
+	constructor(options: LocalFilesystemOptions) {
 		if (
 			!options ||
 			typeof options.path !== "string" ||
 			options.path.length === 0
 		) {
-			throw new TypeError("FsBackend requires a non-empty path");
+			throw new TypeError("LocalFilesystem requires a non-empty path");
 		}
 		if (
 			options.lixDir !== undefined &&
 			(typeof options.lixDir !== "string" || options.lixDir.length === 0)
 		) {
-			throw new TypeError("FsBackend lixDir must be a non-empty string");
+			throw new TypeError("LocalFilesystem lixDir must be a non-empty string");
 		}
 		if (typeof options.syncAllFiles !== "boolean") {
-			throw new TypeError("FsBackend syncAllFiles must be a boolean");
+			throw new TypeError("LocalFilesystem syncAllFiles must be a boolean");
 		}
 		this.path = options.path;
 		this.lixDir = options.lixDir;
@@ -113,9 +113,9 @@ export class FsBackend {
 	}
 
 	private client(operation: string): LixWorkerClient {
-		const client = openFsBackends.get(this);
+		const client = openLocalFilesystems.get(this);
 		if (!client) {
-			throw fsBackendNotOpen(operation);
+			throw localFilesystemNotOpen(operation);
 		}
 		return client;
 	}
@@ -125,39 +125,44 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (!options || typeof options !== "object") {
 		throw new TypeError("openLix() options must be an object");
 	}
-	if (options.backend === undefined) {
-		return new Lix(await openLixWorker({ kind: "memory" }));
-	}
-	if (options.backend instanceof SqliteBackend) {
-		return new Lix(
-			await openLixWorker({ kind: "sqlite", path: options.backend.path }),
+	if ("backend" in options) {
+		throw new TypeError(
+			"openLix() option 'backend' was removed; use 'storage' instead",
 		);
 	}
-	if (options.backend instanceof FsBackend) {
-		const backend = options.backend;
-		if (openFsBackends.has(backend)) {
-			throw fsBackendAlreadyOpen();
+	if (options.storage === undefined) {
+		return new Lix(await openLixWorker({ kind: "memory" }));
+	}
+	if (options.storage instanceof SQLite) {
+		return new Lix(
+			await openLixWorker({ kind: "sqlite", path: options.storage.path }),
+		);
+	}
+	if (options.storage instanceof LocalFilesystem) {
+		const storage = options.storage;
+		if (openLocalFilesystems.has(storage)) {
+			throw localFilesystemAlreadyOpen();
 		}
-		openFsBackends.set(backend, null);
+		openLocalFilesystems.set(storage, null);
 		try {
 			const client = await openLixWorker(
 				{
-					kind: "fs",
-					path: backend.path,
-					lixDir: backend.lixDir,
-					syncAllFiles: backend.syncAllFiles,
+					kind: "localFilesystem",
+					path: storage.path,
+					lixDir: storage.lixDir,
+					syncAllFiles: storage.syncAllFiles,
 				},
-				() => openFsBackends.delete(backend),
+				() => openLocalFilesystems.delete(storage),
 			);
-			openFsBackends.set(backend, client);
+			openLocalFilesystems.set(storage, client);
 			return new Lix(client);
 		} catch (error) {
-			openFsBackends.delete(backend);
+			openLocalFilesystems.delete(storage);
 			throw error;
 		}
 	}
 	throw new TypeError(
-		"openLix() requires backend to be SqliteBackend or FsBackend",
+		"openLix() requires storage to be SQLite or LocalFilesystem",
 	);
 }
 
