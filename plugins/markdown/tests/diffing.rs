@@ -151,6 +151,70 @@ fn editing_frontmatter_updates_one_durable_node_and_renders_yaml() {
 }
 
 #[test]
+fn changing_frontmatter_dialect_is_a_content_change() {
+    let yaml_source = concat!(
+        "---\n",
+        "title = \"Tokyo Packing List\"\n",
+        "---\n",
+        "\n",
+        "# Tokyo Packing List\n",
+    );
+    let toml_source = yaml_source
+        .replacen("---", "+++", 1)
+        .replacen("---", "+++", 1);
+    let before = state_from_source(yaml_source);
+    let frontmatter_id = ids_of_kind(&before, "frontmatter")[0].clone();
+
+    let delta = changes(before.clone(), &toml_source);
+    assert_eq!(delta.len(), 1, "{delta:#?}");
+    assert_eq!(change_snapshot(&delta[0])["kind"], "frontmatter");
+    assert_eq!(change_snapshot(&delta[0])["payload"]["kind"], "toml");
+    assert_eq!(delta[0].metadata, None);
+
+    let after = evolve(before, &toml_source);
+    assert_eq!(ids_of_kind(&after, "frontmatter"), vec![frontmatter_id]);
+    assert_eq!(support::render(after), toml_source);
+}
+
+#[test]
+fn adding_and_removing_frontmatter_is_local_and_preserves_heading_identity() {
+    let body_source = "# Tokyo Packing List\n";
+    let frontmatter_source = concat!(
+        "---\n",
+        "title: Tokyo Packing List\n",
+        "---\n",
+        "\n",
+        "# Tokyo Packing List\n",
+    );
+    let body = state_from_source(body_source);
+    let heading_id = ids_of_kind(&body, "heading")[0].clone();
+
+    let added = changes(body.clone(), frontmatter_source);
+    assert_eq!(added.len(), 1, "{added:#?}");
+    assert_eq!(change_snapshot(&added[0])["kind"], "frontmatter");
+
+    let with_frontmatter = evolve(body, frontmatter_source);
+    let frontmatter_id = ids_of_kind(&with_frontmatter, "frontmatter")[0].clone();
+    assert_eq!(
+        ids_of_kind(&with_frontmatter, "heading"),
+        vec![heading_id.clone()]
+    );
+    assert_eq!(
+        support::render(with_frontmatter.clone()),
+        frontmatter_source
+    );
+
+    let removed = changes(with_frontmatter.clone(), body_source);
+    assert_eq!(removed.len(), 1, "{removed:#?}");
+    assert_eq!(removed[0].entity_pk, vec![frontmatter_id]);
+    assert!(removed[0].snapshot_content.is_none());
+
+    let body_again = evolve(with_frontmatter, body_source);
+    assert_eq!(ids_of_kind(&body_again, "heading"), vec![heading_id]);
+    assert_eq!(support::render(body_again), body_source);
+}
+
+#[test]
 fn list_style_edit_updates_only_the_list_container() {
     let before_source = (0..100)
         .map(|index| format!("- Item {index:03}"))

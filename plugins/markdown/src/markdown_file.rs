@@ -271,13 +271,14 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
         )),
         md::Block::Frontmatter(node) => Ok(new_tree(
             NodeKind::Frontmatter,
-            json!({ "value": node.value }),
             json!({
                 "kind": match node.kind {
                     md::FrontmatterKind::Yaml => "yaml",
                     md::FrontmatterKind::Toml => "toml",
                 },
+                "value": node.value,
             }),
+            empty(),
             Vec::new(),
         )),
         md::Block::BlockQuote(node) => Ok(new_tree(
@@ -758,7 +759,7 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         })),
         NodeKind::Frontmatter => Ok(md::Block::Frontmatter(md::Frontmatter {
             meta,
-            kind: match string_field(&tree.node.format, "kind")? {
+            kind: match string_field(&tree.node.payload, "kind")? {
                 "yaml" => md::FrontmatterKind::Yaml,
                 "toml" => md::FrontmatterKind::Toml,
                 value => return Err(invalid_field(&tree.node, "kind", value)),
