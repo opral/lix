@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.3 - 2026-07-15
+
+### Patch
+
+- Preserved YAML and TOML frontmatter when Lix tracks Markdown files.
+
+  Markdown frontmatter now remains a single editable block instead of being rewritten as thematic breaks and list content.
+
 ## 0.8.2 - 2026-07-14
 
 ### Patch
