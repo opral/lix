@@ -8,6 +8,26 @@ use support::{file, render, rows_of_kind, semantic_html, snapshot, state_from_so
 fn promised_format_tier_round_trips_exactly() {
     let fixtures = [
         ("empty", ""),
+        (
+            "yaml-frontmatter",
+            "---\ntitle: Tokyo Packing List\ntags:\n  - travel\n  - checklist\n---\n\n# Tokyo Packing List\n",
+        ),
+        (
+            "toml-frontmatter",
+            "+++\ntitle = \"Tokyo Packing List\"\n+++\n\n# Tokyo Packing List\n",
+        ),
+        (
+            "crlf-yaml-frontmatter",
+            "---\r\ntitle: Tokyo Packing List\r\n---\r\n\r\n# Tokyo Packing List\r\n",
+        ),
+        (
+            "empty-yaml-frontmatter",
+            "---\n\n---\n\n# Tokyo Packing List\n",
+        ),
+        (
+            "yaml-frontmatter-with-block-scalar",
+            "---\nsummary: |\n  first\n  ---\n  last\n---\n\n# Tokyo Packing List\n",
+        ),
         ("no-final-newline", "paragraph"),
         ("final-newline", "paragraph\n"),
         ("crlf", "# A\r\n\r\nB\r\n"),
@@ -61,6 +81,80 @@ fn promised_format_tier_round_trips_exactly() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn yaml_frontmatter_is_structured_and_idempotent() {
+    let source = concat!(
+        "---\n",
+        "title: Tokyo Packing List\n",
+        "date: 2026-07-15\n",
+        "tags:\n",
+        "  - travel\n",
+        "  - checklist\n",
+        "---\n",
+        "\n",
+        "# Tokyo Packing List\n",
+    );
+
+    let state = state_from_source(source);
+    let frontmatter = rows_of_kind(&state, "frontmatter");
+    assert_eq!(frontmatter.len(), 1);
+    assert_eq!(snapshot(frontmatter[0])["payload"]["kind"], "yaml");
+    assert_eq!(
+        snapshot(frontmatter[0])["payload"]["value"],
+        "title: Tokyo Packing List\ndate: 2026-07-15\ntags:\n  - travel\n  - checklist"
+    );
+    assert_eq!(rows_of_kind(&state, "thematic_break").len(), 0);
+    assert_eq!(render(state.clone()), source);
+    assert!(
+        MarkdownPlugin::detect_changes(state, file(source))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn frontmatter_before_a_heading_canonicalizes_to_one_blank_separator() {
+    let source = "---\ntitle: Tokyo Packing List\n---\n# Tokyo Packing List\n";
+    let canonical = "---\ntitle: Tokyo Packing List\n---\n\n# Tokyo Packing List\n";
+    let state = state_from_source(source);
+
+    assert_eq!(rows_of_kind(&state, "frontmatter").len(), 1);
+    assert_eq!(rows_of_kind(&state, "heading").len(), 1);
+    assert_eq!(render(state.clone()), canonical);
+    assert!(
+        MarkdownPlugin::detect_changes(state, file(canonical))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_leading_thematic_break_is_not_frontmatter() {
+    let source = "---\n\nBody\n";
+    let state = state_from_source(source);
+
+    assert_eq!(rows_of_kind(&state, "frontmatter").len(), 0);
+    assert_eq!(rows_of_kind(&state, "thematic_break").len(), 1);
+    assert_eq!(render(state), "- - -\n\nBody\n");
+}
+
+#[test]
+fn incomplete_frontmatter_opener_remains_ordinary_markdown() {
+    let source = "---\ntitle: Tokyo Packing List\n";
+    let canonical = "- - -\n\ntitle: Tokyo Packing List\n";
+    let state = state_from_source(source);
+
+    assert_eq!(rows_of_kind(&state, "frontmatter").len(), 0);
+    assert_eq!(rows_of_kind(&state, "thematic_break").len(), 1);
+    assert_eq!(render(state.clone()), canonical);
+    assert_eq!(semantic_html(source), semantic_html(canonical));
+    assert!(
+        MarkdownPlugin::detect_changes(state, file(canonical))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

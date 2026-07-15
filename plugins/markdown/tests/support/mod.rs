@@ -95,10 +95,11 @@ pub fn ids_of_kind(state: &[EntityState], kind: &str) -> Vec<String> {
 }
 
 pub fn semantic_html(source: &str) -> String {
-    let options = markdown::Options {
+    let mut options = markdown::Options {
         parse: markdown::ParseOptions::gfm(),
         compile: markdown::CompileOptions::gfm(),
     };
+    options.parse.constructs.frontmatter = true;
     markdown::to_html_with_options(source, &options)
         .expect("fixture should compile as GFM")
         .trim_end_matches(['\r', '\n'])

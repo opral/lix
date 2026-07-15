@@ -69,10 +69,11 @@ fn evaluate(input: &[u8]) -> Outcome {
 
 fn semantic_html(input: &[u8]) -> String {
     let source = decode_like_plugin(input);
-    let options = markdown::Options {
+    let mut options = markdown::Options {
         parse: markdown::ParseOptions::gfm(),
         compile: markdown::CompileOptions::gfm(),
     };
+    options.parse.constructs.frontmatter = true;
     markdown::to_html_with_options(&source, &options)
         .expect("fixture should compile as GFM")
         .trim_end_matches(['\r', '\n'])
@@ -220,9 +221,15 @@ fn fixtures() -> Vec<Fixture> {
         ),
         case("loose_list_extra_blank", b"- one\n\n- two\n", true, true),
         case(
-            "frontmatter_like",
+            "yaml_frontmatter",
             b"---\ntitle: Test\n---\n\nBody\n",
-            false,
+            true,
+            true,
+        ),
+        case(
+            "toml_frontmatter",
+            b"+++\ntitle = \"Test\"\n+++\n\nBody\n",
+            true,
             true,
         ),
         case("mdx_jsx_like", b"<Component foo={1} />\n", true, true),
