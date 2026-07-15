@@ -27,11 +27,12 @@ pub use lix_engine::{
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     ObserveEvent, ObserveEvents, ProjectedValue, PutBatch, ReadEntry, ReadOptions, Row, ScanChunk,
-    ScanOptions, SpaceId, SqlQueryResult, Storage, StorageConformanceReport,
-    StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
-    StorageFactory, StorageFixture, StorageRead, StorageTestConfig, StorageWrite, StoredValue,
-    SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
-    TryFromValue, Value, WriteOptions, WriteStats, run_storage_conformance,
+    ScanOptions, SpaceId, SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage,
+    StorageConformanceReport, StorageConformanceResult, StorageConformanceStatus,
+    StorageConformanceTest, StorageError, StorageFactory, StorageFixture, StorageRead,
+    StorageTestConfig, StorageWrite, StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
+    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, Value, WriteOptions, WriteStats,
+    parse_sql_script, run_storage_conformance,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

@@ -77,6 +77,7 @@ pub use session::{
     MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
+pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::conformance::{
     ConformanceReport as StorageConformanceReport, ConformanceResult as StorageConformanceResult,
     ConformanceStatus as StorageConformanceStatus, ConformanceTest as StorageConformanceTest,
