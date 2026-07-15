@@ -128,6 +128,29 @@ fn one_edit_in_a_thousand_paragraphs_is_one_row_update() {
 }
 
 #[test]
+fn editing_frontmatter_updates_one_durable_node_and_renders_yaml() {
+    let before_source = concat!(
+        "---\n",
+        "title: Tokyo Packing List\n",
+        "status: draft\n",
+        "---\n",
+        "\n",
+        "# Tokyo Packing List\n",
+    );
+    let after_source = before_source.replace("status: draft", "status: in-progress");
+    let before = state_from_source(before_source);
+    let frontmatter_id = ids_of_kind(&before, "frontmatter")[0].clone();
+
+    let delta = changes(before.clone(), &after_source);
+    assert_eq!(delta.len(), 1, "{delta:#?}");
+    assert_eq!(change_snapshot(&delta[0])["kind"], "frontmatter");
+
+    let after = evolve(before, &after_source);
+    assert_eq!(ids_of_kind(&after, "frontmatter"), vec![frontmatter_id]);
+    assert_eq!(support::render(after), after_source);
+}
+
+#[test]
 fn list_style_edit_updates_only_the_list_container() {
     let before_source = (0..100)
         .map(|index| format!("- Item {index:03}"))

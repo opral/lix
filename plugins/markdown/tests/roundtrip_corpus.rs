@@ -220,9 +220,9 @@ fn fixtures() -> Vec<Fixture> {
         ),
         case("loose_list_extra_blank", b"- one\n\n- two\n", true, true),
         case(
-            "frontmatter_like",
+            "yaml_frontmatter",
             b"---\ntitle: Test\n---\n\nBody\n",
-            false,
+            true,
             true,
         ),
         case("mdx_jsx_like", b"<Component foo={1} />\n", true, true),

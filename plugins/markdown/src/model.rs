@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NodeKind {
     Document,
+    Frontmatter,
     Paragraph,
     Heading,
     ThematicBreak,

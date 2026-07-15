@@ -58,6 +58,7 @@ pub(crate) fn parse_markdown_source(source: &str) -> Result<ParsedMarkdown, Plug
 
 fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginError> {
     let mut options = SyntaxOptions::gfm();
+    options.constructs.frontmatter = true;
     options.parse.preserve_character_escapes = true;
     options.parse.preserve_character_references = true;
     let mut output = options.parse(source);
@@ -264,6 +265,17 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
                     md::ThematicBreakMarker::Dash => "dash",
                     md::ThematicBreakMarker::Asterisk => "asterisk",
                     md::ThematicBreakMarker::Underscore => "underscore",
+                },
+            }),
+            Vec::new(),
+        )),
+        md::Block::Frontmatter(node) => Ok(new_tree(
+            NodeKind::Frontmatter,
+            json!({ "value": node.value }),
+            json!({
+                "kind": match node.kind {
+                    md::FrontmatterKind::Yaml => "yaml",
+                    md::FrontmatterKind::Toml => "toml",
                 },
             }),
             Vec::new(),
@@ -743,6 +755,15 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
                 "underscore" => md::ThematicBreakMarker::Underscore,
                 value => return Err(invalid_field(&tree.node, "marker", value)),
             },
+        })),
+        NodeKind::Frontmatter => Ok(md::Block::Frontmatter(md::Frontmatter {
+            meta,
+            kind: match string_field(&tree.node.format, "kind")? {
+                "yaml" => md::FrontmatterKind::Yaml,
+                "toml" => md::FrontmatterKind::Toml,
+                value => return Err(invalid_field(&tree.node, "kind", value)),
+            },
+            value: owned_string_field(&tree.node.payload, "value")?,
         })),
         NodeKind::BlockQuote => Ok(md::Block::BlockQuote(md::BlockQuote {
             meta,
@@ -1498,6 +1519,7 @@ fn invalid_inline_field(node: &InlineNode, field: &str, value: &str) -> PluginEr
 fn kind_name(kind: NodeKind) -> &'static str {
     match kind {
         NodeKind::Document => "document",
+        NodeKind::Frontmatter => "frontmatter",
         NodeKind::Paragraph => "paragraph",
         NodeKind::Heading => "heading",
         NodeKind::ThematicBreak => "thematic_break",

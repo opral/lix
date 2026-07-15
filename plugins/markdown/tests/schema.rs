@@ -20,6 +20,7 @@ fn exposes_one_self_referencing_markdown_node_schema() {
     );
     let raw = node_schema_json();
     assert!(raw.contains("\"document\""));
+    assert!(raw.contains("\"frontmatter\""));
     assert!(raw.contains("\"table_column\""));
     assert!(raw.contains("\"table_cell\""));
     assert!(raw.contains("\"parent_id\""));
