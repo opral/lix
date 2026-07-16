@@ -21,7 +21,7 @@ impl CommandOutput {
 pub fn hint_after_init() -> Vec<String> {
     vec![
         "Try inserting data with: lix sql execute \"INSERT INTO lix_key_value (key, value) VALUES ('hello', '\"world\"')\"".into(),
-        "Store files with: lix sql execute \"INSERT INTO lix_file (path, data) VALUES ('/readme.txt', lix_text_encode('hello'))\"".into(),
+        "Store files with: lix sql execute \"INSERT INTO lix_file (path, data) VALUES ('/readme.txt', CAST('hello' AS BINARY))\"".into(),
     ]
 }
 
@@ -31,7 +31,7 @@ pub fn hint_blob_in_result(result: &ExecuteResult) -> Vec<String> {
         .iter()
         .any(|row| row.values().iter().any(|v| matches!(v, Value::Blob(_))));
     if has_blob {
-        vec!["Tip: use lix_text_decode(data) to view text content".into()]
+        vec!["Tip: use CAST(data AS TEXT) to view text content".into()]
     } else {
         Vec::new()
     }

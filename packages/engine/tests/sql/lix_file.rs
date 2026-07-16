@@ -801,7 +801,7 @@ simulation_test!(
                  VALUES (\
                    'text-function-data-file',\
                    '/text-function.bin',\
-                   lix_text_decode(X'68656C6C6F')\
+                   lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')\
                  )",
             ),
         ] {
@@ -2012,7 +2012,7 @@ simulation_test!(
             ("update-text-file", "'hello'"),
             (
                 "update-text-function-file",
-                "lix_text_decode(X'68656C6C6F')",
+                "lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')",
             ),
             ("update-int-file", "12345"),
             ("update-float-file", "1.5"),
@@ -2322,7 +2322,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_global) \
-                 VALUES ('global-shared-file', '/shared/a.txt', lix_text_encode('a'), true)",
+                 VALUES ('global-shared-file', '/shared/a.txt', CAST('a' AS BINARY), true)",
                 &[],
             )
             .await
@@ -2363,7 +2363,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-readme', '/scratch/readme.md', lix_text_encode('hello'))",
+                 VALUES ('file-readme', '/scratch/readme.md', CAST('hello' AS BINARY))",
                 &[],
             )
             .await
@@ -2430,7 +2430,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
-                 VALUES ('file-draft', '/docs/draft.md', lix_text_encode('draft'), true)",
+                 VALUES ('file-draft', '/docs/draft.md', CAST('draft' AS BINARY), true)",
                 &[],
             )
             .await

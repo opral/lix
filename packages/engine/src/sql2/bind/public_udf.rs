@@ -2,8 +2,7 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement,
-    Value, Visit, Visitor,
+    Expr, Function, FunctionArguments, ObjectNamePart, Statement, Visit, Visitor,
 };
 #[cfg(test)]
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -59,10 +58,6 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
         "lix_json" => expect_exact_arity(name, arity, 1),
         "lix_empty_blob" | "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
             expect_exact_arity(name, arity, 0)
-        }
-        "lix_text_encode" | "lix_text_decode" => {
-            expect_arity_range(name, arity, 1, 2)?;
-            validate_literal_utf8_encoding(name, &function.args)
         }
         _ => Ok(()),
     }
@@ -151,8 +146,6 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         "lix_timestamp" => Some("lix_timestamp"),
         "lix_uuid_v7" => Some("lix_uuid_v7"),
         "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
-        "lix_text_encode" => Some("lix_text_encode"),
-        "lix_text_decode" => Some("lix_text_decode"),
         _ => None,
     }
 }
@@ -180,72 +173,6 @@ fn expect_exact_arity(name: &str, actual: usize, expected: usize) -> Result<(), 
     Err(invalid_param(format!("{name} requires {expectation}")))
 }
 
-fn expect_arity_range(name: &str, actual: usize, min: usize, max: usize) -> Result<(), LixError> {
-    if (min..=max).contains(&actual) {
-        return Ok(());
-    }
-    Err(invalid_param(format!(
-        "{name} requires {min} or {max} arguments"
-    )))
-}
-
-fn validate_literal_utf8_encoding(name: &str, args: &FunctionArguments) -> Result<(), LixError> {
-    let Some(encoding) = function_arg(args, 1) else {
-        return Ok(());
-    };
-    let Some(value) = string_literal_arg(encoding) else {
-        return Ok(());
-    };
-    let normalized = value.trim().to_ascii_uppercase().replace('-', "");
-    if normalized == "UTF8" {
-        Ok(())
-    } else {
-        Err(invalid_param(format!(
-            "{name}() only supports UTF8 encoding, got '{value}'"
-        )))
-    }
-}
-
-fn function_arg(args: &FunctionArguments, index: usize) -> Option<&FunctionArg> {
-    match args {
-        FunctionArguments::List(list) => list.args.get(index),
-        _ => None,
-    }
-}
-
-fn string_literal_arg(arg: &FunctionArg) -> Option<&str> {
-    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-    | FunctionArg::Named {
-        arg: FunctionArgExpr::Expr(expr),
-        ..
-    }
-    | FunctionArg::ExprNamed {
-        arg: FunctionArgExpr::Expr(expr),
-        ..
-    }) = arg
-    else {
-        return None;
-    };
-    let Expr::Value(value) = expr else {
-        return None;
-    };
-    match &value.value {
-        Value::SingleQuotedString(value)
-        | Value::DoubleQuotedString(value)
-        | Value::TripleSingleQuotedString(value)
-        | Value::TripleDoubleQuotedString(value)
-        | Value::EscapedStringLiteral(value)
-        | Value::UnicodeStringLiteral(value)
-        | Value::NationalStringLiteral(value)
-        | Value::SingleQuotedRawStringLiteral(value)
-        | Value::DoubleQuotedRawStringLiteral(value)
-        | Value::TripleSingleQuotedRawStringLiteral(value)
-        | Value::TripleDoubleQuotedRawStringLiteral(value) => Some(value.as_str()),
-        Value::DollarQuotedString(value) => Some(value.value.as_str()),
-        _ => None,
-    }
-}
-
 fn invalid_param(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PARAM, message)
 }
@@ -270,23 +197,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_literal_encoding_as_public_invalid_param() {
-        let error = validate_public_udf_calls("SELECT lix_text_encode('Ada', 'base64')")
-            .expect_err("unsupported encoding should be rejected");
-        assert_eq!(error.code, "LIX_INVALID_PARAM");
-        assert!(
-            error
-                .message
-                .contains("lix_text_encode() only supports UTF8 encoding")
-        );
-    }
-
-    #[test]
     fn accepts_valid_public_lix_udf_calls() {
-        validate_public_udf_calls(
-            "SELECT lix_json('{\"x\":1}'), lix_text_decode(X'416461', 'utf-8')",
-        )
-        .expect("valid calls should pass public validation");
+        validate_public_udf_calls("SELECT lix_json('{\"x\":1}'), lix_empty_blob()")
+            .expect("valid calls should pass public validation");
     }
 
     #[test]

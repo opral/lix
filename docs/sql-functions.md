@@ -1,10 +1,10 @@
 ---
-description: Built-in scalar SQL functions provided by the Lix engine. Covers JSON parsing and projection, ID and timestamp generation, text/blob coercion, and the active-version commit id helper used to scope history queries.
+description: Built-in scalar SQL functions provided by the Lix engine. Covers JSON parsing and projection, ID and timestamp generation, and the active-version commit id helper used to scope history queries.
 ---
 
 # SQL Functions
 
-Lix's DataFusion-backed engine registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between standard SQL and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, coercing between text and bytes, and resolving the active version's commit id for history queries.
+Lix's DataFusion-backed engine registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between standard SQL and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, and resolving the active version's commit id for history queries.
 
 ## At a glance
 
@@ -16,8 +16,6 @@ Lix's DataFusion-backed engine registers a small set of scalar functions for use
 | `lix_json_get_text(json, path...)` | text | Project a value out of a JSON column as plain text. |
 | `lix_uuid_v7()` | text | Generate a UUIDv7 string. |
 | `lix_timestamp()` | text | Current ISO-8601 timestamp string. |
-| `lix_text_decode(blob[, encoding])` | text | Decode a `BLOB` to text (default `utf-8`). |
-| `lix_text_encode(text[, encoding])` | blob | Encode text into a `BLOB` (default `utf-8`). |
 | `lix_empty_blob()` | blob | Zero-byte `BLOB` literal. |
 
 All functions are scalar; call them anywhere a SQL expression is allowed.
@@ -116,28 +114,13 @@ INSERT INTO event (id, occurred_at) VALUES (lix_uuid_v7(), lix_timestamp());
 
 ## Text & bytes
 
-### `lix_text_decode(blob[, encoding])`
-
-Decodes a `BLOB` to text. The optional second argument is the encoding name (`"utf-8"` is the default and currently the only supported encoding):
+Use standard SQL casts to convert between UTF-8 text and bytes:
 
 ```sql
-SELECT lix_text_decode(data) FROM lix_file WHERE path = '/notes/readme.md';
-```
+SELECT CAST(data AS TEXT) FROM lix_file WHERE path = '/notes/readme.md';
 
-### `lix_text_encode(text[, encoding])`
-
-Inverse of `lix_text_decode`. Encodes text into a `BLOB`:
-
-```sql
 INSERT INTO lix_file (path, data)
-VALUES ('/notes/hello.txt', lix_text_encode('hello world'));
-```
-
-Standard SQL binary casts are also supported when an explicit cast is more convenient:
-
-```sql
-INSERT INTO lix_file (path, data)
-VALUES ($1, CAST($2 AS BINARY));
+VALUES ('/notes/hello.txt', CAST('hello world' AS BINARY));
 ```
 
 ### `lix_empty_blob()`

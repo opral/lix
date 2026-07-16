@@ -907,7 +907,6 @@ fn bind_function(
     reject_unsupported_function_modifiers(function)?;
     let name = bind_lix_function_name(function)?;
     let raw_args = function_args(&function.args)?;
-    validate_text_encoding_literal(&name, &raw_args)?;
     let args = raw_args
         .iter()
         .map(|arg| bind_arg_expr(arg, params))
@@ -945,38 +944,9 @@ fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixErr
             expect_exact_function_arity(name, actual, 0)
         }
         "lix_json_get" | "lix_json_get_text" => expect_min_function_arity(name, actual, 2),
-        "lix_text_encode" | "lix_text_decode" => {
-            if (1..=2).contains(&actual) {
-                Ok(())
-            } else {
-                Err(super::error::unsupported(format!(
-                    "{name} requires 1 or 2 arguments"
-                )))
-            }
-        }
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL function '{name}'"
         ))),
-    }
-}
-
-fn validate_text_encoding_literal(name: &str, args: &[&Expr]) -> Result<(), LixError> {
-    if !matches!(name, "lix_text_encode" | "lix_text_decode") || args.len() < 2 {
-        return Ok(());
-    }
-    let Expr::Value(value) = args[1] else {
-        return Ok(());
-    };
-    let Some(encoding) = string_literal_value(&value.value) else {
-        return Ok(());
-    };
-    let normalized = encoding.trim().to_ascii_uppercase().replace('-', "");
-    if normalized == "UTF8" {
-        Ok(())
-    } else {
-        Err(super::error::unsupported(format!(
-            "{name} only supports UTF8 encoding, got '{encoding}'"
-        )))
     }
 }
 
@@ -996,24 +966,6 @@ fn expect_min_function_arity(name: &str, actual: usize, minimum: usize) -> Resul
         )));
     }
     Ok(())
-}
-
-fn string_literal_value(value: &Value) -> Option<&str> {
-    match value {
-        Value::SingleQuotedString(value)
-        | Value::DoubleQuotedString(value)
-        | Value::TripleSingleQuotedString(value)
-        | Value::TripleDoubleQuotedString(value)
-        | Value::EscapedStringLiteral(value)
-        | Value::UnicodeStringLiteral(value)
-        | Value::NationalStringLiteral(value)
-        | Value::SingleQuotedRawStringLiteral(value)
-        | Value::DoubleQuotedRawStringLiteral(value)
-        | Value::TripleSingleQuotedRawStringLiteral(value)
-        | Value::TripleDoubleQuotedRawStringLiteral(value) => Some(value.as_str()),
-        Value::DollarQuotedString(value) => Some(value.value.as_str()),
-        _ => None,
-    }
 }
 
 fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
@@ -1039,9 +991,7 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
         | "lix_empty_blob"
         | "lix_timestamp"
         | "lix_uuid_v7"
-        | "lix_active_branch_commit_id"
-        | "lix_text_encode"
-        | "lix_text_decode" => Ok(name),
+        | "lix_active_branch_commit_id" => Ok(name),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL function '{name}'"
         ))),
@@ -2024,7 +1974,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_public_values_functions() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), lix_text_encode('hello'))",
+            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), CAST('hello' AS BINARY))",
         );
         let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
@@ -2041,20 +1991,17 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             function_names,
-            BTreeSet::from(["lix_text_encode", "lix_timestamp", "lix_uuid_v7"])
+            BTreeSet::from(["lix_timestamp", "lix_uuid_v7"])
         );
     }
 
     #[test]
     fn bind_statement_rejects_unsupported_function_details() {
-        for sql in [
-            "INSERT INTO lix_file (id, data) VALUES ('f1', lix_text_encode('Ada', 'base64'))",
-            "INSERT INTO lix_file (id, data) VALUES ('f1', lix_empty_blob() FILTER (WHERE false))",
-        ] {
-            let error = bind_statement(&parse_statement(sql), &[], "branch1")
-                .expect_err("unsupported function details should fail closed");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
-        }
+        let sql =
+            "INSERT INTO lix_file (id, data) VALUES ('f1', lix_empty_blob() FILTER (WHERE false))";
+        let error = bind_statement(&parse_statement(sql), &[], "branch1")
+            .expect_err("unsupported function details should fail closed");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 
     #[test]
