@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.4 - 2026-07-16
+
+### Patch
+
+- Added SQL script planning to the Rust and Workerd SDKs.
+
+  Lix now parses single and multi-statement SQL into one atomic statement plan with request-wide parameter ranges.
+
 ## 0.8.3 - 2026-07-15
 
 ### Patch
