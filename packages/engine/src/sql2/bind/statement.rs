@@ -3,10 +3,10 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName, ObjectNamePart,
-    OnConflictAction, OnInsert, Query, SetExpr, Statement as SqlStatement, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Update, Value, Visit, Visitor,
+    AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType as SqlDataType, Delete,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName,
+    ObjectNamePart, OnConflictAction, OnInsert, Query, SetExpr, Statement as SqlStatement,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Value, Visit, Visitor,
 };
 use serde_json::Value as JsonValue;
 
@@ -16,7 +16,7 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKi
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 
-use super::expr::{BoundExpr, BoundLiteral, BoundParamRef};
+use super::expr::{BoundCastType, BoundExpr, BoundLiteral, BoundParamRef};
 use super::read::BoundRead;
 use super::table::{
     BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
@@ -538,6 +538,21 @@ fn bind_insert_value_expr(expr: &Expr, params: &mut ParamBinder) -> Result<Bound
     match expr {
         Expr::Value(value) => bind_value(&value.value, params),
         Expr::Nested(expr) => bind_insert_value_expr(expr, params),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => bind_cast_expr(
+            kind,
+            expr,
+            data_type,
+            *array,
+            format.is_some(),
+            params,
+            bind_insert_value_expr,
+        ),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -682,6 +697,21 @@ fn bind_expr(
         }
         Expr::Value(value) => bind_value(&value.value, params),
         Expr::Nested(expr) => bind_expr(table, expr, params),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => bind_cast_expr(
+            kind,
+            expr,
+            data_type,
+            *array,
+            format.is_some(),
+            params,
+            |expr, params| bind_expr(table, expr, params),
+        ),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -711,11 +741,51 @@ fn bind_conflict_expr(
             bind_expr(table, expr, params)
         }
         Expr::Nested(expr) => bind_conflict_expr(table, expr, params),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => bind_cast_expr(
+            kind,
+            expr,
+            data_type,
+            *array,
+            format.is_some(),
+            params,
+            |expr, params| bind_conflict_expr(table, expr, params),
+        ),
         Expr::Function(function) => bind_function(function, params, |expr, params| {
             bind_conflict_expr(table, expr, params)
         }),
         _ => bind_expr(table, expr, params),
     }
+}
+
+fn bind_cast_expr(
+    kind: &CastKind,
+    expr: &Expr,
+    data_type: &SqlDataType,
+    array: bool,
+    has_format: bool,
+    params: &mut ParamBinder,
+    bind_inner: impl FnOnce(&Expr, &mut ParamBinder) -> Result<BoundExpr, LixError>,
+) -> Result<BoundExpr, LixError> {
+    if kind != &CastKind::Cast
+        || array
+        || has_format
+        || !matches!(data_type, SqlDataType::Binary(None))
+    {
+        return Err(super::error::unsupported(format!(
+            "unsupported SQL cast 'CAST({expr} AS {data_type})'"
+        )));
+    }
+
+    Ok(BoundExpr::Cast {
+        expr: Box::new(bind_inner(expr, params)?),
+        data_type: BoundCastType::Binary,
+    })
 }
 
 fn bind_value(value: &Value, params: &mut ParamBinder) -> Result<BoundExpr, LixError> {

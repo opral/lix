@@ -1155,6 +1155,10 @@ fn eval_expr_value(
             }),
         BoundExpr::Column(column) => column_eval_value(context, &column.name),
         BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
+        BoundExpr::Cast { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity writes do not support CAST expressions yet",
+        )),
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
             let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let raw = match raw {
@@ -1612,6 +1616,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => Ok(()),
+        BoundExpr::Cast { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity writes do not support CAST expressions yet",
+        )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}

@@ -133,6 +133,13 @@ INSERT INTO lix_file (path, data)
 VALUES ('/notes/hello.txt', lix_text_encode('hello world'));
 ```
 
+Standard SQL binary casts are also supported when an explicit cast is more convenient:
+
+```sql
+INSERT INTO lix_file (path, data)
+VALUES ($1, CAST($2 AS BINARY));
+```
+
 ### `lix_empty_blob()`
 
 Returns a zero-length `BLOB`. Handy for creating an empty file:

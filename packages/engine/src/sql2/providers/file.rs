@@ -60,9 +60,8 @@ use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
 use crate::sql2::write_normalization::{
-    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell, is_binary_type,
-    lix_file_data_type_error, lix_file_data_type_error_with_value, logical_expr_is_binary_or_null,
-    reject_non_binary_casts_for_insert_column, scalar_is_binary_or_null,
+    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
+    lix_file_data_type_error, lix_file_data_type_error_with_value, scalar_is_binary_or_null,
 };
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
@@ -645,9 +644,6 @@ impl TableSpec for LixFileSpec {
         let include_data_writes = self.schema.field_with_name("data").is_ok()
             && insert_intents.includes_column("data")
             && !self.options.omitted_insert_columns.contains("data");
-        if include_data_writes {
-            reject_non_binary_casts_for_insert_column(input, "data", "INSERT into lix_file")?;
-        }
         let sink = Arc::new(LixFileInsertSink::new(
             write_ctx,
             self.functions.clone(),
@@ -3630,18 +3626,10 @@ fn validate_lix_file_update_assignments(
 }
 
 fn reject_non_binary_lix_file_data_assignment(expr: &Expr) -> Result<()> {
-    match expr {
-        Expr::Literal(value, _) => {
-            if !scalar_is_binary_or_null(value) {
-                return Err(non_binary_lix_file_data_assignment_error());
-            }
-        }
-        Expr::Cast(cast)
-            if is_binary_type(&cast.data_type) && !logical_expr_is_binary_or_null(&cast.expr) =>
-        {
+    if let Expr::Literal(value, _) = expr {
+        if !scalar_is_binary_or_null(value) {
             return Err(non_binary_lix_file_data_assignment_error());
         }
-        _ => {}
     }
 
     Ok(())

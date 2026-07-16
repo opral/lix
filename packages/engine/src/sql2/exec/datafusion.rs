@@ -13,7 +13,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::{Column, DFSchema, ParamValues, ScalarValue};
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::expr::{BinaryExpr, InList, ScalarFunction};
+use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
 use datafusion::prelude::SessionContext;
@@ -22,7 +22,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::functions::FunctionContext;
-use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
+use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundInsertValues, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
@@ -602,39 +602,65 @@ fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Resu
     if !matches!(
         plan.bound.target,
         BoundWriteTarget::File(FileWriteSurface::Base | FileWriteSurface::ByBranch)
-    ) || plan.bound.op != BoundWriteOp::Insert
-    {
+    ) {
         return Ok(());
     }
 
-    match &plan.bound.input {
-        BoundWriteInput::Values(values) => {
-            if let Some(column_index) = values.column_index("data") {
-                for row in &values.rows {
-                    validate_lix_file_data_insert_expr(&row[column_index], params)?;
+    if plan.bound.op == BoundWriteOp::Insert {
+        match &plan.bound.input {
+            BoundWriteInput::Values(values) => {
+                if let Some(column_index) = values.column_index("data") {
+                    for row in &values.rows {
+                        validate_lix_file_data_write_expr(&row[column_index], params, false)?;
+                    }
                 }
             }
-            Ok(())
+            BoundWriteInput::Query { columns, .. } => {
+                if columns.iter().any(|column| column.name == "data") {
+                    return Err(lix_file_data_type_lix_error());
+                }
+            }
+            BoundWriteInput::None => {}
         }
-        BoundWriteInput::Query { columns, .. } => {
-            if columns.iter().any(|column| column.name == "data") {
-                Err(lix_file_data_type_lix_error())
-            } else {
-                Ok(())
+    }
+
+    for assignment in &plan.bound.assignments {
+        if assignment.column.name == "data" {
+            validate_lix_file_data_write_expr(&assignment.value, params, false)?;
+        }
+    }
+    if let Some(conflict) = &plan.bound.conflict {
+        for assignment in conflict.action.assignments() {
+            if assignment.column.name == "data" {
+                validate_lix_file_data_write_expr(&assignment.value, params, true)?;
             }
         }
-        BoundWriteInput::None => Ok(()),
     }
+
+    Ok(())
 }
 
-fn validate_lix_file_data_insert_expr(expr: &BoundExpr, params: &[Value]) -> Result<(), LixError> {
+fn validate_lix_file_data_write_expr(
+    expr: &BoundExpr,
+    params: &[Value],
+    allow_excluded_column: bool,
+) -> Result<(), LixError> {
     match expr {
         BoundExpr::Literal(BoundLiteral::Blob(_)) => Ok(()),
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
             Some(Value::Blob(_)) => Ok(()),
             _ => Err(lix_file_data_type_lix_error()),
         },
-        BoundExpr::Function { .. } => Ok(()),
+        BoundExpr::Function { name, .. }
+            if matches!(name.as_str(), "lix_empty_blob" | "lix_text_encode") =>
+        {
+            Ok(())
+        }
+        BoundExpr::Cast {
+            data_type: BoundCastType::Binary,
+            ..
+        } => Ok(()),
+        BoundExpr::ExcludedColumn(_) if allow_excluded_column => Ok(()),
         BoundExpr::ExcludedColumn(_) => Err(lix_file_data_type_lix_error()),
         _ => Err(lix_file_data_type_lix_error()),
     }
@@ -969,6 +995,15 @@ fn datafusion_expr_from_bound_expr(
             };
             let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value);
             Ok(Expr::Literal(value, metadata))
+        }
+        BoundExpr::Cast { expr, data_type } => {
+            let data_type = match data_type {
+                BoundCastType::Binary => DataType::Binary,
+            };
+            Ok(Expr::Cast(Cast::new(
+                Box::new(datafusion_expr_from_bound_expr(session, expr, params)?),
+                data_type,
+            )))
         }
         BoundExpr::Function { name, args } => {
             let udf = session.udf(name).map_err(datafusion_error_to_lix_error)?;
