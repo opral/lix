@@ -17,6 +17,7 @@ mod providers;
 mod read_only;
 mod result_metadata;
 mod runtime;
+mod script;
 mod session;
 #[cfg(test)]
 mod test_support;
@@ -45,3 +46,4 @@ pub(crate) use exec::{
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
+pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
