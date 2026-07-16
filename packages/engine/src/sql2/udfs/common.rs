@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::common::{DataFusionError, Result, plan_err};
+use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::ColumnarValue;
 use serde_json::Value as JsonValue;
 
@@ -82,81 +80,6 @@ pub(super) fn numeric_value(array: &dyn Array, row: usize) -> Result<Option<Stri
     numeric_array!(Float32Array);
     numeric_array!(Float64Array);
     Ok(None)
-}
-
-pub(super) fn decode_utf8_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return (!array.is_null(row))
-            .then(|| String::from_utf8(array.value(row).to_vec()))
-            .transpose()
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "lix_text_decode() expected valid UTF8 bytes: {error}"
-                ))
-            });
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return (!array.is_null(row))
-            .then(|| String::from_utf8(array.value(row).to_vec()))
-            .transpose()
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "lix_text_decode() expected valid UTF8 bytes: {error}"
-                ))
-            });
-    }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok((!array.is_null(row)).then(|| array.value(row).to_string()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok((!array.is_null(row)).then(|| array.value(row).to_string()));
-    }
-    Err(DataFusionError::Execution(format!(
-        "lix_text_decode() expected Binary or Utf8, got {:?}",
-        array.data_type()
-    )))
-}
-
-pub(super) fn encode_utf8_value(array: &dyn Array, row: usize) -> Result<Option<Vec<u8>>> {
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok((!array.is_null(row)).then(|| array.value(row).as_bytes().to_vec()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok((!array.is_null(row)).then(|| array.value(row).as_bytes().to_vec()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok((!array.is_null(row)).then(|| array.value(row).to_vec()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok((!array.is_null(row)).then(|| array.value(row).to_vec()));
-    }
-    Err(DataFusionError::Execution(format!(
-        "lix_text_encode() expected Utf8 or Binary, got {:?}",
-        array.data_type()
-    )))
-}
-
-pub(super) fn validate_utf8_encoding_arg(
-    fn_name: &str,
-    encoding: Option<&ColumnarValue>,
-) -> Result<()> {
-    let Some(encoding) = encoding else {
-        return Ok(());
-    };
-    let arrays = ColumnarValue::values_to_arrays(std::slice::from_ref(encoding))?;
-    let array = &arrays[0];
-    if array.is_empty() {
-        return Ok(());
-    }
-    let Some(value) = text_like_value(array.as_ref(), 0)? else {
-        return Ok(());
-    };
-    let normalized = value.trim().to_ascii_uppercase().replace('-', "");
-    if normalized == "UTF8" {
-        Ok(())
-    } else {
-        plan_err!("{fn_name}() only supports UTF8 encoding, got '{value}'")
-    }
 }
 
 pub(super) fn extract_json_path(
@@ -280,16 +203,4 @@ fn validate_json_path_key_segment(fn_name: &str, value: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-pub(super) fn binary_array_from_owned(values: &[Option<Vec<u8>>]) -> BinaryArray {
-    let refs = values
-        .iter()
-        .map(|value| value.as_deref())
-        .collect::<Vec<_>>();
-    BinaryArray::from(refs)
-}
-
-pub(super) fn array_ref<T: Array + 'static>(array: T) -> ArrayRef {
-    Arc::new(array)
 }

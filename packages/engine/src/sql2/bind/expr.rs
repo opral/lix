@@ -4,7 +4,19 @@ pub(crate) enum BoundExpr {
     ExcludedColumn(BoundColumnRef),
     Param(BoundParamRef),
     Literal(BoundLiteral),
-    Function { name: String, args: Vec<Self> },
+    Cast {
+        expr: Box<Self>,
+        data_type: BoundCastType,
+    },
+    Function {
+        name: String,
+        args: Vec<Self>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundCastType {
+    Binary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,11 +1,8 @@
 mod common;
 mod lix_active_branch_commit_id;
-mod lix_empty_blob;
 mod lix_json;
 mod lix_json_get;
 mod lix_json_get_text;
-mod lix_text_decode;
-mod lix_text_encode;
 mod lix_timestamp;
 mod lix_uuid_v7;
 
@@ -29,10 +26,7 @@ pub(crate) fn register_sql2_functions(
     ));
     ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
     ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));
-    ctx.register_udf(ScalarUDF::from(lix_text_decode::LixTextDecode::new()));
-    ctx.register_udf(ScalarUDF::from(lix_text_encode::LixTextEncode::new()));
     ctx.register_udf(ScalarUDF::from(lix_json::LixJson));
-    ctx.register_udf(ScalarUDF::from(lix_empty_blob::LixEmptyBlob));
     ctx.register_udf(ScalarUDF::from(lix_uuid_v7::LixUuidV7 {
         functions: functions.clone(),
     }));
@@ -41,7 +35,7 @@ pub(crate) fn register_sql2_functions(
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use datafusion::arrow::array::{Array, BinaryArray, StringArray};
+    use datafusion::arrow::array::{Array, StringArray};
     use datafusion::prelude::SessionContext;
 
     use super::{register_sql2_functions, system_sql2_function_provider};
@@ -62,23 +56,5 @@ pub(super) mod test_support {
             .downcast_ref::<StringArray>()
             .expect("first column should be utf8");
         (!array.is_null(0)).then(|| array.value(0).to_string())
-    }
-
-    pub(super) async fn single_binary(sql: &str) -> Option<Vec<u8>> {
-        let ctx = SessionContext::new();
-        register_sql2_functions(&ctx, system_sql2_function_provider(), None);
-        let batches = ctx
-            .sql(sql)
-            .await
-            .expect("query should plan")
-            .collect()
-            .await
-            .expect("query should execute");
-        let array = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("first column should be binary");
-        (!array.is_null(0)).then(|| array.value(0).to_vec())
     }
 }

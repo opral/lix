@@ -3,10 +3,10 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName, ObjectNamePart,
-    OnConflictAction, OnInsert, Query, SetExpr, Statement as SqlStatement, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Update, Value, Visit, Visitor,
+    AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType as SqlDataType, Delete,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName,
+    ObjectNamePart, OnConflictAction, OnInsert, Query, SetExpr, Statement as SqlStatement,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Value, Visit, Visitor,
 };
 use serde_json::Value as JsonValue;
 
@@ -16,7 +16,7 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKi
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 
-use super::expr::{BoundExpr, BoundLiteral, BoundParamRef};
+use super::expr::{BoundCastType, BoundExpr, BoundLiteral, BoundParamRef};
 use super::read::BoundRead;
 use super::table::{
     BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
@@ -538,6 +538,21 @@ fn bind_insert_value_expr(expr: &Expr, params: &mut ParamBinder) -> Result<Bound
     match expr {
         Expr::Value(value) => bind_value(&value.value, params),
         Expr::Nested(expr) => bind_insert_value_expr(expr, params),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => bind_cast_expr(
+            kind,
+            expr,
+            data_type,
+            *array,
+            format.is_some(),
+            params,
+            bind_insert_value_expr,
+        ),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -682,6 +697,21 @@ fn bind_expr(
         }
         Expr::Value(value) => bind_value(&value.value, params),
         Expr::Nested(expr) => bind_expr(table, expr, params),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => bind_cast_expr(
+            kind,
+            expr,
+            data_type,
+            *array,
+            format.is_some(),
+            params,
+            |expr, params| bind_expr(table, expr, params),
+        ),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -711,11 +741,51 @@ fn bind_conflict_expr(
             bind_expr(table, expr, params)
         }
         Expr::Nested(expr) => bind_conflict_expr(table, expr, params),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => bind_cast_expr(
+            kind,
+            expr,
+            data_type,
+            *array,
+            format.is_some(),
+            params,
+            |expr, params| bind_conflict_expr(table, expr, params),
+        ),
         Expr::Function(function) => bind_function(function, params, |expr, params| {
             bind_conflict_expr(table, expr, params)
         }),
         _ => bind_expr(table, expr, params),
     }
+}
+
+fn bind_cast_expr(
+    kind: &CastKind,
+    expr: &Expr,
+    data_type: &SqlDataType,
+    array: bool,
+    has_format: bool,
+    params: &mut ParamBinder,
+    bind_inner: impl FnOnce(&Expr, &mut ParamBinder) -> Result<BoundExpr, LixError>,
+) -> Result<BoundExpr, LixError> {
+    if kind != &CastKind::Cast
+        || array
+        || has_format
+        || !matches!(data_type, SqlDataType::Binary(None))
+    {
+        return Err(super::error::unsupported(format!(
+            "unsupported SQL cast 'CAST({expr} AS {data_type})'"
+        )));
+    }
+
+    Ok(BoundExpr::Cast {
+        expr: Box::new(bind_inner(expr, params)?),
+        data_type: BoundCastType::Binary,
+    })
 }
 
 fn bind_value(value: &Value, params: &mut ParamBinder) -> Result<BoundExpr, LixError> {
@@ -837,7 +907,6 @@ fn bind_function(
     reject_unsupported_function_modifiers(function)?;
     let name = bind_lix_function_name(function)?;
     let raw_args = function_args(&function.args)?;
-    validate_text_encoding_literal(&name, &raw_args)?;
     let args = raw_args
         .iter()
         .map(|arg| bind_arg_expr(arg, params))
@@ -871,42 +940,13 @@ fn reject_unsupported_function_modifiers(function: &Function) -> Result<(), LixE
 fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixError> {
     match name {
         "lix_json" => expect_exact_function_arity(name, actual, 1),
-        "lix_empty_blob" | "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
+        "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
             expect_exact_function_arity(name, actual, 0)
         }
         "lix_json_get" | "lix_json_get_text" => expect_min_function_arity(name, actual, 2),
-        "lix_text_encode" | "lix_text_decode" => {
-            if (1..=2).contains(&actual) {
-                Ok(())
-            } else {
-                Err(super::error::unsupported(format!(
-                    "{name} requires 1 or 2 arguments"
-                )))
-            }
-        }
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL function '{name}'"
         ))),
-    }
-}
-
-fn validate_text_encoding_literal(name: &str, args: &[&Expr]) -> Result<(), LixError> {
-    if !matches!(name, "lix_text_encode" | "lix_text_decode") || args.len() < 2 {
-        return Ok(());
-    }
-    let Expr::Value(value) = args[1] else {
-        return Ok(());
-    };
-    let Some(encoding) = string_literal_value(&value.value) else {
-        return Ok(());
-    };
-    let normalized = encoding.trim().to_ascii_uppercase().replace('-', "");
-    if normalized == "UTF8" {
-        Ok(())
-    } else {
-        Err(super::error::unsupported(format!(
-            "{name} only supports UTF8 encoding, got '{encoding}'"
-        )))
     }
 }
 
@@ -926,24 +966,6 @@ fn expect_min_function_arity(name: &str, actual: usize, minimum: usize) -> Resul
         )));
     }
     Ok(())
-}
-
-fn string_literal_value(value: &Value) -> Option<&str> {
-    match value {
-        Value::SingleQuotedString(value)
-        | Value::DoubleQuotedString(value)
-        | Value::TripleSingleQuotedString(value)
-        | Value::TripleDoubleQuotedString(value)
-        | Value::EscapedStringLiteral(value)
-        | Value::UnicodeStringLiteral(value)
-        | Value::NationalStringLiteral(value)
-        | Value::SingleQuotedRawStringLiteral(value)
-        | Value::DoubleQuotedRawStringLiteral(value)
-        | Value::TripleSingleQuotedRawStringLiteral(value)
-        | Value::TripleDoubleQuotedRawStringLiteral(value) => Some(value.as_str()),
-        Value::DollarQuotedString(value) => Some(value.value.as_str()),
-        _ => None,
-    }
 }
 
 fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
@@ -966,12 +988,9 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
         "lix_json"
         | "lix_json_get"
         | "lix_json_get_text"
-        | "lix_empty_blob"
         | "lix_timestamp"
         | "lix_uuid_v7"
-        | "lix_active_branch_commit_id"
-        | "lix_text_encode"
-        | "lix_text_decode" => Ok(name),
+        | "lix_active_branch_commit_id" => Ok(name),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL function '{name}'"
         ))),
@@ -1954,7 +1973,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_public_values_functions() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), lix_text_encode('hello'))",
+            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), CAST('hello' AS BINARY))",
         );
         let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
@@ -1971,20 +1990,16 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             function_names,
-            BTreeSet::from(["lix_text_encode", "lix_timestamp", "lix_uuid_v7"])
+            BTreeSet::from(["lix_timestamp", "lix_uuid_v7"])
         );
     }
 
     #[test]
     fn bind_statement_rejects_unsupported_function_details() {
-        for sql in [
-            "INSERT INTO lix_file (id, data) VALUES ('f1', lix_text_encode('Ada', 'base64'))",
-            "INSERT INTO lix_file (id, data) VALUES ('f1', lix_empty_blob() FILTER (WHERE false))",
-        ] {
-            let error = bind_statement(&parse_statement(sql), &[], "branch1")
-                .expect_err("unsupported function details should fail closed");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
-        }
+        let sql = "INSERT INTO lix_file (id) VALUES (lix_uuid_v7() FILTER (WHERE false))";
+        let error = bind_statement(&parse_statement(sql), &[], "branch1")
+            .expect_err("unsupported function details should fail closed");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 
     #[test]

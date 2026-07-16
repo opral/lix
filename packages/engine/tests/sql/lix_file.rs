@@ -795,6 +795,15 @@ simulation_test!(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('bool-data-file', '/bool.bin', true)",
             ),
+            (
+                "text-function-data-file",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES (\
+                   'text-function-data-file',\
+                   '/text-function.bin',\
+                   lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')\
+                 )",
+            ),
         ] {
             let error = session
                 .execute(sql, &[])
@@ -809,6 +818,7 @@ simulation_test!(
                 "SELECT id FROM lix_file \
                  WHERE id IN (\
                    'text-data-file',\
+                   'text-function-data-file',\
                    'int-data-file',\
                    'float-data-file',\
                    'bool-data-file'\
@@ -882,6 +892,50 @@ simulation_test!(
                 .expect_err("non-binary data parameter should be rejected");
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
         }
+    }
+);
+
+simulation_test!(
+    lix_file_accepts_explicit_text_to_binary_casts,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('cast-binary-file', $1, CAST($2 AS BINARY))",
+                &[
+                    Value::Text("/cast-binary.txt".to_string()),
+                    Value::Text("inserted".to_string()),
+                ],
+            )
+            .await
+            .expect("explicit binary cast insert should succeed");
+
+        session
+            .execute(
+                "UPDATE lix_file SET data = CAST($1 AS BINARY) \
+                 WHERE id = 'cast-binary-file'",
+                &[Value::Text("updated".to_string())],
+            )
+            .await
+            .expect("explicit binary cast update should succeed");
+
+        let result = session
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'cast-binary-file'",
+                &[],
+            )
+            .await
+            .expect("cast file read should succeed");
+        assert_rows_eq(result, vec![vec![Value::Blob(b"updated".to_vec())]]);
     }
 );
 
@@ -1956,6 +2010,10 @@ simulation_test!(
 
         for (id, assignment) in [
             ("update-text-file", "'hello'"),
+            (
+                "update-text-function-file",
+                "lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')",
+            ),
             ("update-int-file", "12345"),
             ("update-float-file", "1.5"),
             ("update-bool-file", "true"),
@@ -1987,6 +2045,7 @@ simulation_test!(
                 "SELECT id, data FROM lix_file \
                  WHERE id IN (\
                    'update-text-file',\
+                   'update-text-function-file',\
                    'update-int-file',\
                    'update-float-file',\
                    'update-bool-file'\
@@ -2014,6 +2073,10 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("update-text-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+                vec![
+                    Value::Text("update-text-function-file".to_string()),
                     Value::Blob(b"hello".to_vec()),
                 ],
             ],
@@ -2259,7 +2322,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_global) \
-                 VALUES ('global-shared-file', '/shared/a.txt', lix_text_encode('a'), true)",
+                 VALUES ('global-shared-file', '/shared/a.txt', CAST('a' AS BINARY), true)",
                 &[],
             )
             .await
@@ -2300,7 +2363,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-readme', '/scratch/readme.md', lix_text_encode('hello'))",
+                 VALUES ('file-readme', '/scratch/readme.md', CAST('hello' AS BINARY))",
                 &[],
             )
             .await
@@ -2367,7 +2430,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
-                 VALUES ('file-draft', '/docs/draft.md', lix_text_encode('draft'), true)",
+                 VALUES ('file-draft', '/docs/draft.md', CAST('draft' AS BINARY), true)",
                 &[],
             )
             .await

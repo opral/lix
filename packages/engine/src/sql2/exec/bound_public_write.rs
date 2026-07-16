@@ -1155,6 +1155,10 @@ fn eval_expr_value(
             }),
         BoundExpr::Column(column) => column_eval_value(context, &column.name),
         BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
+        BoundExpr::Cast { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity writes do not support CAST expressions yet",
+        )),
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
             let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let raw = match raw {
@@ -1183,9 +1187,6 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
             EntityEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
         ),
-        BoundExpr::Function { name, args } if name == "lix_empty_blob" && args.is_empty() => {
-            Ok(EntityEvalValue::Json(JsonValue::Array(Vec::new())))
-        }
         BoundExpr::Function { name, args }
             if name == "lix_active_branch_commit_id" && args.is_empty() =>
         {
@@ -1228,36 +1229,6 @@ fn eval_expr_value(
                 Ok(EntityEvalValue::SqlText(json_text_value(&current)?))
             } else {
                 Ok(EntityEvalValue::Json(current))
-            }
-        }
-        BoundExpr::Function { name, args }
-            if (name == "lix_text_encode" || name == "lix_text_decode")
-                && (1..=2).contains(&args.len()) =>
-        {
-            if args.len() == 2 {
-                validate_utf8_encoding(
-                    eval_expr(&args[1], context, ctx, params, active_branch_commit_id)?,
-                    name,
-                )?;
-            }
-            let value = eval_expr(&args[0], context, ctx, params, active_branch_commit_id)?;
-            if name == "lix_text_encode" {
-                Ok(EntityEvalValue::Json(JsonValue::Array(
-                    text_like_bytes(&value, name)?
-                        .into_iter()
-                        .map(JsonValue::from)
-                        .collect(),
-                )))
-            } else {
-                let bytes = binary_like_bytes(&value, name)?;
-                String::from_utf8(bytes)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_TYPE_MISMATCH,
-                            format!("lix_text_decode() expected valid UTF8 bytes: {error}"),
-                        )
-                    })
-                    .map(EntityEvalValue::SqlText)
             }
         }
         BoundExpr::Function { name, .. } => Err(LixError::new(
@@ -1612,16 +1583,16 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => Ok(()),
+        BoundExpr::Cast { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity writes do not support CAST expressions yet",
+        )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}
-                "lix_empty_blob"
-                | "lix_uuid_v7"
-                | "lix_timestamp"
-                | "lix_active_branch_commit_id"
+                "lix_uuid_v7" | "lix_timestamp" | "lix_active_branch_commit_id"
                     if args.is_empty() => {}
                 "lix_json_get" | "lix_json_get_text" if args.len() >= 2 => {}
-                "lix_text_encode" | "lix_text_decode" if (1..=2).contains(&args.len()) => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -1797,62 +1768,6 @@ fn json_text_value(value: &JsonValue) -> Result<String, LixError> {
         }
         JsonValue::Null => Ok("null".to_string()),
     }
-}
-
-fn validate_utf8_encoding(value: JsonValue, fn_name: &str) -> Result<(), LixError> {
-    let value = json_text_value(&value)?;
-    let normalized = value.trim().to_ascii_uppercase().replace('-', "");
-    if normalized == "UTF8" {
-        Ok(())
-    } else {
-        Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            format!("{fn_name}() only supports UTF8 encoding, got '{value}'"),
-        ))
-    }
-}
-
-fn text_like_bytes(value: &JsonValue, fn_name: &str) -> Result<Vec<u8>, LixError> {
-    Ok(match value {
-        JsonValue::String(value) => value.as_bytes().to_vec(),
-        JsonValue::Number(value) => value.to_string().into_bytes(),
-        JsonValue::Bool(value) => value.to_string().into_bytes(),
-        JsonValue::Array(values) => values
-            .iter()
-            .map(byte_from_json_value)
-            .collect::<Result<Vec<_>, _>>()?,
-        JsonValue::Null => Vec::new(),
-        JsonValue::Object(_) => {
-            return Err(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("{fn_name}() expected text or binary-compatible input, got {value}"),
-            ));
-        }
-    })
-}
-
-fn binary_like_bytes(value: &JsonValue, fn_name: &str) -> Result<Vec<u8>, LixError> {
-    match value {
-        JsonValue::Array(values) => values.iter().map(byte_from_json_value).collect(),
-        JsonValue::String(value) => Ok(value.as_bytes().to_vec()),
-        JsonValue::Null => Ok(Vec::new()),
-        other => Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            format!("{fn_name}() expected binary or text-compatible input, got {other}"),
-        )),
-    }
-}
-
-fn byte_from_json_value(value: &JsonValue) -> Result<u8, LixError> {
-    value
-        .as_u64()
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("binary value must contain integer bytes, got {value}"),
-            )
-        })
 }
 
 fn column_eval_value(
