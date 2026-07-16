@@ -651,7 +651,6 @@ fn validate_lix_file_data_write_expr(
             Some(Value::Blob(_)) => Ok(()),
             _ => Err(lix_file_data_type_lix_error()),
         },
-        BoundExpr::Function { name, .. } if name == "lix_empty_blob" => Ok(()),
         BoundExpr::Cast {
             data_type: BoundCastType::Binary,
             ..

@@ -940,7 +940,7 @@ fn reject_unsupported_function_modifiers(function: &Function) -> Result<(), LixE
 fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixError> {
     match name {
         "lix_json" => expect_exact_function_arity(name, actual, 1),
-        "lix_empty_blob" | "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
+        "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
             expect_exact_function_arity(name, actual, 0)
         }
         "lix_json_get" | "lix_json_get_text" => expect_min_function_arity(name, actual, 2),
@@ -988,7 +988,6 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
         "lix_json"
         | "lix_json_get"
         | "lix_json_get_text"
-        | "lix_empty_blob"
         | "lix_timestamp"
         | "lix_uuid_v7"
         | "lix_active_branch_commit_id" => Ok(name),
@@ -1997,8 +1996,7 @@ mod tests {
 
     #[test]
     fn bind_statement_rejects_unsupported_function_details() {
-        let sql =
-            "INSERT INTO lix_file (id, data) VALUES ('f1', lix_empty_blob() FILTER (WHERE false))";
+        let sql = "INSERT INTO lix_file (id) VALUES (lix_uuid_v7() FILTER (WHERE false))";
         let error = bind_statement(&parse_statement(sql), &[], "branch1")
             .expect_err("unsupported function details should fail closed");
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);

@@ -16,7 +16,6 @@ Lix's DataFusion-backed engine registers a small set of scalar functions for use
 | `lix_json_get_text(json, path...)` | text | Project a value out of a JSON column as plain text. |
 | `lix_uuid_v7()` | text | Generate a UUIDv7 string. |
 | `lix_timestamp()` | text | Current ISO-8601 timestamp string. |
-| `lix_empty_blob()` | blob | Zero-byte `BLOB` literal. |
 
 All functions are scalar; call them anywhere a SQL expression is allowed.
 
@@ -121,15 +120,6 @@ SELECT CAST(data AS TEXT) FROM lix_file WHERE path = '/notes/readme.md';
 
 INSERT INTO lix_file (path, data)
 VALUES ('/notes/hello.txt', CAST('hello world' AS BINARY));
-```
-
-### `lix_empty_blob()`
-
-Returns a zero-length `BLOB`. Handy for creating an empty file:
-
-```sql
-INSERT INTO lix_file (path, data)
-VALUES ('/empty.bin', lix_empty_blob());
 ```
 
 ## Notes

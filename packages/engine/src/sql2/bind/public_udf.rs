@@ -56,7 +56,7 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
 
     match name {
         "lix_json" => expect_exact_arity(name, arity, 1),
-        "lix_empty_blob" | "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
+        "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
             expect_exact_arity(name, arity, 0)
         }
         _ => Ok(()),
@@ -142,7 +142,6 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
     };
     match ident.to_ascii_lowercase().as_str() {
         "lix_json" => Some("lix_json"),
-        "lix_empty_blob" => Some("lix_empty_blob"),
         "lix_timestamp" => Some("lix_timestamp"),
         "lix_uuid_v7" => Some("lix_uuid_v7"),
         "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
@@ -198,7 +197,7 @@ mod tests {
 
     #[test]
     fn accepts_valid_public_lix_udf_calls() {
-        validate_public_udf_calls("SELECT lix_json('{\"x\":1}'), lix_empty_blob()")
+        validate_public_udf_calls("SELECT lix_json('{\"x\":1}'), lix_timestamp()")
             .expect("valid calls should pass public validation");
     }
 
