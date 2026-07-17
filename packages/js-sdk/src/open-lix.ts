@@ -11,7 +11,6 @@ import type {
 } from "./binding-types.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
-import { openLixWorkerBinding } from "./worker/client.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -129,6 +128,16 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			"openLix() option 'backend' was removed; use 'storage' instead",
 		);
 	}
+	if (options.server !== undefined) {
+		if (options.storage !== undefined) {
+			throw new TypeError(
+				"openLix() remote mode cannot be combined with client storage",
+			);
+		}
+		const { openRemoteLixBinding } = await import("./remote/client.js");
+		return new Lix(await openRemoteLixBinding(options.server));
+	}
+	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
 		return new Lix(await openLixWorkerBinding({ kind: "memory" }));
 	}

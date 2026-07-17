@@ -31,6 +31,8 @@ export type {
 	MergeConflictSide,
 	ObserveEvent,
 	OpenLixOptions,
+	RemoteLixFetch,
+	RemoteLixServerOptions,
 	SqlParam,
 	SQLiteOptions,
 	SwitchBranchOptions,
