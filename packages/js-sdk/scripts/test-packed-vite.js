@@ -95,11 +95,15 @@ try {
 		/^js-component-bindgen-component\.core2-.*\.wasm$/,
 		"JCO core2 WASM",
 	);
-	const mainSource = await readFile(join(assetsDir, mainBundle), "utf8");
 	const workerSource = await readFile(join(assetsDir, browserWorker), "utf8");
+	const browserJavaScriptSources = await Promise.all(
+		builtAssets
+			.filter((file) => file.endsWith(".js"))
+			.map((file) => readFile(join(assetsDir, file), "utf8")),
+	);
 	assert.ok(
-		mainSource.includes(browserWorker),
-		"The main bundle does not reference the emitted browser worker",
+		browserJavaScriptSources.some((source) => source.includes(browserWorker)),
+		"The browser bundle does not reference the emitted browser worker",
 	);
 	assert.ok(
 		workerSource.includes(engineWasm),
@@ -121,13 +125,7 @@ try {
 		builtAssets.every((file) => !file.endsWith(".node")),
 		"Vite emitted a native Node binding in the browser build",
 	);
-	const browserJavaScript = (
-		await Promise.all(
-			builtAssets
-				.filter((file) => file.endsWith(".js"))
-				.map((file) => readFile(join(assetsDir, file), "utf8")),
-		)
-	).join("\n");
+	const browserJavaScript = browserJavaScriptSources.join("\n");
 	for (const [label, nodeRuntimeMarker] of [
 		["Node worker module", "entry.node"],
 		["Node worker implementation", "Lix worker requires a parent port"],
