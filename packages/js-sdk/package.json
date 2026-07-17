@@ -16,6 +16,10 @@
 			"types": "./dist/workerd.d.ts",
 			"workerd": "./dist/workerd.js",
 			"default": "./dist/workerd.js"
+		},
+		"./remote-protocol": {
+			"types": "./dist/remote/protocol.d.ts",
+			"default": "./dist/remote/protocol.js"
 		}
 	},
 	"imports": {

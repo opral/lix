@@ -8,11 +8,30 @@ export type LocalFilesystemOptions = {
 	syncAllFiles: boolean;
 };
 
-export type OpenLixOptions = {
-	storage?:
-		| import("./open-lix.js").SQLite
-		| import("./open-lix.js").LocalFilesystem;
+export type RemoteLixFetch = (
+	input: RequestInfo | URL,
+	init?: RequestInit,
+) => Promise<Response>;
+
+export type RemoteLixServerOptions = {
+	mode: "remote";
+	url: string | URL;
+	branchId?: string;
+	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+	fetch?: RemoteLixFetch;
 };
+
+export type OpenLixOptions =
+	| {
+			storage?:
+				| import("./open-lix.js").SQLite
+				| import("./open-lix.js").LocalFilesystem;
+			server?: never;
+	  }
+	| {
+			storage?: never;
+			server: RemoteLixServerOptions;
+	  };
 
 export type LixValue =
 	| { kind: "null"; value: null }
