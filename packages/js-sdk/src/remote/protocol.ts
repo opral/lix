@@ -1,4 +1,7 @@
-import type { BindingExecuteResult } from "../binding-types.js";
+import type {
+	BindingExecuteResult,
+	BindingObserveEvent,
+} from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
 export const REMOTE_PROTOCOL_VERSION = 1;
@@ -64,6 +67,10 @@ export type RemoteErrorBody = {
 		hint?: string;
 		details?: unknown;
 	};
+};
+
+export type RemoteObserveErrorEvent = RemoteErrorBody & {
+	retryable?: boolean;
 };
 
 export function encodeWireValue(value: NativeLixValue): WireValue {
@@ -154,6 +161,33 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 	};
 }
 
+export function decodeObserveEvent(value: unknown): BindingObserveEvent {
+	const event = record(value, "observe event");
+	if (
+		typeof event.sequence !== "number" ||
+		!Number.isSafeInteger(event.sequence) ||
+		event.sequence < 0
+	) {
+		throw protocolError(
+			"observe event sequence must be a non-negative safe integer",
+		);
+	}
+	if (
+		typeof event.mutationSequence !== "number" ||
+		!Number.isSafeInteger(event.mutationSequence) ||
+		event.mutationSequence < 0
+	) {
+		throw protocolError(
+			"observe event mutationSequence must be a non-negative safe integer",
+		);
+	}
+	return {
+		sequence: event.sequence,
+		mutationSequence: event.mutationSequence,
+		rows: decodeExecuteResult(event.result),
+	};
+}
+
 export function remoteError(
 	code: string,
 	message: string,
@@ -184,7 +218,7 @@ export function protocolError(message: string): Error & { code: string } {
 
 export function errorFromResponseBody(
 	value: unknown,
-	status: number,
+	status?: number,
 ): Error & { code: string } {
 	const body = record(value, "remote error response");
 	const rawError = record(body.error, "remote error response error");
@@ -194,7 +228,9 @@ export function errorFromResponseBody(
 			: "LIX_REMOTE_REQUEST_FAILED",
 		typeof rawError.message === "string"
 			? rawError.message
-			: `Remote Lix request failed with status ${status}`,
+			: status === undefined
+				? "Remote Lix operation failed"
+				: `Remote Lix request failed with status ${status}`,
 		{
 			hint: typeof rawError.hint === "string" ? rawError.hint : undefined,
 			details: rawError.details,
