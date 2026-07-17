@@ -1,5 +1,6 @@
 import type {
 	BindingExecuteResult,
+	BindingObserveEvent,
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
@@ -19,12 +20,17 @@ import type { NativeLixValue } from "../value.js";
 import {
 	decodeExecuteResult,
 	decodeHandshake,
+	decodeObserveEvent,
 	encodeWireValue,
 	errorFromResponseBody,
 	protocolError,
 	record,
 	remoteError,
 } from "./protocol.js";
+import { readSseEvents } from "./sse.js";
+
+const OBSERVE_RETRY_BASE_MS = 100;
+const OBSERVE_RETRY_MAX_MS = 5_000;
 
 export async function openRemoteLixBinding(
 	options: RemoteLixServerOptions,
@@ -39,6 +45,7 @@ class RemoteLixBinding implements LixBinding {
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #initialBranchId: string | undefined;
+	readonly #observations = new Set<RemoteObservation>();
 	#activeBranchId = "";
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
@@ -107,11 +114,27 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async observe(
-		_sql: string,
-		_params: NativeLixValue[],
+		sql: string,
+		params: NativeLixValue[],
 	): Promise<ObserveEventsBinding> {
 		this.#assertOpen();
-		throw unsupportedRemoteOperation("observe");
+		return this.#enqueue(async () => {
+			const wireParams = params.map(encodeWireValue);
+			const observation = new RemoteObservation({
+				activeBranchId: () => this.#activeBranchId,
+				openStream: (branchId, signal) =>
+					this.#requestObserveStream(
+						branchId,
+						sql,
+						wireParams,
+						signal,
+					),
+				onClose: () => this.#observations.delete(observation),
+			});
+			this.#observations.add(observation);
+			observation.start();
+			return observation;
+		});
 	}
 
 	async beginTransaction(): Promise<LixTransactionBinding> {
@@ -172,6 +195,7 @@ class RemoteLixBinding implements LixBinding {
 				throw protocolError("switch branch response is invalid");
 			}
 			this.#activeBranchId = options.branchId;
+			for (const observation of this.#observations) observation.restart();
 			return { branchId: options.branchId };
 		});
 	}
@@ -203,7 +227,8 @@ class RemoteLixBinding implements LixBinding {
 	async close(): Promise<void> {
 		if (!this.#acceptingOperations) return this.#operationQueue;
 		this.#acceptingOperations = false;
-		return this.#enqueue(async () => undefined);
+		this.#closeObservations();
+		return this.#enqueue(async () => this.#closeObservations());
 	}
 
 	async #requestJson(path: string, init: RequestInit): Promise<unknown> {
@@ -223,23 +248,8 @@ class RemoteLixBinding implements LixBinding {
 				{ details: { cause: errorMessage(cause) } },
 			);
 		}
+		if (!response.ok) throw await errorFromHttpResponse(response);
 		const text = await response.text();
-		if (!response.ok) {
-			let body: unknown;
-			try {
-				body = JSON.parse(text);
-			} catch {
-				throw remoteError(
-					"LIX_REMOTE_REQUEST_FAILED",
-					`Remote Lix request failed with status ${response.status}`,
-					{
-						status: response.status,
-						details: text.length === 0 ? undefined : { body: text.slice(0, 1000) },
-					},
-				);
-			}
-			throw errorFromResponseBody(body, response.status);
-		}
 		try {
 			return JSON.parse(text);
 		} catch {
@@ -249,10 +259,50 @@ class RemoteLixBinding implements LixBinding {
 		}
 	}
 
+	async #requestObserveStream(
+		branchId: string,
+		sql: string,
+		params: ReturnType<typeof encodeWireValue>[],
+		signal: AbortSignal,
+	): Promise<Response> {
+		let headers: Headers;
+		try {
+			headers = new Headers(await resolveHeaders(this.#headers));
+		} catch (cause) {
+			throw remoteError(
+				"LIX_REMOTE_CONFIGURATION_ERROR",
+				"Remote Lix observation headers could not be resolved",
+				{ details: { cause: errorMessage(cause) } },
+			);
+		}
+		headers.set("accept", "text/event-stream");
+		headers.set("content-type", "application/json");
+		try {
+			return await this.#fetch(new URL("observe", this.#baseUrl), {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ branchId, sql, params }),
+				signal,
+			});
+		} catch (cause) {
+			if (signal.aborted) throw cause;
+			throw remoteError(
+				"LIX_REMOTE_UNAVAILABLE",
+				"The remote Lix observation stream is unavailable",
+				{ details: { cause: errorMessage(cause) } },
+			);
+		}
+	}
+
 	#assertOpen(): void {
 		if (!this.#acceptingOperations) {
 			throw remoteError("LIX_ERROR_CLOSED", "Lix is closed");
 		}
+	}
+
+	#closeObservations(): void {
+		for (const observation of [...this.#observations]) observation.close();
+		this.#observations.clear();
 	}
 
 	#enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -265,10 +315,402 @@ class RemoteLixBinding implements LixBinding {
 	}
 }
 
+type ObserveWaiter = {
+	resolve(value: BindingObserveEvent | undefined): void;
+	reject(error: unknown): void;
+};
+
+type ObserveOutcome =
+	| { ok: true; event: BindingObserveEvent }
+	| { ok: false; error: unknown };
+
+type RemoteObservationOptions = {
+	activeBranchId(): string;
+	openStream(branchId: string, signal: AbortSignal): Promise<Response>;
+	onClose(): void;
+};
+
+class RemoteObservation implements ObserveEventsBinding {
+	readonly #activeBranchId: () => string;
+	readonly #openStream: RemoteObservationOptions["openStream"];
+	readonly #onClose: () => void;
+	#outcomes: ObserveOutcome[] = [];
+	#waiters: ObserveWaiter[] = [];
+	#terminalError: unknown;
+	#lastRows: BindingExecuteResult | undefined;
+	#lastSequence = -1;
+	#controller: AbortController | undefined;
+	#retryTimer: ReturnType<typeof setTimeout> | undefined;
+	#retryAttempt = 0;
+	#serverRetryMs: number | undefined;
+	#generation = 0;
+	#closed = false;
+
+	constructor(options: RemoteObservationOptions) {
+		this.#activeBranchId = options.activeBranchId;
+		this.#openStream = options.openStream;
+		this.#onClose = options.onClose;
+	}
+
+	start(): void {
+		if (
+			this.#closed ||
+			this.#terminalError !== undefined ||
+			this.#controller !== undefined ||
+			this.#retryTimer !== undefined
+		) {
+			return;
+		}
+		const generation = this.#generation;
+		const branchId = this.#activeBranchId();
+		const controller = new AbortController();
+		this.#controller = controller;
+		void this.#consume(generation, branchId, controller);
+	}
+
+	next(): Promise<BindingObserveEvent | undefined> {
+		const outcome = this.#outcomes.shift();
+		if (outcome?.ok) return Promise.resolve(outcome.event);
+		if (outcome) return Promise.reject(outcome.error);
+		if (this.#terminalError !== undefined) {
+			return Promise.reject(this.#terminalError);
+		}
+		if (this.#closed) return Promise.resolve(undefined);
+		return new Promise((resolve, reject) => {
+			this.#waiters.push({ resolve, reject });
+		});
+	}
+
+	restart(): void {
+		if (this.#closed) return;
+		this.#generation += 1;
+		this.#controller?.abort();
+		this.#controller = undefined;
+		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
+		this.#retryAttempt = 0;
+		this.#serverRetryMs = undefined;
+		this.#terminalError = undefined;
+		this.#outcomes = [];
+		this.start();
+	}
+
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#generation += 1;
+		this.#controller?.abort();
+		this.#controller = undefined;
+		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
+		this.#outcomes = [];
+		this.#terminalError = undefined;
+		for (const waiter of this.#waiters.splice(0)) waiter.resolve(undefined);
+		this.#onClose();
+	}
+
+	async #consume(
+		generation: number,
+		branchId: string,
+		controller: AbortController,
+	): Promise<void> {
+		let reconnect = false;
+		let streamOpened = false;
+		try {
+			const response = await this.#openStream(branchId, controller.signal);
+			if (!this.#isCurrent(generation, controller)) return;
+			streamOpened = true;
+			if (!response.ok) {
+				if (isRetryableObserveStatus(response.status)) {
+					void response.body?.cancel();
+					reconnect = true;
+					return;
+				}
+				const error = await errorFromHttpResponse(response);
+				if (this.#isCurrent(generation, controller)) this.#fail(error);
+				return;
+			}
+			if (!response.body) {
+				this.#fail(protocolError("remote observe response has no body"));
+				return;
+			}
+			const contentType = response.headers.get("content-type") ?? "";
+			if (
+				contentType.split(";", 1)[0]?.trim().toLowerCase() !==
+				"text/event-stream"
+			) {
+				this.#fail(
+					protocolError("remote observe response must be text/event-stream"),
+				);
+				return;
+			}
+			for await (const frame of readSseEvents(response.body)) {
+				if (!this.#isCurrent(generation, controller)) return;
+				if (frame.retry !== undefined) this.#serverRetryMs = frame.retry;
+				if (frame.event === "next") {
+					let event: BindingObserveEvent;
+					try {
+						event = decodeObserveEvent(JSON.parse(frame.data));
+					} catch (error) {
+						this.#fail(asObserveProtocolError(error, "next"));
+						return;
+					}
+					this.#retryAttempt = 0;
+					this.#accept(event);
+				} else if (frame.event === "error") {
+					try {
+						const payload = record(
+							JSON.parse(frame.data),
+							"remote observe error event",
+						);
+						if (
+							payload.retryable !== undefined &&
+							typeof payload.retryable !== "boolean"
+						) {
+							throw protocolError(
+								"remote observe error retryable must be a boolean",
+							);
+						}
+						const error = errorFromResponseBody(payload);
+						if (payload.retryable === true) {
+							this.#pushRecoverableError(error);
+							reconnect = true;
+							controller.abort();
+						} else {
+							this.#fail(error);
+						}
+					} catch (error) {
+						this.#fail(asObserveProtocolError(error, "error"));
+					}
+					return;
+				} else if (frame.event !== "message" || frame.data.length > 0) {
+					this.#fail(
+						protocolError(`unknown remote observe event: ${frame.event}`),
+					);
+					return;
+				}
+			}
+			if (this.#isCurrent(generation, controller)) reconnect = true;
+		} catch (error) {
+			if (
+				!this.#isCurrent(generation, controller) ||
+				controller.signal.aborted
+			) {
+				return;
+			}
+			if (streamOpened || isRetryableObserveError(error)) reconnect = true;
+			else this.#fail(error);
+		} finally {
+			if (this.#isCurrent(generation, controller)) {
+				this.#controller = undefined;
+				if (reconnect) this.#scheduleReconnect(generation);
+			}
+		}
+	}
+
+	#accept(event: BindingObserveEvent): void {
+		if (this.#closed || this.#terminalError !== undefined) return;
+		if (
+			this.#lastRows !== undefined &&
+			executeResultsEqual(this.#lastRows, event.rows)
+		) {
+			return;
+		}
+		const normalized = {
+			sequence: this.#lastSequence + 1,
+			mutationSequence: event.mutationSequence,
+			rows: event.rows,
+		};
+		this.#lastRows = event.rows;
+		this.#lastSequence = normalized.sequence;
+		const waiter = this.#waiters.shift();
+		if (waiter) waiter.resolve(normalized);
+		else {
+			this.#outcomes = this.#outcomes.filter((outcome) => !outcome.ok);
+			this.#outcomes.push({ ok: true, event: normalized });
+		}
+	}
+
+	#pushRecoverableError(error: unknown): void {
+		if (this.#closed || this.#terminalError !== undefined) return;
+		const waiter = this.#waiters.shift();
+		if (waiter) waiter.reject(error);
+		else if (!this.#outcomes.some((outcome) => !outcome.ok)) {
+			this.#outcomes.push({ ok: false, error });
+		}
+	}
+
+	#fail(error: unknown): void {
+		if (this.#closed || this.#terminalError !== undefined) return;
+		this.#terminalError = error;
+		this.#controller?.abort();
+		for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
+	}
+
+	#scheduleReconnect(generation: number): void {
+		if (
+			this.#closed ||
+			this.#terminalError !== undefined ||
+			generation !== this.#generation ||
+			this.#controller !== undefined ||
+			this.#retryTimer !== undefined
+		) {
+			return;
+		}
+		const delay =
+			this.#serverRetryMs === undefined
+				? Math.min(
+						OBSERVE_RETRY_BASE_MS * 2 ** this.#retryAttempt,
+						OBSERVE_RETRY_MAX_MS,
+					)
+				: Math.min(
+						Math.max(this.#serverRetryMs, OBSERVE_RETRY_BASE_MS),
+						OBSERVE_RETRY_MAX_MS,
+					);
+		this.#retryAttempt += 1;
+		this.#retryTimer = setTimeout(() => {
+			this.#retryTimer = undefined;
+			if (generation === this.#generation) this.start();
+		}, delay);
+	}
+
+	#isCurrent(generation: number, controller: AbortController): boolean {
+		return (
+			!this.#closed &&
+			generation === this.#generation &&
+			controller === this.#controller
+		);
+	}
+}
+
 async function resolveHeaders(
 	headers: RemoteLixServerOptions["headers"],
 ): Promise<HeadersInit | undefined> {
 	return typeof headers === "function" ? await headers() : headers;
+}
+
+async function errorFromHttpResponse(response: Response): Promise<Error> {
+	const text = await response.text();
+	try {
+		return errorFromResponseBody(JSON.parse(text), response.status);
+	} catch (error) {
+		if (
+			error instanceof Error &&
+			"status" in error &&
+			(error as { status?: number }).status === response.status
+		) {
+			return error;
+		}
+		return remoteError(
+			"LIX_REMOTE_REQUEST_FAILED",
+			`Remote Lix request failed with status ${response.status}`,
+			{
+				status: response.status,
+				details: text.length === 0 ? undefined : { body: text.slice(0, 1000) },
+			},
+		);
+	}
+}
+
+function isRetryableObserveStatus(status: number): boolean {
+	return status === 408 || status === 429 || status >= 500;
+}
+
+function isRetryableObserveError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		"code" in error &&
+		(error as { code?: string }).code === "LIX_REMOTE_UNAVAILABLE"
+	);
+}
+
+function asObserveProtocolError(error: unknown, event: string): Error {
+	if (
+		error instanceof Error &&
+		"code" in error &&
+		(error as { code?: string }).code === "LIX_REMOTE_PROTOCOL_ERROR"
+	) {
+		return error;
+	}
+	return protocolError(
+		`remote observe ${event} event contains invalid data: ${errorMessage(error)}`,
+	);
+}
+
+function executeResultsEqual(
+	left: BindingExecuteResult,
+	right: BindingExecuteResult,
+): boolean {
+	return (
+		left.rowsAffected === right.rowsAffected &&
+		stringArraysEqual(left.columns, right.columns) &&
+		left.rows.length === right.rows.length &&
+		left.rows.every(
+			(row, rowIndex) =>
+				row.length === right.rows[rowIndex]?.length &&
+				row.every((value, valueIndex) =>
+					nativeValuesEqual(value, right.rows[rowIndex]?.[valueIndex]),
+				),
+		) &&
+		left.notices.length === right.notices.length &&
+		left.notices.every((notice, index) => {
+			const other = right.notices[index];
+			return (
+				notice.code === other?.code &&
+				notice.message === other.message &&
+				notice.hint === other.hint
+			);
+		})
+	);
+}
+
+function nativeValuesEqual(
+	left: NativeLixValue,
+	right: NativeLixValue | undefined,
+): boolean {
+	if (!right || left.kind !== right.kind) return false;
+	switch (left.kind) {
+		case "blob":
+			return (
+				right.kind === "blob" &&
+				left.blob.length === right.blob.length &&
+				left.blob.every((byte, index) => byte === right.blob[index])
+			);
+		case "json":
+			return right.kind === "json" && jsonValuesEqual(left.value, right.value);
+		default:
+			return left.value === right.value;
+	}
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+	if (left === right) return true;
+	if (Array.isArray(left) || Array.isArray(right)) {
+		return (
+			Array.isArray(left) &&
+			Array.isArray(right) &&
+			left.length === right.length &&
+			left.every((value, index) => jsonValuesEqual(value, right[index]))
+		);
+	}
+	if (!left || !right || typeof left !== "object" || typeof right !== "object") {
+		return false;
+	}
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	const leftKeys = Object.keys(leftRecord).sort();
+	const rightKeys = Object.keys(rightRecord).sort();
+	return (
+		stringArraysEqual(leftKeys, rightKeys) &&
+		leftKeys.every((key) => jsonValuesEqual(leftRecord[key], rightRecord[key]))
+	);
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+	return (
+		left.length === right.length &&
+		left.every((value, index) => value === right[index])
+	);
 }
 
 function protocolBaseUrl(value: string | URL): URL {

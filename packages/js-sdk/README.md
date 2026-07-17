@@ -22,6 +22,39 @@ console.log(result.rows[0]?.get("message"));
 await lix.close();
 ```
 
+## Remote workspaces
+
+Use the same Lix client as a thin client against a hosted workspace:
+
+```ts
+const lix = await openLix({
+	server: {
+		mode: "remote",
+		url: "https://lixray.com/@namespace/workspace",
+		headers: async () => ({
+			Authorization: `Bearer ${await accessToken()}`,
+		}),
+	},
+});
+
+const files = lix.observe("SELECT path FROM lix_file ORDER BY path");
+const initial = await files.next();
+
+await lix.execute(
+	"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+	["/hello.txt", new TextEncoder().encode("hello")],
+);
+const update = await files.next();
+
+files.close();
+await lix.close();
+```
+
+Remote mode uses the server for persistence and does not open a local engine,
+so it does not take a client `storage`. Dynamic headers are resolved for every
+request and observation reconnect. An injected `fetch` can route requests
+through a service binding or another authorized server-side transport.
+
 Filesystem sync and SQLite persistence use native Node.js dependencies:
 
 ```ts
