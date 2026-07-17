@@ -4,12 +4,14 @@ import {
 	invalidArgument,
 } from "./errors.js";
 import type {
-	BindingExecuteResult,
 	BindingObserveEvent,
+	LixBinding,
+	LixTransactionBinding,
+	ObserveEventsBinding,
 } from "./binding-types.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
-import { LixWorkerClient, openLixWorker } from "./worker/client.js";
+import { openLixWorkerBinding } from "./worker/client.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -28,17 +30,15 @@ import type {
 } from "./types.js";
 
 const transactionFinalizer = new FinalizationRegistry<{
-	client: LixWorkerClient;
-	transactionId: number;
-}>(({ client, transactionId }) => {
-	client.notify({ kind: "transaction.abandon", transactionId });
+	transaction: LixTransactionBinding;
+}>(({ transaction }) => {
+	void transaction.rollback().catch(() => undefined);
 });
 const observeFinalizer = new FinalizationRegistry<{
-	client: LixWorkerClient;
-	observeId: Promise<number | undefined>;
-}>(({ client, observeId }) => {
-	void observeId.then((id) => {
-		if (id !== undefined) client.notify({ kind: "observe.close", observeId: id });
+	observe: Promise<ObserveEventsBinding | undefined>;
+}>(({ observe }) => {
+	void observe.then((events) => {
+		events?.close();
 	});
 });
 
@@ -57,7 +57,7 @@ export class SQLite {
 	}
 }
 
-const openLocalFilesystems = new WeakMap<LocalFilesystem, LixWorkerClient | null>();
+const openLocalFilesystems = new WeakMap<LocalFilesystem, LixBinding | null>();
 
 export class LocalFilesystem {
 	readonly path: string;
@@ -102,17 +102,14 @@ export class LocalFilesystem {
 				);
 			}
 		}
-		await this.client("importPaths").request({
-			kind: "importFilesystemPaths",
-			paths: [...paths],
-		});
+		await this.client("importPaths").importFilesystemPaths([...paths]);
 	}
 
 	async syncDiskToLix(): Promise<void> {
-		return this.client("syncDiskToLix").request({ kind: "syncDiskToLix" });
+		return this.client("syncDiskToLix").syncDiskToLix();
 	}
 
-	private client(operation: string): LixWorkerClient {
+	private client(operation: string): LixBinding {
 		const client = openLocalFilesystems.get(this);
 		if (!client) {
 			throw localFilesystemNotOpen(operation);
@@ -131,11 +128,14 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		);
 	}
 	if (options.storage === undefined) {
-		return new Lix(await openLixWorker({ kind: "memory" }));
+		return new Lix(await openLixWorkerBinding({ kind: "memory" }));
 	}
 	if (options.storage instanceof SQLite) {
 		return new Lix(
-			await openLixWorker({ kind: "sqlite", path: options.storage.path }),
+			await openLixWorkerBinding({
+				kind: "sqlite",
+				path: options.storage.path,
+			}),
 		);
 	}
 	if (options.storage instanceof LocalFilesystem) {
@@ -145,7 +145,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		}
 		openLocalFilesystems.set(storage, null);
 		try {
-			const client = await openLixWorker(
+			const binding = await openLixWorkerBinding(
 				{
 					kind: "localFilesystem",
 					path: storage.path,
@@ -154,8 +154,8 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				},
 				() => openLocalFilesystems.delete(storage),
 			);
-			openLocalFilesystems.set(storage, client);
-			return new Lix(client);
+			openLocalFilesystems.set(storage, binding);
+			return new Lix(binding);
 		} catch (error) {
 			openLocalFilesystems.delete(storage);
 			throw error;
@@ -169,7 +169,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 export class Lix {
 	private closePromise: Promise<void> | undefined;
 
-	constructor(private readonly client: LixWorkerClient) {}
+	constructor(private readonly binding: LixBinding) {}
 
 	async execute(
 		sql: string,
@@ -178,65 +178,59 @@ export class Lix {
 	): Promise<ExecuteResult> {
 		assertExecuteArgs("lix", sql, params, options);
 		return wrapExecuteResult(
-			await this.client.request<BindingExecuteResult>({
-				kind: "execute",
+			await this.binding.execute(
 				sql,
-				params: params.map((param, index) =>
+				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
 				options,
-			}),
+			),
 		);
 	}
 
 	observe(sql: string, params: SqlParam[] = []): ObserveEvents {
 		assertSqlArgs("observe", "lix", sql, params);
 		return new ObserveEvents(
-			this.client,
-			this.client.request<number>({
-				kind: "observe",
+			this.binding.observe(
 				sql,
-				params: params.map((param, index) =>
+				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
-			}),
+			),
 		);
 	}
 
 	async beginTransaction(): Promise<LixTransaction> {
-		const transactionId = await this.client.request<number>({
-			kind: "beginTransaction",
-		});
-		return new LixTransaction(this.client, transactionId);
+		return new LixTransaction(await this.binding.beginTransaction());
 	}
 
 	async activeBranchId(): Promise<string> {
-		return this.client.request({ kind: "activeBranchId" });
+		return this.binding.activeBranchId();
 	}
 
 	async createBranch(
 		options: CreateBranchOptions,
 	): Promise<CreateBranchReceipt> {
-		return this.client.request({ kind: "createBranch", options });
+		return this.binding.createBranch(options);
 	}
 
 	async switchBranch(
 		options: SwitchBranchOptions,
 	): Promise<SwitchBranchReceipt> {
-		return this.client.request({ kind: "switchBranch", options });
+		return this.binding.switchBranch(options);
 	}
 
 	async mergeBranchPreview(
 		options: MergeBranchOptions,
 	): Promise<MergeBranchPreview> {
 		return normalizeOptionals(
-			await this.client.request({ kind: "mergeBranchPreview", options }),
+			await this.binding.mergeBranchPreview(options),
 		);
 	}
 
 	async mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt> {
 		const receipt = normalizeOptionals<MergeBranchReceipt>(
-			await this.client.request({ kind: "mergeBranch", options }),
+			await this.binding.mergeBranch(options),
 		);
 		receipt.createdMergeCommitId ??= null;
 		return receipt;
@@ -244,8 +238,7 @@ export class Lix {
 
 	async close(): Promise<void> {
 		this.closePromise ??= (async () => {
-			await this.client.request({ kind: "close" });
-			await this.client.terminate();
+			await this.binding.close();
 		})();
 		try {
 			await this.closePromise;
@@ -259,34 +252,28 @@ export class Lix {
 export class ObserveEvents {
 	private readonly setup: { error?: unknown } = {};
 	private closed = false;
-	private readonly observeId: Promise<number | undefined>;
+	private readonly observeBinding: Promise<ObserveEventsBinding | undefined>;
 
-	constructor(
-		private readonly client: LixWorkerClient,
-		observeId: Promise<number>,
-	) {
+	constructor(observeBinding: Promise<ObserveEventsBinding>) {
 		const setup = this.setup;
-		this.observeId = observeId.catch((error: unknown) => {
+		this.observeBinding = observeBinding.catch((error: unknown) => {
 			setup.error = error;
 			return undefined;
 		});
 		observeFinalizer.register(
 			this,
-			{ client, observeId: this.observeId },
+			{ observe: this.observeBinding },
 			this,
 		);
 	}
 
 	async next(): Promise<ObserveEvent | undefined> {
 		if (this.closed) return undefined;
-		const observeId = await this.observeId;
-		if (observeId === undefined) {
+		const binding = await this.observeBinding;
+		if (binding === undefined) {
 			throw this.setup.error;
 		}
-		const event = await this.client.request<BindingObserveEvent | undefined>({
-			kind: "observe.next",
-			observeId,
-		});
+		const event: BindingObserveEvent | null | undefined = await binding.next();
 		if (event == null) {
 			return undefined;
 		}
@@ -301,22 +288,17 @@ export class ObserveEvents {
 		if (this.closed) return;
 		this.closed = true;
 		observeFinalizer.unregister(this);
-		void this.observeId.then((observeId) => {
-			if (observeId !== undefined) {
-				this.client.notify({ kind: "observe.close", observeId });
-			}
+		void this.observeBinding.then((binding) => {
+			binding?.close();
 		});
 	}
 }
 
 export class LixTransaction {
-	constructor(
-		private readonly client: LixWorkerClient,
-		private readonly transactionId: number,
-	) {
+	constructor(private readonly binding: LixTransactionBinding) {
 		transactionFinalizer.register(
 			this,
-			{ client, transactionId },
+			{ transaction: binding },
 			this,
 		);
 	}
@@ -328,15 +310,13 @@ export class LixTransaction {
 	): Promise<ExecuteResult> {
 		assertExecuteArgs("lixTransaction", sql, params, options);
 		return wrapExecuteResult(
-			await this.client.request<BindingExecuteResult>({
-				kind: "transaction.execute",
-				transactionId: this.transactionId,
+			await this.binding.execute(
 				sql,
-				params: params.map((param, index) =>
+				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
 				options,
-			}),
+			),
 		);
 	}
 
@@ -352,7 +332,9 @@ export class LixTransaction {
 		kind: "transaction.commit" | "transaction.rollback",
 	): Promise<void> {
 		transactionFinalizer.unregister(this);
-		return this.client.request({ kind, transactionId: this.transactionId });
+		return kind === "transaction.commit"
+			? this.binding.commit()
+			: this.binding.rollback();
 	}
 }
 
