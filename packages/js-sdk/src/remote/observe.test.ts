@@ -13,7 +13,10 @@ test("remote observe streams native Lix results", async () => {
 				return new URL(request.url).pathname.endsWith("/.lix/v1/")
 					? handshake()
 					: sseResponse(
-							sseFrame("next", observePayload("hello", 0, 7)),
+							sseFrame(
+								"next",
+								multiplexObservePayload("observe-1", "hello", 0, 7),
+							),
 						);
 			},
 		},
@@ -25,15 +28,159 @@ test("remote observe streams native Lix results", async () => {
 	expect(initial?.mutationSequence).toBe(7);
 	expect(initial?.result.rows[0]?.get("value")).toBe("hello");
 	expect(requests[1]?.headers.get("accept")).toBe("text/event-stream");
+	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
+		"/@acme/workspace/.lix/v1/observe/multiplex",
+	);
 	expect(await requests[1]?.json()).toEqual({
 		branchId: "main-id",
-		sql: "SELECT $1 AS value",
-		params: [{ kind: "text", value: "hello" }],
+		subscriptions: [
+			{
+				id: "observe-1",
+				sql: "SELECT $1 AS value",
+				params: [{ kind: "text", value: "hello" }],
+			},
+		],
 	});
 
 	events.close();
 	expect(await events.next()).toBeUndefined();
 	await lix.close();
+});
+
+test("remote observe multiplexes more than six subscriptions without blocking execute", async () => {
+	const observeRequests: Request[] = [];
+	let liveObserveRequests = 0;
+	let maximumLiveObserveRequests = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/.lix/v1/")) return handshake();
+				if (pathname.endsWith("/execute")) {
+					return Response.json({
+						columns: ["value"],
+						rows: [[{ kind: "text", value: "executed" }]],
+						rowsAffected: 0,
+						notices: [],
+					});
+				}
+
+				observeRequests.push(request.clone());
+				liveObserveRequests += 1;
+				maximumLiveObserveRequests = Math.max(
+					maximumLiveObserveRequests,
+					liveObserveRequests,
+				);
+				let released = false;
+				const release = () => {
+					if (released) return;
+					released = true;
+					liveObserveRequests -= 1;
+				};
+				request.signal.addEventListener("abort", release, { once: true });
+				await Promise.resolve();
+				if (request.signal.aborted) {
+					release();
+					throw new DOMException("Aborted", "AbortError");
+				}
+				const body = (await request.clone().json()) as {
+					subscriptions: Array<{ id: string }>;
+				};
+				return heldSseResponse(
+					body.subscriptions
+						.map((subscription, index) =>
+							sseFrame(
+								"next",
+								multiplexObservePayload(
+									subscription.id,
+									`value-${index}`,
+									0,
+									0,
+								),
+							),
+						)
+						.join(""),
+					request.signal,
+				);
+			},
+		},
+	});
+
+	const observations = Array.from({ length: 8 }, (_, index) =>
+		lix.observe(`SELECT ${index} AS value`),
+	);
+	const initial = await Promise.all(
+		observations.map((observation) => observation.next()),
+	);
+	expect(initial.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
+		Array.from({ length: 8 }, (_, index) => `value-${index}`),
+	);
+	expect(liveObserveRequests).toBe(1);
+	expect(maximumLiveObserveRequests).toBe(1);
+	expect(
+		observeRequests.every((request) =>
+			new URL(request.url).pathname.endsWith("/observe/multiplex"),
+		),
+	).toBe(true);
+	const latestBody = (await observeRequests.at(-1)?.json()) as {
+		subscriptions: unknown[];
+	};
+	expect(latestBody.subscriptions).toHaveLength(8);
+
+	const executed = await lix.execute("SELECT 'executed' AS value");
+	expect(executed.rows[0]?.get("value")).toBe("executed");
+	expect(liveObserveRequests).toBe(1);
+
+	await lix.close();
+	expect(liveObserveRequests).toBe(0);
+});
+
+test("hub-wide protocol failures abort a held multiplex stream without reconnecting", async () => {
+	vi.useFakeTimers();
+	try {
+		let observeRequests = 0;
+		let liveObserveRequests = 0;
+		const lix = await openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/@acme/workspace",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					if (new URL(request.url).pathname.endsWith("/.lix/v1/")) {
+						return handshake();
+					}
+					observeRequests += 1;
+					liveObserveRequests += 1;
+					request.signal.addEventListener(
+						"abort",
+						() => {
+							liveObserveRequests -= 1;
+						},
+						{ once: true },
+					);
+					return heldSseResponse(
+						sseFrame("next", observePayload("missing subscription id", 0, 0)),
+						request.signal,
+					);
+				},
+			},
+		});
+
+		const events = lix.observe("SELECT value");
+		await expect(events.next()).rejects.toMatchObject({
+			code: "LIX_REMOTE_PROTOCOL_ERROR",
+		});
+		expect(liveObserveRequests).toBe(0);
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(observeRequests).toBe(1);
+
+		await lix.close();
+	} finally {
+		vi.useRealTimers();
+	}
 });
 
 test("remote observe can continue after a semantic SSE error", async () => {
@@ -53,6 +200,7 @@ test("remote observe can continue after a semantic SSE error", async () => {
 					return observeRequests === 1
 						? sseResponse(
 								sseFrame("error", {
+									subscriptionId: "observe-1",
 									retryable: true,
 									error: {
 										code: "LIX_OBSERVE_RUNTIME",
@@ -63,7 +211,10 @@ test("remote observe can continue after a semantic SSE error", async () => {
 								}),
 							)
 						: heldSseResponse(
-								sseFrame("next", observePayload("recovered", 0, 2)),
+								sseFrame(
+									"next",
+									multiplexObservePayload("observe-1", "recovered", 0, 2),
+								),
 								request.signal,
 							);
 				},
@@ -103,6 +254,7 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 				observeRequests += 1;
 				return sseResponse(
 					sseFrame("error", {
+						subscriptionId: "observe-1",
 						error: {
 							code: "LIX_INVALID_SQL",
 							message: "invalid observed query",
@@ -153,7 +305,10 @@ test("a successful branch switch restarts existing remote observations", async (
 				const body = (await request.clone().json()) as { branchId: string };
 				observedBranches.push(body.branchId);
 				return heldSseResponse(
-					sseFrame("next", observePayload(body.branchId, 0, 0)),
+					sseFrame(
+						"next",
+						multiplexObservePayload("observe-1", body.branchId, 0, 0),
+					),
 					request.signal,
 				);
 			},
@@ -208,7 +363,7 @@ test("a stale pre-switch HTTP error cannot fail the restarted observation", asyn
 					);
 				}
 				return heldSseResponse(
-					sseFrame("next", observePayload("draft", 0, 1)),
+					sseFrame("next", multiplexObservePayload("observe-1", "draft", 0, 1)),
 					request.signal,
 				);
 			},
@@ -265,11 +420,18 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 					observedAuthorization.push(request.headers.get("authorization"));
 					if (observeRequests <= 2) {
 						return sseResponse(
-							sseFrame("next", observePayload("first", 0, 0), 25),
+							sseFrame(
+								"next",
+								multiplexObservePayload("observe-1", "first", 0, 0),
+								25,
+							),
 						);
 					}
 					return heldSseResponse(
-						sseFrame("next", observePayload("second", 0, 0)),
+						sseFrame(
+							"next",
+							multiplexObservePayload("observe-1", "second", 0, 0),
+						),
 						request.signal,
 					);
 				},
@@ -331,7 +493,7 @@ test("closing Lix stops observations before an earlier finite request settles", 
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/.lix/v1/")) return handshake();
-				if (pathname.endsWith("/observe")) {
+				if (pathname.endsWith("/observe/multiplex")) {
 					return heldSseResponse("", request.signal);
 				}
 				executeStarted.resolve();
@@ -370,6 +532,18 @@ function observePayload(value: string, sequence: number, mutationSequence: numbe
 			rowsAffected: 0,
 			notices: [],
 		},
+	};
+}
+
+function multiplexObservePayload(
+	subscriptionId: string,
+	value: string,
+	sequence: number,
+	mutationSequence: number,
+) {
+	return {
+		subscriptionId,
+		...observePayload(value, sequence, mutationSequence),
 	};
 }
 

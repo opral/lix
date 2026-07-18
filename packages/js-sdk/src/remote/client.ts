@@ -26,6 +26,7 @@ import {
 	protocolError,
 	record,
 	remoteError,
+	type RemoteObserveSubscription,
 } from "./protocol.js";
 import { readSseEvents } from "./sse.js";
 
@@ -45,7 +46,7 @@ class RemoteLixBinding implements LixBinding {
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #initialBranchId: string | undefined;
-	readonly #observations = new Set<RemoteObservation>();
+	readonly #observationHub: RemoteObservationHub;
 	#activeBranchId = "";
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
@@ -82,6 +83,11 @@ class RemoteLixBinding implements LixBinding {
 		}
 		this.#headers = options.headers;
 		this.#initialBranchId = options.branchId;
+		this.#observationHub = new RemoteObservationHub({
+			activeBranchId: () => this.#activeBranchId,
+			openStream: (branchId, subscriptions, signal) =>
+				this.#requestObserveStream(branchId, subscriptions, signal),
+		});
 	}
 
 	async open(): Promise<void> {
@@ -118,23 +124,9 @@ class RemoteLixBinding implements LixBinding {
 		params: NativeLixValue[],
 	): Promise<ObserveEventsBinding> {
 		this.#assertOpen();
-		return this.#enqueue(async () => {
-			const wireParams = params.map(encodeWireValue);
-			const observation = new RemoteObservation({
-				activeBranchId: () => this.#activeBranchId,
-				openStream: (branchId, signal) =>
-					this.#requestObserveStream(
-						branchId,
-						sql,
-						wireParams,
-						signal,
-					),
-				onClose: () => this.#observations.delete(observation),
-			});
-			this.#observations.add(observation);
-			observation.start();
-			return observation;
-		});
+		return this.#enqueue(async () =>
+			this.#observationHub.observe(sql, params.map(encodeWireValue)),
+		);
 	}
 
 	async beginTransaction(): Promise<LixTransactionBinding> {
@@ -195,7 +187,7 @@ class RemoteLixBinding implements LixBinding {
 				throw protocolError("switch branch response is invalid");
 			}
 			this.#activeBranchId = options.branchId;
-			for (const observation of this.#observations) observation.restart();
+			this.#observationHub.restart();
 			return { branchId: options.branchId };
 		});
 	}
@@ -227,8 +219,8 @@ class RemoteLixBinding implements LixBinding {
 	async close(): Promise<void> {
 		if (!this.#acceptingOperations) return this.#operationQueue;
 		this.#acceptingOperations = false;
-		this.#closeObservations();
-		return this.#enqueue(async () => this.#closeObservations());
+		this.#observationHub.close();
+		return this.#enqueue(async () => this.#observationHub.close());
 	}
 
 	async #requestJson(path: string, init: RequestInit): Promise<unknown> {
@@ -261,8 +253,7 @@ class RemoteLixBinding implements LixBinding {
 
 	async #requestObserveStream(
 		branchId: string,
-		sql: string,
-		params: ReturnType<typeof encodeWireValue>[],
+		subscriptions: RemoteObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response> {
 		let headers: Headers;
@@ -278,10 +269,10 @@ class RemoteLixBinding implements LixBinding {
 		headers.set("accept", "text/event-stream");
 		headers.set("content-type", "application/json");
 		try {
-			return await this.#fetch(new URL("observe", this.#baseUrl), {
+			return await this.#fetch(new URL("observe/multiplex", this.#baseUrl), {
 				method: "POST",
 				headers,
-				body: JSON.stringify({ branchId, sql, params }),
+				body: JSON.stringify({ branchId, subscriptions }),
 				signal,
 			});
 		} catch (cause) {
@@ -298,11 +289,6 @@ class RemoteLixBinding implements LixBinding {
 		if (!this.#acceptingOperations) {
 			throw remoteError("LIX_ERROR_CLOSED", "Lix is closed");
 		}
-	}
-
-	#closeObservations(): void {
-		for (const observation of [...this.#observations]) observation.close();
-		this.#observations.clear();
 	}
 
 	#enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -324,21 +310,20 @@ type ObserveOutcome =
 	| { ok: true; event: BindingObserveEvent }
 	| { ok: false; error: unknown };
 
-type RemoteObservationOptions = {
+type RemoteObservationHubOptions = {
 	activeBranchId(): string;
-	openStream(branchId: string, signal: AbortSignal): Promise<Response>;
-	onClose(): void;
+	openStream(
+		branchId: string,
+		subscriptions: RemoteObserveSubscription[],
+		signal: AbortSignal,
+	): Promise<Response>;
 };
 
-class RemoteObservation implements ObserveEventsBinding {
+class RemoteObservationHub {
 	readonly #activeBranchId: () => string;
-	readonly #openStream: RemoteObservationOptions["openStream"];
-	readonly #onClose: () => void;
-	#outcomes: ObserveOutcome[] = [];
-	#waiters: ObserveWaiter[] = [];
-	#terminalError: unknown;
-	#lastRows: BindingExecuteResult | undefined;
-	#lastSequence = -1;
+	readonly #openStream: RemoteObservationHubOptions["openStream"];
+	readonly #observations = new Map<string, RemoteObservation>();
+	#nextObservationId = 0;
 	#controller: AbortController | undefined;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	#retryAttempt = 0;
@@ -346,26 +331,295 @@ class RemoteObservation implements ObserveEventsBinding {
 	#generation = 0;
 	#closed = false;
 
-	constructor(options: RemoteObservationOptions) {
+	constructor(options: RemoteObservationHubOptions) {
 		this.#activeBranchId = options.activeBranchId;
 		this.#openStream = options.openStream;
-		this.#onClose = options.onClose;
 	}
 
-	start(): void {
+	observe(
+		sql: string,
+		params: RemoteObserveSubscription["params"],
+	): RemoteObservation {
+		const id = `observe-${++this.#nextObservationId}`;
+		const observation = new RemoteObservation({
+			id,
+			sql,
+			params,
+			onClose: () => {
+				this.#observations.delete(id);
+				this.#restartStream();
+			},
+		});
+		this.#observations.set(id, observation);
+		this.#restartStream();
+		return observation;
+	}
+
+	restart(): void {
+		if (this.#closed) return;
+		for (const observation of this.#observations.values()) {
+			observation.restart();
+		}
+		this.#restartStream();
+	}
+
+	close(): void {
+		if (!this.#closed) {
+			this.#closed = true;
+			this.#stopStream();
+		}
+		for (const observation of [...this.#observations.values()]) {
+			observation.close();
+		}
+		this.#observations.clear();
+	}
+
+	#restartStream(): void {
+		this.#stopStream();
+		this.#startStream();
+	}
+
+	#startStream(): void {
 		if (
 			this.#closed ||
-			this.#terminalError !== undefined ||
+			this.#observations.size === 0 ||
 			this.#controller !== undefined ||
 			this.#retryTimer !== undefined
 		) {
 			return;
 		}
 		const generation = this.#generation;
-		const branchId = this.#activeBranchId();
 		const controller = new AbortController();
 		this.#controller = controller;
-		void this.#consume(generation, branchId, controller);
+		void this.#consume(generation, controller);
+	}
+
+	#stopStream(): void {
+		this.#generation += 1;
+		this.#controller?.abort();
+		this.#controller = undefined;
+		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
+		this.#retryAttempt = 0;
+		this.#serverRetryMs = undefined;
+	}
+
+	async #consume(
+		generation: number,
+		controller: AbortController,
+	): Promise<void> {
+		let reconnect = false;
+		let streamOpened = false;
+		try {
+			const response = await this.#openStream(
+				this.#activeBranchId(),
+				[...this.#observations.values()].map((observation) =>
+					observation.request(),
+				),
+				controller.signal,
+			);
+			if (!this.#isCurrent(generation, controller)) return;
+			streamOpened = true;
+			if (!response.ok) {
+				if (isRetryableObserveStatus(response.status)) {
+					void response.body?.cancel();
+					reconnect = true;
+					return;
+				}
+				const error = await errorFromHttpResponse(response);
+				if (this.#isCurrent(generation, controller)) {
+					this.#failStream(error, controller);
+				}
+				return;
+			}
+			if (!response.body) {
+				this.#failStream(
+					protocolError("remote observe response has no body"),
+					controller,
+				);
+				return;
+			}
+			const contentType = response.headers.get("content-type") ?? "";
+			if (
+				contentType.split(";", 1)[0]?.trim().toLowerCase() !==
+				"text/event-stream"
+			) {
+				this.#failStream(
+					protocolError("remote observe response must be text/event-stream"),
+					controller,
+				);
+				return;
+			}
+			for await (const frame of readSseEvents(response.body)) {
+				if (!this.#isCurrent(generation, controller)) return;
+				if (frame.retry !== undefined) this.#serverRetryMs = frame.retry;
+				if (frame.event === "next") {
+					try {
+						const payload = record(
+							JSON.parse(frame.data),
+							"remote multiplex observe next event",
+						);
+						const observation = this.#observation(payload.subscriptionId);
+						observation.accept(decodeObserveEvent(payload));
+						this.#retryAttempt = 0;
+					} catch (error) {
+						this.#failStream(
+							asObserveProtocolError(error, "next"),
+							controller,
+						);
+						return;
+					}
+				} else if (frame.event === "error") {
+					try {
+						const payload = record(
+							JSON.parse(frame.data),
+							"remote multiplex observe error event",
+						);
+						if (
+							payload.retryable !== undefined &&
+							typeof payload.retryable !== "boolean"
+						) {
+							throw protocolError(
+								"remote observe error retryable must be a boolean",
+							);
+						}
+						const error = errorFromResponseBody(payload);
+						if (payload.subscriptionId !== undefined) {
+							const observation = this.#observation(payload.subscriptionId);
+							if (payload.retryable === true) {
+								observation.recover(error);
+								reconnect = true;
+								controller.abort();
+								return;
+							}
+							observation.fail(error);
+							continue;
+						}
+						if (payload.retryable === true) {
+							for (const observation of this.#observations.values()) {
+								observation.recover(error);
+							}
+							reconnect = true;
+							controller.abort();
+						} else {
+							this.#failStream(error, controller);
+						}
+					} catch (error) {
+						this.#failStream(
+							asObserveProtocolError(error, "error"),
+							controller,
+						);
+					}
+					return;
+				} else if (frame.event !== "message" || frame.data.length > 0) {
+					this.#failStream(
+						protocolError(`unknown remote observe event: ${frame.event}`),
+						controller,
+					);
+					return;
+				}
+			}
+			if (this.#isCurrent(generation, controller)) reconnect = true;
+		} catch (error) {
+			if (
+				!this.#isCurrent(generation, controller) ||
+				controller.signal.aborted
+			) {
+				return;
+			}
+			if (streamOpened || isRetryableObserveError(error)) reconnect = true;
+			else this.#failStream(error, controller);
+		} finally {
+			if (this.#isCurrent(generation, controller)) {
+				this.#controller = undefined;
+				if (reconnect) this.#scheduleReconnect(generation);
+			}
+		}
+	}
+
+	#observation(id: unknown): RemoteObservation {
+		if (typeof id !== "string" || id.length === 0) {
+			throw protocolError("remote observe event requires subscriptionId");
+		}
+		const observation = this.#observations.get(id);
+		if (!observation) {
+			throw protocolError(`unknown remote observe subscription: ${id}`);
+		}
+		return observation;
+	}
+
+	#failAll(error: unknown): void {
+		for (const observation of this.#observations.values()) {
+			observation.fail(error);
+		}
+	}
+
+	#failStream(error: unknown, controller: AbortController): void {
+		this.#failAll(error);
+		controller.abort();
+	}
+
+	#scheduleReconnect(generation: number): void {
+		if (
+			this.#closed ||
+			this.#observations.size === 0 ||
+			generation !== this.#generation ||
+			this.#controller !== undefined ||
+			this.#retryTimer !== undefined
+		) {
+			return;
+		}
+		const delay =
+			this.#serverRetryMs === undefined
+				? Math.min(
+						OBSERVE_RETRY_BASE_MS * 2 ** this.#retryAttempt,
+						OBSERVE_RETRY_MAX_MS,
+					)
+				: Math.min(
+						Math.max(this.#serverRetryMs, OBSERVE_RETRY_BASE_MS),
+						OBSERVE_RETRY_MAX_MS,
+					);
+		this.#retryAttempt += 1;
+		this.#retryTimer = setTimeout(() => {
+			this.#retryTimer = undefined;
+			if (generation === this.#generation) this.#startStream();
+		}, delay);
+	}
+
+	#isCurrent(generation: number, controller: AbortController): boolean {
+		return (
+			!this.#closed &&
+			generation === this.#generation &&
+			controller === this.#controller
+		);
+	}
+}
+
+type RemoteObservationOptions = RemoteObserveSubscription & {
+	onClose(): void;
+};
+
+class RemoteObservation implements ObserveEventsBinding {
+	readonly #id: string;
+	readonly #sql: string;
+	readonly #params: RemoteObserveSubscription["params"];
+	readonly #onClose: () => void;
+	#outcomes: ObserveOutcome[] = [];
+	#waiters: ObserveWaiter[] = [];
+	#terminalError: unknown;
+	#lastRows: BindingExecuteResult | undefined;
+	#lastSequence = -1;
+	#closed = false;
+
+	constructor(options: RemoteObservationOptions) {
+		this.#id = options.id;
+		this.#sql = options.sql;
+		this.#params = options.params;
+		this.#onClose = options.onClose;
+	}
+
+	request(): RemoteObserveSubscription {
+		return { id: this.#id, sql: this.#sql, params: this.#params };
 	}
 
 	next(): Promise<BindingObserveEvent | undefined> {
@@ -383,132 +637,20 @@ class RemoteObservation implements ObserveEventsBinding {
 
 	restart(): void {
 		if (this.#closed) return;
-		this.#generation += 1;
-		this.#controller?.abort();
-		this.#controller = undefined;
-		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
-		this.#retryTimer = undefined;
-		this.#retryAttempt = 0;
-		this.#serverRetryMs = undefined;
 		this.#terminalError = undefined;
 		this.#outcomes = [];
-		this.start();
 	}
 
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
-		this.#generation += 1;
-		this.#controller?.abort();
-		this.#controller = undefined;
-		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
-		this.#retryTimer = undefined;
 		this.#outcomes = [];
 		this.#terminalError = undefined;
 		for (const waiter of this.#waiters.splice(0)) waiter.resolve(undefined);
 		this.#onClose();
 	}
 
-	async #consume(
-		generation: number,
-		branchId: string,
-		controller: AbortController,
-	): Promise<void> {
-		let reconnect = false;
-		let streamOpened = false;
-		try {
-			const response = await this.#openStream(branchId, controller.signal);
-			if (!this.#isCurrent(generation, controller)) return;
-			streamOpened = true;
-			if (!response.ok) {
-				if (isRetryableObserveStatus(response.status)) {
-					void response.body?.cancel();
-					reconnect = true;
-					return;
-				}
-				const error = await errorFromHttpResponse(response);
-				if (this.#isCurrent(generation, controller)) this.#fail(error);
-				return;
-			}
-			if (!response.body) {
-				this.#fail(protocolError("remote observe response has no body"));
-				return;
-			}
-			const contentType = response.headers.get("content-type") ?? "";
-			if (
-				contentType.split(";", 1)[0]?.trim().toLowerCase() !==
-				"text/event-stream"
-			) {
-				this.#fail(
-					protocolError("remote observe response must be text/event-stream"),
-				);
-				return;
-			}
-			for await (const frame of readSseEvents(response.body)) {
-				if (!this.#isCurrent(generation, controller)) return;
-				if (frame.retry !== undefined) this.#serverRetryMs = frame.retry;
-				if (frame.event === "next") {
-					let event: BindingObserveEvent;
-					try {
-						event = decodeObserveEvent(JSON.parse(frame.data));
-					} catch (error) {
-						this.#fail(asObserveProtocolError(error, "next"));
-						return;
-					}
-					this.#retryAttempt = 0;
-					this.#accept(event);
-				} else if (frame.event === "error") {
-					try {
-						const payload = record(
-							JSON.parse(frame.data),
-							"remote observe error event",
-						);
-						if (
-							payload.retryable !== undefined &&
-							typeof payload.retryable !== "boolean"
-						) {
-							throw protocolError(
-								"remote observe error retryable must be a boolean",
-							);
-						}
-						const error = errorFromResponseBody(payload);
-						if (payload.retryable === true) {
-							this.#pushRecoverableError(error);
-							reconnect = true;
-							controller.abort();
-						} else {
-							this.#fail(error);
-						}
-					} catch (error) {
-						this.#fail(asObserveProtocolError(error, "error"));
-					}
-					return;
-				} else if (frame.event !== "message" || frame.data.length > 0) {
-					this.#fail(
-						protocolError(`unknown remote observe event: ${frame.event}`),
-					);
-					return;
-				}
-			}
-			if (this.#isCurrent(generation, controller)) reconnect = true;
-		} catch (error) {
-			if (
-				!this.#isCurrent(generation, controller) ||
-				controller.signal.aborted
-			) {
-				return;
-			}
-			if (streamOpened || isRetryableObserveError(error)) reconnect = true;
-			else this.#fail(error);
-		} finally {
-			if (this.#isCurrent(generation, controller)) {
-				this.#controller = undefined;
-				if (reconnect) this.#scheduleReconnect(generation);
-			}
-		}
-	}
-
-	#accept(event: BindingObserveEvent): void {
+	accept(event: BindingObserveEvent): void {
 		if (this.#closed || this.#terminalError !== undefined) return;
 		if (
 			this.#lastRows !== undefined &&
@@ -531,7 +673,7 @@ class RemoteObservation implements ObserveEventsBinding {
 		}
 	}
 
-	#pushRecoverableError(error: unknown): void {
+	recover(error: unknown): void {
 		if (this.#closed || this.#terminalError !== undefined) return;
 		const waiter = this.#waiters.shift();
 		if (waiter) waiter.reject(error);
@@ -540,46 +682,10 @@ class RemoteObservation implements ObserveEventsBinding {
 		}
 	}
 
-	#fail(error: unknown): void {
+	fail(error: unknown): void {
 		if (this.#closed || this.#terminalError !== undefined) return;
 		this.#terminalError = error;
-		this.#controller?.abort();
 		for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
-	}
-
-	#scheduleReconnect(generation: number): void {
-		if (
-			this.#closed ||
-			this.#terminalError !== undefined ||
-			generation !== this.#generation ||
-			this.#controller !== undefined ||
-			this.#retryTimer !== undefined
-		) {
-			return;
-		}
-		const delay =
-			this.#serverRetryMs === undefined
-				? Math.min(
-						OBSERVE_RETRY_BASE_MS * 2 ** this.#retryAttempt,
-						OBSERVE_RETRY_MAX_MS,
-					)
-				: Math.min(
-						Math.max(this.#serverRetryMs, OBSERVE_RETRY_BASE_MS),
-						OBSERVE_RETRY_MAX_MS,
-					);
-		this.#retryAttempt += 1;
-		this.#retryTimer = setTimeout(() => {
-			this.#retryTimer = undefined;
-			if (generation === this.#generation) this.start();
-		}, delay);
-	}
-
-	#isCurrent(generation: number, controller: AbortController): boolean {
-		return (
-			!this.#closed &&
-			generation === this.#generation &&
-			controller === this.#controller
-		);
 	}
 }
 
