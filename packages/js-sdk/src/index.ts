@@ -17,6 +17,8 @@ export type {
 	CreateBranchReceipt,
 	ExecuteOptions,
 	ExecuteResult,
+	LixBatchOptions,
+	LixBatchStatement,
 	LocalFilesystemOptions,
 	JsonValue,
 	LixValue,

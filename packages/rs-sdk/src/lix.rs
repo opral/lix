@@ -1,8 +1,9 @@
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteOptions, ExecuteResult, LixError,
-    Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    ObserveEvents, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteBatchStatement, ExecuteOptions,
+    ExecuteResult, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
+    SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -99,6 +100,24 @@ where
     ) -> Result<ExecuteResult, LixError> {
         self.session
             .execute_with_options(sql, params, options)
+            .await
+    }
+
+    /// Executes statements sequentially in one atomic transaction.
+    pub async fn execute_batch(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session.execute_batch(statements).await
+    }
+
+    pub async fn execute_batch_with_options(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session
+            .execute_batch_with_options(statements, options)
             .await
     }
 

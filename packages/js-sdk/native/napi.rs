@@ -1,7 +1,8 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, LocalFilesystem, LocalFilesystemOpenOptions, Memory,
+    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    LocalFilesystem, LocalFilesystemOpenOptions, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
@@ -63,6 +64,13 @@ impl From<NativeExecuteOptions> for RsExecuteOptions {
     }
 }
 
+#[napi(object)]
+#[expect(missing_debug_implementations)]
+pub struct NativeExecuteBatchStatement {
+    pub sql: String,
+    pub params: Option<Vec<LixValue>>,
+}
+
 #[derive(Clone)]
 struct NativeLixActor {
     commands: Sender<LixCommand>,
@@ -80,6 +88,7 @@ type NativeResult<T> = std::result::Result<T, LixError>;
 type NativeResolver<T> = Box<dyn FnOnce(Env) -> Result<T> + Send>;
 type NativeDeferred<T> = JsDeferred<T, NativeResolver<T>>;
 type NativeExecuteDeferred = NativeDeferred<ExecuteResult>;
+type NativeExecuteBatchDeferred = NativeDeferred<Vec<ExecuteResult>>;
 type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeStringDeferred = NativeDeferred<String>;
 type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
@@ -94,6 +103,11 @@ enum LixCommand {
         params: Vec<Value>,
         options: RsExecuteOptions,
         deferred: NativeExecuteDeferred,
+    },
+    ExecuteBatch {
+        statements: Vec<RsExecuteBatchStatement>,
+        options: RsExecuteOptions,
+        deferred: NativeExecuteBatchDeferred,
     },
     BeginTransaction {
         transaction_id: u64,
@@ -264,6 +278,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
     while let Ok(command) = receiver.recv() {
         match command {
             LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::ExecuteBatch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -304,6 +319,22 @@ fn handle_lix_command(
             let result = rt
                 .block_on(state.lix.execute(&sql, &params, options))
                 .and_then(ExecuteResult::try_from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::ExecuteBatch {
+            statements,
+            options,
+            deferred,
+        } => {
+            let result = rt
+                .block_on(state.lix.execute_batch(&statements, options))
+                .and_then(|results| {
+                    results
+                        .into_iter()
+                        .map(ExecuteResult::try_from)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                });
             settle_deferred(deferred, result);
             false
         }
@@ -440,6 +471,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::Execute { deferred, .. } | LixCommand::TransactionExecute { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::ExecuteBatch { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::BeginTransaction { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -491,6 +525,20 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.execute_with_options(sql, params, options).await,
             Self::SQLite(lix) => lix.execute_with_options(sql, params, options).await,
             Self::LocalFilesystem(lix, _) => lix.execute_with_options(sql, params, options).await,
+        }
+    }
+
+    async fn execute_batch(
+        &self,
+        statements: &[RsExecuteBatchStatement],
+        options: RsExecuteOptions,
+    ) -> std::result::Result<Vec<RsExecuteResult>, LixError> {
+        match self {
+            Self::Memory(lix) => lix.execute_batch_with_options(statements, options).await,
+            Self::SQLite(lix) => lix.execute_batch_with_options(statements, options).await,
+            Self::LocalFilesystem(lix, _) => {
+                lix.execute_batch_with_options(statements, options).await
+            }
         }
     }
 
@@ -850,6 +898,41 @@ impl NativeLix {
             .send_with_deferred(deferred, |deferred| LixCommand::Execute {
                 sql,
                 params,
+                options,
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "executeBatch")]
+    pub fn execute_batch<'env>(
+        &self,
+        env: &'env Env,
+        statements: Vec<NativeExecuteBatchStatement>,
+        options: Option<NativeExecuteOptions>,
+    ) -> Result<Object<'env>> {
+        let statements = statements
+            .into_iter()
+            .map(|statement| {
+                let params = statement
+                    .params
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Value::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(RsExecuteBatchStatement {
+                    sql: statement.sql,
+                    params,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, LixError>>()
+            .map_err(|error| throw_lix_error(env, error))?;
+        let options = options.map(RsExecuteOptions::from).unwrap_or_default();
+        let (deferred, promise): (NativeExecuteBatchDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::ExecuteBatch {
+                statements,
                 options,
                 deferred,
             });

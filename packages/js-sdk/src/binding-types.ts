@@ -2,6 +2,7 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	ExecuteOptions,
+	LixBatchOptions,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
@@ -29,12 +30,21 @@ export type BindingObserveEvent = {
 
 export type BindingParam = NativeLixValue;
 
+export type BindingBatchStatement = {
+	sql: string;
+	params: BindingParam[];
+};
+
 export type LixBinding = {
 	execute(
 		sql: string,
 		params: BindingParam[],
 		options?: ExecuteOptions,
 	): Promise<BindingExecuteResult>;
+	executeBatch(
+		statements: BindingBatchStatement[],
+		options?: LixBatchOptions,
+	): Promise<BindingExecuteResult[]>;
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;

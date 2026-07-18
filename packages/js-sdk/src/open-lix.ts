@@ -13,6 +13,8 @@ import { LixWorkerClient, openLixWorker } from "./worker/client.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
+	LixBatchOptions,
+	LixBatchStatement,
 	ExecuteOptions,
 	ExecuteResult,
 	LocalFilesystemOptions,
@@ -187,6 +189,19 @@ export class Lix {
 				options,
 			}),
 		);
+	}
+
+	async executeBatch(
+		statements: readonly LixBatchStatement[],
+		options?: LixBatchOptions,
+	): Promise<readonly ExecuteResult[]> {
+		const normalizedStatements = normalizeBatchStatements(statements, options);
+		const results = await this.client.request<BindingExecuteResult[]>({
+			kind: "executeBatch",
+			statements: normalizedStatements,
+			options,
+		});
+		return results.map(wrapExecuteResult);
 	}
 
 	observe(sql: string, params: SqlParam[] = []): ObserveEvents {
@@ -407,4 +422,103 @@ function assertSqlArgs(
 			receiver,
 		);
 	}
+}
+
+function normalizeBatchStatements(
+	statements: readonly LixBatchStatement[],
+	options?: LixBatchOptions,
+) {
+	if (!Array.isArray(statements)) {
+		throw invalidArgument(
+			"executeBatch",
+			"statements",
+			"array",
+			typeof statements,
+		);
+	}
+	if (statements.length === 0) {
+		throw invalidArgument(
+			"executeBatch",
+			"statements",
+			"non-empty array",
+			"empty array",
+		);
+	}
+	assertBatchOptions(options);
+	return statements.map((statement, statementIndex) => {
+		try {
+			if (
+				!statement ||
+				typeof statement !== "object" ||
+				Array.isArray(statement)
+			) {
+				throw invalidArgument(
+					"executeBatch",
+					`statements[${statementIndex}]`,
+					"object",
+					Array.isArray(statement) ? "array" : typeof statement,
+				);
+			}
+			if (typeof statement.sql !== "string") {
+				throw invalidArgument(
+					"executeBatch",
+					`statements[${statementIndex}].sql`,
+					"string",
+					typeof statement.sql,
+				);
+			}
+			const params = statement.params ?? [];
+			if (!Array.isArray(params)) {
+				throw invalidArgument(
+					"executeBatch",
+					`statements[${statementIndex}].params`,
+					"array",
+					typeof params,
+				);
+			}
+			return {
+				sql: statement.sql,
+				params: params.map((param, parameterIndex) =>
+					toNativeValue(normalizeParam(param, parameterIndex)),
+				),
+			};
+		} catch (error) {
+			throw withBatchStatementIndex(error, statementIndex);
+		}
+	});
+}
+
+function assertBatchOptions(options?: LixBatchOptions) {
+	if (options === undefined) return;
+	if (!options || typeof options !== "object" || Array.isArray(options)) {
+		throw invalidArgument(
+			"executeBatch",
+			"options",
+			"object",
+			typeof options,
+		);
+	}
+	if (options.originKey !== undefined && typeof options.originKey !== "string") {
+		throw invalidArgument(
+			"executeBatch",
+			"options.originKey",
+			"string",
+			typeof options.originKey,
+		);
+	}
+}
+
+function withBatchStatementIndex(error: unknown, statementIndex: number): unknown {
+	if (!error || typeof error !== "object") return error;
+	const lixError = error as { details?: unknown };
+	const details = lixError.details;
+	lixError.details = {
+		...(details && typeof details === "object" && !Array.isArray(details)
+			? details
+			: details === undefined
+				? {}
+				: { cause: details }),
+		statementIndex,
+	};
+	return error;
 }

@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use serde_json::{Map as JsonMap, Value as JsonValue};
+
 use crate::branch::BranchRefReader;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql2;
@@ -308,6 +310,13 @@ pub struct ExecuteOptions {
     pub origin_key: Option<String>,
 }
 
+/// One SQL statement to execute as part of an atomic batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecuteBatchStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
 impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -412,6 +421,66 @@ where
             self.observe_invalidation.bump_if_storage_changed(&stats);
         }
         Ok(ExecuteResult::from_sql_query_result(read_result.query))
+    }
+
+    /// Executes SQL statements sequentially in one atomic transaction.
+    ///
+    /// Each statement receives its own parameter list. The transaction commits
+    /// only after every statement succeeds, so reads can observe earlier
+    /// staged writes while observers see only the final committed state.
+    pub async fn execute_batch(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.execute_batch_with_options(statements, ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn execute_batch_with_options(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.ensure_open()?;
+        if statements.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_batch requires at least one statement",
+            )
+            .with_details(serde_json::json!({
+                "operation": "executeBatch",
+                "argument": "statements",
+                "expected": "non-empty array",
+            })));
+        }
+
+        let statements = statements.to_vec();
+        self.with_write_transaction(move |transaction| {
+            Box::pin(async move {
+                let mut results = Vec::with_capacity(statements.len());
+                for (statement_index, statement) in statements.iter().enumerate() {
+                    let parsed = sql2::parse_statement(&statement.sql)
+                        .map_err(|error| with_batch_statement_index(error, statement_index))?;
+                    let result = execute_transaction_statement(
+                        transaction,
+                        &statement.sql,
+                        parsed,
+                        &statement.params,
+                        options.clone(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        with_batch_statement_index(
+                            normalize_sql_surface_error(error, &statement.sql),
+                            statement_index,
+                        )
+                    })?;
+                    results.push(result);
+                }
+                Ok(results)
+            })
+        })
+        .await
     }
 
     #[doc(hidden)]
@@ -702,20 +771,9 @@ where
         let _operation_guard = self.begin_session_operation()?;
         let statement = sql2::parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
-        match sql2::bind_statement_route(&statement)? {
-            sql2::BoundStatementRoute::Write => {
-                execute_transaction_write_auto(transaction, statement, params, options)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))
-            }
-            sql2::BoundStatementRoute::Read => {
-                let result = transaction
-                    .execute_read_sql_statement(sql, statement, params)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                Ok(ExecuteResult::from_sql_query_result(result))
-            }
-        }
+        execute_transaction_statement(transaction, sql, statement, params, options)
+            .await
+            .map_err(|error| normalize_sql_surface_error(error, sql))
     }
 
     #[cfg(test)]
@@ -794,6 +852,45 @@ where
     .await;
     transaction.replace_origin_key(previous_origin_key);
     result
+}
+
+async fn execute_transaction_statement<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    sql: &str,
+    statement: datafusion::sql::parser::Statement,
+    params: &[Value],
+    options: ExecuteOptions,
+) -> Result<ExecuteResult, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    match sql2::bind_statement_route(&statement)? {
+        sql2::BoundStatementRoute::Write => {
+            execute_transaction_write_auto(transaction, statement, params, options).await
+        }
+        sql2::BoundStatementRoute::Read => transaction
+            .execute_read_sql_statement(sql, statement, params)
+            .await
+            .map(ExecuteResult::from_sql_query_result),
+    }
+}
+
+fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
+    let mut details = match error.details.take() {
+        Some(JsonValue::Object(details)) => details,
+        Some(details) => {
+            let mut wrapped = JsonMap::new();
+            wrapped.insert("cause".to_string(), details);
+            wrapped
+        }
+        None => JsonMap::new(),
+    };
+    details.insert(
+        "statementIndex".to_string(),
+        JsonValue::from(statement_index),
+    );
+    error.details = Some(JsonValue::Object(details));
+    error
 }
 
 #[cfg(test)]

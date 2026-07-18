@@ -1,10 +1,12 @@
 import type {
+	BindingBatchStatement,
 	BindingParam,
 	LixStorageConfig,
 } from "../binding-types.js";
 import type {
 	CreateBranchOptions,
 	ExecuteOptions,
+	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
 } from "../types.js";
@@ -21,6 +23,11 @@ export type WorkerOperation =
 			sql: string;
 			params: BindingParam[];
 			options?: ExecuteOptions;
+	  }
+	| {
+			kind: "executeBatch";
+			statements: BindingBatchStatement[];
+			options?: LixBatchOptions;
 	  }
 	| { kind: "beginTransaction" }
 	| {

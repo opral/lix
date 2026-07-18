@@ -1,6 +1,6 @@
 use lix_sdk::{
-    CreateBranchOptions, Lix, LixError, Memory, MergeBranchOptions, MergeBranchOutcome,
-    OpenLixOptions, Storage, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, Storage, SwitchBranchOptions, Value, open_lix,
 };
 #[cfg(feature = "local_filesystem")]
 use lix_sdk::{LocalFilesystem, LocalFilesystemOpenOptions, open_lix_with_storage};
@@ -260,6 +260,100 @@ async fn transaction_commits_multiple_statements_together() {
         .await
         .unwrap();
     assert_eq!(committed.len(), 2);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_batch_is_atomic_and_returns_ordered_results() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let results = lix
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+                params: vec![
+                    Value::Text("batch-rs-a".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+                params: vec![
+                    Value::Text("batch-rs-b".to_string()),
+                    Value::Text("second".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key"
+                    .to_string(),
+                params: vec![
+                    Value::Text("batch-rs-a".to_string()),
+                    Value::Text("batch-rs-b".to_string()),
+                ],
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].rows_affected(), 1);
+    assert_eq!(results[1].rows_affected(), 1);
+    assert_eq!(
+        results[2]
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Text("batch-rs-a".to_string()),
+                Value::Json("first".into()),
+            ],
+            vec![
+                Value::Text("batch-rs-b".to_string()),
+                Value::Json("second".into()),
+            ],
+        ]
+    );
+
+    let error = lix
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+                params: vec![
+                    Value::Text("batch-rs-rollback".to_string()),
+                    Value::Text("before failure".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT entity_pk FROM lix_state_history".to_string(),
+                params: Vec::new(),
+            },
+        ])
+        .await
+        .expect_err("middle batch statement should fail");
+    assert_eq!(error.code, LixError::CODE_HISTORY_FILTER_REQUIRED);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("statementIndex"))
+            .and_then(|value| value.as_u64()),
+        Some(1),
+    );
+
+    let rolled_back = lix
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = $1",
+            &[Value::Text("batch-rs-rollback".to_string())],
+        )
+        .await
+        .unwrap();
+    assert!(rolled_back.is_empty());
+
+    let empty_error = lix
+        .execute_batch(&[])
+        .await
+        .expect_err("empty batch should be rejected");
+    assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
     lix.close().await.unwrap();
 }
 

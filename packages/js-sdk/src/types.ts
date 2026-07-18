@@ -37,6 +37,15 @@ export type ExecuteOptions = {
 	originKey?: string;
 };
 
+export type LixBatchStatement = {
+	sql: string;
+	params?: readonly SqlParam[];
+};
+
+export type LixBatchOptions = {
+	originKey?: string;
+};
+
 export type ExecuteResult = {
 	columns: string[];
 	rows: RowLike[];

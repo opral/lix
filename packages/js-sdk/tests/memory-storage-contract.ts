@@ -113,6 +113,88 @@ export function registerMemoryStorageContract({
 			await lix.close();
 		});
 
+		test("executes ordered atomic batches with per-statement parameters", async () => {
+			const { openLix } = await loadSdk();
+			const lix = await wait(openLix(), "open memory Lix");
+
+			try {
+				const oneStatement = await lix.executeBatch([
+					{ sql: "SELECT $1 AS value", params: ["one statement"] },
+				]);
+				expect(oneStatement).toHaveLength(1);
+				expect(oneStatement[0]?.rows[0]?.get("value")).toBe(
+					"one statement",
+				);
+
+				const results = await lix.executeBatch([
+					{
+						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+						params: ["batch-a", "first"],
+					},
+					{
+						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+						params: ["batch-b", "second"],
+					},
+					{
+						sql: "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
+						params: ["batch-a", "batch-b"],
+					},
+				]);
+				expect(results).toHaveLength(3);
+				expect(results[0]?.rowsAffected).toBe(1);
+				expect(results[1]?.rowsAffected).toBe(1);
+				expect(
+					results[2]?.rows.map((row) => row.toObject()),
+				).toEqual([
+					{ key: "batch-a", value: "first" },
+					{ key: "batch-b", value: "second" },
+				]);
+
+				const executeResult = await lix.execute("SELECT $1 AS value", [
+					"execute remains unchanged",
+				]);
+				expect(executeResult.rows[0]?.get("value")).toBe(
+					"execute remains unchanged",
+				);
+
+				await expect(lix.executeBatch([])).rejects.toMatchObject({
+					name: "LixError",
+					code: "LIX_INVALID_ARGUMENT",
+					details: {
+						operation: "executeBatch",
+						argument: "statements",
+						expected: "non-empty array",
+						actual: "empty array",
+					},
+				});
+
+				await expect(
+					lix.executeBatch([
+						{
+							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+							params: ["batch-rolled-back", "before failure"],
+						},
+						{ sql: "SELECT entity_pk FROM lix_state_history" },
+						{
+							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+							params: ["batch-not-run", "after failure"],
+						},
+					]),
+				).rejects.toMatchObject({
+					name: "LixError",
+					code: "LIX_HISTORY_FILTER_REQUIRED",
+					details: { statementIndex: 1 },
+				});
+				const rolledBack = await lix.execute(
+					"SELECT key FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
+					["batch-rolled-back", "batch-not-run"],
+				);
+				expect(rolledBack.rows).toHaveLength(0);
+			} finally {
+				await lix.close();
+			}
+		});
+
 		test("creates, switches, previews, and merges branches", async () => {
 			const { openLix } = await loadSdk();
 			const lix = await wait(openLix(), "open memory Lix");
@@ -167,6 +249,55 @@ export function registerMemoryStorageContract({
 			});
 			events.close();
 			await lix.close();
+		});
+
+		test("observe reports only the final committed batch state", async () => {
+			const { openLix } = await loadSdk();
+			const lix = await wait(openLix(), "open memory Lix");
+			const events = lix.observe(
+				"SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
+				["batch-observe-a", "batch-observe-b"],
+			);
+
+			try {
+				const initial = await wait(events.next(), "initial batch observation");
+				expect(initial?.result.rows).toHaveLength(0);
+
+				const updatePromise = events.next();
+				const batch = lix.executeBatch([
+					{
+						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+						params: ["batch-observe-a", "first"],
+					},
+					{
+						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+						params: ["batch-observe-b", "second"],
+					},
+				]);
+				const update = await wait(updatePromise, "batch observation");
+				await wait(batch, "atomic batch");
+				expect(update?.sequence).toBe(1);
+				expect(update?.result.rows.map((row) => row.toObject())).toEqual([
+					{ key: "batch-observe-a", value: "first" },
+					{ key: "batch-observe-b", value: "second" },
+				]);
+
+				const noIntermediateUpdate = events.next();
+				await expect(
+					withTimeout(
+						noIntermediateUpdate,
+						"intermediate batch observation",
+						100,
+					),
+				).rejects.toThrow(/timed out/);
+				events.close();
+				await expect(
+					wait(noIntermediateUpdate, "closed batch observation"),
+				).resolves.toBeUndefined();
+			} finally {
+				events.close();
+				await lix.close();
+			}
 		});
 
 		test("observe rejects concurrent next and close resolves the pending next", async () => {

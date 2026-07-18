@@ -68,8 +68,8 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
-    CoherentReadBatch, ExecuteOptions, ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef,
-    TryFromValue,
+    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ObserveEvent,
+    ObserveEvents, Row, RowRef, TryFromValue,
 };
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
