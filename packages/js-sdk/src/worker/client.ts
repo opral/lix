@@ -1,5 +1,10 @@
 import { createWorkerConnection } from "#worker-factory";
-import type { LixStorageConfig } from "../binding-types.js";
+import type {
+	LixBinding,
+	LixStorageConfig,
+	LixTransactionBinding,
+	ObserveEventsBinding,
+} from "../binding-types.js";
 import {
 	deserializeWorkerError,
 	type WorkerConnection,
@@ -25,6 +30,84 @@ export async function openLixWorker(
 		await client.terminate();
 		throw error;
 	}
+}
+
+/** Opens the local worker transport behind the semantic Lix binding. */
+export async function openLixWorkerBinding(
+	storage: LixStorageConfig,
+	onDisposed?: () => void,
+): Promise<LixBinding> {
+	const client = await openLixWorker(storage, onDisposed);
+	return workerBinding(client);
+}
+
+function workerBinding(client: LixWorkerClient): LixBinding {
+	return {
+		execute: (sql, params, options) =>
+			client.request({ kind: "execute", sql, params, options }),
+		executeBatch: (statements, options) =>
+			client.request({ kind: "executeBatch", statements, options }),
+		observe: async (sql, params) => {
+			const observeId = await client.request<number>({
+				kind: "observe",
+				sql,
+				params,
+			});
+			return workerObserveBinding(client, observeId);
+		},
+		beginTransaction: async () => {
+			const transactionId = await client.request<number>({
+				kind: "beginTransaction",
+			});
+			return workerTransactionBinding(client, transactionId);
+		},
+		activeBranchId: () => client.request({ kind: "activeBranchId" }),
+		createBranch: (options) =>
+			client.request({ kind: "createBranch", options }),
+		switchBranch: (options) =>
+			client.request({ kind: "switchBranch", options }),
+		importFilesystemPaths: (paths) =>
+			client.request({ kind: "importFilesystemPaths", paths }),
+		mergeBranchPreview: (options) =>
+			client.request({ kind: "mergeBranchPreview", options }),
+		mergeBranch: (options) =>
+			client.request({ kind: "mergeBranch", options }),
+		syncDiskToLix: () => client.request({ kind: "syncDiskToLix" }),
+		close: async () => {
+			await client.request({ kind: "close" });
+			await client.terminate();
+		},
+	};
+}
+
+function workerTransactionBinding(
+	client: LixWorkerClient,
+	transactionId: number,
+): LixTransactionBinding {
+	return {
+		execute: (sql, params, options) =>
+			client.request({
+				kind: "transaction.execute",
+				transactionId,
+				sql,
+				params,
+				options,
+			}),
+		commit: () =>
+			client.request({ kind: "transaction.commit", transactionId }),
+		rollback: () =>
+			client.request({ kind: "transaction.rollback", transactionId }),
+	};
+}
+
+function workerObserveBinding(
+	client: LixWorkerClient,
+	observeId: number,
+): ObserveEventsBinding {
+	return {
+		next: () => client.request({ kind: "observe.next", observeId }),
+		close: () => client.notify({ kind: "observe.close", observeId }),
+	};
 }
 
 export class LixWorkerClient {

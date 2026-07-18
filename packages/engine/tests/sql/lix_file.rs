@@ -5,6 +5,66 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_update_can_compare_the_read_only_change_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('guarded-file', '/guarded.txt', X'6265666F7265')",
+                &[],
+            )
+            .await
+            .expect("guarded file insert should succeed");
+        let current = session
+            .execute(
+                "SELECT lixcol_change_id FROM lix_file WHERE id = 'guarded-file'",
+                &[],
+            )
+            .await
+            .expect("change id read should succeed");
+        let change_id = match current.rows()[0]
+            .value("lixcol_change_id")
+            .expect("change id column")
+        {
+            Value::Text(value) => value.clone(),
+            value => panic!("expected text change id, got {value:?}"),
+        };
+
+        let applied = session
+            .execute(
+                "UPDATE lix_file SET data = X'6166746572' WHERE path = '/guarded.txt' AND lixcol_change_id = $1",
+                &[Value::Text(change_id)],
+            )
+            .await
+            .expect("matching change id should be accepted in an update predicate");
+        assert_eq!(applied.rows_affected(), 1);
+
+        let stale = session
+            .execute(
+                "UPDATE lix_file SET data = X'7374616C65' WHERE path = '/guarded.txt' AND lixcol_change_id = 'stale'",
+                &[],
+            )
+            .await
+            .expect("stale change id should produce a zero-row update");
+        assert_eq!(stale.rows_affected(), 0);
+
+        let content = session
+            .execute("SELECT data FROM lix_file WHERE id = 'guarded-file'", &[])
+            .await
+            .expect("guarded file read should succeed");
+        assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec())]]);
+    }
+);
+
+simulation_test!(
     lix_file_read_allows_public_path_inside_scalar_function,
     |sim| async move {
         let engine = sim.boot_engine().await;
