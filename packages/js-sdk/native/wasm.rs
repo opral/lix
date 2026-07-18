@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Function, Promise, Reflect};
 use lix_sdk::{
-    CreateBranchOptions as RsCreateBranchOptions, ExecuteOptions as RsExecuteOptions,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
+    CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
+    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, Memory, MergeBranchOptions as RsMergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, Value, WasmComponentInstance, WasmLimits,
     WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime, open_lix,
@@ -99,6 +99,42 @@ impl WasmLix {
             .await
             .map_err(lix_error_to_js)?;
         execute_result_to_js(result)
+    }
+
+    #[wasm_bindgen(js_name = executeBatch)]
+    pub async fn execute_batch(
+        &self,
+        statements: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let statements: Vec<ExecuteBatchStatementDto> = from_js(statements)?;
+        let statements = statements
+            .into_iter()
+            .map(|statement| {
+                let params = statement
+                    .params
+                    .into_iter()
+                    .map(Value::try_from)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RsExecuteBatchStatement {
+                    sql: statement.sql,
+                    params,
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()
+            .map_err(lix_error_to_js)?;
+        let options = execute_options_from_js(options)?;
+        let results = self
+            .inner
+            .execute_batch_with_options(&statements, options)
+            .await
+            .map_err(lix_error_to_js)?;
+        let results = results
+            .into_iter()
+            .map(ExecuteResultDto::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(lix_error_to_js)?;
+        to_js(&results)
     }
 
     #[wasm_bindgen(js_name = observe)]
@@ -496,6 +532,14 @@ struct LixValueDto {
     kind: String,
     value: Option<serde_json::Value>,
     blob: Option<ByteBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecuteBatchStatementDto {
+    sql: String,
+    #[serde(default)]
+    params: Vec<LixValueDto>,
 }
 
 fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {

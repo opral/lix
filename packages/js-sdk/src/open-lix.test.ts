@@ -411,6 +411,44 @@ test("execute originKey is exposed on change and history surfaces without metada
 	await lix.close();
 });
 
+test("executeBatch propagates originKey to every write", async () => {
+	const lix = await openLix();
+	const firstFileId = "batch-origin-file-1";
+	const secondFileId = "batch-origin-file-2";
+
+	const results = await lix.executeBatch(
+		[
+			{
+				sql: "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+				params: [
+					firstFileId,
+					"/batch-origin-one.md",
+					new TextEncoder().encode("one\n"),
+				],
+			},
+			{
+				sql: "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+				params: [
+					secondFileId,
+					"/batch-origin-two.md",
+					new TextEncoder().encode("two\n"),
+				],
+			},
+		],
+		{ originKey: "batch-origin" },
+	);
+
+	expect(results.map((result) => result.rowsAffected)).toEqual([1, 1]);
+	expect(get(await currentFileChange(lix, firstFileId), "origin_key")).toBe(
+		"batch-origin",
+	);
+	expect(get(await currentFileChange(lix, secondFileId), "origin_key")).toBe(
+		"batch-origin",
+	);
+
+	await lix.close();
+});
+
 test("fs storage with external lixDir imports the directory and writes normal files back", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
