@@ -331,13 +331,12 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
         .await
         .expect_err("middle batch statement should fail");
     assert_eq!(error.code, LixError::CODE_HISTORY_FILTER_REQUIRED);
-    assert_eq!(
+    assert!(
         error
             .details
             .as_ref()
             .and_then(|details| details.get("statementIndex"))
-            .and_then(|value| value.as_u64()),
-        Some(1),
+            .is_some_and(|value| value.as_u64() == Some(1)),
     );
 
     let rolled_back = lix
