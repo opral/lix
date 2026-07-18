@@ -16,10 +16,16 @@ const fixtureSource = join(
 	"test-fixtures",
 	"vite-production",
 );
+const remoteFixtureSource = join(
+	packageDir,
+	"test-fixtures",
+	"vite-remote",
+);
 const viteBin = join(packageDir, "node_modules", "vite", "bin", "vite.js");
 const base = "/lix-sdk-smoke/";
 const tempRoot = await mkdtemp(join(tmpdir(), "lix-sdk-vite-smoke-"));
 const fixtureDir = join(tempRoot, "app");
+const remoteFixtureDir = join(tempRoot, "remote-app");
 let server;
 let browser;
 
@@ -146,6 +152,43 @@ try {
 		await server.close();
 		server = undefined;
 	}
+
+	await cp(remoteFixtureSource, remoteFixtureDir, { recursive: true });
+	await run(
+		"npm",
+		[
+			"install",
+			"--ignore-scripts",
+			"--no-audit",
+			"--no-fund",
+			"--no-package-lock",
+			"--omit=optional",
+			tarballPath,
+		],
+		{ cwd: remoteFixtureDir },
+	);
+	const remoteNodeEntry = (
+		await output(
+			process.execPath,
+			[
+				"--input-type=module",
+				"--eval",
+				"console.log(import.meta.resolve('@lix-js/sdk/remote'))",
+			],
+			{ cwd: remoteFixtureDir },
+		)
+	).trim();
+	assert.match(remoteNodeEntry, /\/dist\/remote\.js$/);
+	await run(process.execPath, [viteBin, "build"], { cwd: remoteFixtureDir });
+	const remoteAssets = await readdir(join(remoteFixtureDir, "dist", "assets"));
+	assert.ok(
+		remoteAssets.every((file) => !file.endsWith(".wasm")),
+		`Remote-only Vite build emitted WASM: ${remoteAssets.join(", ")}`,
+	);
+	assert.ok(
+		remoteAssets.every((file) => !file.startsWith("entry.browser-")),
+		"Remote-only Vite build emitted the local browser worker",
+	);
 	console.log("Packed Vite production smoke passed.");
 } finally {
 	await browser?.close();
