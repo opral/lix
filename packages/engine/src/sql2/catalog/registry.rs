@@ -460,7 +460,7 @@ fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::hidden("lixcol_schema_key"),
         PublicColumn::hidden("lixcol_file_id"),
         PublicColumn::public_insert_only("lixcol_global"),
-        PublicColumn::hidden("lixcol_change_id"),
+        PublicColumn::public_read_only("lixcol_change_id"),
         PublicColumn::hidden("lixcol_created_at"),
         PublicColumn::hidden("lixcol_updated_at"),
         PublicColumn::hidden("lixcol_commit_id"),

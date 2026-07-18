@@ -89,3 +89,47 @@ test("Workerd snapshots reject malformed bytes", async () => {
 		openMemoryLix({ snapshot: new Uint8Array([1, 2, 3]) }),
 	).rejects.toThrow(/invalid in-memory snapshot/);
 });
+
+test("Workerd executeBatch accepts nested statement parameters", async () => {
+	const lix = await openMemoryLix();
+	try {
+		const [inserted] = await lix.executeBatch([
+			{
+				sql: "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+				params: [
+					{ kind: "text", value: "/batch.txt" },
+					{
+						kind: "blob",
+						value: null,
+						blob: new TextEncoder().encode("before"),
+					},
+				],
+			},
+		]);
+		expect(inserted?.rowsAffected).toBe(1);
+
+		const current = await lix.execute(
+			"SELECT lixcol_change_id FROM lix_file WHERE path = '/batch.txt'",
+			noParams,
+		);
+		const revision = current.rows[0]?.[0];
+		expect(revision).toMatchObject({ kind: "text" });
+		const [updated] = await lix.executeBatch([
+			{
+				sql: "UPDATE lix_file SET data = $1 WHERE path = $2 AND lixcol_change_id = $3",
+				params: [
+					{
+						kind: "blob",
+						value: null,
+						blob: new TextEncoder().encode("after"),
+					},
+					{ kind: "text", value: "/batch.txt" },
+					revision!,
+				],
+			},
+		]);
+		expect(updated?.rowsAffected).toBe(1);
+	} finally {
+		await lix.close();
+	}
+});

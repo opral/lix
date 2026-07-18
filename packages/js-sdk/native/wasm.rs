@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use futures_util::future::{AbortHandle, Abortable};
-use js_sys::{Function, Promise, Reflect};
+use js_sys::{Array, Function, Promise, Reflect};
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
     ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
@@ -107,22 +107,7 @@ impl WasmLix {
         statements: JsValue,
         options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let statements: Vec<ExecuteBatchStatementDto> = from_js(statements)?;
-        let statements = statements
-            .into_iter()
-            .map(|statement| {
-                let params = statement
-                    .params
-                    .into_iter()
-                    .map(Value::try_from)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(RsExecuteBatchStatement {
-                    sql: statement.sql,
-                    params,
-                })
-            })
-            .collect::<Result<Vec<_>, LixError>>()
-            .map_err(lix_error_to_js)?;
+        let statements = batch_statements_from_js(statements)?;
         let options = execute_options_from_js(options)?;
         let results = self
             .inner
@@ -534,14 +519,6 @@ struct LixValueDto {
     blob: Option<ByteBuf>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExecuteBatchStatementDto {
-    sql: String,
-    #[serde(default)]
-    params: Vec<LixValueDto>,
-}
-
 fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
     let values: Vec<LixValueDto> = from_js(value)?;
     values
@@ -549,6 +526,35 @@ fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
         .map(Value::try_from)
         .collect::<Result<Vec<_>, _>>()
         .map_err(lix_error_to_js)
+}
+
+fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
+    if !Array::is_array(&value) {
+        return Err(lix_error_to_js(invalid_param(
+            "executeBatch statements must be an array",
+        )));
+    }
+    Array::from(&value)
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            let sql = Reflect::get(&statement, &JsValue::from_str("sql"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .ok_or_else(|| {
+                    lix_error_to_js(invalid_param(format!(
+                        "executeBatch statement at index {index} must include SQL text"
+                    )))
+                })?;
+            let params = Reflect::get(&statement, &JsValue::from_str("params"))?;
+            let params = if params.is_undefined() {
+                Vec::new()
+            } else {
+                values_from_js(params)?
+            };
+            Ok(RsExecuteBatchStatement { sql, params })
+        })
+        .collect()
 }
 
 impl TryFrom<LixValueDto> for Value {
