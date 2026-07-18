@@ -37,10 +37,26 @@ export type RemoteExecuteResponse = {
 
 export type RemoteObserveRequest = Omit<RemoteExecuteRequest, "options">;
 
+export type RemoteObserveSubscription = Omit<
+	RemoteObserveRequest,
+	"branchId"
+> & {
+	id: string;
+};
+
+export type RemoteMultiplexObserveRequest = {
+	branchId: string;
+	subscriptions: RemoteObserveSubscription[];
+};
+
 export type RemoteObserveEvent = {
 	sequence: number;
 	mutationSequence: number;
 	result: RemoteExecuteResponse;
+};
+
+export type RemoteMultiplexObserveEvent = RemoteObserveEvent & {
+	subscriptionId: string;
 };
 
 export type RemoteCreateBranchRequest = {
@@ -71,6 +87,10 @@ export type RemoteErrorBody = {
 
 export type RemoteObserveErrorEvent = RemoteErrorBody & {
 	retryable?: boolean;
+};
+
+export type RemoteMultiplexObserveErrorEvent = RemoteObserveErrorEvent & {
+	subscriptionId?: string;
 };
 
 export function encodeWireValue(value: NativeLixValue): WireValue {
