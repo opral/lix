@@ -55,6 +55,21 @@ so it does not take a client `storage`. Dynamic headers are resolved for every
 request and observation reconnect. An injected `fetch` can route requests
 through a service binding or another authorized server-side transport.
 
+Browser deployments that only use remote mode can import the same API from the
+remote-only entrypoint. This keeps the local worker and engine WASM out of the
+bundle:
+
+```ts
+import { openLix } from "@lix-js/sdk/remote";
+
+const lix = await openLix({
+	server: {
+		mode: "remote",
+		url: "https://lixray.com/@namespace/workspace",
+	},
+});
+```
+
 Filesystem sync and SQLite persistence use native Node.js dependencies:
 
 ```ts
