@@ -10,7 +10,7 @@ test("remote observe streams native Lix results", async () => {
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
-				return new URL(request.url).pathname.endsWith("/.lix/v1/")
+				return new URL(request.url).pathname.endsWith("/lix/v1/")
 					? handshake()
 					: sseResponse(
 							sseFrame(
@@ -29,10 +29,9 @@ test("remote observe streams native Lix results", async () => {
 	expect(initial?.result.rows[0]?.get("value")).toBe("hello");
 	expect(requests[1]?.headers.get("accept")).toBe("text/event-stream");
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
-		"/@acme/workspace/.lix/v1/observe/multiplex",
+		"/@acme/workspace/lix/v1/observe/multiplex",
 	);
 	expect(await requests[1]?.json()).toEqual({
-		branchId: "main-id",
 		subscriptions: [
 			{
 				id: "observe-1",
@@ -58,7 +57,7 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/.lix/v1/")) return handshake();
+				if (pathname.endsWith("/lix/v1/")) return handshake();
 				if (pathname.endsWith("/execute")) {
 					return Response.json({
 						columns: ["value"],
@@ -149,7 +148,7 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 				url: "https://lixray.test/@acme/workspace",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
-					if (new URL(request.url).pathname.endsWith("/.lix/v1/")) {
+					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
 					observeRequests += 1;
@@ -193,7 +192,7 @@ test("remote observe can continue after a semantic SSE error", async () => {
 				url: "https://lixray.test/@acme/workspace",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
-					if (new URL(request.url).pathname.endsWith("/.lix/v1/")) {
+					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
 					observeRequests += 1;
@@ -248,7 +247,7 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 			mode: "remote",
 			url: "https://lixray.test/@acme/workspace",
 			fetch: async (input) => {
-				if (new URL(input.toString()).pathname.endsWith("/.lix/v1/")) {
+				if (new URL(input.toString()).pathname.endsWith("/lix/v1/")) {
 					return handshake();
 				}
 				observeRequests += 1;
@@ -278,8 +277,9 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 	await lix.close();
 });
 
-test("a successful branch switch restarts existing remote observations", async () => {
-	const observedBranches: string[] = [];
+test("a successful branch switch updates observations on the existing server stream", async () => {
+	let observeController: ReadableStreamDefaultController<Uint8Array> | undefined;
+	let observeRequests = 0;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -287,11 +287,11 @@ test("a successful branch switch restarts existing remote observations", async (
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/.lix/v1/")) return handshake();
+				if (pathname.endsWith("/lix/v1/")) return handshake();
 				if (pathname.endsWith("/branch/switch")) {
 					const body = (await request.json()) as { branchId: string };
-					return body.branchId === "missing-id"
-						? Response.json(
+					if (body.branchId === "missing-id") {
+						return Response.json(
 								{
 									error: {
 										code: "LIX_BRANCH_NOT_FOUND",
@@ -299,17 +299,34 @@ test("a successful branch switch restarts existing remote observations", async (
 									},
 								},
 								{ status: 404 },
-							)
-						: Response.json({ branchId: body.branchId });
+							);
+					}
+					observeController?.enqueue(
+						new TextEncoder().encode(
+							sseFrame(
+								"next",
+								multiplexObservePayload("observe-1", body.branchId, 1, 1),
+							),
+						),
+					);
+					return Response.json({ branchId: body.branchId });
 				}
-				const body = (await request.clone().json()) as { branchId: string };
-				observedBranches.push(body.branchId);
-				return heldSseResponse(
-					sseFrame(
-						"next",
-						multiplexObservePayload("observe-1", body.branchId, 0, 0),
-					),
-					request.signal,
+				observeRequests += 1;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							observeController = controller;
+							controller.enqueue(
+								new TextEncoder().encode(
+									sseFrame(
+										"next",
+										multiplexObservePayload("observe-1", "main-id", 0, 0),
+									),
+								),
+							);
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
 				);
 			},
 		},
@@ -322,81 +339,13 @@ test("a successful branch switch restarts existing remote observations", async (
 	const switched = await afterSwitch;
 	expect(switched?.result.rows[0]?.get("value")).toBe("draft-id");
 	expect(switched?.sequence).toBe(1);
-	expect(observedBranches).toEqual(["main-id", "draft-id"]);
+	expect(observeRequests).toBe(1);
 	await expect(
 		lix.switchBranch({ branchId: "missing-id" }),
 	).rejects.toMatchObject({ code: "LIX_BRANCH_NOT_FOUND" });
-	expect(observedBranches).toEqual(["main-id", "draft-id"]);
+	expect(observeRequests).toBe(1);
 
 	events.close();
-	await lix.close();
-});
-
-test("a stale pre-switch HTTP error cannot fail the restarted observation", async () => {
-	const firstObserveOpened = deferred<void>();
-	let staleBody: ReadableStreamDefaultController<Uint8Array> | undefined;
-	let observeRequests = 0;
-	const lix = await openLix({
-		server: {
-			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
-			fetch: async (input, init) => {
-				const request = new Request(input, init);
-				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/.lix/v1/")) return handshake();
-				if (pathname.endsWith("/branch/switch")) {
-					return Response.json({ branchId: "draft-id" });
-				}
-				observeRequests += 1;
-				if (observeRequests === 1) {
-					firstObserveOpened.resolve();
-					return new Response(
-						new ReadableStream<Uint8Array>({
-							start(controller) {
-								staleBody = controller;
-							},
-						}),
-						{
-							status: 400,
-							headers: { "content-type": "application/json" },
-						},
-					);
-				}
-				return heldSseResponse(
-					sseFrame("next", multiplexObservePayload("observe-1", "draft", 0, 1)),
-					request.signal,
-				);
-			},
-		},
-	});
-
-	const events = lix.observe("SELECT value");
-	const first = events.next();
-	await firstObserveOpened.promise;
-	await lix.switchBranch({ branchId: "draft-id" });
-	expect((await first)?.result.rows[0]?.get("value")).toBe("draft");
-	staleBody?.enqueue(
-		new TextEncoder().encode(
-			JSON.stringify({
-				error: { code: "LIX_STALE", message: "stale main error" },
-			}),
-		),
-	);
-	staleBody?.close();
-	await Promise.resolve();
-	await Promise.resolve();
-
-	const later = events.next();
-	const state = await Promise.race([
-		later.then(
-			() => "resolved",
-			() => "rejected",
-		),
-		new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 0)),
-	]);
-	expect(state).toBe("pending");
-	events.close();
-	expect(await later).toBeUndefined();
 	await lix.close();
 });
 
@@ -413,7 +362,7 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 				headers: () => ({ Authorization: `Bearer token-${++headerCalls}` }),
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
-					if (new URL(request.url).pathname.endsWith("/.lix/v1/")) {
+					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
 					observeRequests += 1;
@@ -468,7 +417,7 @@ test("closing Lix resolves pending remote observation reads", async () => {
 			url: "https://lixray.test/@acme/workspace",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
-				return new URL(request.url).pathname.endsWith("/.lix/v1/")
+				return new URL(request.url).pathname.endsWith("/lix/v1/")
 					? handshake()
 					: heldSseResponse("", request.signal);
 			},
@@ -492,7 +441,7 @@ test("closing Lix stops observations before an earlier finite request settles", 
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/.lix/v1/")) return handshake();
+				if (pathname.endsWith("/lix/v1/")) return handshake();
 				if (pathname.endsWith("/observe/multiplex")) {
 					return heldSseResponse("", request.signal);
 				}

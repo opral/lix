@@ -32,7 +32,8 @@ pub use lix_engine::{
     StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
     StorageFactory, StorageFixture, StorageRead, StorageTestConfig, StorageWrite, StoredValue,
     SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
-    TryFromValue, Value, WriteOptions, WriteStats, parse_sql_script, run_storage_conformance,
+    TryFromValue, Value, WireValue, WriteOptions, WriteStats, parse_sql_script,
+    run_storage_conformance,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

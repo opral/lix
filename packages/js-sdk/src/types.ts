@@ -16,7 +16,6 @@ export type RemoteLixFetch = (
 export type RemoteLixServerOptions = {
 	mode: "remote";
 	url: string | URL;
-	branchId?: string;
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
 	fetch?: RemoteLixFetch;
 };

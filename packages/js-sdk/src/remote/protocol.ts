@@ -5,7 +5,7 @@ import type {
 import type { NativeLixValue } from "../value.js";
 
 export const REMOTE_PROTOCOL_VERSION = 1;
-export const REMOTE_PROTOCOL_PATH = "/.lix/v1/";
+export const REMOTE_PROTOCOL_PATH = "/lix/v1/";
 
 export type WireValue =
 	| { kind: "null"; value: null }
@@ -22,9 +22,13 @@ export type RemoteHandshake = {
 };
 
 export type RemoteExecuteRequest = {
-	branchId: string;
 	sql: string;
 	params: WireValue[];
+	options?: { originKey?: string };
+};
+
+export type RemoteExecuteBatchRequest = {
+	statements: Array<{ sql: string; params: WireValue[] }>;
 	options?: { originKey?: string };
 };
 
@@ -37,15 +41,11 @@ export type RemoteExecuteResponse = {
 
 export type RemoteObserveRequest = Omit<RemoteExecuteRequest, "options">;
 
-export type RemoteObserveSubscription = Omit<
-	RemoteObserveRequest,
-	"branchId"
-> & {
+export type RemoteObserveSubscription = RemoteObserveRequest & {
 	id: string;
 };
 
 export type RemoteMultiplexObserveRequest = {
-	branchId: string;
 	subscriptions: RemoteObserveSubscription[];
 };
 
@@ -60,7 +60,6 @@ export type RemoteMultiplexObserveEvent = RemoteObserveEvent & {
 };
 
 export type RemoteCreateBranchRequest = {
-	branchId: string;
 	id?: string;
 	name: string;
 	fromCommitId?: string;

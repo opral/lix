@@ -1,5 +1,6 @@
 import type {
 	BindingExecuteResult,
+	BindingBatchStatement,
 	BindingObserveEvent,
 	LixBinding,
 	LixTransactionBinding,
@@ -9,6 +10,7 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	ExecuteOptions,
+	LixBatchOptions,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
@@ -25,6 +27,7 @@ import {
 	errorFromResponseBody,
 	protocolError,
 	record,
+	REMOTE_PROTOCOL_PATH,
 	remoteError,
 	type RemoteObserveSubscription,
 } from "./protocol.js";
@@ -45,9 +48,7 @@ class RemoteLixBinding implements LixBinding {
 	readonly #baseUrl: URL;
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
-	readonly #initialBranchId: string | undefined;
 	readonly #observationHub: RemoteObservationHub;
-	#activeBranchId = "";
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
 
@@ -65,14 +66,6 @@ class RemoteLixBinding implements LixBinding {
 		}
 		this.#fetch = remoteFetch;
 		if (
-			options.branchId !== undefined &&
-			(typeof options.branchId !== "string" || options.branchId.length === 0)
-		) {
-			throw new TypeError(
-				"openLix() remote server branchId must be a non-empty string",
-			);
-		}
-		if (
 			options.headers !== undefined &&
 			typeof options.headers !== "function" &&
 			!isHeadersInit(options.headers)
@@ -82,20 +75,14 @@ class RemoteLixBinding implements LixBinding {
 			);
 		}
 		this.#headers = options.headers;
-		this.#initialBranchId = options.branchId;
 		this.#observationHub = new RemoteObservationHub({
-			activeBranchId: () => this.#activeBranchId,
-			openStream: (branchId, subscriptions, signal) =>
-				this.#requestObserveStream(branchId, subscriptions, signal),
+			openStream: (subscriptions, signal) =>
+				this.#requestObserveStream(subscriptions, signal),
 		});
 	}
 
 	async open(): Promise<void> {
-		const handshake = decodeHandshake(await this.#requestJson("", { method: "GET" }));
-		this.#activeBranchId = handshake.activeBranchId;
-		if (this.#initialBranchId !== undefined) {
-			await this.switchBranch({ branchId: this.#initialBranchId });
-		}
+		decodeHandshake(await this.#requestJson("", { method: "GET" }));
 	}
 
 	async execute(
@@ -109,7 +96,6 @@ class RemoteLixBinding implements LixBinding {
 				await this.#requestJson("execute", {
 					method: "POST",
 					body: JSON.stringify({
-						branchId: this.#activeBranchId,
 						sql,
 						params: params.map(encodeWireValue),
 						...(options === undefined ? {} : { options }),
@@ -117,6 +103,29 @@ class RemoteLixBinding implements LixBinding {
 				}),
 			),
 		);
+	}
+
+	async executeBatch(
+		statements: BindingBatchStatement[],
+		options?: LixBatchOptions,
+	): Promise<BindingExecuteResult[]> {
+		this.#assertOpen();
+		return this.#enqueue(async () => {
+			const value = await this.#requestJson("execute-batch", {
+				method: "POST",
+				body: JSON.stringify({
+					statements: statements.map((statement) => ({
+						sql: statement.sql,
+						params: statement.params.map(encodeWireValue),
+					})),
+					...(options === undefined ? {} : { options }),
+				}),
+			});
+			if (!Array.isArray(value)) {
+				throw protocolError("execute batch response must be an array");
+			}
+			return value.map(decodeExecuteResult);
+		});
 	}
 
 	async observe(
@@ -136,7 +145,10 @@ class RemoteLixBinding implements LixBinding {
 
 	async activeBranchId(): Promise<string> {
 		this.#assertOpen();
-		return this.#enqueue(async () => this.#activeBranchId);
+		return this.#enqueue(async () =>
+			decodeHandshake(await this.#requestJson("", { method: "GET" }))
+				.activeBranchId,
+		);
 	}
 
 	async createBranch(
@@ -147,10 +159,7 @@ class RemoteLixBinding implements LixBinding {
 			const value = record(
 				await this.#requestJson("branch/create", {
 					method: "POST",
-					body: JSON.stringify({
-						branchId: this.#activeBranchId,
-						...options,
-					}),
+					body: JSON.stringify(options),
 				}),
 				"create branch response",
 			);
@@ -186,8 +195,6 @@ class RemoteLixBinding implements LixBinding {
 			if (value.branchId !== options.branchId) {
 				throw protocolError("switch branch response is invalid");
 			}
-			this.#activeBranchId = options.branchId;
-			this.#observationHub.restart();
 			return { branchId: options.branchId };
 		});
 	}
@@ -252,7 +259,6 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async #requestObserveStream(
-		branchId: string,
 		subscriptions: RemoteObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response> {
@@ -272,7 +278,7 @@ class RemoteLixBinding implements LixBinding {
 			return await this.#fetch(new URL("observe/multiplex", this.#baseUrl), {
 				method: "POST",
 				headers,
-				body: JSON.stringify({ branchId, subscriptions }),
+				body: JSON.stringify({ subscriptions }),
 				signal,
 			});
 		} catch (cause) {
@@ -311,16 +317,13 @@ type ObserveOutcome =
 	| { ok: false; error: unknown };
 
 type RemoteObservationHubOptions = {
-	activeBranchId(): string;
 	openStream(
-		branchId: string,
 		subscriptions: RemoteObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response>;
 };
 
 class RemoteObservationHub {
-	readonly #activeBranchId: () => string;
 	readonly #openStream: RemoteObservationHubOptions["openStream"];
 	readonly #observations = new Map<string, RemoteObservation>();
 	#nextObservationId = 0;
@@ -332,7 +335,6 @@ class RemoteObservationHub {
 	#closed = false;
 
 	constructor(options: RemoteObservationHubOptions) {
-		this.#activeBranchId = options.activeBranchId;
 		this.#openStream = options.openStream;
 	}
 
@@ -353,14 +355,6 @@ class RemoteObservationHub {
 		this.#observations.set(id, observation);
 		this.#restartStream();
 		return observation;
-	}
-
-	restart(): void {
-		if (this.#closed) return;
-		for (const observation of this.#observations.values()) {
-			observation.restart();
-		}
-		this.#restartStream();
 	}
 
 	close(): void {
@@ -412,7 +406,6 @@ class RemoteObservationHub {
 		let streamOpened = false;
 		try {
 			const response = await this.#openStream(
-				this.#activeBranchId(),
 				[...this.#observations.values()].map((observation) =>
 					observation.request(),
 				),
@@ -635,12 +628,6 @@ class RemoteObservation implements ObserveEventsBinding {
 		});
 	}
 
-	restart(): void {
-		if (this.#closed) return;
-		this.#terminalError = undefined;
-		this.#outcomes = [];
-	}
-
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -834,7 +821,7 @@ function protocolBaseUrl(value: string | URL): URL {
 			"openLix() remote server url must not contain a query or fragment",
 		);
 	}
-	workspaceUrl.pathname = `${workspaceUrl.pathname.replace(/\/$/, "")}/.lix/v1/`;
+	workspaceUrl.pathname = `${workspaceUrl.pathname.replace(/\/$/, "")}${REMOTE_PROTOCOL_PATH}`;
 	return workspaceUrl;
 }
 

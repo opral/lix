@@ -7,10 +7,10 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	const remoteFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 		const request = new Request(input, init);
 		requests.push(request);
-		if (new URL(request.url).pathname.endsWith("/.lix/v1/")) {
+		if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 			return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
 		}
-		if (new URL(request.url).pathname.endsWith("/.lix/v1/execute")) {
+		if (new URL(request.url).pathname.endsWith("/lix/v1/execute")) {
 			return Response.json({
 				columns: ["n", "bytes", "json"],
 				rows: [
@@ -58,14 +58,14 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 		new Uint8Array([1, 2, 3]),
 	);
 	expect(result.rows[0]?.get("json")).toEqual({ ok: true });
-	expect(headerCalls).toBe(2);
+	expect(headerCalls).toBe(3);
 	expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
-		"/@acme/workspace/.lix/v1/",
-		"/@acme/workspace/.lix/v1/execute",
+		"/@acme/workspace/lix/v1/",
+		"/@acme/workspace/lix/v1/",
+		"/@acme/workspace/lix/v1/execute",
 	]);
-	expect(requests[1]?.headers.get("authorization")).toBe("Bearer token-2");
-	expect(await requests[1]?.json()).toEqual({
-		branchId: "main-id",
+	expect(requests[2]?.headers.get("authorization")).toBe("Bearer token-3");
+	expect(await requests[2]?.json()).toEqual({
 		sql: "SELECT $1, $2, $3, $4, $5, $6, $7",
 		params: [
 			{ kind: "null", value: null },
@@ -82,25 +82,83 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	await lix.close();
 });
 
-test("remote branches preserve local Lix branch semantics", async () => {
+test("remote executeBatch uses the first-class atomic batch endpoint", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
 			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				return new URL(request.url).pathname.endsWith("/lix/v1/")
+					? Response.json({ protocolVersion: 1, activeBranchId: "main-id" })
+					: Response.json([
+							{
+								columns: ["value"],
+								rows: [[{ kind: "int", value: 1 }]],
+								rowsAffected: 0,
+								notices: [],
+							},
+							{
+								columns: ["value"],
+								rows: [[{ kind: "text", value: "two" }]],
+								rowsAffected: 0,
+								notices: [],
+							},
+						]);
+			},
+		},
+	});
+
+	const results = await lix.executeBatch(
+		[
+			{ sql: "SELECT $1 AS value", params: [1] },
+			{ sql: "SELECT $1 AS value", params: ["two"] },
+		],
+		{ originKey: "batch-test" },
+	);
+	expect(results.map((result) => result.rows[0]?.get("value"))).toEqual([
+		1,
+		"two",
+	]);
+	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
+		"/@acme/workspace/lix/v1/execute-batch",
+	);
+	expect(await requests[1]?.json()).toEqual({
+		statements: [
+			{ sql: "SELECT $1 AS value", params: [{ kind: "int", value: 1 }] },
+			{
+				sql: "SELECT $1 AS value",
+				params: [{ kind: "text", value: "two" }],
+			},
+		],
+		options: { originKey: "batch-test" },
+	});
+
+	await lix.close();
+});
+
+test("remote branches preserve local Lix branch semantics", async () => {
+	const requests: Request[] = [];
+	let activeBranchId = "main-id";
+	const lix = await openLix({
+		server: {
+			mode: "remote",
 			url: new URL("https://lixray.test/@acme/workspace/"),
-			branchId: "requested-id",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/.lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/")) {
 					return Response.json({
 						protocolVersion: 1,
-						activeBranchId: "main-id",
+						activeBranchId,
 					});
 				}
 				if (pathname.endsWith("/branch/switch")) {
 					const body = (await request.json()) as { branchId: string };
+					activeBranchId = body.branchId;
 					return Response.json({ branchId: body.branchId });
 				}
 				if (pathname.endsWith("/branch/create")) {
@@ -116,17 +174,15 @@ test("remote branches preserve local Lix branch semantics", async () => {
 		},
 	});
 
-	expect(await lix.activeBranchId()).toBe("requested-id");
+	expect(await lix.activeBranchId()).toBe("main-id");
 	const created = await lix.createBranch({ name: "Draft" });
 	expect(created.id).toBe("draft-id");
-	expect(await lix.activeBranchId()).toBe("requested-id");
+	expect(await lix.activeBranchId()).toBe("main-id");
 	await lix.switchBranch({ branchId: created.id });
 	expect(await lix.activeBranchId()).toBe("draft-id");
-	expect(
-		await Promise.all(requests.slice(1).map((request) => request.clone().json())),
-	).toEqual([
-		{ branchId: "requested-id" },
-		{ branchId: "requested-id", name: "Draft" },
+	const posted = requests.filter((request) => request.method === "POST");
+	expect(await Promise.all(posted.map((request) => request.clone().json()))).toEqual([
+		{ name: "Draft" },
 		{ branchId: "draft-id" },
 	]);
 
@@ -140,7 +196,7 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 			url: "https://lixray.test/@acme/workspace",
 			fetch: (async (input: RequestInfo | URL) => {
 				const pathname = new URL(input.toString()).pathname;
-				return pathname.endsWith("/.lix/v1/")
+				return pathname.endsWith("/lix/v1/")
 					? Response.json({ protocolVersion: 1, activeBranchId: "main-id" })
 					: Response.json(
 							{
@@ -170,13 +226,44 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 	await lix.close();
 });
 
+test("remote clients share the same workspace active branch", async () => {
+	let activeBranchId = "main-id";
+	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+		const request = new Request(input, init);
+		const pathname = new URL(request.url).pathname;
+		if (pathname.endsWith("/lix/v1/")) {
+			return Response.json({ protocolVersion: 1, activeBranchId });
+		}
+		if (pathname.endsWith("/branch/switch")) {
+			activeBranchId = ((await request.json()) as { branchId: string }).branchId;
+			return Response.json({ branchId: activeBranchId });
+		}
+		throw new Error(`Unexpected request: ${pathname}`);
+	};
+	const options = {
+		server: {
+			mode: "remote" as const,
+			url: "https://lixray.test/@acme/workspace",
+			fetch: remoteFetch,
+		},
+	};
+	const first = await openLix(options);
+	const second = await openLix(options);
+
+	await first.switchBranch({ branchId: "draft-id" });
+	expect(await first.activeBranchId()).toBe("draft-id");
+	expect(await second.activeBranchId()).toBe("draft-id");
+
+	await Promise.all([first.close(), second.close()]);
+});
+
 test("remote operations preserve normal Lix call ordering", async () => {
 	let finishSwitch: (() => void) | undefined;
 	const switchGate = new Promise<void>((resolve) => {
 		finishSwitch = resolve;
 	});
 	const requestOrder: string[] = [];
-	let executeBranchId = "";
+	let executeBody: unknown;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -184,7 +271,7 @@ test("remote operations preserve normal Lix call ordering", async () => {
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/.lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/")) {
 					return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
 				}
 				if (pathname.endsWith("/branch/switch")) {
@@ -194,8 +281,7 @@ test("remote operations preserve normal Lix call ordering", async () => {
 				}
 				if (pathname.endsWith("/execute")) {
 					requestOrder.push("execute");
-					executeBranchId = ((await request.json()) as { branchId: string })
-						.branchId;
+					executeBody = await request.json();
 					return Response.json({
 						columns: [],
 						rows: [],
@@ -216,7 +302,7 @@ test("remote operations preserve normal Lix call ordering", async () => {
 	finishSwitch?.();
 	await Promise.all([switching, executing]);
 	expect(requestOrder).toEqual(["switch", "execute"]);
-	expect(executeBranchId).toBe("draft-id");
+	expect(executeBody).toEqual({ sql: "SELECT 1", params: [] });
 
 	await lix.close();
 });
@@ -229,7 +315,7 @@ test("remote responses reject malformed rows and non-JSON HTTP errors", async ()
 			url: "https://lixray.test/@acme/workspace",
 			fetch: async (input) => {
 				const pathname = new URL(input.toString()).pathname;
-				if (pathname.endsWith("/.lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/")) {
 					return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
 				}
 				executeCalls += 1;

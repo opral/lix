@@ -14,7 +14,7 @@ test("the remote-only entrypoint opens the same Lix facade", async () => {
 	});
 
 	expect(await lix.activeBranchId()).toBe("main-id");
-	expect(remoteFetch).toHaveBeenCalledOnce();
+	expect(remoteFetch).toHaveBeenCalledTimes(2);
 	await lix.close();
 });
 
