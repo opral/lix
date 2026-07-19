@@ -466,6 +466,7 @@ impl TableSpec for LixFileSpec {
         if ExactStringColumnFilterAnalyzer::new("lixcol_branch_id").supports(filter)
             || analyzer.supports(filter)
             || ExactStringColumnFilterAnalyzer::new("directory_id").supports(filter)
+            || is_null_column_filter(filter, "directory_id")
             || contains_column(filter, "path")
         {
             TableProviderFilterPushDown::Exact
@@ -504,6 +505,9 @@ impl TableSpec for LixFileSpec {
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let target_directory_ids =
             exact_string_column_constraint_from_filters(&filters, "directory_id")?;
+        let root_directory_filter = filters
+            .iter()
+            .any(|filter| is_null_column_filter(filter, "directory_id"));
         let path_predicate = file_path_predicate_from_filters(&filters);
         // The path index carries every descriptor column, not just `path`.
         // Prefer it for all descriptor-only scans so queries such as
@@ -514,7 +518,8 @@ impl TableSpec for LixFileSpec {
         // to matching cached descriptors instead of scanning complete state.
         let use_path_index = should_use_path_index(&path_predicate, needs_blob_rows)
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
-            || matches!(&target_directory_ids, FileIdConstraint::Ids(_));
+            || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
+            || root_directory_filter;
         let indexed_matches = if !use_path_index {
             None
         } else {
@@ -525,26 +530,30 @@ impl TableSpec for LixFileSpec {
                 ))
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
-            let matches = match (&target_file_ids, &target_directory_ids) {
-                (FileIdConstraint::Ids(file_ids), FileIdConstraint::Ids(directory_ids)) => {
-                    indexed_file_directory_matches(
+            let matches = if root_directory_filter {
+                indexed_file_root_matches(Arc::clone(&index), &target_file_ids, &path_predicate)
+            } else {
+                match (&target_file_ids, &target_directory_ids) {
+                    (FileIdConstraint::Ids(file_ids), FileIdConstraint::Ids(directory_ids)) => {
+                        indexed_file_directory_matches(
+                            Arc::clone(&index),
+                            directory_ids,
+                            Some(file_ids),
+                            &path_predicate,
+                        )
+                    }
+                    (_, FileIdConstraint::Ids(directory_ids)) => indexed_file_directory_matches(
                         Arc::clone(&index),
                         directory_ids,
-                        Some(file_ids),
+                        None,
                         &path_predicate,
-                    )
-                }
-                (_, FileIdConstraint::Ids(directory_ids)) => indexed_file_directory_matches(
-                    Arc::clone(&index),
-                    directory_ids,
-                    None,
-                    &path_predicate,
-                ),
-                (FileIdConstraint::Ids(file_ids), _) => {
-                    indexed_file_id_matches(Arc::clone(&index), file_ids, &path_predicate)
-                }
-                (FileIdConstraint::All | FileIdConstraint::None, _) => {
-                    indexed_file_matches(Arc::clone(&index), &path_predicate)
+                    ),
+                    (FileIdConstraint::Ids(file_ids), _) => {
+                        indexed_file_id_matches(Arc::clone(&index), file_ids, &path_predicate)
+                    }
+                    (FileIdConstraint::All | FileIdConstraint::None, _) => {
+                        indexed_file_matches(Arc::clone(&index), &path_predicate)
+                    }
                 }
             };
             let index_scan_threshold =
@@ -3214,6 +3223,14 @@ impl FileIdConstraint {
             }
         }
     }
+
+    fn allows(&self, file_id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Ids(file_ids) => file_ids.contains(file_id),
+        }
+    }
 }
 
 fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
@@ -3432,6 +3449,33 @@ fn indexed_file_directory_matches(
         .map(|(index, _)| index)
         .collect();
     FilesystemPathSelection::new(index, indices)
+}
+
+fn indexed_file_root_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+    file_ids: &FileIdConstraint,
+    path_predicate: &FilePathPredicate,
+) -> FilesystemPathSelection {
+    let indices = index
+        .entries()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind == FilesystemPathKind::File
+                && entry.parent_id.is_none()
+                && file_ids.allows(entry.id())
+                && path_predicate.matches(&entry.path)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    FilesystemPathSelection::new(index, indices)
+}
+
+fn is_null_column_filter(expr: &Expr, column_name: &str) -> bool {
+    matches!(
+        expr,
+        Expr::IsNull(inner)
+            if matches!(inner.as_ref(), Expr::Column(column) if column.name == column_name)
+    )
 }
 
 fn file_path_comparison_from_binary_filter(binary_expr: &BinaryExpr) -> Option<FilePathPredicate> {
@@ -4495,6 +4539,117 @@ mod tests {
                 NullableKeyFilter::Value("file-docs".to_string()),
                 NullableKeyFilter::Value("file-other-doc".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_root_directory_scan_uses_indexed_descriptors_and_only_scans_root_blob_rows() {
+        let root_data = b"root contents".to_vec();
+        let root_blob_hash = BlobHash::from_content(&root_data).to_hex();
+        let nested_data = b"nested contents".to_vec();
+        let nested_blob_hash = BlobHash::from_content(&nested_data).to_hex();
+        let live_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_directory_row(
+                    "dir-docs",
+                    "branch-b",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                ),
+                live_file_row(
+                    "file-nested",
+                    "branch-b",
+                    r#"{"id":"file-nested","directory_id":"dir-docs","name":"readme.md"}"#,
+                ),
+                live_file_row(
+                    "file-root",
+                    "branch-b",
+                    r#"{"id":"file-root","directory_id":null,"name":"root.md"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixFileSpec::active_branch(
+            "branch-b",
+            Arc::new(RecordingLiveStateReader {
+                rows: vec![
+                    live_blob_ref_row(
+                        "file-root",
+                        "branch-b",
+                        "file-root",
+                        &root_blob_hash,
+                        root_data.len(),
+                    ),
+                    live_blob_ref_row(
+                        "file-nested",
+                        "branch-b",
+                        "file-nested",
+                        &nested_blob_hash,
+                        nested_data.len(),
+                    ),
+                ],
+                scan_requests: Arc::clone(&live_state_requests),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            Arc::new(StaticBlobReader::from_blobs(Vec::new())),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            test_functions(),
+        );
+        let projection = vec![
+            spec.schema().index_of("path").expect("path column"),
+            spec.schema().index_of("name").expect("name column"),
+            spec.schema()
+                .index_of("lixcol_metadata")
+                .expect("metadata column"),
+            spec.schema()
+                .index_of("lixcol_change_id")
+                .expect("change-id column"),
+            spec.schema()
+                .index_of("lixcol_updated_at")
+                .expect("updated-at column"),
+        ];
+        let filters = vec![Expr::IsNull(Box::new(column("directory_id")))];
+
+        assert_eq!(
+            spec.filter_pushdown(&filters[0]),
+            TableProviderFilterPushDown::Exact
+        );
+        let planned = spec
+            .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
+            .await
+            .expect("root-directory scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("root-directory scan should load");
+
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column should be string data");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(paths.value(0), "/root.md");
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        let requests = live_state_requests
+            .lock()
+            .expect("live-state request mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single("file-root")]
+        );
+        assert_eq!(
+            requests[0].filter.file_ids,
+            vec![NullableKeyFilter::Value("file-root".to_string())]
         );
     }
 
