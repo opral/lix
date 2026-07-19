@@ -1,27 +1,12 @@
 # Performance observations
 
 This is a living backlog for evidence-backed performance work that is larger
-than a narrowly scoped, independently benchmarked pull request. Entries stay
-here until measurement shows they are not worthwhile, at which point their
-status and rationale should be updated rather than silently removed.
-
-## Active: coalesce concurrent filesystem path-index builds
-
-- **Evidence:** LixRay's directory listing asks Lix for root directories and
-  root files at the same time. Both can request the same branch's
-  `FilesystemPathIndex` after a cache invalidation. The current cache follows
-  a get/build/insert flow, so simultaneous misses can each rebuild the full
-  descriptor index.
-- **Potential:** Avoiding a duplicate `O(files)` index construction should
-  materially improve cold listings in large workspaces; it is a plausible
-  >50% improvement for that cold combined path.
-- **Why it is not a small PR:** A single-flight async cache needs deliberate
-  cancellation, error, invalidation, and branch-key semantics. It must be
-  measured against both warm and cold-after-write listings before changing the
-  cache contract.
-- **Next measurement:** Compare the actual paired root listing immediately
-  after a write, before and after a per-key build coalescing prototype.
-- **Status:** observing; no implementation proposed yet.
+than a bounded, independently benchmarked pull request. Only cross-cutting
+refactors expected to touch more than roughly five files belong here; a small
+filter pushdown, cache, or index improvement should instead be implemented and
+measured in the PR stack. Entries stay until measurement shows they are not
+worthwhile, at which point their status and rationale should be updated rather
+than silently removed.
 
 ## Active: incrementally maintain the filesystem path index
 
