@@ -465,6 +465,7 @@ impl TableSpec for LixFileSpec {
         let analyzer = LixFileIdFilterAnalyzer;
         if ExactStringColumnFilterAnalyzer::new("lixcol_branch_id").supports(filter)
             || analyzer.supports(filter)
+            || ExactStringColumnFilterAnalyzer::new("directory_id").supports(filter)
             || contains_column(filter, "path")
         {
             TableProviderFilterPushDown::Exact
@@ -501,16 +502,19 @@ impl TableSpec for LixFileSpec {
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let needs_blob_rows = scan_needs_blob_rows(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
+        let target_directory_ids =
+            exact_string_column_constraint_from_filters(&filters, "directory_id")?;
         let path_predicate = file_path_predicate_from_filters(&filters);
         // The path index carries every descriptor column, not just `path`.
         // Prefer it for all descriptor-only scans so queries such as
         // `SELECT id FROM lix_file` and `COUNT(*)` do not materialize the
         // complete descriptor/directory live-state domain on every request.
         // Scans that need file data or the blob revision still load blob rows.
-        // A path predicate or exact file ids can narrow those loads to matching
-        // cached descriptors instead of scanning the complete directory state.
+        // A path predicate or exact file/directory ids can narrow those loads
+        // to matching cached descriptors instead of scanning complete state.
         let use_path_index = should_use_path_index(&path_predicate, needs_blob_rows)
-            || matches!(&target_file_ids, FileIdConstraint::Ids(_));
+            || matches!(&target_file_ids, FileIdConstraint::Ids(_))
+            || matches!(&target_directory_ids, FileIdConstraint::Ids(_));
         let indexed_matches = if !use_path_index {
             None
         } else {
@@ -521,11 +525,25 @@ impl TableSpec for LixFileSpec {
                 ))
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
-            let matches = match &target_file_ids {
-                FileIdConstraint::Ids(ids) => {
-                    indexed_file_id_matches(Arc::clone(&index), ids, &path_predicate)
+            let matches = match (&target_file_ids, &target_directory_ids) {
+                (FileIdConstraint::Ids(file_ids), FileIdConstraint::Ids(directory_ids)) => {
+                    indexed_file_directory_matches(
+                        Arc::clone(&index),
+                        directory_ids,
+                        Some(file_ids),
+                        &path_predicate,
+                    )
                 }
-                FileIdConstraint::All | FileIdConstraint::None => {
+                (_, FileIdConstraint::Ids(directory_ids)) => indexed_file_directory_matches(
+                    Arc::clone(&index),
+                    directory_ids,
+                    None,
+                    &path_predicate,
+                ),
+                (FileIdConstraint::Ids(file_ids), _) => {
+                    indexed_file_id_matches(Arc::clone(&index), file_ids, &path_predicate)
+                }
+                (FileIdConstraint::All | FileIdConstraint::None, _) => {
                     indexed_file_matches(Arc::clone(&index), &path_predicate)
                 }
             };
@@ -3199,7 +3217,14 @@ impl FileIdConstraint {
 }
 
 fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
-    let analyzer = LixFileIdFilterAnalyzer;
+    exact_string_column_constraint_from_filters(filters, "id")
+}
+
+fn exact_string_column_constraint_from_filters(
+    filters: &[Expr],
+    column_name: &'static str,
+) -> Result<FileIdConstraint> {
+    let analyzer = ExactStringColumnFilterAnalyzer::new(column_name);
     let mut constraint = FileIdConstraint::All;
     for filter in filters {
         if let Some(filter_constraint) = analyzer.analyze(filter)? {
@@ -3379,6 +3404,29 @@ fn indexed_file_id_matches(
         .filter(|(_, entry)| {
             entry.kind == FilesystemPathKind::File
                 && file_ids.contains(entry.id())
+                && path_predicate.matches(&entry.path)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    FilesystemPathSelection::new(index, indices)
+}
+
+fn indexed_file_directory_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+    directory_ids: &BTreeSet<String>,
+    file_ids: Option<&BTreeSet<String>>,
+    path_predicate: &FilePathPredicate,
+) -> FilesystemPathSelection {
+    let indices = index
+        .entries()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind == FilesystemPathKind::File
+                && entry
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|directory_id| directory_ids.contains(directory_id))
+                && file_ids.map_or(true, |file_ids| file_ids.contains(entry.id()))
                 && path_predicate.matches(&entry.path)
         })
         .map(|(index, _)| index)
@@ -3976,13 +4024,13 @@ mod tests {
     use datafusion::logical_expr::expr::{Cast, InList, ScalarFunction};
     use datafusion::logical_expr::lit;
     use datafusion::logical_expr::{
-        BinaryExpr, ColumnarValue, Expr, Operator, Volatility, create_udf,
+        BinaryExpr, ColumnarValue, Expr, Operator, TableProviderFilterPushDown, Volatility,
+        create_udf,
     };
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::Literal;
     use serde_json::Value as JsonValue;
 
-    use crate::LixError;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
@@ -4000,6 +4048,7 @@ mod tests {
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
     use crate::wasm::UnsupportedWasmRuntime;
+    use crate::{LixError, NullableKeyFilter};
 
     use super::{
         BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, LixFileSpec, TableSpec,
@@ -4331,6 +4380,121 @@ mod tests {
         assert_eq!(
             requests[0].filter.schema_keys,
             vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_directory_id_scan_uses_indexed_descriptors_and_only_scans_blob_rows() {
+        let data = b"docs contents".to_vec();
+        let blob_hash = BlobHash::from_content(&data).to_hex();
+        let other_data = b"other contents".to_vec();
+        let other_blob_hash = BlobHash::from_content(&other_data).to_hex();
+        let live_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_directory_row(
+                    "dir-docs",
+                    "branch-b",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                ),
+                live_file_row(
+                    "file-docs",
+                    "branch-b",
+                    r#"{"id":"file-docs","directory_id":"dir-docs","name":"readme.md"}"#,
+                ),
+                live_file_row(
+                    "file-other-doc",
+                    "branch-b",
+                    r#"{"id":"file-other-doc","directory_id":"dir-docs","name":"other.md"}"#,
+                ),
+                live_file_row(
+                    "file-root",
+                    "branch-b",
+                    r#"{"id":"file-root","directory_id":null,"name":"root.md"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixFileSpec::active_branch(
+            "branch-b",
+            Arc::new(RecordingLiveStateReader {
+                rows: vec![
+                    live_blob_ref_row("file-docs", "branch-b", "file-docs", &blob_hash, data.len()),
+                    live_blob_ref_row(
+                        "file-other-doc",
+                        "branch-b",
+                        "file-other-doc",
+                        &other_blob_hash,
+                        other_data.len(),
+                    ),
+                ],
+                scan_requests: Arc::clone(&live_state_requests),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            Arc::new(StaticBlobReader::from_blobs(Vec::new())),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            test_functions(),
+        );
+        let projection = vec![
+            spec.schema().index_of("path").expect("path column"),
+            spec.schema()
+                .index_of("lixcol_change_id")
+                .expect("change-id column"),
+        ];
+        let filters = vec![eq_filter("directory_id", "dir-docs")];
+
+        assert_eq!(
+            spec.filter_pushdown(&filters[0]),
+            TableProviderFilterPushDown::Exact
+        );
+        let planned = spec
+            .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
+            .await
+            .expect("directory-id scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("directory-id scan should load");
+
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column should be string data");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.expect("path should not be null").to_string())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["/docs/other.md".to_string(), "/docs/readme.md".to_string()])
+        );
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        let requests = live_state_requests
+            .lock()
+            .expect("live-state request mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![
+                crate::entity_pk::EntityPk::single("file-docs"),
+                crate::entity_pk::EntityPk::single("file-other-doc"),
+            ]
+        );
+        assert_eq!(
+            requests[0].filter.file_ids,
+            vec![
+                NullableKeyFilter::Value("file-docs".to_string()),
+                NullableKeyFilter::Value("file-other-doc".to_string()),
+            ]
         );
     }
 
