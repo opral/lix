@@ -502,10 +502,13 @@ impl TableSpec for LixFileSpec {
         let needs_blob_rows = scan_needs_blob_rows(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let path_predicate = file_path_predicate_from_filters(&filters);
-        let use_path_index = path_predicate != FilePathPredicate::All
-            || (filters.is_empty()
-                && projected_schema.index_of("path").is_ok()
-                && !needs_blob_rows);
+        // The path index carries every descriptor column, not just `path`.
+        // Prefer it for all descriptor-only scans so queries such as
+        // `SELECT id FROM lix_file` and `COUNT(*)` do not materialize the
+        // complete descriptor/directory live-state domain on every request.
+        // Scans that need file data or the blob revision still load blob rows;
+        // a path predicate can narrow those loads to the matching file ids.
+        let use_path_index = should_use_path_index(&path_predicate, needs_blob_rows);
         let indexed_matches = if !use_path_index {
             None
         } else {
@@ -3038,6 +3041,10 @@ fn scan_needs_blob_rows(
         })
 }
 
+fn should_use_path_index(path_predicate: &FilePathPredicate, needs_blob_rows: bool) -> bool {
+    path_predicate != &FilePathPredicate::All || !needs_blob_rows
+}
+
 fn lix_file_scan_request(
     branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
@@ -3928,6 +3935,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{
@@ -3937,6 +3945,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::execution::TaskContext;
+    use datafusion::execution::context::ExecutionProps;
     use datafusion::logical_expr::expr::{Cast, InList, ScalarFunction};
     use datafusion::logical_expr::lit;
     use datafusion::logical_expr::{
@@ -3948,16 +3957,22 @@ mod tests {
 
     use crate::LixError;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
+    use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
-    use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
+    use crate::filesystem::{
+        FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemPathIndex,
+        FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemRowContext,
+    };
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::plugin::PluginRuntimeHost;
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteContextBranchRefReader};
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
+    use crate::wasm::UnsupportedWasmRuntime;
 
     use super::{
         BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, LixFileSpec, TableSpec,
@@ -4164,6 +4179,71 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn descriptor_only_scans_use_the_filesystem_path_index() {
+        assert!(super::should_use_path_index(
+            &super::FilePathPredicate::All,
+            false,
+        ));
+        assert!(!super::should_use_path_index(
+            &super::FilePathPredicate::All,
+            true,
+        ));
+        assert!(super::should_use_path_index(
+            &super::FilePathPredicate::Comparison {
+                operation: super::FilePathComparison::Equal,
+                value: "/readme.md".to_string(),
+            },
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn descriptor_only_scan_loads_rows_from_the_filesystem_path_index() {
+        let live_state_scans = Arc::new(AtomicUsize::new(0));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            )])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixFileSpec::active_branch(
+            "branch-b",
+            Arc::new(RejectingLiveStateReader {
+                scan_count: Arc::clone(&live_state_scans),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            Arc::new(StaticBlobReader::from_blobs(Vec::new())),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            test_functions(),
+        );
+        let projection = vec![spec.schema().index_of("id").expect("id column")];
+
+        let planned = spec
+            .plan_scan(Some(&projection), &[], None, &ExecutionProps::new())
+            .await
+            .expect("descriptor-only scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("descriptor-only scan should load");
+
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id column should be string data");
+        assert_eq!(ids.value(0), "file-readme");
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
+    }
+
     fn scalar_function_expr(name: &str, args: Vec<Expr>) -> Expr {
         let udf = create_udf(
             name,
@@ -4353,6 +4433,64 @@ mod tests {
     #[derive(Default)]
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
+    }
+
+    struct RejectingLiveStateReader {
+        scan_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for RejectingLiveStateReader {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_count.fetch_add(1, Ordering::SeqCst);
+            Err(LixError::unknown(
+                "descriptor-only scan should not read live state",
+            ))
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Err(LixError::unknown(
+                "descriptor-only scan should not load live-state rows",
+            ))
+        }
+    }
+
+    struct StaticFilesystemPathIndexReader {
+        index: Arc<FilesystemPathIndex>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl FilesystemPathIndexReader for StaticFilesystemPathIndexReader {
+        async fn path_index(
+            &self,
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&self.index))
+        }
+    }
+
+    struct TestBranchRefReader;
+
+    #[async_trait]
+    impl BranchRefReader for TestBranchRefReader {
+        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+            Ok(Some(BranchHead {
+                branch_id: branch_id.to_string(),
+                commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
+            }))
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
+            Ok(Vec::new())
+        }
     }
 
     #[async_trait]
