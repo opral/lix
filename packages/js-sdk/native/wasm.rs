@@ -18,7 +18,7 @@ use lix_sdk::{
     OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, WasmComponentInstance,
     WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime,
-    open_lix, parse_sql_script as parse_rs_sql_script,
+    open_lix, open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -69,8 +69,8 @@ pub async fn open_memory_from_snapshot(
         }
         None => Memory::new(),
     };
-    let mut options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(runtime);
-    if let Some(dispatch) = telemetry_dispatch {
+    let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(runtime);
+    let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
             let Ok(span) = to_js(&crate::telemetry::TelemetrySpanDto::from(span)) else {
@@ -78,9 +78,13 @@ pub async fn open_memory_from_snapshot(
             };
             let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
         }));
-        options = options.with_telemetry(sink);
+        sink
+    });
+    let inner = match telemetry {
+        Some(telemetry) => open_lix_with_telemetry(options, telemetry).await,
+        None => open_lix(options).await,
     }
-    let inner = open_lix(options).await.map_err(lix_error_to_js)?;
+    .map_err(lix_error_to_js)?;
     Ok(WasmLix { inner, storage })
 }
 

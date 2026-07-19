@@ -13,7 +13,6 @@ use std::sync::Arc;
 pub struct OpenLixOptions<StorageImpl = Memory> {
     pub storage: StorageImpl,
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
-    pub telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
 impl Default for OpenLixOptions<Memory> {
@@ -21,7 +20,6 @@ impl Default for OpenLixOptions<Memory> {
         Self {
             storage: Memory::new(),
             wasm_runtime: None,
-            telemetry: None,
         }
     }
 }
@@ -31,17 +29,11 @@ impl<StorageImpl> OpenLixOptions<StorageImpl> {
         Self {
             storage,
             wasm_runtime: None,
-            telemetry: None,
         }
     }
 
     pub fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
         self.wasm_runtime = Some(wasm_runtime);
-        self
-    }
-
-    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
-        self.telemetry = Some(telemetry);
         self
     }
 }
@@ -67,8 +59,32 @@ pub async fn open_lix<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    open_lix_with_optional_telemetry(options, None).await
+}
+
+/// Opens a Lix workspace session with an explicit per-engine telemetry sink.
+///
+/// Telemetry is intentionally a separate entry point so adding the opt-in does
+/// not break callers that construct [`OpenLixOptions`] with a struct literal.
+pub async fn open_lix_with_telemetry<StorageImpl>(
+    options: OpenLixOptions<StorageImpl>,
+    telemetry: Arc<dyn TelemetrySink>,
+) -> Result<Lix<StorageImpl>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    open_lix_with_optional_telemetry(options, Some(telemetry)).await
+}
+
+async fn open_lix_with_optional_telemetry<StorageImpl>(
+    options: OpenLixOptions<StorageImpl>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
+) -> Result<Lix<StorageImpl>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let engine =
-        open_or_initialize_engine(options.storage, options.wasm_runtime, options.telemetry).await?;
+        open_or_initialize_engine(options.storage, options.wasm_runtime, telemetry).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,

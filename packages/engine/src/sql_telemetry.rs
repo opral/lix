@@ -190,10 +190,11 @@ fn query_operation(query_text: &str) -> String {
 fn sanitize_query_text(sql: &str) -> String {
     let characters = sql.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(sql.len().min(MAX_QUERY_TEXT_CHARS));
+    let mut output_chars = 0;
     let mut index = 0;
     let mut pending_space = false;
 
-    while index < characters.len() && output.chars().count() < MAX_QUERY_TEXT_CHARS {
+    'query: while index < characters.len() {
         let character = characters[index];
         if character.is_whitespace() {
             pending_space = true;
@@ -228,25 +229,35 @@ fn sanitize_query_text(sql: &str) -> String {
             continue;
         }
 
-        push_pending_space(&mut output, &mut pending_space);
+        if !push_pending_space(&mut output, &mut output_chars, &mut pending_space) {
+            break;
+        }
 
         if character == '\'' {
-            output.push('?');
+            if !push_query_text_char(&mut output, &mut output_chars, '?') {
+                break;
+            }
             index = skip_single_quoted_literal(&characters, index + 1);
             continue;
         }
         if character == '$' {
             if characters.get(index + 1).is_some_and(char::is_ascii_digit) {
-                output.push('$');
+                if !push_query_text_char(&mut output, &mut output_chars, '$') {
+                    break;
+                }
                 index += 1;
                 while index < characters.len() && characters[index].is_ascii_digit() {
-                    output.push(characters[index]);
+                    if !push_query_text_char(&mut output, &mut output_chars, characters[index]) {
+                        break 'query;
+                    }
                     index += 1;
                 }
                 continue;
             }
             if let Some((delimiter, body_start)) = dollar_quote_delimiter(&characters, index) {
-                output.push('?');
+                if !push_query_text_char(&mut output, &mut output_chars, '?') {
+                    break;
+                }
                 index = skip_dollar_quoted_literal(&characters, body_start, &delimiter);
                 continue;
             }
@@ -256,21 +267,29 @@ fn sanitize_query_text(sql: &str) -> String {
                 .get(index.wrapping_sub(1))
                 .is_some_and(|previous| previous.is_ascii_alphanumeric() || *previous == '_')
         {
-            output.push('?');
+            if !push_query_text_char(&mut output, &mut output_chars, '?') {
+                break;
+            }
             index = skip_numeric_literal(&characters, index + 1);
             continue;
         }
         if matches!(character, '"' | '`' | '[') {
             let closing = if character == '[' { ']' } else { character };
-            output.push(character);
+            if !push_query_text_char(&mut output, &mut output_chars, character) {
+                break;
+            }
             index += 1;
             while index < characters.len() {
                 let current = characters[index];
-                output.push(current);
+                if !push_query_text_char(&mut output, &mut output_chars, current) {
+                    break 'query;
+                }
                 index += 1;
                 if current == closing {
                     if characters.get(index) == Some(&closing) {
-                        output.push(closing);
+                        if !push_query_text_char(&mut output, &mut output_chars, closing) {
+                            break 'query;
+                        }
                         index += 1;
                     } else {
                         break;
@@ -280,18 +299,36 @@ fn sanitize_query_text(sql: &str) -> String {
             continue;
         }
 
-        output.push(character);
+        if !push_query_text_char(&mut output, &mut output_chars, character) {
+            break;
+        }
         index += 1;
     }
 
     output.trim().to_string()
 }
 
-fn push_pending_space(output: &mut String, pending_space: &mut bool) {
+fn push_query_text_char(output: &mut String, output_chars: &mut usize, character: char) -> bool {
+    if *output_chars >= MAX_QUERY_TEXT_CHARS {
+        return false;
+    }
+    output.push(character);
+    *output_chars += 1;
+    true
+}
+
+fn push_pending_space(
+    output: &mut String,
+    output_chars: &mut usize,
+    pending_space: &mut bool,
+) -> bool {
     if *pending_space && !output.is_empty() && !output.ends_with(' ') {
-        output.push(' ');
+        if !push_query_text_char(output, output_chars, ' ') {
+            return false;
+        }
     }
     *pending_space = false;
+    true
 }
 
 fn skip_single_quoted_literal(characters: &[char], mut index: usize) -> usize {
@@ -371,6 +408,15 @@ mod tests {
             sanitize_query_text("SELECT \"odd table\".value FROM \"odd table\" WHERE id = 9"),
             "SELECT \"odd table\".value FROM \"odd table\" WHERE id = ?"
         );
+    }
+
+    #[test]
+    fn caps_query_text_inside_quoted_identifiers() {
+        let oversized_identifier = format!("SELECT \"{}", "a".repeat(MAX_QUERY_TEXT_CHARS * 2));
+        let sanitized = sanitize_query_text(&oversized_identifier);
+
+        assert_eq!(sanitized.chars().count(), MAX_QUERY_TEXT_CHARS);
+        assert!(sanitized.starts_with("SELECT \""));
     }
 
     #[test]

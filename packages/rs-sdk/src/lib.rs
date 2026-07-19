@@ -14,7 +14,9 @@ mod sqlite;
 
 #[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
 pub use filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
-pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_storage};
+pub use lix::{
+    Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_storage, open_lix_with_telemetry,
+};
 pub use lix_engine::telemetry::{
     CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryAttribute, TelemetrySink,
     TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanKind, TelemetrySpanStart,

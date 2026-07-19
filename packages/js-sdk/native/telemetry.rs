@@ -14,6 +14,10 @@ pub(crate) struct TelemetrySpanDto {
     attributes: BTreeMap<&'static str, serde_json::Value>,
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "JavaScript telemetry timestamps and durations are represented as Number"
+)]
 impl From<CompletedTelemetrySpan> for TelemetrySpanDto {
     fn from(span: CompletedTelemetrySpan) -> Self {
         let mut attributes = BTreeMap::new();

@@ -8,7 +8,7 @@ use lix_sdk::{
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
     ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, SQLite, SQLiteOptions,
     SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, TelemetrySink, Value,
-    WasmRuntime, open_lix,
+    WasmRuntime, open_lix, open_lix_with_telemetry,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
@@ -801,17 +801,14 @@ fn take_wasm_runtime_dispatch(
     })
 }
 
-fn telemetry_sink(dispatch: Option<SharedJsTelemetryDispatch>) -> Option<Arc<dyn TelemetrySink>> {
-    dispatch.map(|dispatch| {
-        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
-            let Ok(json) = serde_json::to_string(&crate::telemetry::TelemetrySpanDto::from(span))
-            else {
-                return;
-            };
-            let _ = dispatch.call(json, ThreadsafeFunctionCallMode::NonBlocking);
-        }));
-        sink
-    })
+fn telemetry_sink(dispatch: SharedJsTelemetryDispatch) -> Arc<dyn TelemetrySink> {
+    Arc::new(CallbackTelemetrySink::new(move |span| {
+        let Ok(json) = serde_json::to_string(&crate::telemetry::TelemetrySpanDto::from(span))
+        else {
+            return;
+        };
+        let _ = dispatch.call(json, ThreadsafeFunctionCallMode::NonBlocking);
+    }))
 }
 
 fn open_memory_native(
@@ -822,12 +819,12 @@ fn open_memory_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let mut options = RsOpenLixOptions::default()
+    let options = RsOpenLixOptions::default()
         .with_wasm_runtime(Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch)));
-    if let Some(telemetry) = telemetry_sink(telemetry_dispatch) {
-        options = options.with_telemetry(telemetry);
-    }
-    let lix = rt.block_on(open_lix(options))?;
+    let lix = match telemetry_dispatch.map(telemetry_sink) {
+        Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
+        None => rt.block_on(open_lix(options))?,
+    };
     NativeLix::new(NativeLixInner::Memory(lix))
 }
 
@@ -841,12 +838,12 @@ fn open_sqlite_native(
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
     let storage = SQLite::new(SQLiteOptions { path: path.into() })?;
-    let mut options = RsOpenLixOptions::new(storage)
+    let options = RsOpenLixOptions::new(storage)
         .with_wasm_runtime(Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch)));
-    if let Some(telemetry) = telemetry_sink(telemetry_dispatch) {
-        options = options.with_telemetry(telemetry);
-    }
-    let lix = rt.block_on(open_lix(options))?;
+    let lix = match telemetry_dispatch.map(telemetry_sink) {
+        Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
+        None => rt.block_on(open_lix(options))?,
+    };
     NativeLix::new(NativeLixInner::SQLite(lix))
 }
 
@@ -868,11 +865,11 @@ fn open_local_filesystem_native(
         options,
         Arc::clone(&wasm_runtime),
     ))?;
-    let mut options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(wasm_runtime);
-    if let Some(telemetry) = telemetry_sink(telemetry_dispatch) {
-        options = options.with_telemetry(telemetry);
-    }
-    let lix = rt.block_on(open_lix(options))?;
+    let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(wasm_runtime);
+    let lix = match telemetry_dispatch.map(telemetry_sink) {
+        Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
+        None => rt.block_on(open_lix(options))?,
+    };
     NativeLix::new(NativeLixInner::LocalFilesystem(lix, storage))
 }
 

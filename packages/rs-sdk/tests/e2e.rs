@@ -1,7 +1,7 @@
 use lix_sdk::{
     CallbackTelemetrySink, CompletedTelemetrySpan, CreateBranchOptions, ExecuteBatchStatement, Lix,
     LixError, Memory, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, Storage,
-    SwitchBranchOptions, TelemetryValue, Value, open_lix,
+    SwitchBranchOptions, TelemetryValue, Value, open_lix, open_lix_with_telemetry,
 };
 #[cfg(feature = "local_filesystem")]
 use lix_sdk::{LocalFilesystem, LocalFilesystemOpenOptions, open_lix_with_storage};
@@ -18,7 +18,7 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
     let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
         captured.lock().unwrap().push(span);
     }));
-    let lix = open_lix(OpenLixOptions::default().with_telemetry(telemetry))
+    let lix = open_lix_with_telemetry(OpenLixOptions::default(), telemetry)
         .await
         .unwrap();
 

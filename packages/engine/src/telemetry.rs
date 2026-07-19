@@ -12,7 +12,7 @@ pub enum TelemetrySpanKind {
 }
 
 /// One vendor-neutral telemetry attribute.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryAttribute {
     pub key: &'static str,
     pub value: TelemetryValue,
@@ -34,7 +34,7 @@ impl TelemetryAttribute {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelemetryValue {
     String(String),
     U64(u64),
@@ -42,7 +42,7 @@ pub enum TelemetryValue {
 }
 
 /// Information available when an engine operation begins.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetrySpanStart {
     pub kind: TelemetrySpanKind,
     pub name: &'static str,
@@ -57,7 +57,7 @@ pub enum TelemetrySpanStatus {
 }
 
 /// Information available when an engine operation finishes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetrySpanEnd {
     pub duration_ns: u64,
     pub status: TelemetrySpanStatus,
@@ -65,7 +65,7 @@ pub struct TelemetrySpanEnd {
 }
 
 /// A completed span used by callback and cross-runtime adapters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedTelemetrySpan {
     pub start: TelemetrySpanStart,
     pub end: TelemetrySpanEnd,

@@ -111,7 +111,6 @@ async fn sqlite_open_lix_options_supplies_plugin_wasm_runtime() {
     let lix = open_lix(OpenLixOptions {
         storage: SQLite::open(&path).expect("sqlite storage opens"),
         wasm_runtime: Some(wasm_runtime),
-        telemetry: None,
     })
     .await
     .expect("lix opens on sqlite storage with wasm runtime");
