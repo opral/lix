@@ -11,6 +11,7 @@ async function openMemoryLix(options: { snapshot?: Uint8Array } = {}) {
 		async () => {
 			throw new Error("plugins are unavailable in this test");
 		},
+		undefined,
 		options.snapshot,
 	);
 }

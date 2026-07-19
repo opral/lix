@@ -90,6 +90,7 @@ precis-profiles = "0.1.13"
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
 blake3 = "1"
 fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

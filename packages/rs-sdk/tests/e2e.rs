@@ -1,13 +1,48 @@
 use lix_sdk::{
-    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
-    MergeBranchOutcome, OpenLixOptions, Storage, SwitchBranchOptions, Value, open_lix,
+    CallbackTelemetrySink, CompletedTelemetrySpan, CreateBranchOptions, ExecuteBatchStatement, Lix,
+    LixError, Memory, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, Storage,
+    SwitchBranchOptions, TelemetryValue, Value, open_lix, open_lix_with_telemetry,
 };
 #[cfg(feature = "local_filesystem")]
 use lix_sdk::{LocalFilesystem, LocalFilesystemOpenOptions, open_lix_with_storage};
 #[cfg(feature = "local_filesystem")]
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "local_filesystem")]
 use std::time::{Duration, Instant};
+
+#[tokio::test]
+async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
+    let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+    let captured = Arc::clone(&spans);
+    let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
+        captured.lock().unwrap().push(span);
+    }));
+    let lix = open_lix_with_telemetry(OpenLixOptions::default(), telemetry)
+        .await
+        .unwrap();
+
+    lix.execute("SELECT 'private-value' AS value, 42 AS number", &[])
+        .await
+        .unwrap();
+
+    let spans = spans.lock().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| span.start.name == "lix.sql.query")
+        .expect("query telemetry should be emitted when configured");
+    let query_text = span
+        .start
+        .attributes
+        .iter()
+        .find_map(|attribute| match (&attribute.key, &attribute.value) {
+            (&"db.query.text", TelemetryValue::String(value)) => Some(value.as_str()),
+            _ => None,
+        })
+        .expect("query telemetry includes sanitized SQL");
+    assert_eq!(query_text, "SELECT ? AS value, ? AS number");
+    assert!(span.end.duration_ns > 0);
+}
 
 #[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {

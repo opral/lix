@@ -8,6 +8,7 @@ import type {
 	MergeBranchReceipt,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
+	LixTelemetrySpan,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
 
@@ -73,6 +74,7 @@ export type ObserveEventsBinding = {
 };
 
 export type PluginRuntimeDispatch = (request: unknown) => Promise<unknown>;
+export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
 export type LixStorageConfig =
 	| { kind: "memory" }

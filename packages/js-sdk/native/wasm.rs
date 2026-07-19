@@ -10,14 +10,15 @@ use async_trait::async_trait;
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Promise, Reflect};
 use lix_sdk::{
-    CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, Memory, MergeBranchOptions as RsMergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
+    CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions,
+    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
-    SwitchBranchOptions as RsSwitchBranchOptions, Value, WasmComponentInstance, WasmLimits,
-    WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime, open_lix,
-    parse_sql_script as parse_rs_sql_script,
+    SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, WasmComponentInstance,
+    WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime,
+    open_lix, open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -47,13 +48,17 @@ pub struct WasmObserveEvents {
 }
 
 #[wasm_bindgen(js_name = openMemory)]
-pub async fn open_memory(plugin_runtime_dispatch: Function) -> Result<WasmLix, JsValue> {
-    open_memory_from_snapshot(plugin_runtime_dispatch, None).await
+pub async fn open_memory(
+    plugin_runtime_dispatch: Function,
+    telemetry_dispatch: Option<Function>,
+) -> Result<WasmLix, JsValue> {
+    open_memory_from_snapshot(plugin_runtime_dispatch, telemetry_dispatch, None).await
 }
 
 #[wasm_bindgen(js_name = openMemoryFromSnapshot)]
 pub async fn open_memory_from_snapshot(
     plugin_runtime_dispatch: Function,
+    telemetry_dispatch: Option<Function>,
     snapshot: Option<Vec<u8>>,
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
@@ -65,9 +70,32 @@ pub async fn open_memory_from_snapshot(
         None => Memory::new(),
     };
     let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(runtime);
-    let inner = open_lix(options).await.map_err(lix_error_to_js)?;
+    let telemetry = telemetry_dispatch.map(|dispatch| {
+        let dispatch = BrowserTelemetryDispatch(dispatch);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            let Ok(span) = to_js(&crate::telemetry::TelemetrySpanDto::from(span)) else {
+                return;
+            };
+            let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
+        }));
+        sink
+    });
+    let inner = match telemetry {
+        Some(telemetry) => open_lix_with_telemetry(options, telemetry).await,
+        None => open_lix(options).await,
+    }
+    .map_err(lix_error_to_js)?;
     Ok(WasmLix { inner, storage })
 }
+
+struct BrowserTelemetryDispatch(Function);
+
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "browser WASM is single-threaded but the shared telemetry trait requires Send"
+)]
+unsafe impl Send for BrowserTelemetryDispatch {}
+unsafe impl Sync for BrowserTelemetryDispatch {}
 
 #[wasm_bindgen(js_name = parseSqlScript)]
 pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsValue, JsValue> {

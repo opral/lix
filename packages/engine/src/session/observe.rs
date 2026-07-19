@@ -144,14 +144,14 @@ where
         let Some(shared_state) = &self.query.shared_state else {
             return self
                 .session
-                .execute(&self.query.sql, &self.query.params)
+                .execute_for_observe(&self.query.sql, &self.query.params)
                 .await;
         };
 
         shared_state
             .evaluate(generation, || async {
                 self.session
-                    .execute(&self.query.sql, &self.query.params)
+                    .execute_for_observe(&self.query.sql, &self.query.params)
                     .await
             })
             .await

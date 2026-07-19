@@ -78,6 +78,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				lix = await openLixBinding(
 					operation.storage,
 					createPluginRuntimeDispatch() as PluginRuntimeDispatch,
+					operation.telemetryEnabled
+						? (span) => endpoint.postMessage({ kind: "telemetry", span })
+						: undefined,
 				);
 				return undefined;
 			case "execute":

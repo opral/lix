@@ -97,6 +97,15 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			"openLix() option 'backend' was removed; use 'storage' instead",
 		);
 	}
+	if (
+		options.telemetry !== undefined &&
+		(typeof options.telemetry !== "object" ||
+			typeof options.telemetry.onSpan !== "function")
+	) {
+		throw new TypeError(
+			"openLix() telemetry requires an onSpan callback",
+		);
+	}
 	if (options.server !== undefined) {
 		if (options.storage !== undefined) {
 			throw new TypeError(
@@ -108,14 +117,16 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
-		return new Lix(await openLixWorkerBinding({ kind: "memory" }));
+		return new Lix(
+			await openLixWorkerBinding({ kind: "memory" }, undefined, options.telemetry),
+		);
 	}
 	if (options.storage instanceof SQLite) {
 		return new Lix(
 			await openLixWorkerBinding({
 				kind: "sqlite",
 				path: options.storage.path,
-			}),
+			}, undefined, options.telemetry),
 		);
 	}
 	if (options.storage instanceof LocalFilesystem) {
@@ -133,6 +144,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 					syncAllFiles: storage.syncAllFiles,
 				},
 				() => openLocalFilesystems.delete(storage),
+				options.telemetry,
 			);
 			openLocalFilesystems.set(storage, binding);
 			return new Lix(binding);

@@ -5,6 +5,7 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 } from "../binding-types.js";
+import type { LixTelemetryOptions } from "../types.js";
 import {
 	deserializeWorkerError,
 	type WorkerConnection,
@@ -21,10 +22,15 @@ type PendingRequest = {
 export async function openLixWorker(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
+	telemetry?: LixTelemetryOptions,
 ): Promise<LixWorkerClient> {
-	const client = new LixWorkerClient(onDisposed);
+	const client = new LixWorkerClient(onDisposed, undefined, telemetry);
 	try {
-		await client.request({ kind: "open", storage });
+		await client.request({
+			kind: "open",
+			storage,
+			telemetryEnabled: telemetry !== undefined,
+		});
 		return client;
 	} catch (error) {
 		await client.terminate();
@@ -36,8 +42,9 @@ export async function openLixWorker(
 export async function openLixWorkerBinding(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
+	telemetry?: LixTelemetryOptions,
 ): Promise<LixBinding> {
-	const client = await openLixWorker(storage, onDisposed);
+	const client = await openLixWorker(storage, onDisposed, telemetry);
 	return workerBinding(client);
 }
 
@@ -118,6 +125,7 @@ export class LixWorkerClient {
 	constructor(
 		private readonly onDisposed?: () => void,
 		private readonly connection: WorkerConnection = createWorkerConnection(),
+		private readonly telemetry?: LixTelemetryOptions,
 	) {
 		connection.onMessage((message) => this.handleMessage(message));
 		connection.onFatal((error) => this.handleFatal(error));
@@ -163,6 +171,14 @@ export class LixWorkerClient {
 	}
 
 	private handleMessage(message: WorkerResponse): void {
+		if ("kind" in message) {
+			try {
+				this.telemetry?.onSpan(message.span);
+			} catch {
+				// Telemetry callbacks are isolated from Lix operation results.
+			}
+			return;
+		}
 		const pending = this.pending.get(message.id);
 		if (!pending) return;
 		this.pending.delete(message.id);

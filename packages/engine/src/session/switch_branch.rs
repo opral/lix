@@ -81,6 +81,7 @@ where
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),
+            self.telemetry.clone(),
             self.transaction_manager(),
         );
         Ok((

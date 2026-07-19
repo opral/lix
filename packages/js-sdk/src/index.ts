@@ -31,6 +31,8 @@ export type {
 	MergeConflictSide,
 	ObserveEvent,
 	OpenLixOptions,
+	LixTelemetryOptions,
+	LixTelemetrySpan,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
 	SqlParam,

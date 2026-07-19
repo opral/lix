@@ -3324,6 +3324,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "unicode-normalization",
  "uuid",
  "web-time",

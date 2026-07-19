@@ -5,20 +5,26 @@ import type {
 	LixStorageConfig,
 	LixBinding,
 	PluginRuntimeDispatch,
+	TelemetryDispatch,
 } from "./binding-types.js";
 
 type NativeAddon = {
 	Lix: {
-		openMemory(dispatch: PluginRuntimeDispatch): Promise<LixBinding>;
+		openMemory(
+			dispatch: PluginRuntimeDispatch,
+			telemetry?: (spanJson: string) => void,
+		): Promise<LixBinding>;
 		openSQLite(
 			path: string,
 			dispatch: PluginRuntimeDispatch,
+			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
 		openLocalFilesystem(
 			path: string,
 			lixDir: string | undefined,
 			syncAllFiles: boolean,
 			dispatch: PluginRuntimeDispatch,
+			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
 	};
 };
@@ -67,18 +73,23 @@ try {
 export function openLixBinding(
 	storage: LixStorageConfig,
 	dispatch: PluginRuntimeDispatch,
+	telemetry?: TelemetryDispatch,
 ): Promise<LixBinding> {
+	const nativeTelemetry = telemetry
+		? (spanJson: string) => telemetry(JSON.parse(spanJson))
+		: undefined;
 	switch (storage.kind) {
 		case "memory":
-			return addon.Lix.openMemory(dispatch);
+			return addon.Lix.openMemory(dispatch, nativeTelemetry);
 		case "sqlite":
-			return addon.Lix.openSQLite(storage.path, dispatch);
+			return addon.Lix.openSQLite(storage.path, dispatch, nativeTelemetry);
 		case "localFilesystem":
 			return addon.Lix.openLocalFilesystem(
 				storage.path,
 				storage.lixDir,
 				storage.syncAllFiles,
 				dispatch,
+				nativeTelemetry,
 			);
 	}
 }

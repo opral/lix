@@ -17,6 +17,7 @@ use crate::session::SessionContext;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
+use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
@@ -34,6 +35,30 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
     plugin_host: PluginRuntimeHost,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
+}
+
+#[derive(Default)]
+#[expect(missing_debug_implementations)]
+pub struct EngineOptions {
+    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
+}
+
+impl EngineOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
+        self.wasm_runtime = Some(wasm_runtime);
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
 }
 
 impl<StorageImpl> Engine<StorageImpl>
@@ -65,7 +90,7 @@ where
     /// context. Independently constructing multiple Engine values over the same
     /// cloned storage is outside that MVP runtime-sharing boundary.
     pub async fn new(storage: StorageImpl) -> Result<Self, LixError> {
-        Self::new_with_wasm_runtime(storage, Arc::new(UnsupportedWasmRuntime)).await
+        Self::new_with_options(storage, EngineOptions::new()).await
     }
 
     /// Creates an engine with a WASM component runtime for installed plugins.
@@ -73,7 +98,21 @@ where
         storage: StorageImpl,
         wasm_runtime: Arc<dyn WasmRuntime>,
     ) -> Result<Self, LixError> {
+        Self::new_with_options(
+            storage,
+            EngineOptions::new().with_wasm_runtime(wasm_runtime),
+        )
+        .await
+    }
+
+    pub async fn new_with_options(
+        storage: StorageImpl,
+        options: EngineOptions,
+    ) -> Result<Self, LixError> {
         let storage = StorageAdapter::new(storage);
+        let wasm_runtime = options
+            .wasm_runtime
+            .unwrap_or_else(|| Arc::new(UnsupportedWasmRuntime));
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_index = LiveStateIndexContext::new();
@@ -101,6 +140,7 @@ where
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
             observe_invalidation: Arc::new(ObserveInvalidation::new()),
             plugin_host: PluginRuntimeHost::new(wasm_runtime),
+            telemetry: options.telemetry,
         })
     }
 
@@ -147,6 +187,7 @@ where
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),
+            self.telemetry.clone(),
         )
         .await
     }
@@ -163,6 +204,7 @@ where
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),
+            self.telemetry.clone(),
         )
         .await
     }
