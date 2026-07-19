@@ -342,12 +342,24 @@ impl TableSpec for LixDirectorySpec {
         .map_err(lix_error_to_datafusion_error)?;
         let filters = filters.to_vec();
         let target_parent_ids = exact_string_column_constraint_from_filters(&filters, "parent_id")?;
+        let root_parent_filter = filters
+            .iter()
+            .any(|filter| is_null_column_filter(filter, "parent_id"));
         let mut indexed_matches = self
             .indexed_path_matches(&request, &filters)
             .await?
             .map(|(selected, _)| selected);
         if indexed_matches.is_none() {
-            if let FileIdConstraint::Ids(parent_ids) = &target_parent_ids {
+            if root_parent_filter {
+                let index = self
+                    .filesystem_path_index
+                    .path_index(&FilesystemPathIndexRequest::new(
+                        request.filter.branch_ids.clone(),
+                    ))
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                indexed_matches = Some(indexed_directory_root_matches(index));
+            } else if let FileIdConstraint::Ids(parent_ids) = &target_parent_ids {
                 let index = self
                     .filesystem_path_index
                     .path_index(&FilesystemPathIndexRequest::new(
@@ -1426,6 +1438,28 @@ fn indexed_directory_parent_matches(
     FilesystemPathSelection::new(index, indices)
 }
 
+fn indexed_directory_root_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+) -> FilesystemPathSelection {
+    let indices = index
+        .entries()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind == FilesystemPathKind::Directory && entry.parent_id.is_none()
+        })
+        .map(|(index, _)| index)
+        .collect();
+    FilesystemPathSelection::new(index, indices)
+}
+
+fn is_null_column_filter(expr: &Expr, column_name: &str) -> bool {
+    matches!(
+        expr,
+        Expr::IsNull(inner)
+            if matches!(inner.as_ref(), Expr::Column(column) if column.name == column_name)
+    )
+}
+
 fn lix_directory_record_batch_from_rendered(
     schema: &SchemaRef,
     directory_rows: Vec<(DirectoryDescriptorRecord, Option<String>)>,
@@ -2273,6 +2307,76 @@ mod tests {
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(paths.value(0), "/docs/guides/");
         assert_eq!(paths.value(1), "/docs/reference/");
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn directory_root_scan_uses_indexed_descriptors() {
+        let live_state_scans = Arc::new(AtomicUsize::new(0));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_row(
+                    "dir-docs",
+                    "branch-a",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                ),
+                live_row(
+                    "dir-guides",
+                    "branch-a",
+                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
+                ),
+                live_row(
+                    "dir-other",
+                    "branch-a",
+                    r#"{"id":"dir-other","parent_id":null,"name":"other"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixDirectorySpec::active_branch(
+            "branch-a",
+            Arc::new(RejectingLiveStateReader {
+                scan_count: Arc::clone(&live_state_scans),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            test_functions(),
+        );
+        let projection = vec![
+            spec.schema().index_of("path").expect("path column"),
+            spec.schema().index_of("name").expect("name column"),
+            spec.schema()
+                .index_of("lixcol_change_id")
+                .expect("change-id column"),
+            spec.schema()
+                .index_of("lixcol_updated_at")
+                .expect("updated-at column"),
+        ];
+        let filters = vec![Expr::IsNull(Box::new(Expr::Column(Column::from_name(
+            "parent_id",
+        ))))];
+
+        let planned = spec
+            .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
+            .await
+            .expect("root-directory scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("root-directory scan should load");
+
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column should be string data");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(paths.value(0), "/docs/");
+        assert_eq!(paths.value(1), "/other/");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }
