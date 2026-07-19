@@ -4,6 +4,7 @@ use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
+use crate::telemetry::TelemetrySink;
 use tokio::sync::Notify;
 
 use crate::LixError;
@@ -24,6 +25,7 @@ pub struct SessionTransaction<StorageImpl: Storage = Memory> {
     observe_invalidation: Arc<ObserveInvalidation>,
     _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
     write_access: Option<SessionWriteAccess>,
+    pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -68,6 +70,7 @@ where
             observe_invalidation: Arc::clone(&self.observe_invalidation),
             _deterministic_runtime_guard: deterministic_runtime_guard,
             write_access: Some(write_access),
+            telemetry: self.telemetry.clone(),
         })
     }
 }

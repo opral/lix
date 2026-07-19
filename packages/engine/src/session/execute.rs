@@ -1,18 +1,19 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use serde_json::{Map as JsonMap, Value as JsonValue};
-
 use crate::branch::BranchRefReader;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
     StorageWriteOptions, StorageWriteSet,
 };
+use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
 use super::transaction::SessionTransaction;
@@ -339,6 +340,45 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
+        self.execute_with_kind(sql, params, options, "execute")
+            .await
+    }
+
+    pub(crate) async fn execute_for_observe(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        self.execute_with_kind(sql, params, ExecuteOptions::default(), "observe")
+            .await
+    }
+
+    async fn execute_with_kind(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        execution_kind: &'static str,
+    ) -> Result<ExecuteResult, LixError> {
+        let telemetry =
+            SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, execution_kind, None);
+        let operation = self.execute_with_options_inner(sql, params, options);
+        let result = match telemetry.as_ref() {
+            Some(telemetry) => telemetry.instrument(operation).await,
+            None => operation.await,
+        };
+        if let Some(telemetry) = telemetry {
+            telemetry.finish(&result);
+        }
+        result
+    }
+
+    async fn execute_with_options_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
@@ -441,6 +481,27 @@ where
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
     ) -> Result<Vec<ExecuteResult>, LixError> {
+        let telemetry = start_batch(
+            self.telemetry.as_ref(),
+            TelemetrySpanKind::SqlBatch,
+            statements.len(),
+        );
+        let operation = self.execute_batch_with_options_inner(statements, options);
+        let result = match telemetry.as_ref() {
+            Some(telemetry) => telemetry.instrument(operation).await,
+            None => operation.await,
+        };
+        if let Some(telemetry) = telemetry {
+            finish_operation(telemetry, &result);
+        }
+        result
+    }
+
+    async fn execute_batch_with_options_inner(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
         if statements.is_empty() {
             return Err(LixError::new(
@@ -455,26 +516,43 @@ where
         }
 
         let statements = statements.to_vec();
+        let telemetry_sink = self.telemetry.clone();
         self.with_write_transaction(move |transaction| {
             Box::pin(async move {
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, statement) in statements.iter().enumerate() {
-                    let parsed = sql2::parse_statement(&statement.sql)
-                        .map_err(|error| with_batch_statement_index(error, statement_index))?;
-                    let result = execute_transaction_statement(
-                        transaction,
+                    let telemetry = SqlStatementTelemetry::start(
+                        telemetry_sink.as_ref(),
                         &statement.sql,
-                        parsed,
-                        &statement.params,
-                        options.clone(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        with_batch_statement_index(
-                            normalize_sql_surface_error(error, &statement.sql),
-                            statement_index,
+                        "batch",
+                        Some(statement_index),
+                    );
+                    let operation = async {
+                        let parsed = sql2::parse_statement(&statement.sql)
+                            .map_err(|error| with_batch_statement_index(error, statement_index))?;
+                        execute_transaction_statement(
+                            transaction,
+                            &statement.sql,
+                            parsed,
+                            &statement.params,
+                            options.clone(),
                         )
-                    })?;
+                        .await
+                        .map_err(|error| {
+                            with_batch_statement_index(
+                                normalize_sql_surface_error(error, &statement.sql),
+                                statement_index,
+                            )
+                        })
+                    };
+                    let result = match telemetry.as_ref() {
+                        Some(telemetry) => telemetry.instrument(operation).await,
+                        None => operation.await,
+                    };
+                    if let Some(telemetry) = telemetry {
+                        telemetry.finish(&result);
+                    }
+                    let result = result?;
                     results.push(result);
                 }
                 Ok(results)
@@ -485,6 +563,26 @@ where
 
     #[doc(hidden)]
     pub async fn execute_coherent_read_batch(
+        &self,
+        statements: &[(&str, &[Value])],
+    ) -> Result<CoherentReadBatch, LixError> {
+        let telemetry = start_batch(
+            self.telemetry.as_ref(),
+            TelemetrySpanKind::SqlCoherentReadBatch,
+            statements.len(),
+        );
+        let operation = self.execute_coherent_read_batch_inner(statements);
+        let result = match telemetry.as_ref() {
+            Some(telemetry) => telemetry.instrument(operation).await,
+            None => operation.await,
+        };
+        if let Some(telemetry) = telemetry {
+            finish_operation(telemetry, &result);
+        }
+        result
+    }
+
+    async fn execute_coherent_read_batch_inner(
         &self,
         statements: &[(&str, &[Value])],
     ) -> Result<CoherentReadBatch, LixError> {
@@ -559,11 +657,29 @@ where
                 plugin_host: self.plugin_host.clone(),
             };
             let mut results = Vec::with_capacity(statements.len());
-            for ((sql, params), statement) in statements.iter().zip(parsed) {
-                let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                results.push(ExecuteResult::from_sql_query_result(query));
+            for (statement_index, ((sql, params), statement)) in
+                statements.iter().zip(parsed).enumerate()
+            {
+                let telemetry = SqlStatementTelemetry::start(
+                    self.telemetry.as_ref(),
+                    sql,
+                    "coherent_read_batch",
+                    Some(statement_index),
+                );
+                let operation = async {
+                    sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params)
+                        .await
+                        .map(ExecuteResult::from_sql_query_result)
+                        .map_err(|error| normalize_sql_surface_error(error, sql))
+                };
+                let result = match telemetry.as_ref() {
+                    Some(telemetry) => telemetry.instrument(operation).await,
+                    None => operation.await,
+                };
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish(&result);
+                }
+                results.push(result?);
             }
             drop(ctx);
             drop(live_state);
@@ -768,12 +884,24 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
-        let statement = sql2::parse_statement(sql)?;
-        let transaction = self.transaction_mut()?;
-        execute_transaction_statement(transaction, sql, statement, params, options)
-            .await
-            .map_err(|error| normalize_sql_surface_error(error, sql))
+        let telemetry =
+            SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
+        let operation = async {
+            let _operation_guard = self.begin_session_operation()?;
+            let statement = sql2::parse_statement(sql)?;
+            let transaction = self.transaction_mut()?;
+            execute_transaction_statement(transaction, sql, statement, params, options)
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, sql))
+        };
+        let result = match telemetry.as_ref() {
+            Some(telemetry) => telemetry.instrument(operation).await,
+            None => operation.await,
+        };
+        if let Some(telemetry) = telemetry {
+            telemetry.finish(&result);
+        }
+        result
     }
 
     #[cfg(test)]

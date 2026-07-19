@@ -37,12 +37,14 @@ pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
+mod sql_telemetry;
 pub mod storage;
 #[allow(unused_imports)]
 pub mod storage_adapter;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
+pub mod telemetry;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
 #[cfg(feature = "storage-benches")]
@@ -65,7 +67,7 @@ pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, Fil
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
-pub use engine::Engine;
+pub use engine::{Engine, EngineOptions};
 pub use init::InitReceipt;
 pub use session::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ObserveEvent,

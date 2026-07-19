@@ -365,7 +365,8 @@ impl LocalFilesystem {
     ) -> Result<Self, LixError> {
         let layout = prepare_filesystem_layout(&options.root, options.lix_dir.as_deref())?;
         let storage = open_filesystem_rocksdb(&layout)?;
-        let engine = crate::lix::open_or_initialize_engine(storage.clone(), wasm_runtime).await?;
+        let engine =
+            crate::lix::open_or_initialize_engine(storage.clone(), wasm_runtime, None).await?;
         let inner =
             FilesystemSync::open_with_engine(storage, engine, layout, options.sync_all_files)
                 .await?;
@@ -2562,7 +2563,7 @@ mod tests {
         path_filter: FilesystemPathFilter,
     ) -> FilesystemState<RocksDBFilesystem> {
         let storage = open_filesystem_rocksdb(&layout).unwrap();
-        let engine = crate::lix::open_or_initialize_engine(storage.clone(), None)
+        let engine = crate::lix::open_or_initialize_engine(storage.clone(), None, None)
             .await
             .unwrap();
         FilesystemState {

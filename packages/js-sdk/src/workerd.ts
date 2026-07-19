@@ -65,6 +65,7 @@ export async function openMemoryLix(
 		async () => {
 			throw new Error("Lix plugin execution is unavailable in Workerd");
 		},
+		undefined,
 		options.snapshot,
 	);
 }

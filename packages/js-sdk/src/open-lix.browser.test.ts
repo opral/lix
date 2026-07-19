@@ -7,6 +7,32 @@ registerMemoryStorageContract({
 	operationTimeoutMs: 30_000,
 });
 
+test("forwards opt-in SQL telemetry from browser WASM", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	let resolveSpan!: (span: { attributes: Record<string, unknown> }) => void;
+	const received = new Promise<{ attributes: Record<string, unknown> }>(
+		(resolve) => {
+			resolveSpan = resolve;
+		},
+	);
+	const lix = await openLix({
+		telemetry: {
+			onSpan(span) {
+				if (span.name === "lix.sql.query") resolveSpan(span);
+			},
+		},
+	});
+	try {
+		await lix.execute("SELECT 'private-value' AS value, 42 AS number");
+		const span = await received;
+		expect(span.attributes["db.query.text"]).toBe(
+			"SELECT ? AS value, ? AS number",
+		);
+	} finally {
+		await lix.close();
+	}
+});
+
 test("loads and executes the engine outside the browser main thread", async () => {
 	const wasm = WebAssembly as unknown as Record<
 		string,

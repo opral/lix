@@ -21,12 +21,40 @@ import {
 	Value,
 	type ExecuteResult,
 	type Lix,
+	type LixTelemetrySpan,
 } from "./index.js";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
 
 registerMemoryStorageContract({
 	name: "Node native",
 	loadSdk: async () => await import("./index.js"),
+});
+
+test("openLix forwards opt-in SQL telemetry from the engine", async () => {
+	let resolveSpan!: (span: LixTelemetrySpan) => void;
+	const received = new Promise<LixTelemetrySpan>((resolve) => {
+		resolveSpan = resolve;
+	});
+	const lix = await openLix({
+		telemetry: {
+			onSpan(span) {
+				if (span.name === "lix.sql.query") resolveSpan(span);
+			},
+		},
+	});
+
+	await lix.execute("SELECT 'private-value' AS value, 42 AS number");
+	const span = await received;
+	expect(span).toMatchObject({
+		schemaVersion: 1,
+		name: "lix.sql.query",
+		status: "ok",
+	});
+	expect(span.durationMs).toBeGreaterThanOrEqual(0);
+	expect(span.attributes["db.query.text"]).toBe(
+		"SELECT ? AS value, ? AS number",
+	);
+	await lix.close();
 });
 
 test("openLix exposes the lix-sdk e2e flow", async () => {

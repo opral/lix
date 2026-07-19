@@ -1,7 +1,8 @@
+use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteBatchStatement, ExecuteOptions,
-    ExecuteResult, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
+    CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
+    ExecuteOptions, ExecuteResult, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
     SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
@@ -12,6 +13,7 @@ use std::sync::Arc;
 pub struct OpenLixOptions<StorageImpl = Memory> {
     pub storage: StorageImpl,
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    pub telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
 impl Default for OpenLixOptions<Memory> {
@@ -19,6 +21,7 @@ impl Default for OpenLixOptions<Memory> {
         Self {
             storage: Memory::new(),
             wasm_runtime: None,
+            telemetry: None,
         }
     }
 }
@@ -28,11 +31,17 @@ impl<StorageImpl> OpenLixOptions<StorageImpl> {
         Self {
             storage,
             wasm_runtime: None,
+            telemetry: None,
         }
     }
 
     pub fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
         self.wasm_runtime = Some(wasm_runtime);
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 }
@@ -58,7 +67,8 @@ pub async fn open_lix<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = open_or_initialize_engine(options.storage, options.wasm_runtime).await?;
+    let engine =
+        open_or_initialize_engine(options.storage, options.wasm_runtime, options.telemetry).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
@@ -218,15 +228,16 @@ where
 pub(crate) async fn open_or_initialize_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
 ) -> Result<Engine<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    match new_engine(storage.clone(), wasm_runtime.clone()).await {
+    match new_engine(storage.clone(), wasm_runtime.clone(), telemetry.clone()).await {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
             Engine::initialize(storage.clone()).await?;
-            new_engine(storage, wasm_runtime).await
+            new_engine(storage, wasm_runtime, telemetry).await
         }
         Err(error) => Err(error),
     }
@@ -235,32 +246,31 @@ where
 async fn new_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
 ) -> Result<Engine<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    match wasm_runtime {
-        Some(wasm_runtime) => Engine::new_with_wasm_runtime(storage, wasm_runtime).await,
-        None => new_engine_with_default_runtime(storage).await,
+    let wasm_runtime = match wasm_runtime {
+        Some(wasm_runtime) => Some(wasm_runtime),
+        None => default_wasm_runtime()?,
+    };
+    let mut options = EngineOptions::new();
+    if let Some(wasm_runtime) = wasm_runtime {
+        options = options.with_wasm_runtime(wasm_runtime);
     }
+    if let Some(telemetry) = telemetry {
+        options = options.with_telemetry(telemetry);
+    }
+    Engine::new_with_options(storage, options).await
 }
 
 #[cfg(feature = "default_wasm_runtime")]
-async fn new_engine_with_default_runtime<StorageImpl>(
-    storage: StorageImpl,
-) -> Result<Engine<StorageImpl>, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    Engine::new_with_wasm_runtime(storage, crate::default_wasm_runtime::runtime()?).await
+fn default_wasm_runtime() -> Result<Option<Arc<dyn WasmRuntime>>, LixError> {
+    Ok(Some(crate::default_wasm_runtime::runtime()?))
 }
 
 #[cfg(not(feature = "default_wasm_runtime"))]
-async fn new_engine_with_default_runtime<StorageImpl>(
-    storage: StorageImpl,
-) -> Result<Engine<StorageImpl>, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    Engine::new(storage).await
+fn default_wasm_runtime() -> Result<Option<Arc<dyn WasmRuntime>>, LixError> {
+    Ok(None)
 }

@@ -20,16 +20,31 @@ export type RemoteLixServerOptions = {
 	fetch?: RemoteLixFetch;
 };
 
+export type LixTelemetrySpan = {
+	schemaVersion: 1;
+	name: string;
+	startedAtUnixMs: number;
+	durationMs: number;
+	status: "ok" | "error";
+	attributes: Record<string, string | number | boolean>;
+};
+
+export type LixTelemetryOptions = {
+	onSpan(span: LixTelemetrySpan): void;
+};
+
 export type OpenLixOptions =
 	| {
 			storage?:
 				| import("./open-lix.js").SQLite
 				| import("./open-lix.js").LocalFilesystem;
 			server?: never;
+			telemetry?: LixTelemetryOptions;
 	  }
 	| {
 			storage?: never;
 			server: RemoteLixServerOptions;
+			telemetry?: never;
 	  };
 
 export type LixValue =

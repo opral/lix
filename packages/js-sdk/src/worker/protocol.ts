@@ -9,6 +9,7 @@ import type {
 	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
+	LixTelemetrySpan,
 } from "../types.js";
 
 export type WorkerRequest = {
@@ -17,7 +18,7 @@ export type WorkerRequest = {
 };
 
 export type WorkerOperation =
-	| { kind: "open"; storage: LixStorageConfig }
+	| { kind: "open"; storage: LixStorageConfig; telemetryEnabled: boolean }
 	| {
 			kind: "execute";
 			sql: string;
@@ -81,7 +82,8 @@ export type SerializedWorkerError = {
 
 export type WorkerResponse =
 	| { id: number; ok: true; value?: unknown }
-	| { id: number; ok: false; error: SerializedWorkerError };
+	| { id: number; ok: false; error: SerializedWorkerError }
+	| { kind: "telemetry"; span: LixTelemetrySpan };
 
 export function serializeWorkerError(error: unknown): SerializedWorkerError {
 	if (!(error instanceof Error)) {

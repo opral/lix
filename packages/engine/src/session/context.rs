@@ -28,6 +28,7 @@ use crate::sql2::{
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
+use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
 use crate::{LixError, NullableKeyFilter};
@@ -63,6 +64,7 @@ pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
     pub(super) plugin_host: PluginRuntimeHost,
+    pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -81,6 +83,7 @@ where
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -94,6 +97,7 @@ where
             observe_coordinator,
             observe_invalidation,
             plugin_host,
+            telemetry,
         );
         session.active_branch_id().await?;
         Ok(session)
@@ -111,6 +115,7 @@ where
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -126,6 +131,7 @@ where
             observe_coordinator,
             observe_invalidation,
             plugin_host,
+            telemetry,
         ))
     }
 
@@ -141,6 +147,7 @@ where
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Self {
         Self::new_with_transaction_manager(
             mode,
@@ -154,6 +161,7 @@ where
             observe_coordinator,
             observe_invalidation,
             plugin_host,
+            telemetry,
             SessionTransactionManager::new(),
         )
     }
@@ -170,6 +178,7 @@ where
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
         transaction_manager: SessionTransactionManager,
     ) -> Self {
         Self {
@@ -184,6 +193,7 @@ where
             observe_coordinator,
             observe_invalidation,
             plugin_host,
+            telemetry,
             transaction_manager,
         }
     }
