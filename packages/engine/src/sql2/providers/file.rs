@@ -22,7 +22,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::expr::{InList, Like};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
@@ -509,6 +509,9 @@ impl TableSpec for LixFileSpec {
             .iter()
             .any(|filter| is_null_column_filter(filter, "directory_id"));
         let path_predicate = file_path_predicate_from_filters(&filters);
+        let indexed_path_predicate = path_predicate
+            .clone()
+            .and(lower_path_contains_predicate_from_filters(&filters));
         // The path index carries every descriptor column, not just `path`.
         // Prefer it for all descriptor-only scans so queries such as
         // `SELECT id FROM lix_file` and `COUNT(*)` do not materialize the
@@ -516,7 +519,7 @@ impl TableSpec for LixFileSpec {
         // Scans that need file data or the blob revision still load blob rows.
         // A path predicate or exact file/directory ids can narrow those loads
         // to matching cached descriptors instead of scanning complete state.
-        let use_path_index = should_use_path_index(&path_predicate, needs_blob_rows)
+        let use_path_index = should_use_path_index(&indexed_path_predicate, needs_blob_rows)
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
             || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
             || root_directory_filter;
@@ -531,7 +534,11 @@ impl TableSpec for LixFileSpec {
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matches = if root_directory_filter {
-                indexed_file_root_matches(Arc::clone(&index), &target_file_ids, &path_predicate)
+                indexed_file_root_matches(
+                    Arc::clone(&index),
+                    &target_file_ids,
+                    &indexed_path_predicate,
+                )
             } else {
                 match (&target_file_ids, &target_directory_ids) {
                     (FileIdConstraint::Ids(file_ids), FileIdConstraint::Ids(directory_ids)) => {
@@ -539,20 +546,22 @@ impl TableSpec for LixFileSpec {
                             Arc::clone(&index),
                             directory_ids,
                             Some(file_ids),
-                            &path_predicate,
+                            &indexed_path_predicate,
                         )
                     }
                     (_, FileIdConstraint::Ids(directory_ids)) => indexed_file_directory_matches(
                         Arc::clone(&index),
                         directory_ids,
                         None,
-                        &path_predicate,
+                        &indexed_path_predicate,
                     ),
-                    (FileIdConstraint::Ids(file_ids), _) => {
-                        indexed_file_id_matches(Arc::clone(&index), file_ids, &path_predicate)
-                    }
+                    (FileIdConstraint::Ids(file_ids), _) => indexed_file_id_matches(
+                        Arc::clone(&index),
+                        file_ids,
+                        &indexed_path_predicate,
+                    ),
                     (FileIdConstraint::All | FileIdConstraint::None, _) => {
-                        indexed_file_matches(Arc::clone(&index), &path_predicate)
+                        indexed_file_matches(Arc::clone(&index), &indexed_path_predicate)
                     }
                 }
             };
@@ -3307,6 +3316,10 @@ pub(super) enum FilePathPredicate {
         value: String,
     },
     In(BTreeSet<String>),
+    /// A conservative fast path for the MCP file search shape:
+    /// `LOWER(path) LIKE '%ascii-lowercase-literal%'`. Other LIKE forms retain the
+    /// regular residual-filter scan so SQL pattern semantics stay unchanged.
+    LowercaseContains(String),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -3317,6 +3330,7 @@ impl FilePathPredicate {
             Self::All => true,
             Self::Comparison { operation, value } => operation.matches(path, value),
             Self::In(values) => values.contains(path),
+            Self::LowercaseContains(value) => path.to_lowercase().contains(value),
             Self::And(left, right) => left.matches(path) && right.matches(path),
             Self::Or(left, right) => left.matches(path) || right.matches(path),
         }
@@ -3394,6 +3408,27 @@ fn file_path_predicate_from_expr(expr: &Expr) -> FilePathPredicate {
     }
 }
 
+/// Extract only AND-connected `LOWER(path) LIKE '%literal%'` terms for read
+/// scans. DML keeps using [`file_path_predicate_from_filters`] unchanged.
+fn lower_path_contains_predicate_from_filters(filters: &[Expr]) -> FilePathPredicate {
+    filters
+        .iter()
+        .fold(FilePathPredicate::All, |predicate, filter| {
+            predicate.and(lower_path_contains_predicate_from_expr(filter))
+        })
+}
+
+fn lower_path_contains_predicate_from_expr(expr: &Expr) -> FilePathPredicate {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            lower_path_contains_predicate_from_expr(&binary_expr.left)
+                .and(lower_path_contains_predicate_from_expr(&binary_expr.right))
+        }
+        Expr::Like(like) => lower_path_contains_predicate(like).unwrap_or(FilePathPredicate::All),
+        _ => FilePathPredicate::All,
+    }
+}
+
 pub(super) fn indexed_path_matches(
     index: Arc<crate::filesystem::FilesystemPathIndex>,
     predicate: &FilePathPredicate,
@@ -3431,6 +3466,7 @@ pub(super) fn indexed_path_matches(
             FilePathPredicate::In(values) => {
                 Box::new(values.iter().flat_map(|value| index.exact_indices(value)))
             }
+            FilePathPredicate::LowercaseContains(_) => Box::new(index.all_indices()),
             FilePathPredicate::And(left, right) => {
                 let left = indices(index, left, kind);
                 let right = indices(index, right, kind);
@@ -3443,7 +3479,10 @@ pub(super) fn indexed_path_matches(
             }
         };
         candidate_indices
-            .filter(|candidate| index.entry(*candidate).kind == kind)
+            .filter(|candidate| {
+                let entry = index.entry(*candidate);
+                entry.kind == kind && predicate.matches(&entry.path)
+            })
             .collect()
     }
 
@@ -3563,6 +3602,32 @@ fn file_path_in_predicate(in_list: &InList) -> FilePathPredicate {
         return FilePathPredicate::All;
     };
     FilePathPredicate::In(values)
+}
+
+fn lower_path_contains_predicate(like: &Like) -> Option<FilePathPredicate> {
+    if like.negated || like.case_insensitive || like.escape_char.is_some() {
+        return None;
+    }
+    let Expr::ScalarFunction(function) = like.expr.as_ref() else {
+        return None;
+    };
+    if function.name() != "lower"
+        || !matches!(function.args.as_slice(), [Expr::Column(column)] if column.name == "path")
+    {
+        return None;
+    }
+    let pattern = string_expr_literal(&like.pattern)?;
+    let literal = pattern.strip_prefix('%')?.strip_suffix('%')?;
+    if literal.is_empty()
+        || !literal.is_ascii()
+        || literal.bytes().any(|byte| byte.is_ascii_uppercase())
+        || literal.contains('%')
+        || literal.contains('_')
+        || literal.contains('\\')
+    {
+        return None;
+    }
+    Some(FilePathPredicate::LowercaseContains(literal.to_string()))
 }
 
 fn string_column_literal_filter(
@@ -4113,7 +4178,7 @@ mod tests {
     use datafusion::common::{Column, ScalarValue};
     use datafusion::execution::TaskContext;
     use datafusion::execution::context::ExecutionProps;
-    use datafusion::logical_expr::expr::{Cast, InList, ScalarFunction};
+    use datafusion::logical_expr::expr::{Cast, InList, Like, ScalarFunction};
     use datafusion::logical_expr::lit;
     use datafusion::logical_expr::{
         BinaryExpr, ColumnarValue, Expr, Operator, TableProviderFilterPushDown, Volatility,
@@ -4301,6 +4366,73 @@ mod tests {
     }
 
     #[test]
+    fn file_path_predicates_select_ascii_lower_path_contains_searches() {
+        let predicate = super::file_path_predicate_from_filters(&[
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("path")),
+                Operator::GtEq,
+                Box::new(string_literal("/docs/")),
+            )),
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("path")),
+                Operator::Lt,
+                Box::new(string_literal("/docs0")),
+            )),
+        ]);
+        let indexed_predicate =
+            predicate.and(super::lower_path_contains_predicate_from_filters(&[
+                lower_path_contains_filter("%readme%"),
+            ]));
+
+        assert!(indexed_predicate.matches("/docs/README.md"));
+        assert!(!indexed_predicate.matches("/docs/changelog.md"));
+        assert!(!indexed_predicate.matches("/other/readme.md"));
+
+        assert_eq!(
+            super::file_path_predicate_from_filters(&[lower_path_contains_filter("%readme%")]),
+            super::FilePathPredicate::All,
+            "DML path predicates should not gain a LOWER LIKE fast path",
+        );
+
+        for filter in [
+            lower_path_contains_filter("%read_me%"),
+            lower_path_contains_filter("%read\\me%"),
+            lower_path_contains_filter("%résumé%"),
+            lower_path_contains_filter("%ReadMe%"),
+            lower_path_contains_filter("%README%"),
+            lower_path_contains_filter("readme%"),
+            Expr::Not(Box::new(lower_path_contains_filter("%readme%"))),
+            lower_path_contains_filter_with_options("%readme%", true, None, false),
+            lower_path_contains_filter_with_options("%readme%", false, None, true),
+            lower_path_contains_filter_with_options("%readme%", false, Some('\\'), false),
+        ] {
+            assert_eq!(
+                super::lower_path_contains_predicate_from_filters(&[filter]),
+                super::FilePathPredicate::All,
+                "unsupported LIKE shape should retain the residual scan",
+            );
+        }
+
+        let disjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(lower_path_contains_filter("%readme%")),
+            Operator::Or,
+            Box::new(eq_filter("path", "/docs/readme.md")),
+        ));
+        assert_eq!(
+            super::lower_path_contains_predicate_from_filters(&[disjunction]),
+            super::FilePathPredicate::All,
+            "OR-connected LIKE terms must retain the residual scan",
+        );
+
+        assert!(
+            super::lower_path_contains_predicate_from_filters(&[lower_path_contains_filter(
+                "%docs/readme.md%"
+            ),])
+            .matches("/docs/readme.md")
+        );
+    }
+
+    #[test]
     fn file_path_predicates_stay_conservative_across_boolean_filters() {
         let path_filter = eq_filter("path", "/readme.md");
         let id_filter = eq_filter("id", "file-other");
@@ -4472,6 +4604,173 @@ mod tests {
         assert_eq!(
             requests[0].filter.schema_keys,
             vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_path_contains_scan_loads_blob_rows_only_for_the_matching_find_files_projection()
+    {
+        let selected_data = b"selected contents".to_vec();
+        let selected_blob_hash = BlobHash::from_content(&selected_data).to_hex();
+        let changelog_data = b"changelog contents".to_vec();
+        let changelog_blob_hash = BlobHash::from_content(&changelog_data).to_hex();
+        let outside_data = b"outside contents".to_vec();
+        let outside_blob_hash = BlobHash::from_content(&outside_data).to_hex();
+        let selected_change_id = ChangeId::for_test_label("selected-search-blob");
+        let live_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_directory_row(
+                    "dir-docs",
+                    "branch-b",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"Docs"}"#,
+                ),
+                live_directory_row(
+                    "dir-other",
+                    "branch-b",
+                    r#"{"id":"dir-other","parent_id":null,"name":"Other"}"#,
+                ),
+                live_file_row(
+                    "file-selected",
+                    "branch-b",
+                    r#"{"id":"file-selected","directory_id":"dir-docs","name":"README.md"}"#,
+                ),
+                live_file_row(
+                    "file-changelog",
+                    "branch-b",
+                    r#"{"id":"file-changelog","directory_id":"dir-docs","name":"changelog.md"}"#,
+                ),
+                live_file_row(
+                    "file-outside",
+                    "branch-b",
+                    r#"{"id":"file-outside","directory_id":"dir-other","name":"README.md"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let path_predicate = super::file_path_predicate_from_filters(&[
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("path")),
+                Operator::GtEq,
+                Box::new(string_literal("/Docs/")),
+            )),
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("path")),
+                Operator::Lt,
+                Box::new(string_literal("/Docs0")),
+            )),
+        ]);
+        let indexed_path_predicate =
+            path_predicate.and(super::lower_path_contains_predicate_from_filters(&[
+                lower_path_contains_filter("%readme%"),
+            ]));
+        let matches = super::indexed_file_matches(Arc::clone(&index), &indexed_path_predicate);
+        assert_eq!(
+            matches
+                .entries()
+                .map(|entry| entry.id().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["file-selected".to_string()],
+            "the range and contains predicates should exclude both the local non-match and outside root",
+        );
+
+        let mut selected_blob = live_blob_ref_row(
+            "file-selected",
+            "branch-b",
+            "file-selected",
+            &selected_blob_hash,
+            selected_data.len(),
+        );
+        selected_blob.change_id = Some(selected_change_id);
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(RecordingLiveStateReader {
+            rows: vec![
+                selected_blob,
+                live_blob_ref_row(
+                    "file-changelog",
+                    "branch-b",
+                    "file-changelog",
+                    &changelog_blob_hash,
+                    changelog_data.len(),
+                ),
+                live_blob_ref_row(
+                    "file-outside",
+                    "branch-b",
+                    "file-outside",
+                    &outside_blob_hash,
+                    outside_data.len(),
+                ),
+            ],
+            scan_requests: Arc::clone(&live_state_requests),
+        });
+        let base_schema = super::lix_file_schema();
+        let find_files_projection = vec![
+            base_schema.index_of("path").expect("path column"),
+            base_schema.index_of("name").expect("name column"),
+            base_schema
+                .index_of("lixcol_metadata")
+                .expect("metadata column"),
+            base_schema
+                .index_of("lixcol_change_id")
+                .expect("change-id column"),
+            base_schema
+                .index_of("lixcol_updated_at")
+                .expect("updated-at column"),
+        ];
+        let projected_schema = super::projected_schema(&base_schema, Some(&find_files_projection))
+            .expect("findFiles projection should be valid");
+        let request = super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
+        let rows = super::scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true)
+            .await
+            .expect("matching blob rows should load");
+        let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
+            .expect("indexed rows should prepare");
+        let blob_reader: Arc<dyn BlobDataReader> =
+            Arc::new(StaticBlobReader::from_blobs(Vec::new()));
+        let batch = super::lix_file_record_batch_from_prepared(
+            &projected_schema,
+            &blob_reader,
+            None,
+            false,
+            prepared,
+        )
+        .await
+        .expect("findFiles projection should render");
+
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column should be string data");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column should be string data");
+        let change_ids = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("change-id column should be string data");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(paths.value(0), "/Docs/README.md");
+        assert_eq!(names.value(0), "README.md");
+        assert_eq!(change_ids.value(0), selected_change_id.to_string());
+
+        let requests = live_state_requests
+            .lock()
+            .expect("live-state request mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single("file-selected")]
+        );
+        assert_eq!(
+            requests[0].filter.file_ids,
+            vec![NullableKeyFilter::Value("file-selected".to_string())]
         );
     }
 
@@ -4710,6 +5009,25 @@ mod tests {
             Arc::new(|_: &[ColumnarValue]| Ok(ColumnarValue::Scalar(ScalarValue::Null))),
         );
         Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(udf), args))
+    }
+
+    fn lower_path_contains_filter(pattern: &str) -> Expr {
+        lower_path_contains_filter_with_options(pattern, false, None, false)
+    }
+
+    fn lower_path_contains_filter_with_options(
+        pattern: &str,
+        negated: bool,
+        escape_char: Option<char>,
+        case_insensitive: bool,
+    ) -> Expr {
+        Expr::Like(Like::new(
+            negated,
+            Box::new(scalar_function_expr("lower", vec![column("path")])),
+            Box::new(string_literal(pattern)),
+            escape_char,
+            case_insensitive,
+        ))
     }
 
     fn lix_file_update_stage_from_batch_for_test(

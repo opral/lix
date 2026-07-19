@@ -97,6 +97,111 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_lower_path_like_keeps_the_blob_revision_for_guarded_updates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('guarded-search-file', '/Docs/Guarded-Readme.md', X'6265666F7265')",
+                &[],
+            )
+            .await
+            .expect("search fixture insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('other-search-file', '/Docs/other.md', X'6F74686572')",
+                &[],
+            )
+            .await
+            .expect("non-matching search fixture insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('unicode-search-file', '/Ä/Readme.md', X'756E69636F6465')",
+                &[],
+            )
+            .await
+            .expect("Unicode search fixture insert should succeed");
+
+        let search = session
+            .execute(
+                "SELECT path, name, lixcol_metadata, lixcol_change_id, lixcol_updated_at \
+                 FROM lix_file WHERE lower(path) LIKE $1 ORDER BY path",
+                &[Value::Text("%guarded%".to_string())],
+            )
+            .await
+            .expect("lower path search should succeed");
+        assert_eq!(search.rows().len(), 1);
+        assert_eq!(
+            search.rows()[0].value("path").expect("path should exist"),
+            &Value::Text("/Docs/Guarded-Readme.md".to_string())
+        );
+        assert_eq!(
+            search.rows()[0].value("name").expect("name should exist"),
+            &Value::Text("Guarded-Readme.md".to_string())
+        );
+
+        let mixed_case_pattern = session
+            .execute(
+                "SELECT path FROM lix_file WHERE lower(path) LIKE $1 ORDER BY path",
+                &[Value::Text("%Guarded%".to_string())],
+            )
+            .await
+            .expect("mixed-case lower path search should succeed");
+        assert_eq!(
+            mixed_case_pattern.len(),
+            0,
+            "LOWER(path) does not lower the LIKE pattern",
+        );
+
+        let change_id = match search.rows()[0]
+            .value("lixcol_change_id")
+            .expect("search result should include a revision")
+        {
+            Value::Text(value) => value.clone(),
+            value => panic!("expected text change id, got {value:?}"),
+        };
+
+        let updated = session
+            .execute(
+                "UPDATE lix_file SET data = X'6166746572' WHERE path = '/Docs/Guarded-Readme.md' AND lixcol_change_id = $1",
+                &[Value::Text(change_id)],
+            )
+            .await
+            .expect("search revision should guard the data update");
+        assert_eq!(updated.rows_affected(), 1);
+
+        let content = session
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'guarded-search-file'",
+                &[],
+            )
+            .await
+            .expect("updated file should be readable");
+        assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec())]]);
+
+        let unicode_search = session
+            .execute(
+                "SELECT path FROM lix_file WHERE lower(path) LIKE $1 ORDER BY path",
+                &[Value::Text("%ä/readme%".to_string())],
+            )
+            .await
+            .expect("non-ASCII lower path search should retain SQL semantics");
+        assert_rows_eq(
+            unicode_search,
+            vec![vec![Value::Text("/Ä/Readme.md".to_string())]],
+        );
+    }
+);
+
+simulation_test!(
     lix_file_by_branch_read_rejects_dynamic_branch_id_operand,
     |sim| async move {
         let engine = sim.boot_engine().await;
