@@ -58,7 +58,10 @@ use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
-use super::file::{FilePathPredicate, file_path_predicate_from_filters, indexed_path_matches};
+use super::file::{
+    FileIdConstraint, FilePathPredicate, exact_string_column_constraint_from_filters,
+    file_path_predicate_from_filters, indexed_path_matches,
+};
 use super::spec::{
     PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema,
     register_spec_table, row_source,
@@ -338,10 +341,23 @@ impl TableSpec for LixDirectorySpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
         let filters = filters.to_vec();
+        let target_parent_ids = exact_string_column_constraint_from_filters(&filters, "parent_id")?;
         let mut indexed_matches = self
             .indexed_path_matches(&request, &filters)
             .await?
             .map(|(selected, _)| selected);
+        if indexed_matches.is_none() {
+            if let FileIdConstraint::Ids(parent_ids) = &target_parent_ids {
+                let index = self
+                    .filesystem_path_index
+                    .path_index(&FilesystemPathIndexRequest::new(
+                        request.filter.branch_ids.clone(),
+                    ))
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                indexed_matches = Some(indexed_directory_parent_matches(index, parent_ids));
+            }
+        }
         if indexed_matches.is_none() && filters.is_empty() && output_schema.index_of("path").is_ok()
         {
             let index = self
@@ -1391,6 +1407,25 @@ fn indexed_lix_directory_record_batch(
     lix_directory_record_batch_from_rendered(schema, rows)
 }
 
+fn indexed_directory_parent_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+    parent_ids: &BTreeSet<String>,
+) -> FilesystemPathSelection {
+    let indices = index
+        .entries()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind == FilesystemPathKind::Directory
+                && entry
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent_id| parent_ids.contains(parent_id))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    FilesystemPathSelection::new(index, indices)
+}
+
 fn lix_directory_record_batch_from_rendered(
     schema: &SchemaRef,
     directory_rows: Vec<(DirectoryDescriptorRecord, Option<String>)>,
@@ -1742,18 +1777,29 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::{Column, ScalarValue};
+    use datafusion::execution::context::ExecutionProps;
+    use datafusion::logical_expr::expr::BinaryExpr;
+    use datafusion::logical_expr::{Expr, Operator};
     use serde_json::json;
 
     use crate::LixError;
     use crate::binary_cas::BlobDataReader;
+    use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
+    use crate::filesystem::{
+        FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    };
     use crate::functions::FunctionProviderHandle;
-    use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
+    use crate::live_state::{
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
@@ -1781,6 +1827,75 @@ mod tests {
         FunctionProviderHandle::system()
     }
 
+    fn eq_filter(column_name: &str, value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name(column_name))),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(value.to_string())),
+                None,
+            )),
+        ))
+    }
+
+    struct RejectingLiveStateReader {
+        scan_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for RejectingLiveStateReader {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_count.fetch_add(1, Ordering::SeqCst);
+            Err(LixError::unknown(
+                "directory parent-id scan should not read live state",
+            ))
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Err(LixError::unknown(
+                "directory parent-id scan should not load live-state rows",
+            ))
+        }
+    }
+
+    struct StaticFilesystemPathIndexReader {
+        index: Arc<FilesystemPathIndex>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl FilesystemPathIndexReader for StaticFilesystemPathIndexReader {
+        async fn path_index(
+            &self,
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&self.index))
+        }
+    }
+
+    struct TestBranchRefReader;
+
+    #[async_trait]
+    impl BranchRefReader for TestBranchRefReader {
+        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+            Ok(Some(BranchHead {
+                branch_id: branch_id.to_string(),
+                commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
+            }))
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
+            Ok(Vec::new())
+        }
+    }
+
     /// Stage a single INSERT batch through the directory spec, exercising the
     /// same `stage_insert` path the writable provider uses.
     async fn stage_directory_insert(
@@ -1794,8 +1909,7 @@ mod tests {
         let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
             write_ctx.clone(),
         ));
-        let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-            live_state.clone();
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let spec = match branch_binding {
             BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),
@@ -2092,6 +2206,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn directory_parent_id_scan_uses_indexed_descriptors() {
+        let live_state_scans = Arc::new(AtomicUsize::new(0));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_row(
+                    "dir-docs",
+                    "branch-a",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                ),
+                live_row(
+                    "dir-guides",
+                    "branch-a",
+                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
+                ),
+                live_row(
+                    "dir-reference",
+                    "branch-a",
+                    r#"{"id":"dir-reference","parent_id":"dir-docs","name":"reference"}"#,
+                ),
+                live_row(
+                    "dir-other",
+                    "branch-a",
+                    r#"{"id":"dir-other","parent_id":null,"name":"other"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixDirectorySpec::active_branch(
+            "branch-a",
+            Arc::new(RejectingLiveStateReader {
+                scan_count: Arc::clone(&live_state_scans),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            test_functions(),
+        );
+        let projection = vec![
+            spec.schema().index_of("path").expect("path column"),
+            spec.schema().index_of("name").expect("name column"),
+            spec.schema()
+                .index_of("lixcol_change_id")
+                .expect("change-id column"),
+            spec.schema()
+                .index_of("lixcol_updated_at")
+                .expect("updated-at column"),
+        ];
+        let filters = vec![eq_filter("parent_id", "dir-docs")];
+
+        let planned = spec
+            .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
+            .await
+            .expect("parent-id scan should plan");
+        let batch = (planned.load)().await.expect("parent-id scan should load");
+
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column should be string data");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(paths.value(0), "/docs/guides/");
+        assert_eq!(paths.value(1), "/docs/reference/");
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn decodes_directory_insert_into_lix_state_write_row() {
         let rows = lix_directory_write_rows_from_batch(&directory_insert_batch(true, false), None)
@@ -2329,8 +2514,7 @@ mod tests {
         let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
             write_ctx.clone(),
         ));
-        let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-            live_state.clone();
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let provider = SpecTableProvider::new(
             Arc::new(LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),

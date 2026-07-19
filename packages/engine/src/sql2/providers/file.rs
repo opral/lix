@@ -3173,7 +3173,7 @@ async fn scan_indexed_file_rows(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FileIdConstraint {
+pub(super) enum FileIdConstraint {
     All,
     None,
     Ids(BTreeSet<String>),
@@ -3220,7 +3220,7 @@ fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint>
     exact_string_column_constraint_from_filters(filters, "id")
 }
 
-fn exact_string_column_constraint_from_filters(
+pub(super) fn exact_string_column_constraint_from_filters(
     filters: &[Expr],
     column_name: &'static str,
 ) -> Result<FileIdConstraint> {
