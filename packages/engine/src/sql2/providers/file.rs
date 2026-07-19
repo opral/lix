@@ -3426,7 +3426,7 @@ fn indexed_file_directory_matches(
                     .parent_id
                     .as_ref()
                     .is_some_and(|directory_id| directory_ids.contains(directory_id))
-                && file_ids.map_or(true, |file_ids| file_ids.contains(entry.id()))
+                && file_ids.is_none_or(|file_ids| file_ids.contains(entry.id()))
                 && path_predicate.matches(&entry.path)
         })
         .map(|(index, _)| index)
