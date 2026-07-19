@@ -57,15 +57,17 @@ simulation_test!(
 
         let result = session
             .execute(
-                &format!(
-                    "SELECT id, path, name, data, lixcol_start_commit_id, lixcol_depth \
-                     FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
-                       AND id = 'history-file' \
-                       AND path LIKE '/docs/%' \
-                     ORDER BY lixcol_depth"
-                ),
-                &[],
+                "SELECT id, path, name, data, lixcol_start_commit_id, lixcol_depth \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = $1 \
+                   AND id = $2 \
+                   AND path LIKE $3 \
+                 ORDER BY lixcol_depth",
+                &[
+                    Value::Text(second_commit_id.clone()),
+                    Value::Text("history-file".to_string()),
+                    Value::Text("/docs/%".to_string()),
+                ],
             )
             .await
             .expect("file history read should succeed");
@@ -177,6 +179,64 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES \
+                    ('history-in-a', '/history/in-a.txt', X'61'), \
+                    ('history-in-b', '/history/in-b.txt', X'62')",
+            &[],
+        )
+        .await
+        .expect("file inserts should succeed");
+    let commit_id = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("file commit head should load")
+        .expect("file commit head should exist");
+
+    let result = session
+        .execute(
+            "SELECT id, path, data \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = $1 \
+                   AND id IN ($2, $3) \
+                 ORDER BY id",
+            &[
+                Value::Text(commit_id),
+                Value::Text("history-in-b".to_string()),
+                Value::Text("history-in-a".to_string()),
+            ],
+        )
+        .await
+        .expect("bound ID IN history read should succeed");
+
+    assert_rows_eq(
+        result,
+        vec![
+            vec![
+                Value::Text("history-in-a".to_string()),
+                Value::Text("/history/in-a.txt".to_string()),
+                Value::Blob(b"a".to_vec()),
+            ],
+            vec![
+                Value::Text("history-in-b".to_string()),
+                Value::Text("/history/in-b.txt".to_string()),
+                Value::Blob(b"b".to_vec()),
+            ],
+        ],
+    );
+});
 
 simulation_test!(
     lix_file_history_limit_applies_after_sql_ordering,
@@ -396,6 +456,30 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
                 Value::Integer(2),
             ],
         ],
+    );
+
+    // The plugin was installed before this narrow event depth. The provider
+    // must retain plugin discovery/state history from the broader context
+    // route instead of applying the file-ID fast path to a plugin history.
+    let depth_filtered = session
+        .execute(
+            &format!(
+                "SELECT data, lixcol_depth \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                   AND id = '{file_id}' \
+                   AND lixcol_depth = 1"
+            ),
+            &[],
+        )
+        .await
+        .expect("depth-filtered plugin history should retain materialization context");
+    assert_rows_eq(
+        depth_filtered,
+        vec![vec![
+            Value::Blob(b"rendered:second-a|second-b".to_vec()),
+            Value::Integer(1),
+        ]],
     );
 
     session.close().await.expect("session should close");
