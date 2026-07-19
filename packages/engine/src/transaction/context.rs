@@ -487,6 +487,13 @@ where
         file_data: &[TransactionFileData],
     ) -> Result<PluginFileDataReconciliation, LixError> {
         let mut reconciliation = PluginFileDataReconciliation::default();
+        // A single staged write can contain many ordinary files for the same
+        // branch. Reconciliation reads the pre-write filesystem each time, so
+        // retain that immutable view for this invocation rather than rebuilding
+        // it once per file. Nothing from this write is staged until this method
+        // returns, which keeps the cached snapshot equivalent to the previous
+        // per-file reads.
+        let mut contexts = BTreeMap::<String, PluginReconciliationContext>::new();
         for write in file_data {
             if let Some(rows) = plugin_archive_schema_rows_for_write(write)? {
                 reconciliation.rows.extend(rows);
@@ -498,20 +505,43 @@ where
             if !is_plugin_reconciliation_candidate_path(write_path) {
                 continue;
             }
-            let filesystem = self.filesystem_index_for_branch(&write.branch_id).await?;
-            let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
-            let existing_file = filesystem.file_entries().find(|(_, file)| {
-                file.id == write.file_id
-                    && file.scope.global == write.global
-                    && file.scope.untracked == write.untracked
-            });
-            let existing_plugin = existing_file
-                .and_then(|(path, _)| select_plugin_for_path(&installed_plugins, path));
-            let selected_plugin = select_plugin_for_path(&installed_plugins, write_path);
-            let filename = write
-                .filename
-                .clone()
-                .or_else(|| existing_file.map(|(_, file)| file.name.clone()));
+            if !contexts.contains_key(&write.branch_id) {
+                let filesystem = self.filesystem_index_for_branch(&write.branch_id).await?;
+                let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
+                contexts.insert(
+                    write.branch_id.clone(),
+                    PluginReconciliationContext {
+                        filesystem,
+                        installed_plugins,
+                    },
+                );
+            }
+            let (existing_plugin, selected_plugin, filename, existing_file_has_blob) = {
+                let context = contexts
+                    .get(&write.branch_id)
+                    .expect("plugin reconciliation context should be cached");
+                let existing_file = context.filesystem.file_entries().find(|(_, file)| {
+                    file.id == write.file_id
+                        && file.scope.global == write.global
+                        && file.scope.untracked == write.untracked
+                });
+                let existing_plugin = existing_file
+                    .and_then(|(path, _)| select_plugin_for_path(&context.installed_plugins, path));
+                let selected_plugin =
+                    select_plugin_for_path(&context.installed_plugins, write_path);
+                let filename = write
+                    .filename
+                    .clone()
+                    .or_else(|| existing_file.map(|(_, file)| file.name.clone()));
+                let existing_file_has_blob =
+                    existing_file.is_some_and(|(_, file)| file.blob_hash.is_some());
+                (
+                    existing_plugin,
+                    selected_plugin,
+                    filename,
+                    existing_file_has_blob,
+                )
+            };
             let context = FilesystemRowContext {
                 branch_id: write.branch_id.clone(),
                 global: write.global,
@@ -547,7 +577,7 @@ where
                 },
             )
             .await?;
-            if existing_file.is_some_and(|(_, file)| file.blob_hash.is_some()) {
+            if existing_file_has_blob {
                 reconciliation.rows.push(blob_ref_tombstone_row(
                     write.file_id.clone(),
                     context.clone(),
@@ -1426,6 +1456,13 @@ impl From<&TransactionFileData> for PluginFileWriteKey {
 struct PluginFileDataReconciliation {
     file_keys: BTreeSet<PluginFileWriteKey>,
     rows: Vec<TransactionWriteRow>,
+}
+
+/// The pre-write filesystem and plugin set for one branch during a single
+/// `RowsWithFileData` reconciliation pass.
+struct PluginReconciliationContext {
+    filesystem: FilesystemIndex,
+    installed_plugins: Vec<InstalledPlugin>,
 }
 
 fn plugin_archive_schema_rows_for_write(

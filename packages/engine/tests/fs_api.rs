@@ -11,6 +11,7 @@ use lix_engine::wasm::{
     WasmPluginFile, WasmRuntime,
 };
 use lix_engine::{Engine, ExecuteResult, LixError, Memory, SessionContext, Value};
+use serde_json::json;
 
 simulation_test!(
     sql_file_write_read_and_readdir_roundtrip,
@@ -398,6 +399,63 @@ async fn plugin_detect_changes_receives_descriptor_filename() {
         .expect("detect filename lock should not be poisoned")
         .clone();
     assert_eq!(filenames, vec![Some("raw.sentinel".to_string())]);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn multi_value_file_upsert_reconciles_each_plugin_file() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(storage, runtime.clone())
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    install_plugin(&session, "plugin_sentinel", &sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+    let sql = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+               VALUES ($1, $2, $3), ($4, $5, $6) \
+               ON CONFLICT (path) DO UPDATE SET \
+                 data = excluded.data, lixcol_metadata = excluded.lixcol_metadata";
+    let params = [
+        Value::Text("/nested/first.sentinel".to_string()),
+        Value::Blob(b"first".to_vec()),
+        Value::Json(json!({"size": 5})),
+        Value::Text("/nested/second.sentinel".to_string()),
+        Value::Blob(b"second".to_vec()),
+        Value::Json(json!({"size": 6})),
+    ];
+    session
+        .execute(sql, &params)
+        .await
+        .expect("multi-value plugin file upsert should succeed");
+    session
+        .execute(sql, &params)
+        .await
+        .expect("multi-value plugin file overwrite should succeed");
+
+    let filenames = runtime
+        .detect_filenames
+        .lock()
+        .expect("detect filename lock should not be poisoned")
+        .clone();
+    assert_eq!(
+        filenames,
+        vec![
+            Some("first.sentinel".to_string()),
+            Some("second.sentinel".to_string()),
+            Some("first.sentinel".to_string()),
+            Some("second.sentinel".to_string()),
+        ]
+    );
 
     session.close().await.expect("session should close");
 }
