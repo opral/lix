@@ -52,24 +52,24 @@ mod tests {
     #[tokio::test]
     async fn deterministic_known_repros_match_reference_writer() {
         for case in deterministic_repro_cases() {
-            assert_case_matches_reference(&case).await;
+            Box::pin(assert_case_matches_reference(&case)).await;
         }
     }
 
     #[tokio::test]
     async fn generated_dml_cases_match_reference_writer() {
         for case in generated_dml_cases() {
-            assert_case_matches_reference(&case).await;
+            Box::pin(assert_case_matches_reference(&case)).await;
         }
     }
 
     async fn assert_case_matches_reference(case: &DifferentialSqlCase) {
-        let reference = run_case(case, WriteExecutorMode::ForceDataFusion).await;
+        let reference = Box::pin(run_case(case, WriteExecutorMode::ForceDataFusion)).await;
         let candidate_mode = match case.expectation {
             DifferentialExpectation::SemanticParityMayFallback => WriteExecutorMode::Auto,
             DifferentialExpectation::FastRequiredParity => WriteExecutorMode::ForceFast,
         };
-        let candidate = run_case(case, candidate_mode).await;
+        let candidate = Box::pin(run_case(case, candidate_mode)).await;
         assert_expected_execution(case, &reference.execution);
         assert_eq!(
             candidate, reference,
@@ -77,13 +77,13 @@ mod tests {
             case.seed, candidate_mode, case.sql
         );
         if matches!(case.expected_execution, ExpectedExecution::Err { .. }) {
-            assert_independent_no_mutation(case, &reference).await;
+            Box::pin(assert_independent_no_mutation(case, &reference)).await;
         } else if case.expectation == DifferentialExpectation::FastRequiredParity {
             if matches!(
                 reference.execution,
                 ExecutionSignature::Ok { rows_affected: 0 }
             ) {
-                assert_independent_no_mutation(case, &reference).await;
+                Box::pin(assert_independent_no_mutation(case, &reference)).await;
             }
             assert_eq!(
                 candidate.executor_path,
@@ -96,7 +96,7 @@ mod tests {
             reference.execution,
             ExecutionSignature::Ok { rows_affected: 0 }
         ) {
-            assert_independent_no_mutation(case, &reference).await;
+            Box::pin(assert_independent_no_mutation(case, &reference)).await;
         }
     }
 
@@ -104,7 +104,7 @@ mod tests {
         case: &DifferentialSqlCase,
         reference: &DifferentialOutcome,
     ) {
-        let baseline = run_baseline(case).await;
+        let baseline = Box::pin(run_baseline(case)).await;
         assert_eq!(
             reference.staged_rows, baseline.staged_rows,
             "differential SQL seed '{}' changed staged rows in the independent no-mutation check\nSQL: {}",
