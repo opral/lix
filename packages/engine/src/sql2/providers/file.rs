@@ -990,15 +990,19 @@ impl UpsertSupport for LixFileSpec {
         proposed: &RecordBatch,
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
-        // Existing rows whose `id` matches a proposed row, rendered as a full
-        // `lix_file` batch (with materialized `data`) so the driver can build
-        // the augmented `excluded.*` batch the conflict assignments run over.
-        let target_file_ids = match target.kind() {
-            UpsertConflictKind::Id => proposed_file_id_constraint(proposed)?,
-            UpsertConflictKind::Path => {
-                validate_required_paths(proposed, "lix_file")?;
-                FileIdConstraint::All
-            }
+        // Existing rows matching the proposed conflict identity, rendered as
+        // a full `lix_file` batch (with materialized `data`) so the driver can
+        // build the augmented `excluded.*` batch the conflict assignments run
+        // over.
+        let (target_file_ids, path_predicate) = match target.kind() {
+            UpsertConflictKind::Id => (
+                proposed_file_id_constraint(proposed)?,
+                FilePathPredicate::All,
+            ),
+            UpsertConflictKind::Path => (
+                FileIdConstraint::All,
+                proposed_file_path_predicate(proposed)?,
+            ),
         };
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         if matches!(self.branch_binding, BranchBinding::Explicit) {
@@ -1016,23 +1020,56 @@ impl UpsertSupport for LixFileSpec {
         .map_err(lix_error_to_datafusion_error)?;
 
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+        let prepared = if target.kind() == UpsertConflictKind::Path {
+            // Path conflicts only need the proposed paths. Use the filesystem
+            // index for descriptor matching, then fetch blob refs solely for
+            // matching files instead of materializing the complete file/blob
+            // candidate batch.
+            let index = self
+                .filesystem_path_index
+                .path_index(&FilesystemPathIndexRequest::new(
+                    request.filter.branch_ids.clone(),
+                ))
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            let indexed_matches = indexed_file_matches(index, &path_predicate);
+            let rows = scan_indexed_file_rows(live_state.clone(), &request, &indexed_matches, true)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            prepare_indexed_lix_file_rows(&indexed_matches, rows)
+        } else {
+            let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            prepare_lix_file_rows(rows, &FilePathPredicate::All)
+        }
+        .map_err(lix_error_to_datafusion_error)?;
+        let plugin_render = if prepared.needs_plugin_render(true) {
+            plugin_render_context_for_lix_file_scan(
+                live_state,
+                &self.blob_reader,
+                &request,
+                self.plugin_host.clone(),
+                true,
+            )
             .await
-            .map_err(lix_error_to_datafusion_error)?;
-        let plugin_render = plugin_render_context_for_lix_file_scan(
-            live_state,
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "sql2 lix_file plugin discovery failed: {error}"
+                ))
+            })?
+        } else {
+            None
+        };
+        lix_file_record_batch_from_prepared(
+            &self.schema,
             &self.blob_reader,
-            &request,
-            self.plugin_host.clone(),
+            plugin_render,
             true,
+            prepared,
         )
         .await
-        .map_err(|error| {
-            DataFusionError::Execution(format!("sql2 lix_file plugin discovery failed: {error}"))
-        })?;
-        lix_file_record_batch(&self.schema, &self.blob_reader, plugin_render, true, rows)
-            .await
-            .map_err(lix_error_to_datafusion_error)
+        .map_err(lix_error_to_datafusion_error)
     }
 
     fn validate_conflict_pair(
@@ -1168,6 +1205,16 @@ fn proposed_file_id_constraint(batch: &RecordBatch) -> Result<FileIdConstraint> 
         return Ok(FileIdConstraint::None);
     }
     Ok(FileIdConstraint::from_ids(ids))
+}
+
+/// The exact paths whose existing rows can conflict with a proposed
+/// `INSERT .. ON CONFLICT (path)` batch.
+fn proposed_file_path_predicate(batch: &RecordBatch) -> Result<FilePathPredicate> {
+    validate_required_paths(batch, "lix_file")?;
+    let paths = (0..batch.num_rows())
+        .map(|row_index| required_string_value(batch, row_index, "path"))
+        .collect::<Result<BTreeSet<_>>>()?;
+    Ok(FilePathPredicate::In(paths))
 }
 
 /// The `id` constraint of an augmented conflict batch (existing-row columns).
@@ -2550,6 +2597,7 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
     )
 }
 
+#[cfg(test)]
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,

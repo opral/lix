@@ -3886,6 +3886,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_file_path_upsert_uses_indexed_conflict_candidates() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(StaticBlobReader {
+            bytes: b"old".to_vec(),
+        });
+        let live_state = Arc::new(CapturingRowsLiveStateReader {
+            rows: vec![
+                live_file_row("target", "branch-a", None, "target.md"),
+                live_file_row("other", "branch-a", None, "other.md"),
+                live_blob_ref_row("target", "branch-a", b"old"),
+                live_blob_ref_row("other", "branch-a", b"skip"),
+            ],
+            requests: Arc::clone(&requests),
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data, lixcol_metadata) \
+             VALUES ('/target.md', X'6E6577', '{\"size\":3}') \
+             ON CONFLICT (path) DO UPDATE \
+             SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata",
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("path upsert should update the matching file");
+
+        assert_eq!(path, WriteExecutorPath::DataFusion);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let requests = requests.lock().expect("captured requests lock");
+        assert!(requests.iter().any(|request| {
+            request.filter.schema_keys
+                == vec![
+                    "lix_directory_descriptor".to_string(),
+                    "lix_file_descriptor".to_string(),
+                ]
+        }));
+        let blob_requests = requests
+            .iter()
+            .filter(|request| request.filter.schema_keys == vec!["lix_binary_blob_ref".to_string()])
+            .collect::<Vec<_>>();
+        assert_eq!(blob_requests.len(), 1);
+        assert_eq!(
+            blob_requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single("target")]
+        );
+        assert_eq!(
+            blob_requests[0].filter.file_ids,
+            vec![NullableKeyFilter::Value("target".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn execute_sql_insert_into_directory_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
