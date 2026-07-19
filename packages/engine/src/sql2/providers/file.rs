@@ -506,9 +506,11 @@ impl TableSpec for LixFileSpec {
         // Prefer it for all descriptor-only scans so queries such as
         // `SELECT id FROM lix_file` and `COUNT(*)` do not materialize the
         // complete descriptor/directory live-state domain on every request.
-        // Scans that need file data or the blob revision still load blob rows;
-        // a path predicate can narrow those loads to the matching file ids.
-        let use_path_index = should_use_path_index(&path_predicate, needs_blob_rows);
+        // Scans that need file data or the blob revision still load blob rows.
+        // A path predicate or exact file ids can narrow those loads to matching
+        // cached descriptors instead of scanning the complete directory state.
+        let use_path_index = should_use_path_index(&path_predicate, needs_blob_rows)
+            || matches!(&target_file_ids, FileIdConstraint::Ids(_));
         let indexed_matches = if !use_path_index {
             None
         } else {
@@ -519,7 +521,14 @@ impl TableSpec for LixFileSpec {
                 ))
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
-            let matches = indexed_file_matches(Arc::clone(&index), &path_predicate);
+            let matches = match &target_file_ids {
+                FileIdConstraint::Ids(ids) => {
+                    indexed_file_id_matches(Arc::clone(&index), ids, &path_predicate)
+                }
+                FileIdConstraint::All | FileIdConstraint::None => {
+                    indexed_file_matches(Arc::clone(&index), &path_predicate)
+                }
+            };
             let index_scan_threshold =
                 2_048_usize.max(index.kind_count(FilesystemPathKind::File) / 1_000);
             if needs_blob_rows && matches.len() > index_scan_threshold {
@@ -3359,6 +3368,24 @@ fn indexed_file_matches(
     indexed_path_matches(index, predicate, FilesystemPathKind::File)
 }
 
+fn indexed_file_id_matches(
+    index: Arc<crate::filesystem::FilesystemPathIndex>,
+    file_ids: &BTreeSet<String>,
+    path_predicate: &FilePathPredicate,
+) -> FilesystemPathSelection {
+    let indices = index
+        .entries()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind == FilesystemPathKind::File
+                && file_ids.contains(entry.id())
+                && path_predicate.matches(&entry.path)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    FilesystemPathSelection::new(index, indices)
+}
+
 fn file_path_comparison_from_binary_filter(binary_expr: &BinaryExpr) -> Option<FilePathPredicate> {
     let operation = match binary_expr.op {
         Operator::Eq => FilePathComparison::Equal,
@@ -3934,8 +3961,8 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{
@@ -4244,6 +4271,69 @@ mod tests {
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn file_id_data_scan_uses_indexed_descriptor_and_only_scans_blob_rows() {
+        let data = b"readme contents".to_vec();
+        let blob_hash = BlobHash::from_content(&data).to_hex();
+        let live_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            )])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixFileSpec::active_branch(
+            "branch-b",
+            Arc::new(RecordingLiveStateReader {
+                rows: vec![live_blob_ref_row(
+                    "file-readme",
+                    "branch-b",
+                    "file-readme",
+                    &blob_hash,
+                    data.len(),
+                )],
+                scan_requests: Arc::clone(&live_state_requests),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            test_functions(),
+        );
+        let projection = vec![spec.schema().index_of("data").expect("data column")];
+        let filters = vec![eq_filter("id", "file-readme")];
+
+        let planned = spec
+            .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
+            .await
+            .expect("file-id data scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("file-id data scan should load");
+
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("data column should be binary data");
+        assert_eq!(values.value(0), data.as_slice());
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        let requests = live_state_requests
+            .lock()
+            .expect("live-state request mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+    }
+
     fn scalar_function_expr(name: &str, args: Vec<Expr>) -> Expr {
         let udf = create_udf(
             name,
@@ -4437,6 +4527,32 @@ mod tests {
 
     struct RejectingLiveStateReader {
         scan_count: Arc<AtomicUsize>,
+    }
+
+    struct RecordingLiveStateReader {
+        rows: Vec<MaterializedLiveStateRow>,
+        scan_requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for RecordingLiveStateReader {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_requests
+                .lock()
+                .expect("live-state request mutex should not be poisoned")
+                .push(request.clone());
+            Ok(self.rows.clone())
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Ok(None)
+        }
     }
 
     #[async_trait]
