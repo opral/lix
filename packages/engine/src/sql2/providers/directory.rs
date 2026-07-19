@@ -51,8 +51,8 @@ use crate::filesystem::{
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, VisibleFilesystem,
     create_directory_path_with_leaf_id_with_resolvers, derive_directory_paths,
     directory_descriptor_write_row, directory_path_resolvers_from_live_state,
-    filesystem_storage_scope_key, plan_parsed_directory_path_update_with_resolvers,
-    plan_recursive_directory_delete,
+    directory_path_resolvers_from_path_index, filesystem_storage_scope_key,
+    plan_parsed_directory_path_update_with_resolvers, plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
@@ -239,6 +239,43 @@ impl LixDirectorySpec {
             branch_ref,
             functions,
             branch_binding: BranchBinding::explicit(),
+        }
+    }
+
+    /// Build the resolver set used by path-based directory writes from the
+    /// descriptor index.  The transaction write context serves its revisioned
+    /// cache until filesystem descriptors are staged, then safely rebuilds an
+    /// overlay-aware index, so this has the same transaction visibility as the
+    /// previous live-state scan.
+    async fn path_resolvers_for_write(
+        &self,
+        write_ctx: &SqlWriteContext,
+    ) -> Result<BTreeMap<String, DirectoryPathResolver>> {
+        let branch_ids = self
+            .branch_binding
+            .active_branch_id()
+            .map(|branch_id| vec![branch_id.to_string()])
+            .unwrap_or_default();
+        let index = self
+            .filesystem_path_index
+            .path_index(&FilesystemPathIndexRequest::new(branch_ids))
+            .await;
+        match index {
+            Ok(index) => directory_path_resolvers_from_path_index(
+                index.as_ref(),
+                self.branch_binding.active_branch_id(),
+            )
+            .map_err(lix_error_to_datafusion_error),
+            // The index includes files as well as directories. If building it
+            // fails for an unrelated malformed file descriptor, retain the
+            // previous directory-write behavior rather than failing a write
+            // that the directory-only live-state resolver can still plan.
+            Err(_) => directory_path_resolvers_from_live_state(
+                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                self.branch_binding.active_branch_id(),
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error),
         }
     }
 
@@ -455,14 +492,7 @@ impl TableSpec for LixDirectorySpec {
         let mut count = 0_u64;
         for batch in batches {
             if path_resolvers.is_none() {
-                path_resolvers = Some(
-                    directory_path_resolvers_from_live_state(
-                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                        self.branch_binding.active_branch_id(),
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?,
-                );
+                path_resolvers = Some(self.path_resolvers_for_write(write_ctx).await?);
             }
             count = count
                 .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
@@ -673,21 +703,16 @@ impl UpsertSupport for LixDirectorySpec {
 
     /// Produce the staged INSERT rows for the non-conflicting proposed rows,
     /// replicating `stage_insert`'s row production exactly: seed the directory
-    /// path resolvers from live state, then branch on whether the batch carries
-    /// a non-null `path` column. Directories have no file data, so the result
-    /// is plain state rows.
+    /// path resolvers from the transaction-visible filesystem index, then
+    /// branch on whether the batch carries a non-null `path` column.
+    /// Directories have no file data, so the result is plain state rows.
     async fn insert_staged_rows(
         &self,
         write_ctx: &SqlWriteContext,
         batch: &RecordBatch,
     ) -> Result<StagedUpsert> {
         let surface_name = lix_directory_surface_name(&self.branch_binding);
-        let mut path_resolvers = directory_path_resolvers_from_live_state(
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-            self.branch_binding.active_branch_id(),
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
+        let mut path_resolvers = self.path_resolvers_for_write(write_ctx).await?;
 
         let rows = if record_batch_has_non_null_column(batch, "path")? {
             lix_directory_write_rows_from_batch_with_path_resolvers(
@@ -713,8 +738,8 @@ impl UpsertSupport for LixDirectorySpec {
 
     /// Scan the existing directories that could conflict with `proposed`,
     /// scoped to the active/explicit branch and narrowed to the proposed
-    /// directory ids, returned as a batch in this table's column schema (the
-    /// same builder the scan path uses).
+    /// directory ids or exact paths, returned as a batch in this table's
+    /// column schema (the same builder the scan path uses).
     async fn scan_conflict_candidates(
         &self,
         write_ctx: &SqlWriteContext,
@@ -745,6 +770,31 @@ impl UpsertSupport for LixDirectorySpec {
                 Vec::new()
             }
         };
+
+        if target.kind() == UpsertConflictKind::Path {
+            // `ON CONFLICT (path)` has a finite, exact set of proposed
+            // paths. The filesystem index preserves every visible directory
+            // lane for each path (tracked, untracked, and global), so retain
+            // those rows for the generic matcher and its lane validation.
+            // Primary-key conflict targets intentionally retain the generic
+            // entity-PK scan below. An index-build failure also falls through
+            // to that generic directory-only scan.
+            let index = self
+                .filesystem_path_index
+                .path_index(&FilesystemPathIndexRequest::new(
+                    request.filter.branch_ids.clone(),
+                ))
+                .await;
+            if let Ok(index) = index {
+                let matches = indexed_path_matches(
+                    index,
+                    &proposed_directory_path_predicate(proposed)?,
+                    FilesystemPathKind::Directory,
+                );
+                return indexed_lix_directory_record_batch(&self.schema, &matches)
+                    .map_err(lix_error_to_datafusion_error);
+            }
+        }
 
         let rows = write_ctx
             .scan_live_state(&request)
@@ -824,6 +874,16 @@ fn proposed_directory_entity_pks(proposed: &RecordBatch) -> Result<Vec<EntityPk>
         }
     }
     Ok(entity_pks)
+}
+
+/// The finite, exact directory paths whose existing rows can conflict with a
+/// proposed `INSERT .. ON CONFLICT (path)` batch.
+fn proposed_directory_path_predicate(batch: &RecordBatch) -> Result<FilePathPredicate> {
+    validate_required_paths(batch, "lix_directory")?;
+    let paths = (0..batch.num_rows())
+        .map(|row_index| required_string_value(batch, row_index, "path"))
+        .collect::<Result<BTreeSet<_>>>()?;
+    Ok(FilePathPredicate::In(paths))
 }
 
 fn proposed_branch_ids(batch: &RecordBatch) -> Result<Vec<String>> {
@@ -1842,10 +1902,10 @@ mod tests {
 
     use super::super::spec::{SpecTableProvider, TableSpec};
     use super::{
-        BranchBinding, DirectoryDescriptorRecord, LixDirectorySpec, WriteAccess,
-        derive_directory_paths, lix_directory_by_branch_schema, lix_directory_insert_origin,
-        lix_directory_record_batch, lix_directory_recursive_delete_rows_from_batch,
-        lix_directory_write_rows_from_batch,
+        BranchBinding, DirectoryDescriptorRecord, LixDirectorySpec, UpsertConflictTarget,
+        UpsertSupport, WriteAccess, derive_directory_paths, lix_directory_by_branch_schema,
+        lix_directory_insert_origin, lix_directory_record_batch,
+        lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
     use crate::filesystem::{
@@ -1914,6 +1974,20 @@ mod tests {
         }
     }
 
+    struct FailingFilesystemPathIndexReader;
+
+    #[async_trait]
+    impl FilesystemPathIndexReader for FailingFilesystemPathIndexReader {
+        async fn path_index(
+            &self,
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            Err(LixError::unknown(
+                "unrelated malformed file descriptor prevented path-index construction",
+            ))
+        }
+    }
+
     struct TestBranchRefReader;
 
     #[async_trait]
@@ -1962,10 +2036,35 @@ mod tests {
         spec.stage_insert(&write_ctx, vec![batch]).await
     }
 
+    /// Stage one active-branch INSERT with an injected path-index reader so a
+    /// routing test can prove resolver seeding does not fall back to a
+    /// live-state scan.
+    async fn stage_active_directory_insert_with_path_index(
+        write_ctx: SqlWriteContext,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        batch: RecordBatch,
+    ) -> Result<u64, datafusion::common::DataFusionError> {
+        let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
+            write_ctx.clone(),
+        ));
+        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
+            write_ctx.clone(),
+        ));
+        let spec = LixDirectorySpec::active_branch(
+            write_ctx.active_branch_id(),
+            live_state,
+            filesystem_path_index,
+            branch_ref,
+            test_functions(),
+        );
+        spec.stage_insert(&write_ctx, vec![batch]).await
+    }
+
     #[derive(Default)]
     struct CapturingWriteContext {
         rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
+        reject_scans: bool,
     }
 
     #[async_trait]
@@ -2006,6 +2105,11 @@ mod tests {
             &mut self,
             _request: &LiveStateScanRequest,
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            if self.reject_scans {
+                return Err(LixError::unknown(
+                    "directory index routing should not scan live state",
+                ));
+            }
             Ok(self.rows.clone())
         }
 
@@ -2149,6 +2253,20 @@ mod tests {
             ],
         )
         .expect("directory path insert batch should build")
+    }
+
+    fn active_directory_path_insert_batch(path: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, true),
+            ])),
+            vec![
+                string_column(vec![Some("dir-nested")]),
+                string_column(vec![Some(path)]),
+            ],
+        )
+        .expect("active directory path insert batch should build")
     }
 
     fn directory_delete_batch(ids: &[&str]) -> RecordBatch {
@@ -2582,7 +2700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_insert_sink_seeds_path_resolver_from_live_state() {
+    async fn directory_insert_sink_seeds_path_resolver_from_filesystem_index() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
                 "dir-docs",
@@ -2590,6 +2708,7 @@ mod tests {
                 "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
+            reject_scans: false,
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_path_insert_batch("/docs/nested/");
@@ -2606,6 +2725,281 @@ mod tests {
         assert_eq!(snapshot["id"], "dir-nested");
         assert_eq!(snapshot["parent_id"], "dir-docs");
         assert_eq!(snapshot["name"], "nested");
+    }
+
+    #[tokio::test]
+    async fn directory_path_insert_uses_indexed_resolver_without_live_state_fallback() {
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![live_row(
+                "dir-docs",
+                "branch-a",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            )])
+            .expect("filesystem path index should build"),
+        );
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::new(AtomicUsize::new(0)),
+            });
+        let mut write_context = CapturingWriteContext {
+            rows: Vec::new(),
+            writes: Vec::new(),
+            reject_scans: true,
+        };
+
+        let count = {
+            let write_ctx = SqlWriteContext::new(&mut write_context);
+            stage_active_directory_insert_with_path_index(
+                write_ctx,
+                filesystem_path_index,
+                active_directory_path_insert_batch("/docs/nested/"),
+            )
+            .await
+            .expect("indexed directory path insert should stage without a live-state scan")
+        };
+
+        assert_eq!(count, 1);
+        let [TransactionWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
+            panic!("expected one directory staged write");
+        };
+        assert_eq!(rows.len(), 1);
+        let snapshot = rows[0]
+            .snapshot
+            .as_ref()
+            .expect("staged descriptor snapshot");
+        assert_eq!(snapshot["id"], "dir-nested");
+        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "nested");
+    }
+
+    #[tokio::test]
+    async fn directory_path_insert_falls_back_when_path_index_build_fails() {
+        let mut write_context = CapturingWriteContext {
+            rows: vec![live_row(
+                "dir-docs",
+                "branch-a",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            )],
+            writes: Vec::new(),
+            reject_scans: false,
+        };
+
+        let count = {
+            let write_ctx = SqlWriteContext::new(&mut write_context);
+            stage_active_directory_insert_with_path_index(
+                write_ctx,
+                Arc::new(FailingFilesystemPathIndexReader),
+                active_directory_path_insert_batch("/docs/nested/"),
+            )
+            .await
+            .expect("directory path insert should retain its live-state fallback")
+        };
+
+        assert_eq!(count, 1);
+        let [TransactionWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
+            panic!("expected one directory staged write");
+        };
+        assert_eq!(rows.len(), 1);
+        let snapshot = rows[0]
+            .snapshot
+            .as_ref()
+            .expect("staged descriptor snapshot");
+        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "nested");
+    }
+
+    #[tokio::test]
+    async fn directory_path_conflict_candidates_use_index_and_retain_visible_lanes() {
+        let tracked = live_row(
+            "dir-tracked",
+            "branch-a",
+            "{\"id\":\"dir-tracked\",\"parent_id\":null,\"name\":\"docs\"}",
+        );
+        let mut untracked = live_row(
+            "dir-untracked",
+            "branch-a",
+            "{\"id\":\"dir-untracked\",\"parent_id\":null,\"name\":\"docs\"}",
+        );
+        untracked.untracked = true;
+        let mut global = live_row(
+            "dir-global",
+            "global",
+            "{\"id\":\"dir-global\",\"parent_id\":null,\"name\":\"docs\"}",
+        );
+        global.global = true;
+        let other = live_row(
+            "dir-other",
+            "branch-a",
+            "{\"id\":\"dir-other\",\"parent_id\":null,\"name\":\"other\"}",
+        );
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![tracked, untracked, global, other])
+                .expect("filesystem path index should build"),
+        );
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::new(AtomicUsize::new(0)),
+            });
+        let mut write_context = CapturingWriteContext {
+            rows: Vec::new(),
+            writes: Vec::new(),
+            reject_scans: true,
+        };
+        let candidates = {
+            let write_ctx = SqlWriteContext::new(&mut write_context);
+            let spec = LixDirectorySpec::active_branch(
+                "branch-a",
+                Arc::new(RejectingLiveStateReader {
+                    scan_count: Arc::new(AtomicUsize::new(0)),
+                }),
+                filesystem_path_index,
+                Arc::new(TestBranchRefReader),
+                test_functions(),
+            );
+            spec.scan_conflict_candidates(
+                &write_ctx,
+                &active_directory_path_insert_batch("/docs/"),
+                &UpsertConflictTarget::path(&["path"]),
+            )
+            .await
+            .expect("path conflicts should route through the filesystem index")
+        };
+
+        let ids = candidates
+            .column_by_name("id")
+            .expect("candidate id column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("candidate id column should be string");
+        let globals = candidates
+            .column_by_name("lixcol_global")
+            .expect("candidate global column")
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("candidate global column should be boolean");
+        let untracked = candidates
+            .column_by_name("lixcol_untracked")
+            .expect("candidate untracked column")
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("candidate untracked column should be boolean");
+        let lanes = (0..candidates.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    globals.value(row),
+                    untracked.value(row),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            lanes,
+            [
+                ("dir-global".to_string(), true, false),
+                ("dir-tracked".to_string(), false, false),
+                ("dir-untracked".to_string(), false, true),
+            ]
+            .into_iter()
+            .collect(),
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_path_conflict_candidates_fall_back_when_index_build_fails() {
+        let mut write_context = CapturingWriteContext {
+            rows: vec![live_row(
+                "dir-docs",
+                "branch-a",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            )],
+            writes: Vec::new(),
+            reject_scans: false,
+        };
+        let candidates = {
+            let write_ctx = SqlWriteContext::new(&mut write_context);
+            let spec = LixDirectorySpec::active_branch(
+                "branch-a",
+                Arc::new(RejectingLiveStateReader {
+                    scan_count: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(FailingFilesystemPathIndexReader),
+                Arc::new(TestBranchRefReader),
+                test_functions(),
+            );
+            spec.scan_conflict_candidates(
+                &write_ctx,
+                &active_directory_path_insert_batch("/docs/"),
+                &UpsertConflictTarget::path(&["path"]),
+            )
+            .await
+            .expect("path conflicts should retain their generic directory scan fallback")
+        };
+
+        let ids = candidates
+            .column_by_name("id")
+            .expect("candidate id column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("candidate id column should be string");
+        assert_eq!(candidates.num_rows(), 1);
+        assert_eq!(ids.value(0), "dir-docs");
+    }
+
+    #[tokio::test]
+    async fn directory_id_conflict_candidates_keep_generic_entity_pk_scan() {
+        let indexed = live_row(
+            "dir-index-only",
+            "branch-a",
+            "{\"id\":\"dir-index-only\",\"parent_id\":null,\"name\":\"docs\"}",
+        );
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
+            Arc::new(StaticFilesystemPathIndexReader {
+                index: Arc::new(
+                    FilesystemPathIndex::from_live_rows(vec![indexed])
+                        .expect("filesystem path index should build"),
+                ),
+                request_count: Arc::new(AtomicUsize::new(0)),
+            });
+        let mut write_context = CapturingWriteContext {
+            rows: vec![live_row(
+                "dir-docs",
+                "branch-a",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            )],
+            writes: Vec::new(),
+            reject_scans: false,
+        };
+        let candidates = {
+            let write_ctx = SqlWriteContext::new(&mut write_context);
+            let spec = LixDirectorySpec::active_branch(
+                "branch-a",
+                Arc::new(RejectingLiveStateReader {
+                    scan_count: Arc::new(AtomicUsize::new(0)),
+                }),
+                filesystem_path_index,
+                Arc::new(TestBranchRefReader),
+                test_functions(),
+            );
+            spec.scan_conflict_candidates(
+                &write_ctx,
+                &directory_insert_batch(false, false),
+                &UpsertConflictTarget::id(&["id"]),
+            )
+            .await
+            .expect("id conflicts should use the entity-primary-key scan")
+        };
+
+        let ids = candidates
+            .column_by_name("id")
+            .expect("candidate id column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("candidate id column should be string");
+        assert_eq!(candidates.num_rows(), 1);
+        assert_eq!(ids.value(0), "dir-docs");
     }
 
     #[test]
