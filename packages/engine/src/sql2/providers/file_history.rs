@@ -25,6 +25,7 @@ use crate::plugin::{
     plugin_key_from_archive_path, render_materialized_plugin_file, retain_plugin_state_rows,
     select_best_glob_match,
 };
+use crate::schema::is_seed_schema_key;
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlHistoryQuerySource;
@@ -52,6 +53,7 @@ use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table,
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
@@ -143,6 +145,7 @@ where
         let metadata_projection =
             HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
+        let lookup_ids = FileHistoryLookupIds::from_public_predicate(&public_predicate);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -154,6 +157,7 @@ where
                     self.plugin_host.clone(),
                     route,
                     public_predicate,
+                    lookup_ids,
                     schema,
                     metadata_projection,
                 ),
@@ -164,6 +168,7 @@ where
                     plugin_host,
                     route,
                     public_predicate,
+                    lookup_ids,
                     schema,
                     metadata_projection,
                 )| async move {
@@ -174,6 +179,7 @@ where
                         plugin_host,
                         &route,
                         &public_predicate,
+                        lookup_ids.as_ref(),
                         needs_data,
                         metadata_projection,
                     )
@@ -383,6 +389,31 @@ impl FileHistoryPublicPredicate {
     fn is_all(&self) -> bool {
         matches!(self, Self::All)
     }
+
+    fn exact_ids(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::Ids(ids) => Some(ids),
+            _ => None,
+        }
+    }
+}
+
+/// A conservative exact public `id` constraint that can be translated to the
+/// canonical descriptor/blob entity primary key. Unlike
+/// [`FileHistoryPublicPredicate`], this deliberately declines disjunctions and
+/// non-literal `id` expressions: those retain the existing complete traversal
+/// and DataFusion residual evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileHistoryLookupIds(BTreeSet<String>);
+
+impl FileHistoryLookupIds {
+    fn from_public_predicate(predicate: &FileHistoryPublicPredicate) -> Option<Self> {
+        predicate.exact_ids().cloned().map(Self)
+    }
+
+    fn entity_pks(&self) -> Result<Vec<String>, LixError> {
+        self.0.iter().map(|id| entity_pk_json_array(id)).collect()
+    }
 }
 
 fn string_literal(expr: &Expr) -> Option<String> {
@@ -433,6 +464,7 @@ async fn load_file_history_rows<S>(
     plugin_host: PluginRuntimeHost,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
+    lookup_ids: Option<&FileHistoryLookupIds>,
     needs_data: bool,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<FileHistoryOutputRow>, LixError>
@@ -450,11 +482,35 @@ where
 
     let event_route = route.traversal_only();
     let context_route = route.starts_only();
+    // Plugins can materialize file history from state rather than a blob. A
+    // plugin install always registers at least one non-seed schema, so retain
+    // the complete filesystem traversal whenever reachable history contains
+    // one. The common no-plugin workspace can safely narrow descriptor/blob
+    // history to the exact public file IDs while retaining all directories for
+    // historical path and rename reconstruction.
+    let lookup_ids = if let Some(lookup_ids) = lookup_ids {
+        match history_contains_non_seed_registered_schema(
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            &context_route,
+        )
+        .await
+        {
+            Ok(false) => Some(lookup_ids),
+            // If this proof cannot be completed, preserve the established
+            // complete traversal rather than introducing a new query error or
+            // risking skipped plugin materialization.
+            Ok(true) | Err(_) => None,
+        }
+    } else {
+        None
+    };
     let filesystem_context = load_file_history_filesystem_context(
         Arc::clone(&commit_graph),
         query_source.clone(),
         &event_route,
         &context_route,
+        lookup_ids,
         metadata_projection,
     )
     .await?;
@@ -467,26 +523,30 @@ where
         &filesystem_context.event_blobs,
         &filesystem_context.descriptors,
     );
-    let plugin_schema_keys = discover_file_history_plugin_schema_keys(
-        blob_reader,
-        &mut installed_plugin_metadata_cache,
-        &filesystem_context,
-        &events,
-        public_predicate,
-    )
-    .await?;
-    let (mut event_plugin_state, plugin_state) = if plugin_schema_keys.is_empty() {
+    let (mut event_plugin_state, plugin_state) = if lookup_ids.is_some() {
         (Vec::new(), Vec::new())
     } else {
-        load_file_history_plugin_state(
-            commit_graph,
-            query_source,
-            &event_route,
-            &context_route,
-            plugin_schema_keys,
-            metadata_projection,
+        let plugin_schema_keys = discover_file_history_plugin_schema_keys(
+            blob_reader,
+            &mut installed_plugin_metadata_cache,
+            &filesystem_context,
+            &events,
+            public_predicate,
         )
-        .await?
+        .await?;
+        if plugin_schema_keys.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            load_file_history_plugin_state(
+                commit_graph,
+                query_source,
+                &event_route,
+                &context_route,
+                plugin_schema_keys,
+                metadata_projection,
+            )
+            .await?
+        }
     };
     retain_matching_plugin_events(
         &mut event_plugin_state,
@@ -658,27 +718,24 @@ async fn load_file_history_filesystem_context<S>(
     query_source: SqlHistoryQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
+    lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryFilesystemContext, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let filesystem_schema_keys = file_history_filesystem_schema_keys();
+    let lookup_ids = lookup_ids.cloned();
     let (event_entries, context_entries) =
         load_file_history_entry_sets(event_route, context_route, move |route| {
             let commit_graph = Arc::clone(&commit_graph);
-            let json_reader = query_source.json_reader.clone();
-            let schema_keys = filesystem_schema_keys.clone();
+            let query_source = query_source.clone();
+            let lookup_ids = lookup_ids.clone();
             async move {
-                load_history_entries(
-                    HistoryViewDescriptor {
-                        view_name: "lix_file_history",
-                        start_commit_column: HISTORY_COL_START_COMMIT_ID,
-                    },
+                load_file_history_filesystem_entries(
                     commit_graph,
-                    json_reader,
+                    query_source,
                     &route,
-                    schema_keys,
+                    lookup_ids.as_ref(),
                     metadata_projection,
                 )
                 .await
@@ -694,6 +751,104 @@ where
         directories: parse_file_history_directories(&context_entries)?,
         blobs: parse_file_history_blobs(&context_entries)?,
     })
+}
+
+async fn history_contains_non_seed_registered_schema<S>(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    route: &HistoryRoute,
+) -> Result<bool, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let entries = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+        },
+        commit_graph,
+        query_source.json_reader,
+        route,
+        vec![REGISTERED_SCHEMA_KEY.to_string()],
+        HistoryMetadataProjection::default(),
+    )
+    .await?;
+    Ok(entries.iter().any(|entry| {
+        entry
+            .change
+            .entity_pk
+            .as_single_string_owned()
+            .map_or(true, |schema_key| !is_seed_schema_key(&schema_key))
+    }))
+}
+
+async fn load_file_history_filesystem_entries<S>(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    route: &HistoryRoute,
+    lookup_ids: Option<&FileHistoryLookupIds>,
+    metadata_projection: HistoryMetadataProjection,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let Some(lookup_ids) = lookup_ids else {
+        return load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "lix_file_history",
+                start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            },
+            commit_graph,
+            query_source.json_reader,
+            route,
+            file_history_filesystem_schema_keys(),
+            metadata_projection,
+        )
+        .await;
+    };
+
+    let descriptor_and_blob_route = file_history_descriptor_blob_route(route, lookup_ids)?;
+    let mut entries = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+        },
+        Arc::clone(&commit_graph),
+        query_source.json_reader.clone(),
+        &descriptor_and_blob_route,
+        vec![
+            FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            BLOB_REF_SCHEMA_KEY.to_string(),
+        ],
+        metadata_projection,
+    )
+    .await?;
+    // Directory changes can rename or move a selected file. Their entity keys
+    // are unrelated to the public file ID, so retain the complete directory
+    // history and let `file_history_events` join only relevant directories.
+    let directories = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+        },
+        commit_graph,
+        query_source.json_reader,
+        route,
+        vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        metadata_projection,
+    )
+    .await?;
+    entries.extend(directories);
+    Ok(entries)
+}
+
+fn file_history_descriptor_blob_route(
+    route: &HistoryRoute,
+    lookup_ids: &FileHistoryLookupIds,
+) -> Result<HistoryRoute, LixError> {
+    let mut route = route.clone();
+    route.entity_pks = lookup_ids.entity_pks()?;
+    Ok(route)
 }
 
 async fn load_file_history_plugin_state<S>(
@@ -1630,6 +1785,7 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::common::{Column, ScalarValue};
+    use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
     use crate::LixError;
@@ -1640,9 +1796,9 @@ mod tests {
 
     use super::{
         FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryFilesystemContext,
-        FileHistoryPublicPredicate, HistoryRoute, PreparedFileHistoryRow,
-        file_history_event_from_entry, load_file_history_blob_bytes, load_file_history_entry_sets,
-        prepare_file_history_rows,
+        FileHistoryLookupIds, FileHistoryPublicPredicate, HistoryRoute, PreparedFileHistoryRow,
+        file_history_descriptor_blob_route, file_history_event_from_entry,
+        load_file_history_blob_bytes, load_file_history_entry_sets, prepare_file_history_rows,
     };
 
     fn history_entry(file_id: &str, depth: u32, snapshot_content: Option<String>) -> HistoryEntry {
@@ -1714,6 +1870,17 @@ mod tests {
                 ScalarValue::Utf8(Some(value.to_string())),
                 None,
             )),
+        ))
+    }
+
+    fn in_filter(column_name: &str, values: &[&str]) -> Expr {
+        Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::from_name(column_name))),
+            values
+                .iter()
+                .map(|value| Expr::Literal(ScalarValue::Utf8(Some((*value).to_string())), None))
+                .collect(),
+            false,
         ))
     }
 
@@ -1819,6 +1986,70 @@ mod tests {
             FileHistoryPublicPredicate::extract_conjuncts(&mixed_and)
                 .matches("file-a", Some("/a.md")),
             "a guaranteed public conjunct remains safe for early pruning"
+        );
+    }
+
+    #[test]
+    fn exact_public_ids_route_only_descriptor_and_blob_history() {
+        let predicate =
+            FileHistoryPublicPredicate::from_filters(&[in_filter("id", &["file-b", "file-a"])]);
+        let ids = FileHistoryLookupIds::from_public_predicate(&predicate)
+            .expect("literal public ID IN filter should be routable");
+        let route = file_history_descriptor_blob_route(
+            &HistoryRoute {
+                start_commit_ids: vec!["commit-start".to_string()],
+                ..HistoryRoute::default()
+            },
+            &ids,
+        )
+        .expect("file IDs should encode as canonical entity keys");
+
+        assert_eq!(
+            route.entity_pks,
+            vec![r#"["file-a"]"#.to_string(), r#"["file-b"]"#.to_string()]
+        );
+        assert_eq!(route.start_commit_ids, vec!["commit-start".to_string()]);
+    }
+
+    #[test]
+    fn public_id_pushdown_declines_or_nonliteral_and_mixed_predicates() {
+        let disjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "file-a")),
+            Operator::Or,
+            Box::new(eq_filter("id", "file-b")),
+        ));
+        assert!(
+            FileHistoryLookupIds::from_public_predicate(&FileHistoryPublicPredicate::from_filters(
+                &[disjunction]
+            ))
+            .is_none(),
+            "OR must retain the existing complete traversal"
+        );
+
+        let nonliteral = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("id"))),
+            Operator::Eq,
+            Box::new(Expr::Column(Column::from_name("other_id"))),
+        ));
+        assert!(
+            FileHistoryLookupIds::from_public_predicate(&FileHistoryPublicPredicate::from_filters(
+                &[nonliteral]
+            ))
+            .is_none(),
+            "non-literal IDs cannot become storage keys"
+        );
+
+        let mixed_conjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "file-a")),
+            Operator::And,
+            Box::new(eq_filter("path", "/a.md")),
+        ));
+        assert!(
+            FileHistoryLookupIds::from_public_predicate(&FileHistoryPublicPredicate::from_filters(
+                &[mixed_conjunction]
+            ))
+            .is_none(),
+            "mixed public predicates retain the existing complete traversal"
         );
     }
 
