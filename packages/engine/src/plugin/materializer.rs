@@ -28,8 +28,14 @@ pub(crate) async fn load_installed_plugins_from_filesystem(
     filesystem: &FilesystemIndex,
     blob_reader: &dyn BlobDataReader,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
+    #[cfg(test)]
+    let mut examined_file_entries = 0usize;
     let mut plugins = Vec::new();
     for (path, file) in filesystem.file_entries() {
+        #[cfg(test)]
+        {
+            examined_file_entries += 1;
+        }
         let Some(plugin_key) = plugin_key_from_archive_path(path) else {
             continue;
         };
@@ -47,12 +53,16 @@ pub(crate) async fn load_installed_plugins_from_filesystem(
                 format!("installed plugin archive '{path}' blob '{blob_hash}' is missing"),
             ));
         };
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_plugin_archive_load(archive_bytes.len());
         plugins.push(load_installed_plugin_from_archive_bytes(
             &plugin_key,
             path,
             &archive_bytes,
         )?);
     }
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_plugin_discovery(examined_file_entries);
     Ok(plugins)
 }
 

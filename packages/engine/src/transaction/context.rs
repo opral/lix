@@ -538,6 +538,18 @@ where
         &mut self,
         file_data: &[TransactionFileData],
     ) -> Result<PluginFileDataReconciliation, LixError> {
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_reconciliation(
+            file_data
+                .iter()
+                .filter(|write| {
+                    write
+                        .path
+                        .as_deref()
+                        .is_some_and(is_plugin_reconciliation_candidate_path)
+                })
+                .count(),
+        );
         let mut reconciliation = PluginFileDataReconciliation::default();
         // A single staged write can contain many ordinary files for the same
         // branch. Reconciliation reads the pre-write filesystem each time, so
@@ -572,11 +584,19 @@ where
                 let context = contexts
                     .get(&write.branch_id)
                     .expect("plugin reconciliation context should be cached");
+                #[cfg(test)]
+                let mut examined_file_entries = 0usize;
                 let existing_file = context.filesystem.file_entries().find(|(_, file)| {
+                    #[cfg(test)]
+                    {
+                        examined_file_entries += 1;
+                    }
                     file.id == write.file_id
                         && file.scope.global == write.global
                         && file.scope.untracked == write.untracked
                 });
+                #[cfg(test)]
+                crate::plugin::bench_stats::record_file_id_entries_examined(examined_file_entries);
                 let existing_plugin = existing_file
                     .and_then(|(path, _)| select_plugin_for_path(&context.installed_plugins, path));
                 let selected_plugin =
@@ -723,6 +743,8 @@ where
                 ..Default::default()
             })
             .await?;
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_filesystem_scan(rows.len());
         FilesystemIndex::from_live_rows(rows)
     }
 
@@ -754,6 +776,8 @@ where
                 ..Default::default()
             })
             .await?;
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_plugin_state_read(rows.len());
         Ok(retain_plugin_state_rows(plugin, rows))
     }
 

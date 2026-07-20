@@ -149,6 +149,8 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             hint: None,
             details: None,
         })?;
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_schema_parse();
         let schema_json: JsonValue = serde_json::from_slice(schema_bytes).map_err(|error| {
             LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -226,6 +228,8 @@ pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
             hint: None,
             details: None,
         })?;
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_schema_parse();
         let schema_json: JsonValue = serde_json::from_slice(schema_bytes).map_err(|error| {
             LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -300,6 +304,8 @@ fn read_archive_files_for_install(
             hint: None,
             details: None,
         })?;
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_archive_entry_inflated(bytes.len());
         if files.insert(entry_path.clone(), bytes).is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -361,6 +367,8 @@ fn read_plugin_archive_files(
             hint: None,
             details: None,
         })?;
+        #[cfg(test)]
+        crate::plugin::bench_stats::record_archive_entry_inflated(bytes.len());
         files.insert(entry_path, bytes);
     }
 

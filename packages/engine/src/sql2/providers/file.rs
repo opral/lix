@@ -3355,6 +3355,8 @@ async fn render_plugin_file_for_sql(
             ..Default::default()
         })
         .await?;
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_plugin_state_read(rows.len());
     let active_state = retain_plugin_state_rows(plugin, rows);
     render_materialized_plugin_file(&plugin_render.host, plugin, &active_state).await
 }
@@ -3376,6 +3378,8 @@ async fn load_installed_plugins_for_lix_file_scan(
     plugin_request.limit = None;
 
     let rows = live_state.scan_rows(&plugin_request).await?;
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_filesystem_scan(rows.len());
     let mut rows_by_branch = BTreeMap::<String, Vec<MaterializedLiveStateRow>>::new();
     for row in rows {
         rows_by_branch

@@ -3,6 +3,8 @@ mod bench_support;
 mod commit;
 mod context;
 mod normalization;
+#[cfg(test)]
+mod plugin_bench;
 mod schema_resolver;
 mod staging;
 pub(crate) mod types;

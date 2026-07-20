@@ -48,6 +48,8 @@ pub struct ValidatedPluginManifest {
 }
 
 pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_manifest_parse();
     let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Plugin manifest must be valid JSON: {error}"),
@@ -118,6 +120,8 @@ pub fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
 }
 
 pub fn glob_matches_path(glob: &str, path: &str) -> bool {
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_glob_match_attempt();
     if glob.is_empty() || path.is_empty() {
         return false;
     }
@@ -125,6 +129,8 @@ pub fn glob_matches_path(glob: &str, path: &str) -> bool {
         return true;
     }
 
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_glob_compile();
     GlobBuilder::new(glob)
         .literal_separator(false)
         .build()

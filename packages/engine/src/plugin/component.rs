@@ -64,6 +64,8 @@ pub(crate) async fn load_or_init_plugin_component(
         }
     }
 
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_wasm_component_initialization();
     let initialized = host
         .wasm_runtime()
         .init_component(plugin.wasm.clone(), WasmLimits::default())
@@ -95,6 +97,8 @@ pub(crate) async fn render_with_plugin(
     state: Vec<WasmPluginEntityState>,
 ) -> Result<Vec<u8>, LixError> {
     let instance = load_or_init_plugin_component(host, plugin).await?;
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_wasm_render_invocation();
     instance.render(state).await
 }
 
@@ -105,6 +109,8 @@ pub(crate) async fn detect_changes_with_plugin(
     file: WasmPluginFile,
 ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
     let instance = load_or_init_plugin_component(host, plugin).await?;
+    #[cfg(test)]
+    crate::plugin::bench_stats::record_wasm_detect_invocation();
     instance.detect_changes(state, file).await
 }
 

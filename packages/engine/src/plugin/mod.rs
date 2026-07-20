@@ -5,6 +5,8 @@
 //! buckets.
 
 mod archive;
+#[cfg(test)]
+pub(crate) mod bench_stats;
 pub(crate) mod component;
 mod install;
 mod manifest;
