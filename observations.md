@@ -37,3 +37,26 @@ than silently removed.
   with and without plugin files, then quantify the cache hit rate needed to
   justify the invalidation complexity.
 - **Status:** observing; deferred in favor of the safe per-batch cache.
+
+## Active: batch correlated blob-ref point reads beyond the indexed scan threshold
+
+- **Evidence:** The bounded large-list fix in PR #630 avoids the independent
+  `entity_pk × file_id` Cartesian fanout for more than 32 selected files. It
+  completes a 2,048-file directory list where the old exact-filter plan
+  materialized about 4.19 million identities and was OOM-killed. The current
+  planner intentionally falls back above 2,048 matches, so larger lists cannot
+  use that bounded fast path.
+- **Potential:** A batch API for correlated `(entity_pk, file_id)` blob-ref
+  lookups could use the existing tracked and mutable-state multi-get primitives
+  without either an `O(n²)` identity expansion or one serial prefix scan per
+  file. That could extend predictable list performance beyond the current
+  threshold.
+- **Why it is not a small PR:** Correctly preserving active/global/untracked
+  visibility, tombstones, projection materialization, and duplicate request
+  handling crosses the live-state reader, mutable index, tracked-state, and
+  file provider layers (roughly six production files).
+- **Next measurement:** Compare the current fallback with a correlated batch
+  prototype at 2,048, 2,500, and 10,000 selected files using the real MCP
+  directory-list projection and matched storage snapshots.
+- **Status:** observing; deferred while the bounded prefix strategy is safe
+  and materially faster for indexed lists.
