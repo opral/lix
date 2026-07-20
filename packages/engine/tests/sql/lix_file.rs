@@ -1,6 +1,7 @@
 use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
+use lix_engine::{CreateBranchOptions, MergeBranchOptions, MergeBranchOutcome};
 
 use super::assert_rows_eq;
 
@@ -3121,5 +3122,418 @@ simulation_test!(
                 .contains("duplicate write target column 'path'"),
             "unexpected error: {error:?}"
         );
+    }
+);
+
+simulation_test!(
+    lix_file_transaction_path_index_cache_preserves_reads_after_failure_and_rollback,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('transaction-target', '/docs/target.md', X'6265666F7265')",
+                &[],
+            )
+            .await
+            .expect("transaction fixture file should insert");
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('transaction-conflict-directory', '/conflict/')",
+                &[],
+            )
+            .await
+            .expect("transaction conflict directory should insert");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('transaction-anchor', '/transaction-anchor.md', X'01')",
+                &[],
+            )
+            .await
+            .expect("transaction descriptor anchor should stage");
+
+        let update = transaction
+            .execute(
+                "UPDATE lix_file SET data = X'6166746572' \
+                 WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("first path-filtered transaction update should succeed");
+        assert_eq!(update.rows_affected(), 1);
+
+        let first_read = transaction
+            .execute(
+                "SELECT id, data FROM lix_file WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("transaction read-your-writes lookup should succeed");
+        assert_rows_eq(
+            first_read,
+            vec![vec![
+                Value::Text("transaction-target".to_string()),
+                Value::Blob(b"after".to_vec()),
+            ]],
+        );
+
+        transaction
+            .execute(
+                "UPDATE lix_file SET data = X'616761696E' \
+                 WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("repeated path-filtered transaction update should succeed");
+        let repeated_read = transaction
+            .execute(
+                "SELECT data FROM lix_file WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("repeated transaction path lookup should succeed");
+        assert_rows_eq(repeated_read, vec![vec![Value::Blob(b"again".to_vec())]]);
+
+        let error = transaction
+            .execute(
+                "UPDATE lix_file SET path = '/conflict' WHERE id = 'transaction-target'",
+                &[],
+            )
+            .await
+            .expect_err("conflicting transaction path update should fail");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+
+        let after_failure = transaction
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("cached path lookup should remain usable after a failed write");
+        assert_rows_eq(
+            after_failure,
+            vec![vec![
+                Value::Text("transaction-target".to_string()),
+                Value::Text("/docs/target.md".to_string()),
+                Value::Blob(b"again".to_vec()),
+            ]],
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+
+        let rolled_back = session
+            .execute(
+                "SELECT id, data FROM lix_file WHERE path = '/docs/target.md'",
+                &[],
+            )
+            .await
+            .expect("rolled-back transaction path lookup should succeed");
+        assert_rows_eq(
+            rolled_back,
+            vec![vec![
+                Value::Text("transaction-target".to_string()),
+                Value::Blob(b"before".to_vec()),
+            ]],
+        );
+        let anchor = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/transaction-anchor.md'",
+                &[],
+            )
+            .await
+            .expect("rolled-back anchor lookup should succeed");
+        assert_eq!(anchor.len(), 0);
+    }
+);
+
+simulation_test!(
+    lix_file_transaction_path_index_cache_rebuilds_for_branch_local_tombstones,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let branch_id = sim.main_branch_id();
+
+        session
+            .execute(
+                "INSERT INTO lix_file_by_branch \
+                 (id, path, data, lixcol_global, lixcol_branch_id) \
+                 VALUES ('lane-file', '/global.md', X'01', true, 'global')",
+                &[],
+            )
+            .await
+            .expect("global lane file should insert");
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_branch \
+                     (id, path, data, lixcol_branch_id) \
+                     VALUES ('lane-file', '/branch.md', X'02', '{branch_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect("branch-local lane file should insert");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('lane-anchor', '/lane-anchor.md', X'03')",
+                &[],
+            )
+            .await
+            .expect("transaction descriptor anchor should stage");
+
+        let local = transaction
+            .execute("SELECT id, path FROM lix_file WHERE id = 'lane-file'", &[])
+            .await
+            .expect("branch-local lane file should be visible");
+        assert_rows_eq(
+            local,
+            vec![vec![
+                Value::Text("lane-file".to_string()),
+                Value::Text("/branch.md".to_string()),
+            ]],
+        );
+
+        let deleted = transaction
+            .execute(
+                &format!(
+                    "DELETE FROM lix_file_by_branch \
+                     WHERE id = 'lane-file' AND lixcol_branch_id = '{branch_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("branch-local lane tombstone should stage");
+        assert_eq!(deleted.rows_affected(), 1);
+
+        let hidden_by_tombstone = transaction
+            .execute("SELECT id, path FROM lix_file WHERE id = 'lane-file'", &[])
+            .await
+            .expect("lane lookup should succeed after the local tombstone");
+        assert_eq!(
+            hidden_by_tombstone.len(),
+            0,
+            "the branch-local tombstone must suppress its lower-priority global lane"
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+        let restored = session
+            .execute("SELECT id, path FROM lix_file WHERE id = 'lane-file'", &[])
+            .await
+            .expect("branch-local lane should be restored after rollback");
+        assert_rows_eq(
+            restored,
+            vec![vec![
+                Value::Text("lane-file".to_string()),
+                Value::Text("/branch.md".to_string()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_transaction_path_index_cache_observes_other_session_commits,
+    options = crate::support::simulation_test::engine::SimulationOptions {
+        deterministic: false,
+    },
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("transaction session should open"),
+            &engine,
+        );
+        let other_session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("other session should open"),
+            &engine,
+        );
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('revision-anchor', '/revision-anchor.md', X'01')",
+                &[],
+            )
+            .await
+            .expect("transaction descriptor anchor should stage");
+
+        let missing = transaction
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/other-session.md'",
+                &[],
+            )
+            .await
+            .expect("initial transaction lookup should succeed");
+        assert_eq!(missing.len(), 0);
+
+        other_session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('other-session-file', '/other-session.md', X'02')",
+                &[],
+            )
+            .await
+            .expect("other session file should commit");
+
+        let visible_after_commit = transaction
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/other-session.md'",
+                &[],
+            )
+            .await
+            .expect("transaction lookup should observe the newer committed path revision");
+        assert_rows_eq(
+            visible_after_commit,
+            vec![vec![
+                Value::Text("other-session-file".to_string()),
+                Value::Text("/other-session.md".to_string()),
+            ]],
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+    }
+);
+
+simulation_test!(
+    lix_file_transaction_path_index_cache_observes_merge_reachability_changes,
+    options = crate::support::simulation_test::engine::SimulationOptions {
+        deterministic: false,
+    },
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.create_branch(CreateBranchOptions {
+            id: Some("path-index-draft".to_string()),
+            name: "Path index draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft branch should create");
+        let draft = main.wrap_session(
+            engine
+                .open_session("path-index-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('merge-main-file', '/main.md', X'01')",
+            &[],
+        )
+        .await
+        .expect("main divergence file should insert");
+        draft
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('merge-draft-file', '/merged.md', X'02')",
+                &[],
+            )
+            .await
+            .expect("draft merge file should insert");
+
+        let transaction_session = main.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("transaction session should open"),
+            &engine,
+        );
+        let mut transaction = transaction_session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('merge-revision-anchor', '/merge-revision-anchor.md', X'03')",
+                &[],
+            )
+            .await
+            .expect("transaction descriptor anchor should stage");
+        let missing_before_merge = transaction
+            .execute("SELECT id FROM lix_file WHERE path = '/merged.md'", &[])
+            .await
+            .expect("initial merge path lookup should succeed");
+        assert_eq!(missing_before_merge.len(), 0);
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "path-index-draft".to_string(),
+            })
+            .await
+            .expect("merge should succeed");
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
+
+        let visible_after_merge = transaction
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/merged.md'",
+                &[],
+            )
+            .await
+            .expect("transaction lookup should observe merged reachable descriptors");
+        assert_rows_eq(
+            visible_after_merge,
+            vec![vec![
+                Value::Text("merge-draft-file".to_string()),
+                Value::Text("/merged.md".to_string()),
+            ]],
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 );
