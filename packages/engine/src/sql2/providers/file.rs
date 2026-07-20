@@ -590,6 +590,7 @@ impl TableSpec for LixFileSpec {
                     Arc::clone(&self.blob_reader),
                     self.plugin_host.clone(),
                     Arc::clone(&self.schema),
+                    Arc::clone(&projected_schema),
                     projection.cloned(),
                     request,
                     target_file_ids,
@@ -605,6 +606,7 @@ impl TableSpec for LixFileSpec {
                     blob_reader,
                     plugin_host,
                     batch_schema,
+                    projected_schema,
                     projection,
                     request,
                     target_file_ids,
@@ -618,9 +620,21 @@ impl TableSpec for LixFileSpec {
                     if let Some(indexed_matches) = indexed_matches.as_ref()
                         && !needs_blob_rows
                     {
+                        // Without residual filters, the path-index order is the
+                        // output order. Materialize only projected columns and
+                        // stop at the scan limit before building Arrow arrays.
+                        // Filtered scans still need their full input schema and
+                        // must apply LIMIT after evaluating every predicate.
+                        let (materialization_schema, materialization_limit) = if filters.is_empty()
+                        {
+                            (&projected_schema, limit)
+                        } else {
+                            (&batch_schema, None)
+                        };
                         let batch = lix_file_record_batch_from_path_selection(
-                            &batch_schema,
+                            materialization_schema,
                             indexed_matches,
+                            materialization_limit,
                         )
                         .map_err(|error| {
                             DataFusionError::Execution(format!(
@@ -630,8 +644,12 @@ impl TableSpec for LixFileSpec {
                         return finish_scan_batch(
                             batch,
                             &filters,
-                            projection.as_deref(),
-                            limit,
+                            if filters.is_empty() {
+                                None
+                            } else {
+                                projection.as_deref()
+                            },
+                            if filters.is_empty() { None } else { limit },
                             "lix_file",
                         );
                     }
@@ -2896,32 +2914,124 @@ fn prepare_indexed_lix_file_rows(
 fn lix_file_record_batch_from_path_selection(
     schema: &SchemaRef,
     matches: &FilesystemPathSelection,
+    limit: Option<usize>,
 ) -> Result<RecordBatch, LixError> {
-    let mut columns = LixFileRecordBatchColumns::default();
-    for entry in matches.entries() {
-        if entry.kind != FilesystemPathKind::File {
-            continue;
-        }
-        let id = entry.id();
-        columns.push(LixFileRecordBatchRow {
-            id: id.to_string(),
-            path: entry.path.clone(),
-            directory_id: entry.parent_id.clone(),
-            name: entry.name.clone(),
-            data: Some(Vec::new()),
-            entity_pk: EntityPk::single(id).as_json_array_text()?,
-            file_id: entry.key.file_id().map(str::to_string),
-            global: entry.key.global(),
-            change_id: entry.change_id().map(|id| id.to_string()),
-            created_at: entry.created_at().to_string(),
-            updated_at: entry.updated_at().to_string(),
-            commit_id: entry.commit_id().map(|id| id.to_string()),
-            untracked: entry.key.is_untracked(),
-            metadata: entry.metadata().map(serialize_row_metadata),
-            branch_id: entry.key.branch_id().to_string(),
-        });
+    let entries = matches
+        .entries_of_kind_with_limit(FilesystemPathKind::File, limit)
+        .collect::<Vec<_>>();
+    let row_count = entries.len();
+    let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let array: ArrayRef = match field.name().as_str() {
+            "id" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.id()))
+                    .collect::<Vec<_>>(),
+            )),
+            "path" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.path.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            "directory_id" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.parent_id.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            "name" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.name.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            "data" => Arc::new(LargeBinaryArray::from(
+                entries.iter().map(|_| Some(&[][..])).collect::<Vec<_>>(),
+            )),
+            "lixcol_entity_pk" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| EntityPk::single(entry.id()).as_json_array_text().map(Some))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            "lixcol_schema_key" => {
+                Arc::new(StringArray::from(vec![
+                    Some(FILE_DESCRIPTOR_SCHEMA_KEY);
+                    row_count
+                ]))
+            }
+            "lixcol_file_id" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.key.file_id())
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_global" => Arc::new(BooleanArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.key.global()))
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_change_id" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.change_id().map(|id| id.to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_created_at" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.created_at()))
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_updated_at" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.updated_at()))
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_commit_id" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.commit_id().map(|id| id.to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_untracked" => Arc::new(BooleanArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.key.is_untracked()))
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_metadata" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.metadata())
+                    .collect::<Vec<_>>(),
+            )),
+            "lixcol_branch_id" => Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| Some(entry.key.branch_id()))
+                    .collect::<Vec<_>>(),
+            )),
+            other => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("sql2 lix_file provider does not support projected column '{other}'"),
+                ));
+            }
+        };
+        columns.push(array);
     }
-    columns.into_record_batch(schema)
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 failed to build indexed lix_file record batch: {error}"),
+        )
+    })
 }
 
 struct LixFileRecordBatchRow {
@@ -4801,6 +4911,87 @@ mod tests {
         );
         assert_eq!(string_value("lixcol_metadata"), r#"{"source":"index"}"#);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_free_descriptor_scan_pushes_projection_and_limit_into_path_selection() {
+        let live_state_scans = Arc::new(AtomicUsize::new(0));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_file_row(
+                    "file-c",
+                    "branch-b",
+                    r#"{"id":"file-c","directory_id":null,"name":"c.txt"}"#,
+                ),
+                live_file_row(
+                    "file-a",
+                    "branch-b",
+                    r#"{"id":"file-a","directory_id":null,"name":"a.txt"}"#,
+                ),
+                live_file_row(
+                    "file-b",
+                    "branch-b",
+                    r#"{"id":"file-b","directory_id":null,"name":"b.txt"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixFileSpec::active_branch(
+            "branch-b",
+            Arc::new(RejectingLiveStateReader {
+                scan_count: Arc::clone(&live_state_scans),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            Arc::new(StaticBlobReader::from_blobs(Vec::new())),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            test_functions(),
+        );
+        let id_projection = vec![spec.schema().index_of("id").expect("id column")];
+
+        let planned = spec
+            .plan_scan(Some(&id_projection), &[], Some(1), &ExecutionProps::new())
+            .await
+            .expect("limited descriptor-only scan should plan");
+        assert_eq!(planned.ordering.as_deref(), Some("path"));
+        let batch = (planned.load)()
+            .await
+            .expect("limited descriptor-only scan should load");
+
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.schema().field(0).name(), "id");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("id should be string data")
+                .value(0),
+            "file-a"
+        );
+
+        let empty_projection = Vec::new();
+        let planned = spec
+            .plan_scan(
+                Some(&empty_projection),
+                &[],
+                Some(2),
+                &ExecutionProps::new(),
+            )
+            .await
+            .expect("count-style descriptor scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("count-style descriptor scan should load");
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 2);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }
 
