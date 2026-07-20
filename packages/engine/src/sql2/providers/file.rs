@@ -615,6 +615,26 @@ impl TableSpec for LixFileSpec {
                     needs_blob_rows,
                     limit,
                 )| async move {
+                    if let Some(indexed_matches) = indexed_matches.as_ref()
+                        && !needs_blob_rows
+                    {
+                        let batch = lix_file_record_batch_from_path_selection(
+                            &batch_schema,
+                            indexed_matches,
+                        )
+                        .map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "sql2 indexed lix_file batch build failed: {error}"
+                            ))
+                        })?;
+                        return finish_scan_batch(
+                            batch,
+                            &filters,
+                            projection.as_deref(),
+                            limit,
+                            "lix_file",
+                        );
+                    }
                     let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
                         let rows = scan_indexed_file_rows(
                             Arc::clone(&live_state),
@@ -2873,6 +2893,179 @@ fn prepare_indexed_lix_file_rows(
     })
 }
 
+fn lix_file_record_batch_from_path_selection(
+    schema: &SchemaRef,
+    matches: &FilesystemPathSelection,
+) -> Result<RecordBatch, LixError> {
+    let mut columns = LixFileRecordBatchColumns::default();
+    for entry in matches.entries() {
+        if entry.kind != FilesystemPathKind::File {
+            continue;
+        }
+        let id = entry.id();
+        columns.push(LixFileRecordBatchRow {
+            id: id.to_string(),
+            path: entry.path.clone(),
+            directory_id: entry.parent_id.clone(),
+            name: entry.name.clone(),
+            data: Some(Vec::new()),
+            entity_pk: EntityPk::single(id).as_json_array_text()?,
+            file_id: entry.key.file_id().map(str::to_string),
+            global: entry.key.global(),
+            change_id: entry.change_id().map(|id| id.to_string()),
+            created_at: entry.created_at().to_string(),
+            updated_at: entry.updated_at().to_string(),
+            commit_id: entry.commit_id().map(|id| id.to_string()),
+            untracked: entry.key.is_untracked(),
+            metadata: entry.metadata().map(serialize_row_metadata),
+            branch_id: entry.key.branch_id().to_string(),
+        });
+    }
+    columns.into_record_batch(schema)
+}
+
+struct LixFileRecordBatchRow {
+    id: String,
+    path: String,
+    directory_id: Option<String>,
+    name: String,
+    data: Option<Vec<u8>>,
+    entity_pk: String,
+    file_id: Option<String>,
+    global: bool,
+    change_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    commit_id: Option<String>,
+    untracked: bool,
+    metadata: Option<String>,
+    branch_id: String,
+}
+
+#[derive(Default)]
+struct LixFileRecordBatchColumns {
+    ids: Vec<Option<String>>,
+    paths: Vec<Option<String>>,
+    directory_ids: Vec<Option<String>>,
+    names: Vec<Option<String>>,
+    data_values: Vec<Option<Vec<u8>>>,
+    entity_pks: Vec<Option<String>>,
+    schema_keys: Vec<Option<String>>,
+    file_ids: Vec<Option<String>>,
+    globals: Vec<Option<bool>>,
+    change_ids: Vec<Option<String>>,
+    created_ats: Vec<Option<String>>,
+    updated_ats: Vec<Option<String>>,
+    commit_ids: Vec<Option<String>>,
+    untracked_values: Vec<Option<bool>>,
+    metadata_values: Vec<Option<String>>,
+    branch_ids: Vec<Option<String>>,
+}
+
+impl LixFileRecordBatchColumns {
+    fn push(&mut self, row: LixFileRecordBatchRow) {
+        self.ids.push(Some(row.id));
+        self.paths.push(Some(row.path));
+        self.directory_ids.push(row.directory_id);
+        self.names.push(Some(row.name));
+        self.data_values.push(row.data);
+        self.entity_pks.push(Some(row.entity_pk));
+        self.schema_keys
+            .push(Some(FILE_DESCRIPTOR_SCHEMA_KEY.to_string()));
+        self.file_ids.push(row.file_id);
+        self.globals.push(Some(row.global));
+        self.change_ids.push(row.change_id);
+        self.created_ats.push(Some(row.created_at));
+        self.updated_ats.push(Some(row.updated_at));
+        self.commit_ids.push(row.commit_id);
+        self.untracked_values.push(Some(row.untracked));
+        self.metadata_values.push(row.metadata);
+        self.branch_ids.push(Some(row.branch_id));
+    }
+
+    fn into_record_batch(self, schema: &SchemaRef) -> Result<RecordBatch, LixError> {
+        let row_count = self.ids.len();
+        let Self {
+            ids,
+            paths,
+            directory_ids,
+            names,
+            data_values,
+            entity_pks,
+            schema_keys,
+            file_ids,
+            globals,
+            change_ids,
+            created_ats,
+            updated_ats,
+            commit_ids,
+            untracked_values,
+            metadata_values,
+            branch_ids,
+        } = self;
+        let ids: ArrayRef = Arc::new(StringArray::from(ids));
+        let paths: ArrayRef = Arc::new(StringArray::from(paths));
+        let directory_ids: ArrayRef = Arc::new(StringArray::from(directory_ids));
+        let names: ArrayRef = Arc::new(StringArray::from(names));
+        let data_values: ArrayRef = Arc::new(LargeBinaryArray::from(
+            data_values
+                .iter()
+                .map(|value| value.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+        let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
+        let schema_keys: ArrayRef = Arc::new(StringArray::from(schema_keys));
+        let file_ids: ArrayRef = Arc::new(StringArray::from(file_ids));
+        let globals: ArrayRef = Arc::new(BooleanArray::from(globals));
+        let change_ids: ArrayRef = Arc::new(StringArray::from(change_ids));
+        let created_ats: ArrayRef = Arc::new(StringArray::from(created_ats));
+        let updated_ats: ArrayRef = Arc::new(StringArray::from(updated_ats));
+        let commit_ids: ArrayRef = Arc::new(StringArray::from(commit_ids));
+        let untracked_values: ArrayRef = Arc::new(BooleanArray::from(untracked_values));
+        let metadata_values: ArrayRef = Arc::new(StringArray::from(metadata_values));
+        let branch_ids: ArrayRef = Arc::new(StringArray::from(branch_ids));
+
+        let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let array = match field.name().as_str() {
+                "id" => Arc::clone(&ids),
+                "path" => Arc::clone(&paths),
+                "directory_id" => Arc::clone(&directory_ids),
+                "name" => Arc::clone(&names),
+                "data" => Arc::clone(&data_values),
+                "lixcol_entity_pk" => Arc::clone(&entity_pks),
+                "lixcol_schema_key" => Arc::clone(&schema_keys),
+                "lixcol_file_id" => Arc::clone(&file_ids),
+                "lixcol_global" => Arc::clone(&globals),
+                "lixcol_change_id" => Arc::clone(&change_ids),
+                "lixcol_created_at" => Arc::clone(&created_ats),
+                "lixcol_updated_at" => Arc::clone(&updated_ats),
+                "lixcol_commit_id" => Arc::clone(&commit_ids),
+                "lixcol_untracked" => Arc::clone(&untracked_values),
+                "lixcol_metadata" => Arc::clone(&metadata_values),
+                "lixcol_branch_id" => Arc::clone(&branch_ids),
+                other => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 lix_file provider does not support projected column '{other}'"
+                        ),
+                    ));
+                }
+            };
+            columns.push(array);
+        }
+
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("sql2 failed to build lix_file record batch: {error}"),
+            )
+        })
+    }
+}
+
 async fn lix_file_record_batch_from_prepared(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
@@ -2892,22 +3085,7 @@ async fn lix_file_record_batch_from_prepared(
         mut file_paths,
         path_ordered_file_keys,
     } = prepared;
-    let mut ids = Vec::new();
-    let mut paths = Vec::new();
-    let mut directory_ids = Vec::new();
-    let mut names = Vec::new();
-    let mut data_values = Vec::new();
-    let mut entity_pks = Vec::new();
-    let mut schema_keys = Vec::new();
-    let mut file_ids = Vec::new();
-    let mut globals = Vec::new();
-    let mut change_ids = Vec::new();
-    let mut created_ats = Vec::new();
-    let mut updated_ats = Vec::new();
-    let mut commit_ids = Vec::new();
-    let mut untracked_values = Vec::new();
-    let mut metadata_values = Vec::new();
-    let mut branch_ids = Vec::new();
+    let mut columns = LixFileRecordBatchColumns::default();
     let mut blob_bytes = if needs_data {
         load_blob_bytes_for_files(blob_reader, &file_rows, &blob_rows).await?
     } else {
@@ -2923,8 +3101,8 @@ async fn lix_file_record_batch_from_prepared(
         let path = file_paths
             .remove(&key)
             .expect("prepared lix_file descriptor should have a path");
+        let blob_key = file.blob_ref_key();
         let data = if needs_data {
-            let blob_key = file.blob_ref_key();
             match blob_bytes.take(&blob_key) {
                 Some(data) => data,
                 None => {
@@ -2940,70 +3118,37 @@ async fn lix_file_record_batch_from_prepared(
         } else {
             Some(Vec::new())
         };
-        let blob_ref = blob_rows.get(&file.blob_ref_key());
+        let blob_ref = blob_rows.get(&blob_key);
         let projected_change_id = blob_ref
             .and_then(|blob_ref| blob_ref.live.change_id)
             .or(file.live.change_id);
-
-        ids.push(Some(file.id));
-        paths.push(Some(path));
-        directory_ids.push(file.directory_id);
-        names.push(Some(file.name));
-        data_values.push(data);
-        entity_pks.push(Some(file.live.entity_pk.as_json_array_text()?));
-        schema_keys.push(Some(file.live.schema_key));
-        file_ids.push(file.live.file_id);
-        globals.push(Some(file.live.global));
-        change_ids.push(projected_change_id.map(|id| id.to_string()));
-        created_ats.push(file.live.created_at);
-        updated_ats.push(file.live.updated_at);
-        commit_ids.push(file.live.commit_id.map(|id| id.to_string()));
-        untracked_values.push(Some(file.live.untracked));
-        metadata_values.push(file.live.metadata.as_deref().map(serialize_row_metadata));
-        branch_ids.push(Some(file.live.branch_id));
+        let FileDescriptorRecord {
+            id,
+            directory_id,
+            name,
+            live,
+            ..
+        } = file;
+        columns.push(LixFileRecordBatchRow {
+            id,
+            path,
+            directory_id,
+            name,
+            data,
+            entity_pk: live.entity_pk.as_json_array_text()?,
+            file_id: live.file_id,
+            global: live.global,
+            change_id: projected_change_id.map(|id| id.to_string()),
+            created_at: live.created_at,
+            updated_at: live.updated_at,
+            commit_id: live.commit_id.map(|id| id.to_string()),
+            untracked: live.untracked,
+            metadata: live.metadata.as_deref().map(serialize_row_metadata),
+            branch_id: live.branch_id,
+        });
     }
 
-    let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let array: ArrayRef = match field.name().as_str() {
-            "id" => Arc::new(StringArray::from(ids.clone())),
-            "path" => Arc::new(StringArray::from(paths.clone())),
-            "directory_id" => Arc::new(StringArray::from(directory_ids.clone())),
-            "name" => Arc::new(StringArray::from(names.clone())),
-            "data" => Arc::new(LargeBinaryArray::from(
-                data_values
-                    .iter()
-                    .map(|value| value.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            "lixcol_entity_pk" => Arc::new(StringArray::from(entity_pks.clone())),
-            "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
-            "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
-            "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
-            "lixcol_change_id" => Arc::new(StringArray::from(change_ids.clone())),
-            "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
-            "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
-            "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
-            "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
-            "lixcol_branch_id" => Arc::new(StringArray::from(branch_ids.clone())),
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("sql2 lix_file provider does not support projected column '{other}'"),
-                ));
-            }
-        };
-        columns.push(array);
-    }
-
-    let options = RecordBatchOptions::new().with_row_count(Some(ids.len()));
-    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("sql2 failed to build lix_file record batch: {error}"),
-        )
-    })
+    columns.into_record_batch(schema)
 }
 
 #[derive(Default)]
@@ -4572,15 +4717,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn descriptor_only_scan_loads_rows_from_the_filesystem_path_index() {
+    async fn descriptor_only_scan_materializes_index_columns_without_live_rows() {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let mut file = live_file_row(
+            "file-readme",
+            "branch-b",
+            r#"{"id":"file-readme","directory_id":"dir-docs","name":"readme.md"}"#,
+        );
+        file.metadata = Some(r#"{"source":"index"}"#.to_string());
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
-            )])
+            FilesystemPathIndex::from_live_rows(vec![
+                live_directory_row(
+                    "dir-docs",
+                    "branch-b",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                ),
+                file,
+            ])
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
@@ -4597,7 +4751,23 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
             test_functions(),
         );
-        let projection = vec![spec.schema().index_of("id").expect("id column")];
+        let projection = [
+            "id",
+            "path",
+            "directory_id",
+            "name",
+            "lixcol_entity_pk",
+            "lixcol_schema_key",
+            "lixcol_commit_id",
+            "lixcol_metadata",
+        ]
+        .into_iter()
+        .map(|column_name| {
+            spec.schema()
+                .index_of(column_name)
+                .expect("descriptor column should exist")
+        })
+        .collect::<Vec<_>>();
 
         let planned = spec
             .plan_scan(Some(&projection), &[], None, &ExecutionProps::new())
@@ -4607,12 +4777,118 @@ mod tests {
             .await
             .expect("descriptor-only scan should load");
 
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("id column should be string data");
-        assert_eq!(ids.value(0), "file-readme");
+        assert_eq!(batch.num_rows(), 1);
+        let string_value = |column_name: &str| {
+            batch
+                .column(batch.schema().index_of(column_name).unwrap())
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("descriptor column should be string data")
+                .value(0)
+        };
+        assert_eq!(string_value("id"), "file-readme");
+        assert_eq!(string_value("path"), "/docs/readme.md");
+        assert_eq!(string_value("directory_id"), "dir-docs");
+        assert_eq!(string_value("name"), "readme.md");
+        assert_eq!(string_value("lixcol_entity_pk"), "[\"file-readme\"]");
+        assert_eq!(
+            string_value("lixcol_schema_key"),
+            super::FILE_DESCRIPTOR_SCHEMA_KEY
+        );
+        assert_eq!(
+            string_value("lixcol_commit_id"),
+            CommitId::for_test_label("commit-file-readme").to_string()
+        );
+        assert_eq!(string_value("lixcol_metadata"), r#"{"source":"index"}"#);
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn by_branch_descriptor_scan_keeps_scope_columns_and_residual_filtering() {
+        let live_state_scans = Arc::new(AtomicUsize::new(0));
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let mut target = live_file_row(
+            "file-target",
+            "branch-b",
+            r#"{"id":"file-target","directory_id":null,"name":"readme.md"}"#,
+        );
+        target.file_id = Some("remote-file-target".to_string());
+        target.untracked = true;
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_file_row(
+                    "file-other",
+                    "branch-a",
+                    r#"{"id":"file-other","directory_id":null,"name":"readme.md"}"#,
+                ),
+                target,
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let spec = LixFileSpec::by_branch(
+            Arc::new(RejectingLiveStateReader {
+                scan_count: Arc::clone(&live_state_scans),
+            }),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::clone(&path_index_requests),
+            }),
+            Arc::new(TestBranchRefReader),
+            Arc::new(StaticBlobReader::from_blobs(Vec::new())),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            test_functions(),
+        );
+        let projection = [
+            "id",
+            "lixcol_file_id",
+            "lixcol_global",
+            "lixcol_untracked",
+            "lixcol_created_at",
+            "lixcol_updated_at",
+            "lixcol_branch_id",
+        ]
+        .into_iter()
+        .map(|column_name| {
+            spec.schema()
+                .index_of(column_name)
+                .expect("by-branch descriptor column should exist")
+        })
+        .collect::<Vec<_>>();
+        let filters = vec![eq_filter("lixcol_branch_id", "branch-b")];
+
+        let planned = spec
+            .plan_scan(Some(&projection), &filters, Some(1), &ExecutionProps::new())
+            .await
+            .expect("by-branch descriptor scan should plan");
+        let batch = (planned.load)()
+            .await
+            .expect("by-branch descriptor scan should load");
+
+        assert_eq!(batch.num_rows(), 1);
+        let string_value = |column_name: &str| {
+            batch
+                .column(batch.schema().index_of(column_name).unwrap())
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("descriptor column should be string data")
+                .value(0)
+        };
+        let boolean_value = |column_name: &str| {
+            batch
+                .column(batch.schema().index_of(column_name).unwrap())
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("descriptor column should be boolean data")
+                .value(0)
+        };
+        assert_eq!(string_value("id"), "file-target");
+        assert_eq!(string_value("lixcol_file_id"), "remote-file-target");
+        assert!(!boolean_value("lixcol_global"));
+        assert!(boolean_value("lixcol_untracked"));
+        assert_eq!(string_value("lixcol_created_at"), "2026-04-23T00:00:00Z");
+        assert_eq!(string_value("lixcol_updated_at"), "2026-04-23T01:00:00Z");
+        assert_eq!(string_value("lixcol_branch_id"), "branch-b");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }

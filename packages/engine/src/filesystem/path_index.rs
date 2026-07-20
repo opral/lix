@@ -89,6 +89,26 @@ impl FilesystemPathEntry {
         }
     }
 
+    pub(crate) fn metadata(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+
+    pub(crate) fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    pub(crate) fn updated_at(&self) -> &str {
+        &self.updated_at
+    }
+
+    pub(crate) fn change_id(&self) -> Option<ChangeId> {
+        self.change_id
+    }
+
+    pub(crate) fn commit_id(&self) -> Option<CommitId> {
+        self.commit_id
+    }
+
     fn estimated_heap_bytes(&self) -> usize {
         self.path.capacity()
             + self.parent_id.as_ref().map_or(0, String::capacity)
