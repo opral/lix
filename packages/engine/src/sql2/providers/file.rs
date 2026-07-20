@@ -92,8 +92,8 @@ use crate::transaction::types::{
 };
 
 use super::spec::{
-    DmlApply, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch,
-    register_spec_table, row_source,
+    DmlApply, DmlPlanOptions, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec,
+    finish_scan_batch, register_spec_table, row_source,
 };
 use super::upsert::{
     StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport, validate_target_columns,
@@ -763,7 +763,18 @@ impl TableSpec for LixFileSpec {
         write_ctx: SqlWriteContext,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
-        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"));
+        self.plan_delete_with_options(write_ctx, filters, DmlPlanOptions::default())
+            .await
+    }
+
+    async fn plan_delete_with_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        filters: &[Expr],
+        options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
+            || options.returning_columns.contains("data");
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);

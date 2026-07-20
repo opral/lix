@@ -114,6 +114,29 @@ simulation_test!(read_only_file_descriptor_rejects_writes, |sim| async move {
     );
 });
 
+simulation_test!(read_only_entity_delete_like_is_rejected, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+        &engine,
+    );
+
+    assert_read_only_error(
+        session
+            .execute(
+                "DELETE FROM lix_file_descriptor WHERE name LIKE '%.txt'",
+                &[],
+            )
+            .await
+            .expect_err("file descriptor LIKE delete should be read-only"),
+        "lix_file_descriptor",
+        "lix_file",
+    );
+});
+
 simulation_test!(read_only_binary_blob_ref_rejects_writes, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

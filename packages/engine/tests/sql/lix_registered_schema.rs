@@ -238,6 +238,22 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             .contains("delete lix_registered_schema is not supported"),
         "unexpected error: {error:?}"
     );
+
+    let like_error = session
+        .execute(
+            "DELETE FROM lix_registered_schema \
+             WHERE lix_json_get_text(value, 'x-lix-key') LIKE 'engine_delete%'",
+            &[],
+        )
+        .await
+        .expect_err("schema deletion through LIKE is not supported either");
+    assert_eq!(like_error.code, LixError::CODE_UNSUPPORTED_SQL);
+    assert!(
+        like_error
+            .message
+            .contains("delete lix_registered_schema is not supported"),
+        "unexpected error: {like_error:?}"
+    );
 });
 
 simulation_test!(

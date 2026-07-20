@@ -93,6 +93,7 @@ mod sql {
     };
 }
 
+    mod delete_returning;
     mod entity_history;
     mod entity_view;
     mod errors;

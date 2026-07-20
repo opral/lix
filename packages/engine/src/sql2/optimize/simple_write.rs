@@ -20,7 +20,8 @@ pub(crate) struct FastDeletePlan;
 pub(crate) fn try_make_fast_write_plan(
     plan: &LogicalWritePlan,
 ) -> Result<Option<FastWritePlan>, LixError> {
-    if !is_supported_fast_target(plan) || !is_known_no_match(plan) {
+    if plan.bound.returning.is_some() || !is_supported_fast_target(plan) || !is_known_no_match(plan)
+    {
         return Ok(None);
     }
 
