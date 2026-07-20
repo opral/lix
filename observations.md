@@ -60,3 +60,21 @@ than silently removed.
   directory-list projection and matched storage snapshots.
 - **Status:** observing; deferred while the bounded prefix strategy is safe
   and materially faster for indexed lists.
+
+## Active: runtime dynamic join-filter integration
+
+- **Evidence:** A one-row `lix_file` → `lix_change` join cannot pass the file
+  row's runtime `lixcol_change_id` into `ChangeSpec`; the provider must scan
+  the global direct/derived change surface. The bounded Markdown fix instead
+  issues a point `id + file_id` change lookup after reading the file.
+- **Potential:** General runtime dynamic-filter support could make correlated
+  joins use point reads without an application-level split query.
+- **Why it is not a small PR:** It requires filter-aware `PlannedScan` /
+  `SpecScanExec` plumbing plus per-provider dynamic-filter semantics and
+  validation of direct versus derived change rows, touching core SQL execution
+  across more than five files.
+- **Next measurement:** Prototype runtime filter binding for the exact
+  file-to-change join and compare observer re-execution at 2.5k, 10k, and
+  50k changes.
+- **Status:** observing; deferred while explicit 90%-path point lookups remain
+  sufficient.
