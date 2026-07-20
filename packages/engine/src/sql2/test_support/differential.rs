@@ -151,23 +151,25 @@ mod tests {
             .await
             .expect("differential transaction should open");
         for setup_sql in case.transaction_setup_sql {
-            transaction
-                .execute_with_write_executor_mode(
-                    setup_sql,
-                    &[],
-                    WriteExecutorMode::ForceDataFusion,
+            Box::pin(transaction.execute_with_write_executor_mode(
+                setup_sql,
+                &[],
+                WriteExecutorMode::ForceDataFusion,
+            ))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "differential SQL seed '{}' transaction setup failed\nSQL: {}\nerror: {:?}",
+                    case.seed, setup_sql, error
                 )
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "differential SQL seed '{}' transaction setup failed\nSQL: {}\nerror: {:?}",
-                        case.seed, setup_sql, error
-                    )
-                });
+            });
         }
-        let execution_result = transaction
-            .execute_with_write_executor_mode_and_trace(case.sql.as_ref(), &params, mode)
-            .await;
+        let execution_result = Box::pin(transaction.execute_with_write_executor_mode_and_trace(
+            case.sql.as_ref(),
+            &params,
+            mode,
+        ))
+        .await;
         let execution = execution_signature(&execution_result);
         let executor_path = execution_result
             .as_ref()
@@ -229,19 +231,20 @@ mod tests {
             .await
             .expect("differential baseline transaction should open");
         for setup_sql in case.transaction_setup_sql {
-            transaction
-                .execute_with_write_executor_mode(
+            Box::pin(
+                transaction.execute_with_write_executor_mode(
                     setup_sql,
                     &[],
                     WriteExecutorMode::ForceDataFusion,
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "differential SQL seed '{}' baseline transaction setup failed\nSQL: {}\nerror: {:?}",
+                    case.seed, setup_sql, error
                 )
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "differential SQL seed '{}' baseline transaction setup failed\nSQL: {}\nerror: {:?}",
-                        case.seed, setup_sql, error
-                    )
-                });
+            });
         }
 
         let staged_rows =
