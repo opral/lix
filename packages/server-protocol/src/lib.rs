@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
+use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 /// Stable URL prefix owned by the Lix server protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
@@ -53,14 +54,20 @@ where
             )
         })?;
         let lix = Arc::clone(&self.lix);
-        tokio::task::spawn_blocking(move || runtime.block_on(operation(lix)))
-            .await
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("join Lix server operation: {error}"),
-                )
-            })?
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                parent.in_scope(|| runtime.block_on(operation(lix)))
+            })
+        })
+        .await
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("join Lix server operation: {error}"),
+            )
+        })?
     }
 
     fn observe(&self, sql: &str, params: &[Value]) -> Result<ServerObserve<S>, LixError> {
@@ -90,21 +97,27 @@ where
         })?;
         let events = Arc::clone(&self.events);
         let (cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let result = tokio::task::spawn_blocking(move || {
-            let mut events = events.lock().map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("lock Lix observe stream: {error}"),
-                )
-            })?;
-            runtime.block_on(async {
-                tokio::select! {
-                    result = events.next() => result,
-                    _ = cancel => Err(LixError::new(
-                        LixError::CODE_CLOSED,
-                        "Lix observe wait was cancelled",
-                    )),
-                }
+            tracing::dispatcher::with_default(&dispatch, || {
+                parent.in_scope(|| {
+                    let mut events = events.lock().map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("lock Lix observe stream: {error}"),
+                        )
+                    })?;
+                    runtime.block_on(async {
+                        tokio::select! {
+                            result = events.next() => result,
+                            _ = cancel => Err(LixError::new(
+                                LixError::CODE_CLOSED,
+                                "Lix observe wait was cancelled",
+                            )),
+                        }
+                    })
+                })
             })
         })
         .await
@@ -298,31 +311,36 @@ where
         let params = decode_params(subscription.params)?;
         let events = state.observe(&sql, &params)?;
         let sender = sender.clone();
-        tasks.push(tokio::spawn(async move {
-            loop {
-                let message = match events.next().await {
-                    Ok(Some(event)) => match ObserveEventResponse::try_from(event) {
-                        Ok(payload) => MultiplexObserveMessage::Next {
-                            subscription_id: subscription_id.clone(),
-                            payload,
+        let parent = tracing::Span::current();
+        tasks.push(tokio::spawn(
+            async move {
+                loop {
+                    let message = match events.next().await {
+                        Ok(Some(event)) => match ObserveEventResponse::try_from(event) {
+                            Ok(payload) => MultiplexObserveMessage::Next {
+                                subscription_id: subscription_id.clone(),
+                                payload,
+                            },
+                            Err(error) => MultiplexObserveMessage::Error {
+                                subscription_id: subscription_id.clone(),
+                                error: ErrorEnvelope::from_lix_error(&error),
+                            },
                         },
+                        Ok(None) => break,
                         Err(error) => MultiplexObserveMessage::Error {
                             subscription_id: subscription_id.clone(),
                             error: ErrorEnvelope::from_lix_error(&error),
                         },
-                    },
-                    Ok(None) => break,
-                    Err(error) => MultiplexObserveMessage::Error {
-                        subscription_id: subscription_id.clone(),
-                        error: ErrorEnvelope::from_lix_error(&error),
-                    },
-                };
-                let terminal = matches!(message, MultiplexObserveMessage::Error { .. });
-                if sender.send(message).await.is_err() || terminal {
-                    break;
+                    };
+                    let terminal = matches!(message, MultiplexObserveMessage::Error { .. });
+                    if sender.send(message).await.is_err() || terminal {
+                        break;
+                    }
                 }
             }
-        }));
+            .instrument(parent)
+            .with_current_subscriber(),
+        ));
     }
     drop(sender);
     let stream = async_stream::stream! {
@@ -687,15 +705,73 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt as _;
-    use lix_sdk::{Memory, OpenLixOptions, open_lix};
+    use lix_sdk::{
+        Memory, OpenLixOptions, TracingTelemetrySink, open_lix, open_lix_with_telemetry,
+    };
     use serde_json::{Value as JsonValue, json};
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt as _;
+    use tracing::Subscriber;
+    use tracing_subscriber::{
+        layer::{Context as LayerContext, Layer},
+        prelude::*,
+        registry::LookupSpan,
+    };
+
+    #[derive(Clone, Debug)]
+    struct CapturedSpan {
+        parent: Option<tracing::span::Id>,
+        name: &'static str,
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        spans: Arc<Mutex<Vec<CapturedSpan>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            context: LayerContext<'_, S>,
+        ) {
+            let parent = attributes.parent().cloned().or_else(|| {
+                attributes
+                    .is_contextual()
+                    .then(|| context.current_span().id().cloned())
+                    .flatten()
+            });
+            self.spans
+                .lock()
+                .expect("capture spans")
+                .push(CapturedSpan {
+                    parent,
+                    name: attributes.metadata().name(),
+                });
+        }
+    }
 
     async fn app() -> Router {
         let lix = Arc::new(
             open_lix(OpenLixOptions::<Memory>::default())
                 .await
                 .expect("open lix"),
+        );
+        handler(lix)
+    }
+
+    async fn app_with_tracing_telemetry() -> Router {
+        let lix = Arc::new(
+            open_lix_with_telemetry(
+                OpenLixOptions::<Memory>::default(),
+                Arc::new(TracingTelemetrySink::new()),
+            )
+            .await
+            .expect("open lix"),
         );
         handler(lix)
     }
@@ -791,5 +867,32 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn execute_keeps_sql_span_under_protocol_request_across_blocking_runtime() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let protocol_span = tracing::info_span!("lix.protocol.request");
+        let protocol_span_id = protocol_span.id().expect("protocol span id");
+
+        let response = json_request(
+            app_with_tracing_telemetry().await,
+            "POST",
+            "/lix/v1/execute",
+            json!({ "sql": "SELECT 1", "params": [] }),
+        )
+        .instrument(protocol_span)
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let spans = spans.lock().expect("capture spans");
+        let sql_span = spans
+            .iter()
+            .find(|span| span.name == "lix.sql.query")
+            .expect("SQL span");
+        assert_eq!(sql_span.parent.as_ref(), Some(&protocol_span_id));
     }
 }
