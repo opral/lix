@@ -802,7 +802,7 @@ impl TableSpec for LixFileSpec {
         let indexed_matches = self.indexed_path_matches(&request, filters).await?;
 
         let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
-        let capture_path_resolver_rows = (update_columns.path || update_columns.descriptor)
+        let capture_path_resolver_rows = update_columns.requires_path_resolver()
             && matches!(
                 (&self.branch_binding, &target_file_ids),
                 (BranchBinding::Active { .. }, FileIdConstraint::All)
@@ -834,18 +834,19 @@ impl TableSpec for LixFileSpec {
                 } = lix_file_dml_source_state(&captured, "UPDATE")?;
                 let assignment_values =
                     UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
-                let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
-                    path_update_plugin_rewrite_file_ids(
-                        plugin_render.as_ref(),
-                        &matched_batch,
-                        &assignment_values,
-                        branch_binding.active_branch_id(),
-                    )?
-                } else {
-                    BTreeSet::new()
-                };
+                let plugin_rewrite_file_ids =
+                    if update_columns.updates_path() && !update_columns.data {
+                        path_update_plugin_rewrite_file_ids(
+                            plugin_render.as_ref(),
+                            &matched_batch,
+                            &assignment_values,
+                            branch_binding.active_branch_id(),
+                        )?
+                    } else {
+                        BTreeSet::new()
+                    };
                 let mut path_resolvers = None;
-                if update_columns.path || update_columns.descriptor {
+                if update_columns.requires_path_resolver() {
                     path_resolvers = Some(if let Some(path_index) = path_index {
                         directory_path_resolvers_from_path_index(
                             path_index.index(),
@@ -1146,7 +1147,7 @@ impl UpsertSupport for LixFileSpec {
         let blob_ref_keys =
             blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
 
-        let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
+        let plugin_rewrite_file_ids = if update_columns.updates_path() && !update_columns.data {
             let plugin_render = plugin_render_context_for_lix_file_scan(
                 live_state.clone(),
                 &self.blob_reader,
@@ -1171,7 +1172,7 @@ impl UpsertSupport for LixFileSpec {
         };
 
         let mut path_resolvers = None;
-        if update_columns.path || update_columns.descriptor {
+        if update_columns.requires_path_resolver() {
             path_resolvers = Some(
                 directory_path_resolvers_from_live_state(
                     Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
@@ -1942,6 +1943,12 @@ fn lix_file_existing_update_stage_from_batch(
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
+    // Descriptor attributes retain the existing materialized public path. A
+    // resolver is only needed when a write can alter the directory graph. In
+    // particular, metadata is stored on the descriptor but cannot change its
+    // path, so a content-and-metadata overwrite can use the matched row's
+    // already materialized path for downstream file-data handling.
+    let reuse_materialized_path = include_descriptor_writes && path_resolvers.is_none();
     let mut path_resolvers = path_resolvers;
 
     for row_index in 0..batch.num_rows() {
@@ -1979,7 +1986,13 @@ fn lix_file_existing_update_stage_from_batch(
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
             let path = if include_descriptor_writes {
-                data_path
+                match data_path {
+                    Some(path) => Some(path),
+                    None if reuse_materialized_path => {
+                        Some(required_string_value(batch, row_index, "path")?)
+                    }
+                    None => None,
+                }
             } else {
                 optional_string_value(batch, row_index, "path")?
             };
@@ -2006,29 +2019,73 @@ fn lix_file_existing_update_stage_from_batch(
     Ok(staged)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LixFileDescriptorUpdate {
+    None,
+    Attributes,
+    Topology,
+    Path,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LixFileUpdateColumns {
-    path: bool,
     data: bool,
-    descriptor: bool,
+    descriptor: LixFileDescriptorUpdate,
 }
 
 impl LixFileUpdateColumns {
     fn from_assignments(assignments: &[(String, Arc<dyn PhysicalExpr>)]) -> Self {
-        let path = assignments
-            .iter()
-            .any(|(column_name, _)| column_name == "path");
-        let data = assignments
-            .iter()
-            .any(|(column_name, _)| column_name == "data");
-        let descriptor = assignments
-            .iter()
-            .any(|(column_name, _)| column_name != "path" && column_name != "data");
-        Self {
-            path,
-            data,
-            descriptor,
+        let mut impact = Self {
+            data: false,
+            descriptor: LixFileDescriptorUpdate::None,
+        };
+        for (column_name, _) in assignments {
+            let descriptor = match column_name.as_str() {
+                // These fields determine the visible filesystem graph and
+                // therefore require collision checks and path resolution.
+                "path" => LixFileDescriptorUpdate::Path,
+                "directory_id" | "name" => LixFileDescriptorUpdate::Topology,
+                // Payload and descriptor attributes retain the current path.
+                "data" => {
+                    impact.data = true;
+                    continue;
+                }
+                "lixcol_metadata" => LixFileDescriptorUpdate::Attributes,
+                // Assignment validation rejects every other writable target.
+                // Treating an unexpected target as topology-changing keeps a
+                // future surface extension conservative until it is classified.
+                _ => LixFileDescriptorUpdate::Topology,
+            };
+            impact.descriptor = match (impact.descriptor, descriptor) {
+                (LixFileDescriptorUpdate::Path, _) | (_, LixFileDescriptorUpdate::Path) => {
+                    LixFileDescriptorUpdate::Path
+                }
+                (LixFileDescriptorUpdate::Topology, _) | (_, LixFileDescriptorUpdate::Topology) => {
+                    LixFileDescriptorUpdate::Topology
+                }
+                (LixFileDescriptorUpdate::Attributes, _)
+                | (_, LixFileDescriptorUpdate::Attributes) => LixFileDescriptorUpdate::Attributes,
+                (LixFileDescriptorUpdate::None, LixFileDescriptorUpdate::None) => {
+                    LixFileDescriptorUpdate::None
+                }
+            };
         }
+        impact
+    }
+
+    fn updates_path(self) -> bool {
+        self.descriptor == LixFileDescriptorUpdate::Path
+    }
+
+    fn writes_descriptor(self) -> bool {
+        self.descriptor != LixFileDescriptorUpdate::None
+    }
+
+    fn requires_path_resolver(self) -> bool {
+        matches!(
+            self.descriptor,
+            LixFileDescriptorUpdate::Topology | LixFileDescriptorUpdate::Path
+        )
     }
 }
 
@@ -2041,7 +2098,7 @@ fn reject_lix_file_update_plugin_storage_paths(
         if let Some(existing_path) = optional_string_value(batch, row_index, "path")? {
             let parsed = parse_file_upsert_path(&existing_path, TransactionWriteOperation::Update)?;
             if parsed.plugin_key.is_some() {
-                if update_columns.path {
+                if update_columns.updates_path() {
                     return Err(lix_error_to_datafusion_error(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         "UPDATE lix_file cannot modify plugin archive paths".to_string(),
@@ -2055,7 +2112,7 @@ fn reject_lix_file_update_plugin_storage_paths(
                 }
             }
         }
-        if update_columns.path {
+        if update_columns.updates_path() {
             let assigned_path =
                 update_required_string_value(batch, assignment_values, row_index, "path")?;
             let parsed = parse_file_upsert_path(&assigned_path, TransactionWriteOperation::Update)?;
@@ -2082,13 +2139,13 @@ fn lix_file_update_stage_from_batch(
 ) -> Result<LixFileStagedBatch> {
     reject_lix_file_update_plugin_storage_paths(batch, assignment_values, update_columns)?;
 
-    if update_columns.path || update_columns.descriptor {
+    if update_columns.requires_path_resolver() {
         let Some(path_resolvers) = path_resolvers else {
             return Err(DataFusionError::Execution(
                 "UPDATE lix_file requires filesystem path resolver".to_string(),
             ));
         };
-        return if update_columns.path {
+        return if update_columns.updates_path() {
             lix_file_path_update_stage_from_batch(
                 batch,
                 assignment_values,
@@ -2104,7 +2161,7 @@ fn lix_file_update_stage_from_batch(
                 batch,
                 assignment_values,
                 branch_binding,
-                update_columns.descriptor,
+                update_columns.writes_descriptor(),
                 update_columns.data,
                 blob_ref_keys,
                 Some(path_resolvers),
@@ -2116,7 +2173,7 @@ fn lix_file_update_stage_from_batch(
         batch,
         assignment_values,
         branch_binding,
-        update_columns.descriptor,
+        update_columns.writes_descriptor(),
         update_columns.data,
         blob_ref_keys,
         None,
@@ -4224,8 +4281,9 @@ mod tests {
 
     use super::{
         BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, LixFileSpec, TableSpec,
-        derive_directory_paths, lix_file_delete_stage_from_batch, lix_file_insert_stage_from_batch,
-        lix_file_insert_stage_from_batch_with_path_resolvers, lix_file_write_rows_from_batch,
+        UpsertSupport, derive_directory_paths, lix_file_delete_stage_from_batch,
+        lix_file_insert_stage_from_batch, lix_file_insert_stage_from_batch_with_path_resolvers,
+        lix_file_write_rows_from_batch,
     };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -5252,13 +5310,13 @@ mod tests {
         blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     ) -> datafusion::common::Result<super::LixFileStagedBatch> {
         let mut columns = Vec::new();
-        if update_columns.path {
+        if update_columns.updates_path() {
             columns.push("path");
         }
         if update_columns.data {
             columns.push("data");
         }
-        if update_columns.descriptor {
+        if update_columns.writes_descriptor() {
             columns.extend(["directory_id", "name"]);
         }
         let assignment_values = super::UpdateAssignmentValues::from_batch_columns(batch, &columns);
@@ -5872,6 +5930,30 @@ mod tests {
         .expect("file descriptor data update batch")
     }
 
+    fn metadata_data_update_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, false),
+                Field::new("directory_id", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_metadata", DataType::Utf8, true),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("/docs/readme.md")]),
+                string_column(vec![Some("dir-docs")]),
+                string_column(vec![Some("readme.md")]),
+                Arc::new(BinaryArray::from_vec(vec![b"updated"])) as ArrayRef,
+                string_column(vec![Some(r#"{"source":"upload"}"#)]),
+                string_column(vec![Some("branch-b")]),
+            ],
+        )
+        .expect("file metadata data update batch")
+    }
+
     fn empty_data_update_batch() -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -6292,9 +6374,8 @@ mod tests {
             &path_update_batch_with_path("/.lix/plugins/nested/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: false,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6316,9 +6397,8 @@ mod tests {
             &path_update_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: false,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6337,9 +6417,8 @@ mod tests {
             &data_update_batch_with_path("/.lix/plugins/nested/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
-                path: false,
                 data: true,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::None,
             },
             None,
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6384,9 +6463,8 @@ mod tests {
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: false,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6423,9 +6501,8 @@ mod tests {
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: false,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6464,9 +6541,8 @@ mod tests {
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: false,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6505,9 +6581,8 @@ mod tests {
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: false,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["dir-generated-docs"]),
@@ -6560,9 +6635,8 @@ mod tests {
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: true,
                 data: true,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6603,9 +6677,8 @@ mod tests {
             &descriptor_data_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: false,
                 data: true,
-                descriptor: true,
+                descriptor: super::LixFileDescriptorUpdate::Topology,
             },
             Some(&mut resolvers),
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6641,14 +6714,72 @@ mod tests {
     }
 
     #[test]
+    fn file_metadata_data_update_reuses_materialized_path_without_resolver() {
+        let batch = metadata_data_update_batch();
+        let assignments = vec![
+            literal_assignment("data", ScalarValue::Binary(Some(b"updated".to_vec()))),
+            literal_assignment(
+                "lixcol_metadata",
+                ScalarValue::Utf8(Some(r#"{"source":"upload"}"#.to_string())),
+            ),
+        ];
+        let update_columns = super::LixFileUpdateColumns::from_assignments(&assignments);
+        assert!(update_columns.data);
+        assert!(update_columns.writes_descriptor());
+        assert!(
+            !update_columns.requires_path_resolver(),
+            "metadata must not be treated as a filesystem topology mutation"
+        );
+
+        let structural_columns =
+            super::LixFileUpdateColumns::from_assignments(&[literal_assignment(
+                "directory_id",
+                ScalarValue::Utf8(Some("dir-other".to_string())),
+            )]);
+        assert!(
+            structural_columns.requires_path_resolver(),
+            "directory moves must retain resolver validation"
+        );
+
+        let assignment_values =
+            super::UpdateAssignmentValues::from_batch_columns(&batch, &["data", "lixcol_metadata"]);
+        let staged = super::lix_file_update_stage_from_batch(
+            &batch,
+            &assignment_values,
+            None,
+            update_columns,
+            &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
+            &BTreeSet::new(),
+            None,
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect("metadata/data update should not need a path resolver");
+
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("metadata update should stage a descriptor row");
+        assert_eq!(
+            descriptor.metadata.as_ref().map(TransactionJson::value),
+            Some(&serde_json::json!({"source": "upload"}))
+        );
+        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(
+            staged.file_data_writes[0].path.as_deref(),
+            Some("/docs/readme.md")
+        );
+        assert_eq!(staged.file_data_writes[0].data(), b"updated");
+    }
+
+    #[test]
     fn file_data_update_without_path_ignores_materialized_path_column() {
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: false,
                 data: true,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::None,
             },
             None,
             &mut test_id_generator(&["should-not-be-used"]),
@@ -6668,9 +6799,8 @@ mod tests {
             &empty_data_update_batch(),
             None,
             super::LixFileUpdateColumns {
-                path: false,
                 data: true,
-                descriptor: false,
+                descriptor: super::LixFileDescriptorUpdate::None,
             },
             None,
             &mut test_id_generator(&["should-not-be-used"]),
@@ -7007,6 +7137,35 @@ mod tests {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn file_upsert_attribute_update_does_not_rescan_path_topology() {
+        let mut write_context = CapturingWriteContext {
+            rows: file_dml_rows(),
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let assignments = vec![
+            literal_assignment("data", ScalarValue::Binary(Some(b"updated".to_vec()))),
+            literal_assignment(
+                "lixcol_metadata",
+                ScalarValue::Utf8(Some(r#"{"source":"upload"}"#.to_string())),
+            ),
+        ];
+
+        let staged = spec
+            .apply_conflict_update(&write_ctx, &metadata_data_update_batch(), &assignments)
+            .await
+            .expect("attribute-only conflict update should stage");
+
+        assert_eq!(
+            write_context.scan_count, 2,
+            "the conflict update needs its matched file/blob and directory scans, but metadata must not add a resolver scan"
+        );
+        assert_eq!(staged.file_data.len(), 1);
+        assert_eq!(staged.file_data[0].path.as_deref(), Some("/docs/readme.md"));
     }
 
     #[tokio::test]
