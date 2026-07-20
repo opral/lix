@@ -53,13 +53,22 @@ pub(crate) async fn commit_prepared_writes(
         }
     }
 
-    let mut state_rows = prepared_writes.state_rows;
-    let filesystem_view_changed = state_rows.iter().any(|row| {
+    let filesystem_view_changed = prepared_writes.state_rows.iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
             "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
         )
-    });
+    }) || prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .flat_map(|change_refs| change_refs.selected_change_refs.iter())
+        .any(|change_ref| {
+            matches!(
+                change_ref.schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor"
+            )
+        });
+    let mut state_rows = prepared_writes.state_rows;
     let insert_identities = prepared_writes
         .insert_identities
         .into_keys()

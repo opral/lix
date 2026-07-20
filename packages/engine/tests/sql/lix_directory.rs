@@ -1627,3 +1627,107 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_directory_transaction_path_index_rebuilds_for_subtree_move_and_delete,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('transaction-subtree-file', '/old/sub/readme.md', X'726561646D65')",
+                &[],
+            )
+            .await
+            .expect("subtree fixture should insert");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        let warm = transaction
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/old/sub/readme.md'",
+                &[],
+            )
+            .await
+            .expect("old subtree path should warm the transaction index");
+        assert_rows_eq(
+            warm,
+            vec![vec![Value::Text("transaction-subtree-file".to_string())]],
+        );
+
+        let moved = transaction
+            .execute(
+                "UPDATE lix_directory SET path = '/new/' WHERE path = '/old/'",
+                &[],
+            )
+            .await
+            .expect("transactional subtree root move should succeed");
+        assert_eq!(moved.rows_affected(), 1);
+
+        let old_path = transaction
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/old/sub/readme.md'",
+                &[],
+            )
+            .await
+            .expect("old subtree path lookup should succeed as a miss");
+        assert_eq!(old_path.len(), 0);
+        let moved_path = transaction
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/new/sub/readme.md'",
+                &[],
+            )
+            .await
+            .expect("moved descendant should use rebuilt transaction index");
+        assert_rows_eq(
+            moved_path,
+            vec![vec![
+                Value::Text("transaction-subtree-file".to_string()),
+                Value::Text("/new/sub/readme.md".to_string()),
+            ]],
+        );
+
+        let deleted = transaction
+            .execute("DELETE FROM lix_directory WHERE path = '/new/'", &[])
+            .await
+            .expect("transactional recursive subtree delete should succeed");
+        assert_eq!(deleted.rows_affected(), 3);
+        let after_delete = transaction
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/new/sub/readme.md'",
+                &[],
+            )
+            .await
+            .expect("deleted descendant path lookup should succeed as a miss");
+        assert_eq!(after_delete.len(), 0);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+        let restored = session
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/old/sub/readme.md'",
+                &[],
+            )
+            .await
+            .expect("rollback should restore the original subtree path");
+        assert_rows_eq(
+            restored,
+            vec![vec![
+                Value::Text("transaction-subtree-file".to_string()),
+                Value::Text("/old/sub/readme.md".to_string()),
+            ]],
+        );
+    }
+);

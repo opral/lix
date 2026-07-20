@@ -9,13 +9,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
-use crate::branch::{BranchContext, BranchRefReader, branch_ref_stage_row};
+use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader, branch_ref_stage_row};
 use crate::catalog::CatalogContext;
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
@@ -23,8 +26,9 @@ use crate::common::LixTimestamp;
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    FilesystemIndex, FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
-    FilesystemRowContext, blob_ref_tombstone_row, build_path_index, filesystem_schema_keys,
+    FilesystemIndex, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
+    FilesystemPathIndexRequest, FilesystemRowContext, blob_ref_tombstone_row,
+    filesystem_schema_keys, load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
@@ -73,6 +77,44 @@ pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TransactionPathIndexBuildStats {
+    builds: usize,
+    descriptor_rows: usize,
+}
+
+#[cfg(test)]
+static TRANSACTION_PATH_INDEX_BUILD_STATS: Mutex<TransactionPathIndexBuildStats> =
+    Mutex::new(TransactionPathIndexBuildStats {
+        builds: 0,
+        descriptor_rows: 0,
+    });
+
+#[cfg(test)]
+fn reset_transaction_path_index_build_stats() {
+    *TRANSACTION_PATH_INDEX_BUILD_STATS
+        .lock()
+        .expect("transaction path index build stats lock") =
+        TransactionPathIndexBuildStats::default();
+}
+
+#[cfg(test)]
+fn transaction_path_index_build_stats() -> TransactionPathIndexBuildStats {
+    *TRANSACTION_PATH_INDEX_BUILD_STATS
+        .lock()
+        .expect("transaction path index build stats lock")
+}
+
+#[cfg(test)]
+fn record_transaction_path_index_build(descriptor_rows: usize) {
+    let mut stats = TRANSACTION_PATH_INDEX_BUILD_STATS
+        .lock()
+        .expect("transaction path index build stats lock");
+    stats.builds += 1;
+    stats.descriptor_rows += descriptor_rows;
+}
+
 /// One execution-scoped transaction capability for engine write paths.
 ///
 /// This is intentionally not a session-wide kitchen sink. It owns the storage
@@ -94,6 +136,8 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     catalog_context: Arc<CatalogContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
+    filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
+    filesystem_path_index_epoch: Arc<AtomicUsize>,
     storage: StorageAdapter<StorageImpl>,
     sql_schema_cache: SqlSchemaCache,
     functions: FunctionProviderHandle,
@@ -311,6 +355,8 @@ where
                 catalog_context,
                 schema_resolver,
                 staged_writes,
+                filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
+                filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
                 storage,
                 sql_schema_cache: SqlSchemaCache::default(),
                 functions,
@@ -412,6 +458,12 @@ where
         let write = self.reconcile_plugin_write(write).await?;
         require_valid_transaction_write_storage_scopes(&write)?;
         let write = self.prepare_transaction_write(write).await?;
+        if prepared_transaction_write_affects_filesystem_path_index(&write) {
+            // TransactionWriteBuffer may retain an earlier row from this batch even
+            // when a later row makes staging fail, so invalidate before staging.
+            self.filesystem_path_index_epoch
+                .fetch_add(1, Ordering::SeqCst);
+        }
         self.staged_writes.stage_write(write)
     }
 
@@ -894,6 +946,8 @@ where
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
         let staged_writes = Arc::clone(&self.staged_writes);
+        let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
+        let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
         let plugin_host = self.plugin_host.clone();
 
         with_static_transaction_sql_read::<StorageImpl, _, _>(read, |read_store| async move {
@@ -907,6 +961,8 @@ where
                 functions,
                 staged,
                 staged_writes,
+                filesystem_path_index_cache,
+                filesystem_path_index_epoch,
                 plugin_host,
             };
             let result = crate::sql2::execute_transaction_read_statement_from_parsed(
@@ -1019,6 +1075,8 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     functions: FunctionProviderHandle,
     staged: crate::transaction::staging::PreparedStateRowOverlay,
     staged_writes: Arc<TransactionWriteBuffer>,
+    filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
+    filesystem_path_index_epoch: Arc<AtomicUsize>,
     plugin_host: PluginRuntimeHost,
 }
 
@@ -1035,14 +1093,20 @@ where
     fn live_state(&self) -> Arc<dyn crate::live_state::LiveStateReader> {
         Arc::new(TransactionReadLiveStateReader {
             base: self.live_state.reader(self.read_store.clone()),
+            read_store: self.read_store.clone(),
             staged: self.staged.clone(),
+            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
+            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
         })
     }
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(TransactionReadLiveStateReader {
             base: self.live_state.reader(self.read_store.clone()),
+            read_store: self.read_store.clone(),
             staged: self.staged.clone(),
+            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
+            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
         })
     }
 
@@ -1138,7 +1202,10 @@ async fn load_transaction_blob_bytes(
 
 struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
     base: crate::live_state::LiveStateStoreReader<SharedStorageAdapterRead<R>>,
+    read_store: SharedStorageAdapterRead<R>,
     staged: crate::transaction::staging::PreparedStateRowOverlay,
+    filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
+    filesystem_path_index_epoch: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -1191,7 +1258,35 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        build_path_index(self, request).await
+        let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        if descriptor_epoch == 0 {
+            return self.base.path_index(request).await;
+        }
+        // The revision probe is only a cache-freshness optimization. Preserve the
+        // pre-cache overlay behavior if a storage fault affects that single key.
+        let cache_revision = load_path_index_revision(&self.read_store)
+            .await
+            .ok()
+            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
+        if let Some(cache_revision) = cache_revision.as_deref()
+            && let Some(index) = self
+                .filesystem_path_index_cache
+                .get(request, Some(cache_revision))
+        {
+            return Ok(index);
+        }
+        let rows =
+            overlay_scan_rows(&self.base, &self.staged, &request.live_state_request()).await?;
+        #[cfg(test)]
+        record_transaction_path_index_build(rows.len());
+        let index = Arc::new(FilesystemPathIndex::from_live_rows(rows)?);
+        Ok(match cache_revision {
+            Some(cache_revision) => {
+                self.filesystem_path_index_cache
+                    .insert(request, Some(&cache_revision), index)
+            }
+            None => index,
+        })
     }
 }
 
@@ -1385,18 +1480,41 @@ where
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        if !self.staged_writes.has_staged_filesystem_descriptors()? {
-            let read = SharedStorageAdapterRead::new(
-                self.storage
-                    .begin_read(StorageReadOptions::default())
-                    .await?,
-            );
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        if descriptor_epoch == 0 {
             return self.live_state.reader(read).path_index(request).await;
         }
-        let rows = self
-            .scan_visible_live_state(&request.live_state_request())
-            .await?;
-        Ok(Arc::new(FilesystemPathIndex::from_live_rows(rows)?))
+        // The revision probe is only a cache-freshness optimization. Preserve the
+        // pre-cache overlay behavior if a storage fault affects that single key.
+        let cache_revision = load_path_index_revision(&read)
+            .await
+            .ok()
+            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
+        if let Some(cache_revision) = cache_revision.as_deref()
+            && let Some(index) = self
+                .filesystem_path_index_cache
+                .get(request, Some(cache_revision))
+        {
+            return Ok(index);
+        }
+        let staged = self.staged_writes.staging_overlay()?;
+        let base = self.live_state.reader(read);
+        let rows = overlay_scan_rows(&base, &staged, &request.live_state_request()).await?;
+        #[cfg(test)]
+        record_transaction_path_index_build(rows.len());
+        let index = Arc::new(FilesystemPathIndex::from_live_rows(rows)?);
+        Ok(match cache_revision {
+            Some(cache_revision) => {
+                self.filesystem_path_index_cache
+                    .insert(request, Some(&cache_revision), index)
+            }
+            None => index,
+        })
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
@@ -1418,6 +1536,38 @@ where
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
     }
+}
+
+fn prepared_transaction_write_affects_filesystem_path_index(
+    write: &PreparedTransactionWrite,
+) -> bool {
+    let rows = match write {
+        PreparedTransactionWrite::Rows { rows, .. }
+        | PreparedTransactionWrite::RowsWithFileData { rows, .. } => rows,
+    };
+    rows.iter().any(|row| {
+        matches!(
+            row.schema_key.as_str(),
+            "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
+        )
+    })
+}
+
+fn transaction_path_index_cache_revision(
+    filesystem_revision: Option<Vec<u8>>,
+    descriptor_epoch: usize,
+) -> Vec<u8> {
+    let mut cache_revision = b"transaction-path-index-v1".to_vec();
+    cache_revision.extend_from_slice(&descriptor_epoch.to_be_bytes());
+    match filesystem_revision {
+        Some(revision) => {
+            cache_revision.push(1);
+            cache_revision.extend_from_slice(&revision.len().to_be_bytes());
+            cache_revision.extend_from_slice(&revision);
+        }
+        None => cache_revision.push(0),
+    }
+    cache_revision
 }
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -1714,10 +1864,12 @@ async fn load_workspace_branch_id(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use serde_json::json;
 
     use super::*;
+    use crate::Engine;
     use crate::GLOBAL_BRANCH_ID;
     use crate::NullableKeyFilter;
     use crate::branch::BranchContext;
@@ -1735,6 +1887,102 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[tokio::test]
+    #[ignore = "release-only transaction path-index benchmark probe"]
+    async fn transaction_path_index_benchmark_probe() {
+        let file_count = std::env::var("LIX_PATH_INDEX_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        let rounds = std::env::var("LIX_PATH_INDEX_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(24);
+        let warmup_rounds = 4;
+
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open initialized storage");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        let values = (0..file_count)
+            .map(|index| format!("('/seed-{index:05}.md', X'01')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        session
+            .execute(
+                &format!("INSERT INTO lix_file (path, data) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("fixture files should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/transaction-anchor.md', X'01')",
+                &[],
+            )
+            .await
+            .expect("transaction anchor descriptor should stage");
+
+        reset_transaction_path_index_build_stats();
+        let sql = "UPDATE lix_file SET data = X'02' WHERE path = '/seed-00000.md'";
+        for _ in 0..warmup_rounds {
+            transaction
+                .execute(sql, &[])
+                .await
+                .expect("warm transaction path update should succeed");
+        }
+
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let started = Instant::now();
+            transaction
+                .execute(sql, &[])
+                .await
+                .expect("timed transaction path update should succeed");
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        let stats = transaction_path_index_build_stats();
+        println!(
+            "transaction_path_index_probe files={file_count} rounds={rounds} \
+             builds={} descriptor_rows={} p50_us={} p95_us={}",
+            stats.builds,
+            stats.descriptor_rows,
+            percentile(50, 100).as_micros(),
+            percentile(95, 100).as_micros(),
+        );
+        assert_eq!(
+            stats.builds, 1,
+            "repeated data-only path updates should reuse one transaction-visible index"
+        );
+        assert_eq!(
+            stats.descriptor_rows,
+            file_count + 1,
+            "the one cached build should include the staged anchor and committed files"
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("benchmark transaction should roll back");
+    }
 
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
