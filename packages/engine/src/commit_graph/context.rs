@@ -186,6 +186,26 @@ where
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
         let commits = self.reachable_commits(start_commit_id).await?;
+        let mut member_change_ids = Vec::new();
+        let mut seen_change_ids = BTreeSet::new();
+
+        for reachable in &commits {
+            if !depth_matches(reachable.depth, request) {
+                continue;
+            }
+
+            seen_change_ids.insert(reachable.commit.canonical_change.id);
+            for change_id in &reachable.commit.change_ids {
+                if seen_change_ids.insert(*change_id) {
+                    member_change_ids.push(*change_id);
+                }
+            }
+        }
+
+        let mut member_changes = self
+            .load_canonical_changes(&member_change_ids)
+            .await?
+            .into_iter();
         let mut entries = Vec::new();
         let mut seen_change_ids = BTreeSet::new();
 
@@ -211,7 +231,12 @@ where
                 if !seen_change_ids.insert(change_id) {
                     continue;
                 }
-                let change = self.load_member_canonical_change(&change_id).await?;
+                let change = member_changes.next().flatten().ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("commit_graph references missing change '{change_id}'"),
+                    )
+                })?;
                 if change_matches_history_request(&change, request) {
                     entries.push(CommitGraphChangeHistoryEntry {
                         change,
@@ -224,23 +249,6 @@ where
         }
 
         Ok(entries)
-    }
-
-    async fn load_member_canonical_change(
-        &mut self,
-        change_id: &ChangeId,
-    ) -> Result<CommitGraphChange, LixError> {
-        self.load_canonical_changes(std::slice::from_ref(change_id))
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("commit_graph references missing change '{change_id}'"),
-                )
-            })
     }
 
     async fn load_changelog_commit(
@@ -709,7 +717,10 @@ mod tests {
             .await
             .expect("first history should resolve");
         let calls_after_first = change_get_many_calls.load(Ordering::Relaxed);
-        assert!(calls_after_first > 0, "first history should load changes");
+        assert_eq!(
+            calls_after_first, 1,
+            "one history traversal should batch all uncached member changes"
+        );
 
         let second = reader
             .change_history_from_commit(&commit_head, &request)
