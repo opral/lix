@@ -3893,7 +3893,8 @@ mod tests {
         });
         let live_state = Arc::new(CapturingRowsLiveStateReader {
             rows: vec![
-                live_file_row("target", "branch-a", None, "target.md"),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_file_row("target", "branch-a", Some("dir-docs"), "target.md"),
                 live_file_row("other", "branch-a", None, "other.md"),
                 live_blob_ref_row("target", "branch-a", b"old"),
                 live_blob_ref_row("other", "branch-a", b"skip"),
@@ -3905,14 +3906,14 @@ mod tests {
             active_branch_id: "branch-a",
             blob_reader,
             live_state,
-            staged_writes,
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, data, lixcol_metadata) \
-             VALUES ('/target.md', X'6E6577', '{\"size\":3}') \
+             VALUES ('/docs/target.md', X'6E6577', '{\"size\":3}') \
              ON CONFLICT (path) DO UPDATE \
              SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata",
             &[],
@@ -3925,13 +3926,31 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
         let requests = requests.lock().expect("captured requests lock");
-        assert!(requests.iter().any(|request| {
-            request.filter.schema_keys
-                == vec![
-                    "lix_directory_descriptor".to_string(),
-                    "lix_file_descriptor".to_string(),
-                ]
-        }));
+        let topology_scans = requests
+            .iter()
+            .filter(|request| {
+                request.filter.schema_keys
+                    == vec![
+                        "lix_directory_descriptor".to_string(),
+                        "lix_file_descriptor".to_string(),
+                    ]
+            })
+            .count();
+        assert_eq!(
+            topology_scans, 1,
+            "the path conflict index needs one combined topology scan"
+        );
+        let directory_scans = requests
+            .iter()
+            .filter(|request| {
+                request.filter.schema_keys == vec!["lix_directory_descriptor".to_string()]
+                    && request.filter.entity_pks.is_empty()
+            })
+            .count();
+        assert_eq!(
+            directory_scans, 1,
+            "the conflict update needs one directory scan; an attribute-only update must not add a resolver scan"
+        );
         let blob_requests = requests
             .iter()
             .filter(|request| request.filter.schema_keys == vec!["lix_binary_blob_ref".to_string()])
@@ -3944,6 +3963,42 @@ mod tests {
         assert_eq!(
             blob_requests[0].filter.file_ids,
             vec![NullableKeyFilter::Value("target".to_string())]
+        );
+        drop(requests);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_rows.len(), 1);
+        assert_eq!(descriptor_rows[0].entity_pk, "[\"target\"]");
+        let descriptor: JsonValue = serde_json::from_str(
+            descriptor_rows[0]
+                .snapshot_content
+                .as_deref()
+                .expect("descriptor should carry a snapshot"),
+        )
+        .expect("descriptor snapshot JSON");
+        assert_eq!(descriptor["id"], "target");
+        assert_eq!(descriptor["directory_id"], "dir-docs");
+        assert_eq!(descriptor["name"], "target.md");
+        assert_eq!(descriptor_rows[0].metadata.as_deref(), Some("{\"size\":3}"));
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_ref_rows.len(), 1);
+        assert_eq!(blob_ref_rows[0].entity_pk, "[\"target\"]");
+        let blob_ref: JsonValue = serde_json::from_str(
+            blob_ref_rows[0]
+                .snapshot_content
+                .as_deref()
+                .expect("blob ref should carry a snapshot"),
+        )
+        .expect("blob ref snapshot JSON");
+        assert_eq!(blob_ref["size_bytes"], 3);
+        assert_eq!(
+            blob_ref["blob_hash"],
+            crate::binary_cas::BlobHash::from_content(b"new").to_hex()
         );
     }
 
