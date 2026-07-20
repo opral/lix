@@ -1701,24 +1701,30 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     let Some(file_id) = file_id else {
         return Ok(0);
     };
-    let mut file_request = lix_file_scan_request(Some(&active_branch_id), None, None);
-    file_request.filter.schema_keys = vec![
-        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        BLOB_REF_SCHEMA_KEY.to_string(),
-    ];
-    file_request.filter.entity_pks = vec![EntityPk::single(file_id.clone())];
-    let mut rows = ctx.scan_live_state(&file_request).await?;
+    // The revisioned path index contains every visible descriptor together with
+    // its already-derived path. Reuse it instead of scanning every directory
+    // descriptor just to reconstruct this one file's path.
+    let index = ctx
+        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+            active_branch_id.clone(),
+        ]))
+        .await?;
+    let target_file_ids = BTreeSet::from([file_id.clone()]);
+    let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
 
-    let mut directory_request = lix_file_scan_request(Some(&active_branch_id), None, None);
-    directory_request.filter.schema_keys = vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()];
-    rows.extend(ctx.scan_live_state(&directory_request).await?);
+    // Blob references are not part of the descriptor index and can change
+    // without a path-index revision, so load only this file's current blobs.
+    let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
+    blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
+    blob_request.filter.entity_pks = vec![EntityPk::single(file_id.clone())];
+    let rows = ctx.scan_live_state(&blob_request).await?;
 
     let PreparedLixFileRows {
         file_rows,
         blob_rows,
         file_paths,
         ..
-    } = prepare_lix_file_rows(rows, &FilePathPredicate::All)?;
+    } = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
     let existing = file_rows
         .into_iter()
         .filter(|(_, file)| file.id == file_id)
@@ -5293,6 +5299,14 @@ mod tests {
         scan_count: usize,
     }
 
+    struct IndexedFileDataUpdateWriteContext {
+        index: Arc<FilesystemPathIndex>,
+        blob_rows: Vec<MaterializedLiveStateRow>,
+        writes: Vec<TransactionWrite>,
+        scan_requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+        path_index_requests: Arc<AtomicUsize>,
+    }
+
     struct StaticBlobReader {
         bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
     }
@@ -5392,6 +5406,69 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
             Ok(TransactionWriteOutcome { count: 0 })
+        }
+    }
+
+    #[async_trait]
+    impl SqlWriteExecutionContext for IndexedFileDataUpdateWriteContext {
+        fn active_branch_id(&self) -> &str {
+            "branch-b"
+        }
+
+        fn functions(&self) -> FunctionProviderHandle {
+            test_functions()
+        }
+
+        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_bytes_many(
+            &mut self,
+            hashes: &[BlobHash],
+        ) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
+        }
+
+        async fn scan_live_state(
+            &mut self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_requests
+                .lock()
+                .expect("scan request mutex should not be poisoned")
+                .push(request.clone());
+            Ok(self.blob_rows.clone())
+        }
+
+        async fn filesystem_path_index(
+            &mut self,
+            request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            assert_eq!(request.branch_ids, vec!["branch-b".to_string()]);
+            self.path_index_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&self.index))
+        }
+
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<CommitId>, LixError> {
+            Ok(Some(CommitId::for_test_label(&format!(
+                "commit-{branch_id}"
+            ))))
+        }
+
+        async fn stage_write(
+            &mut self,
+            write: TransactionWrite,
+        ) -> Result<TransactionWriteOutcome, LixError> {
+            let count = match &write {
+                TransactionWrite::Rows { rows, .. } => rows.len() as u64,
+                TransactionWrite::RowsWithFileData { count, .. } => *count,
+            };
+            self.writes.push(write);
+            Ok(TransactionWriteOutcome { count })
         }
     }
 
@@ -6930,6 +7007,70 @@ mod tests {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn fast_file_data_update_uses_path_index_and_target_blob_scan() {
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_directory_row(
+                    "dir-docs",
+                    "branch-b",
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                ),
+                live_file_row(
+                    "file-readme",
+                    "branch-b",
+                    r#"{"id":"file-readme","directory_id":"dir-docs","name":"readme.md"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let old_data = b"old";
+        let mut write_context = IndexedFileDataUpdateWriteContext {
+            index,
+            blob_rows: vec![live_blob_ref_row(
+                "file-readme",
+                "branch-b",
+                "file-readme",
+                &BlobHash::from_content(old_data).to_hex(),
+                old_data.len(),
+            )],
+            writes: Vec::new(),
+            scan_requests: Arc::clone(&scan_requests),
+            path_index_requests: Arc::clone(&path_index_requests),
+        };
+
+        let count = super::execute_fast_lix_file_data_update_by_id(
+            &mut write_context,
+            Some("file-readme".to_string()),
+            b"new".to_vec(),
+        )
+        .await
+        .expect("fast data update should stage");
+
+        assert_eq!(count, 1);
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        let requests = scan_requests.lock().expect("scan request mutex");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+        );
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single("file-readme")]
+        );
+        drop(requests);
+
+        let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[0] else {
+            panic!("data update should stage file data");
+        };
+        assert_eq!(file_data.len(), 1);
+        assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
+        assert_eq!(file_data[0].data(), b"new");
     }
 
     #[tokio::test]
