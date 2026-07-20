@@ -12,8 +12,24 @@ pub(crate) struct BoundWrite {
     pub(crate) predicate: BoundPredicate,
     pub(crate) assignments: Vec<BoundAssignment>,
     pub(crate) conflict: Option<BoundInsertConflict>,
+    /// The pre-change projection requested by `DELETE … RETURNING`.
+    ///
+    /// This remains part of the bound write rather than a post-hoc read so
+    /// execution can project directly from the exact batch being deleted.
+    pub(crate) returning: Option<BoundReturning>,
     pub(crate) params: BoundParamMap,
     pub(crate) branch_scope: BranchScope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundReturning {
+    pub(crate) items: Vec<BoundReturningItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundReturningItem {
+    pub(crate) expr: BoundExpr,
+    pub(crate) output_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

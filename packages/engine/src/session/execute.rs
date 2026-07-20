@@ -51,6 +51,23 @@ impl ExecuteResult {
         .with_rows(result.rows)
     }
 
+    fn from_sql_write_result(result: sql2::SqlWriteResult) -> Self {
+        let sql2::SqlWriteResult {
+            rows_affected,
+            returning,
+        } = result;
+        match returning {
+            Some(result) => Self {
+                columns: result.columns,
+                rows: Vec::new(),
+                rows_affected,
+                notices: result.notices,
+            }
+            .with_rows(result.rows),
+            None => Self::from_rows_affected(rows_affected),
+        }
+    }
+
     pub fn from_rows_affected(rows_affected: u64) -> Self {
         Self {
             columns: Vec::new(),
@@ -398,10 +415,13 @@ where
                             let tx_plan =
                                 sql2::create_write_logical_plan_from_parsed(transaction, statement)
                                     .await?;
-                            let affected_rows =
-                                sql2::execute_write_logical_plan(transaction, tx_plan, &params)
-                                    .await?;
-                            Ok(ExecuteResult::from_rows_affected(affected_rows))
+                            let result = sql2::execute_write_logical_plan_result(
+                                transaction,
+                                tx_plan,
+                                &params,
+                            )
+                            .await?;
+                            Ok(ExecuteResult::from_sql_write_result(result))
                         }
                         .await;
                         transaction.replace_origin_key(previous_origin_key);
@@ -713,14 +733,14 @@ where
                         let tx_plan =
                             sql2::create_write_logical_plan_from_parsed(transaction, statement)
                                 .await?;
-                        let affected_rows = sql2::execute_write_logical_plan_with_mode(
+                        let result = sql2::execute_write_logical_plan_with_mode_result(
                             transaction,
                             tx_plan,
                             &params,
                             mode,
                         )
                         .await?;
-                        Ok(ExecuteResult::from_rows_affected(affected_rows))
+                        Ok(ExecuteResult::from_sql_write_result(result))
                     })
                 })
                 .await
@@ -974,8 +994,8 @@ where
     let result = async {
         transaction.prepare_sql_visible_schemas().await?;
         let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
-        let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
-        Ok(ExecuteResult::from_rows_affected(affected_rows))
+        let result = sql2::execute_write_logical_plan_result(transaction, tx_plan, params).await?;
+        Ok(ExecuteResult::from_sql_write_result(result))
     }
     .await;
     transaction.replace_origin_key(previous_origin_key);
@@ -1033,9 +1053,10 @@ where
 {
     transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
-    let affected_rows =
-        sql2::execute_write_logical_plan_with_mode(transaction, tx_plan, params, mode).await?;
-    Ok(ExecuteResult::from_rows_affected(affected_rows))
+    let result =
+        sql2::execute_write_logical_plan_with_mode_result(transaction, tx_plan, params, mode)
+            .await?;
+    Ok(ExecuteResult::from_sql_write_result(result))
 }
 
 #[cfg(test)]
@@ -1050,10 +1071,14 @@ where
 {
     transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
-    let (affected_rows, path) =
-        sql2::execute_write_logical_plan_with_mode_and_trace(transaction, tx_plan, params, mode)
-            .await?;
-    Ok((ExecuteResult::from_rows_affected(affected_rows), Some(path)))
+    let (result, path) = sql2::execute_write_logical_plan_with_mode_and_trace_result(
+        transaction,
+        tx_plan,
+        params,
+        mode,
+    )
+    .await?;
+    Ok((ExecuteResult::from_sql_write_result(result), Some(path)))
 }
 
 fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {

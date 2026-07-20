@@ -23,6 +23,8 @@ use crate::transaction::types::{
 };
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 
+use super::SqlWriteResult;
+
 #[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
@@ -36,7 +38,7 @@ pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
 }
 
 pub(crate) enum BoundPublicWriteExecution {
-    Executed(u64),
+    Executed(SqlWriteResult),
     Unsupported,
 }
 
@@ -55,10 +57,12 @@ pub(crate) async fn try_execute_bound_public_write(
             if let Some(shape) = fast_file_path_write_shape(plan, surface) {
                 execute_file_path_write(ctx, plan, params, shape)
                     .await
+                    .map(SqlWriteResult::affected)
                     .map(BoundPublicWriteExecution::Executed)
             } else if let Some(shape) = fast_file_data_update_shape(plan, surface) {
                 execute_file_data_update(ctx, params, &shape)
                     .await
+                    .map(SqlWriteResult::affected)
                     .map(BoundPublicWriteExecution::Executed)
             } else {
                 Ok(BoundPublicWriteExecution::Unsupported)
@@ -147,7 +151,7 @@ async fn execute_entity_write(
     plan: &LogicalWritePlan,
     surface: &EntityWriteSurface,
     params: &[Value],
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     let schema_key = match surface {
         EntityWriteSurface::Base { schema_key } | EntityWriteSurface::ByBranch { schema_key } => {
             schema_key
@@ -172,23 +176,29 @@ async fn execute_entity_write(
         BoundWriteOp::Insert => {
             if no_op {
                 entity_insert_rows(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
-                return Ok(0);
+                return Ok(SqlWriteResult::affected(0));
             }
             if plan.bound.conflict.is_some() {
-                entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+                entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
+                    .await
+                    .map(SqlWriteResult::affected)
             } else {
-                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
+                    .await
+                    .map(SqlWriteResult::affected)
             }
         }
         BoundWriteOp::Update => {
             if no_op {
-                return Ok(0);
+                return Ok(SqlWriteResult::affected(0));
             }
-            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
+                .await
+                .map(SqlWriteResult::affected)
         }
         BoundWriteOp::Delete => {
             if no_op {
-                return Ok(0);
+                return Ok(empty_entity_delete_returning_result(plan));
             }
             entity_delete(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
         }
@@ -531,9 +541,10 @@ async fn entity_delete(
     spec: &EntitySurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec).await?;
     let mut write_rows = Vec::new();
+    let mut returning_rows = plan.bound.returning.as_ref().map(|_| Vec::new());
     for candidate in candidates {
         let Some(snapshot) = candidate_snapshot(&candidate)? else {
             continue;
@@ -548,6 +559,18 @@ async fn entity_delete(
             active_branch_commit_id,
         )? {
             reject_projected_global_write(plan, &candidate, "DELETE")?;
+            if let (Some(returning), Some(rows)) =
+                (plan.bound.returning.as_ref(), returning_rows.as_mut())
+            {
+                rows.push(entity_returning_row(
+                    returning,
+                    &context,
+                    spec,
+                    ctx,
+                    params,
+                    active_branch_commit_id,
+                )?);
+            }
             write_rows.push(entity_replace_row_from_live(
                 ctx,
                 spec,
@@ -559,7 +582,119 @@ async fn entity_delete(
             )?);
         }
     }
-    stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
+    let rows_affected = stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
+    match (plan.bound.returning.as_ref(), returning_rows) {
+        (Some(returning), Some(rows)) => Ok(SqlWriteResult::returning(
+            rows_affected,
+            crate::SqlQueryResult {
+                columns: returning
+                    .items
+                    .iter()
+                    .map(|item| item.output_name.clone())
+                    .collect(),
+                rows,
+                notices: Vec::new(),
+            },
+        )),
+        _ => Ok(SqlWriteResult::affected(rows_affected)),
+    }
+}
+
+fn empty_entity_delete_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
+    match &plan.bound.returning {
+        Some(returning) => SqlWriteResult::returning(
+            0,
+            crate::SqlQueryResult {
+                columns: returning
+                    .items
+                    .iter()
+                    .map(|item| item.output_name.clone())
+                    .collect(),
+                rows: Vec::new(),
+                notices: Vec::new(),
+            },
+        ),
+        None => SqlWriteResult::affected(0),
+    }
+}
+
+fn entity_returning_row(
+    returning: &crate::sql2::bind::write::BoundReturning,
+    context: &EntityEvalContext<'_>,
+    spec: &EntitySurfaceSpec,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<Vec<Value>, LixError> {
+    returning
+        .items
+        .iter()
+        .map(|item| {
+            entity_returning_value(
+                &item.expr,
+                context,
+                spec,
+                ctx,
+                params,
+                active_branch_commit_id,
+            )
+        })
+        .collect()
+}
+
+fn entity_returning_value(
+    expr: &BoundExpr,
+    context: &EntityEvalContext<'_>,
+    spec: &EntitySurfaceSpec,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<Value, LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Blob(value)) => return Ok(Value::Blob(value.clone())),
+        BoundExpr::Param(param)
+            if params
+                .get(param.index.saturating_sub(1))
+                .is_some_and(|value| matches!(value, Value::Blob(_))) =>
+        {
+            let Value::Blob(value) = params
+                .get(param.index.saturating_sub(1))
+                .expect("checked SQL parameter exists")
+            else {
+                unreachable!("checked SQL parameter is a blob");
+            };
+            return Ok(Value::Blob(value.clone()));
+        }
+        _ => {}
+    }
+
+    let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
+    if bound_expr_is_json(expr, spec) {
+        return Ok(match value {
+            EntityEvalValue::SqlNull => Value::Null,
+            EntityEvalValue::SqlText(value) => Value::Text(value),
+            EntityEvalValue::Json(value) => Value::Json(value),
+        });
+    }
+    Ok(match value {
+        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null) => Value::Null,
+        EntityEvalValue::SqlText(value) | EntityEvalValue::Json(JsonValue::String(value)) => {
+            Value::Text(value)
+        }
+        EntityEvalValue::Json(JsonValue::Bool(value)) => Value::Boolean(value),
+        EntityEvalValue::Json(JsonValue::Number(value)) => {
+            if let Some(value) = value.as_i64() {
+                Value::Integer(value)
+            } else if let Some(value) = value.as_f64() {
+                Value::Real(value)
+            } else {
+                Value::Text(value.to_string())
+            }
+        }
+        EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
+            Value::Json(value)
+        }
+    })
 }
 
 fn entity_conflict_update_row(
@@ -1292,6 +1427,10 @@ fn predicate_matches(
             )?;
             Ok(!left.is_null() && !right.is_null() && left == right)
         }
+        BoundPredicate::Like { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity writes do not support LIKE predicates",
+        )),
         BoundPredicate::IsNull(expr) => {
             let value = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
             Ok(value.is_null())
@@ -1412,6 +1551,11 @@ fn validate_bound_write_supported(
             validate_expr_supported(&assignment.value)?;
         }
     }
+    if let Some(returning) = &plan.bound.returning {
+        for item in &returning.items {
+            validate_expr_supported(&item.expr)?;
+        }
+    }
     Ok(())
 }
 
@@ -1439,6 +1583,12 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
                 .iter()
                 .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
         })
+        && plan.bound.returning.as_ref().is_none_or(|returning| {
+            returning
+                .items
+                .iter()
+                .all(|item| validate_expr_supported(&item.expr).is_ok())
+        })
 }
 
 fn validate_predicate_supported(predicate: &BoundPredicate) -> Result<(), LixError> {
@@ -1455,6 +1605,13 @@ fn validate_predicate_supported(predicate: &BoundPredicate) -> Result<(), LixErr
             validate_expr_supported(left)?;
             validate_expr_supported(right)
         }
+        // Entity deletes with LIKE use the generic DataFusion write path so
+        // the predicate has exactly the same Arrow/DataFusion semantics as
+        // every other writable surface.
+        BoundPredicate::Like { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity writes do not support LIKE predicates",
+        )),
         BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
             validate_expr_supported(expr)
         }
@@ -1476,6 +1633,7 @@ fn validate_json_predicate_types(
     match predicate {
         BoundPredicate::True
         | BoundPredicate::False
+        | BoundPredicate::Like { .. }
         | BoundPredicate::IsNull(_)
         | BoundPredicate::IsNotNull(_) => Ok(()),
         BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {

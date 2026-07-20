@@ -11,9 +11,9 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
+use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 
-use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
@@ -27,9 +27,14 @@ use crate::sql2::catalog::{
     entity_surface_schema,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
+use crate::sql2::read_only::reject_read_only_entity_surface;
+use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
     SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
+};
+use crate::transaction::types::{
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
 
 use super::entity_history::register_entity_history_surface;
@@ -40,7 +45,9 @@ use super::spec::{
     InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table,
     row_source,
 };
-use super::values::string_expr_literal;
+use super::values::{
+    optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 pub(crate) async fn register_entity_providers<S>(
@@ -239,6 +246,16 @@ impl EntitySpec {
             if row_filters.is_empty() { limit } else { None },
             !row_filters.is_empty(),
         );
+        let exact_branch_ids = exact_branch_ids_from_filters(filters)?;
+        // Preserve an exact by-branch selector before resolving an explicit
+        // provider scope. Resolving first would enumerate every branch even
+        // when the DELETE has an exact `lixcol_branch_id = ...` predicate,
+        // and write contexts intentionally only expose point branch-head
+        // lookups. Active surfaces retain their existing post-resolution
+        // filtering behavior so a branch overlay is still constructed first.
+        if matches!(&self.branch_binding, BranchBinding::Explicit) {
+            apply_exact_branch_id_filter(&mut request, exact_branch_ids.clone());
+        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -246,7 +263,7 @@ impl EntitySpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        apply_exact_branch_id_filter(&mut request, exact_branch_ids_from_filters(filters)?);
+        apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
         Ok((projected_schema, request, row_filters))
     }
@@ -321,10 +338,70 @@ impl TableSpec for EntitySpec {
 
     async fn plan_delete(
         &self,
-        _write_ctx: SqlWriteContext,
-        _filters: &[Expr],
+        write_ctx: SqlWriteContext,
+        filters: &[Expr],
     ) -> Result<PlannedDml> {
-        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
+        reject_read_only_entity_surface(&self.spec.schema_key, "DELETE")?;
+        if self.spec.schema_key == "lix_registered_schema" {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "delete lix_registered_schema is not supported",
+            )));
+        }
+        if !filters.iter().any(contains_like_filter) {
+            return not_impl_err!(
+                "raw DataFusion DELETE is disabled; use the sql2 bound write pipeline"
+            );
+        }
+        let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
+        let source = row_source(
+            (
+                Arc::clone(&self.spec),
+                Arc::clone(&self.live_state),
+                schema,
+                request,
+                row_filters,
+            ),
+            |(spec, live_state, schema, request, row_filters)| async move {
+                let mut rows = live_state
+                    .scan_rows(&request)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                apply_entity_row_filters(&mut rows, &row_filters)?;
+                entity_record_batch(&spec, schema, &rows)
+            },
+        );
+        let spec = Arc::clone(&self.spec);
+        let branch_binding = self.branch_binding.clone();
+        Ok(PlannedDml {
+            source,
+            apply: Arc::new(move |matched_batch| {
+                let write_ctx = write_ctx.clone();
+                let spec = Arc::clone(&spec);
+                let branch_binding = branch_binding.clone();
+                async move {
+                    let rows = entity_delete_stage_rows_from_batch(
+                        &matched_batch,
+                        spec.as_ref(),
+                        &branch_binding,
+                    )?;
+                    let count = u64::try_from(rows.len()).map_err(|_| {
+                        DataFusionError::Execution("DELETE row count overflow".to_string())
+                    })?;
+                    if count > 0 {
+                        write_ctx
+                            .stage_write(TransactionWrite::Rows {
+                                mode: TransactionWriteMode::Replace,
+                                rows,
+                            })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+                    Ok(count)
+                }
+                .boxed()
+            }),
+        })
     }
 
     async fn plan_update(
@@ -335,6 +412,111 @@ impl TableSpec for EntitySpec {
     ) -> Result<PlannedDml> {
         not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
+}
+
+fn contains_like_filter(expr: &Expr) -> bool {
+    match expr {
+        Expr::Like(_) => true,
+        Expr::BinaryExpr(binary) => {
+            contains_like_filter(&binary.left) || contains_like_filter(&binary.right)
+        }
+        _ => false,
+    }
+}
+
+fn entity_delete_stage_rows_from_batch(
+    batch: &RecordBatch,
+    spec: &EntitySurfaceSpec,
+    branch_binding: &BranchBinding,
+) -> Result<Vec<TransactionWriteRow>> {
+    (0..batch.num_rows())
+        .map(|row_index| {
+            let global = optional_bool_value(
+                batch,
+                row_index,
+                "lixcol_global",
+                "DELETE FROM entity surface",
+            )?
+            .unwrap_or(false);
+            let source_branch_id = optional_string_value(
+                batch,
+                row_index,
+                "lixcol_branch_id",
+                "DELETE FROM entity surface",
+            )?;
+            if matches!(branch_binding, BranchBinding::Explicit)
+                && global
+                && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
+            {
+                return Err(DataFusionError::Execution(
+                    "DELETE through an entity by-branch surface cannot mutate a projected global row"
+                        .to_string(),
+                ));
+            }
+            let branch_id = if global {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                source_branch_id
+                    .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "DELETE FROM entity by-branch requires lixcol_branch_id".to_string(),
+                        )
+                    })?
+            };
+            let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+                batch,
+                row_index,
+                "lixcol_entity_pk",
+                "DELETE FROM entity surface",
+            )?)
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "DELETE FROM entity surface has invalid lixcol_entity_pk: {error}"
+                ))
+            })?;
+            let metadata = optional_string_value(
+                batch,
+                row_index,
+                "lixcol_metadata",
+                "DELETE FROM entity surface",
+            )?
+            .map(|value| {
+                let metadata =
+                    parse_row_metadata_value(&value, &spec.schema_key).map_err(lix_error_to_datafusion_error)?;
+                TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
+                    .map_err(lix_error_to_datafusion_error)
+            })
+            .transpose()?;
+
+            Ok(TransactionWriteRow {
+                entity_pk: Some(entity_pk),
+                schema_key: spec.schema_key.clone(),
+                file_id: optional_string_value(
+                    batch,
+                    row_index,
+                    "lixcol_file_id",
+                    "DELETE FROM entity surface",
+                )?,
+                snapshot: None,
+                metadata,
+                origin: None,
+                created_at: None,
+                updated_at: None,
+                global,
+                change_id: None,
+                commit_id: None,
+                untracked: optional_bool_value(
+                    batch,
+                    row_index,
+                    "lixcol_untracked",
+                    "DELETE FROM entity surface",
+                )?
+                .unwrap_or(false),
+                branch_id,
+            })
+        })
+        .collect()
 }
 
 fn entity_pks_from_primary_key_filters(

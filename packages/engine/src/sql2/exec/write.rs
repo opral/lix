@@ -6,7 +6,7 @@ use serde_json::json;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
-use super::SqlLogicalPlan;
+use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
@@ -56,14 +56,25 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
     }))
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<u64, LixError> {
+    execute_write_logical_plan_result(ctx, plan, params)
+        .await
+        .map(|result| result.rows_affected)
+}
+
+pub(crate) async fn execute_write_logical_plan_result(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+) -> Result<SqlWriteResult, LixError> {
     execute_write_logical_plan_with_mode_inner(ctx, plan, params, WriteExecutorModeInner::Auto)
         .await
-        .map(|(rows_affected, _path)| rows_affected)
+        .map(|(result, _path)| result)
 }
 
 #[cfg(test)]
@@ -75,7 +86,19 @@ pub(crate) async fn execute_write_logical_plan_with_mode(
 ) -> Result<u64, LixError> {
     execute_write_logical_plan_with_mode_and_trace(ctx, plan, params, mode)
         .await
-        .map(|(rows_affected, _path)| rows_affected)
+        .map(|(result, _path)| result)
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_write_logical_plan_with_mode_result(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    mode: WriteExecutorMode,
+) -> Result<SqlWriteResult, LixError> {
+    execute_write_logical_plan_with_mode_and_trace_result(ctx, plan, params, mode)
+        .await
+        .map(|(result, _path)| result)
 }
 
 #[cfg(test)]
@@ -85,6 +108,18 @@ pub(crate) async fn execute_write_logical_plan_with_mode_and_trace(
     params: &[Value],
     mode: WriteExecutorMode,
 ) -> Result<(u64, WriteExecutorPath), LixError> {
+    execute_write_logical_plan_with_mode_and_trace_result(ctx, plan, params, mode)
+        .await
+        .map(|(result, path)| (result.rows_affected, path))
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_write_logical_plan_with_mode_and_trace_result(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    mode: WriteExecutorMode,
+) -> Result<(SqlWriteResult, WriteExecutorPath), LixError> {
     let mode = match mode {
         WriteExecutorMode::Auto => WriteExecutorModeInner::Auto,
         WriteExecutorMode::ForceDataFusion => WriteExecutorModeInner::ForceDataFusion,
@@ -105,7 +140,7 @@ async fn execute_write_logical_plan_with_mode_inner(
     plan: SqlLogicalPlan,
     params: &[Value],
     mode: WriteExecutorModeInner,
-) -> Result<(u64, WriteExecutorPath), LixError> {
+) -> Result<(SqlWriteResult, WriteExecutorPath), LixError> {
     let SqlLogicalPlan::Write(write_plan) = plan else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -120,8 +155,8 @@ async fn execute_write_logical_plan_with_mode_inner(
             .await
             .map_err(normalize_bound_public_write_error)?
         {
-            super::bound_public_write::BoundPublicWriteExecution::Executed(rows_affected) => {
-                return Ok((rows_affected, WriteExecutorPath::Fast));
+            super::bound_public_write::BoundPublicWriteExecution::Executed(result) => {
+                return Ok((result, WriteExecutorPath::Fast));
             }
             super::bound_public_write::BoundPublicWriteExecution::Unsupported => {}
         }
@@ -135,7 +170,10 @@ async fn execute_write_logical_plan_with_mode_inner(
             let rows_affected =
                 crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
                     .await?;
-            return Ok((rows_affected, WriteExecutorPath::Fast));
+            return Ok((
+                SqlWriteResult::affected(rows_affected),
+                WriteExecutorPath::Fast,
+            ));
         }
         if mode == WriteExecutorModeInner::ForceFast {
             return Err(LixError::new(
@@ -145,9 +183,9 @@ async fn execute_write_logical_plan_with_mode_inner(
         }
     }
 
-    let rows_affected =
+    let result =
         super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
-    Ok((rows_affected, WriteExecutorPath::DataFusion))
+    Ok((result, WriteExecutorPath::DataFusion))
 }
 
 fn resolve_parameterized_branch_scope(
@@ -380,7 +418,7 @@ fn resolved_predicate_branch_selector(
                 .transpose()
                 .map(|selector| selector.unwrap_or(ResolvedBranchSelector::Missing))
         }
-        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
+        BoundPredicate::Like { .. } | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
             Ok(ResolvedBranchSelector::Missing)
         }
         BoundPredicate::In { expr, values } => {
@@ -537,7 +575,7 @@ fn resolved_predicate_global_selector(
             .map(|expr| global_selector_value(expr, params))
             .transpose()
             .map(|selector| selector.unwrap_or(ResolvedGlobalSelector::Missing)),
-        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
+        BoundPredicate::Like { .. } | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
             Ok(ResolvedGlobalSelector::Missing)
         }
         BoundPredicate::In { expr, values } => {

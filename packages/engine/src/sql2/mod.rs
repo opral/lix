@@ -33,16 +33,18 @@ pub(crate) use context::{
     SqlHistoryQuerySource, SqlJsonReader, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
-pub(crate) use exec::SessionReadSqlResult;
+pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, create_write_logical_plan_from_parsed, execute_read_statement_from_parsed,
-    execute_transaction_read_statement_from_parsed, execute_write_logical_plan,
+    execute_transaction_read_statement_from_parsed, execute_write_logical_plan_result,
 };
 #[cfg(test)]
 pub(crate) use exec::{
-    WriteExecutorMode, WriteExecutorPath, create_write_logical_plan,
+    WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
+    execute_write_logical_plan_with_mode_and_trace_result,
+    execute_write_logical_plan_with_mode_result,
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;

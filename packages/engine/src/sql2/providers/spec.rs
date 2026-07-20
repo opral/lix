@@ -10,8 +10,9 @@
 //! per row, so the indirection has no effect on scan or write throughput.
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, UInt64Array};
@@ -68,6 +69,92 @@ where
 /// resulting transaction writes, and returns the affected-row count.
 pub(super) type DmlApply =
     Arc<dyn Fn(RecordBatch) -> BoxFuture<'static, Result<u64>> + Send + Sync>;
+
+/// Optional pre-delete projection captured from the exact batch that will be
+/// handed to a DML apply handler.  The capture is deliberately separate from
+/// the physical DML count output: callers continue to receive an accurate
+/// affected-row count even when a delete stages additional cascade rows.
+#[derive(Clone)]
+pub(crate) struct DmlReturning {
+    schema: SchemaRef,
+    expressions: Vec<Arc<dyn PhysicalExpr>>,
+    required_columns: BTreeSet<String>,
+    captured: Arc<Mutex<Option<RecordBatch>>>,
+}
+
+impl DmlReturning {
+    pub(crate) fn new(
+        schema: SchemaRef,
+        expressions: Vec<Arc<dyn PhysicalExpr>>,
+        required_columns: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            schema,
+            expressions,
+            required_columns,
+            captured: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    pub(crate) fn required_columns(&self) -> &BTreeSet<String> {
+        &self.required_columns
+    }
+
+    fn project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let columns = self
+            .expressions
+            .iter()
+            .map(|expression| {
+                expression
+                    .evaluate(batch)
+                    .and_then(|value| value.into_array(batch.num_rows()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(DataFusionError::from)
+    }
+
+    fn capture(&self, batch: RecordBatch) {
+        *self
+            .captured
+            .lock()
+            .expect("DELETE RETURNING capture mutex poisoned") = Some(batch);
+    }
+
+    pub(crate) fn take_captured(&self) -> Result<RecordBatch> {
+        self.captured
+            .lock()
+            .expect("DELETE RETURNING capture mutex poisoned")
+            .take()
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "DELETE RETURNING execution completed without a captured result".to_string(),
+                )
+            })
+    }
+}
+
+/// Extra planning inputs needed by a DML spec without making `RETURNING`
+/// behavior part of every table implementation.  Most specs ignore it; the
+/// file surface uses it to avoid loading binary blobs unless a return
+/// expression actually references `data`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct DmlPlanOptions {
+    pub(super) returning_columns: BTreeSet<String>,
+}
+
+impl DmlPlanOptions {
+    fn from_returning(returning: Option<&DmlReturning>) -> Self {
+        Self {
+            returning_columns: returning
+                .map(|returning| returning.required_columns().clone())
+                .unwrap_or_default(),
+        }
+    }
+}
 
 /// Exec-time INSERT handler: receives the collected input batches, stages
 /// the resulting transaction writes, and returns the inserted-row count.
@@ -182,6 +269,18 @@ pub(super) trait TableSpec: Send + Sync + 'static {
         )))
     }
 
+    /// Variant of [`TableSpec::plan_delete`] that exposes only the pieces of
+    /// a `RETURNING` projection a source loader may need.  Specs that do not
+    /// have lazily loaded columns retain their existing plan unchanged.
+    async fn plan_delete_with_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        filters: &[Expr],
+        _options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_delete(write_ctx, filters).await
+    }
+
     async fn plan_update(
         &self,
         _write_ctx: SqlWriteContext,
@@ -272,6 +371,44 @@ impl SpecTableProvider {
         self.spec.plan_insert(write_ctx.clone(), input).await?;
         Ok((write_ctx, support, target))
     }
+
+    pub(crate) async fn delete_with_returning(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+        returning: DmlReturning,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.delete_impl(state, filters, Some(returning)).await
+    }
+
+    async fn delete_impl(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+        returning: Option<DmlReturning>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self.spec.table_name();
+        let write_ctx = self
+            .write_access
+            .require_write(&format!("DELETE FROM {table}"))?;
+        let filters = self.spec.prepare_write_filters(filters)?;
+        let physical_filters = physical_filters(&self.schema, &filters, state)?;
+        let planned = self
+            .spec
+            .plan_delete_with_options(
+                write_ctx,
+                &filters,
+                DmlPlanOptions::from_returning(returning.as_ref()),
+            )
+            .await?;
+        Ok(Arc::new(SpecDmlExec::new(
+            table.into(),
+            "DELETE",
+            planned,
+            physical_filters,
+            returning,
+        )))
+    }
 }
 
 impl std::fmt::Debug for SpecTableProvider {
@@ -358,19 +495,7 @@ impl TableProvider for SpecTableProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table = self.spec.table_name();
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("DELETE FROM {table}"))?;
-        let filters = self.spec.prepare_write_filters(filters)?;
-        let physical_filters = physical_filters(&self.schema, &filters, state)?;
-        let planned = self.spec.plan_delete(write_ctx, &filters).await?;
-        Ok(Arc::new(SpecDmlExec::new(
-            table.into(),
-            "DELETE",
-            planned,
-            physical_filters,
-        )))
+        self.delete_impl(state, filters, None).await
     }
 
     async fn update(
@@ -408,6 +533,7 @@ impl TableProvider for SpecTableProvider {
             "UPDATE",
             planned,
             physical_filters,
+            None,
         )))
     }
 }
@@ -599,6 +725,7 @@ pub(super) struct SpecDmlExec {
     source: RowSource,
     apply: DmlApply,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    returning: Option<DmlReturning>,
     result_schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -609,6 +736,7 @@ impl SpecDmlExec {
         operation: &'static str,
         planned: PlannedDml,
         filters: Vec<Arc<dyn PhysicalExpr>>,
+        returning: Option<DmlReturning>,
     ) -> Self {
         let result_schema = dml_count_schema();
         let properties = dml_plan_properties(Arc::clone(&result_schema));
@@ -618,6 +746,7 @@ impl SpecDmlExec {
             source: planned.source,
             apply: planned.apply,
             filters,
+            returning,
             result_schema,
             properties: Arc::new(properties),
         }
@@ -689,6 +818,7 @@ impl ExecutionPlan for SpecDmlExec {
         let source = Arc::clone(&self.source);
         let apply = Arc::clone(&self.apply);
         let filters = self.filters.clone();
+        let returning = self.returning.clone();
         let table = Arc::clone(&self.table);
         let result_schema = Arc::clone(&self.result_schema);
         let stream_schema = Arc::clone(&result_schema);
@@ -696,7 +826,14 @@ impl ExecutionPlan for SpecDmlExec {
         let stream = stream::once(async move {
             let source_batch = source().await?;
             let matched_batch = filter_batch(source_batch, &filters, &table)?;
+            let returned_batch = returning
+                .as_ref()
+                .map(|returning| returning.project(&matched_batch))
+                .transpose()?;
             let count = apply(matched_batch).await?;
+            if let (Some(returning), Some(returned_batch)) = (returning, returned_batch) {
+                returning.capture(returned_batch);
+            }
             Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
                 dml_count_batch(stream_schema, count)?,
             )]))

@@ -13,7 +13,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::{Column, DFSchema, ParamValues, ScalarValue};
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, ScalarFunction};
+use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
 use datafusion::prelude::SessionContext;
@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::functions::FunctionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
-use crate::sql2::bind::write::{BoundInsertValues, FileWriteSurface};
+use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
@@ -45,7 +45,7 @@ use crate::sql2::session::{
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
 
-use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan};
+use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
 
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
 
@@ -262,16 +262,22 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     params: &[Value],
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     validate_bound_write_input(plan, params)?;
     let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
-        .table_provider(table_name)
+        .table_provider(&table_name)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     let table_schema = table.schema();
     let state = session.state();
+    let returning = datafusion_delete_returning(
+        &session,
+        table_schema.as_ref(),
+        plan.bound.returning.as_ref(),
+        params,
+    )?;
 
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
@@ -279,7 +285,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                 insert_input_plan(&session, std::sync::Arc::clone(&table_schema), plan, params)
                     .await?;
             if plan.bound.branch_scope == BranchScope::Empty {
-                return Ok(0);
+                return Ok(SqlWriteResult::affected(0));
             }
             if let Some(conflict) = &plan.bound.conflict {
                 let target_columns: Vec<String> = conflict
@@ -310,43 +316,78 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                         }
                     }
                 };
-                return crate::sql2::providers::execute_spec_upsert(
+                let rows_affected = crate::sql2::providers::execute_spec_upsert(
                     &table,
                     &input,
                     proposed_batches,
                     &target_columns,
                     &action,
                 )
-                .await;
+                .await?;
+                return Ok(SqlWriteResult::affected(rows_affected));
             }
-            table.insert_into(&state, input, InsertOp::Append).await
+            table
+                .insert_into(&state, input, InsertOp::Append)
+                .await
+                .map_err(datafusion_error_to_lix_error)
         }
         BoundWriteOp::Update => {
             let assignments =
                 datafusion_assignments(&session, table_schema.as_ref(), plan, params)?;
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
             if plan.bound.branch_scope == BranchScope::Empty {
-                return Ok(0);
+                return Ok(SqlWriteResult::affected(0));
             }
-            table.update(&state, assignments, filters).await
+            table
+                .update(&state, assignments, filters)
+                .await
+                .map_err(datafusion_error_to_lix_error)
         }
         BoundWriteOp::Delete => {
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
             if plan.bound.branch_scope == BranchScope::Empty {
-                return Ok(0);
+                return Ok(sql_write_empty_returning_result(returning.as_ref())?);
             }
-            table.delete_from(&state, filters).await
+            match &returning {
+                Some(returning) => {
+                    crate::sql2::providers::execute_spec_delete_with_returning(
+                        &table,
+                        &state,
+                        filters,
+                        returning.clone(),
+                    )
+                    .await
+                }
+                None => table
+                    .delete_from(&state, filters)
+                    .await
+                    .map_err(datafusion_error_to_lix_error),
+            }
         }
-    }
-    .map_err(datafusion_error_to_lix_error)?;
+    }?;
 
     let batches = crate::sql2::runtime::collect_input_plan(exec, session.task_ctx())
         .await
         .map_err(datafusion_error_to_lix_error)?;
     let result =
         query_result_from_batches(&[Field::new("count", DataType::UInt64, false)], &batches)?;
-
-    affected_rows_from_query_result(result)
+    let rows_affected = affected_rows_from_query_result(result)?;
+    match returning {
+        Some(returning) => {
+            let batch = returning
+                .take_captured()
+                .map_err(datafusion_error_to_lix_error)?;
+            let fields = returning
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>();
+            let result = query_result_from_batches(&fields, &[batch])?;
+            Ok(SqlWriteResult::returning(rows_affected, result))
+        }
+        None => Ok(SqlWriteResult::affected(rows_affected)),
+    }
 }
 
 pub(crate) async fn validate_datafusion_write_logical_plan(
@@ -358,11 +399,17 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
     let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
-        .table_provider(table_name)
+        .table_provider(&table_name)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     let table_schema = table.schema();
     let state = session.state();
+    let returning = datafusion_delete_returning(
+        &session,
+        table_schema.as_ref(),
+        plan.bound.returning.as_ref(),
+        params,
+    )?;
 
     match plan.bound.op {
         BoundWriteOp::Insert => {
@@ -405,10 +452,20 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
         }
         BoundWriteOp::Delete => {
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
-            let _ = table
-                .delete_from(&state, filters)
-                .await
-                .map_err(datafusion_error_to_lix_error)?;
+            match returning {
+                Some(returning) => {
+                    let _ = crate::sql2::providers::execute_spec_delete_with_returning(
+                        &table, &state, filters, returning,
+                    )
+                    .await?;
+                }
+                None => {
+                    let _ = table
+                        .delete_from(&state, filters)
+                        .await
+                        .map_err(datafusion_error_to_lix_error)?;
+                }
+            }
         }
     }
 
@@ -673,6 +730,82 @@ fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
     }
 }
 
+fn datafusion_delete_returning(
+    session: &SessionContext,
+    table_schema: &Schema,
+    returning: Option<&BoundReturning>,
+    params: &[Value],
+) -> Result<Option<crate::sql2::providers::DmlReturning>, LixError> {
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+    let df_schema =
+        DFSchema::try_from(table_schema.clone()).map_err(datafusion_error_to_lix_error)?;
+    let props = session.state().execution_props().clone();
+    let mut fields = Vec::with_capacity(returning.items.len());
+    let mut expressions = Vec::with_capacity(returning.items.len());
+    let mut required_columns = BTreeSet::new();
+
+    for item in &returning.items {
+        let expr = datafusion_expr_from_bound_expr(session, &item.expr, params)?;
+        let (_, inferred_field) = expr
+            .to_field(&df_schema)
+            .map_err(datafusion_error_to_lix_error)?;
+        fields.push(
+            Field::new(
+                &item.output_name,
+                inferred_field.data_type().clone(),
+                inferred_field.is_nullable(),
+            )
+            .with_metadata(inferred_field.metadata().clone()),
+        );
+        expressions.push(
+            datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
+                .map_err(datafusion_error_to_lix_error)?,
+        );
+        bound_expr_column_names(&item.expr, &mut required_columns);
+    }
+
+    Ok(Some(crate::sql2::providers::DmlReturning::new(
+        std::sync::Arc::new(Schema::new(fields)),
+        expressions,
+        required_columns,
+    )))
+}
+
+fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
+    match expr {
+        BoundExpr::Column(column) => {
+            columns.insert(column.name.clone());
+        }
+        BoundExpr::ExcludedColumn(_) | BoundExpr::Param(_) | BoundExpr::Literal(_) => {}
+        BoundExpr::Cast { expr, .. } => bound_expr_column_names(expr, columns),
+        BoundExpr::Function { args, .. } => {
+            for arg in args {
+                bound_expr_column_names(arg, columns);
+            }
+        }
+    }
+}
+
+fn sql_write_empty_returning_result(
+    returning: Option<&crate::sql2::providers::DmlReturning>,
+) -> Result<SqlWriteResult, LixError> {
+    let Some(returning) = returning else {
+        return Ok(SqlWriteResult::affected(0));
+    };
+    let fields = returning
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    Ok(SqlWriteResult::returning(
+        0,
+        query_result_from_batches(&fields, &[])?,
+    ))
+}
+
 fn insert_field_expr(
     session: &SessionContext,
     row: &[BoundExpr],
@@ -865,6 +998,23 @@ fn datafusion_filters_from_predicate(
                 )?),
             ))])
         }
+        BoundPredicate::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+            escape_char,
+        } => Ok(vec![Expr::Like(Like::new(
+            *negated,
+            Box::new(datafusion_filter_expr_from_bound_expr(
+                session, expr, params, false, false,
+            )?),
+            Box::new(datafusion_filter_expr_from_bound_expr(
+                session, pattern, params, false, false,
+            )?),
+            *escape_char,
+            *case_insensitive,
+        ))]),
         BoundPredicate::IsNull(expr) => Ok(vec![Expr::IsNull(Box::new(
             datafusion_filter_expr_from_bound_expr(session, expr, params, false, false)?,
         ))]),
@@ -1061,27 +1211,50 @@ fn canonical_json_text(raw: &str) -> Result<String, LixError> {
         })
 }
 
-fn write_target_table_name(plan: &LogicalWritePlan) -> Result<&'static str, LixError> {
+fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
         BoundWriteTarget::LixState
             if plan.bound.branch_scope == BranchScope::Global
                 && plan.bound.op != BoundWriteOp::Insert =>
         {
-            Ok("lix_state_by_branch")
+            Ok("lix_state_by_branch".to_string())
         }
-        BoundWriteTarget::LixState => Ok("lix_state"),
-        BoundWriteTarget::LixStateByBranch => Ok("lix_state_by_branch"),
-        BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file"),
-        BoundWriteTarget::File(FileWriteSurface::ByBranch) => Ok("lix_file_by_branch"),
-        BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory"),
+        BoundWriteTarget::LixState => Ok("lix_state".to_string()),
+        BoundWriteTarget::LixStateByBranch => Ok("lix_state_by_branch".to_string()),
+        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::Base {
+            schema_key,
+        }) if bound_predicate_contains_like(&plan.bound.predicate) => Ok(schema_key.clone()),
+        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
+            schema_key,
+        }) if bound_predicate_contains_like(&plan.bound.predicate) => {
+            Ok(format!("{schema_key}_by_branch"))
+        }
+        BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file".to_string()),
+        BoundWriteTarget::File(FileWriteSurface::ByBranch) => Ok("lix_file_by_branch".to_string()),
+        BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory".to_string()),
         BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch) => {
-            Ok("lix_directory_by_branch")
+            Ok("lix_directory_by_branch".to_string())
         }
-        BoundWriteTarget::Branch => Ok("lix_branch"),
-        _ => Err(LixError::new(
+        BoundWriteTarget::Branch => Ok("lix_branch".to_string()),
+        BoundWriteTarget::Entity(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer currently supports only lix_state writes",
         )),
+    }
+}
+
+fn bound_predicate_contains_like(predicate: &BoundPredicate) -> bool {
+    match predicate {
+        BoundPredicate::Like { .. } => true,
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
+            predicates.iter().any(bound_predicate_contains_like)
+        }
+        BoundPredicate::True
+        | BoundPredicate::False
+        | BoundPredicate::Eq(_, _)
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_)
+        | BoundPredicate::In { .. } => false,
     }
 }
 
@@ -5281,6 +5454,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_delete_entity_by_branch_like_uses_datafusion_and_stages_tombstone() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![
+            live_entity_row("entity-a", "branch-a", "A"),
+            live_entity_row("entity-b", "branch-b", "Before"),
+            live_entity_row("entity-c", "branch-b", "After"),
+        ]);
+        ctx.schema_definitions = vec![json!({
+            "x-lix-key": "test_state_schema",
+            "type": "object",
+            "properties": {
+                "value": { "type": "string" }
+            }
+        })];
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "DELETE FROM test_state_schema_by_branch \
+             WHERE lixcol_branch_id = $1 AND value LIKE $2",
+            &[
+                Value::Text("branch-b".to_string()),
+                Value::Text("Before%".to_string()),
+            ],
+            WriteExecutorMode::Auto,
+        )
+        .await
+        .expect("DELETE LIKE on an entity surface should stage a tombstone");
+
+        assert_eq!(path, WriteExecutorPath::DataFusion);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
+        assert_eq!(rows[0].branch_id, "branch-b");
+        assert!(rows[0].tombstone);
+    }
+
+    #[tokio::test]
     async fn execute_sql_update_lix_state_stages_rewritten_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
@@ -5977,6 +6193,45 @@ mod tests {
         assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
         assert!(rows.iter().any(|row| row.entity_pk == "[\"entity-1\"]"));
         assert!(rows.iter().any(|row| row.entity_pk == "[\"entity-2\"]"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_like_stages_only_matching_rows() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut skipped = live_lix_state_row("entity-skipped", Some("{\"source\":\"skip\"}"));
+        skipped.schema_key = "app_other".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                live_lix_state_row("entity-matched", Some("{\"source\":\"match\"}")),
+                skipped,
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state WHERE schema_key LIKE $1",
+            &[Value::Text("lix_%".to_string())],
+        )
+        .await
+        .expect("DELETE LIKE should use the generic lix_state write path");
+
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, "[\"entity-matched\"]");
+        assert!(rows[0].tombstone);
     }
 
     async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, LixError> {

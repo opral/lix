@@ -34,6 +34,7 @@ pub(crate) use file::{
     FastLixFilePathWriteConflict, execute_fast_lix_file_data_update_by_id,
     execute_fast_lix_file_path_writes,
 };
+pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
 /// Execute an `INSERT ... ON CONFLICT` against a registered table provider.
@@ -80,6 +81,30 @@ pub(crate) async fn validate_spec_upsert(
         .await
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
     Ok(())
+}
+
+/// Plan a DELETE with a pre-delete `RETURNING` projection against a registered
+/// spec provider.  The projection is captured by the provider's existing
+/// one-pass DML executor, not by a separate SELECT.
+pub(crate) async fn execute_spec_delete_with_returning(
+    table: &Arc<dyn TableProvider>,
+    state: &dyn datafusion::catalog::Session,
+    filters: Vec<datafusion::logical_expr::Expr>,
+    returning: DmlReturning,
+) -> Result<Arc<dyn ExecutionPlan>, LixError> {
+    let provider = table
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "DELETE RETURNING is not supported on this table",
+            )
+        })?;
+    provider
+        .delete_with_returning(state, filters, returning)
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
 }
 
 pub(crate) async fn register_read<C>(

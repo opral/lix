@@ -13,6 +13,13 @@ pub(crate) enum BoundPredicate {
     And(Vec<Self>),
     Or(Vec<Self>),
     Eq(BoundExpr, BoundExpr),
+    Like {
+        expr: BoundExpr,
+        pattern: BoundExpr,
+        negated: bool,
+        case_insensitive: bool,
+        escape_char: Option<char>,
+    },
     IsNull(BoundExpr),
     IsNotNull(BoundExpr),
     In {

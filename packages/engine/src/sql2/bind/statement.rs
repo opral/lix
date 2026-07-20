@@ -5,8 +5,9 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType as SqlDataType, Delete,
     Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName,
-    ObjectNamePart, OnConflictAction, OnInsert, Query, SetExpr, Statement as SqlStatement,
-    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Value, Visit, Visitor,
+    ObjectNamePart, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
+    Value, Visit, Visitor, WildcardAdditionalOptions,
 };
 use serde_json::Value as JsonValue;
 
@@ -23,8 +24,8 @@ use super::table::{
 };
 use super::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundParamMap,
-    BoundWrite, BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
-    EntityWriteSurface, FileWriteSurface,
+    BoundReturning, BoundReturningItem, BoundWrite, BoundWriteInput, BoundWriteOp,
+    BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
 };
 
 pub(crate) fn bind_statement(
@@ -131,6 +132,7 @@ pub(super) fn bind_insert_bound(
         predicate: BoundPredicate::True,
         assignments: Vec::new(),
         conflict,
+        returning: None,
         params: params.into_map(),
         branch_scope,
     })
@@ -169,6 +171,7 @@ pub(super) fn bind_update_bound(
         predicate,
         assignments,
         conflict: None,
+        returning: None,
         params: params.into_map(),
         branch_scope,
     })
@@ -184,6 +187,7 @@ pub(super) fn bind_delete_bound(
     let table = bind_delete_target(catalog, &delete.from)?;
     require_write_capability(&table.surface, BoundWriteOp::Delete)?;
     let predicate = bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
+    let returning = bind_delete_returning(&table, delete.returning.as_ref(), &mut params)?;
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
@@ -197,9 +201,84 @@ pub(super) fn bind_delete_bound(
         predicate,
         assignments: Vec::new(),
         conflict: None,
+        returning,
         params: params.into_map(),
         branch_scope,
     })
+}
+
+/// Bind the `RETURNING` list against the target surface itself.  It is not a
+/// nested SELECT: expressions are evaluated from the exact pre-delete row
+/// batch at execution time, before that batch is staged as tombstones.
+fn bind_delete_returning(
+    table: &BoundTable,
+    returning: Option<&Vec<SelectItem>>,
+    params: &mut ParamBinder,
+) -> Result<Option<BoundReturning>, LixError> {
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+
+    let mut items = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::Wildcard(options) => {
+                reject_returning_wildcard_options(options)?;
+                for column in table
+                    .surface
+                    .columns
+                    .iter()
+                    .filter(|column| column.is_public())
+                {
+                    items.push(BoundReturningItem {
+                        expr: BoundExpr::Column(bind_public_column_ref(table, &column.name)?),
+                        output_name: column.name.clone(),
+                    });
+                }
+            }
+            SelectItem::QualifiedWildcard(_, _) => {
+                return Err(super::error::unsupported(
+                    "qualified wildcards in DELETE RETURNING are not supported",
+                ));
+            }
+            SelectItem::UnnamedExpr(sql_expr) => {
+                let expr = bind_expr(table, sql_expr, params)?;
+                let output_name = match &expr {
+                    BoundExpr::Column(column) => column.name.clone(),
+                    _ => sql_expr.to_string(),
+                };
+                items.push(BoundReturningItem { expr, output_name });
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                items.push(BoundReturningItem {
+                    expr: bind_expr(table, expr, params)?,
+                    output_name: normalize_identifier(alias),
+                });
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return Err(super::error::unsupported(
+            "DELETE RETURNING requires at least one result expression",
+        ));
+    }
+
+    Ok(Some(BoundReturning { items }))
+}
+
+fn reject_returning_wildcard_options(options: &WildcardAdditionalOptions) -> Result<(), LixError> {
+    if options.opt_ilike.is_some()
+        || options.opt_exclude.is_some()
+        || options.opt_except.is_some()
+        || options.opt_replace.is_some()
+        || options.opt_rename.is_some()
+    {
+        return Err(super::error::unsupported(
+            "DELETE RETURNING wildcard modifiers are not supported",
+        ));
+    }
+    Ok(())
 }
 
 fn reject_unsupported_insert_clauses(insert: &Insert) -> Result<(), LixError> {
@@ -356,11 +435,6 @@ fn reject_unsupported_delete_clauses(delete: &Delete) -> Result<(), LixError> {
     }
     if delete.using.is_some() {
         return Err(super::error::unsupported("DELETE USING is not supported"));
-    }
-    if delete.returning.is_some() {
-        return Err(super::error::unsupported(
-            "DELETE RETURNING is not supported",
-        ));
     }
     if !delete.order_by.is_empty() {
         return Err(super::error::unsupported(
@@ -599,6 +673,7 @@ fn bind_predicate(
     params: &mut ParamBinder,
 ) -> Result<BoundPredicate, LixError> {
     match expr {
+        Expr::Nested(expr) => bind_predicate(table, expr, params),
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
             let mut predicates = Vec::new();
             flatten_and_predicate(table, left, params, &mut predicates)?;
@@ -615,6 +690,38 @@ fn bind_predicate(
             bind_expr(table, left, params)?,
             bind_expr(table, right, params)?,
         )),
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => bind_like_predicate(
+            table,
+            *negated,
+            *any,
+            expr,
+            pattern,
+            escape_char,
+            false,
+            params,
+        ),
+        Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => bind_like_predicate(
+            table,
+            *negated,
+            *any,
+            expr,
+            pattern,
+            escape_char,
+            true,
+            params,
+        ),
         Expr::IsNull(expr) => Ok(BoundPredicate::IsNull(bind_expr(table, expr, params)?)),
         Expr::IsNotNull(expr) => Ok(BoundPredicate::IsNotNull(bind_expr(table, expr, params)?)),
         Expr::InList {
@@ -641,6 +748,44 @@ fn bind_predicate(
             "unsupported SQL predicate '{expr}'"
         ))),
     }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn bind_like_predicate(
+    table: &BoundTable,
+    negated: bool,
+    any: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    escape_char: &Option<Value>,
+    case_insensitive: bool,
+    params: &mut ParamBinder,
+) -> Result<BoundPredicate, LixError> {
+    if any {
+        return Err(super::error::unsupported(
+            "ANY in LIKE predicates is not supported",
+        ));
+    }
+    let escape_char = match escape_char {
+        // Keep the bound-write surface aligned with DataFusion's SQL planner:
+        // its LIKE escape parser accepts one single-byte quoted character.
+        Some(Value::SingleQuotedString(value)) if value.len() == 1 => {
+            Some(value.chars().next().expect("single-character LIKE escape"))
+        }
+        Some(value) => {
+            return Err(super::error::unsupported(format!(
+                "invalid LIKE escape character; expected a single-quoted single character, got {value}"
+            )));
+        }
+        None => None,
+    };
+    Ok(BoundPredicate::Like {
+        expr: bind_expr(table, expr, params)?,
+        pattern: bind_expr(table, pattern, params)?,
+        negated,
+        case_insensitive,
+        escape_char,
+    })
 }
 
 fn flatten_and_predicate(
@@ -1366,9 +1511,10 @@ fn insert_row_global_selector(
 
 fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelector, LixError> {
     match predicate {
-        BoundPredicate::True | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
-            Ok(GlobalSelector::Missing)
-        }
+        BoundPredicate::True
+        | BoundPredicate::Like { .. }
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_) => Ok(GlobalSelector::Missing),
         BoundPredicate::False => Ok(GlobalSelector::Empty),
         BoundPredicate::And(predicates) => {
             let mut result = GlobalSelector::Missing;
@@ -1571,9 +1717,10 @@ fn predicate_branch_selector(
     branch_column: &str,
 ) -> Result<BranchSelector, LixError> {
     match predicate {
-        BoundPredicate::True | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
-            Ok(BranchSelector::Missing)
-        }
+        BoundPredicate::True
+        | BoundPredicate::Like { .. }
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_) => Ok(BranchSelector::Missing),
         BoundPredicate::False => Ok(BranchSelector::Static(BTreeSet::new())),
         BoundPredicate::And(predicates) => {
             let mut result = BranchSelector::Missing;
@@ -2300,6 +2447,94 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error.message.contains("require an explicit"));
+    }
+
+    #[test]
+    fn bind_statement_binds_delete_like_predicate_and_parameter() {
+        let statement = parse_statement("DELETE FROM lix_file WHERE path NOT LIKE $1");
+        let bound = bind_statement(&statement, &[], "branch1").expect("DELETE LIKE should bind");
+
+        assert!(matches!(
+            bound.predicate,
+            BoundPredicate::Like {
+                expr: BoundExpr::Column(ref column),
+                pattern: BoundExpr::Param(param),
+                negated: true,
+                case_insensitive: false,
+                escape_char: None,
+            } if column.name == "path" && param.index == 1
+        ));
+        assert_eq!(
+            bound.params.params.keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn bind_statement_keeps_like_out_of_by_branch_scope_selection() {
+        let statement =
+            parse_statement("DELETE FROM lix_file_by_branch WHERE lixcol_branch_id LIKE 'draft%'");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("LIKE must not grant a by-branch write scope");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.message.contains("require an explicit"));
+    }
+
+    #[test]
+    fn bind_statement_expands_delete_returning_star_and_preserves_aliases() {
+        let statement = parse_statement(
+            "DELETE FROM lix_file WHERE id = 'readme' RETURNING *, path AS deleted_path",
+        );
+        let bound = bind_statement(&statement, &[], "branch1").expect("DELETE should bind");
+        let returning = bound.returning.expect("RETURNING should be bound");
+
+        assert_eq!(
+            returning
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "id",
+                "path",
+                "directory_id",
+                "name",
+                "data",
+                "lixcol_global",
+                "lixcol_change_id",
+                "lixcol_untracked",
+                "lixcol_metadata",
+                "deleted_path",
+            ]
+        );
+        assert!(matches!(
+            returning.items.last().expect("aliased item").expr,
+            BoundExpr::Column(ref column) if column.name == "path"
+        ));
+    }
+
+    #[test]
+    fn bind_statement_binds_returning_parameters_into_write_parameter_map() {
+        let statement =
+            parse_statement("DELETE FROM lix_file WHERE id = $1 RETURNING $2 AS marker");
+        let bound = bind_statement(&statement, &[], "branch1").expect("DELETE should bind");
+
+        assert_eq!(
+            bound.params.params.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(matches!(
+            bound
+                .returning
+                .expect("RETURNING should be bound")
+                .items
+                .as_slice(),
+            [BoundReturningItem {
+                expr: BoundExpr::Param(param),
+                output_name,
+            }] if param.index == 2 && output_name == "marker"
+        ));
     }
 
     #[test]
