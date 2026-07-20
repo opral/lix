@@ -6,7 +6,7 @@
     clippy::unused_self
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::LixError;
 use crate::changelog::{
@@ -22,7 +22,6 @@ use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-
 /// Read model for resolving changelog commits into entity state at a head.
 ///
 /// This module does not own durable storage. It reads immutable changelog
@@ -41,7 +40,10 @@ impl CommitGraphContext {
     where
         S: StorageAdapterRead,
     {
-        CommitGraphStoreReader { store }
+        CommitGraphStoreReader {
+            store,
+            canonical_change_cache: HashMap::new(),
+        }
     }
 }
 
@@ -51,6 +53,10 @@ where
     S: StorageAdapterRead,
 {
     store: S,
+    // A reader is bound to one pinned storage snapshot for the duration of a
+    // SQL statement. File-history shaping asks the same reader for distinct
+    // schema slices of that history, so retain immutable change records here.
+    canonical_change_cache: HashMap<ChangeId, Option<CommitGraphChange>>,
 }
 
 impl<S> CommitGraphStoreReader<S>
@@ -272,18 +278,37 @@ where
     }
 
     async fn load_canonical_changes(
-        &self,
+        &mut self,
         change_ids: &[ChangeId],
     ) -> Result<Vec<Option<CommitGraphChange>>, LixError> {
-        let mut reader = ChangelogContext::new().reader(&self.store);
-        let batch = reader
-            .load_changes(ChangeLoadRequest { change_ids })
-            .await?;
-        batch
-            .entries
+        let uncached_ids = change_ids
+            .iter()
+            .filter(|change_id| !self.canonical_change_cache.contains_key(change_id))
+            .copied()
+            .collect::<BTreeSet<_>>()
             .into_iter()
-            .map(|entry| Ok(entry.map(commit_graph_change_from_change_record)))
-            .collect()
+            .collect::<Vec<_>>();
+        if !uncached_ids.is_empty() {
+            let mut reader = ChangelogContext::new().reader(&self.store);
+            let batch = reader
+                .load_changes(ChangeLoadRequest {
+                    change_ids: &uncached_ids,
+                })
+                .await?;
+            for (change_id, entry) in uncached_ids.into_iter().zip(batch.entries) {
+                self.canonical_change_cache
+                    .insert(change_id, entry.map(commit_graph_change_from_change_record));
+            }
+        }
+        Ok(change_ids
+            .iter()
+            .map(|change_id| {
+                self.canonical_change_cache
+                    .get(change_id)
+                    .cloned()
+                    .unwrap_or(None)
+            })
+            .collect())
     }
 }
 
@@ -381,6 +406,8 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::changelog::{
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
@@ -389,8 +416,43 @@ mod tests {
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
-    use crate::storage_adapter::StorageAdapter;
-    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::storage::{
+        GetManyResult, GetOptions, Key, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError,
+        StorageRead,
+    };
+    use crate::storage_adapter::{
+        Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
+        StorageWriteOptions,
+    };
+
+    #[derive(Clone)]
+    struct CountingMemoryRead {
+        inner: MemoryRead,
+        change_get_many_calls: Arc<AtomicUsize>,
+    }
+
+    impl StorageRead for CountingMemoryRead {
+        async fn get_many(
+            &self,
+            space: SpaceId,
+            keys: &[Key],
+            opts: GetOptions,
+        ) -> Result<GetManyResult, StorageError> {
+            if space == crate::changelog::CHANGE_SPACE.id {
+                self.change_get_many_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.get_many(space, keys, opts).await
+        }
+
+        async fn scan(
+            &self,
+            space: SpaceId,
+            range: KeyRange,
+            opts: ScanOptions,
+        ) -> Result<ScanChunk, StorageError> {
+            self.inner.scan(space, range, opts).await
+        }
+    }
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -602,6 +664,62 @@ mod tests {
                     1
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn change_history_reuses_canonical_changes_across_requests() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        append_changes(
+            &storage,
+            &[
+                entity_change("change-root", "entity-root", "test_schema", "{}"),
+                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-head"],
+                    &["commit-root"],
+                ),
+            ],
+        )
+        .await;
+
+        let change_get_many_calls = Arc::new(AtomicUsize::new(0));
+        let read = memory
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let graph = CommitGraphContext::new();
+        let mut reader = graph.reader(StorageAdapterReadScope::new(CountingMemoryRead {
+            inner: read,
+            change_get_many_calls: Arc::clone(&change_get_many_calls),
+        }));
+        let request = CommitGraphChangeHistoryRequest {
+            schema_keys: vec!["test_schema".to_string()],
+            include_tombstones: true,
+            ..CommitGraphChangeHistoryRequest::default()
+        };
+        let commit_head = commit_id("commit-head");
+
+        let first = reader
+            .change_history_from_commit(&commit_head, &request)
+            .await
+            .expect("first history should resolve");
+        let calls_after_first = change_get_many_calls.load(Ordering::Relaxed);
+        assert!(calls_after_first > 0, "first history should load changes");
+
+        let second = reader
+            .change_history_from_commit(&commit_head, &request)
+            .await
+            .expect("second history should resolve");
+        assert_eq!(second, first);
+        assert_eq!(
+            change_get_many_calls.load(Ordering::Relaxed),
+            calls_after_first,
+            "a pinned reader should reuse previously loaded canonical changes",
         );
     }
 
