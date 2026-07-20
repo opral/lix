@@ -138,6 +138,16 @@ impl FilesystemPathSelection {
         self.indices.iter().map(|index| &self.index.entries[*index])
     }
 
+    pub(crate) fn entries_of_kind_with_limit(
+        &self,
+        kind: FilesystemPathKind,
+        limit: Option<usize>,
+    ) -> impl Iterator<Item = &FilesystemPathEntry> {
+        self.entries()
+            .filter(move |entry| entry.kind == kind)
+            .take(limit.unwrap_or(usize::MAX))
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.indices.len()
     }
