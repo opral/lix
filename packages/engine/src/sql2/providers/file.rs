@@ -69,6 +69,7 @@ use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const INDEXED_BLOB_REF_EXACT_FILE_FILTER_MAX_IDS: usize = 32;
 
 use crate::filesystem::{
     BlobRefRowInput, DirectoryPathRecord, DirectoryPathResolver, FileDeleteInput,
@@ -3230,10 +3231,18 @@ async fn scan_indexed_file_rows(
         .iter()
         .map(|file_id| EntityPk::single(file_id.clone()))
         .collect();
-    blob_request.filter.file_ids = file_ids
-        .into_iter()
-        .map(crate::NullableKeyFilter::Value)
-        .collect();
+    // Small exact sets are cheaper as storage point reads. Valid blob refs use
+    // their file id as `entity_pk`, so for larger indexed lists omitting the
+    // independent file-id filter prevents a Cartesian product in storage. The
+    // final FilesystemBlobRefKey join still defends against malformed rows.
+    if file_ids.len() <= INDEXED_BLOB_REF_EXACT_FILE_FILTER_MAX_IDS {
+        blob_request.filter.file_ids = file_ids
+            .into_iter()
+            .map(crate::NullableKeyFilter::Value)
+            .collect();
+    } else {
+        blob_request.filter.file_ids.clear();
+    }
     blob_request.limit = None;
     live_state.scan_rows(&blob_request).await
 }
@@ -4887,6 +4896,187 @@ mod tests {
                 NullableKeyFilter::Value("file-other-doc".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn indexed_blob_entity_prefix_preserves_blob_storage_lanes() {
+        let tracked_data = b"tracked".to_vec();
+        let global_data = b"global".to_vec();
+        let untracked_data = b"untracked".to_vec();
+        let misplaced_data = b"misplaced".to_vec();
+
+        let mut global_file = live_file_row(
+            "file-global",
+            crate::GLOBAL_BRANCH_ID,
+            r#"{"id":"file-global","directory_id":null,"name":"global.md"}"#,
+        );
+        global_file.global = true;
+        let mut untracked_file = live_file_row(
+            "file-untracked",
+            "branch-b",
+            r#"{"id":"file-untracked","directory_id":null,"name":"untracked.md"}"#,
+        );
+        untracked_file.untracked = true;
+        let mut index_rows = vec![
+            live_file_row(
+                "file-tracked",
+                "branch-b",
+                r#"{"id":"file-tracked","directory_id":null,"name":"tracked.md"}"#,
+            ),
+            global_file,
+            untracked_file,
+        ];
+        index_rows.extend((0..30).map(|index| {
+            live_file_row(
+                &format!("file-padding-{index}"),
+                "branch-b",
+                &format!(
+                    r#"{{"id":"file-padding-{index}","directory_id":null,"name":"padding-{index}.md"}}"#
+                ),
+            )
+        }));
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(index_rows)
+                .expect("filesystem path index should build"),
+        );
+        let matches =
+            super::indexed_file_matches(Arc::clone(&index), &super::FilePathPredicate::All);
+
+        let mut tracked_blob = live_blob_ref_row(
+            "file-tracked",
+            "branch-b",
+            "file-tracked",
+            &BlobHash::from_content(&tracked_data).to_hex(),
+            tracked_data.len(),
+        );
+        tracked_blob.change_id = Some(ChangeId::for_test_label("tracked-blob"));
+        let mut global_blob = live_blob_ref_row(
+            "file-global",
+            crate::GLOBAL_BRANCH_ID,
+            "file-global",
+            &BlobHash::from_content(&global_data).to_hex(),
+            global_data.len(),
+        );
+        global_blob.global = true;
+        global_blob.change_id = Some(ChangeId::for_test_label("global-blob"));
+        let mut untracked_blob = live_blob_ref_row(
+            "file-untracked",
+            "branch-b",
+            "file-untracked",
+            &BlobHash::from_content(&untracked_data).to_hex(),
+            untracked_data.len(),
+        );
+        untracked_blob.untracked = true;
+        untracked_blob.change_id = Some(ChangeId::for_test_label("untracked-blob"));
+        // An unexpected file-id under a selected entity prefix must not attach
+        // to the descriptor: the final FilesystemBlobRefKey join includes it.
+        let mut misplaced_blob = live_blob_ref_row(
+            "file-tracked",
+            "branch-b",
+            "different-file-id",
+            &BlobHash::from_content(&misplaced_data).to_hex(),
+            misplaced_data.len(),
+        );
+        misplaced_blob.change_id = Some(ChangeId::for_test_label("misplaced-blob"));
+        let live_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(RecordingLiveStateReader {
+            rows: vec![tracked_blob, global_blob, untracked_blob, misplaced_blob],
+            scan_requests: Arc::clone(&live_state_requests),
+        });
+        let base_schema = super::lix_file_schema();
+        let projection = vec![
+            base_schema.index_of("path").expect("path column"),
+            base_schema
+                .index_of("lixcol_change_id")
+                .expect("change id column"),
+        ];
+        let projected_schema = super::projected_schema(&base_schema, Some(&projection))
+            .expect("projection should be valid");
+        let request = super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
+        let rows = super::scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true)
+            .await
+            .expect("matching blob rows should load");
+        let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
+            .expect("indexed rows should prepare");
+        let blob_reader: Arc<dyn BlobDataReader> =
+            Arc::new(StaticBlobReader::from_blobs(Vec::new()));
+        let batch = super::lix_file_record_batch_from_prepared(
+            &projected_schema,
+            &blob_reader,
+            None,
+            false,
+            prepared,
+        )
+        .await
+        .expect("prefix-selected blobs should render");
+
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column should be string data");
+        let change_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("change id column should be string data");
+        let changes_by_path = paths
+            .iter()
+            .zip(change_ids.iter())
+            .filter_map(|(path, change_id)| {
+                let path = path?;
+                if !matches!(path, "/global.md" | "/tracked.md" | "/untracked.md") {
+                    return None;
+                }
+                change_id.map(|change_id| (path.to_string(), change_id.to_string()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            changes_by_path,
+            BTreeMap::from([
+                (
+                    "/global.md".to_string(),
+                    ChangeId::for_test_label("global-blob").to_string(),
+                ),
+                (
+                    "/tracked.md".to_string(),
+                    ChangeId::for_test_label("tracked-blob").to_string(),
+                ),
+                (
+                    "/untracked.md".to_string(),
+                    ChangeId::for_test_label("untracked-blob").to_string(),
+                ),
+            ])
+        );
+        assert_ne!(
+            changes_by_path.get("/tracked.md"),
+            Some(&ChangeId::for_test_label("misplaced-blob").to_string()),
+            "the full FilesystemBlobRefKey must reject a mismatched file-id"
+        );
+        let requests = live_state_requests
+            .lock()
+            .expect("live-state request mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].filter.entity_pks.len(), 33);
+        assert!(
+            requests[0]
+                .filter
+                .entity_pks
+                .contains(&crate::entity_pk::EntityPk::single("file-global"))
+        );
+        assert!(
+            requests[0]
+                .filter
+                .entity_pks
+                .contains(&crate::entity_pk::EntityPk::single("file-tracked"))
+        );
+        assert!(
+            requests[0]
+                .filter
+                .entity_pks
+                .contains(&crate::entity_pk::EntityPk::single("file-untracked"))
+        );
+        assert!(requests[0].filter.file_ids.is_empty());
     }
 
     #[tokio::test]
