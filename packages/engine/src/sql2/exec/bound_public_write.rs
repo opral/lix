@@ -601,21 +601,23 @@ async fn entity_delete(
 }
 
 fn empty_entity_delete_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
-    match &plan.bound.returning {
-        Some(returning) => SqlWriteResult::returning(
-            0,
-            crate::SqlQueryResult {
-                columns: returning
-                    .items
-                    .iter()
-                    .map(|item| item.output_name.clone())
-                    .collect(),
-                rows: Vec::new(),
-                notices: Vec::new(),
-            },
-        ),
-        None => SqlWriteResult::affected(0),
-    }
+    plan.bound.returning.as_ref().map_or_else(
+        || SqlWriteResult::affected(0),
+        |returning| {
+            SqlWriteResult::returning(
+                0,
+                crate::SqlQueryResult {
+                    columns: returning
+                        .items
+                        .iter()
+                        .map(|item| item.output_name.clone())
+                        .collect(),
+                    rows: Vec::new(),
+                    notices: Vec::new(),
+                },
+            )
+        },
+    )
 }
 
 fn entity_returning_row(
@@ -682,15 +684,11 @@ fn entity_returning_value(
             Value::Text(value)
         }
         EntityEvalValue::Json(JsonValue::Bool(value)) => Value::Boolean(value),
-        EntityEvalValue::Json(JsonValue::Number(value)) => {
-            if let Some(value) = value.as_i64() {
-                Value::Integer(value)
-            } else if let Some(value) = value.as_f64() {
-                Value::Real(value)
-            } else {
-                Value::Text(value.to_string())
-            }
-        }
+        EntityEvalValue::Json(JsonValue::Number(value)) => value
+            .as_i64()
+            .map(Value::Integer)
+            .or_else(|| value.as_f64().map(Value::Real))
+            .unwrap_or_else(|| Value::Text(value.to_string())),
         EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
             Value::Json(value)
         }

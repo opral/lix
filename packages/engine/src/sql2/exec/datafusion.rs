@@ -346,7 +346,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         BoundWriteOp::Delete => {
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
             if plan.bound.branch_scope == BranchScope::Empty {
-                return Ok(sql_write_empty_returning_result(returning.as_ref())?);
+                return sql_write_empty_returning_result(returning.as_ref());
             }
             match &returning {
                 Some(returning) => {
