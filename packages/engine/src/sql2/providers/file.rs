@@ -4373,60 +4373,71 @@ pub(super) fn indexed_path_matches(
     predicate: &FilePathPredicate,
     kind: FilesystemPathKind,
 ) -> FilesystemPathSelection {
-    fn indices(
+    fn entries(
         index: &crate::filesystem::FilesystemPathIndex,
         predicate: &FilePathPredicate,
         kind: FilesystemPathKind,
-    ) -> BTreeSet<usize> {
-        let candidate_indices: Box<dyn Iterator<Item = usize>> = match predicate {
-            FilePathPredicate::All => Box::new(index.all_indices()),
-            FilePathPredicate::Comparison { operation, value } => {
-                let range = match operation {
-                    FilePathComparison::Equal => index.exact_indices(value),
-                    FilePathComparison::LessThan => index.range_indices(
-                        std::ops::Bound::Unbounded,
-                        std::ops::Bound::Excluded(value.as_str()),
-                    ),
-                    FilePathComparison::LessThanOrEqual => index.range_indices(
-                        std::ops::Bound::Unbounded,
-                        std::ops::Bound::Included(value.as_str()),
-                    ),
-                    FilePathComparison::GreaterThan => index.range_indices(
-                        std::ops::Bound::Excluded(value.as_str()),
-                        std::ops::Bound::Unbounded,
-                    ),
-                    FilePathComparison::GreaterThanOrEqual => index.range_indices(
-                        std::ops::Bound::Included(value.as_str()),
-                        std::ops::Bound::Unbounded,
-                    ),
-                };
-                Box::new(range)
-            }
-            FilePathPredicate::In(values) => {
-                Box::new(values.iter().flat_map(|value| index.exact_indices(value)))
-            }
-            FilePathPredicate::LowercaseContains(_) => Box::new(index.all_indices()),
+    ) -> BTreeMap<
+        (FilesystemPathKind, FilesystemDescriptorKey),
+        Arc<crate::filesystem::FilesystemPathEntry>,
+    > {
+        let candidates = match predicate {
+            FilePathPredicate::All => index.entries(),
+            FilePathPredicate::Comparison { operation, value } => match operation {
+                FilePathComparison::Equal => index.exact_entries(value),
+                FilePathComparison::LessThan => index.range_entries(
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Excluded(value.as_str()),
+                ),
+                FilePathComparison::LessThanOrEqual => index.range_entries(
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Included(value.as_str()),
+                ),
+                FilePathComparison::GreaterThan => index.range_entries(
+                    std::ops::Bound::Excluded(value.as_str()),
+                    std::ops::Bound::Unbounded,
+                ),
+                FilePathComparison::GreaterThanOrEqual => index.range_entries(
+                    std::ops::Bound::Included(value.as_str()),
+                    std::ops::Bound::Unbounded,
+                ),
+            },
+            FilePathPredicate::In(values) => values
+                .iter()
+                .flat_map(|value| index.exact_entries(value))
+                .collect(),
+            FilePathPredicate::LowercaseContains(_) => index.entries(),
             FilePathPredicate::And(left, right) => {
-                let left = indices(index, left, kind);
-                let right = indices(index, right, kind);
-                return left.intersection(&right).copied().collect();
+                let left = entries(index, left, kind);
+                let right = entries(index, right, kind);
+                return left
+                    .into_iter()
+                    .filter(|(identity, _)| right.contains_key(identity))
+                    .collect();
             }
             FilePathPredicate::Or(left, right) => {
-                let mut matches = indices(index, left, kind);
-                matches.extend(indices(index, right, kind));
+                let mut matches = entries(index, left, kind);
+                matches.extend(entries(index, right, kind));
                 return matches;
             }
         };
-        candidate_indices
-            .filter(|candidate| {
-                let entry = index.entry(*candidate);
-                entry.kind == kind && predicate.matches(&entry.path)
-            })
+        candidates
+            .into_iter()
+            .filter(|entry| entry.kind == kind && predicate.matches(&entry.path))
+            .map(|entry| ((entry.kind, entry.key.clone()), entry))
             .collect()
     }
 
-    let indices = indices(&index, predicate, kind).into_iter().collect();
-    FilesystemPathSelection::new(index, indices)
+    let mut entries = entries(&index, predicate, kind)
+        .into_values()
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.key.cmp(&right.key))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    FilesystemPathSelection::new(index, entries)
 }
 
 fn indexed_file_matches(
@@ -4441,11 +4452,10 @@ fn indexed_file_id_matches(
     file_ids: &BTreeSet<String>,
     path_predicate: &FilePathPredicate,
 ) -> FilesystemPathSelection {
-    let mut indices = file_ids
+    let mut entries = file_ids
         .iter()
-        .flat_map(|file_id| index.exact_file_id_indices(file_id))
-        .filter(|candidate| {
-            let entry = index.entry(*candidate);
+        .flat_map(|file_id| index.exact_file_id_entries(file_id))
+        .filter(|entry| {
             debug_assert_eq!(entry.kind, FilesystemPathKind::File);
             path_predicate.matches(&entry.path)
         })
@@ -4453,8 +4463,12 @@ fn indexed_file_id_matches(
     // Each equal-ID range is path-ordered, but multiple ranges arrive in ID
     // order. Restore the primary index order promised to DataFusion before
     // LIMIT is applied.
-    indices.sort_unstable();
-    FilesystemPathSelection::new(index, indices)
+    entries.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    FilesystemPathSelection::new(index, entries)
 }
 
 fn indexed_file_directory_matches(
@@ -4463,10 +4477,10 @@ fn indexed_file_directory_matches(
     file_ids: Option<&BTreeSet<String>>,
     path_predicate: &FilePathPredicate,
 ) -> FilesystemPathSelection {
-    let indices = index
+    let entries = index
         .entries()
-        .enumerate()
-        .filter(|(_, entry)| {
+        .into_iter()
+        .filter(|entry| {
             entry.kind == FilesystemPathKind::File
                 && entry
                     .parent_id
@@ -4475,9 +4489,8 @@ fn indexed_file_directory_matches(
                 && file_ids.is_none_or(|file_ids| file_ids.contains(entry.id()))
                 && path_predicate.matches(&entry.path)
         })
-        .map(|(index, _)| index)
         .collect();
-    FilesystemPathSelection::new(index, indices)
+    FilesystemPathSelection::new(index, entries)
 }
 
 fn indexed_file_root_matches(
@@ -4485,18 +4498,17 @@ fn indexed_file_root_matches(
     file_ids: &FileIdConstraint,
     path_predicate: &FilePathPredicate,
 ) -> FilesystemPathSelection {
-    let indices = index
+    let entries = index
         .entries()
-        .enumerate()
-        .filter(|(_, entry)| {
+        .into_iter()
+        .filter(|entry| {
             entry.kind == FilesystemPathKind::File
                 && entry.parent_id.is_none()
                 && file_ids.allows(entry.id())
                 && path_predicate.matches(&entry.path)
         })
-        .map(|(index, _)| index)
         .collect();
-    FilesystemPathSelection::new(index, indices)
+    FilesystemPathSelection::new(index, entries)
 }
 
 fn is_null_column_filter(expr: &Expr, column_name: &str) -> bool {

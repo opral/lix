@@ -390,12 +390,37 @@ where
         transaction
             .validate_prepared_writes_by_branch(&prepared_writes)
             .await?;
+        let filesystem_delta_rows = if prepared_writes
+            .state_rows
+            .iter()
+            .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        {
+            Vec::new()
+        } else {
+            prepared_writes
+                .state_rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.schema_key.as_str(),
+                        "lix_file_descriptor" | "lix_directory_descriptor"
+                    )
+                })
+                .cloned()
+                .map(MaterializedLiveStateRow::from)
+                .collect::<Vec<_>>()
+        };
         let mut read = SharedStorageAdapterRead::new(
             transaction
                 .storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
+        let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
+            None
+        } else {
+            load_path_index_revision(&read).await.ok().flatten()
+        };
         let writes = match commit::commit_prepared_writes(
             &transaction.binary_cas,
             transaction.branch_ctx.as_ref(),
@@ -418,6 +443,22 @@ where
             Ok(stats)
         })
         .await?;
+        if !filesystem_delta_rows.is_empty()
+            && incremental_filesystem_index_enabled()
+            && let Ok(next_read) = transaction
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+        {
+            let next_read = SharedStorageAdapterRead::new(next_read);
+            if let Ok(next_revision) = load_path_index_revision(&next_read).await {
+                transaction.live_state.advance_filesystem_path_indexes(
+                    previous_filesystem_revision.as_deref(),
+                    next_revision.as_deref(),
+                    &filesystem_delta_rows,
+                );
+            }
+        }
         Ok(TransactionCommitOutcome { storage_stats })
     }
 
@@ -1603,6 +1644,14 @@ where
     }
 }
 
+fn incremental_filesystem_index_enabled() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("LIX_PATH_INDEX_BENCH_DISABLE_INCREMENTAL").is_some() {
+        return false;
+    }
+    true
+}
+
 pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::StorageRead> {
     active_branch_id: String,
     read_store: SharedStorageAdapterRead<R>,
@@ -2547,7 +2596,7 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(24);
-        let warmup_rounds = 4;
+        let warmup_rounds = 4_usize;
 
         let storage = Memory::new();
         Engine::initialize(storage.clone())
@@ -2630,6 +2679,96 @@ mod tests {
             .rollback()
             .await
             .expect("benchmark transaction should roll back");
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only committed filesystem index benchmark probe"]
+    async fn committed_filesystem_path_index_benchmark_probe() {
+        let file_count = std::env::var("LIX_PATH_INDEX_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        let rounds = std::env::var("LIX_PATH_INDEX_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(24);
+        let warmup_rounds = 4_usize;
+
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open initialized storage");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        let values = (0..file_count)
+            .map(|index| format!("('file-{index:05}', '/seed-{index:05}.md', X'01')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        session
+            .execute(
+                &format!("INSERT INTO lix_file (id, path, data) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("fixture files should commit");
+        session
+            .execute("SELECT id FROM lix_file WHERE path = '/seed-00000.md'", &[])
+            .await
+            .expect("fixture path index should warm");
+        crate::filesystem::reset_full_rebuild_stats();
+
+        let mut samples = Vec::with_capacity(rounds);
+        for iteration in 0..warmup_rounds.saturating_add(rounds) {
+            let path = if iteration % 2 == 0 {
+                "/renamed-00000.md"
+            } else {
+                "/seed-00000.md"
+            };
+            session
+                .execute(
+                    &format!("UPDATE lix_file SET path = '{path}' WHERE id = 'file-00000'"),
+                    &[],
+                )
+                .await
+                .expect("descriptor invalidation fixture should commit");
+            let started = Instant::now();
+            session
+                .execute(
+                    &format!("UPDATE lix_file SET data = X'02' WHERE path = '{path}'"),
+                    &[],
+                )
+                .await
+                .expect("singleton write after descriptor commit should succeed");
+            let elapsed = started.elapsed();
+            if iteration >= warmup_rounds {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        println!(
+            "committed_filesystem_path_index_probe files={file_count} rounds={rounds} \
+             rebuilds={} descriptor_rows={} p50_us={} p95_us={}",
+            crate::filesystem::full_rebuild_stats().0,
+            crate::filesystem::full_rebuild_stats().1,
+            percentile(50, 100).as_micros(),
+            percentile(95, 100).as_micros(),
+        );
+        if incremental_filesystem_index_enabled() {
+            assert_eq!(
+                crate::filesystem::full_rebuild_stats(),
+                (0, 0),
+                "committed singleton updates must not rebuild or rescan descriptors"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,7 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -9,7 +12,7 @@ use serde::Deserialize;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::compose_file_path;
+use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -21,6 +24,7 @@ use crate::storage_adapter::{
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
 use super::keys::{DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY};
+use super::persistent_map::PersistentMap;
 use super::planner::FilesystemDescriptorKey;
 
 const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::new(
@@ -29,6 +33,25 @@ const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::new(
 );
 const FILESYSTEM_PATH_REVISION_KEY: &[u8] = b"global";
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+static FULL_REBUILD_BUILDS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static FULL_REBUILD_DESCRIPTOR_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_full_rebuild_stats() {
+    FULL_REBUILD_BUILDS.store(0, Ordering::SeqCst);
+    FULL_REBUILD_DESCRIPTOR_ROWS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn full_rebuild_stats() -> (usize, usize) {
+    (
+        FULL_REBUILD_BUILDS.load(Ordering::SeqCst),
+        FULL_REBUILD_DESCRIPTOR_ROWS.load(Ordering::SeqCst),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FilesystemPathKind {
@@ -43,6 +66,7 @@ pub(crate) struct FilesystemPathEntry {
     pub(crate) parent_id: Option<String>,
     pub(crate) name: String,
     pub(crate) key: FilesystemDescriptorKey,
+    parent_identity: Option<FilesystemPathEntryIdentity>,
     metadata: Option<String>,
     created_at: String,
     updated_at: String,
@@ -123,19 +147,22 @@ impl FilesystemPathEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct FilesystemPathSelection {
     index: Arc<FilesystemPathIndex>,
-    indices: Arc<[usize]>,
+    entries: Arc<[Arc<FilesystemPathEntry>]>,
 }
 
 impl FilesystemPathSelection {
-    pub(crate) fn new(index: Arc<FilesystemPathIndex>, indices: Vec<usize>) -> Self {
+    pub(crate) fn new(
+        index: Arc<FilesystemPathIndex>,
+        entries: Vec<Arc<FilesystemPathEntry>>,
+    ) -> Self {
         Self {
             index,
-            indices: indices.into(),
+            entries: entries.into(),
         }
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &FilesystemPathEntry> {
-        self.indices.iter().map(|index| &self.index.entries[*index])
+        self.entries.iter().map(AsRef::as_ref)
     }
 
     pub(crate) fn entries_of_kind_with_limit(
@@ -149,11 +176,11 @@ impl FilesystemPathSelection {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.indices.len()
+        self.entries.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.entries.is_empty()
     }
 
     pub(crate) fn index(&self) -> &FilesystemPathIndex {
@@ -166,19 +193,65 @@ impl FilesystemPathSelection {
 /// Duplicate paths remain adjacent because Lix path uniqueness is storage-scope
 /// local. Distinct branch/global lanes can legally render the same path and SQL
 /// predicates must retain every visible candidate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemPathEntryIdentity {
+    kind: FilesystemPathKind,
+    key: FilesystemDescriptorKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemPathSortKey {
+    path: String,
+    identity: FilesystemPathEntryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemFileIdSortKey {
+    id: String,
+    path: FilesystemPathSortKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemDescriptorIdSortKey {
+    id: String,
+    kind: FilesystemPathKind,
+    identity: FilesystemPathEntryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemChildSortKey {
+    parent: FilesystemPathEntryIdentity,
+    child: FilesystemPathEntryIdentity,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct FilesystemPathIndex {
-    entries: Vec<FilesystemPathEntry>,
-    file_indices_by_id: Vec<FilesystemFileIdIndexEntry>,
+    entries_by_path: PersistentMap<FilesystemPathSortKey, Arc<FilesystemPathEntry>>,
+    entries_by_identity: PersistentMap<FilesystemPathEntryIdentity, Arc<FilesystemPathEntry>>,
+    files_by_id: PersistentMap<FilesystemFileIdSortKey, Arc<FilesystemPathEntry>>,
+    entries_by_descriptor_id:
+        PersistentMap<FilesystemDescriptorIdSortKey, Arc<FilesystemPathEntry>>,
+    children_by_parent: PersistentMap<FilesystemChildSortKey, Arc<FilesystemPathEntry>>,
     file_count: usize,
     directory_count: usize,
     estimated_heap_bytes: usize,
+    generation: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FilesystemFileIdIndexEntry {
-    hash: u64,
-    path_index: usize,
+impl Default for FilesystemPathIndex {
+    fn default() -> Self {
+        Self {
+            entries_by_path: PersistentMap::default(),
+            entries_by_identity: PersistentMap::default(),
+            files_by_id: PersistentMap::default(),
+            entries_by_descriptor_id: PersistentMap::default(),
+            children_by_parent: PersistentMap::default(),
+            file_count: 0,
+            directory_count: 0,
+            estimated_heap_bytes: size_of::<Self>(),
+            generation: None,
+        }
+    }
 }
 
 impl FilesystemPathIndex {
@@ -263,6 +336,15 @@ impl FilesystemPathIndex {
                 parent_id: record.parent_id.clone(),
                 name: record.name.clone(),
                 key: record.key.clone(),
+                parent_identity: record.parent_id.as_deref().and_then(|parent_id| {
+                    file_directory_parent_keys(key, parent_id)
+                        .into_iter()
+                        .find(|candidate| directory_paths.contains_key(candidate))
+                        .map(|key| FilesystemPathEntryIdentity {
+                            kind: FilesystemPathKind::Directory,
+                            key,
+                        })
+                }),
                 metadata: record.metadata.clone(),
                 created_at: record.created_at.clone(),
                 updated_at: record.updated_at.clone(),
@@ -272,6 +354,7 @@ impl FilesystemPathIndex {
         }
 
         for (key, record) in file_rows {
+            let mut parent_identity = None;
             let directory_path = match record.directory_id.as_deref() {
                 Some(directory_id) => {
                     let parent_key = file_directory_parent_keys(&key, directory_id)
@@ -291,6 +374,10 @@ impl FilesystemPathIndex {
                             ),
                         ));
                     };
+                    parent_identity = parent_key.clone().map(|key| FilesystemPathEntryIdentity {
+                        kind: FilesystemPathKind::Directory,
+                        key,
+                    });
                     Some(path.as_str())
                 }
                 None => None,
@@ -302,6 +389,7 @@ impl FilesystemPathIndex {
                 parent_id: record.directory_id,
                 name: record.name,
                 key,
+                parent_identity,
                 metadata: record.metadata,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
@@ -310,107 +398,347 @@ impl FilesystemPathIndex {
             });
         }
 
-        entries.sort_unstable_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.key.cmp(&right.key))
-                .then_with(|| left.kind.cmp(&right.kind))
-        });
-        let mut file_indices_by_id = Vec::with_capacity(file_count);
-        file_indices_by_id.extend(
-            entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.kind == FilesystemPathKind::File)
-                .map(|(index, entry)| FilesystemFileIdIndexEntry {
-                    hash: xxhash_rust::xxh3::xxh3_64(entry.id().as_bytes()),
-                    path_index: index,
-                }),
-        );
-        radix_sort_file_indices_by_hash(&mut file_indices_by_id);
-        debug_assert_eq!(file_indices_by_id.len(), file_count);
+        let entries = entries.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let mut entries_by_path = entries
+            .iter()
+            .map(|entry| (path_sort_key(entry), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        entries_by_path.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut entries_by_identity = entries
+            .iter()
+            .map(|entry| (entry_identity(entry), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        entries_by_identity.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut files_by_id = entries
+            .iter()
+            .filter(|entry| entry.kind == FilesystemPathKind::File)
+            .map(|entry| (file_id_sort_key(entry), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        files_by_id.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut entries_by_descriptor_id = entries
+            .iter()
+            .map(|entry| (descriptor_id_sort_key(entry), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        entries_by_descriptor_id.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut children_by_parent = entries
+            .iter()
+            .filter_map(|entry| {
+                entry.parent_identity.clone().map(|parent| {
+                    (
+                        FilesystemChildSortKey {
+                            parent,
+                            child: entry_identity(entry),
+                        },
+                        Arc::clone(entry),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        children_by_parent.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let directory_count = entries.len().saturating_sub(file_count);
-        let estimated_heap_bytes = size_of::<Self>()
-            + entries.capacity() * size_of::<FilesystemPathEntry>()
-            + file_indices_by_id.capacity() * size_of::<FilesystemFileIdIndexEntry>()
-            + entries
-                .iter()
-                .map(FilesystemPathEntry::estimated_heap_bytes)
-                .sum::<usize>();
+        let estimated_heap_bytes = estimated_index_heap_bytes(&entries);
         Ok(Self {
-            entries,
-            file_indices_by_id,
+            entries_by_path: PersistentMap::from_sorted(entries_by_path),
+            entries_by_identity: PersistentMap::from_sorted(entries_by_identity),
+            files_by_id: PersistentMap::from_sorted(files_by_id),
+            entries_by_descriptor_id: PersistentMap::from_sorted(entries_by_descriptor_id),
+            children_by_parent: PersistentMap::from_sorted(children_by_parent),
             file_count,
             directory_count,
             estimated_heap_bytes,
+            generation: None,
         })
     }
 
-    pub(crate) fn exact_indices(&self, path: &str) -> std::ops::Range<usize> {
-        let start = self
-            .entries
-            .partition_point(|entry| entry.path.as_str() < path);
-        let end = self
-            .entries
-            .partition_point(|entry| entry.path.as_str() <= path);
-        start..end
+    pub(crate) fn exact_entries(&self, path: &str) -> Vec<Arc<FilesystemPathEntry>> {
+        self.entries_by_path
+            .values_equal_by(path, |key| key.path.as_str())
     }
 
-    /// Primary path-ordered indices for every file descriptor with this ID.
-    pub(crate) fn exact_file_id_indices<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> impl Iterator<Item = usize> + 'a {
-        let hash = xxhash_rust::xxh3::xxh3_64(id.as_bytes());
-        let start = self
-            .file_indices_by_id
-            .partition_point(|candidate| candidate.hash < hash);
-        let end = self
-            .file_indices_by_id
-            .partition_point(|candidate| candidate.hash <= hash);
-        self.file_indices_by_id[start..end]
-            .iter()
-            .filter_map(move |candidate| {
-                (self.entries[candidate.path_index].id() == id).then_some(candidate.path_index)
-            })
+    pub(crate) fn exact_file_id_entries(&self, id: &str) -> Vec<Arc<FilesystemPathEntry>> {
+        self.files_by_id.values_equal_by(id, |key| key.id.as_str())
     }
 
-    pub(crate) fn range_indices(
+    pub(crate) fn range_entries(
         &self,
         lower: Bound<&str>,
         upper: Bound<&str>,
-    ) -> std::ops::Range<usize> {
-        let start = match lower {
-            Bound::Unbounded => 0,
-            Bound::Included(path) => self
-                .entries
-                .partition_point(|entry| entry.path.as_str() < path),
-            Bound::Excluded(path) => self
-                .entries
-                .partition_point(|entry| entry.path.as_str() <= path),
+    ) -> Vec<Arc<FilesystemPathEntry>> {
+        self.entries_by_path
+            .values_range_by(lower, upper, |key| key.path.as_str())
+    }
+
+    pub(crate) fn entries(&self) -> Vec<Arc<FilesystemPathEntry>> {
+        self.entries_by_path.values()
+    }
+
+    pub(crate) fn with_generation(mut self, generation: Option<&[u8]>) -> Self {
+        self.generation = generation.map(<[u8]>::to_vec);
+        self
+    }
+
+    pub(crate) fn generation(&self) -> Option<&[u8]> {
+        self.generation.as_deref()
+    }
+
+    /// Applies committed descriptor rows by path-copying only the affected AVL
+    /// search paths. Directory moves additionally rewrite their descendants.
+    pub(crate) fn apply_committed_rows(
+        &self,
+        request: &FilesystemPathIndexRequest,
+        rows: &[MaterializedLiveStateRow],
+        generation: Option<&[u8]>,
+    ) -> Result<Self, LixError> {
+        let mut next = self.clone();
+        next.generation = generation.map(<[u8]>::to_vec);
+        for row in rows {
+            if !matches!(
+                row.schema_key.as_str(),
+                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            ) || (!row.global && !request.branch_ids.contains(&row.branch_id))
+            {
+                continue;
+            }
+            next.apply_committed_row(row)?;
+        }
+        Ok(next)
+    }
+
+    fn apply_committed_row(&mut self, row: &MaterializedLiveStateRow) -> Result<(), LixError> {
+        let kind = match row.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY => FilesystemPathKind::File,
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => FilesystemPathKind::Directory,
+            _ => return Ok(()),
         };
-        let end = match upper {
-            Bound::Unbounded => self.entries.len(),
-            Bound::Included(path) => self
-                .entries
-                .partition_point(|entry| entry.path.as_str() <= path),
-            Bound::Excluded(path) => self
-                .entries
-                .partition_point(|entry| entry.path.as_str() < path),
+        let descriptor_id = row
+            .snapshot_content
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(row.entity_pk.as_single_string_owned()?);
+        let same_id = self
+            .entries_by_descriptor_id
+            .values_equal_by(descriptor_id.as_str(), |key| key.id.as_str())
+            .into_iter()
+            .filter(|entry| entry.kind == kind)
+            .collect::<Vec<_>>();
+        if row.global && same_id.iter().any(|entry| !entry.key.global()) {
+            return Ok(());
+        }
+
+        let key = FilesystemDescriptorKey::from_live_row(row, descriptor_id);
+        let identity = FilesystemPathEntryIdentity {
+            kind,
+            key: key.clone(),
         };
-        start..end
+        let prior = same_id
+            .iter()
+            .find(|entry| entry_identity(entry) == identity)
+            .cloned();
+        let mut descendants = if kind == FilesystemPathKind::Directory {
+            prior
+                .as_ref()
+                .map(|entry| self.descendants(entry))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for entry in same_id {
+            if entry.key == key || (!row.global && entry.key.global()) {
+                self.remove_entry(&entry);
+            }
+        }
+        if row.deleted || row.snapshot_content.is_none() {
+            for descendant in descendants {
+                self.remove_entry(&descendant);
+            }
+            return Ok(());
+        }
+
+        let entry = self.entry_from_row(row, key, kind)?;
+        self.insert_entry(Arc::new(entry));
+        for descendant in &mut descendants {
+            let path = self.path_for_entry(descendant)?;
+            let mut rewritten = (**descendant).clone();
+            rewritten.path = path;
+            self.insert_entry(Arc::new(rewritten));
+        }
+        Ok(())
     }
 
-    pub(crate) fn all_indices(&self) -> std::ops::Range<usize> {
-        0..self.entries.len()
+    fn entry_from_row(
+        &self,
+        row: &MaterializedLiveStateRow,
+        key: FilesystemDescriptorKey,
+        kind: FilesystemPathKind,
+    ) -> Result<FilesystemPathEntry, LixError> {
+        let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "descriptor delta has no snapshot",
+            )
+        })?;
+        let (parent_id, name) = match kind {
+            FilesystemPathKind::File => {
+                let snapshot: FileSnapshot = serde_json::from_str(snapshot).map_err(|error| {
+                    LixError::unknown(format!(
+                        "invalid lix_file_descriptor snapshot JSON: {error}"
+                    ))
+                })?;
+                (snapshot.directory_id, snapshot.name)
+            }
+            FilesystemPathKind::Directory => {
+                let snapshot: DirectorySnapshot =
+                    serde_json::from_str(snapshot).map_err(|error| {
+                        LixError::unknown(format!(
+                            "invalid lix_directory_descriptor snapshot JSON: {error}"
+                        ))
+                    })?;
+                (snapshot.parent_id, snapshot.name)
+            }
+        };
+        let mut entry = FilesystemPathEntry {
+            path: String::new(),
+            kind,
+            parent_id,
+            name,
+            key,
+            parent_identity: None,
+            metadata: row.metadata.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            change_id: row.change_id,
+            commit_id: row.commit_id,
+        };
+        entry.parent_identity = self.resolve_parent_identity(&entry);
+        entry.path = self.path_for_entry(&entry)?;
+        Ok(entry)
     }
 
-    pub(crate) fn entry(&self, index: usize) -> &FilesystemPathEntry {
-        &self.entries[index]
+    fn path_for_entry(&self, entry: &FilesystemPathEntry) -> Result<String, LixError> {
+        let parent_path = match entry.parent_id.as_deref() {
+            None => None,
+            Some(parent_id) => {
+                let parent = entry
+                    .parent_identity
+                    .as_ref()
+                    .and_then(|identity| self.entries_by_identity.get(identity))
+                    .cloned()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_FOREIGN_KEY,
+                            format!(
+                                "filesystem descriptor '{}' references missing parent '{}'",
+                                entry.id(),
+                                parent_id
+                            ),
+                        )
+                    })?;
+                Some(parent.path.clone())
+            }
+        };
+        match entry.kind {
+            FilesystemPathKind::File => compose_file_path(parent_path.as_deref(), &entry.name),
+            FilesystemPathKind::Directory => {
+                compose_directory_path(parent_path.as_deref(), &entry.name)
+            }
+        }
     }
 
-    pub(crate) fn entries(&self) -> impl Iterator<Item = &FilesystemPathEntry> {
-        self.entries.iter()
+    fn resolve_parent_identity(
+        &self,
+        entry: &FilesystemPathEntry,
+    ) -> Option<FilesystemPathEntryIdentity> {
+        let parent_id = entry.parent_id.as_deref()?;
+        file_directory_parent_keys(&entry.key, parent_id)
+            .into_iter()
+            .map(|key| FilesystemPathEntryIdentity {
+                kind: FilesystemPathKind::Directory,
+                key,
+            })
+            .find(|identity| self.entries_by_identity.get(identity).is_some())
+    }
+
+    fn descendants(&self, root: &FilesystemPathEntry) -> Vec<Arc<FilesystemPathEntry>> {
+        let mut descendants = Vec::new();
+        let mut queue = VecDeque::from([entry_identity(root)]);
+        while let Some(parent) = queue.pop_front() {
+            for child in self
+                .children_by_parent
+                .values_equal_by(&parent, |key| &key.parent)
+            {
+                if child.kind == FilesystemPathKind::Directory {
+                    queue.push_back(entry_identity(&child));
+                }
+                descendants.push(child);
+            }
+        }
+        descendants
+    }
+
+    fn remove_entry(&mut self, entry: &FilesystemPathEntry) {
+        let identity = entry_identity(entry);
+        self.entries_by_path = self.entries_by_path.remove(&path_sort_key(entry));
+        self.entries_by_identity = self.entries_by_identity.remove(&identity);
+        self.entries_by_descriptor_id = self
+            .entries_by_descriptor_id
+            .remove(&descriptor_id_sort_key(entry));
+        if entry.kind == FilesystemPathKind::File {
+            self.files_by_id = self.files_by_id.remove(&file_id_sort_key(entry));
+            self.file_count = self.file_count.saturating_sub(1);
+        } else {
+            self.directory_count = self.directory_count.saturating_sub(1);
+        }
+        if let Some(parent) = entry.parent_identity.clone() {
+            self.children_by_parent = self.children_by_parent.remove(&FilesystemChildSortKey {
+                parent,
+                child: identity,
+            });
+        }
+        self.estimated_heap_bytes = self
+            .estimated_heap_bytes
+            .saturating_sub(estimated_entry_index_bytes(entry));
+    }
+
+    fn insert_entry(&mut self, entry: Arc<FilesystemPathEntry>) {
+        let identity = entry_identity(&entry);
+        if let Some(previous) = self.entries_by_identity.get(&identity).cloned() {
+            self.remove_entry(&previous);
+        }
+        self.entries_by_path = self
+            .entries_by_path
+            .insert(path_sort_key(&entry), Arc::clone(&entry));
+        self.entries_by_identity = self
+            .entries_by_identity
+            .insert(identity.clone(), Arc::clone(&entry));
+        self.entries_by_descriptor_id = self
+            .entries_by_descriptor_id
+            .insert(descriptor_id_sort_key(&entry), Arc::clone(&entry));
+        if entry.kind == FilesystemPathKind::File {
+            self.files_by_id = self
+                .files_by_id
+                .insert(file_id_sort_key(&entry), Arc::clone(&entry));
+            self.file_count += 1;
+        } else {
+            self.directory_count += 1;
+        }
+        if let Some(parent) = entry.parent_identity.clone() {
+            self.children_by_parent = self.children_by_parent.insert(
+                FilesystemChildSortKey {
+                    parent,
+                    child: identity,
+                },
+                Arc::clone(&entry),
+            );
+        }
+        self.estimated_heap_bytes = self
+            .estimated_heap_bytes
+            .saturating_add(estimated_entry_index_bytes(&entry));
     }
 
     pub(crate) fn kind_count(&self, kind: FilesystemPathKind) -> usize {
@@ -425,41 +753,49 @@ impl FilesystemPathIndex {
     }
 }
 
-/// Sort fingerprints in linear time. Entries start in primary path order, and
-/// the stable passes preserve that order inside each equal-hash bucket.
-fn radix_sort_file_indices_by_hash(entries: &mut Vec<FilesystemFileIdIndexEntry>) {
-    const RADIX_BITS: usize = 11;
-    const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
-    const RADIX_MASK: u64 = RADIX_BUCKETS as u64 - 1;
+fn entry_identity(entry: &FilesystemPathEntry) -> FilesystemPathEntryIdentity {
+    FilesystemPathEntryIdentity {
+        kind: entry.kind,
+        key: entry.key.clone(),
+    }
+}
 
-    if entries.len() < 2 {
-        return;
+fn path_sort_key(entry: &FilesystemPathEntry) -> FilesystemPathSortKey {
+    FilesystemPathSortKey {
+        path: entry.path.clone(),
+        identity: entry_identity(entry),
     }
-    let mut scratch = vec![
-        FilesystemFileIdIndexEntry {
-            hash: 0,
-            path_index: 0,
-        };
-        entries.len()
-    ];
-    for shift in (0..u64::BITS as usize).step_by(RADIX_BITS) {
-        let mut offsets = [0_usize; RADIX_BUCKETS];
-        for entry in entries.iter() {
-            offsets[((entry.hash >> shift) & RADIX_MASK) as usize] += 1;
-        }
-        let mut next_offset = 0;
-        for offset in &mut offsets {
-            let count = *offset;
-            *offset = next_offset;
-            next_offset += count;
-        }
-        for entry in entries.iter() {
-            let bucket = ((entry.hash >> shift) & RADIX_MASK) as usize;
-            scratch[offsets[bucket]] = *entry;
-            offsets[bucket] += 1;
-        }
-        std::mem::swap(entries, &mut scratch);
+}
+
+fn file_id_sort_key(entry: &FilesystemPathEntry) -> FilesystemFileIdSortKey {
+    FilesystemFileIdSortKey {
+        id: entry.id().to_string(),
+        path: path_sort_key(entry),
     }
+}
+
+fn descriptor_id_sort_key(entry: &FilesystemPathEntry) -> FilesystemDescriptorIdSortKey {
+    FilesystemDescriptorIdSortKey {
+        id: entry.id().to_string(),
+        kind: entry.kind,
+        identity: entry_identity(entry),
+    }
+}
+
+fn estimated_index_heap_bytes(entries: &[Arc<FilesystemPathEntry>]) -> usize {
+    size_of::<FilesystemPathIndex>()
+        + entries
+            .iter()
+            .map(|entry| estimated_entry_index_bytes(entry))
+            .sum::<usize>()
+}
+
+fn estimated_entry_index_bytes(entry: &FilesystemPathEntry) -> usize {
+    size_of::<FilesystemPathEntry>()
+        + size_of::<FilesystemPathSortKey>()
+        + size_of::<FilesystemPathEntryIdentity>()
+        + size_of::<FilesystemDescriptorIdSortKey>()
+        + entry.estimated_heap_bytes()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +858,11 @@ pub(crate) async fn build_path_index(
     request: &FilesystemPathIndexRequest,
 ) -> Result<Arc<FilesystemPathIndex>, LixError> {
     let rows = live_state.scan_rows(&request.live_state_request()).await?;
+    #[cfg(test)]
+    {
+        FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
+        FULL_REBUILD_DESCRIPTOR_ROWS.fetch_add(rows.len(), Ordering::SeqCst);
+    }
     Ok(Arc::new(FilesystemPathIndex::from_live_rows(rows)?))
 }
 
@@ -589,6 +930,11 @@ impl FilesystemPathIndexCache {
         if let Some(position) = entries.iter().position(|candidate| candidate.key == key) {
             return Arc::clone(&entries[position].index);
         }
+        let index = if index.generation() == revision {
+            index
+        } else {
+            Arc::new((*index).clone().with_generation(revision))
+        };
         entries.retain(|candidate| candidate.key.branch_ids != key.branch_ids);
         let bytes =
             size_of::<CachedIndex>() + key.estimated_heap_bytes() + index.estimated_heap_bytes();
@@ -607,6 +953,67 @@ impl FilesystemPathIndexCache {
             entries.remove(0);
         }
         index
+    }
+
+    /// Advances every cached branch view that was built from `previous_revision`.
+    /// A failed delta application evicts only that view so correctness falls
+    /// back to the existing full reconstruction path.
+    pub(crate) fn advance_committed(
+        &self,
+        previous_revision: Option<&[u8]>,
+        next_revision: Option<&[u8]>,
+        rows: &[MaterializedLiveStateRow],
+    ) {
+        let previous_revision = previous_revision.map(<[u8]>::to_vec);
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("filesystem path cache lock poisoned");
+        // Global/untracked mutations can change visibility in every branch;
+        // leave that uncommon fan-out case to the reconstruction fallback.
+        if rows.iter().any(|row| row.global || row.untracked) {
+            entries.retain(|candidate| candidate.key.revision != previous_revision);
+            return;
+        }
+        let mut advanced = Vec::new();
+        entries.retain(|candidate| {
+            if candidate.key.revision != previous_revision {
+                return true;
+            }
+            // A multi-branch effective view needs cross-branch precedence
+            // reconciliation. Filesystem queries normally use one branch, so
+            // keep this uncommon case on the correctness fallback as well.
+            if candidate.key.branch_ids.len() != 1 {
+                return false;
+            }
+            let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone());
+            if let Ok(index) = candidate
+                .index
+                .apply_committed_rows(&request, rows, next_revision)
+            {
+                advanced.push((request, Arc::new(index)));
+            }
+            false
+        });
+        for (request, index) in advanced {
+            let key = CacheKey {
+                branch_ids: request.branch_ids,
+                revision: next_revision.map(<[u8]>::to_vec),
+            };
+            let bytes = size_of::<CachedIndex>()
+                + key.estimated_heap_bytes()
+                + index.estimated_heap_bytes();
+            entries.push(CachedIndex { key, index, bytes });
+        }
+        while entries.len() > 1
+            && entries
+                .iter()
+                .map(|candidate| candidate.bytes)
+                .sum::<usize>()
+                > MAX_CACHE_BYTES
+        {
+            entries.remove(0);
+        }
     }
 }
 
@@ -743,20 +1150,22 @@ mod tests {
         ])
         .expect("path index should build");
 
-        assert_eq!(index.exact_indices("/docs/a.md").len(), 2);
-        assert!(index.exact_indices("/docs/missing.md").is_empty());
+        assert_eq!(index.exact_entries("/docs/a.md").len(), 2);
+        assert!(index.exact_entries("/docs/missing.md").is_empty());
         let range =
-            index.range_indices(Bound::Included("/docs/a.md"), Bound::Excluded("/docs/c.md"));
+            index.range_entries(Bound::Included("/docs/a.md"), Bound::Excluded("/docs/c.md"));
         assert_eq!(
             range
-                .map(|entry| index.entry(entry).path.as_str())
+                .iter()
+                .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["/docs/a.md", "/docs/a.md", "/docs/b.md"]
         );
         assert_eq!(
             index
-                .all_indices()
-                .map(|entry| index.entry(entry).path.as_str())
+                .entries()
+                .iter()
+                .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["/docs/", "/docs/", "/docs/a.md", "/docs/a.md", "/docs/b.md"]
         );
@@ -764,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_file_id_indices_keep_every_file_lane_and_exclude_directories() {
+    fn exact_file_id_entries_keep_every_file_lane_and_exclude_directories() {
         let index = FilesystemPathIndex::from_live_rows(vec![
             directory_row("shared", None, "directory", "branch-a", false),
             file_row("shared", None, "z-tracked.md", "branch-a", false),
@@ -773,10 +1182,7 @@ mod tests {
         ])
         .expect("path index should build");
 
-        let matches = index
-            .exact_file_id_indices("shared")
-            .map(|candidate| index.entry(candidate))
-            .collect::<Vec<_>>();
+        let matches = index.exact_file_id_entries("shared");
         assert_eq!(
             matches
                 .iter()
@@ -789,50 +1195,8 @@ mod tests {
                 .iter()
                 .all(|entry| entry.kind == FilesystemPathKind::File)
         );
-        assert!(index.exact_file_id_indices("missing").next().is_none());
-
-        let expected_heap_bytes = size_of::<FilesystemPathIndex>()
-            + index.entries.capacity() * size_of::<FilesystemPathEntry>()
-            + index.file_indices_by_id.capacity() * size_of::<FilesystemFileIdIndexEntry>()
-            + index
-                .entries
-                .iter()
-                .map(FilesystemPathEntry::estimated_heap_bytes)
-                .sum::<usize>();
-        assert_eq!(index.estimated_heap_bytes(), expected_heap_bytes);
-        assert!(index.file_indices_by_id.capacity() >= 3);
-    }
-
-    #[test]
-    fn radix_sort_orders_hashes_and_preserves_primary_order_for_ties() {
-        let mut entries = vec![
-            FilesystemFileIdIndexEntry {
-                hash: u64::MAX,
-                path_index: 0,
-            },
-            FilesystemFileIdIndexEntry {
-                hash: 1,
-                path_index: 1,
-            },
-            FilesystemFileIdIndexEntry {
-                hash: u64::MAX,
-                path_index: 2,
-            },
-            FilesystemFileIdIndexEntry {
-                hash: 0,
-                path_index: 3,
-            },
-        ];
-
-        radix_sort_file_indices_by_hash(&mut entries);
-
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| (entry.hash, entry.path_index))
-                .collect::<Vec<_>>(),
-            vec![(0, 3), (1, 1), (u64::MAX, 0), (u64::MAX, 2)]
-        );
+        assert!(index.exact_file_id_entries("missing").is_empty());
+        assert!(index.estimated_heap_bytes() > size_of::<FilesystemPathIndex>());
     }
 
     #[test]
@@ -842,14 +1206,155 @@ mod tests {
         let first = Arc::new(FilesystemPathIndex::default());
         let second = Arc::new(FilesystemPathIndex::default());
 
-        cache.insert(&request, Some(&[1]), Arc::clone(&first));
-        cache.insert(&request, Some(&[2]), Arc::clone(&second));
+        cache.insert(&request, Some(&[1]), first);
+        let second = cache.insert(&request, Some(&[2]), second);
 
         assert!(cache.get(&request, Some(&[1])).is_none());
         assert!(Arc::ptr_eq(
             &cache.get(&request, Some(&[2])).expect("new revision"),
             &second
         ));
+    }
+
+    #[test]
+    fn cache_advances_matching_generation_from_descriptor_delta() {
+        let cache = FilesystemPathIndexCache::default();
+        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let prior = cache.insert(
+            &request,
+            Some(&[1]),
+            Arc::new(
+                FilesystemPathIndex::from_live_rows(vec![file_row(
+                    "file-a",
+                    None,
+                    "before.md",
+                    "branch-a",
+                    false,
+                )])
+                .expect("prior index should build"),
+            ),
+        );
+
+        cache.advance_committed(
+            Some(&[1]),
+            Some(&[2]),
+            &[file_row("file-a", None, "after.md", "branch-a", false)],
+        );
+
+        let next = cache.get(&request, Some(&[2])).expect("advanced index");
+        assert!(cache.get(&request, Some(&[1])).is_none());
+        assert_eq!(prior.exact_entries("/before.md").len(), 1);
+        assert!(prior.exact_entries("/after.md").is_empty());
+        assert!(next.exact_entries("/before.md").is_empty());
+        assert_eq!(next.exact_entries("/after.md").len(), 1);
+        assert_eq!(next.generation(), Some([2].as_slice()));
+    }
+
+    #[test]
+    fn committed_file_delta_advances_generation_without_mutating_prior_snapshot() {
+        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let prior = FilesystemPathIndex::from_live_rows(vec![file_row(
+            "file-a",
+            None,
+            "before.md",
+            "branch-a",
+            false,
+        )])
+        .expect("prior index should build")
+        .with_generation(Some(&[1]));
+
+        let next = prior
+            .apply_committed_rows(
+                &request,
+                &[file_row("file-a", None, "after.md", "branch-a", false)],
+                Some(&[2]),
+            )
+            .expect("descriptor delta should apply");
+
+        assert_eq!(prior.generation(), Some([1].as_slice()));
+        assert_eq!(next.generation(), Some([2].as_slice()));
+        assert_eq!(prior.exact_entries("/before.md").len(), 1);
+        assert!(prior.exact_entries("/after.md").is_empty());
+        assert!(next.exact_entries("/before.md").is_empty());
+        assert_eq!(next.exact_entries("/after.md").len(), 1);
+        assert_eq!(next.exact_file_id_entries("file-a")[0].path, "/after.md");
+    }
+
+    #[test]
+    fn committed_branch_delta_preserves_another_branch_lane() {
+        let request =
+            FilesystemPathIndexRequest::new(vec!["branch-a".to_string(), "branch-b".to_string()]);
+        let prior = FilesystemPathIndex::from_live_rows(vec![
+            file_row("shared", None, "a.md", "branch-a", false),
+            file_row("shared", None, "b.md", "branch-b", false),
+        ])
+        .expect("prior index should build");
+
+        let next = prior
+            .apply_committed_rows(
+                &request,
+                &[file_row("shared", None, "a2.md", "branch-a", false)],
+                Some(&[2]),
+            )
+            .expect("descriptor delta should apply");
+
+        assert!(next.exact_entries("/a.md").is_empty());
+        assert_eq!(next.exact_entries("/a2.md").len(), 1);
+        assert_eq!(next.exact_entries("/b.md").len(), 1);
+    }
+
+    #[test]
+    fn committed_directory_delta_rewrites_only_its_descendants() {
+        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let prior = FilesystemPathIndex::from_live_rows(vec![
+            directory_row("docs", None, "docs", "branch-a", false),
+            directory_row("nested", Some("docs"), "nested", "branch-a", false),
+            file_row("inside", Some("nested"), "inside.md", "branch-a", false),
+            file_row("outside", None, "outside.md", "branch-a", false),
+        ])
+        .expect("prior index should build");
+
+        let next = prior
+            .apply_committed_rows(
+                &request,
+                &[directory_row("docs", None, "archive", "branch-a", false)],
+                Some(&[2]),
+            )
+            .expect("subtree delta should apply");
+
+        assert_eq!(next.exact_entries("/archive/").len(), 1);
+        assert_eq!(next.exact_entries("/archive/nested/").len(), 1);
+        assert_eq!(next.exact_entries("/archive/nested/inside.md").len(), 1);
+        assert_eq!(next.exact_entries("/outside.md").len(), 1);
+        assert!(next.exact_entries("/docs/nested/inside.md").is_empty());
+    }
+
+    #[test]
+    fn committed_directory_tombstone_does_not_resurrect_removed_children() {
+        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let prior = FilesystemPathIndex::from_live_rows(vec![
+            directory_row("docs", None, "docs", "branch-a", false),
+            directory_row("nested", Some("docs"), "nested", "branch-a", false),
+            file_row("inside", Some("nested"), "inside.md", "branch-a", false),
+        ])
+        .expect("prior index should build");
+        let mut tombstone = directory_row("docs", None, "docs", "branch-a", false);
+        tombstone.snapshot_content = None;
+        tombstone.deleted = true;
+        let deleted = prior
+            .apply_committed_rows(&request, &[tombstone], Some(&[2]))
+            .expect("subtree tombstone should apply");
+        assert!(deleted.entries().is_empty());
+
+        let recreated = deleted
+            .apply_committed_rows(
+                &request,
+                &[directory_row("docs", None, "recreated", "branch-a", false)],
+                Some(&[3]),
+            )
+            .expect("root recreation should apply");
+        assert_eq!(recreated.exact_entries("/recreated/").len(), 1);
+        assert_eq!(recreated.entries().len(), 1);
     }
 
     fn directory_row(

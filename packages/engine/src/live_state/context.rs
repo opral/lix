@@ -75,6 +75,16 @@ impl LiveStateContext {
     pub(crate) fn index(&self) -> &LiveStateIndexContext {
         &self.live_index
     }
+
+    pub(crate) fn advance_filesystem_path_indexes(
+        &self,
+        previous_revision: Option<&[u8]>,
+        next_revision: Option<&[u8]>,
+        rows: &[MaterializedLiveStateRow],
+    ) {
+        self.filesystem_path_index_cache
+            .advance_committed(previous_revision, next_revision, rows);
+    }
 }
 
 /// Visible live-state reader backed by a caller-provided KV store.
