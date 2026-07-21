@@ -22,7 +22,9 @@ lix_local_filesystem = { workspace = true, optional = true }
 lix_sqlite_storage = { workspace = true, optional = true }
 
 async-trait = "0.1"
+blake3 = { version = "1", optional = true }
 bytes = "1"
+lru = { version = "0.18", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 tempfile = { version = "3", optional = true }
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
@@ -36,11 +38,12 @@ tokio = { version = "1", features = ["rt", "sync"] }
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
+wasm-encoder = "0.248"
 zip = { version = "8", default-features = false }
 
 [features]
 default = ["default_wasm_runtime"]
-default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+default_wasm_runtime = ["dep:blake3", "dep:lru", "dep:wasmtime", "dep:wasmtime-wasi"]
 local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
 

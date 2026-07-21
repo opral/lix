@@ -3384,15 +3384,18 @@ name = "lix_sdk"
 version = "0.8.4"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "codspeed-criterion-compat",
  "lix_engine",
  "lix_local_filesystem",
  "lix_sqlite_storage",
+ "lru",
  "notify-debouncer-full",
  "rusqlite",
  "tempfile",
  "tokio",
+ "wasm-encoder 0.248.0",
  "wasmtime",
  "wasmtime-wasi",
  "zip",
