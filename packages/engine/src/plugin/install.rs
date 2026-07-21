@@ -59,14 +59,6 @@ pub(crate) fn plugin_install_plan_from_archive_path(
             ),
         ));
     }
-    if parsed.manifest.file_match.content_type.is_some() {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            "Plugin installation does not support manifest match.content_type",
-        )
-        .with_hint("Remove match.content_type; registry matching currently uses path_glob only."));
-    }
-
     let schema_rows = plugin_schema_rows(&parsed, branch_id, global, untracked)?;
     Ok(PluginArchiveInstallPlan {
         archive_file_id: plugin_storage_archive_file_id(&plugin_key),
@@ -196,19 +188,45 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_rejects_content_type_until_registry_matching_supports_it() {
+    fn install_plan_preserves_content_type_for_registry_matching() {
         let archive = plugin_archive(Some("text"));
-        let error = plugin_install_plan_from_archive_path(
+        let plan = plugin_install_plan_from_archive_path(
             "/.lix/plugins/plugin_test.lixplugin",
             &archive,
             "main",
             false,
             false,
         )
-        .expect_err("content_type must not be silently ignored by registry matching");
+        .expect("content_type is part of the durable matcher contract");
 
-        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert!(error.message.contains("content_type"), "{error:?}");
+        assert_eq!(
+            plan.parsed.manifest.file_match.content_type,
+            Some(crate::plugin::PluginContentType::Text)
+        );
+    }
+
+    #[test]
+    fn bundled_csv_and_markdown_content_type_manifests_install() {
+        let cases = [
+            ("plugin_csv", "*.{csv,tsv}"),
+            ("plugin_md_v2", "*.{md,markdown}"),
+        ];
+
+        for (plugin_key, path_glob) in cases {
+            let archive = plugin_archive_for(plugin_key, path_glob, Some("text"));
+            let path = format!("/.lix/plugins/{plugin_key}.lixplugin");
+            let plan = plugin_install_plan_from_archive_path(&path, &archive, "main", false, false)
+                .unwrap_or_else(|error| {
+                    panic!("bundled {plugin_key} manifest must install: {error:?}")
+                });
+
+            assert_eq!(plan.plugin_key, plugin_key);
+            assert_eq!(plan.parsed.manifest.file_match.path_glob, path_glob);
+            assert_eq!(
+                plan.parsed.manifest.file_match.content_type,
+                Some(crate::plugin::PluginContentType::Text)
+            );
+        }
     }
 
     #[test]
@@ -248,15 +266,23 @@ mod tests {
     }
 
     fn plugin_archive(content_type: Option<&str>) -> Vec<u8> {
+        plugin_archive_for("plugin_test", "*.test", content_type)
+    }
+
+    fn plugin_archive_for(
+        plugin_key: &str,
+        path_glob: &str,
+        content_type: Option<&str>,
+    ) -> Vec<u8> {
         let content_type = content_type
             .map(|value| format!(r#", "content_type":"{value}""#))
             .unwrap_or_default();
         let manifest = format!(
             r#"{{
-                "key":"plugin_test",
+                "key":"{plugin_key}",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "match":{{"path_glob":"*.test"{content_type}}},
+                "match":{{"path_glob":"{path_glob}"{content_type}}},
                 "entry":"plugin.wasm",
                 "schemas":["schema/plugin_test_note.json"]
             }}"#

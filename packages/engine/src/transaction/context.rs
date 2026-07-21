@@ -592,6 +592,7 @@ where
                 runtime: parsed.manifest.runtime,
                 api_version: parsed.manifest.api_version.clone(),
                 path_glob: parsed.manifest.file_match.path_glob.clone(),
+                content_type: parsed.manifest.file_match.content_type,
                 entry: parsed.manifest.entry.clone(),
                 schema_keys: parsed.schema_keys.clone(),
                 manifest_json: parsed.normalized_manifest_json.clone(),
@@ -995,7 +996,7 @@ where
             }
             let Some(plugin) = catalogs
                 .get(&write.branch_id)
-                .and_then(|catalog| catalog.select(path))
+                .and_then(|catalog| catalog.select_for_bytes(path, write.data()))
             else {
                 continue;
             };

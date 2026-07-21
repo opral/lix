@@ -2414,6 +2414,10 @@ fn path_update_plugin_rewrite_file_ids(
         if existing_path == assigned_path {
             continue;
         }
+        // Path-only UPDATE sources already materialize `data` so a plugin
+        // handoff can restage the file. Use those bytes for typed matching;
+        // this adds no storage or rendering work beyond the existing source.
+        let data = required_binary_value(batch, row_index, "data")?;
 
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
@@ -2423,7 +2427,7 @@ fn path_update_plugin_rewrite_file_ids(
             .map(PluginFileOwner::plugin_key);
         let assigned_plugin_key = plugin_render
             .branch(&context.branch_id)
-            .and_then(|branch| branch.catalog.select(&assigned_path))
+            .and_then(|branch| branch.catalog.select_for_bytes(&assigned_path, &data))
             .map(PluginRegistryEntry::key);
         if existing_plugin_key != assigned_plugin_key {
             file_ids.insert(file_id);
@@ -3708,7 +3712,7 @@ async fn plugin_render_context_for_lix_file_scan(
             prepared.file_paths.get(key).is_some_and(|path| {
                 branches
                     .get(key.branch_id())
-                    .and_then(|branch| branch.catalog.select(path))
+                    .and_then(|branch| branch.catalog.select(path, None))
                     .is_some()
             })
         });
@@ -5028,7 +5032,7 @@ mod tests {
     use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::plugin::{
-        PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
+        PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentType, PluginFileOwner, PluginRegistry,
         PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime, PluginRuntimeHost,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
     };
@@ -6987,20 +6991,35 @@ mod tests {
         schema_key: &str,
         wasm: &[u8],
     ) -> PluginRegistryEntry {
-        let manifest_json = serde_json::json!({
+        test_plugin_registry_entry_with_content_type(key, path_glob, None, schema_key, wasm)
+    }
+
+    fn test_plugin_registry_entry_with_content_type(
+        key: &str,
+        path_glob: &str,
+        content_type: Option<PluginContentType>,
+        schema_key: &str,
+        wasm: &[u8],
+    ) -> PluginRegistryEntry {
+        let mut manifest = serde_json::json!({
             "api_version": "0.1.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
             "runtime": "wasm-component-v1",
             "schemas": ["schema/plugin.json"],
-        })
-        .to_string();
+        });
+        if let Some(content_type) = content_type {
+            manifest["match"]["content_type"] =
+                serde_json::to_value(content_type).expect("plugin content type should serialize");
+        }
+        let manifest_json = manifest.to_string();
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponentV1,
             api_version: "0.1.0".to_string(),
             path_glob: path_glob.to_string(),
+            content_type,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![schema_key.to_string()],
             manifest_json,
@@ -7167,6 +7186,10 @@ mod tests {
     }
 
     fn path_update_batch_with_path(path: &str) -> RecordBatch {
+        path_update_batch_with_path_and_data(path, b"hello")
+    }
+
+    fn path_update_batch_with_path_and_data(path: &str, data: &[u8]) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -7177,7 +7200,7 @@ mod tests {
             vec![
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some(path)]),
-                Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
+                Arc::new(BinaryArray::from_vec(vec![data])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
         )
@@ -7590,20 +7613,20 @@ mod tests {
         assert_eq!(
             context
                 .branch("branch-a")
-                .and_then(|branch| branch.catalog.select("/note.branch-a"))
+                .and_then(|branch| branch.catalog.select("/note.branch-a", None))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
         assert!(
             context
                 .branch("branch-a")
-                .and_then(|branch| branch.catalog.select("/note.branch-b"))
+                .and_then(|branch| branch.catalog.select("/note.branch-b", None))
                 .is_none()
         );
         assert_eq!(
             context
                 .branch("branch-b")
-                .and_then(|branch| branch.catalog.select("/note.branch-b"))
+                .and_then(|branch| branch.catalog.select("/note.branch-b", None))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
@@ -7901,10 +7924,75 @@ mod tests {
         assert_eq!(
             context
                 .branch("branch-b")
-                .and_then(|branch| branch.catalog.select("/note.active"))
+                .and_then(|branch| branch.catalog.select("/note.active", None))
                 .map(PluginRegistryEntry::key),
             Some("plugin_active")
         );
+    }
+
+    #[tokio::test]
+    async fn path_update_uses_materialized_data_for_content_type_matching() {
+        let wasm = b"test wasm";
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"note.raw"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("blobless file should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::new(RowsLiveStateReader {
+                rows: vec![live_plugin_registry_row(
+                    "branch-b",
+                    vec![test_plugin_registry_entry_with_content_type(
+                        "plugin_text",
+                        "*.active",
+                        Some(PluginContentType::Text),
+                        "plugin_text_state",
+                        wasm,
+                    )],
+                )],
+            }) as Arc<dyn LiveStateReader>,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            true,
+        )
+        .await
+        .expect("plugin registry should load")
+        .expect("the active registry should create a context");
+        let assignments = vec![literal_assignment(
+            "path",
+            ScalarValue::Utf8(Some("/note.active".to_string())),
+        )];
+
+        for (data, expected) in [
+            (
+                b"hello".as_slice(),
+                BTreeSet::from(["file-readme".to_string()]),
+            ),
+            ([0xff, 0xfe].as_slice(), BTreeSet::new()),
+        ] {
+            let batch = path_update_batch_with_path_and_data("/note.raw", data);
+            let assignment_values = super::UpdateAssignmentValues::evaluate(&batch, &assignments)
+                .expect("path assignment should evaluate");
+            let rewritten = super::path_update_plugin_rewrite_file_ids(
+                Some(&context),
+                &batch,
+                &assignment_values,
+                Some("branch-b"),
+            )
+            .expect("typed path ownership comparison should succeed");
+            assert_eq!(rewritten, expected);
+        }
     }
 
     #[test]
