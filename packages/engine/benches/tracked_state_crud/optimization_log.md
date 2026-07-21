@@ -1926,3 +1926,79 @@ scale, not an effect.
 Read-path cost added: diff/commit-root validation loads change records
 for a commit's ref list instead of reading identities from the chunk —
 batched point reads on a validation path, not on live reads.
+
+## 2026-07-21 — Derive commit rows outside tracked-state trees
+
+Hypothesis: the synthetic `lix_commit` row added to every tracked root turns a
+one-row user commit into two immutable-tree mutations. It therefore misses the
+existing singleton path-copy path, grows the tree once per commit, and rewrites
+chunks unrelated to user state. The row is redundant: `changelog.commit` is the
+canonical record and live-state already synthesizes `lix_commit` rows from the
+commit graph.
+
+An environment-gated counterfactual first omitted only that tree delta. After
+the hypothesis cleared the byte gate, the production layout removed physical
+commit rows from initialization, normal commits, and root rebuilds. Exact 1k
+transaction accounting was identical on SQLite and RocksDB because both consume
+the same engine write set:
+
+| Operation | Baseline value bytes | Canonical layout | Change | Baseline puts | Canonical layout |
+|---|---:|---:|---:|---:|---:|
+| update one | 11,506 | 4,831 | -58.0% | 11 | 9 |
+| delete one | 11,287 | 4,612 | -59.1% | 11 | 9 |
+| insert 1k | 424,263 | 424,045 | -0.05% | 1,075 | 1,075 |
+| update 1k | 527,076 | 526,780 | -0.06% | 1,410 | 1,410 |
+| delete 1k | 170,289 | 169,993 | -0.17% | 1,031 | 1,031 |
+
+The singleton reduction was entirely `tracked_state.tree_chunk`: five puts and
+10,834 value bytes became three puts and 4,179 bytes. `written_bytes` excludes
+keys, tombstone framing, and the storage adapter's constant mutation-revision
+put, so it is a logical layout metric rather than physical backend I/O.
+
+SlateDB is the primary physical-write target. Its probe measured the durable WAL
+SST at the object-store boundary. Each transaction remained one WAL PUT:
+
+| Operation | Baseline WAL bytes | Canonical layout | Change |
+|---|---:|---:|---:|
+| insert 1k | 161,559 | 161,423 | -0.08% |
+| update one, first 200 commits (average) | 7,215 | 4,546 | -37.0% |
+| update one, next 200 commits (average) | 7,915 | 4,546 | -42.6% |
+| delete one | 5,715 | 4,496 | -21.3% |
+
+The canonical update stayed at 4,546 bytes while the baseline grew as each
+synthetic commit row accumulated in the state tree. In the final 200-sample A/B,
+local p50/p95 moved from 2.882/4.577 ms to 2.517/2.704 ms; with 25 ms simulated
+object latency it moved from 30.650/31.031 ms to 30.238/30.753 ms. Earlier
+counterbalanced pairs moved in both directions. The layout therefore clears the
+30–40% singleton byte gate and improves the CPU-dominated local run, but does
+not claim a remote durable-latency win: one object-store flush/RTT still
+dominates p95.
+
+RocksDB's final WAL records independently confirm that this is not a SlateDB
+artifact:
+
+| Operation | Baseline WAL append | Canonical layout | Change |
+|---|---:|---:|---:|
+| update one | 11,948 | 5,193 | -56.5% |
+| delete one | 11,728 | 4,973 | -57.6% |
+| update 1k | 567,280 | 566,984 | -0.05% |
+
+Each singleton result was byte-identical across three repetitions. RocksDB's
+current adapter uses a single `WriteBatch` with `sync=false`, so these are
+physical WAL write-amplification results, not durable-latency results.
+
+The resulting format is canonical rather than SlateDB-specific. New tracked
+roots contain authored changes only; initialization, root rebuild, validation,
+diff, merge, and materialization no longer carry a physical-commit-row path.
+RocksDB receives the same smaller `WriteBatch`; its current `sync=false` bench
+remains a CPU/layout portability control rather than a durable-latency measure.
+
+The hard cut is explicit and backend-neutral: commit-root metadata now starts
+with the `LXTR2` format marker, and unversioned roots clearly require repository
+recreation. There is no legacy decoder. This prevents an old root's physical
+commit rows from being silently inherited on SQLite, RocksDB, or SlateDB.
+
+Removing the synthetic row exposed a zero-delta case for allowed empty merges.
+Without a fast path, the generic tree builder would scan and rewrite the entire
+parent tree. Empty child roots now reuse the parent's root id, row count, and
+height, stage no tree chunks, and write only their own commit-root metadata.

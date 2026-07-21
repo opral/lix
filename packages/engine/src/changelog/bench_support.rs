@@ -37,7 +37,6 @@ impl BenchAppend {
         self.append
             .changes
             .iter()
-            .filter(|change| change.schema_key != "lix_commit")
             .map(|change| change.change_id.to_string())
             .collect()
     }
@@ -47,7 +46,7 @@ impl BenchAppend {
     }
 
     pub fn change_count(&self) -> usize {
-        self.change_ids().len()
+        self.append.changes.len()
     }
 
     pub fn append_id(&self) -> String {
@@ -646,14 +645,7 @@ impl BenchCorpus {
             .collect::<Vec<_>>();
         let change_ids = append_batches
             .iter()
-            .flat_map(|append| {
-                append
-                    .append
-                    .changes
-                    .iter()
-                    .filter(|change| change.schema_key != "lix_commit")
-                    .map(|change| change.change_id)
-            })
+            .flat_map(|append| append.append.changes.iter().map(|change| change.change_id))
             .collect::<Vec<_>>();
         Self {
             append_batches,

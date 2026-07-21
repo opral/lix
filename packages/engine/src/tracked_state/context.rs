@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
     ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
-    CommitLoadRequest, CommitProjection, CommitRecord,
+    CommitLoadRequest, CommitProjection,
 };
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
@@ -252,7 +252,6 @@ where
 
         let mut change_ids = rows
             .iter()
-            .filter(|(row, _)| row.schema_key != "lix_commit")
             .map(|(row, _)| row.change_id)
             .collect::<Vec<_>>();
         change_ids.sort();
@@ -273,28 +272,6 @@ where
             };
             changes.insert(change_id, change);
         }
-        let commit_ids = rows
-            .iter()
-            .filter(|(row, _)| row.schema_key == "lix_commit")
-            .map(|(row, _)| row.commit_id)
-            .collect::<Vec<_>>();
-        if !commit_ids.is_empty() {
-            let batch = changelog_reader
-                .load_commits(CommitLoadRequest {
-                    commit_ids: &commit_ids,
-                    projection: CommitProjection::Record,
-                })
-                .await?;
-            for (commit_id, entry) in commit_ids.into_iter().zip(batch.entries) {
-                let Some(CommitLoadEntry::Record(commit)) = entry else {
-                    return Err(LixError::unknown(format!(
-                        "tracked-state diff row references missing changelog commit '{commit_id}'"
-                    )));
-                };
-                changes.insert(commit.change_id, change_record_from_commit_record(&commit)?);
-            }
-        }
-
         let mut validation_cache = DiffCommitRootValidationCache::new();
         for (row, expected_commit_id) in rows {
             validate_diff_row_against_changelog(row, &changes)?;
@@ -486,8 +463,8 @@ where
             )));
         };
         let CommitLoadEntry::Full {
-            record,
             change_ref_chunks: chunks,
+            ..
         } = entry
         else {
             return Err(LixError::unknown(format!(
@@ -495,14 +472,6 @@ where
             )));
         };
         let mut winners = HashMap::new();
-        winners.insert(
-            TrackedStateIdentity {
-                schema_key: "lix_commit".to_string(),
-                file_id: None,
-                entity_pk: EntityPk::single(record.commit_id),
-            },
-            record.change_id,
-        );
         // Ref chunks carry change ids only; row identities live in the
         // change records, batch point-read here.
         let change_ids = chunks
@@ -887,7 +856,7 @@ where
 /// Writer for changelog-backed tracked-state commit roots.
 pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     chunk_overlay: storage::TrackedStateChunkOverlay,
-    staged_roots: BTreeMap<String, TrackedStateRootId>,
+    staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
     tree: TrackedStateTree,
     store: &'a S,
     writes: &'a mut StorageWriteSet,
@@ -930,13 +899,13 @@ where
         let typed_parent_commit_id = parent_commit_id
             .map(|id| CommitId::parse_lix(id, "tracked-state parent commit_id"))
             .transpose()?;
-        let base_root = match parent_commit_id {
+        let parent_metadata = match parent_commit_id {
             Some(parent_commit_id) => {
-                let root = match self.staged_roots.get(parent_commit_id) {
-                    Some(root) => Some(root.clone()),
-                    None => self.tree.load_root(self.store, parent_commit_id).await?,
+                let metadata = match self.staged_roots.get(parent_commit_id) {
+                    Some(metadata) => Some(metadata.clone()),
+                    None => storage::load_commit_root(self.store, parent_commit_id).await?,
                 };
-                let Some(root) = root else {
+                let Some(metadata) = metadata else {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
@@ -944,10 +913,39 @@ where
                         ),
                     ));
                 };
-                Some(root)
+                Some(metadata)
             }
             None => None,
         };
+        let base_root = parent_metadata
+            .as_ref()
+            .map(|metadata| metadata.root_id.clone());
+        if deltas.is_empty()
+            && let Some(parent_metadata) = parent_metadata.as_ref()
+        {
+            let root_id = parent_metadata.root_id.clone();
+            let metadata = TrackedStateCommitRoot {
+                commit_id: typed_commit_id,
+                root_id: root_id.clone(),
+                parent_roots: vec![TrackedStateCommitRootParent {
+                    commit_id: typed_parent_commit_id.expect("parent metadata requires parent id"),
+                    root_id: root_id.clone(),
+                }],
+                changed_key_count: 0,
+                row_count_estimate: parent_metadata.row_count_estimate,
+                tree_height: parent_metadata.tree_height,
+                primary_chunk_count: 0,
+                primary_chunk_bytes: 0,
+            };
+            storage::stage_commit_root(self.writes, &metadata)?;
+            self.staged_roots.insert(commit_id.to_string(), metadata);
+            return Ok(TrackedStateWriteReport {
+                commit_id: typed_commit_id,
+                root_id,
+                changed_rows: 0,
+                primary_chunk_puts: 0,
+            });
+        }
         let parent_values = if let Some(base_root) = base_root.as_ref() {
             let keys = deltas
                 .iter()
@@ -994,54 +992,51 @@ where
                 Some(commit_id),
             )
             .await?;
-        self.staged_roots
-            .insert(commit_id.to_string(), result.root_id.clone());
-        storage::stage_commit_root(
-            self.writes,
-            &TrackedStateCommitRoot {
-                commit_id: typed_commit_id,
-                root_id: result.root_id.clone(),
-                parent_roots: typed_parent_commit_id
-                    .zip(base_root.as_ref())
-                    .map(|(parent_commit_id, root_id)| {
-                        vec![TrackedStateCommitRootParent {
-                            commit_id: parent_commit_id,
-                            root_id: root_id.clone(),
-                        }]
-                    })
-                    .unwrap_or_default(),
-                changed_key_count: u64::try_from(deltas.len()).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit_root changed key count exceeds u64",
-                    )
-                })?,
-                row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit_root row count exceeds u64",
-                    )
-                })?,
-                tree_height: u32::try_from(result.tree_height).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit_root tree height exceeds u32",
-                    )
-                })?,
-                primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit_root chunk count exceeds u64",
-                    )
-                })?,
-                primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit_root chunk bytes exceeds u64",
-                    )
-                })?,
-            },
-        )?;
+        let metadata = TrackedStateCommitRoot {
+            commit_id: typed_commit_id,
+            root_id: result.root_id.clone(),
+            parent_roots: typed_parent_commit_id
+                .zip(base_root.as_ref())
+                .map(|(parent_commit_id, root_id)| {
+                    vec![TrackedStateCommitRootParent {
+                        commit_id: parent_commit_id,
+                        root_id: root_id.clone(),
+                    }]
+                })
+                .unwrap_or_default(),
+            changed_key_count: u64::try_from(deltas.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root changed key count exceeds u64",
+                )
+            })?,
+            row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root row count exceeds u64",
+                )
+            })?,
+            tree_height: u32::try_from(result.tree_height).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root tree height exceeds u32",
+                )
+            })?,
+            primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root chunk count exceeds u64",
+                )
+            })?,
+            primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root chunk bytes exceeds u64",
+                )
+            })?,
+        };
+        storage::stage_commit_root(self.writes, &metadata)?;
+        self.staged_roots.insert(commit_id.to_string(), metadata);
 
         Ok(TrackedStateWriteReport {
             commit_id: typed_commit_id,
@@ -1118,25 +1113,6 @@ fn validate_diff_row_against_changelog(
     Ok(())
 }
 
-fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecord, LixError> {
-    let snapshot_content = commit_row_snapshot_content(&commit.commit_id.to_string())?;
-    Ok(ChangeRecord {
-        format_version: 1,
-        change_id: commit.change_id,
-        schema_key: "lix_commit".to_string(),
-        entity_pk: EntityPk::single(commit.commit_id),
-        file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
-        metadata: crate::json_store::JsonSlot::None,
-        created_at: commit.created_at,
-        origin_key: None,
-    })
-}
-
-fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-    crate::changelog::commit_row_snapshot_json(commit_id)
-}
-
 fn tracked_state_identity_from_diff_row(
     row: &TrackedStateDiffRow,
 ) -> Result<TrackedStateIdentity, LixError> {
@@ -1182,6 +1158,7 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
+    use crate::changelog::CommitRecord;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -1278,11 +1255,74 @@ mod tests {
         assert_eq!(metadata.parent_roots.len(), 1);
         assert_eq!(metadata.parent_roots[0].commit_id, "parent");
         assert_eq!(metadata.parent_roots[0].root_id, parent_root);
-        assert_eq!(metadata.changed_key_count, 3);
-        assert_eq!(metadata.row_count_estimate, 4);
+        assert_eq!(metadata.changed_key_count, 2);
+        assert_eq!(metadata.row_count_estimate, 2);
         assert!(metadata.tree_height >= 1);
         assert!(metadata.primary_chunk_count >= 1);
         assert!(metadata.primary_chunk_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn stage_empty_commit_root_reuses_parent_without_tree_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "parent",
+            None,
+            &[row("entity-a", "change-parent", "parent")],
+        )
+        .await
+        .expect("parent root should write");
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let parent_metadata = storage::load_commit_root(&read, "parent")
+            .await
+            .expect("parent metadata should load")
+            .expect("parent metadata should exist");
+        let mut writes = storage.new_write_set();
+        let report = tracked_state
+            .writer(&mut read, &mut writes)
+            .stage_commit_root("empty-child", Some("parent"), [])
+            .await
+            .expect("empty child root should stage");
+
+        assert_eq!(report.changed_rows, 0);
+        assert_eq!(report.primary_chunk_puts, 0);
+        assert_eq!(report.root_id, parent_metadata.root_id);
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("empty child root should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should reopen");
+        let child_metadata = storage::load_commit_root(&read, "empty-child")
+            .await
+            .expect("child metadata should load")
+            .expect("child metadata should exist");
+
+        assert_eq!(child_metadata.root_id, parent_metadata.root_id);
+        assert_eq!(child_metadata.changed_key_count, 0);
+        assert_eq!(
+            child_metadata.row_count_estimate,
+            parent_metadata.row_count_estimate
+        );
+        assert_eq!(child_metadata.tree_height, parent_metadata.tree_height);
+        assert_eq!(child_metadata.primary_chunk_count, 0);
+        assert_eq!(child_metadata.primary_chunk_bytes, 0);
+        assert_eq!(child_metadata.parent_roots.len(), 1);
+        assert_eq!(child_metadata.parent_roots[0].commit_id, "parent");
+        assert_eq!(
+            child_metadata.parent_roots[0].root_id,
+            parent_metadata.root_id
+        );
     }
 
     #[tokio::test]
@@ -1898,65 +1938,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_rebuild_repairs_stale_root_missing_commit_row() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        let row = row_with_value("entity-a", "change-a", "commit-1", "value");
-        write_root_for_test(
-            &storage,
-            &tracked_state,
-            "commit-1",
-            None,
-            std::slice::from_ref(&row),
-        )
-        .await
-        .expect("root should write");
-        overwrite_root_without_commit_row_for_test(
-            &storage,
-            "commit-1",
-            std::slice::from_ref(&row),
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        tracked_state
-            .root_rebuilder(&read, &mut writes)
-            .rebuild_commit_root_at("commit-1")
-            .await
-            .expect("stale root should repair");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repaired root should commit");
-
-        let rows = tracked_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .scan_rows_at_commit(
-                "commit-1",
-                &TrackedStateScanRequest {
-                    filter: crate::tracked_state::TrackedStateFilter {
-                        schema_keys: vec!["lix_commit".to_string()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("repaired root should scan");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].schema_key, "lix_commit");
-    }
-
-    #[tokio::test]
     async fn explicit_rebuild_repairs_stale_root_missing_inherited_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
@@ -1980,8 +1961,7 @@ mod tests {
         )
         .await
         .expect("child root should write");
-        overwrite_root_without_commit_row_for_test(&storage, "child", std::slice::from_ref(&child))
-            .await;
+        overwrite_root_with_rows_for_test(&storage, "child", std::slice::from_ref(&child)).await;
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -2559,59 +2539,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rows_materialize_key_derived_snapshots() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        let row = row("entity-a", "change-a", "commit-1");
-        write_root_for_test(
-            &storage,
-            &tracked_state,
-            "commit-1",
-            None,
-            std::slice::from_ref(&row),
-        )
-        .await
-        .expect("root should write");
-
-        let mut reader = tracked_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let request = TrackedStateScanRequest {
-            filter: crate::tracked_state::TrackedStateFilter {
-                schema_keys: vec!["lix_commit".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let rows = reader
-            .scan_rows_at_commit("commit-1", &request)
-            .await
-            .expect("commit rows should scan");
-        let commit_row = rows
-            .iter()
-            .find(|row| row.schema_key == "lix_commit")
-            .expect("commit row should exist");
-        // The snapshot is synthesized from the key and must be byte-equal
-        // to the canonical producer.
-        let expected = crate::changelog::commit_row_snapshot_json(
-            &commit_row
-                .entity_pk
-                .parts
-                .first()
-                .cloned()
-                .unwrap_or_default(),
-        )
-        .expect("snapshot should encode");
-        assert_eq!(
-            commit_row.snapshot_content.as_deref(),
-            Some(expected.as_str())
-        );
-    }
-
-    #[tokio::test]
     async fn inline_threshold_boundary_routes_payloads_deterministically() {
         // 256 bytes inlines into the change record; 257 takes the
         // json_store ref path. Both must read back identically.
@@ -2968,7 +2895,7 @@ mod tests {
             .expect("root chunk corruption should commit");
     }
 
-    async fn overwrite_root_without_commit_row_for_test(
+    async fn overwrite_root_with_rows_for_test(
         storage: &StorageAdapter,
         commit_id: &str,
         rows: &[MaterializedTrackedStateRow],

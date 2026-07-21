@@ -1005,22 +1005,9 @@ mod tests {
         drop(writer);
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-
-            let change_id = format!("{commit_id_text}:commit");
-            let entity_pk = EntityPk::single(&commit_id_text);
-            let deltas = [TrackedStateDeltaRef {
-                schema_key: COMMIT_SCHEMA_KEY,
-                file_id: None,
-                entity_pk: &entity_pk,
-                change_id: ChangeId::for_test_label(&change_id),
-                commit_id: CommitId::for_test_label(&commit_id_text),
-                deleted: false,
-                created_at: ts("1970-01-01T00:00:00.000Z"),
-                updated_at: ts("1970-01-01T00:00:00.000Z"),
-            }];
             TrackedStateContext::new()
                 .writer(read, &mut writes)
-                .stage_commit_root(&commit_id_text, None, deltas)
+                .stage_commit_root(&commit_id_text, None, [])
                 .await
                 .expect("empty tracked roots should stage");
         }
@@ -1121,9 +1108,8 @@ mod tests {
                 crate::changelog::ChangelogContext::new().writer(&mut changelog_read, writes);
             crate::changelog::ChangelogWriter::stage_append(&mut writer, append).await?;
             drop(writer);
-            let commit_entity_pk = EntityPk::single(&commit_id);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
-            let mut deltas = rows
+            let deltas = rows
                 .iter()
                 .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
@@ -1136,16 +1122,6 @@ mod tests {
                     updated_at: *updated_at,
                 })
                 .collect::<Vec<_>>();
-            deltas.push(TrackedStateDeltaRef {
-                schema_key: COMMIT_SCHEMA_KEY,
-                file_id: None,
-                entity_pk: &commit_entity_pk,
-                change_id: ChangeId::for_test_label(&commit_change_id),
-                commit_id: typed_commit_id,
-                deleted: false,
-                created_at: commit_created_at,
-                updated_at: commit_created_at,
-            });
             TrackedStateContext::new()
                 .writer(&*store, writes)
                 .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
@@ -1535,12 +1511,10 @@ mod tests {
         );
 
         let main_root_rows = scan_tracked_root(&tracked_state, &storage, "commit-main").await;
-        assert_eq!(
-            main_root_rows.len(),
-            1,
-            "empty commit root should contain only its derived lix_commit row"
+        assert!(
+            main_root_rows.is_empty(),
+            "derived commit rows must not be stored in tracked roots"
         );
-        assert_eq!(main_root_rows[0].schema_key, "lix_commit");
     }
 
     #[tokio::test]
@@ -2179,7 +2153,7 @@ mod tests {
         }
 
         let global_root_rows = scan_tracked_root(&tracked_state, &storage, "commit-global").await;
-        assert_eq!(global_root_rows.len(), 2);
+        assert_eq!(global_root_rows.len(), 1);
         let Some(global_row) = global_root_rows
             .iter()
             .find(|row| row.schema_key == "lix_key_value")
@@ -2192,7 +2166,7 @@ mod tests {
         );
 
         let main_root_rows = scan_tracked_root(&tracked_state, &storage, "commit-main").await;
-        assert_eq!(main_root_rows.len(), 2);
+        assert_eq!(main_root_rows.len(), 1);
         let Some(main_row) = main_root_rows
             .iter()
             .find(|row| row.schema_key == "lix_key_value")

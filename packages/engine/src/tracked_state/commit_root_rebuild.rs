@@ -233,7 +233,9 @@ where
             change_ids: &change_refs,
         })
         .await?;
-    let mut deltas = change_refs
+    // Rebuild authored state only. Commit rows are a changelog.commit
+    // projection and are deliberately not part of the tracked tree.
+    let deltas = change_refs
         .iter()
         .zip(changes.entries)
         .map(|(change_id, change)| {
@@ -248,7 +250,6 @@ where
             rebuild_delta_from_change_ref(commit_id, *change_id, change)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    deltas.push(rebuild_delta_from_commit_record(&commit)?);
 
     Ok(CommitRootRebuildPlan {
         commit_id: commit.commit_id,
@@ -287,27 +288,6 @@ where
 
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
     commit.parent_commit_ids.first().copied()
-}
-
-fn rebuild_delta_from_commit_record(
-    commit: &CommitRecord,
-) -> Result<CommitRootRebuildDelta, LixError> {
-    let snapshot_content = commit_row_snapshot_content(&commit.commit_id.to_string())?;
-    Ok(CommitRootRebuildDelta {
-        schema_key: "lix_commit".to_string(),
-        file_id: None,
-        entity_pk: EntityPk::single(commit.commit_id),
-        change_id: commit.change_id,
-        commit_id: commit.commit_id,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
-        metadata: crate::json_store::JsonSlot::None,
-        created_at: commit.created_at,
-        updated_at: commit.created_at,
-    })
-}
-
-fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-    crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
 fn rebuild_delta_from_change_ref(

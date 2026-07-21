@@ -207,9 +207,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         &changes,
     )
     .await?;
-    let typed_commit_id = test_commit_id(&commit_id_text);
-    let commit_entity_pk = crate::entity_pk::EntityPk::single(&commit_id_text);
-    let mut deltas = staged
+    let deltas = staged
         .change_commit_ids
         .iter()
         .map(|(row_index, change_commit_id)| {
@@ -233,16 +231,6 @@ pub(crate) async fn stage_tracked_root_from_materialized(
             }
         })
         .collect::<Vec<_>>();
-    deltas.push(TrackedStateDeltaRef {
-        schema_key: "lix_commit",
-        file_id: None,
-        entity_pk: &commit_entity_pk,
-        change_id: staged.commit_change_id,
-        commit_id: typed_commit_id,
-        deleted: false,
-        created_at: staged.commit_created_at,
-        updated_at: staged.commit_created_at,
-    });
     tracked_state
         .writer(read, writes)
         .stage_commit_root(&commit_id_text, parent_commit_id_text.as_deref(), deltas)
@@ -282,9 +270,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         &changes,
     )
     .await?;
-    let typed_commit_id = test_commit_id(&commit_id_text);
-    let commit_entity_pk = crate::entity_pk::EntityPk::single(&commit_id_text);
-    let mut deltas = staged
+    let deltas = staged
         .change_commit_ids
         .iter()
         .map(|(row_index, change_commit_id)| {
@@ -308,16 +294,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             }
         })
         .collect::<Vec<_>>();
-    deltas.push(TrackedStateDeltaRef {
-        schema_key: "lix_commit",
-        file_id: None,
-        entity_pk: &commit_entity_pk,
-        change_id: staged.commit_change_id,
-        commit_id: typed_commit_id,
-        deleted: false,
-        created_at: staged.commit_created_at,
-        updated_at: staged.commit_created_at,
-    });
     tracked_state
         .writer(read, writes)
         .stage_commit_root(
@@ -442,17 +418,11 @@ async fn stage_test_changelog_commit(
     let mut writer = ChangelogContext::new().writer(&mut read, writes);
     writer.stage_append(append).await?;
     change_commit_ids.sort_by_key(|(row_index, _)| *row_index);
-    Ok(TestStagedChangelogCommit {
-        change_commit_ids,
-        commit_change_id: typed_commit_change_id,
-        commit_created_at: created_at,
-    })
+    Ok(TestStagedChangelogCommit { change_commit_ids })
 }
 
 struct TestStagedChangelogCommit {
     change_commit_ids: Vec<(usize, CommitId)>,
-    commit_change_id: ChangeId,
-    commit_created_at: crate::common::LixTimestamp,
 }
 
 async fn load_existing_changelog_change_ids(

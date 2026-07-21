@@ -513,10 +513,10 @@ pub(crate) struct GcPlan {
     pub(crate) repair: GcRepairSet,
 }
 
-/// Canonical `lix_commit` row snapshot. Byte-identity across every producer
-/// (staging, rebuild, graph materialization, row materialization) is
-/// load-bearing: content-addressed roots and deterministic inline slots
-/// both depend on it, so all paths must call this one function.
+/// Canonical derived `lix_commit` row snapshot.
+///
+/// Commit graph, live-state, and SQL change surfaces must produce the same
+/// representation from the canonical `changelog.commit` record.
 pub(crate) fn commit_row_snapshot_json(commit_id: &str) -> Result<String, LixError> {
     serde_json::to_string(&serde_json::json!({ "id": commit_id })).map_err(|error| {
         LixError::new(

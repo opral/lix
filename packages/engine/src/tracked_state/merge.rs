@@ -133,9 +133,6 @@ fn diff_by_identity(
 ) -> Result<BTreeMap<TrackedStateDiffIdentity, &TrackedStateDiffEntry>, LixError> {
     let mut entries = BTreeMap::new();
     for entry in &diff.entries {
-        if entry.identity.schema_key == "lix_commit" {
-            continue;
-        }
         if entries.insert(entry.identity.clone(), entry).is_some() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
