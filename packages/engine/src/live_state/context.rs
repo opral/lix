@@ -14,8 +14,9 @@ use crate::live_state::index::{
     LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexScanRequest,
 };
 use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope, VisibilityRequest,
+    expanded_branch_ids, resolve_visible_rows,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -159,6 +160,190 @@ where
         Ok(rows.into_iter().next())
     }
 
+    /// Loads exact visible identities without lowering correlated row keys to
+    /// independent scan dimensions.
+    pub(crate) async fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        if request.rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Commit-derived rows are synthesized rather than stored under the
+        // requested identity. Preserve their exact scan semantics without
+        // widening the optimized durable-state batch.
+        if request.rows.iter().any(|row| {
+            matches!(
+                row.schema_key.as_str(),
+                COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY
+            )
+        }) {
+            let mut rows = Vec::with_capacity(request.rows.len());
+            for row in &request.rows {
+                rows.push(
+                    self.scan_rows(&request.row_scan_request(row))
+                        .await?
+                        .into_iter()
+                        .next(),
+                );
+            }
+            return Ok(rows);
+        }
+
+        let branch_ids = request
+            .rows
+            .iter()
+            .map(|row| row.branch_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let scope_request = LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                branch_ids,
+                untracked: request.untracked,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let reads_tracked = request.untracked != Some(true);
+        let scope =
+            scan_scope(&self.store, &self.live_index, &scope_request, reads_tracked).await?;
+        let visible_branch_ids = scope
+            .projection_branch_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut storage_identities = std::collections::BTreeSet::new();
+        for row in &request.rows {
+            if !visible_branch_ids.contains(&row.branch_id) {
+                continue;
+            }
+            storage_identities.insert(LiveStateRowIdentity {
+                branch_id: row.branch_id.clone(),
+                schema_key: row.schema_key.clone(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.clone(),
+            });
+            if row.branch_id != GLOBAL_BRANCH_ID {
+                storage_identities.insert(LiveStateRowIdentity {
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    schema_key: row.schema_key.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                    file_id: row.file_id.clone(),
+                });
+            }
+        }
+        let storage_identities = storage_identities.into_iter().collect::<Vec<_>>();
+        let mut candidates =
+            std::collections::BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
+
+        if request.untracked != Some(true) {
+            let mut identities_by_branch = std::collections::BTreeMap::<String, Vec<_>>::new();
+            for identity in &storage_identities {
+                if scope.branch_commit_ids.contains_key(&identity.branch_id) {
+                    identities_by_branch
+                        .entry(identity.branch_id.clone())
+                        .or_default()
+                        .push(identity.clone());
+                }
+            }
+            let projection =
+                crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
+            let tracked_batches = stream::iter(identities_by_branch)
+                .map(|(branch_id, identities)| {
+                    let commit_id = scope.branch_commit_ids[&branch_id].clone();
+                    let projection = projection.clone();
+                    async move {
+                        let keys = identities
+                            .iter()
+                            .map(|identity| crate::tracked_state::TrackedStateKey {
+                                schema_key: identity.schema_key.clone(),
+                                entity_pk: identity.entity_pk.clone(),
+                                file_id: identity.file_id.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        let rows = self
+                            .tracked_state
+                            .reader(&self.store)
+                            .load_projected_rows_at_commit(&commit_id, &keys, &projection)
+                            .await?;
+                        Ok::<_, LixError>((branch_id, identities, rows))
+                    }
+                })
+                .buffered(BRANCH_READ_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+            for (branch_id, identities, rows) in tracked_batches {
+                let source = tracked_source_from_branch_id(&branch_id);
+                for (identity, row) in identities.into_iter().zip(rows) {
+                    if let Some(row) = row {
+                        candidates.insert(identity, project_tracked_row(row, &branch_id, source));
+                    }
+                }
+            }
+        }
+
+        if request.untracked != Some(false) {
+            let index_requests = storage_identities
+                .iter()
+                .map(|identity| crate::live_state::LiveStateIndexRowRequest {
+                    branch_id: identity.branch_id.clone(),
+                    schema_key: identity.schema_key.clone(),
+                    entity_pk: identity.entity_pk.clone(),
+                    file_id: identity.file_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            let rows = self
+                .live_index
+                .reader(&self.store)
+                .load_rows(&index_requests, &request.projection.columns)
+                .await?;
+            for (identity, row) in storage_identities.iter().cloned().zip(rows) {
+                if let Some(row) = row {
+                    // Mutable flat state is canonical over the tracked head for
+                    // the same storage identity.
+                    candidates.insert(identity, MaterializedLiveStateRow::from(row));
+                }
+            }
+        }
+
+        Ok(request
+            .rows
+            .iter()
+            .map(|requested| {
+                if !visible_branch_ids.contains(&requested.branch_id) {
+                    return None;
+                }
+                let branch_identity = LiveStateRowIdentity {
+                    branch_id: requested.branch_id.clone(),
+                    schema_key: requested.schema_key.clone(),
+                    entity_pk: requested.entity_pk.clone(),
+                    file_id: requested.file_id.clone(),
+                };
+                let global_identity = LiveStateRowIdentity {
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    schema_key: requested.schema_key.clone(),
+                    entity_pk: requested.entity_pk.clone(),
+                    file_id: requested.file_id.clone(),
+                };
+                let mut row = candidates
+                    .get(&branch_identity)
+                    .or_else(|| candidates.get(&global_identity))?
+                    .clone();
+                if row.branch_id == GLOBAL_BRANCH_ID && requested.branch_id != GLOBAL_BRANCH_ID {
+                    row.branch_id.clone_from(&requested.branch_id);
+                    row.global = true;
+                }
+                if row.deleted && !request.include_tombstones {
+                    None
+                } else {
+                    Some(row)
+                }
+            })
+            .collect())
+    }
+
     pub(crate) async fn scan_tracked_rows(
         &self,
         request: &LiveStateScanRequest,
@@ -240,6 +425,13 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         Self::load_row(self, request).await
+    }
+
+    async fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        Self::load_exact_rows(self, request).await
     }
 
     async fn scan_tracked_rows(
@@ -638,8 +830,10 @@ mod tests {
     use crate::changelog::{ChangeId, ChangeRecord, ChangelogAppend, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-    use crate::live_state::LiveStateFilter;
     use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
+    use crate::live_state::{
+        LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+    };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
@@ -1041,7 +1235,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        write_empty_commits_to_store(&storage, &read, &["commit-tracked"]).await;
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        stage_materialized_live_rows(
+            &read,
+            &mut writes,
+            &mut json_writer,
+            &[tracked_row_with_commit(
+                "tracked-value",
+                Some("change-tracked"),
+                "commit-tracked",
+            )],
+        )
+        .await
+        .expect("tracked row should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tracked row should commit");
         write_untracked_rows_to_store(
             &storage,
             &read,
@@ -1085,6 +1296,86 @@ mod tests {
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked-value\"}")
         );
+    }
+
+    #[tokio::test]
+    async fn exact_batch_preserves_duplicate_and_missing_slots_for_flat_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        stage_materialized_live_rows(
+            &read,
+            &mut writes,
+            &mut json_writer,
+            &[tracked_row_with_commit(
+                "tracked-value",
+                Some("change-tracked"),
+                "commit-tracked",
+            )],
+        )
+        .await
+        .expect("tracked row should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tracked row should commit");
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[
+                branch_ref_row("global", "commit-tracked"),
+                untracked_row("untracked-value"),
+            ],
+        )
+        .await;
+
+        let selected = LiveStateExactRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            branch_id: "global".to_string(),
+            entity_pk: identity("selected-tab"),
+            file_id: None,
+        };
+        let rows = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("read should reopen"),
+            )
+            .load_exact_rows(&LiveStateExactBatchRequest {
+                rows: vec![
+                    selected.clone(),
+                    selected,
+                    LiveStateExactRowRequest {
+                        schema_key: "lix_key_value".to_string(),
+                        branch_id: "global".to_string(),
+                        entity_pk: identity("missing"),
+                        file_id: None,
+                    },
+                ],
+                projection: LiveStateProjection {
+                    columns: vec!["snapshot_content".to_string()],
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("exact batch should load");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], rows[1]);
+        assert_eq!(
+            rows[0]
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref()),
+            Some("{\"value\":\"untracked-value\"}")
+        );
+        assert!(rows[0].as_ref().is_some_and(|row| row.untracked));
+        assert_eq!(rows[2], None);
     }
 
     #[tokio::test]
@@ -1614,6 +1905,146 @@ mod tests {
         assert_eq!(tombstones[0].branch_id, "main");
         assert!(!tombstones[0].global);
         assert_eq!(tombstones[0].snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn exact_batch_resolves_branch_global_tombstone_projection_and_correlated_keys() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+
+        let mut global_fallback =
+            tracked_row_with_commit("global-fallback", Some("change-fallback"), "commit-global");
+        global_fallback.entity_pk = identity("fallback");
+        global_fallback.file_id = Some("fallback".to_string());
+        global_fallback.metadata = Some("{\"source\":\"global\"}".to_string());
+        let mut global_overridden =
+            tracked_row_with_commit("global-old", Some("change-global-old"), "commit-global");
+        global_overridden.entity_pk = identity("overridden");
+        global_overridden.file_id = Some("overridden".to_string());
+        let mut branch_override = tracked_row_at_with_commit(
+            "branch-a",
+            "branch-new",
+            Some("change-branch-new"),
+            "commit-branch",
+        );
+        branch_override.entity_pk = identity("overridden");
+        branch_override.file_id = Some("overridden".to_string());
+        let mut global_hidden =
+            tracked_row_with_commit("global-hidden", Some("change-hidden"), "commit-global");
+        global_hidden.entity_pk = identity("hidden");
+        global_hidden.file_id = Some("hidden".to_string());
+        let mut branch_tombstone = tombstone_tracked_row_at_with_commit(
+            "branch-a",
+            Some("change-tombstone"),
+            "commit-branch",
+        );
+        branch_tombstone.entity_pk = identity("hidden");
+        branch_tombstone.file_id = Some("hidden".to_string());
+        let mut malformed_cross_pair =
+            tracked_row_with_commit("cross-pair", Some("change-cross"), "commit-global");
+        malformed_cross_pair.entity_pk = identity("entity-a");
+        malformed_cross_pair.file_id = Some("file-b".to_string());
+
+        let rows = [
+            global_fallback,
+            global_overridden,
+            global_hidden,
+            malformed_cross_pair,
+            branch_override,
+            branch_tombstone,
+        ];
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+            .await
+            .expect("tracked rows should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tracked rows should commit");
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch"),
+            ],
+        )
+        .await;
+
+        let exact = |entity: &str, file_id: &str| LiveStateExactRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            branch_id: "branch-a".to_string(),
+            entity_pk: identity(entity),
+            file_id: Some(file_id.to_string()),
+        };
+        let reader = live_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should reopen"),
+        );
+        let loaded = reader
+            .load_exact_rows(&LiveStateExactBatchRequest {
+                rows: vec![
+                    exact("fallback", "fallback"),
+                    exact("overridden", "overridden"),
+                    exact("hidden", "hidden"),
+                    exact("entity-a", "file-a"),
+                    exact("entity-b", "file-b"),
+                    exact("entity-a", "file-b"),
+                    exact("missing", "missing"),
+                ],
+                projection: LiveStateProjection {
+                    columns: vec!["snapshot_content".to_string()],
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("exact tracked batch should load");
+
+        let fallback = loaded[0].as_ref().expect("global fallback should load");
+        assert!(fallback.global);
+        assert_eq!(fallback.branch_id, "branch-a");
+        assert_eq!(
+            fallback.snapshot_content.as_deref(),
+            Some("{\"value\":\"global-fallback\"}")
+        );
+        assert_eq!(fallback.metadata, None, "projection should omit metadata");
+        let overridden = loaded[1].as_ref().expect("branch override should load");
+        assert!(!overridden.global);
+        assert_eq!(
+            overridden.snapshot_content.as_deref(),
+            Some("{\"value\":\"branch-new\"}")
+        );
+        assert_eq!(loaded[2], None, "branch tombstone must hide global row");
+        assert_eq!(loaded[3], None, "entity A/file A must not cross-match");
+        assert_eq!(loaded[4], None, "entity B/file B must not cross-match");
+        assert_eq!(
+            loaded[5]
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref()),
+            Some("{\"value\":\"cross-pair\"}")
+        );
+        assert_eq!(loaded[6], None);
+
+        let tombstone = reader
+            .load_exact_rows(&LiveStateExactBatchRequest {
+                rows: vec![exact("hidden", "hidden")],
+                include_tombstones: true,
+                ..Default::default()
+            })
+            .await
+            .expect("exact tombstone read should load")
+            .pop()
+            .flatten()
+            .expect("tombstone should be returned when requested");
+        assert!(tombstone.deleted);
+        assert!(!tombstone.global);
     }
 
     #[tokio::test]

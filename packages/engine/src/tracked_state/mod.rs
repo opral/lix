@@ -23,7 +23,6 @@ pub(crate) use row_materialization::materialize_rows_from_index_entries;
 pub(crate) use storage::load_root;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE};
-#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use types::TrackedStateKey;
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateReadColumns,

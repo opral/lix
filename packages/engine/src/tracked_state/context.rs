@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::changelog::ChangeId;
+use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
     ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
     CommitLoadRequest, CommitProjection, CommitRecord,
@@ -151,8 +151,7 @@ where
                 &tree_scan_request_from_tracked(request),
             )
             .await?;
-        let materialization =
-            crate::changelog::ChangeRecordProjection::from_columns(&request.read_columns.columns);
+        let materialization = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let mut rows =
             materialize_rows_from_index_entries(&self.store, rows, &materialization).await?;
         if !request.filter.include_tombstones {
@@ -164,35 +163,55 @@ where
         Ok(rows)
     }
 
+    pub(crate) async fn load_projected_rows_at_commit(
+        &mut self,
+        commit_id: &str,
+        keys: &[TrackedStateKey],
+        projection: &ChangeRecordProjection,
+    ) -> Result<Vec<Option<MaterializedTrackedStateRow>>, LixError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut output_indices = BTreeMap::<TrackedStateKey, Vec<usize>>::new();
+        for (index, key) in keys.iter().cloned().enumerate() {
+            output_indices.entry(key).or_default().push(index);
+        }
+        let unique_keys = output_indices.keys().cloned().collect::<Vec<_>>();
+        let values = self
+            .commit_root_values_for_keys(commit_id, &unique_keys)
+            .await?;
+        let mut entries = Vec::new();
+        for (key, value) in unique_keys.into_iter().zip(values) {
+            if let Some(value) = value {
+                entries.push((key, value));
+            }
+        }
+        let materialized =
+            materialize_rows_from_index_entries(&self.store, entries, projection).await?;
+        let mut rows = vec![None; keys.len()];
+        for row in materialized {
+            let key = TrackedStateKey {
+                schema_key: row.schema_key.clone(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.clone(),
+            };
+            if let Some(indices) = output_indices.get(&key) {
+                for &index in indices {
+                    rows[index] = Some(row.clone());
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn load_rows_at_commit(
         &mut self,
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<MaterializedTrackedStateRow>>, LixError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let values = self.commit_root_values_for_keys(commit_id, keys).await?;
-        let mut entry_indices = Vec::new();
-        let mut entries = Vec::new();
-        for (index, (key, value)) in keys.iter().cloned().zip(values).enumerate() {
-            if let Some(value) = value {
-                entry_indices.push(index);
-                entries.push((key, value));
-            }
-        }
-        let materialized = materialize_rows_from_index_entries(
-            &self.store,
-            entries,
-            &crate::changelog::ChangeRecordProjection::full(),
-        )
-        .await?;
-        let mut rows = vec![None; keys.len()];
-        for (index, row) in entry_indices.into_iter().zip(materialized) {
-            rows[index] = Some(row);
-        }
-        Ok(rows)
+        self.load_projected_rows_at_commit(commit_id, keys, &ChangeRecordProjection::full())
+            .await
     }
 
     pub(crate) async fn diff_commits(
@@ -831,7 +850,6 @@ where
             .ok_or_else(|| missing_commit_root_error(commit_id))
     }
 
-    #[cfg(any(test, feature = "storage-benches"))]
     async fn commit_root_values_for_keys(
         &mut self,
         commit_id: &str,

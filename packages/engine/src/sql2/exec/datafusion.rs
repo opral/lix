@@ -2010,6 +2010,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for DummyLiveStateReader {
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -2068,6 +2075,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
@@ -2085,6 +2099,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for CapturingRowsLiveStateReader {
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
@@ -2106,6 +2127,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for CountingRowsLiveStateReader {
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
@@ -4121,22 +4149,28 @@ mod tests {
             })
             .count();
         assert_eq!(
-            directory_scans, 1,
-            "the conflict update needs one directory scan; an attribute-only update must not add a resolver scan"
+            directory_scans, 0,
+            "the augmented conflict batch already carries the selected path, so an attribute-only update needs no directory rescan"
         );
         let blob_requests = requests
             .iter()
             .filter(|request| request.filter.schema_keys == vec!["lix_binary_blob_ref".to_string()])
             .collect::<Vec<_>>();
-        assert_eq!(blob_requests.len(), 1);
         assert_eq!(
-            blob_requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("target")]
+            blob_requests.len(),
+            2,
+            "the conflict probe and conflict apply each point-load the targeted blob without rescanning topology"
         );
-        assert_eq!(
-            blob_requests[0].filter.file_ids,
-            vec![NullableKeyFilter::Value("target".to_string())]
-        );
+        for request in blob_requests {
+            assert_eq!(
+                request.filter.entity_pks,
+                vec![crate::entity_pk::EntityPk::single("target")]
+            );
+            assert_eq!(
+                request.filter.file_ids,
+                vec![NullableKeyFilter::Value("target".to_string())]
+            );
+        }
         drop(requests);
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");

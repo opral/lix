@@ -17,8 +17,8 @@ use crate::filesystem::{
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
@@ -91,6 +91,22 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         &mut self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+
+    async fn load_exact_live_state_rows(
+        &mut self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        let mut rows = Vec::with_capacity(request.rows.len());
+        for row in &request.rows {
+            rows.push(
+                self.scan_live_state(&request.row_scan_request(row))
+                    .await?
+                    .into_iter()
+                    .next(),
+            );
+        }
+        Ok(rows)
+    }
 
     async fn filesystem_path_index(
         &mut self,
@@ -169,6 +185,22 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .scan_live_state(request)
+                .await
+        }
+    }
+
+    pub(crate) async fn load_exact_live_state_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .load_exact_live_state_rows(request)
                 .await
         }
     }
@@ -325,6 +357,13 @@ impl LiveStateReader for WriteContextLiveStateReader {
             })
             .await?;
         Ok(rows.pop())
+    }
+
+    async fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        self.ctx.load_exact_live_state_rows(request).await
     }
 }
 

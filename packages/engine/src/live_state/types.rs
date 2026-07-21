@@ -213,6 +213,56 @@ pub(crate) struct LiveStateRowRequest {
     pub(crate) file_id: NullableKeyFilter<String>,
 }
 
+/// One concrete visible-row identity in an exact batch read.
+///
+/// Unlike [`LiveStateFilter`], the identity fields in this request are
+/// correlated. Implementations must never expand multiple requests into the
+/// Cartesian product of their schema, entity, and file dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LiveStateExactRowRequest {
+    pub(crate) schema_key: String,
+    pub(crate) branch_id: String,
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) file_id: Option<String>,
+}
+
+/// Aligned point-read request for visible live-state rows.
+///
+/// Results preserve `rows` order and cardinality: duplicate identities produce
+/// duplicate result slots and missing or tombstoned identities produce `None`
+/// unless tombstones are explicitly requested.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct LiveStateExactBatchRequest {
+    pub(crate) rows: Vec<LiveStateExactRowRequest>,
+    pub(crate) projection: LiveStateProjection,
+    pub(crate) untracked: Option<bool>,
+    pub(crate) include_tombstones: bool,
+}
+
+impl LiveStateExactBatchRequest {
+    pub(crate) fn row_scan_request(&self, row: &LiveStateExactRowRequest) -> LiveStateScanRequest {
+        LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![row.schema_key.clone()],
+                entity_pks: vec![row.entity_pk.clone()],
+                branch_ids: vec![row.branch_id.clone()],
+                file_ids: vec![
+                    row.file_id
+                        .as_ref()
+                        .map_or(NullableKeyFilter::Null, |file_id| {
+                            NullableKeyFilter::Value(file_id.clone())
+                        }),
+                ],
+                untracked: self.untracked,
+                include_tombstones: self.include_tombstones,
+                ..LiveStateFilter::default()
+            },
+            projection: self.projection.clone(),
+            limit: Some(1),
+        }
+    }
+}
+
 /// Stable visible-row identity used for overlay composition.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LiveStateRowIdentity {
