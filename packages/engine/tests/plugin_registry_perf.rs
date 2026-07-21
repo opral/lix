@@ -13,7 +13,7 @@
 //! ```
 //!
 //! Modes are `p0`, `p1_nonmatch`, `p1_zero_state_write`, `p1_state_write`, and
-//! `p1_read_render`. The legacy `p1_match` name aliases `p1_zero_state_write`.
+//! `p1_read_render`.
 
 use std::fmt::Write as FmtWrite;
 use std::io::{Cursor, Write as IoWrite};
@@ -201,7 +201,7 @@ fn modes_from_env() -> Vec<ProbeMode> {
         .map(|value| match value.trim() {
             "p0" => ProbeMode::P0,
             "p1_nonmatch" => ProbeMode::P1Nonmatch,
-            "p1_match" | "p1_zero_state_write" => ProbeMode::P1ZeroStateWrite,
+            "p1_zero_state_write" => ProbeMode::P1ZeroStateWrite,
             "p1_state_write" => ProbeMode::P1StateWrite,
             "p1_read_render" => ProbeMode::P1ReadRender,
             other => {

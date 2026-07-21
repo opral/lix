@@ -620,12 +620,11 @@ async fn uninstall_keeps_owned_state_and_reinstall_resumes_rendering() {
         .expect("exact archive delete should uninstall");
     assert_eq!(plugin_owner_count(&session, &file_id).await, 1);
     assert_eq!(plugin_state_count(&session, &file_id).await, 1);
-    assert_eq!(
-        read_file(&session, "/resume.sentinel")
-            .await
-            .expect("uninstalled plugin file should remain visible"),
-        Some(Vec::new())
-    );
+    let unavailable = read_file(&session, "/resume.sentinel")
+        .await
+        .expect_err("uninstalled plugin state must not silently render as empty bytes");
+    assert_eq!(unavailable.code, LixError::CODE_PLUGIN_UNAVAILABLE);
+    assert!(unavailable.message.contains("plugin_sentinel"));
 
     install_plugin(&session, "plugin_sentinel", &archive)
         .await
@@ -645,6 +644,19 @@ async fn uninstall_keeps_owned_state_and_reinstall_resumes_rendering() {
         )
         .await
         .expect("second exact archive delete should uninstall");
+    let move_error = session
+        .execute(
+            "UPDATE lix_file SET path = '/resume.txt' \
+             WHERE path = '/resume.sentinel'",
+            &[],
+        )
+        .await
+        .expect_err("materialized plugin files cannot move while their plugin is unavailable");
+    assert_eq!(move_error.code, LixError::CODE_PLUGIN_UNAVAILABLE);
+
+    install_plugin(&session, "plugin_sentinel", &archive)
+        .await
+        .expect("second plugin reinstall should succeed");
     session
         .execute(
             "UPDATE lix_file SET path = '/resume.txt' \
@@ -652,15 +664,12 @@ async fn uninstall_keeps_owned_state_and_reinstall_resumes_rendering() {
             &[],
         )
         .await
-        .expect("path move while no plugins are installed should succeed");
-    install_plugin(&session, "plugin_sentinel", &archive)
-        .await
-        .expect("second plugin reinstall should succeed");
+        .expect("path move should succeed after the plugin is reinstalled");
     assert_eq!(
         read_file(&session, "/resume.txt")
             .await
-            .expect("moved stale-owner file should remain raw"),
-        Some(Vec::new())
+            .expect("moved file should preserve its rendered bytes"),
+        Some(b"plugin-rendered".to_vec())
     );
 
     session.close().await.expect("session should close");

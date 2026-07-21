@@ -94,6 +94,10 @@ impl LixError {
     /// schema definitions retain [`Self::CODE_SCHEMA_DEFINITION`].
     pub const CODE_INVALID_PLUGIN: &'static str = "LIX_ERROR_INVALID_PLUGIN";
 
+    /// A file is materialized as durable plugin state, but the plugin needed
+    /// to render that state is not installed on the file's branch.
+    pub const CODE_PLUGIN_UNAVAILABLE: &'static str = "LIX_ERROR_PLUGIN_UNAVAILABLE";
+
     /// Write-time failure where user data did not conform to a registered
     /// schema (type mismatch, missing required field, pattern violation,
     /// additionalProperties, etc.). Raised from the JSON-Schema validator

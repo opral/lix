@@ -702,9 +702,10 @@ impl TableSpec for LixFileSpec {
                         )
                         .await
                         .map_err(|error| {
-                            DataFusionError::Execution(format!(
-                                "sql2 lix_file plugin discovery failed: {error}"
-                            ))
+                            DataFusionError::Context(
+                                "sql2 lix_file plugin discovery failed".to_string(),
+                                Box::new(lix_error_to_datafusion_error(error)),
+                            )
                         })?
                     } else {
                         None
@@ -718,9 +719,10 @@ impl TableSpec for LixFileSpec {
                     )
                     .await
                     .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file batch build failed: {error}"
-                        ))
+                        DataFusionError::Context(
+                            "sql2 lix_file batch build failed".to_string(),
+                            Box::new(lix_error_to_datafusion_error(error)),
+                        )
                     })?;
                     finish_scan_batch(batch, &filters, projection.as_deref(), limit, "lix_file")
                 },
@@ -1227,6 +1229,7 @@ impl UpsertSupport for LixFileSpec {
                     plugin_host,
                     branches,
                     plugin_owner_candidates_from_batch(augmented, branch_binding)?,
+                    true,
                 )
                 .await
                 .map_err(|error| {
@@ -3476,24 +3479,30 @@ async fn render_plugin_files_for_sql(
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
     file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
 ) -> Result<BTreeMap<FilesystemDescriptorKey, Vec<u8>>, LixError> {
-    let owned_file_keys = file_keys
-        .iter()
-        .filter(|key| {
-            let file = file_rows
-                .get(*key)
-                .expect("prepared lix_file order should reference a descriptor");
-            let path = file_paths
-                .get(*key)
-                .expect("prepared lix_file descriptor should have a path");
-            let active_owner = plugin_render.owner_for_file(key).is_some_and(|owner| {
-                plugin_render
-                    .branch(key.branch_id())
-                    .is_some_and(|branch| branch.catalog.matches_plugin(owner.plugin_key(), path))
-            });
-            !blob_rows.contains_key(&file.blob_ref_key()) && active_owner
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut owned_file_keys = Vec::new();
+    for key in file_keys {
+        let file = file_rows
+            .get(key)
+            .expect("prepared lix_file order should reference a descriptor");
+        if blob_rows.contains_key(&file.blob_ref_key()) {
+            continue;
+        }
+        let Some(owner) = plugin_render.owner_for_file(key) else {
+            continue;
+        };
+        let path = file_paths
+            .get(key)
+            .expect("prepared lix_file descriptor should have a path");
+        let Some(branch) = plugin_render.branch(key.branch_id()) else {
+            return Err(plugin_unavailable_error(file, path, owner));
+        };
+        if branch.registry.get(owner.plugin_key()).is_none() {
+            return Err(plugin_unavailable_error(file, path, owner));
+        }
+        if branch.catalog.matches_plugin(owner.plugin_key(), path) {
+            owned_file_keys.push(key.clone());
+        }
+    }
     if owned_file_keys.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -3702,22 +3711,19 @@ async fn plugin_render_context_for_lix_file_scan(
     prepared: &PreparedLixFileRows,
     include_blob_backed_candidates: bool,
 ) -> Result<Option<PluginRenderContext>, LixError> {
-    let branches = load_plugin_render_branches(Arc::clone(&live_state), request, &host).await?;
-    if branches.is_empty() {
+    let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
+    if candidates.is_empty() {
         return Ok(None);
     }
-    let mut candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
-    if !include_blob_backed_candidates {
-        candidates.retain(|key| {
-            prepared.file_paths.get(key).is_some_and(|path| {
-                branches
-                    .get(key.branch_id())
-                    .and_then(|branch| branch.catalog.select(path, None))
-                    .is_some()
-            })
-        });
-    }
-    plugin_render_context_with_branches(live_state, host, branches, candidates).await
+    let branches = load_plugin_render_branches(Arc::clone(&live_state), request, &host).await?;
+    plugin_render_context_with_branches(
+        live_state,
+        host,
+        branches,
+        candidates,
+        include_blob_backed_candidates,
+    )
+    .await
 }
 
 async fn load_plugin_render_branches(
@@ -3781,6 +3787,7 @@ async fn plugin_render_context_with_branches(
     host: PluginRuntimeHost,
     branches: BTreeMap<String, BranchPluginRenderContext>,
     candidates: Vec<FilesystemDescriptorKey>,
+    keep_catalog_without_owners: bool,
 ) -> Result<Option<PluginRenderContext>, LixError> {
     if candidates.is_empty() {
         return Ok(None);
@@ -3789,9 +3796,6 @@ async fn plugin_render_context_with_branches(
     let mut candidate_keys_by_branch =
         BTreeMap::<String, BTreeMap<String, FilesystemDescriptorKey>>::new();
     for candidate in candidates {
-        if !branches.contains_key(candidate.branch_id()) {
-            continue;
-        }
         let branch_id = candidate.branch_id().to_string();
         let file_id = candidate.descriptor_id().to_string();
         if candidate_keys_by_branch
@@ -3869,6 +3873,10 @@ async fn plugin_render_context_with_branches(
         }
     }
 
+    if owners_by_file.is_empty() && !keep_catalog_without_owners {
+        return Ok(None);
+    }
+
     Ok(Some(PluginRenderContext {
         live_state,
         host,
@@ -3879,6 +3887,30 @@ async fn plugin_render_context_with_branches(
 
 fn invalid_plugin_read_state(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message)
+}
+
+fn plugin_unavailable_error(
+    file: &FileDescriptorRecord,
+    path: &str,
+    owner: &PluginFileOwner,
+) -> LixError {
+    LixError::new(
+        LixError::CODE_PLUGIN_UNAVAILABLE,
+        format!(
+            "file '{path}' requires unavailable plugin '{}'",
+            owner.plugin_key()
+        ),
+    )
+    .with_hint(format!(
+        "Add a valid .lixplugin archive for '{}' to /.lix/plugins/ to render the file again.",
+        owner.plugin_key()
+    ))
+    .with_details(serde_json::json!({
+        "branch_id": file.live.branch_id,
+        "file_id": file.id,
+        "path": path,
+        "plugin_key": owner.plugin_key(),
+    }))
 }
 
 fn plugin_control_live_state_projection() -> LiveStateProjection {
@@ -7567,6 +7599,12 @@ mod tests {
                     wasm,
                 )],
             ),
+            live_plugin_owner_row(
+                "branch-a",
+                "file-a",
+                "plugin_sentinel",
+                vec!["plugin_note_a".to_string()],
+            ),
             live_plugin_registry_row(
                 "branch-b",
                 vec![test_plugin_registry_entry(
@@ -7575,6 +7613,12 @@ mod tests {
                     "plugin_note_b",
                     wasm,
                 )],
+            ),
+            live_plugin_owner_row(
+                "branch-b",
+                "file-b",
+                "plugin_sentinel",
+                vec!["plugin_note_b".to_string()],
             ),
         ];
         let prepared = super::prepare_lix_file_rows(
@@ -7633,7 +7677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_plugin_registry_stops_after_one_exact_tracked_read() {
+    async fn missing_plugin_registry_checks_blobless_file_ownership() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
@@ -7665,7 +7709,7 @@ mod tests {
 
         assert!(context.is_none());
         let requests = requests.lock().expect("scan request mutex");
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].filter.schema_keys, vec!["lix_key_value"]);
         assert_eq!(
             requests[0].filter.entity_pks,
@@ -7675,10 +7719,18 @@ mod tests {
         assert_eq!(requests[0].filter.file_ids, vec![NullableKeyFilter::Null]);
         assert_eq!(requests[0].filter.untracked, Some(false));
         assert_eq!(requests[0].limit, Some(1));
+        assert_eq!(
+            requests[1].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
+        );
+        assert_eq!(
+            requests[1].filter.file_ids,
+            vec![NullableKeyFilter::Value("file-note".to_string())]
+        );
     }
 
     #[tokio::test]
-    async fn installed_nonmatching_plugin_skips_owner_scan_for_blobless_files() {
+    async fn installed_nonmatching_plugin_checks_blobless_file_ownership() {
         let wasm = b"test wasm";
         let requests = Arc::new(Mutex::new(Vec::new()));
         let prepared = super::prepare_lix_file_rows(
@@ -7719,11 +7771,68 @@ mod tests {
 
         assert!(context.is_none());
         let requests = requests.lock().expect("scan request mutex");
-        assert_eq!(requests.len(), 1, "only the exact registry row is read");
+        assert_eq!(requests.len(), 2, "registry and exact owner rows are read");
         assert_eq!(
             requests[0].filter.entity_pks,
             vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
         );
+        assert_eq!(
+            requests[1].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
+        );
+    }
+
+    #[tokio::test]
+    async fn blobless_owned_file_requires_its_installed_plugin() {
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("owned blobless file should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::new(RowsLiveStateReader {
+                rows: vec![live_plugin_owner_row(
+                    "branch-b",
+                    "file-note",
+                    "plugin_sentinel",
+                    vec!["plugin_note".to_string()],
+                )],
+            }) as Arc<dyn LiveStateReader>,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            false,
+        )
+        .await
+        .expect("durable owner lookup should succeed")
+        .expect("durable owner should create a render context");
+        let blob_reader = Arc::new(StaticBlobReader {
+            bytes_by_hash: BTreeMap::new(),
+        }) as Arc<dyn BlobDataReader>;
+
+        let error = super::lix_file_record_batch_from_prepared(
+            &super::lix_file_schema(),
+            &blob_reader,
+            Some(context),
+            true,
+            prepared,
+        )
+        .await
+        .expect_err("missing plugin must not silently render empty bytes");
+
+        assert_eq!(error.code, LixError::CODE_PLUGIN_UNAVAILABLE);
+        assert!(error.message.contains("plugin_sentinel"));
+        assert!(error.message.contains("/note.sentinel"));
     }
 
     #[tokio::test]

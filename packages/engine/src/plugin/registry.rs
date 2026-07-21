@@ -54,8 +54,9 @@ pub(crate) struct PluginRegistryEntryInput {
 
 /// Metadata needed by current-state plugin matching and execution.
 ///
-/// `content_type` is omitted for path-only plugins so registry rows written
-/// before typed matching remain byte-for-byte generation compatible.
+/// Path-only matching is encoded explicitly as `content_type: null`. Registry
+/// rows are an internal engine format, so missing fields are rejected instead
+/// of carrying compatibility for unreleased representations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginRegistryEntry {
@@ -63,7 +64,7 @@ pub(crate) struct PluginRegistryEntry {
     runtime: PluginRuntime,
     api_version: String,
     path_glob: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_content_type")]
     content_type: Option<PluginContentType>,
     entry: String,
     schema_keys: Vec<String>,
@@ -72,6 +73,15 @@ pub(crate) struct PluginRegistryEntry {
     archive_path: String,
     archive_blob_hash: String,
     wasm_blob_hash: String,
+}
+
+fn deserialize_required_content_type<'de, D>(
+    deserializer: D,
+) -> Result<Option<PluginContentType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<PluginContentType>::deserialize(deserializer)
 }
 
 impl PluginRegistryEntry {
@@ -1182,14 +1192,24 @@ mod tests {
     }
 
     #[test]
-    fn content_type_is_durable_and_path_only_rows_remain_compatible() {
-        let legacy = PluginRegistry::new(vec![entry("plugin_a", "*.json", 'a')]).unwrap();
-        let legacy_value = legacy.to_value().unwrap();
-        assert!(legacy_value["plugins"][0].get("content_type").is_none());
+    fn content_type_is_required_and_path_only_matching_is_explicit() {
+        let path_only = PluginRegistry::new(vec![entry("plugin_a", "*.json", 'a')]).unwrap();
+        let path_only_value = path_only.to_value().unwrap();
         assert_eq!(
-            PluginRegistry::from_optional_value(Some(&legacy_value)).unwrap(),
-            legacy
+            path_only_value["plugins"][0]["content_type"],
+            JsonValue::Null
         );
+        assert_eq!(
+            PluginRegistry::from_optional_value(Some(&path_only_value)).unwrap(),
+            path_only
+        );
+
+        let mut missing = path_only_value;
+        missing["plugins"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_type");
+        assert_invalid(missing, "missing field `content_type`");
 
         let typed = PluginRegistry::new(vec![entry_with_content_type(
             "plugin_a",
@@ -1204,7 +1224,7 @@ mod tests {
             PluginRegistry::from_optional_value(Some(&typed_value)).unwrap(),
             typed
         );
-        assert_ne!(legacy.generation(), typed.generation());
+        assert_ne!(path_only.generation(), typed.generation());
 
         let mut mismatched = typed_value;
         mismatched["plugins"][0]["content_type"] = json!("binary");
