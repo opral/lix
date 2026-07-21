@@ -1202,7 +1202,7 @@ impl PendingSchemaDomains {
             domains_by_key
                 .entry(SchemaCatalogKey::from_schema_key(key))
                 .or_default()
-                .insert(row.domain());
+                .insert(row.domain().schema_catalog_domain());
         }
         Ok(Self { domains_by_key })
     }
@@ -1214,8 +1214,11 @@ impl PendingSchemaDomains {
         let Some(domains) = self.domains_by_key.get(&key) else {
             return Ok(());
         };
-        let row_domain = row.domain();
-        if domains.contains(&row_domain) {
+        let visible_schema_domains = row.domain().schema_catalog_domains();
+        if domains
+            .iter()
+            .any(|domain| visible_schema_domains.contains(domain))
+        {
             return Ok(());
         }
         Err(LixError::new(
@@ -3410,6 +3413,28 @@ mod tests {
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("pending registered schema should be visible to later staged rows");
+    }
+
+    #[test]
+    fn pending_schema_domain_covers_file_scoped_rows_in_the_same_catalog() {
+        let mut pending_schema = pending_registered_schema_row("pending_file_schema");
+        pending_schema.global = false;
+        pending_schema.branch_id = "branch-a".to_string();
+        let pending_rows = [PreparedValidationRow::State(&pending_schema)];
+        let domains = PendingSchemaDomains::from_staged_rows(&pending_rows)
+            .expect("pending schema domains should build");
+
+        let mut file_row = staged_row(
+            "pending_file_schema",
+            Some(json!({ "id": "entity-1" }).to_string()),
+        );
+        file_row.global = false;
+        file_row.branch_id = "branch-a".to_string();
+        file_row.file_id = Some("file-a".to_string());
+
+        domains
+            .validate_row_schema_domain(PreparedValidationRow::State(&file_row))
+            .expect("schema catalog scope should cover every file scope in its branch");
     }
 
     #[tokio::test]

@@ -50,6 +50,9 @@ pub(crate) async fn commit_prepared_writes(
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
         for write in &prepared_writes.file_data_writes {
             blob_writer.stage_payload(write.payload()).await?;
+            for payload in write.auxiliary_payloads() {
+                blob_writer.stage_payload(payload).await?;
+            }
         }
     }
 

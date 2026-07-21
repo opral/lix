@@ -3,9 +3,10 @@ use crate::LixError;
 pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix/plugins/";
 const PLUGIN_STORAGE_ROOT_PATH: &str = "/.lix/plugins";
 pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
+const PLUGIN_ARCHIVE_FILE_ID_PREFIX: &str = "lix_plugin_archive::";
 
 pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
-    format!("lix_plugin_archive::{plugin_key}")
+    format!("{PLUGIN_ARCHIVE_FILE_ID_PREFIX}{plugin_key}")
 }
 
 pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
@@ -15,6 +16,19 @@ pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
 pub fn plugin_key_from_archive_path(path: &str) -> Option<String> {
     let file_name = path.strip_prefix(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)?;
     let plugin_key = file_name.strip_suffix(PLUGIN_ARCHIVE_FILE_EXTENSION)?;
+    if !is_valid_plugin_key(plugin_key) {
+        return None;
+    }
+    Some(plugin_key.to_string())
+}
+
+/// Extracts the plugin key from its canonical deterministic archive file ID.
+///
+/// This is deliberately stricter than accepting an arbitrary descriptor ID:
+/// lifecycle code can use it to distinguish plugin install/update/delete
+/// operations without consulting the visible filesystem.
+pub fn plugin_key_from_archive_file_id(file_id: &str) -> Option<String> {
+    let plugin_key = file_id.strip_prefix(PLUGIN_ARCHIVE_FILE_ID_PREFIX)?;
     if !is_valid_plugin_key(plugin_key) {
         return None;
     }
@@ -53,7 +67,8 @@ mod tests {
     use crate::LixError;
 
     use super::{
-        plugin_key_from_archive_path, plugin_storage_archive_path,
+        plugin_key_from_archive_file_id, plugin_key_from_archive_path,
+        plugin_storage_archive_file_id, plugin_storage_archive_path,
         reject_normal_plugin_storage_mutation,
     };
 
@@ -78,6 +93,27 @@ mod tests {
             "/.lix/plugins/.lixplugin",
         ] {
             assert_eq!(plugin_key_from_archive_path(path), None);
+        }
+    }
+
+    #[test]
+    fn archive_file_id_round_trips_only_canonical_plugin_keys() {
+        for key in ["plugin_json", "a", "plugin-2"] {
+            let file_id = plugin_storage_archive_file_id(key);
+            assert_eq!(
+                plugin_key_from_archive_file_id(&file_id).as_deref(),
+                Some(key)
+            );
+        }
+
+        for file_id in [
+            "lix_plugin_archive::",
+            "lix_plugin_archive::PluginJson",
+            "lix_plugin_archive::plugin/nested",
+            "lix_plugin_archive::plugin_json::suffix",
+            "arbitrary-file-id",
+        ] {
+            assert_eq!(plugin_key_from_archive_file_id(file_id), None);
         }
     }
 

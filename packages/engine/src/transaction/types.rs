@@ -181,7 +181,18 @@ pub(crate) struct TransactionFileData {
     pub(crate) branch_id: String,
     pub(crate) global: bool,
     pub(crate) untracked: bool,
+    /// Whether the visible pre-write file had a binary blob reference.
+    ///
+    /// File providers already know this while lowering an UPDATE. Carrying the
+    /// fact through the transaction boundary avoids rediscovering it by
+    /// scanning the filesystem during plugin reconciliation. Inserts and
+    /// callers without a prior row leave this false.
+    pub(crate) had_blob_ref: bool,
     payload: BlobPayload,
+    /// Content-addressed payloads produced while validating this file write.
+    /// Plugin installation uses this for the extracted WASM component so
+    /// steady-state reads can load it directly without reopening the archive.
+    auxiliary_payloads: Vec<BlobPayload>,
 }
 
 impl TransactionFileData {
@@ -201,8 +212,19 @@ impl TransactionFileData {
             branch_id,
             global,
             untracked,
+            had_blob_ref: false,
             payload: BlobPayload::from_bytes(data),
+            auxiliary_payloads: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_had_blob_ref(mut self, had_blob_ref: bool) -> Self {
+        self.had_blob_ref = had_blob_ref;
+        self
+    }
+
+    pub(crate) fn add_auxiliary_payload(&mut self, data: Vec<u8>) {
+        self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
     }
 
     pub(crate) fn data(&self) -> &[u8] {
@@ -219,6 +241,10 @@ impl TransactionFileData {
 
     pub(crate) fn payload(&self) -> &BlobPayload {
         &self.payload
+    }
+
+    pub(crate) fn auxiliary_payloads(&self) -> &[BlobPayload] {
+        &self.auxiliary_payloads
     }
 
     pub(crate) fn is_empty(&self) -> bool {

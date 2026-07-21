@@ -1,17 +1,18 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::binary_cas::BlobHash;
 use crate::common::LixError;
 use crate::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
 
-use super::InstalledPlugin;
+use super::{CompiledPluginCatalog, InstalledPlugin, PluginCatalogCache, PluginRegistry};
 
 #[derive(Clone)]
 pub(crate) struct CachedPluginComponent {
-    pub(crate) wasm: Vec<u8>,
+    pub(crate) wasm_hash: BlobHash,
     pub(crate) instance: Arc<dyn WasmComponentInstance>,
 }
 
@@ -19,6 +20,7 @@ pub(crate) struct CachedPluginComponent {
 pub(crate) struct PluginRuntimeHost {
     wasm_runtime: Arc<dyn WasmRuntime>,
     plugin_component_cache: Arc<Mutex<BTreeMap<String, CachedPluginComponent>>>,
+    plugin_catalog_cache: Arc<Mutex<PluginCatalogCache>>,
 }
 
 impl PluginRuntimeHost {
@@ -26,7 +28,42 @@ impl PluginRuntimeHost {
         Self {
             wasm_runtime,
             plugin_component_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            plugin_catalog_cache: Arc::new(Mutex::new(PluginCatalogCache::default())),
         }
+    }
+
+    /// Returns the compiled matcher for a durable registry generation.
+    ///
+    /// The host is shared across executions, so warm writes compile globs once
+    /// per generation rather than once per transaction or file.
+    pub(crate) fn compiled_plugin_catalog(
+        &self,
+        registry: &PluginRegistry,
+    ) -> Result<Arc<CompiledPluginCatalog>, LixError> {
+        self.plugin_catalog_cache
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin catalog cache lock poisoned",
+                )
+            })?
+            .get_or_compile(registry)
+    }
+
+    /// Returns a warm component without loading its content-addressed bytes.
+    ///
+    /// The lookup examines only the plugin key and fixed-size content hash, so
+    /// its work is independent of the component's byte length. Callers must
+    /// retain and execute the returned instance directly: discarding it and
+    /// performing a second key-only lookup would reopen a race with another
+    /// branch installing a different hash under the same plugin key.
+    pub(crate) fn cached_plugin_component(
+        &self,
+        plugin_key: &str,
+        wasm_hash: BlobHash,
+    ) -> Result<Option<Arc<dyn WasmComponentInstance>>, LixError> {
+        cached_plugin_component(&self.plugin_component_cache, plugin_key, wasm_hash)
     }
 }
 
@@ -46,43 +83,52 @@ pub(crate) trait PluginComponentHost {
     fn wasm_runtime(&self) -> &Arc<dyn WasmRuntime>;
 }
 
+fn cached_plugin_component(
+    cache: &Mutex<BTreeMap<String, CachedPluginComponent>>,
+    plugin_key: &str,
+    wasm_hash: BlobHash,
+) -> Result<Option<Arc<dyn WasmComponentInstance>>, LixError> {
+    let guard = cache.lock().map_err(|_| component_cache_lock_error())?;
+    Ok(guard
+        .get(plugin_key)
+        .filter(|cached| cached.wasm_hash == wasm_hash)
+        .map(|cached| Arc::clone(&cached.instance)))
+}
+
+fn component_cache_lock_error() -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        "plugin component cache lock poisoned",
+    )
+}
+
 pub(crate) async fn load_or_init_plugin_component(
     host: &impl PluginComponentHost,
     plugin: &InstalledPlugin,
 ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+    if let Some(instance) =
+        cached_plugin_component(host.plugin_component_cache(), &plugin.key, plugin.wasm_hash)?
     {
-        let guard = host.plugin_component_cache().lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "plugin component cache lock poisoned".to_string(),
-            hint: None,
-            details: None,
-        })?;
-        if let Some(cached) = guard.get(&plugin.key) {
-            if cached.wasm == plugin.wasm {
-                return Ok(cached.instance.clone());
-            }
-        }
+        return Ok(instance);
     }
 
     let initialized = host
         .wasm_runtime()
         .init_component(plugin.wasm.clone(), WasmLimits::default())
         .await?;
-    let mut guard = host.plugin_component_cache().lock().map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        message: "plugin component cache lock poisoned".to_string(),
-        hint: None,
-        details: None,
-    })?;
+    let mut guard = host
+        .plugin_component_cache()
+        .lock()
+        .map_err(|_| component_cache_lock_error())?;
     if let Some(cached) = guard.get(&plugin.key) {
-        if cached.wasm == plugin.wasm {
-            return Ok(cached.instance.clone());
+        if cached.wasm_hash == plugin.wasm_hash {
+            return Ok(Arc::clone(&cached.instance));
         }
     }
     guard.insert(
         plugin.key.clone(),
         CachedPluginComponent {
-            wasm: plugin.wasm.clone(),
+            wasm_hash: plugin.wasm_hash,
             instance: initialized.clone(),
         },
     );
@@ -183,6 +229,7 @@ mod tests {
             entry: "plugin.wasm".to_string(),
             schema_keys: Vec::new(),
             manifest_json: "{}".to_string(),
+            wasm_hash: BlobHash::from_content(&[1]),
             wasm: vec![1],
         };
 
@@ -195,9 +242,44 @@ mod tests {
         assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
 
         plugin.wasm = vec![2];
+        plugin.wasm_hash = BlobHash::from_content(&plugin.wasm);
         load_or_init_plugin_component(&host, &plugin)
             .await
             .expect("changed wasm should reinitialize instance");
         assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_host_can_hit_component_cache_before_loading_wasm() {
+        let runtime = Arc::new(CountingRuntime::default());
+        let host = PluginRuntimeHost::new(runtime.clone());
+        let plugin = InstalledPlugin {
+            key: "k".to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            path_glob: "*.json".to_string(),
+            content_type: None,
+            entry: "plugin.wasm".to_string(),
+            schema_keys: Vec::new(),
+            manifest_json: "{}".to_string(),
+            wasm_hash: BlobHash::from_content(&[1]),
+            wasm: vec![1],
+        };
+
+        let initialized = load_or_init_plugin_component(&host, &plugin)
+            .await
+            .expect("first load should initialize the component");
+        let cached = host
+            .cached_plugin_component(&plugin.key, plugin.wasm_hash)
+            .expect("warm lookup should acquire the cache")
+            .expect("matching key and hash should hit the cache");
+        assert!(Arc::ptr_eq(&initialized, &cached));
+        assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
+
+        assert!(
+            host.cached_plugin_component(&plugin.key, BlobHash::from_content(&[2]))
+                .expect("hash-mismatch lookup should acquire the cache")
+                .is_none()
+        );
     }
 }

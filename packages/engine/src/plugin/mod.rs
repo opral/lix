@@ -5,18 +5,24 @@
 //! buckets.
 
 mod archive;
-pub(crate) mod component;
+mod component;
 mod install;
 mod manifest;
 mod materializer;
+mod registry;
 mod storage;
 
 pub(crate) use archive::{
     ParsedPluginArchive, load_installed_plugin_from_archive_bytes,
     load_installed_plugin_metadata_from_archive_bytes, parse_plugin_archive_for_install,
 };
-pub(crate) use component::{CachedPluginComponent, PluginComponentHost, PluginRuntimeHost};
-pub(crate) use install::plugin_schema_rows_from_archive_path;
+pub(crate) use component::{
+    CachedPluginComponent, PluginComponentHost, PluginRuntimeHost, load_or_init_plugin_component,
+};
+pub(crate) use install::{
+    PluginArchiveInstallPlan, plugin_install_plan_from_archive_path,
+    plugin_schema_rows_from_archive_path,
+};
 #[allow(unused_imports)]
 pub(crate) use manifest::{
     PluginContentType, PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,
@@ -24,15 +30,22 @@ pub(crate) use manifest::{
 };
 #[allow(unused_imports)]
 pub(crate) use materializer::{
-    PluginDetectedChange, detect_changes_with_plugin, load_installed_plugins_from_filesystem,
+    PluginDetectedChange, detect_changes_with_component_instance, detect_changes_with_plugin,
     plugin_state_live_state_projection, render_materialized_plugin_file, render_plugin_state,
-    retain_plugin_state_rows, select_plugin_for_path,
+    render_plugin_state_with_component_instance, retain_plugin_state_rows,
+    retain_plugin_state_rows_for_schema_keys,
+};
+#[allow(unused_imports)]
+pub(crate) use registry::{
+    CompiledPluginCatalog, MAX_PLUGIN_REGISTRY_ENTRIES, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
+    PluginCatalogCache, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+    PluginRegistryEntryInput,
 };
 #[allow(unused_imports)]
 pub(crate) use storage::{
     PLUGIN_ARCHIVE_FILE_EXTENSION, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, is_plugin_storage_path,
-    plugin_key_from_archive_path, plugin_storage_archive_file_id, plugin_storage_archive_path,
-    reject_normal_plugin_storage_mutation,
+    plugin_key_from_archive_file_id, plugin_key_from_archive_path, plugin_storage_archive_file_id,
+    plugin_storage_archive_path, reject_normal_plugin_storage_mutation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +58,10 @@ pub(crate) struct InstalledPlugin {
     pub entry: String,
     pub schema_keys: Vec<String>,
     pub manifest_json: String,
+    /// Content-addressed identity computed while the component bytes are
+    /// already in hand. Warm component-cache lookups must use this fixed-size
+    /// value instead of rehashing or comparing the full WASM payload.
+    pub wasm_hash: crate::binary_cas::BlobHash,
     pub wasm: Vec<u8>,
 }
 

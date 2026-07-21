@@ -41,6 +41,19 @@ pub enum PluginContentType {
     Binary,
 }
 
+impl PluginContentType {
+    /// Classifies file bytes only when a caller already has the payload.
+    /// Empty bytes are valid UTF-8 and therefore text, matching the bundled
+    /// text plugins' treatment of a newly-created empty file.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        if std::str::from_utf8(bytes).is_ok() {
+            Self::Text
+        } else {
+            Self::Binary
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedPluginManifest {
     pub manifest: PluginManifest,

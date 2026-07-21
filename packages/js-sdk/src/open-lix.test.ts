@@ -1012,7 +1012,7 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 			"SELECT data FROM lix_file WHERE id = $1",
 			[`lix_plugin_archive::${plugin.key}`],
 		);
-		expect(get(stored, "data")).toEqual(plugin.archiveBytes);
+		expectBytesEqual(get(stored, "data"), plugin.archiveBytes);
 	}
 
 	const schemas = await lix.execute(
@@ -1046,7 +1046,7 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 		[`lix_plugin_archive::${csvPlugin.key}`],
 	);
 	expect(get(stored, "name")).toBe(`${csvPlugin.key}.lixplugin`);
-	expect(get(stored, "data")).toEqual(csvPlugin.archiveBytes);
+	expectBytesEqual(get(stored, "data"), csvPlugin.archiveBytes);
 
 	const schemas = await lix.execute(
 		"SELECT table_name \
@@ -1919,6 +1919,13 @@ async function activeHeadCommitId(lix: Lix): Promise<string> {
 
 function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {
 	return result.rows[rowIndex]?.get(column);
+}
+
+function expectBytesEqual(actual: unknown, expected: Uint8Array): void {
+	expect(actual).toBeInstanceOf(Uint8Array);
+	const bytes = actual as Uint8Array;
+	expect(bytes.byteLength).toBe(expected.byteLength);
+	expect(bytes.every((byte, index) => byte === expected[index])).toBe(true);
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms = 1_000): Promise<T> {

@@ -26,21 +26,22 @@ use crate::common::LixTimestamp;
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    FilesystemIndex, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
+    FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemRowContext, blob_ref_tombstone_row,
-    filesystem_schema_keys, load_path_index_revision,
+    load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateFileScanRequest, LiveStateFilter, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateContext, LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::live_state::{overlay_scan_file_rows, overlay_scan_rows};
 use crate::plugin::{
-    InstalledPlugin, PluginDetectedChange, PluginRuntimeHost, detect_changes_with_plugin,
-    is_plugin_storage_path, load_installed_plugins_from_filesystem,
-    plugin_schema_rows_from_archive_path, plugin_state_live_state_projection,
-    retain_plugin_state_rows, select_plugin_for_path,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginArchiveInstallPlan,
+    PluginDetectedChange, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+    PluginRegistryEntryInput, PluginRuntimeHost, detect_changes_with_component_instance,
+    is_plugin_storage_path, plugin_install_plan_from_archive_path, plugin_key_from_archive_file_id,
+    plugin_state_live_state_projection, retain_plugin_state_rows_for_schema_keys,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::SqlWriteExecutionContext;
@@ -65,11 +66,11 @@ use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
 use crate::transaction::types::{
     PreparedStateRow, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
-    TransactionWriteRow, stage_json_from_value,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow, stage_json_from_value,
 };
 use crate::transaction::validation::{TransactionValidationInput, validate_prepared_writes};
-use crate::wasm::WasmPluginFile;
+use crate::wasm::{WasmComponentInstance, WasmPluginFile};
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -481,43 +482,37 @@ where
         overlay_scan_rows(&base, &staged, request).await
     }
 
-    async fn scan_visible_live_state_file(
-        &mut self,
-        request: &LiveStateFileScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self.live_state.reader(read);
-        overlay_scan_file_rows(&base, &staged, request).await
-    }
-
     async fn reconcile_plugin_write(
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWrite, LixError> {
         match write {
             TransactionWrite::Rows { mode, mut rows } => {
-                rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
+                reject_external_plugin_registry_rows(&rows)?;
+                let mut reconciliation = self
+                    .plugin_write_reconciliation(&rows, &mut Vec::new())
+                    .await?;
+                mark_plugin_reconciliation_rows(&mut reconciliation.rows);
+                rows.extend(reconciliation.rows);
                 Ok(TransactionWrite::Rows { mode, rows })
             }
             TransactionWrite::RowsWithFileData {
                 mode,
                 rows,
-                file_data,
+                mut file_data,
                 count,
             } => {
                 let mut rows = rows;
-                let PluginFileDataReconciliation {
+                reject_external_plugin_registry_rows(&rows)?;
+                let PluginWriteReconciliation {
                     file_keys,
-                    rows: plugin_rows,
-                } = self.plugin_file_data_reconciliation(&file_data).await?;
+                    rows: mut plugin_rows,
+                } = self
+                    .plugin_write_reconciliation(&rows, &mut file_data)
+                    .await?;
+                mark_plugin_reconciliation_rows(&mut plugin_rows);
                 rows.retain(|row| !file_keys.iter().any(|key| key.matches_blob_ref_row(row)));
                 rows.extend(plugin_rows);
-                rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
                 let file_data = file_data
                     .into_iter()
                     .filter(|write| {
@@ -534,128 +529,104 @@ where
         }
     }
 
-    async fn plugin_file_data_reconciliation(
+    /// Reconciles plugin lifecycle, ownership, and state for one logical write
+    /// batch against one storage snapshot.
+    ///
+    /// The first and only mandatory current-state lookup is the small durable
+    /// registry row. An empty registry returns before owner, filesystem,
+    /// matcher, state, archive, CAS, or WASM work. Non-empty registries use
+    /// batched owner/state/CAS reads and execute plugin calls in input order.
+    async fn plugin_write_reconciliation(
         &mut self,
-        file_data: &[TransactionFileData],
-    ) -> Result<PluginFileDataReconciliation, LixError> {
-        let mut reconciliation = PluginFileDataReconciliation::default();
-        // A single staged write can contain many ordinary files for the same
-        // branch. Reconciliation reads the pre-write filesystem each time, so
-        // retain that immutable view for this invocation rather than rebuilding
-        // it once per file. Nothing from this write is staged until this method
-        // returns, which keeps the cached snapshot equivalent to the previous
-        // per-file reads.
-        let mut contexts = BTreeMap::<String, PluginReconciliationContext>::new();
-        for write in file_data {
-            if let Some(rows) = plugin_archive_schema_rows_for_write(write)? {
-                reconciliation.rows.extend(rows);
-                continue;
-            }
-            let Some(write_path) = write.path.as_deref() else {
-                continue;
-            };
-            if !is_plugin_reconciliation_candidate_path(write_path) {
-                continue;
-            }
-            if !contexts.contains_key(&write.branch_id) {
-                let filesystem = self.filesystem_index_for_branch(&write.branch_id).await?;
-                let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
-                contexts.insert(
-                    write.branch_id.clone(),
-                    PluginReconciliationContext {
-                        filesystem,
-                        installed_plugins,
-                    },
-                );
-            }
-            let (existing_plugin, selected_plugin, filename, existing_file_has_blob) = {
-                let context = contexts
-                    .get(&write.branch_id)
-                    .expect("plugin reconciliation context should be cached");
-                let existing_file = context.filesystem.file_entries().find(|(_, file)| {
-                    file.id == write.file_id
-                        && file.scope.global == write.global
-                        && file.scope.untracked == write.untracked
-                });
-                let existing_plugin = existing_file
-                    .and_then(|(path, _)| select_plugin_for_path(&context.installed_plugins, path));
-                let selected_plugin =
-                    select_plugin_for_path(&context.installed_plugins, write_path);
-                let filename = write
-                    .filename
-                    .clone()
-                    .or_else(|| existing_file.map(|(_, file)| file.name.clone()));
-                let existing_file_has_blob =
-                    existing_file.is_some_and(|(_, file)| file.blob_hash.is_some());
-                (
-                    existing_plugin,
-                    selected_plugin,
-                    filename,
-                    existing_file_has_blob,
-                )
-            };
-            let context = FilesystemRowContext {
-                branch_id: write.branch_id.clone(),
-                global: write.global,
-                untracked: write.untracked,
-                file_id: None,
-                metadata: None,
-            };
-            if let Some(existing_plugin) = existing_plugin
-                && selected_plugin.is_none_or(|plugin| plugin.key != existing_plugin.key)
-            {
-                let existing_state = self
-                    .active_plugin_state_rows(&write.branch_id, &write.file_id, existing_plugin)
-                    .await?;
-                reconciliation.rows.extend(plugin_state_tombstone_rows(
-                    &existing_state,
-                    &write.file_id,
-                    &context,
-                ));
-            }
-            let Some(plugin) = selected_plugin else {
-                continue;
-            };
-            let active_state = self
-                .active_plugin_state_rows(&write.branch_id, &write.file_id, plugin)
-                .await?;
-            let changes = detect_changes_with_plugin(
-                &self.plugin_host,
-                plugin,
-                &active_state,
-                WasmPluginFile {
-                    filename,
-                    data: write.data().to_vec(),
-                },
-            )
-            .await?;
-            if existing_file_has_blob {
-                reconciliation.rows.push(blob_ref_tombstone_row(
-                    write.file_id.clone(),
-                    context.clone(),
-                ));
-            }
-            reconciliation.rows.extend(plugin_change_rows(
-                plugin,
-                changes,
-                &write.file_id,
-                &context,
-                "plugin detect-changes",
-            )?);
-            reconciliation
-                .file_keys
-                .insert(PluginFileWriteKey::from(write));
-        }
-        Ok(reconciliation)
-    }
+        input_rows: &[TransactionWriteRow],
+        file_data: &mut [TransactionFileData],
+    ) -> Result<PluginWriteReconciliation, LixError> {
+        let mut reconciliation = PluginWriteReconciliation::default();
+        let mut lifecycle = BTreeMap::<PluginLifecycleKey, Option<PluginRegistryEntry>>::new();
+        let mut lifecycle_schema_rows = Vec::<(PluginLifecycleKey, TransactionWriteRow)>::new();
+        let mut current_install_wasm = BTreeMap::<BlobHash, Vec<u8>>::new();
+        let mut branch_ids = BTreeSet::<String>::new();
 
-    async fn plugin_delete_tombstone_rows(
-        &mut self,
-        rows: &[TransactionWriteRow],
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        let mut tombstones = Vec::new();
-        let mut seen = BTreeSet::new();
-        for row in rows {
+        // Parse each archive exactly once. The original ZIP remains the file
+        // payload; the extracted component is staged as a second CAS payload.
+        for write in file_data.iter_mut() {
+            let Some(path) = write.path.as_deref() else {
+                continue;
+            };
+            if !is_plugin_storage_path(path) {
+                if !write.global && !write.untracked {
+                    branch_ids.insert(write.branch_id.clone());
+                }
+                continue;
+            }
+            let plan = plugin_install_plan_from_archive_path(
+                path,
+                write.data(),
+                &write.branch_id,
+                write.global,
+                write.untracked,
+            )?;
+            if write.file_id != plan.archive_file_id {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!(
+                        "plugin archive '{}' must use deterministic file id '{}'",
+                        plan.plugin_key, plan.archive_file_id
+                    ),
+                ));
+            }
+            let archive_blob_hash = write.blob_hash().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "plugin archive payload must not be empty",
+                )
+            })?;
+            let PluginArchiveInstallPlan {
+                plugin_key,
+                archive_file_id,
+                parsed,
+                schema_rows,
+            } = plan;
+            let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
+                key: plugin_key.clone(),
+                runtime: parsed.manifest.runtime,
+                api_version: parsed.manifest.api_version.clone(),
+                path_glob: parsed.manifest.file_match.path_glob.clone(),
+                content_type: parsed.manifest.file_match.content_type,
+                entry: parsed.manifest.entry.clone(),
+                schema_keys: parsed.schema_keys.clone(),
+                manifest_json: parsed.normalized_manifest_json.clone(),
+                archive_file_id,
+                archive_path: path.to_string(),
+                archive_blob_hash: archive_blob_hash.to_hex(),
+                wasm_blob_hash: parsed.wasm_hash.to_hex(),
+            })?;
+            let lifecycle_key = PluginLifecycleKey {
+                branch_id: write.branch_id.clone(),
+                plugin_key,
+            };
+            if lifecycle
+                .insert(lifecycle_key.clone(), Some(entry))
+                .is_some()
+            {
+                return Err(duplicate_plugin_lifecycle_mutation());
+            }
+            current_install_wasm
+                .entry(parsed.wasm_hash)
+                .or_insert_with(|| parsed.wasm_bytes.clone());
+            write.add_auxiliary_payload(parsed.wasm_bytes);
+            lifecycle_schema_rows.extend(
+                schema_rows
+                    .into_iter()
+                    .map(|row| (lifecycle_key.clone(), row)),
+            );
+            branch_ids.insert(write.branch_id.clone());
+        }
+
+        // A canonical archive descriptor tombstone is the uninstall signal.
+        // Other descriptor tombstones are ownership cleanup candidates.
+        let mut deleted_file_keys = BTreeMap::<PluginFileWriteKey, Option<TransactionJson>>::new();
+        for row in input_rows {
             if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.snapshot.is_some() {
                 continue;
             }
@@ -666,95 +637,648 @@ where
             else {
                 continue;
             };
+            if let Some(plugin_key) = plugin_key_from_archive_file_id(file_id) {
+                if row.global || row.untracked || row.branch_id == GLOBAL_BRANCH_ID {
+                    return Err(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "plugin uninstall requires a tracked branch-local archive",
+                    ));
+                }
+                let lifecycle_key = PluginLifecycleKey {
+                    branch_id: row.branch_id.clone(),
+                    plugin_key,
+                };
+                if lifecycle.insert(lifecycle_key, None).is_some() {
+                    return Err(duplicate_plugin_lifecycle_mutation());
+                }
+                branch_ids.insert(row.branch_id.clone());
+                continue;
+            }
+            if row.global || row.untracked {
+                continue;
+            }
             let key = PluginFileWriteKey {
                 branch_id: row.branch_id.clone(),
-                global: row.global,
-                untracked: row.untracked,
+                global: false,
+                untracked: false,
                 file_id: file_id.to_string(),
             };
-            if !seen.insert(key) {
-                continue;
-            }
-            let filesystem = self.filesystem_index_for_branch(&row.branch_id).await?;
-            let Some((path, _file)) = filesystem.file_entries().find(|(_, file)| {
-                file.id == file_id
-                    && file.scope.global == row.global
-                    && file.scope.untracked == row.untracked
-            }) else {
-                continue;
-            };
-            if !is_plugin_reconciliation_candidate_path(path) {
-                continue;
-            }
-            let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
-            let Some(plugin) = select_plugin_for_path(&installed_plugins, path) else {
-                continue;
-            };
-            let active_state = self
-                .active_plugin_state_rows(&row.branch_id, file_id, plugin)
-                .await?;
-            let context = FilesystemRowContext {
-                branch_id: row.branch_id.clone(),
-                global: row.global,
-                untracked: row.untracked,
-                file_id: None,
-                metadata: row.metadata.clone(),
-            };
-            tombstones.extend(plugin_state_tombstone_rows(
-                &active_state,
-                file_id,
-                &context,
-            ));
+            deleted_file_keys
+                .entry(key)
+                .or_insert_with(|| row.metadata.clone());
+            branch_ids.insert(row.branch_id.clone());
         }
-        Ok(tombstones)
-    }
 
-    async fn filesystem_index_for_branch(
-        &mut self,
-        branch_id: &str,
-    ) -> Result<FilesystemIndex, LixError> {
-        let rows = self
-            .scan_visible_live_state(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: filesystem_schema_keys(),
-                    branch_ids: vec![branch_id.to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await?;
-        FilesystemIndex::from_live_rows(rows)
-    }
+        // Registered-schema writes are rare lifecycle operations, but they
+        // must still consult the registry even when no file data is present.
+        // Otherwise a later public UPDATE/DELETE could invalidate an active
+        // plugin's durable state contract behind the registry's back.
+        for row in input_rows {
+            if row.schema_key == REGISTERED_SCHEMA_KEY && !row.global && !row.untracked {
+                branch_ids.insert(row.branch_id.clone());
+            }
+        }
 
-    async fn installed_plugins_for_filesystem(
-        &self,
-        filesystem: &FilesystemIndex,
-    ) -> Result<Vec<InstalledPlugin>, LixError> {
+        if branch_ids.is_empty() {
+            return Ok(reconciliation);
+        }
+
+        let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let blob_reader = self.binary_cas.reader(read);
-        load_installed_plugins_from_filesystem(filesystem, &blob_reader).await
-    }
+        let base = self.live_state.reader(read.clone());
 
-    async fn active_plugin_state_rows(
-        &mut self,
-        branch_id: &str,
-        file_id: &str,
-        plugin: &InstalledPlugin,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let rows = self
-            .scan_visible_live_state_file(&LiveStateFileScanRequest {
-                branch_ids: vec![branch_id.to_string()],
-                file_id: file_id.to_string(),
-                schema_keys: plugin.schema_keys.clone(),
-                projection: plugin_state_live_state_projection(),
-                ..Default::default()
-            })
+        if !lifecycle_schema_rows.is_empty() {
+            let mut desired_schemas = BTreeMap::<(String, EntityPk), (String, JsonValue)>::new();
+            for (lifecycle_key, row) in &lifecycle_schema_rows {
+                let entity_pk = row.entity_pk.clone().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "plugin schema row is missing its entity identity",
+                    )
+                })?;
+                let snapshot = row.snapshot.as_ref().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "plugin schema row is missing its definition",
+                    )
+                })?;
+                let identity = (row.branch_id.clone(), entity_pk);
+                let definition = snapshot.value().clone();
+                if let Some((other_plugin, other_definition)) = desired_schemas.get(&identity)
+                    && other_definition != &definition
+                {
+                    return Err(plugin_schema_collision_error(
+                        &lifecycle_key.plugin_key,
+                        &identity.1,
+                        Some(other_plugin),
+                    ));
+                }
+                desired_schemas.insert(identity, (lifecycle_key.plugin_key.clone(), definition));
+            }
+
+            let schema_rows = overlay_scan_rows(
+                &base,
+                &staged,
+                &LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                        entity_pks: desired_schemas
+                            .keys()
+                            .map(|(_, entity_pk)| entity_pk.clone())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                        branch_ids: desired_schemas
+                            .keys()
+                            .map(|(branch_id, _)| branch_id.clone())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                        file_ids: vec![NullableKeyFilter::Null],
+                        untracked: Some(false),
+                        ..Default::default()
+                    },
+                    projection: plugin_registry_live_state_projection(),
+                    ..Default::default()
+                },
+            )
             .await?;
-        Ok(retain_plugin_state_rows(plugin, rows))
+            let mut existing_schemas = BTreeMap::<(String, EntityPk), JsonValue>::new();
+            for row in schema_rows {
+                let Some(snapshot) = row.snapshot_content.as_deref() else {
+                    continue;
+                };
+                existing_schemas.insert(
+                    (row.branch_id, row.entity_pk),
+                    serde_json::from_str(snapshot).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_DEFINITION,
+                            format!("invalid existing registered schema snapshot: {error}"),
+                        )
+                    })?,
+                );
+            }
+            // Programmatic writes may pair a schema mutation with a plugin
+            // archive in one transaction batch. Model those rows after the
+            // visible snapshot before checking the derived plugin rows.
+            for row in input_rows {
+                if row.schema_key != REGISTERED_SCHEMA_KEY
+                    || row.global
+                    || row.untracked
+                    || row.file_id.is_some()
+                {
+                    continue;
+                }
+                let Some(entity_pk) = row.entity_pk.clone() else {
+                    continue;
+                };
+                let identity = (row.branch_id.clone(), entity_pk);
+                if !desired_schemas.contains_key(&identity) {
+                    continue;
+                }
+                match row.snapshot.as_ref() {
+                    Some(snapshot) => {
+                        existing_schemas.insert(identity, snapshot.value().clone());
+                    }
+                    None => {
+                        existing_schemas.remove(&identity);
+                    }
+                }
+            }
+            for (identity, (plugin_key, definition)) in &desired_schemas {
+                if let Some(existing) = existing_schemas.get(identity)
+                    && existing != definition
+                {
+                    return Err(plugin_schema_collision_error(plugin_key, &identity.1, None));
+                }
+            }
+            reconciliation
+                .rows
+                .extend(lifecycle_schema_rows.into_iter().map(|(_, row)| row));
+        }
+
+        let registry_rows = overlay_scan_rows(
+            &base,
+            &staged,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                    branch_ids: branch_ids.iter().cloned().collect(),
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(false),
+                    ..Default::default()
+                },
+                projection: plugin_registry_live_state_projection(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut registry_rows_by_branch = BTreeMap::<String, MaterializedLiveStateRow>::new();
+        for row in registry_rows {
+            if registry_rows_by_branch
+                .insert(row.branch_id.clone(), row)
+                .is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "durable plugin registry lookup returned duplicate branch rows",
+                ));
+            }
+        }
+
+        let mut registries = BTreeMap::<String, PluginRegistry>::new();
+        let mut changed_registry_branches = BTreeSet::<String>::new();
+        for branch_id in &branch_ids {
+            registries.insert(
+                branch_id.clone(),
+                PluginRegistry::from_optional_live_state_row(
+                    registry_rows_by_branch.get(branch_id),
+                    branch_id,
+                )?,
+            );
+        }
+        for (key, mutation) in lifecycle {
+            let registry = registries
+                .get_mut(&key.branch_id)
+                .expect("lifecycle branch should have a loaded registry");
+            match mutation {
+                Some(plugin) => {
+                    registry.upsert(plugin)?;
+                }
+                None => {
+                    registry.remove(&key.plugin_key)?;
+                }
+            }
+            changed_registry_branches.insert(key.branch_id);
+        }
+        for row in input_rows {
+            if row.schema_key != REGISTERED_SCHEMA_KEY || row.global || row.untracked {
+                continue;
+            }
+            let Some(schema_key) = row
+                .entity_pk
+                .as_ref()
+                .and_then(|entity_pk| entity_pk.as_single_string().ok())
+            else {
+                continue;
+            };
+            let Some(plugin) = registries.get(&row.branch_id).and_then(|registry| {
+                registry
+                    .plugins()
+                    .iter()
+                    .find(|plugin| plugin.schema_keys().iter().any(|key| key == schema_key))
+            }) else {
+                continue;
+            };
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "registered schema '{schema_key}' is owned by active plugin '{}'; uninstall the plugin before migrating or deleting that schema",
+                    plugin.key()
+                ),
+            ));
+        }
+        for branch_id in changed_registry_branches {
+            reconciliation.rows.push(
+                registries
+                    .get(&branch_id)
+                    .expect("changed registry branch should remain loaded")
+                    .write_row(&branch_id)?,
+            );
+        }
+
+        // The dominant no-plugin path ends here. In particular, it does not
+        // inspect descriptors or owners left behind by an uninstall.
+        let active_branch_ids = branch_ids
+            .iter()
+            .filter(|branch_id| {
+                registries
+                    .get(*branch_id)
+                    .is_some_and(|registry| !registry.is_empty())
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if active_branch_ids.is_empty() && deleted_file_keys.is_empty() {
+            return Ok(reconciliation);
+        }
+
+        let owner_branch_ids = active_branch_ids
+            .iter()
+            .cloned()
+            .chain(deleted_file_keys.keys().map(|key| key.branch_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut candidate_file_ids = BTreeSet::<String>::new();
+        for write in file_data.iter() {
+            if write.global
+                || write.untracked
+                || !active_branch_ids.contains(&write.branch_id)
+                || write.path.as_deref().is_none_or(is_plugin_storage_path)
+            {
+                continue;
+            }
+            candidate_file_ids.insert(write.file_id.clone());
+        }
+        for key in deleted_file_keys.keys() {
+            candidate_file_ids.insert(key.file_id.clone());
+        }
+        if candidate_file_ids.is_empty() {
+            return Ok(reconciliation);
+        }
+
+        let owner_rows = overlay_scan_rows(
+            &base,
+            &staged,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+                    entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+                    branch_ids: owner_branch_ids.into_iter().collect(),
+                    file_ids: candidate_file_ids
+                        .iter()
+                        .cloned()
+                        .map(NullableKeyFilter::Value)
+                        .collect(),
+                    untracked: Some(false),
+                    ..Default::default()
+                },
+                projection: plugin_registry_live_state_projection(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
+        for row in owner_rows {
+            let branch_id = row.branch_id.clone();
+            let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
+                continue;
+            };
+            let key = PluginFileWriteKey {
+                branch_id,
+                global: false,
+                untracked: false,
+                file_id: owner.file_id().to_string(),
+            };
+            if owners.insert(key, owner).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "durable plugin owner lookup returned duplicate file rows",
+                ));
+            }
+        }
+
+        let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
+        for branch_id in &active_branch_ids {
+            let registry = registries
+                .get(branch_id)
+                .expect("active branch should have a registry");
+            catalogs.insert(
+                branch_id.clone(),
+                self.plugin_host.compiled_plugin_catalog(registry)?,
+            );
+        }
+
+        let mut selected_plugins = BTreeMap::<PluginFileWriteKey, PluginRegistryEntry>::new();
+        for write in file_data.iter() {
+            let Some(path) = write.path.as_deref() else {
+                continue;
+            };
+            if write.global
+                || write.untracked
+                || is_plugin_storage_path(path)
+                || !active_branch_ids.contains(&write.branch_id)
+            {
+                continue;
+            }
+            let Some(plugin) = catalogs
+                .get(&write.branch_id)
+                .and_then(|catalog| catalog.select_for_bytes(path, write.data()))
+            else {
+                continue;
+            };
+            selected_plugins.insert(PluginFileWriteKey::from(write), plugin.clone());
+        }
+
+        let mut state_groups = BTreeMap::<PluginStateGroupKey, PluginStateGroup>::new();
+        for (key, owner) in &owners {
+            let group_key = PluginStateGroupKey {
+                branch_id: key.branch_id.clone(),
+                plugin_key: owner.plugin_key().to_string(),
+            };
+            let group = state_groups.entry(group_key).or_default();
+            group.file_ids.insert(key.file_id.clone());
+            group
+                .schema_keys
+                .extend(owner.schema_keys().iter().cloned());
+            if let Some(selected) = selected_plugins.get(key)
+                && selected.key() == owner.plugin_key()
+            {
+                group
+                    .schema_keys
+                    .extend(selected.schema_keys().iter().cloned());
+            }
+        }
+        let mut state_by_file =
+            BTreeMap::<PluginStateFileKey, Vec<MaterializedLiveStateRow>>::new();
+        for (group_key, group) in state_groups {
+            let rows = overlay_scan_rows(
+                &base,
+                &staged,
+                &LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: group.schema_keys.into_iter().collect(),
+                        branch_ids: vec![group_key.branch_id.clone()],
+                        file_ids: group
+                            .file_ids
+                            .iter()
+                            .cloned()
+                            .map(NullableKeyFilter::Value)
+                            .collect(),
+                        untracked: Some(false),
+                        ..Default::default()
+                    },
+                    projection: plugin_state_live_state_projection(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            for row in rows {
+                let Some(file_id) = row.file_id.clone() else {
+                    continue;
+                };
+                state_by_file
+                    .entry(PluginStateFileKey {
+                        branch_id: group_key.branch_id.clone(),
+                        plugin_key: group_key.plugin_key.clone(),
+                        file_id,
+                    })
+                    .or_default()
+                    .push(row);
+            }
+        }
+
+        let mut selected_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
+        for (file_key, entry) in &selected_plugins {
+            selected_entries
+                .entry(PluginBranchEntryKey {
+                    branch_id: file_key.branch_id.clone(),
+                    plugin_key: entry.key().to_string(),
+                })
+                .or_insert_with(|| entry.clone());
+        }
+
+        // Resolve warm components by their fixed content hash before asking
+        // the CAS for bytes. Keep the returned Arc itself: another branch may
+        // concurrently replace the key-only cache with a different hash.
+        let mut component_instances =
+            BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentInstance>>::new();
+        let mut cold_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
+        for (key, entry) in selected_entries {
+            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            if let Some(instance) = self
+                .plugin_host
+                .cached_plugin_component(entry.key(), hash)?
+            {
+                component_instances.insert(key, instance);
+            } else {
+                cold_entries.insert(key, entry);
+            }
+        }
+
+        let mut wasm_by_hash = current_install_wasm;
+        let mut missing_hashes = Vec::<BlobHash>::new();
+        for entry in cold_entries.values() {
+            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
+                missing_hashes.push(hash);
+            }
+        }
+        if !missing_hashes.is_empty() {
+            let base_blob_reader = self.binary_cas.reader(read.clone());
+            let loaded = load_transaction_blob_bytes(
+                &base_blob_reader,
+                &self.staged_writes,
+                &missing_hashes,
+            )
+            .await?
+            .into_vec();
+            for (hash, bytes) in missing_hashes.into_iter().zip(loaded) {
+                let bytes = bytes.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "plugin registry references missing WASM blob '{}'",
+                            hash.to_hex()
+                        ),
+                    )
+                })?;
+                wasm_by_hash.insert(hash, bytes);
+            }
+        }
+        for (key, entry) in cold_entries {
+            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            let wasm = wasm_by_hash.get(&hash).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "plugin registry references unavailable WASM blob '{}'",
+                        hash.to_hex()
+                    ),
+                )
+            })?;
+            let plugin = entry.to_installed_plugin(wasm)?;
+            let instance =
+                crate::plugin::load_or_init_plugin_component(&self.plugin_host, &plugin).await?;
+            component_instances.insert(key, instance);
+        }
+
+        let mut reconciled_file_keys = BTreeSet::<PluginFileWriteKey>::new();
+        for write in file_data.iter() {
+            let Some(path) = write.path.as_deref() else {
+                continue;
+            };
+            if write.global
+                || write.untracked
+                || is_plugin_storage_path(path)
+                || !active_branch_ids.contains(&write.branch_id)
+            {
+                continue;
+            }
+            let file_key = PluginFileWriteKey::from(write);
+            let owner = owners.get(&file_key);
+            let selected = selected_plugins.get(&file_key);
+            let context = FilesystemRowContext {
+                branch_id: write.branch_id.clone(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: None,
+            };
+            let old_state = owner
+                .and_then(|owner| {
+                    state_by_file.get(&PluginStateFileKey {
+                        branch_id: write.branch_id.clone(),
+                        plugin_key: owner.plugin_key().to_string(),
+                        file_id: write.file_id.clone(),
+                    })
+                })
+                .cloned()
+                .unwrap_or_default();
+
+            if owner.is_some_and(|owner| {
+                selected.is_none_or(|selected| selected.key() != owner.plugin_key())
+            }) {
+                reconciliation.rows.extend(plugin_state_tombstone_rows(
+                    &old_state,
+                    &write.file_id,
+                    &context,
+                ));
+            }
+
+            let Some(selected) = selected else {
+                if owner.is_some() {
+                    reconciliation.rows.push(PluginFileOwner::delete_row(
+                        write.file_id.clone(),
+                        &write.branch_id,
+                    )?);
+                }
+                reconciled_file_keys.insert(file_key);
+                continue;
+            };
+            let installed_key = PluginBranchEntryKey {
+                branch_id: write.branch_id.clone(),
+                plugin_key: selected.key().to_string(),
+            };
+            let component = component_instances
+                .get(&installed_key)
+                .expect("selected plugin should have a resolved component");
+            let active_state = if owner.is_some_and(|owner| owner.plugin_key() == selected.key()) {
+                let selected_schema_keys = selected.schema_keys().iter().collect::<BTreeSet<_>>();
+                let obsolete_state = old_state
+                    .iter()
+                    .filter(|row| !selected_schema_keys.contains(&row.schema_key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                reconciliation.rows.extend(plugin_state_tombstone_rows(
+                    &obsolete_state,
+                    &write.file_id,
+                    &context,
+                ));
+                retain_plugin_state_rows_for_schema_keys(selected.schema_keys(), old_state)
+            } else {
+                Vec::new()
+            };
+            let changes = detect_changes_with_component_instance(
+                component,
+                &active_state,
+                WasmPluginFile {
+                    filename: write.filename.clone(),
+                    data: write.data().to_vec(),
+                },
+            )
+            .await?;
+            if write.had_blob_ref {
+                reconciliation.rows.push(blob_ref_tombstone_row(
+                    write.file_id.clone(),
+                    context.clone(),
+                ));
+            }
+            reconciliation.rows.extend(plugin_change_rows(
+                selected,
+                changes,
+                &write.file_id,
+                &context,
+                "plugin detect-changes",
+            )?);
+            let desired_owner =
+                PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?;
+            if plugin_owner_needs_write(owner, &desired_owner) {
+                reconciliation
+                    .rows
+                    .push(desired_owner.write_row(&write.branch_id)?);
+            }
+            reconciliation.file_keys.insert(file_key.clone());
+            reconciled_file_keys.insert(file_key);
+        }
+
+        for (file_key, metadata) in deleted_file_keys {
+            if reconciled_file_keys.contains(&file_key) {
+                continue;
+            }
+            let Some(owner) = owners.get(&file_key) else {
+                continue;
+            };
+            let active_state = state_by_file
+                .get(&PluginStateFileKey {
+                    branch_id: file_key.branch_id.clone(),
+                    plugin_key: owner.plugin_key().to_string(),
+                    file_id: file_key.file_id.clone(),
+                })
+                .cloned()
+                .unwrap_or_default();
+            let context = FilesystemRowContext {
+                branch_id: file_key.branch_id.clone(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata,
+            };
+            reconciliation.rows.extend(plugin_state_tombstone_rows(
+                &active_state,
+                &file_key.file_id,
+                &context,
+            ));
+            reconciliation.rows.push(PluginFileOwner::delete_row(
+                file_key.file_id,
+                &file_key.branch_id,
+            )?);
+        }
+
+        Ok(reconciliation)
     }
 
     async fn prepare_transaction_write(
@@ -1572,6 +2096,35 @@ fn transaction_path_index_cache_revision(
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
+
+fn reject_external_plugin_registry_rows(rows: &[TransactionWriteRow]) -> Result<(), LixError> {
+    for row in rows {
+        if row.schema_key != KEY_VALUE_SCHEMA_KEY {
+            continue;
+        }
+        let entity_key = row
+            .entity_pk
+            .as_ref()
+            .and_then(|entity_pk| entity_pk.as_single_string().ok());
+        let snapshot_key = row
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("key"))
+            .and_then(JsonValue::as_str);
+        let reserved = [entity_key, snapshot_key]
+            .into_iter()
+            .flatten()
+            .find(|key| matches!(*key, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY));
+        if let Some(key) = reserved {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!("'{key}' is reserved for engine-managed plugin state"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PluginFileWriteKey {
@@ -1603,48 +2156,97 @@ impl From<&TransactionFileData> for PluginFileWriteKey {
 }
 
 #[derive(Debug, Default)]
-struct PluginFileDataReconciliation {
+struct PluginWriteReconciliation {
     file_keys: BTreeSet<PluginFileWriteKey>,
     rows: Vec<TransactionWriteRow>,
 }
 
-/// The pre-write filesystem and plugin set for one branch during a single
-/// `RowsWithFileData` reconciliation pass.
-struct PluginReconciliationContext {
-    filesystem: FilesystemIndex,
-    installed_plugins: Vec<InstalledPlugin>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginLifecycleKey {
+    branch_id: String,
+    plugin_key: String,
 }
 
-fn plugin_archive_schema_rows_for_write(
-    write: &TransactionFileData,
-) -> Result<Option<Vec<TransactionWriteRow>>, LixError> {
-    let Some(path) = write.path.as_deref() else {
-        return Ok(None);
-    };
-    if !is_plugin_storage_path(path) {
-        return Ok(None);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginStateGroupKey {
+    branch_id: String,
+    plugin_key: String,
+}
+
+#[derive(Debug, Default)]
+struct PluginStateGroup {
+    file_ids: BTreeSet<String>,
+    schema_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginStateFileKey {
+    branch_id: String,
+    plugin_key: String,
+    file_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginBranchEntryKey {
+    branch_id: String,
+    plugin_key: String,
+}
+
+fn plugin_owner_needs_write(current: Option<&PluginFileOwner>, desired: &PluginFileOwner) -> bool {
+    current != Some(desired)
+}
+
+fn duplicate_plugin_lifecycle_mutation() -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        "a write batch may mutate each plugin archive at most once",
+    )
+}
+
+fn plugin_schema_collision_error(
+    plugin_key: &str,
+    entity_pk: &EntityPk,
+    other_plugin: Option<&String>,
+) -> LixError {
+    let schema_key = entity_pk
+        .as_single_string()
+        .unwrap_or("<invalid schema identity>");
+    let owner = other_plugin.map_or_else(
+        || "an existing registered schema".to_string(),
+        |other| format!("plugin '{other}'"),
+    );
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "plugin '{plugin_key}' schema '{schema_key}' conflicts with {owner}; shared schema keys must have identical definitions"
+        ),
+    )
+}
+
+fn mark_plugin_reconciliation_rows(rows: &mut [TransactionWriteRow]) {
+    for row in rows {
+        row.origin = Some(TransactionWriteOrigin {
+            surface: "plugin_reconciliation".to_string(),
+            operation: TransactionWriteOperation::Update,
+            primary_key: None,
+        });
     }
-    Ok(Some(plugin_schema_rows_from_archive_path(
-        path,
-        write.data(),
-        &write.branch_id,
-        write.global,
-        write.untracked,
-    )?))
 }
 
-fn is_plugin_reconciliation_candidate_path(path: &str) -> bool {
-    !is_plugin_storage_path(path)
+fn plugin_registry_live_state_projection() -> LiveStateProjection {
+    LiveStateProjection {
+        columns: vec!["snapshot_content".to_string()],
+    }
 }
 
 fn plugin_change_rows(
-    plugin: &InstalledPlugin,
+    plugin: &PluginRegistryEntry,
     changes: Vec<PluginDetectedChange>,
     file_id: &str,
     context: &FilesystemRowContext,
     json_context: &str,
 ) -> Result<Vec<TransactionWriteRow>, LixError> {
-    let schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
+    let schema_keys = plugin.schema_keys().iter().collect::<BTreeSet<_>>();
     changes
         .into_iter()
         .map(|change| {
@@ -1653,7 +2255,8 @@ fn plugin_change_rows(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
                         "plugin '{}' emitted schema key '{}' that is not declared in its manifest",
-                        plugin.key, change.schema_key
+                        plugin.key(),
+                        change.schema_key
                     ),
                 ));
             }
@@ -1887,6 +2490,23 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn plugin_owner_is_only_rewritten_when_its_durable_contract_changes() {
+        let current = PluginFileOwner::new("file-a", "plugin-a", vec!["schema-a".to_string()])
+            .expect("current owner should be valid");
+        assert!(!plugin_owner_needs_write(Some(&current), &current));
+        assert!(plugin_owner_needs_write(None, &current));
+
+        for desired in [
+            PluginFileOwner::new("file-a", "plugin-b", vec!["schema-a".to_string()])
+                .expect("changed plugin owner should be valid"),
+            PluginFileOwner::new("file-a", "plugin-a", vec!["schema-b".to_string()])
+                .expect("changed schema owner should be valid"),
+        ] {
+            assert!(plugin_owner_needs_write(Some(&current), &desired));
+        }
+    }
 
     #[tokio::test]
     #[ignore = "release-only transaction path-index benchmark probe"]
