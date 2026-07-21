@@ -28,6 +28,9 @@ pub struct WasmPluginDetectedChange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmLimits {
+    /// Maximum bytes available to each guest linear memory. With Wasmtime's
+    /// standard 64 KiB pages, non-page-aligned values permit only the complete
+    /// pages that fit below this bound.
     pub max_memory_bytes: u64,
     pub max_fuel: Option<u64>,
     pub timeout_ms: Option<u64>,
