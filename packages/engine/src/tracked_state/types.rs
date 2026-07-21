@@ -20,37 +20,19 @@ impl TrackedStateRootId {
 }
 
 /// Root-independent tracked entity primary key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateKey {
     pub(crate) schema_key: String,
-    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
 }
 
 /// Zero-copy view of primary tracked-state key.
-#[derive(Debug, Clone, Copy, musli::Encode)]
-#[musli(packed)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
-    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
     pub(crate) entity_pk: &'a EntityPk,
-}
-
-#[derive(Debug, Clone, Copy, musli::Encode)]
-#[musli(packed)]
-pub(crate) struct TrackedSchemaKeyPrefixRef<'a> {
-    pub(crate) schema_key: &'a str,
-}
-
-#[derive(Debug, Clone, Copy, musli::Encode)]
-#[musli(packed)]
-pub(crate) struct TrackedSchemaFilePrefixRef<'a> {
-    pub(crate) schema_key: &'a str,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) file_id: Option<&'a str>,
 }
 
 /// Zero-copy tracked-state commit-root delta prepared from changelog facts.
@@ -67,8 +49,7 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
 }
 
 /// Value stored in tracked-state commit-root trees.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateIndexValue {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
@@ -88,8 +69,7 @@ impl TrackedStateIndexValue {
 }
 
 /// Zero-copy view of a tracked-state commit-root value.
-#[derive(Debug, Clone, Copy, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateIndexValueRef {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,

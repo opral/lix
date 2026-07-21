@@ -113,12 +113,11 @@ impl TrackedStateTree {
         loop {
             match self.load_node(store, &current).await? {
                 DecodedNode::Leaf(leaf) => {
-                    let entry = leaf
-                        .entries()
-                        .binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_key))
-                        .ok()
-                        .map(|index| &leaf.entries()[index]);
-                    return entry.map(|entry| decode_value(&entry.value)).transpose();
+                    let entry = binary_search_leaf_key(&leaf, &encoded_key)?
+                        .map(|index| leaf.entry(index))
+                        .transpose()?
+                        .flatten();
+                    return entry.map(|entry| decode_value(entry.value)).transpose();
                 }
                 DecodedNode::Internal(internal) => {
                     let child = internal
@@ -173,7 +172,31 @@ impl TrackedStateTree {
 
         let ranges = scan_ranges(request);
         let key_decode_hint = scan_key_decode_hint(request, &ranges);
+        let row_capacity = if request.include_tombstones
+            && request.schema_keys.is_empty()
+            && request.entity_pks.is_empty()
+            && request.file_ids.is_empty()
+        {
+            let row_count = match self.load_node(store, root_id.as_bytes()).await? {
+                DecodedNode::Leaf(leaf) => Some(leaf.len() as u64),
+                DecodedNode::Internal(internal) => internal
+                    .children()
+                    .iter()
+                    .try_fold(0u64, |count, child| count.checked_add(child.subtree_count)),
+            };
+            row_count
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let mut rows = Vec::new();
+        let reserve = request
+            .limit
+            .map_or(row_capacity, |limit| limit.min(row_capacity));
+        // Subtree counts are storage data. A corrupt count must not turn a
+        // best-effort scan allocation hint into a capacity panic.
+        let _ = rows.try_reserve_exact(reserve);
         self.scan_node(
             store,
             *root_id.as_bytes(),
@@ -457,55 +480,7 @@ impl TrackedStateTree {
         }))
     }
 
-    fn diff_nodes<'a, S>(
-        &'a self,
-        store: &'a S,
-        left_hash: [u8; TRACKED_STATE_HASH_BYTES],
-        right_hash: [u8; TRACKED_STATE_HASH_BYTES],
-        request: &'a TrackedStateTreeScanRequest,
-        out: &'a mut Vec<TrackedStateTreeDiffEntry>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + 'a>>
-    where
-        S: StorageAdapterRead + 'a,
-    {
-        Box::pin(async move {
-            if left_hash == right_hash {
-                return Ok(());
-            }
-
-            let left = self.load_node(store, &left_hash).await?;
-            let right = self.load_node(store, &right_hash).await?;
-            match (left, right) {
-                (DecodedNode::Leaf(left), DecodedNode::Leaf(right)) => {
-                    self.diff_leaf_entries(left.entries(), right.entries(), request, out)?;
-                }
-                (DecodedNode::Internal(left), DecodedNode::Internal(right))
-                    if internal_boundaries_match(left.children(), right.children()) =>
-                {
-                    for (left_child, right_child) in left.children().iter().zip(right.children()) {
-                        if left_child == right_child {
-                            continue;
-                        }
-                        self.diff_nodes(
-                            store,
-                            left_child.child_hash,
-                            right_child.child_hash,
-                            request,
-                            out,
-                        )
-                        .await?;
-                    }
-                }
-                _ => {
-                    self.diff_leaf_summary_cursors(store, left_hash, right_hash, request, out)
-                        .await?;
-                }
-            }
-            Ok(())
-        })
-    }
-
-    async fn diff_leaf_summary_cursors(
+    async fn diff_nodes(
         &self,
         store: &impl StorageAdapterRead,
         left_hash: [u8; TRACKED_STATE_HASH_BYTES],
@@ -513,74 +488,133 @@ impl TrackedStateTree {
         request: &TrackedStateTreeScanRequest,
         out: &mut Vec<TrackedStateTreeDiffEntry>,
     ) -> Result<(), LixError> {
-        let mut left = LeafSummaryCursor::new(self, store, left_hash).await?;
-        let mut right = LeafSummaryCursor::new(self, store, right_hash).await?;
+        if left_hash == right_hash {
+            return Ok(());
+        }
+
+        let left = self.load_node(store, &left_hash).await?;
+        let right = self.load_node(store, &right_hash).await?;
+        if let (DecodedNode::Leaf(left), DecodedNode::Leaf(right)) = (&left, &right) {
+            return self.diff_decoded_leaves(left, right, request, out);
+        }
+
+        let mut left = node_diff_frontier(left_hash, left)?;
+        let mut right = node_diff_frontier(right_hash, right)?;
         let mut left_window = Vec::new();
         let mut right_window = Vec::new();
+        let mut left_loaded = None;
+        let mut right_loaded = None;
 
         loop {
-            match (left.current(), right.current()) {
-                (Some(left_leaf), Some(right_leaf)) if left_leaf == right_leaf => {
-                    self.diff_leaf_summary_window(store, &left_window, &right_window, request, out)
-                        .await?;
+            match (left.front().cloned(), right.front().cloned()) {
+                (Some(left_node), Some(right_node))
+                    if left_node.child_hash == right_node.child_hash =>
+                {
+                    self.diff_leaf_entries(&left_window, &right_window, request, out)?;
                     left_window.clear();
                     right_window.clear();
-                    left.advance(self, store).await?;
-                    right.advance(self, store).await?;
+                    left.pop_front();
+                    right.pop_front();
+                    left_loaded = None;
+                    right_loaded = None;
                 }
-                (Some(left_leaf), Some(right_leaf)) => {
-                    match left_leaf.last_key.cmp(&right_leaf.last_key) {
-                        std::cmp::Ordering::Less => {
-                            left_window.push(left_leaf.clone());
-                            left.advance(self, store).await?;
+                (Some(left_summary), Some(right_summary)) => {
+                    let left_node = match left_loaded.take() {
+                        Some(node) => node,
+                        None => self.load_node(store, &left_summary.child_hash).await?,
+                    };
+                    let right_node = match right_loaded.take() {
+                        Some(node) => node,
+                        None => self.load_node(store, &right_summary.child_hash).await?,
+                    };
+                    match (left_node, right_node) {
+                        (DecodedNode::Internal(left_node), DecodedNode::Internal(right_node)) => {
+                            replace_front_with_children(&mut left, left_node.into_children())?;
+                            replace_front_with_children(&mut right, right_node.into_children())?;
                         }
-                        std::cmp::Ordering::Greater => {
-                            right_window.push(right_leaf.clone());
-                            right.advance(self, store).await?;
+                        (DecodedNode::Internal(left_node), right_node @ DecodedNode::Leaf(_)) => {
+                            replace_front_with_children(&mut left, left_node.into_children())?;
+                            right_loaded = Some(right_node);
                         }
-                        std::cmp::Ordering::Equal => {
-                            left_window.push(left_leaf.clone());
-                            right_window.push(right_leaf.clone());
-                            left.advance(self, store).await?;
-                            right.advance(self, store).await?;
+                        (left_node @ DecodedNode::Leaf(_), DecodedNode::Internal(right_node)) => {
+                            left_loaded = Some(left_node);
+                            replace_front_with_children(&mut right, right_node.into_children())?;
+                        }
+                        (DecodedNode::Leaf(left_node), DecodedNode::Leaf(right_node)) => {
+                            match left_summary.last_key.cmp(&right_summary.last_key) {
+                                std::cmp::Ordering::Less => {
+                                    left_window.extend(left_node.into_entries());
+                                    left.pop_front();
+                                    right_loaded = Some(DecodedNode::Leaf(right_node));
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    left_loaded = Some(DecodedNode::Leaf(left_node));
+                                    right_window.extend(right_node.into_entries());
+                                    right.pop_front();
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    left.pop_front();
+                                    right.pop_front();
+                                    if left_window.is_empty() && right_window.is_empty() {
+                                        self.diff_decoded_leaves(
+                                            &left_node,
+                                            &right_node,
+                                            request,
+                                            out,
+                                        )?;
+                                    } else {
+                                        left_window.extend(left_node.into_entries());
+                                        right_window.extend(right_node.into_entries());
+                                        self.diff_leaf_entries(
+                                            &left_window,
+                                            &right_window,
+                                            request,
+                                            out,
+                                        )?;
+                                        left_window.clear();
+                                        right_window.clear();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                (Some(left_leaf), None) => {
-                    left_window.push(left_leaf.clone());
-                    left.advance(self, store).await?;
+                (Some(left_summary), None) => {
+                    let left_node = match left_loaded.take() {
+                        Some(node) => node,
+                        None => self.load_node(store, &left_summary.child_hash).await?,
+                    };
+                    match left_node {
+                        DecodedNode::Internal(node) => {
+                            replace_front_with_children(&mut left, node.into_children())?;
+                        }
+                        DecodedNode::Leaf(node) => {
+                            left_window.extend(node.into_entries());
+                            left.pop_front();
+                        }
+                    }
                 }
-                (None, Some(right_leaf)) => {
-                    right_window.push(right_leaf.clone());
-                    right.advance(self, store).await?;
+                (None, Some(right_summary)) => {
+                    let right_node = match right_loaded.take() {
+                        Some(node) => node,
+                        None => self.load_node(store, &right_summary.child_hash).await?,
+                    };
+                    match right_node {
+                        DecodedNode::Internal(node) => {
+                            replace_front_with_children(&mut right, node.into_children())?;
+                        }
+                        DecodedNode::Leaf(node) => {
+                            right_window.extend(node.into_entries());
+                            right.pop_front();
+                        }
+                    }
                 }
                 (None, None) => {
-                    self.diff_leaf_summary_window(store, &left_window, &right_window, request, out)
-                        .await?;
+                    self.diff_leaf_entries(&left_window, &right_window, request, out)?;
                     return Ok(());
                 }
             }
         }
-    }
-
-    async fn diff_leaf_summary_window(
-        &self,
-        store: &impl StorageAdapterRead,
-        left_leaves: &[ChildSummary],
-        right_leaves: &[ChildSummary],
-        request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
-    ) -> Result<(), LixError> {
-        if left_leaves.is_empty() && right_leaves.is_empty() {
-            return Ok(());
-        }
-        let left_entries = self
-            .collect_entries_from_leaf_summaries(store, left_leaves)
-            .await?;
-        let right_entries = self
-            .collect_entries_from_leaf_summaries(store, right_leaves)
-            .await?;
-        self.diff_leaf_entries(&left_entries, &right_entries, request, out)
     }
 
     fn diff_leaf_entries(
@@ -595,18 +629,18 @@ impl TrackedStateTree {
         while left_index < left.len() && right_index < right.len() {
             match left[left_index].key.cmp(&right[right_index].key) {
                 std::cmp::Ordering::Less => {
-                    self.push_removed_diff(&left[left_index], request, out)?;
+                    self.push_removed_diff(left[left_index].as_ref(), request, out)?;
                     left_index += 1;
                 }
                 std::cmp::Ordering::Greater => {
-                    self.push_added_diff(&right[right_index], request, out)?;
+                    self.push_added_diff(right[right_index].as_ref(), request, out)?;
                     right_index += 1;
                 }
                 std::cmp::Ordering::Equal => {
                     if left[left_index].value != right[right_index].value {
                         self.push_modified_diff(
-                            &left[left_index],
-                            &right[right_index],
+                            left[left_index].as_ref(),
+                            right[right_index].as_ref(),
                             request,
                             out,
                         )?;
@@ -617,10 +651,51 @@ impl TrackedStateTree {
             }
         }
         for entry in &left[left_index..] {
-            self.push_removed_diff(entry, request, out)?;
+            self.push_removed_diff(entry.as_ref(), request, out)?;
         }
         for entry in &right[right_index..] {
-            self.push_added_diff(entry, request, out)?;
+            self.push_added_diff(entry.as_ref(), request, out)?;
+        }
+        Ok(())
+    }
+
+    fn diff_decoded_leaves(
+        &self,
+        left: &DecodedLeafNodeRef,
+        right: &DecodedLeafNodeRef,
+        request: &TrackedStateTreeScanRequest,
+        out: &mut Vec<TrackedStateTreeDiffEntry>,
+    ) -> Result<(), LixError> {
+        let mut left_index = 0usize;
+        let mut right_index = 0usize;
+        while left_index < left.len() && right_index < right.len() {
+            let left_entry = decoded_leaf_entry(left, left_index)?;
+            let right_entry = decoded_leaf_entry(right, right_index)?;
+            match left_entry.key.cmp(right_entry.key) {
+                std::cmp::Ordering::Less => {
+                    self.push_removed_diff(left_entry, request, out)?;
+                    left_index += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    self.push_added_diff(right_entry, request, out)?;
+                    right_index += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    if left_entry.value != right_entry.value {
+                        self.push_modified_diff(left_entry, right_entry, request, out)?;
+                    }
+                    left_index += 1;
+                    right_index += 1;
+                }
+            }
+        }
+        while left_index < left.len() {
+            self.push_removed_diff(decoded_leaf_entry(left, left_index)?, request, out)?;
+            left_index += 1;
+        }
+        while right_index < right.len() {
+            self.push_added_diff(decoded_leaf_entry(right, right_index)?, request, out)?;
+            right_index += 1;
         }
         Ok(())
     }
@@ -628,7 +703,7 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_removed_diff(
         &self,
-        entry: &EncodedLeafEntry,
+        entry: EncodedLeafEntryRef<'_>,
         request: &TrackedStateTreeScanRequest,
         out: &mut Vec<TrackedStateTreeDiffEntry>,
     ) -> Result<(), LixError> {
@@ -645,7 +720,7 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_added_diff(
         &self,
-        entry: &EncodedLeafEntry,
+        entry: EncodedLeafEntryRef<'_>,
         request: &TrackedStateTreeScanRequest,
         out: &mut Vec<TrackedStateTreeDiffEntry>,
     ) -> Result<(), LixError> {
@@ -662,8 +737,8 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_modified_diff(
         &self,
-        left: &EncodedLeafEntry,
-        right: &EncodedLeafEntry,
+        left: EncodedLeafEntryRef<'_>,
+        right: EncodedLeafEntryRef<'_>,
         request: &TrackedStateTreeScanRequest,
         out: &mut Vec<TrackedStateTreeDiffEntry>,
     ) -> Result<(), LixError> {
@@ -867,9 +942,9 @@ impl TrackedStateTree {
                 .load_node_with_overlay(store, overlay, &current)
                 .await?
             {
-                DecodedNode::Leaf(leaf) => break leaf.entries().to_vec(),
+                DecodedNode::Leaf(leaf) => break leaf.into_entries(),
                 DecodedNode::Internal(internal) => {
-                    let children = internal.children().to_vec();
+                    let children = internal.into_children();
                     let child_index = children
                         .iter()
                         .position(|child| child.last_key.as_slice() >= encoded_key.as_slice())
@@ -989,12 +1064,17 @@ impl TrackedStateTree {
                 child_index..child_index + old_child_count,
                 replacement_children,
             );
-            replacement_children = self.build_internal_level(children, parent_level, &mut chunks);
+            let promoted_root = path.is_empty() && children.len() == 1;
+            replacement_children = if promoted_root {
+                children
+            } else {
+                self.build_internal_level(children, parent_level, &mut chunks)
+            };
             old_child_count = 1;
 
             let Some(frame) = path.pop() else {
                 let mut summaries = replacement_children;
-                let mut tree_height = parent_level + 1;
+                let mut tree_height = parent_level + usize::from(!promoted_root);
                 while summaries.len() > 1 {
                     summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
                     tree_height += 1;
@@ -1075,9 +1155,23 @@ impl TrackedStateTree {
     #[expect(clippy::cast_possible_truncation)]
     fn build_tree_from_leaf_summaries(
         &self,
-        leaf_summaries: Vec<ChildSummary>,
+        mut leaf_summaries: Vec<ChildSummary>,
         mut chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
     ) -> Result<BuiltTree, LixError> {
+        if leaf_summaries.len() > 1 {
+            // The one empty leaf is the canonical empty-tree root, not a
+            // child that can coexist with live rows. Append-only patching can
+            // retain that sentinel beside newly built leaves unless it is
+            // removed here.
+            if leaf_summaries
+                .iter()
+                .any(|summary| summary.subtree_count != 0)
+            {
+                leaf_summaries.retain(|summary| summary.subtree_count != 0);
+            } else {
+                leaf_summaries.truncate(1);
+            }
+        }
         let row_count = leaf_summaries
             .iter()
             .map(|summary| summary.subtree_count as usize)
@@ -1124,8 +1218,24 @@ impl TrackedStateTree {
         let mut child_start = leaf_start;
         let mut old_child_count = old_leaf_count;
         let mut replacement_children = replacement_leaves;
+        let mut tree_height = levels.len();
 
         for level in 0..levels.len() - 1 {
+            if level + 2 == levels.len() {
+                let mut root_children = levels[level].clone();
+                root_children.splice(
+                    child_start..child_start + old_child_count,
+                    replacement_children,
+                );
+                if root_children.len() == 1 {
+                    replacement_children = root_children;
+                    tree_height -= 1;
+                } else {
+                    replacement_children =
+                        self.build_internal_level(root_children, level + 1, &mut chunks);
+                }
+                break;
+            }
             let patch = self.patch_parent_level(
                 &levels[level],
                 &levels[level + 1],
@@ -1142,7 +1252,6 @@ impl TrackedStateTree {
         }
 
         let mut summaries = replacement_children;
-        let mut tree_height = levels.len();
         while summaries.len() > 1 {
             summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
             tree_height += 1;
@@ -1395,7 +1504,7 @@ impl TrackedStateTree {
             let mut next = Vec::new();
             for hash in current {
                 match self.load_node_with_overlay(store, overlay, &hash).await? {
-                    DecodedNode::Leaf(leaf) => out.extend(leaf.entries().iter().cloned()),
+                    DecodedNode::Leaf(leaf) => out.extend(leaf.into_entries()),
                     DecodedNode::Internal(internal) => {
                         next.extend(internal.children().iter().map(|child| child.child_hash));
                     }
@@ -1461,9 +1570,10 @@ impl TrackedStateTree {
                         else {
                             continue;
                         };
-                        if key_decode_hint.is_some() || request.matches(&key, &value) {
-                            rows.push((key, value));
-                        }
+                        // Encoded ranges or key_matches_scan_filters already
+                        // proved the key predicates, and decode_visible_value
+                        // already enforced tombstone visibility.
+                        rows.push((key, value));
                     }
                 }
                 DecodedNodeRef::Internal(internal) => {
@@ -1556,18 +1666,6 @@ impl TrackedStateTree {
         })
     }
 
-    async fn collect_entries_from_leaf_summaries(
-        &self,
-        store: &impl StorageAdapterRead,
-        leaves: &[ChildSummary],
-    ) -> Result<Vec<EncodedLeafEntry>, LixError> {
-        let mut entries = Vec::new();
-        for leaf in leaves {
-            entries.extend(self.load_leaf_entries(store, &leaf.child_hash).await?);
-        }
-        Ok(entries)
-    }
-
     async fn collect_summary_levels_with_overlay(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -1598,7 +1696,7 @@ impl TrackedStateTree {
         Box::pin(async move {
             match self.load_node_with_overlay(store, overlay, &hash).await? {
                 DecodedNode::Leaf(leaf) => {
-                    let summary = leaf_summary(hash, leaf.entries());
+                    let summary = decoded_leaf_summary(hash, &leaf);
                     push_level_summary(levels, 0, summary.clone());
                     Ok((summary, 0))
                 }
@@ -1643,20 +1741,6 @@ impl TrackedStateTree {
         })
     }
 
-    async fn load_leaf_entries(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        hash: &[u8; TRACKED_STATE_HASH_BYTES],
-    ) -> Result<Vec<EncodedLeafEntry>, LixError> {
-        match self.load_node(store, hash).await? {
-            DecodedNode::Leaf(leaf) => Ok(leaf.entries().to_vec()),
-            DecodedNode::Internal(_) => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state expected leaf chunk but found internal node",
-            )),
-        }
-    }
-
     async fn load_leaf_entries_with_overlay(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -1664,7 +1748,7 @@ impl TrackedStateTree {
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         match self.load_node_with_overlay(store, overlay, hash).await? {
-            DecodedNode::Leaf(leaf) => Ok(leaf.entries().to_vec()),
+            DecodedNode::Leaf(leaf) => Ok(leaf.into_entries()),
             DecodedNode::Internal(_) => Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked-state expected leaf chunk but found internal node",
@@ -1762,7 +1846,7 @@ struct ScanKeyDecodeHint<'a> {
 }
 
 fn binary_search_leaf_key(
-    leaf: &DecodedLeafNodeRef<'_>,
+    leaf: &DecodedLeafNodeRef,
     encoded_key: &[u8],
 ) -> Result<Option<usize>, LixError> {
     let mut low = 0usize;
@@ -1782,113 +1866,6 @@ fn binary_search_leaf_key(
         }
     }
     Ok(None)
-}
-
-struct LeafSummaryCursor {
-    stack: Vec<LeafSummaryCursorFrame>,
-    current: Option<ChildSummary>,
-}
-
-struct LeafSummaryCursorFrame {
-    children: Vec<ChildSummary>,
-    next_index: usize,
-    children_are_leaves: bool,
-}
-
-impl LeafSummaryCursor {
-    async fn new(
-        tree: &TrackedStateTree,
-        store: &impl StorageAdapterRead,
-        root_hash: [u8; TRACKED_STATE_HASH_BYTES],
-    ) -> Result<Self, LixError> {
-        let mut cursor = Self {
-            stack: Vec::new(),
-            current: None,
-        };
-        match tree.load_node(store, &root_hash).await? {
-            DecodedNode::Leaf(leaf) => {
-                cursor.current = Some(leaf_summary(root_hash, leaf.entries()));
-            }
-            DecodedNode::Internal(internal) => {
-                let children = internal.children().to_vec();
-                let children_are_leaves =
-                    child_summaries_are_leaves(tree, store, &children).await?;
-                cursor.stack.push(LeafSummaryCursorFrame {
-                    children,
-                    next_index: 0,
-                    children_are_leaves,
-                });
-                cursor.advance(tree, store).await?;
-            }
-        }
-        Ok(cursor)
-    }
-
-    fn current(&self) -> Option<&ChildSummary> {
-        self.current.as_ref()
-    }
-
-    async fn advance(
-        &mut self,
-        tree: &TrackedStateTree,
-        store: &impl StorageAdapterRead,
-    ) -> Result<(), LixError> {
-        self.current = None;
-        while let Some(frame) = self.stack.last_mut() {
-            if frame.next_index >= frame.children.len() {
-                self.stack.pop();
-                continue;
-            }
-
-            let next = frame.children[frame.next_index].clone();
-            let next_is_leaf = frame.children_are_leaves;
-            frame.next_index += 1;
-            if next_is_leaf {
-                self.current = Some(next);
-                return Ok(());
-            }
-            self.descend_to_leaf(tree, store, next).await?;
-            return Ok(());
-        }
-        Ok(())
-    }
-
-    async fn descend_to_leaf(
-        &mut self,
-        tree: &TrackedStateTree,
-        store: &impl StorageAdapterRead,
-        mut summary: ChildSummary,
-    ) -> Result<(), LixError> {
-        loop {
-            match tree.load_node(store, &summary.child_hash).await? {
-                DecodedNode::Leaf(_) => {
-                    self.current = Some(summary);
-                    return Ok(());
-                }
-                DecodedNode::Internal(internal) => {
-                    let children = internal.children().to_vec();
-                    let children_are_leaves =
-                        child_summaries_are_leaves(tree, store, &children).await?;
-                    let Some(first_child) = children.first().cloned() else {
-                        return Err(LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            "tracked-state internal node has no children",
-                        ));
-                    };
-                    self.stack.push(LeafSummaryCursorFrame {
-                        children,
-                        next_index: 1,
-                        children_are_leaves,
-                    });
-                    if children_are_leaves {
-                        self.current = Some(first_child);
-                        return Ok(());
-                    }
-                    summary = first_child;
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -2146,31 +2123,63 @@ fn first_resync_index(
     None
 }
 
-fn internal_boundaries_match(left: &[ChildSummary], right: &[ChildSummary]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.first_key == right.first_key && left.last_key == right.last_key
-        })
+fn node_diff_frontier(
+    hash: [u8; TRACKED_STATE_HASH_BYTES],
+    node: DecodedNode,
+) -> Result<VecDeque<ChildSummary>, LixError> {
+    match node {
+        DecodedNode::Leaf(leaf) => Ok(VecDeque::from([decoded_leaf_summary(hash, &leaf)])),
+        DecodedNode::Internal(internal) => {
+            let children = internal.into_children();
+            if children.is_empty() {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state internal node has no children",
+                ));
+            }
+            Ok(children.into())
+        }
+    }
 }
 
-async fn child_summaries_are_leaves(
-    tree: &TrackedStateTree,
-    store: &impl StorageAdapterRead,
-    children: &[ChildSummary],
-) -> Result<bool, LixError> {
-    let Some(first_child) = children.first() else {
-        return Ok(false);
-    };
-    Ok(matches!(
-        tree.load_node(store, &first_child.child_hash).await?,
-        DecodedNode::Leaf(_)
-    ))
+fn replace_front_with_children(
+    frontier: &mut VecDeque<ChildSummary>,
+    children: Vec<ChildSummary>,
+) -> Result<(), LixError> {
+    if children.is_empty() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state internal node has no children",
+        ));
+    }
+    frontier.pop_front().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state diff frontier unexpectedly became empty",
+        )
+    })?;
+    for child in children.into_iter().rev() {
+        frontier.push_front(child);
+    }
+    Ok(())
+}
+
+fn decoded_leaf_entry(
+    leaf: &DecodedLeafNodeRef,
+    index: usize,
+) -> Result<EncodedLeafEntryRef<'_>, LixError> {
+    leaf.entry(index)?.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf entry disappeared during diff",
+        )
+    })
 }
 
 fn decode_entry(
-    entry: &EncodedLeafEntry,
+    entry: EncodedLeafEntryRef<'_>,
 ) -> Result<(TrackedStateKey, TrackedStateIndexValue), LixError> {
-    Ok((decode_key(&entry.key)?, decode_value(&entry.value)?))
+    Ok((decode_key(entry.key)?, decode_value(entry.value)?))
 }
 
 fn parent_index_for_child_index(
@@ -2218,21 +2227,15 @@ fn child_range_for_parent(
     Ok(start..end)
 }
 
-fn leaf_summary(
+fn decoded_leaf_summary(
     hash: [u8; TRACKED_STATE_HASH_BYTES],
-    entries: &[EncodedLeafEntry],
+    leaf: &DecodedLeafNodeRef,
 ) -> ChildSummary {
     ChildSummary {
-        first_key: entries
-            .first()
-            .map(|entry| entry.key.clone())
-            .unwrap_or_default(),
-        last_key: entries
-            .last()
-            .map(|entry| entry.key.clone())
-            .unwrap_or_default(),
+        first_key: leaf.first_key().map(<[u8]>::to_vec).unwrap_or_default(),
+        last_key: leaf.last_key().map(<[u8]>::to_vec).unwrap_or_default(),
         child_hash: hash,
-        subtree_count: entries.len() as u64,
+        subtree_count: leaf.len() as u64,
     }
 }
 
@@ -2422,6 +2425,7 @@ fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
@@ -2430,7 +2434,7 @@ mod tests {
     use crate::entity_pk::EntityPk;
     use crate::storage::{
         GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ScanChunk, ScanOptions, SpaceId,
-        StorageError, StorageRead,
+        Storage, StorageError, StorageRead,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
@@ -2441,6 +2445,38 @@ mod tests {
         bytes: Vec<u8>,
         storage_reads: Arc<AtomicUsize>,
         corrupt_first_read: bool,
+    }
+
+    struct CountingStorageRead<R> {
+        read: R,
+        tree_chunk_reads: Arc<AtomicUsize>,
+    }
+
+    impl<R> StorageRead for CountingStorageRead<R>
+    where
+        R: StorageRead,
+    {
+        fn get_many(
+            &self,
+            space: SpaceId,
+            keys: &[Key],
+            opts: GetOptions,
+        ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+            if space == storage::TRACKED_STATE_TREE_CHUNK_SPACE.id {
+                self.tree_chunk_reads
+                    .fetch_add(keys.len(), Ordering::Relaxed);
+            }
+            self.read.get_many(space, keys, opts)
+        }
+
+        fn scan(
+            &self,
+            space: SpaceId,
+            range: KeyRange,
+            opts: ScanOptions,
+        ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+            self.read.scan(space, range, opts)
+        }
     }
 
     impl StorageRead for CountingChunkRead {
@@ -2567,6 +2603,292 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_diff_reads_only_the_changed_path() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        let builder = TrackedStateTree::new();
+        let rows = (0..10_000)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("entity-{index:05}")),
+                    value(&format!("change-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = apply_mutations_for_test(&builder, &storage, None, rows, None)
+            .await
+            .expect("base should build");
+        let updated = apply_mutations_for_test(
+            &builder,
+            &storage,
+            Some(&base.root_id),
+            vec![mutation_owned(
+                key("schema", None, "entity-05000"),
+                value("change-updated", Some("{}")),
+            )],
+            None,
+        )
+        .await
+        .expect("sparse update should build");
+        assert_eq!(base.tree_height, updated.tree_height);
+        assert!(base.tree_height > 1, "fixture must have internal nodes");
+        let inserted = apply_mutations_for_test(
+            &builder,
+            &storage,
+            Some(&base.root_id),
+            vec![mutation_owned(
+                key("schema", None, "entity-10000"),
+                value("change-inserted", Some("{}")),
+            )],
+            None,
+        )
+        .await
+        .expect("sparse append should build");
+
+        let tree_chunk_reads = Arc::new(AtomicUsize::new(0));
+        let read = memory
+            .begin_read(crate::storage::ReadOptions::default())
+            .await
+            .expect("read should open");
+        let store = StorageAdapterReadScope::new(CountingStorageRead {
+            read,
+            tree_chunk_reads: Arc::clone(&tree_chunk_reads),
+        });
+        let cold_tree = TrackedStateTree::new();
+        let request = TrackedStateTreeScanRequest::default();
+
+        let identical = cold_tree
+            .diff(&store, Some(&base.root_id), Some(&base.root_id), &request)
+            .await
+            .expect("identical-root diff should run");
+        assert!(identical.is_empty());
+        assert_eq!(tree_chunk_reads.load(Ordering::Relaxed), 0);
+
+        let sparse = cold_tree
+            .diff(
+                &store,
+                Some(&base.root_id),
+                Some(&updated.root_id),
+                &request,
+            )
+            .await
+            .expect("sparse diff should run");
+        assert_eq!(sparse.len(), 1);
+        assert_eq!(
+            tree_chunk_reads.load(Ordering::Relaxed),
+            base.tree_height * 2,
+            "one value update should read one node from each root per level"
+        );
+
+        tree_chunk_reads.store(0, Ordering::Relaxed);
+        let cold_insert_tree = TrackedStateTree::new();
+        let inserted_diff = cold_insert_tree
+            .diff(
+                &store,
+                Some(&base.root_id),
+                Some(&inserted.root_id),
+                &request,
+            )
+            .await
+            .expect("sparse append diff should run");
+        assert_eq!(inserted_diff.len(), 1);
+        let insert_reads = tree_chunk_reads.load(Ordering::Relaxed);
+        let max_height = base.tree_height.max(inserted.tree_height);
+        assert!(
+            insert_reads <= max_height * 2 + 4,
+            "one appended key read {insert_reads} chunks across height {max_height}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hierarchical_diff_matches_naive_diff_across_shifted_boundaries() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 128,
+            max_chunk_bytes: 512,
+        });
+        let base_rows = (0..512usize)
+            .map(|index| {
+                (
+                    key("schema", None, &format!("entity-{:05}", index * 2)),
+                    value(&format!("base-change-{index}"), Some("{}")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let base = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            base_rows
+                .iter()
+                .map(|(key, value)| mutation(key, value))
+                .collect(),
+            None,
+        )
+        .await
+        .expect("deep base should build");
+        assert!(
+            base.tree_height >= 4,
+            "fixture must exercise a deep hierarchy, got height {}",
+            base.tree_height
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        let levels = tree
+            .collect_summary_levels_with_overlay(&read, &overlay, &base.root_id)
+            .await
+            .expect("summary levels should load");
+        let leaf_summaries = levels.first().expect("base should have a leaf level");
+        assert!(leaf_summaries.len() > 2, "fixture needs several leaves");
+        let boundary_key = decode_key(&leaf_summaries[leaf_summaries.len() / 2].last_key)
+            .expect("leaf boundary key should decode");
+        let boundary_number = boundary_key
+            .entity_pk
+            .as_single_string()
+            .expect("fixture key should be scalar")
+            .strip_prefix("entity-")
+            .expect("fixture key should have its prefix")
+            .parse::<usize>()
+            .expect("fixture key suffix should be numeric");
+        let boundary_insert_number = boundary_number + 1;
+        let middle_insert_number = if boundary_insert_number == 501 {
+            503
+        } else {
+            501
+        };
+
+        let mut changed_rows = base_rows.clone();
+        assert!(
+            changed_rows.remove(&boundary_key).is_some(),
+            "selected boundary key must exist in the base"
+        );
+        changed_rows.insert(
+            key(
+                "schema",
+                None,
+                &format!("entity-{boundary_insert_number:05}"),
+            ),
+            value("boundary-insert", Some("{}")),
+        );
+        changed_rows.insert(
+            key("schema", None, "entity--prepend"),
+            value("prepend-insert", Some("{}")),
+        );
+        changed_rows.insert(
+            key("schema", None, &format!("entity-{middle_insert_number:05}")),
+            value("middle-insert", Some("{}")),
+        );
+        changed_rows.insert(
+            key("schema", None, "entity-99999"),
+            value("append-insert", Some("{}")),
+        );
+        changed_rows.insert(
+            key("schema", None, "entity-00020"),
+            value("updated-existing", Some("{}")),
+        );
+        changed_rows.insert(
+            key("schema", None, "entity-00040"),
+            value("tombstoned-existing", None),
+        );
+
+        let changed = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            changed_rows
+                .iter()
+                .map(|(key, value)| mutation(key, value))
+                .collect(),
+            None,
+        )
+        .await
+        .expect("changed tree should build");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("diff read should open");
+        let actual = TrackedStateTree::with_options(tree.options.clone())
+            .diff(
+                &read,
+                Some(&base.root_id),
+                Some(&changed.root_id),
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .expect("hierarchical diff should run");
+        let expected = naive_tree_diff(&base_rows, &changed_rows);
+
+        assert_eq!(
+            actual, expected,
+            "frontier diff must match ordered map diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn hierarchical_diff_handles_root_height_transition() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 128,
+            max_chunk_bytes: 512,
+        });
+        let mut previous: Option<TrackedStateApplyResult> = None;
+        let mut transition = None;
+
+        for index in 0..2_048usize {
+            let inserted_key = key("schema", None, &format!("entity-{index:05}"));
+            let inserted_value = value(&format!("change-{index}"), Some("{}"));
+            let next = apply_mutations_for_test(
+                &tree,
+                &storage,
+                previous.as_ref().map(|result| &result.root_id),
+                vec![mutation(&inserted_key, &inserted_value)],
+                None,
+            )
+            .await
+            .expect("incremental append should build");
+            if let Some(before) = previous.as_ref()
+                && before.tree_height >= 3
+                && next.tree_height > before.tree_height
+            {
+                transition = Some((before.clone(), next.clone(), inserted_key, inserted_value));
+                break;
+            }
+            previous = Some(next);
+        }
+
+        let (before, after, inserted_key, inserted_value) =
+            transition.expect("fixture should cross a root-height boundary");
+        assert_eq!(after.tree_height, before.tree_height + 1);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("diff read should open");
+        let actual = TrackedStateTree::with_options(tree.options.clone())
+            .diff(
+                &read,
+                Some(&before.root_id),
+                Some(&after.root_id),
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .expect("height-mismatched diff should run");
+
+        assert_eq!(
+            actual,
+            vec![TrackedStateTreeDiffEntry {
+                before: None,
+                after: Some((inserted_key, inserted_value)),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn exact_read_roundtrips_from_applied_root() {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
@@ -2587,6 +2909,91 @@ mod tests {
                 .expect("row should load"),
             Some(value)
         );
+    }
+
+    #[tokio::test]
+    async fn v3_keys_route_through_multilevel_gets_and_prefix_scans() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 128,
+            max_chunk_bytes: 512,
+        });
+        let rows = (0..96usize)
+            .map(|index| {
+                let schema_key = match index % 3 {
+                    0 => "schema",
+                    1 => "schema\0",
+                    _ => "schéma",
+                };
+                let file_id = match index % 4 {
+                    0 => None,
+                    1 => Some(""),
+                    2 => Some("file\0"),
+                    _ => Some("文件"),
+                };
+                let entity_pk = if index % 2 == 0 {
+                    EntityPk::single(format!("entity\0{index:03}"))
+                } else {
+                    EntityPk {
+                        parts: vec![format!("entity-{index:03}"), "尾\0".to_string()],
+                    }
+                };
+                let key = TrackedStateKey {
+                    schema_key: schema_key.to_string(),
+                    file_id: file_id.map(str::to_string),
+                    entity_pk,
+                };
+                let value = value(&format!("change-{index}"), Some("{}"));
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let mutations = rows
+            .iter()
+            .map(|(key, value)| mutation(key, value))
+            .collect();
+        let result = apply_mutations_for_test(&tree, &storage, None, mutations, None)
+            .await
+            .expect("v3-key mutations should apply");
+        assert!(
+            result.tree_height > 1,
+            "fixture must exercise internal nodes"
+        );
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let keys = rows.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            tree.get_many(&store, &result.root_id, &keys)
+                .await
+                .expect("all exact keys should load"),
+            rows.iter()
+                .map(|(_, value)| Some(value.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        let scanned = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema\0".to_string()],
+                    file_ids: vec![NullableKeyFilter::Value(String::new())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("schema/file prefix scan should succeed");
+        let expected = rows
+            .iter()
+            .filter(|(key, _)| key.schema_key == "schema\0" && key.file_id.as_deref() == Some(""))
+            .count();
+        assert_eq!(scanned.len(), expected);
+        assert!(scanned.iter().all(|(key, _)| {
+            key.schema_key == "schema\0" && key.file_id.as_deref() == Some("")
+        }));
     }
 
     #[tokio::test]
@@ -2738,6 +3145,23 @@ mod tests {
             "entity-a"
         );
         assert_eq!(rows[0].0.file_id.as_deref(), Some("file-a"));
+
+        // With no schema predicate there is no encoded scan range or trusted
+        // prefix. This exercises the decoded-key filter path directly.
+        let entity_only_rows = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    entity_pks: vec![EntityPk::single("entity-b")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("entity-only scan should succeed");
+        assert_eq!(entity_only_rows.len(), 1);
+        assert_eq!(entity_only_rows[0].0.schema_key, "schema-a");
+        assert_eq!(entity_only_rows[0].0.file_id.as_deref(), Some("file-a"));
     }
 
     #[tokio::test]
@@ -3030,9 +3454,16 @@ mod tests {
                 value: encoded_inserted_value,
             },
         );
+        let expected_entries = canonical_entries.clone();
         let canonical = tree
             .build_tree_from_entries(canonical_entries)
             .expect("canonical root should build");
+
+        let fast_entries = tree
+            .collect_leaf_entries(&read, &fast.root_id)
+            .await
+            .expect("fast entries should collect");
+        assert_eq!(fast_entries, expected_entries);
 
         assert_eq!(fast.root_id, canonical.root_id);
     }
@@ -3218,6 +3649,26 @@ mod tests {
 
     fn mutation_owned(key: TrackedStateKey, value: TrackedStateIndexValue) -> TrackedStateMutation {
         mutation(&key, &value)
+    }
+
+    fn naive_tree_diff(
+        before: &BTreeMap<TrackedStateKey, TrackedStateIndexValue>,
+        after: &BTreeMap<TrackedStateKey, TrackedStateIndexValue>,
+    ) -> Vec<TrackedStateTreeDiffEntry> {
+        before
+            .keys()
+            .chain(after.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|key| match (before.get(&key), after.get(&key)) {
+                (Some(left), Some(right)) if left == right => None,
+                (left, right) => Some(TrackedStateTreeDiffEntry {
+                    before: left.cloned().map(|value| (key.clone(), value)),
+                    after: right.cloned().map(|value| (key, value)),
+                }),
+            })
+            .collect()
     }
 
     fn encoded_entries_with_change_id(change_id: &str) -> Vec<EncodedLeafEntry> {

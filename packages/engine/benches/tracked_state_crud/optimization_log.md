@@ -2002,3 +2002,127 @@ Removing the synthetic row exposed a zero-delta case for allowed empty merges.
 Without a fast path, the generic tree builder would scan and rewrite the entire
 parent tree. Empty child roots now reuse the parent's root id, row count, and
 height, stage no tree chunks, and write only their own commit-root metadata.
+
+## 2026-07-21 — Tracked-State Tree Codec V3
+
+Hypothesis: tracked-state tree chunks were paying general-purpose row-codec
+overhead independently for every key, value, and internal-node boundary even
+though each leaf is already an ordered block. Applying the same block-local
+ideas used by columnar pages and LSM/SST blocks—order-preserving keys,
+front-coding, and dictionaries for repeated fields—should reduce both durable
+bytes and the amount of data read without adding a second storage layer.
+
+The v3 writer emits one deterministic format:
+
+- Keys use an escaped, order-preserving tuple grammar. Schema and schema/file
+  encodings are exact prefixes, full keys are prefix-free, and variable-length
+  text now shares physical prefixes.
+- Leaves front-code adjacent keys, keep change ids inline, and dictionary only
+  repeated commit ids and state tails. Unique values never pay dictionary
+  entries.
+- A state-tail tag carries deletion, timestamp widths, and the common
+  `created_at == updated_at` case. Minimal little-endian timestamp payloads
+  bound values to 33–49 bytes: epoch/equal is 33 B, 2026/equal is 40 B,
+  two 2026 timestamps are 47 B, and the worst valid pair is 49 B.
+- Internal nodes front-code each first boundary against the prior child's last
+  boundary and each last boundary against its first.
+- Unary roots are promoted and the canonical empty-leaf sentinel cannot remain
+  beside live leaves.
+
+The first counterfactual used two fixed 8-byte timestamp fields. It looked good
+on the normal 2026 workload, but was rejected before publication: stacked on
+#653 it increased SlateDB singleton update/delete WAL bytes by about 9% because
+that deterministic fixture uses compact epoch-like timestamps. The width-tag
+form used here is never larger than that fixed representation and is smaller for
+both epoch-like and ordinary current timestamps.
+
+Current-main 1k transaction accounting at `553a6b7a` (SQLite; RocksDB has the
+same put counts and differs by at most 30 bytes from nondeterministic
+timestamps):
+
+| Operation | v2 bytes | v3 bytes | Change | v2 puts | v3 puts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| insert all | 424,045 | 385,102 | -9.2% | 1,075 | 1,073 |
+| update all | 526,780 | 487,984 | -7.4% | 1,410 | 1,408 |
+| update one | 4,831 | 3,782 | -21.7% | 9 | 9 |
+| delete all | 169,993 | 131,182 | -22.8% | 1,031 | 1,029 |
+| delete one | 4,612 | 3,563 | -22.7% | 9 | 9 |
+
+After `insert_all`, `tracked_state.tree_chunk` moves from 27 rows / 75,270
+key-plus-value bytes to 24 rows / 35,323 bytes (-53.1%). Commit IDs remain
+stable; content-addressed tree chunk hashes and root IDs intentionally change
+with the canonical bytes.
+
+Current-main SlateDB physical validation at `553a6b7a`, 200 singleton samples,
+one durable WAL object PUT per transaction:
+
+| Operation | main logical bytes | v3 | main WAL bytes | v3 | WAL change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| insert 1k | 135,608 | 132,189 | 161,423 | 157,937 | -2.2% |
+| update one, average | 3,766 | 3,260 | 4,546 | 3,988 | -12.3% |
+| delete one | 3,716 | 3,210 | 4,496 | 3,938 | -12.4% |
+
+The byte win is durable; remote latency remains dominated by the unchanged
+single object-store RTT.
+
+An earlier RocksDB 1k Criterion control had no material regression across CRUD
+point estimates: insert 22.48 ms, read all 6.18 ms, read many 714 us, update all
+21.72 ms, update one 1.42 ms, delete all 18.12 ms, and delete one 1.47 ms.
+`read_one_by_pk` has process-level spread at this scale; three v3 repeats were
+194.6/188.7/166.6 us (mean 183.3 us) versus the clean-main repeats'
+190.8/192.5/191.6 us (mean 191.6 us). No read regression is claimed.
+
+Fast-diff validation used the same invariant as
+[Dolt's prolly trees](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree/):
+boundaries depend only on keys, immutable nodes are content-addressed, and equal
+child hashes skip the entire subtree. Two pre-existing paths had weakened that
+property independently of the codec. Ordinary commit diff first ran whole-root
+coverage validation, and a key insertion that shifted an internal boundary fell
+back to enumerating every leaf summary.
+
+A release probe counted logical node loads and cold storage reads. Value updates
+and tombstones remain one path per root (6 loads / 6 reads at both 10k and 100k),
+and identical roots remain 0 / 0. For a one-key append, the old boundary-mismatch
+fallback grew with tree size while the hierarchical Merkle zipper stayed flat:
+
+| Rows | Current-main fallback | V3 hierarchical zipper |
+| ---: | ---: | ---: |
+| 10,000 | 20 loads / 11 reads | 6 loads / 6 reads |
+| 100,000 | 100 loads / 51 reads | 6 loads / 6 reads |
+
+The paired 10k release timings improved with the same access shape:
+
+| One-row diff | Current-main p50 / p95 | V3 p50 / p95 | p50 change |
+| --- | ---: | ---: | ---: |
+| value update | 50.3 / 60.9 us | 22.4 / 32.1 us | -55.5% |
+| append | 139.9 / 160.8 us | 29.2 / 39.8 us | -79.1% |
+| tombstone | 50.6 / 60.7 us | 22.3 / 30.9 us | -55.9% |
+
+At 100k rows, v3 update/append/tombstone p50 stayed at 29.1/39.8/28.8 us.
+Current-main append grew to 1.110 ms and 51 cold reads; v3 append remained six
+reads. Ten times more rows therefore adds less than 1.4x latency to the sparse
+path instead of turning it into a scan.
+
+The 100k v3 tree contained 997 chunks, so the append read 0.6% of them. A 10k
+control that scanned both roots for coverage needed 104 cold chunk reads; that
+scan no longer precedes every normal diff. Normal diff binds each commit root's
+first-parent metadata and point-validates only emitted change records. Winner
+reachability, inherited creation timestamps, and proof that no row was omitted
+remain in the full O(total rows) audit run by explicit tracked-state rebuild.
+Deep-tree oracle tests cover shifted leaf boundaries, prepend/middle/append
+inserts, updates, tombstones, and a root-height transition.
+
+A separately sampled, unfiltered 100k-row scan initially exposed allocator
+churn in the new decoder. The counterfactual made one-part entity keys allocate
+exactly once, preallocated unfiltered result rows from the root subtree count,
+and removed a duplicate post-decode predicate pass. Final single-root scan
+median was about 29.1 ms versus 31.2 ms on current main (about 7% faster); this
+fix does not change the wire format or the Merkle diff path.
+
+This is deliberately a hard cut. Commit-root metadata starts with `LXTR3`, only
+v3 leaf/internal kind bytes decode, and unversioned or older roots fail before
+tree traversal with a repository-recreation error. There is no legacy decoder
+or slow fallback. Validation includes golden wire bytes, logical-vs-byte
+ordering, prefix-freedom, malformed codec, multi-level routing, canonical
+rebuild, sparse/deep/height-transition diff oracles, and backend accounting
+coverage.

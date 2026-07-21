@@ -49,14 +49,18 @@ where
     for plan in plans.iter().rev() {
         report = Some(stage_rebuild_plan_with_writer(&mut writer, plan).await?);
     }
-    report.ok_or_else(|| {
+    let report = report.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "tracked_state commit_root rebuild for commit '{commit_id}' did not stage a root"
             ),
         )
-    })
+    })?;
+    writer
+        .validate_staged_commit_root_against_changelog(commit_id)
+        .await?;
+    Ok(report)
 }
 
 async fn load_rebuild_plans_to_nearest_available_root<S>(
