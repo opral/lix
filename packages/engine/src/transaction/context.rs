@@ -1234,10 +1234,13 @@ where
                 &context,
                 "plugin detect-changes",
             )?);
-            reconciliation.rows.push(
-                PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?
-                    .write_row(&write.branch_id)?,
-            );
+            let desired_owner =
+                PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?;
+            if plugin_owner_needs_write(owner, &desired_owner) {
+                reconciliation
+                    .rows
+                    .push(desired_owner.write_row(&write.branch_id)?);
+            }
             reconciliation.file_keys.insert(file_key.clone());
             reconciled_file_keys.insert(file_key);
         }
@@ -2189,6 +2192,10 @@ struct PluginBranchEntryKey {
     plugin_key: String,
 }
 
+fn plugin_owner_needs_write(current: Option<&PluginFileOwner>, desired: &PluginFileOwner) -> bool {
+    current != Some(desired)
+}
+
 fn duplicate_plugin_lifecycle_mutation() -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
@@ -2483,6 +2490,23 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn plugin_owner_is_only_rewritten_when_its_durable_contract_changes() {
+        let current = PluginFileOwner::new("file-a", "plugin-a", vec!["schema-a".to_string()])
+            .expect("current owner should be valid");
+        assert!(!plugin_owner_needs_write(Some(&current), &current));
+        assert!(plugin_owner_needs_write(None, &current));
+
+        for desired in [
+            PluginFileOwner::new("file-a", "plugin-b", vec!["schema-a".to_string()])
+                .expect("changed plugin owner should be valid"),
+            PluginFileOwner::new("file-a", "plugin-a", vec!["schema-b".to_string()])
+                .expect("changed schema owner should be valid"),
+        ] {
+            assert!(plugin_owner_needs_write(Some(&current), &desired));
+        }
+    }
 
     #[tokio::test]
     #[ignore = "release-only transaction path-index benchmark probe"]
