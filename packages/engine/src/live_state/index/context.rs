@@ -4,9 +4,11 @@ use crate::LixError;
 use crate::changelog::{ChangeId, ChangeRecordProjection, materialize_change_payloads};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 
+#[cfg(test)]
+use super::storage::load_value;
 use super::storage::{
-    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_value, load_values, scan_values,
-    stage_delete, stage_put,
+    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_values, scan_values, stage_delete,
+    stage_put,
 };
 use super::{
     LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
@@ -89,15 +91,54 @@ where
         &self,
         request: &LiveStateIndexRowRequest,
     ) -> Result<Option<MaterializedLiveStateIndexRow>, LixError> {
-        let identity = FlatIdentity::from_request(request);
-        let Some(value) = load_value(&self.store, &identity).await? else {
-            return Ok(None);
-        };
-        Ok(
-            materialize_entries(&self.store, vec![(identity, value)], &[])
-                .await?
-                .pop(),
-        )
+        Ok(self
+            .load_rows(std::slice::from_ref(request), &[])
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    /// Loads correlated flat identities with one point-read plan and one
+    /// payload-materialization batch while preserving input alignment.
+    pub(crate) async fn load_rows(
+        &self,
+        requests: &[LiveStateIndexRowRequest],
+        projection: &[String],
+    ) -> Result<Vec<Option<MaterializedLiveStateIndexRow>>, LixError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut output_indices = BTreeMap::<FlatIdentity, Vec<usize>>::new();
+        for (index, request) in requests.iter().enumerate() {
+            output_indices
+                .entry(FlatIdentity::from_request(request))
+                .or_default()
+                .push(index);
+        }
+        let identities = output_indices.keys().cloned().collect::<Vec<_>>();
+        let values = load_values(&self.store, &identities).await?;
+        let mut entries = Vec::new();
+        for (identity, value) in identities.into_iter().zip(values) {
+            if let Some(value) = value {
+                entries.push((identity, value));
+            }
+        }
+        let materialized = materialize_entries(&self.store, entries, projection).await?;
+        let mut rows = vec![None; requests.len()];
+        for row in materialized {
+            let identity = FlatIdentity {
+                branch_id: row.branch_id.clone(),
+                schema_key: row.schema_key.clone(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.clone(),
+            };
+            if let Some(indices) = output_indices.get(&identity) {
+                for &index in indices {
+                    rows[index] = Some(row.clone());
+                }
+            }
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn load_index_row(

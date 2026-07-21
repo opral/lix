@@ -96,6 +96,7 @@ impl FlatIdentity {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn load_value(
     store: &(impl StorageAdapterRead + ?Sized),
     identity: &FlatIdentity,

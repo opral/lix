@@ -32,10 +32,10 @@ use crate::filesystem::{
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateContext, LiveStateExactBatchRequest, LiveStateFileScanRequest, LiveStateFilter,
+    LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::live_state::{overlay_scan_file_rows, overlay_scan_rows};
+use crate::live_state::{overlay_load_exact_rows, overlay_scan_file_rows, overlay_scan_rows};
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginArchiveInstallPlan,
     PluginDetectedChange, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
@@ -480,6 +480,20 @@ where
         );
         let base = self.live_state.reader(read);
         overlay_scan_rows(&base, &staged, request).await
+    }
+
+    async fn load_visible_exact_live_state_rows(
+        &mut self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        let staged = self.staged_writes.staging_overlay()?;
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let base = self.live_state.reader(read);
+        overlay_load_exact_rows(&base, &staged, request).await
     }
 
     async fn reconcile_plugin_write(
@@ -1771,6 +1785,13 @@ where
             .into_iter()
             .next())
     }
+
+    async fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        overlay_load_exact_rows(&self.base, &self.staged, request).await
+    }
 }
 
 #[async_trait]
@@ -1998,6 +2019,13 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         self.scan_visible_live_state(request).await
+    }
+
+    async fn load_exact_live_state_rows(
+        &mut self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        self.load_visible_exact_live_state_rows(request).await
     }
 
     async fn filesystem_path_index(

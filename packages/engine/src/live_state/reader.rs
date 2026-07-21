@@ -2,7 +2,9 @@ use async_trait::async_trait;
 
 use crate::LixError;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{LiveStateFileScanRequest, LiveStateRowRequest, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateExactBatchRequest, LiveStateFileScanRequest, LiveStateRowRequest, LiveStateScanRequest,
+};
 
 /// Minimal engine read model for transaction planning and SQL providers.
 ///
@@ -44,4 +46,35 @@ pub(crate) trait LiveStateReader: Send + Sync {
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError>;
+
+    /// Loads concrete visible identities while preserving request alignment.
+    ///
+    /// Implementations must provide a correlated batch path. There is no
+    /// scan-based default because silently lowering this operation to one scan
+    /// per row would reintroduce the amplification this API exists to prevent.
+    async fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError>;
+}
+
+#[cfg(test)]
+pub(crate) async fn load_exact_rows_via_scan_for_test<R>(
+    reader: &R,
+    request: &LiveStateExactBatchRequest,
+) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    let mut rows = Vec::with_capacity(request.rows.len());
+    for row in &request.rows {
+        rows.push(
+            reader
+                .scan_rows(&request.row_scan_request(row))
+                .await?
+                .into_iter()
+                .next(),
+        );
+    }
+    Ok(rows)
 }

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::live_state::{
-    LiveStateFileScanRequest, LiveStateReader, LiveStateRowIdentity, LiveStateScanRequest,
-    MaterializedLiveStateRow,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFileScanRequest,
+    LiveStateReader, LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +31,26 @@ pub(crate) trait StagedLiveStateRows {
         request: &LiveStateFileScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         self.staged_rows(&request.to_scan_request())
+    }
+
+    /// Loads exact staged storage identities in request order.
+    ///
+    /// This does not apply global fallback: overlay composition needs the
+    /// branch and global candidates separately to preserve their precedence.
+    fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        request
+            .rows
+            .iter()
+            .map(|row| {
+                Ok(self
+                    .staged_rows(&request.row_scan_request(row))?
+                    .into_iter()
+                    .next())
+            })
+            .collect()
     }
 }
 
@@ -163,6 +183,120 @@ where
             limit: request.limit,
         },
     ))
+}
+
+/// Overlays staged exact identities without converting correlated row keys to
+/// independent scan filters.
+pub(crate) async fn overlay_load_exact_rows<S>(
+    base: &dyn LiveStateReader,
+    staged: &S,
+    request: &LiveStateExactBatchRequest,
+) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError>
+where
+    S: StagedLiveStateRows + ?Sized,
+{
+    if request.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut base_request = request.clone();
+    base_request.include_tombstones = true;
+    let base_rows = base.load_exact_rows(&base_request).await?;
+    if base_rows.len() != request.rows.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "exact live-state base read expected {} result slots, got {}",
+                request.rows.len(),
+                base_rows.len()
+            ),
+        ));
+    }
+
+    let mut staged_requests = Vec::with_capacity(request.rows.len() * 2);
+    let mut staged_indices = Vec::with_capacity(request.rows.len());
+    for row in &request.rows {
+        let global_index = staged_requests.len();
+        staged_requests.push(LiveStateExactRowRequest {
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            schema_key: row.schema_key.clone(),
+            entity_pk: row.entity_pk.clone(),
+            file_id: row.file_id.clone(),
+        });
+        let branch_index = if row.branch_id == GLOBAL_BRANCH_ID {
+            None
+        } else {
+            let index = staged_requests.len();
+            staged_requests.push(row.clone());
+            Some(index)
+        };
+        staged_indices.push((global_index, branch_index));
+    }
+    let staged_request = LiveStateExactBatchRequest {
+        rows: staged_requests,
+        projection: request.projection.clone(),
+        untracked: request.untracked,
+        include_tombstones: true,
+    };
+    let staged_rows = staged.load_exact_rows(&staged_request)?;
+    if staged_rows.len() != staged_request.rows.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "exact staged live-state read expected {} result slots, got {}",
+                staged_request.rows.len(),
+                staged_rows.len()
+            ),
+        ));
+    }
+
+    Ok(request
+        .rows
+        .iter()
+        .zip(base_rows)
+        .zip(staged_indices)
+        .map(|((requested, base), (global_index, branch_index))| {
+            let mut winner = base.map(|row| {
+                let tier = if row.global {
+                    OverlayTier::BaseGlobal
+                } else {
+                    OverlayTier::BaseBranch
+                };
+                (tier, row)
+            });
+            if let Some(mut row) = staged_rows[global_index].clone() {
+                if requested.branch_id != GLOBAL_BRANCH_ID {
+                    row.branch_id.clone_from(&requested.branch_id);
+                }
+                row.global = true;
+                insert_exact_overlay_candidate(&mut winner, OverlayTier::StagedGlobal, row);
+            }
+            if let Some(index) = branch_index
+                && let Some(row) = staged_rows[index].clone()
+            {
+                insert_exact_overlay_candidate(&mut winner, OverlayTier::StagedBranch, row);
+            }
+            let row = winner.map(|(_, row)| row)?;
+            if row.deleted && !request.include_tombstones {
+                None
+            } else {
+                Some(row)
+            }
+        })
+        .collect())
+}
+
+fn insert_exact_overlay_candidate(
+    winner: &mut Option<(OverlayTier, MaterializedLiveStateRow)>,
+    tier: OverlayTier,
+    row: MaterializedLiveStateRow,
+) {
+    if winner
+        .as_ref()
+        .is_none_or(|(existing_tier, _)| *existing_tier <= tier)
+    {
+        *winner = Some((tier, row));
+    }
 }
 
 /// Resolves raw tracked/untracked candidates into the rows visible for a scan.
@@ -760,6 +894,155 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn exact_overlay_preserves_branch_global_precedence_and_tombstones() {
+        let base = FilteringReader {
+            rows: vec![
+                row_at(
+                    "branch-a",
+                    "base-branch",
+                    "base-branch",
+                    false,
+                    Some("base-branch"),
+                ),
+                row_at(
+                    "branch-a",
+                    "base-global",
+                    "base-global",
+                    true,
+                    Some("base-global"),
+                ),
+                row_at(
+                    "branch-a",
+                    "stage-branch",
+                    "base-before-stage",
+                    false,
+                    Some("base-before-stage"),
+                ),
+                row_at(
+                    "branch-a",
+                    "stage-delete",
+                    "base-before-delete",
+                    true,
+                    Some("base-before-delete"),
+                ),
+                tombstone_at("branch-a", "base-tombstone", false, Some("base-tombstone")),
+                row_at(
+                    "branch-a",
+                    "global-delete",
+                    "global-before-delete",
+                    true,
+                    Some("global-before-delete"),
+                ),
+            ],
+        };
+        let staged = FilteringStagedRows {
+            rows: vec![
+                row_at(
+                    "global",
+                    "base-branch",
+                    "staged-global-loses",
+                    true,
+                    Some("staged-global-loses"),
+                ),
+                row_at(
+                    "global",
+                    "base-global",
+                    "staged-global-wins",
+                    true,
+                    Some("staged-global-wins"),
+                ),
+                row_at(
+                    "branch-a",
+                    "stage-branch",
+                    "staged-branch-wins",
+                    false,
+                    Some("staged-branch-wins"),
+                ),
+                tombstone_at(
+                    "branch-a",
+                    "stage-delete",
+                    false,
+                    Some("staged-branch-delete"),
+                ),
+                row_at(
+                    "global",
+                    "stage-global",
+                    "staged-global-only",
+                    true,
+                    Some("staged-global-only"),
+                ),
+                row_at(
+                    "global",
+                    "base-tombstone",
+                    "staged-global-hidden",
+                    true,
+                    Some("staged-global-hidden"),
+                ),
+                tombstone_at(
+                    "global",
+                    "global-delete",
+                    true,
+                    Some("staged-global-delete"),
+                ),
+            ],
+        };
+        let exact = |entity: &str| LiveStateExactRowRequest {
+            schema_key: "schema".to_string(),
+            branch_id: "branch-a".to_string(),
+            entity_pk: EntityPk::single(entity),
+            file_id: None,
+        };
+        let request = LiveStateExactBatchRequest {
+            rows: [
+                "base-branch",
+                "base-global",
+                "stage-branch",
+                "stage-delete",
+                "stage-global",
+                "base-tombstone",
+                "global-delete",
+            ]
+            .into_iter()
+            .map(exact)
+            .collect(),
+            ..Default::default()
+        };
+
+        let rows = overlay_load_exact_rows(&base, &staged, &request)
+            .await
+            .expect("exact overlay should resolve");
+        let value = |index: usize| {
+            rows[index]
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref())
+        };
+        assert_eq!(value(0), Some("{\"value\":\"base-branch\"}"));
+        assert_eq!(value(1), Some("{\"value\":\"staged-global-wins\"}"));
+        assert_eq!(value(2), Some("{\"value\":\"staged-branch-wins\"}"));
+        assert_eq!(rows[3], None, "staged branch tombstone should hide base");
+        assert_eq!(value(4), Some("{\"value\":\"staged-global-only\"}"));
+        assert_eq!(rows[5], None, "base branch tombstone beats staged global");
+        assert_eq!(rows[6], None, "staged global tombstone hides base global");
+
+        let tombstone = overlay_load_exact_rows(
+            &base,
+            &staged,
+            &LiveStateExactBatchRequest {
+                rows: vec![exact("stage-delete")],
+                include_tombstones: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("exact tombstone overlay should resolve")
+        .pop()
+        .flatten()
+        .expect("requested tombstone should be returned");
+        assert!(tombstone.deleted);
+        assert!(!tombstone.global);
+    }
+
     fn row_at(
         branch_id: &str,
         entity_pk: &str,
@@ -821,6 +1104,8 @@ mod tests {
             filter.branch_ids.is_empty() || filter.branch_ids.contains(&row.branch_id);
         let schema_matches =
             filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key);
+        let entity_matches =
+            filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.entity_pk);
         let file_matches = filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|file_id| match file_id {
                 NullableKeyFilter::Any => true,
@@ -828,7 +1113,7 @@ mod tests {
                 NullableKeyFilter::Null => row.file_id.is_none(),
             });
         let tombstone_matches = filter.include_tombstones || !row.deleted;
-        branch_matches && schema_matches && file_matches && tombstone_matches
+        branch_matches && schema_matches && entity_matches && file_matches && tombstone_matches
     }
 
     struct EmptyStagedRows;
@@ -866,6 +1151,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for ExistingGlobalOnlyReader {
+        async fn load_exact_rows(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
@@ -896,6 +1188,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for FilteringReader {
+        async fn load_exact_rows(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,

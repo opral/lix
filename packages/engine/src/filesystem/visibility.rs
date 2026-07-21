@@ -361,6 +361,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RecordingLiveStateReader {
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
@@ -396,6 +403,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,

@@ -7,8 +7,9 @@ use crate::LixError;
 use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
 use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    StagedLiveStateRows, overlay_scan_rows, overlay_scan_tracked_rows,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow, StagedLiveStateRows, overlay_load_exact_rows, overlay_scan_rows,
+    overlay_scan_tracked_rows,
 };
 use crate::transaction::staging::PreparedStateRowOverlay;
 
@@ -141,6 +142,13 @@ where
             .into_iter()
             .next())
     }
+
+    async fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        overlay_load_exact_rows(self.base, self.staged, request).await
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +164,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for SplitCurrentAndTrackedReader {
+        async fn load_exact_rows(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,

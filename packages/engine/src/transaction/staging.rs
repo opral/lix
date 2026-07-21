@@ -22,7 +22,10 @@ use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
-use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::live_state::{
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
+};
 use crate::transaction::types::{
     LogicalPrimaryKey, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
     TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
@@ -673,7 +676,7 @@ impl PreparedStateRowOverlay {
     /// Returns a staged exact-row answer, if this transaction has one.
     #[cfg(test)]
     pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
-        let identity = PreparedStateRowIdentity::from_exact_request(request)?;
+        let identity = PreparedStateRowIdentity::from_row_request(request)?;
         if let Some(row) = self.load_state_slot(&identity) {
             return Some(if row.snapshot.is_none() {
                 StagedExactRow::Tombstone
@@ -701,6 +704,47 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         Ok(self.scan_parts(request)?.rows)
+    }
+
+    fn load_exact_rows(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged identity index lock",
+            )
+        })?;
+        Ok(request
+            .rows
+            .iter()
+            .map(|request_row| {
+                let identity = PreparedStateRowIdentity::from_exact_request(request_row);
+                let Some(RowSlot::State(index)) = by_identity_guard.get(&identity).copied() else {
+                    return None;
+                };
+                let row = rows_guard.get(index)?.as_ref()?;
+                if request
+                    .untracked
+                    .is_some_and(|untracked| row.untracked != untracked)
+                {
+                    return None;
+                }
+                let row = MaterializedLiveStateRow::from(row);
+                if row.deleted && !request.include_tombstones {
+                    None
+                } else {
+                    Some(row)
+                }
+            })
+            .collect())
     }
 }
 
@@ -734,8 +778,17 @@ impl PreparedStateRowIdentity {
         }
     }
 
+    fn from_exact_request(request: &LiveStateExactRowRequest) -> Self {
+        Self {
+            schema_key: request.schema_key.clone(),
+            entity_pk: request.entity_pk.clone(),
+            file_id: request.file_id.clone(),
+            branch_id: request.branch_id.clone(),
+        }
+    }
+
     #[cfg(test)]
-    fn from_exact_request(request: &LiveStateRowRequest) -> Option<Self> {
+    fn from_row_request(request: &LiveStateRowRequest) -> Option<Self> {
         let file_id = match &request.file_id {
             NullableKeyFilter::Null => None,
             NullableKeyFilter::Value(value) => Some(value.clone()),
@@ -1013,7 +1066,10 @@ fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_state::{LiveStateFilter, LiveStateRowRequest};
+    use crate::live_state::{
+        LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateRowRequest,
+        StagedLiveStateRows,
+    };
 
     #[tokio::test]
     async fn update_origin_rows_replace_staged_identity_under_outer_insert_mode() {
@@ -1103,6 +1159,66 @@ mod tests {
             row.snapshot_content.as_deref(),
             Some("{\"key\":\"sql2-duplicate-key\",\"value\":\"second\"}")
         );
+    }
+
+    #[test]
+    fn staging_overlay_exact_batch_is_correlated_aligned_and_tombstone_aware() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    state_row("entity-a", "cross-pair").with_file_id("file-b"),
+                    tombstone_row("deleted").with_file_id("deleted"),
+                ],
+            })
+            .expect("rows should stage");
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build");
+        let exact = |entity: &str, file_id: &str| LiveStateExactRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            branch_id: "global".to_string(),
+            entity_pk: EntityPk::single(entity),
+            file_id: Some(file_id.to_string()),
+        };
+        let cross_pair = exact("entity-a", "file-b");
+        let rows = StagedLiveStateRows::load_exact_rows(
+            &overlay,
+            &LiveStateExactBatchRequest {
+                rows: vec![
+                    cross_pair.clone(),
+                    exact("entity-a", "file-a"),
+                    exact("entity-b", "file-b"),
+                    cross_pair,
+                    exact("missing", "missing"),
+                    exact("deleted", "deleted"),
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("exact staged rows should load");
+
+        assert!(rows[0].is_some());
+        assert_eq!(rows[0], rows[3]);
+        assert_eq!(rows[1], None);
+        assert_eq!(rows[2], None);
+        assert_eq!(rows[4], None);
+        assert_eq!(rows[5], None, "tombstone should be hidden by default");
+
+        let tombstone = StagedLiveStateRows::load_exact_rows(
+            &overlay,
+            &LiveStateExactBatchRequest {
+                rows: vec![exact("deleted", "deleted")],
+                include_tombstones: true,
+                ..Default::default()
+            },
+        )
+        .expect("exact staged tombstone should load")
+        .pop()
+        .flatten()
+        .expect("tombstone should be returned");
+        assert!(tombstone.deleted);
     }
 
     #[tokio::test]
