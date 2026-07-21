@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use globset::GlobBuilder;
+use globset::{GlobBuilder, GlobMatcher};
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -48,27 +48,36 @@ pub struct ValidatedPluginManifest {
 }
 
 pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
-    let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        message: format!("Plugin manifest must be valid JSON: {error}"),
-        hint: None,
-        details: None,
+    let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("Plugin manifest must be valid JSON: {error}"),
+        )
     })?;
 
     validate_plugin_manifest_json(&manifest_json)?;
 
     let manifest: PluginManifest =
-        serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("Plugin manifest does not match expected shape: {error}"),
-            hint: None,
-            details: None,
+        serde_json::from_value(manifest_json.clone()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("Plugin manifest does not match expected shape: {error}"),
+            )
         })?;
-    let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        message: format!("Failed to normalize plugin manifest JSON: {error}"),
-        hint: None,
-        details: None,
+    compile_path_glob(&manifest.file_match.path_glob).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "Plugin manifest path_glob '{}' is invalid: {error}",
+                manifest.file_match.path_glob
+            ),
+        )
+    })?;
+    let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("Failed to normalize plugin manifest JSON: {error}"),
+        )
     })?;
 
     Ok(ValidatedPluginManifest {
@@ -125,23 +134,26 @@ pub fn glob_matches_path(glob: &str, path: &str) -> bool {
         return true;
     }
 
+    compile_path_glob(glob)
+        .map(|compiled| compiled.is_match(path))
+        .unwrap_or(false)
+}
+
+fn compile_path_glob(glob: &str) -> Result<GlobMatcher, globset::Error> {
     GlobBuilder::new(glob)
         .literal_separator(false)
         .build()
-        .map(|compiled| compiled.compile_matcher().is_match(path))
-        .unwrap_or(false)
+        .map(|compiled| compiled.compile_matcher())
 }
 
 fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
     let validator = plugin_manifest_validator()?;
     if let Err(errors) = validator.validate(manifest) {
         let details = format_validation_errors(errors);
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("Invalid plugin manifest: {details}"),
-            hint: None,
-            details: None,
-        });
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("Invalid plugin manifest: {details}"),
+        ));
     }
     Ok(())
 }
@@ -181,24 +193,17 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
             options.with_draft(Draft::Draft202012);
         }
 
-        options
-            .compile(plugin_manifest_schema())
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                message: format!("Failed to compile plugin manifest schema: {error}"),
-                hint: None,
-                details: None,
-            })
+        options.compile(plugin_manifest_schema()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("Failed to compile plugin manifest schema: {error}"),
+            )
+        })
     });
 
     match result {
         Ok(schema) => Ok(schema),
-        Err(error) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: error.message.clone(),
-            hint: None,
-            details: None,
-        }),
+        Err(error) => Err(error.clone()),
     }
 }
 
@@ -231,6 +236,8 @@ fn format_validation_errors<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::LixError;
+
     use super::{PluginContentType, PluginRuntime, glob_matches_path, parse_plugin_manifest_json};
 
     #[test]
@@ -265,13 +272,14 @@ mod tests {
         )
         .expect_err("manifest should be invalid");
 
+        assert_eq!(err.code, LixError::CODE_INVALID_PLUGIN);
         assert!(err.message.contains("Invalid plugin manifest"));
         assert!(err.message.contains("key"));
     }
 
     #[test]
-    fn preserves_invalid_path_glob_text() {
-        let validated = parse_plugin_manifest_json(
+    fn rejects_invalid_path_glob() {
+        let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
@@ -281,9 +289,40 @@ mod tests {
                 "schemas":["schema/default.json"]
             }"#,
         )
-        .expect("manifest should parse");
+        .expect_err("invalid path glob should be rejected");
 
-        assert_eq!(validated.manifest.file_match.path_glob, "*.{md,mdx");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("path_glob"));
+    }
+
+    #[test]
+    fn enforces_manifest_work_bounds_at_the_boundary() {
+        let max_glob = "a".repeat(1024);
+        parse_plugin_manifest_json(&manifest_with(&max_glob, &["schema/default.json".into()]))
+            .expect("the maximum glob length should be inclusive");
+
+        let oversized_glob = "a".repeat(1025);
+        let error = parse_plugin_manifest_json(&manifest_with(
+            &oversized_glob,
+            &["schema/default.json".into()],
+        ))
+        .expect_err("a glob over the work bound must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("path_glob"), "{error:?}");
+
+        let max_schemas = (0..64)
+            .map(|index| format!("schema/{index}.json"))
+            .collect::<Vec<_>>();
+        parse_plugin_manifest_json(&manifest_with("*.json", &max_schemas))
+            .expect("the maximum schema count should be inclusive");
+
+        let oversized_schemas = (0..65)
+            .map(|index| format!("schema/{index}.json"))
+            .collect::<Vec<_>>();
+        let error = parse_plugin_manifest_json(&manifest_with("*.json", &oversized_schemas))
+            .expect_err("a schema list over the work bound must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("schemas"), "{error:?}");
     }
 
     #[test]
@@ -334,6 +373,19 @@ mod tests {
         )
         .expect_err("detect_changes state context config should be rejected");
 
+        assert_eq!(err.code, LixError::CODE_INVALID_PLUGIN);
         assert!(err.message.contains("detect_changes"));
+    }
+
+    fn manifest_with(path_glob: &str, schemas: &[String]) -> String {
+        serde_json::json!({
+            "key": "plugin_bounds",
+            "runtime": "wasm-component-v1",
+            "api_version": "0.1.0",
+            "match": { "path_glob": path_glob },
+            "entry": "plugin.wasm",
+            "schemas": schemas,
+        })
+        .to_string()
     }
 }

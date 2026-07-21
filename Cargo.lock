@@ -3313,6 +3313,7 @@ dependencies = [
  "lix_slatedb_storage",
  "lix_sqlite_storage",
  "lru",
+ "memchr",
  "musli",
  "object_store 0.14.0",
  "paste",
