@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::LixError;
-use crate::branch::BranchRefReader;
+use crate::branch::{BranchHead, BranchRefReader};
 
 use super::branch_ref::CachingBranchRefReader;
 use super::providers;
@@ -14,13 +14,49 @@ pub(crate) async fn build_read_session<C>(ctx: &C) -> Result<SessionContext, Lix
 where
     C: SqlExecutionContext + ?Sized,
 {
+    build_read_session_with_active_head(ctx, None).await
+}
+
+pub(crate) async fn build_read_session_at_head<C>(
+    ctx: &C,
+    active_head: BranchHead,
+) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    build_read_session_with_active_head(ctx, Some(active_head)).await
+}
+
+async fn build_read_session_with_active_head<C>(
+    ctx: &C,
+    active_head: Option<BranchHead>,
+) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let session = new_sql_session_context();
-    let branch_ref: Arc<dyn BranchRefReader> =
-        Arc::new(CachingBranchRefReader::new(ctx.branch_ref()));
-    let active_branch_commit_id = branch_ref
-        .load_head(ctx.active_branch_id())
-        .await?
-        .map(|head| head.commit_id.to_string());
+    let branch_ref: Arc<dyn BranchRefReader> = match active_head.as_ref() {
+        Some(head) => {
+            if head.branch_id != ctx.active_branch_id() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "prepared SQL read head does not match the active branch",
+                ));
+            }
+            Arc::new(CachingBranchRefReader::with_head(
+                ctx.branch_ref(),
+                head.clone(),
+            ))
+        }
+        None => Arc::new(CachingBranchRefReader::new(ctx.branch_ref())),
+    };
+    let active_branch_commit_id = match active_head {
+        Some(head) => Some(head.commit_id.to_string()),
+        None => branch_ref
+            .load_head(ctx.active_branch_id())
+            .await?
+            .map(|head| head.commit_id.to_string()),
+    };
     register_sql2_functions(&session, ctx.functions(), active_branch_commit_id);
     providers::register_read(&session, ctx, branch_ref).await?;
 

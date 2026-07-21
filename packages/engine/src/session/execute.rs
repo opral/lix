@@ -335,6 +335,11 @@ pub struct ExecuteBatchStatement {
     pub params: Vec<Value>,
 }
 
+enum ExecuteBatchExecution {
+    ReadOnly(Vec<datafusion::sql::parser::Statement>),
+    Transaction(Vec<datafusion::sql::parser::Statement>),
+}
+
 impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -483,11 +488,12 @@ where
         Ok(ExecuteResult::from_sql_query_result(read_result.query))
     }
 
-    /// Executes SQL statements sequentially in one atomic transaction.
+    /// Executes SQL statements sequentially against one atomic snapshot.
     ///
-    /// Each statement receives its own parameter list. The transaction commits
-    /// only after every statement succeeds, so reads can observe earlier
-    /// staged writes while observers see only the final committed state.
+    /// Pure-read batches share one immutable read snapshot and prepared SQL
+    /// session. Batches containing writes or durable runtime functions use a
+    /// write transaction, so reads can observe earlier staged writes and the
+    /// transaction commits only after every statement succeeds.
     pub async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],
@@ -536,47 +542,124 @@ where
         }
 
         let statements = statements.to_vec();
-        let telemetry_sink = self.telemetry.clone();
-        self.with_write_transaction(move |transaction| {
-            Box::pin(async move {
-                let mut results = Vec::with_capacity(statements.len());
-                for (statement_index, statement) in statements.iter().enumerate() {
-                    let telemetry = SqlStatementTelemetry::start(
-                        telemetry_sink.as_ref(),
+        match classify_execute_batch(&statements)? {
+            ExecuteBatchExecution::ReadOnly(parsed) => {
+                self.execute_read_only_batch(&statements, parsed).await
+            }
+            ExecuteBatchExecution::Transaction(parsed) => {
+                let telemetry_sink = self.telemetry.clone();
+                self.with_write_transaction(move |transaction| {
+                    Box::pin(async move {
+                        let mut results = Vec::with_capacity(statements.len());
+                        for (statement_index, (statement, parsed)) in
+                            statements.iter().zip(parsed).enumerate()
+                        {
+                            let telemetry = SqlStatementTelemetry::start(
+                                telemetry_sink.as_ref(),
+                                &statement.sql,
+                                "batch",
+                                Some(statement_index),
+                            );
+                            let operation = async {
+                                execute_transaction_statement(
+                                    transaction,
+                                    &statement.sql,
+                                    parsed,
+                                    &statement.params,
+                                    options.clone(),
+                                )
+                                .await
+                                .map_err(|error| {
+                                    with_batch_statement_index(
+                                        normalize_sql_surface_error(error, &statement.sql),
+                                        statement_index,
+                                    )
+                                })
+                            };
+                            let result = match telemetry.as_ref() {
+                                Some(telemetry) => telemetry.instrument(operation).await,
+                                None => operation.await,
+                            };
+                            if let Some(telemetry) = telemetry {
+                                telemetry.finish(&result);
+                            }
+                            results.push(result?);
+                        }
+                        Ok(results)
+                    })
+                })
+                .await
+            }
+        }
+    }
+
+    async fn execute_read_only_batch(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        parsed: Vec<datafusion::sql::parser::Statement>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let _operation_guard = self.begin_waitable_session_operation().await?;
+        let read_scope = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
+        with_static_session_sql_read::<StorageImpl, _, _, _>(read_scope, |read_store| async move {
+            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let visible_schemas = self
+                .catalog_context
+                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+                .await?;
+            let ctx = SessionSqlExecutionContext {
+                active_branch_id: &active_branch_id,
+                read_store,
+                live_state: Arc::clone(&self.live_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                branch_ctx: Arc::clone(&self.branch_ctx),
+                visible_schemas,
+                functions: FunctionProviderHandle::system(),
+                plugin_host: self.plugin_host.clone(),
+            };
+            let read_session = sql2::prepare_read_session(&ctx).await?;
+            let mut results = Vec::with_capacity(statements.len());
+            for (statement_index, (statement, parsed)) in statements.iter().zip(parsed).enumerate()
+            {
+                let telemetry = SqlStatementTelemetry::start(
+                    self.telemetry.as_ref(),
+                    &statement.sql,
+                    "batch",
+                    Some(statement_index),
+                );
+                let operation = async {
+                    sql2::execute_read_statement_in_session_from_parsed(
+                        &read_session,
                         &statement.sql,
-                        "batch",
-                        Some(statement_index),
-                    );
-                    let operation = async {
-                        let parsed = sql2::parse_statement(&statement.sql)
-                            .map_err(|error| with_batch_statement_index(error, statement_index))?;
-                        execute_transaction_statement(
-                            transaction,
-                            &statement.sql,
-                            parsed,
-                            &statement.params,
-                            options.clone(),
+                        parsed,
+                        &statement.params,
+                    )
+                    .await
+                    .map(ExecuteResult::from_sql_query_result)
+                    .map_err(|error| {
+                        with_batch_statement_index(
+                            normalize_sql_surface_error(error, &statement.sql),
+                            statement_index,
                         )
-                        .await
-                        .map_err(|error| {
-                            with_batch_statement_index(
-                                normalize_sql_surface_error(error, &statement.sql),
-                                statement_index,
-                            )
-                        })
-                    };
-                    let result = match telemetry.as_ref() {
-                        Some(telemetry) => telemetry.instrument(operation).await,
-                        None => operation.await,
-                    };
-                    if let Some(telemetry) = telemetry {
-                        telemetry.finish(&result);
-                    }
-                    let result = result?;
-                    results.push(result);
+                    })
+                };
+                let result = match telemetry.as_ref() {
+                    Some(telemetry) => telemetry.instrument(operation).await,
+                    None => operation.await,
+                };
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish(&result);
                 }
-                Ok(results)
-            })
+                results.push(result?);
+            }
+            drop(read_session);
+            drop(ctx);
+            drop(live_state);
+            Ok(results)
         })
         .await
     }
@@ -634,7 +717,7 @@ where
             .await?;
         with_static_session_sql_read::<StorageImpl, _, _, _>(read_scope, |read_store| async move {
             let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-            let active_branch_commit_id = self
+            let active_branch_head = self
                 .branch_ctx
                 .ref_reader(read_store.clone())
                 .load_head(&active_branch_id)
@@ -645,9 +728,8 @@ where
                         "execute coherent read batch",
                         "active branch",
                     )
-                })?
-                .commit_id
-                .to_string();
+                })?;
+            let active_branch_commit_id = active_branch_head.commit_id.to_string();
             let storage_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read_store)
                     .await?
@@ -676,6 +758,7 @@ where
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
             };
+            let read_session = sql2::prepare_read_session_at_head(&ctx, active_branch_head).await?;
             let mut results = Vec::with_capacity(statements.len());
             for (statement_index, ((sql, params), statement)) in
                 statements.iter().zip(parsed).enumerate()
@@ -687,10 +770,15 @@ where
                     Some(statement_index),
                 );
                 let operation = async {
-                    sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params)
-                        .await
-                        .map(ExecuteResult::from_sql_query_result)
-                        .map_err(|error| normalize_sql_surface_error(error, sql))
+                    sql2::execute_read_statement_in_session_from_parsed(
+                        &read_session,
+                        sql,
+                        statement,
+                        params,
+                    )
+                    .await
+                    .map(ExecuteResult::from_sql_query_result)
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
                 };
                 let result = match telemetry.as_ref() {
                     Some(telemetry) => telemetry.instrument(operation).await,
@@ -701,6 +789,7 @@ where
                 }
                 results.push(result?);
             }
+            drop(read_session);
             drop(ctx);
             drop(live_state);
             Ok(CoherentReadBatch {
@@ -1002,6 +1091,34 @@ where
     result
 }
 
+fn classify_execute_batch(
+    statements: &[ExecuteBatchStatement],
+) -> Result<ExecuteBatchExecution, LixError> {
+    // Classify the complete batch before choosing a snapshot or transaction;
+    // switching execution modes between statements would break atomicity, and
+    // any possible durable mutation keeps the whole batch transactional so
+    // later reads retain read-after-write visibility.
+    let mut parsed = Vec::with_capacity(statements.len());
+    let mut is_read_only = true;
+    for (statement_index, statement) in statements.iter().enumerate() {
+        let parsed_statement = sql2::parse_statement(&statement.sql)
+            .map_err(|error| with_batch_statement_index(error, statement_index))?;
+        let route = sql2::bind_statement_route(&parsed_statement)
+            .map_err(|error| with_batch_statement_index(error, statement_index))?;
+        if route == sql2::BoundStatementRoute::Write
+            || sql2::statement_has_durable_runtime_function(&parsed_statement)
+        {
+            is_read_only = false;
+        }
+        parsed.push(parsed_statement);
+    }
+    if is_read_only {
+        Ok(ExecuteBatchExecution::ReadOnly(parsed))
+    } else {
+        Ok(ExecuteBatchExecution::Transaction(parsed))
+    }
+}
+
 async fn execute_transaction_statement<StorageImpl>(
     transaction: &mut crate::transaction::Transaction<StorageImpl>,
     sql: &str,
@@ -1124,6 +1241,71 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("workspace session should open")
+    }
+
+    fn batch_statement(sql: &str) -> ExecuteBatchStatement {
+        ExecuteBatchStatement {
+            sql: sql.to_string(),
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn execute_batch_classifies_only_pure_reads_for_the_fast_path() {
+        assert!(matches!(
+            classify_execute_batch(&[
+                batch_statement("SELECT 1"),
+                batch_statement("SELECT * FROM lix_file"),
+            ])
+            .unwrap(),
+            ExecuteBatchExecution::ReadOnly(_)
+        ));
+        assert!(matches!(
+            classify_execute_batch(&[
+                batch_statement("SELECT 1"),
+                batch_statement("DELETE FROM lix_file WHERE id = 'missing'"),
+            ])
+            .unwrap(),
+            ExecuteBatchExecution::Transaction(_)
+        ));
+        assert!(matches!(
+            classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")]).unwrap(),
+            ExecuteBatchExecution::Transaction(_)
+        ));
+    }
+
+    #[test]
+    fn execute_batch_classification_preserves_the_invalid_statement_index() {
+        let result = classify_execute_batch(&[
+            batch_statement("SELECT 1"),
+            batch_statement("this is not SQL"),
+        ]);
+        let Err(error) = result else {
+            panic!("invalid SQL should fail classification");
+        };
+
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+    }
+
+    #[tokio::test]
+    async fn execute_batch_pure_read_fast_path_preserves_order_and_parameters() {
+        let session = open_session().await;
+        let results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: "SELECT $1 AS value".to_string(),
+                    params: vec![Value::Integer(11)],
+                },
+                ExecuteBatchStatement {
+                    sql: "SELECT $1 AS value".to_string(),
+                    params: vec![Value::Integer(22)],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 11);
+        assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 22);
     }
 
     #[test]

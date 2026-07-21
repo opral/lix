@@ -129,7 +129,9 @@ where
             .await
     }
 
-    /// Executes statements sequentially in one atomic transaction.
+    /// Executes statements sequentially against one atomic snapshot.
+    /// Pure reads share one read snapshot; batches containing writes retain
+    /// transactional read-after-write and rollback semantics.
     pub async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],
