@@ -169,6 +169,7 @@ pub(crate) struct LiveStateScanRequest {
 /// `LiveStateScanRequest` so optimized implementations can preserve the exact
 /// generic scan semantics while specializing the storage path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LiveStateFileScanRequest {
     #[serde(default)]
     pub(crate) branch_ids: Vec<String>,
@@ -186,6 +187,7 @@ pub(crate) struct LiveStateFileScanRequest {
 }
 
 impl LiveStateFileScanRequest {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn to_scan_request(&self) -> LiveStateScanRequest {
         LiveStateScanRequest {
             filter: LiveStateFilter {

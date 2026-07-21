@@ -1,19 +1,15 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::LixError;
-use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::entity_pk::EntityPk;
-use crate::filesystem::FilesystemIndex;
 use crate::live_state::{LiveStateProjection, MaterializedLiveStateRow};
-use crate::wasm::{WasmPluginEntityState, WasmPluginFile};
+use crate::wasm::{WasmComponentInstance, WasmPluginEntityState, WasmPluginFile};
 
+use super::InstalledPlugin;
 use super::component::{
     PluginComponentHost, detect_changes_with_plugin as detect_changes_with_component,
     render_with_plugin as render_with_component,
-};
-use super::{
-    InstalledPlugin, load_installed_plugin_from_archive_bytes, plugin_key_from_archive_path,
-    select_best_glob_match,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,53 +18,6 @@ pub(crate) struct PluginDetectedChange {
     pub(crate) schema_key: String,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-}
-
-pub(crate) async fn load_installed_plugins_from_filesystem(
-    filesystem: &FilesystemIndex,
-    blob_reader: &dyn BlobDataReader,
-) -> Result<Vec<InstalledPlugin>, LixError> {
-    let mut plugins = Vec::new();
-    for (path, file) in filesystem.file_entries() {
-        let Some(plugin_key) = plugin_key_from_archive_path(path) else {
-            continue;
-        };
-        let Some(blob_hash) = file.blob_hash.as_deref() else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("installed plugin archive '{path}' is missing binary blob data"),
-            ));
-        };
-        let hash = BlobHash::from_hex(blob_hash)?;
-        let mut batch = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
-        let Some(archive_bytes) = batch.pop().flatten() else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("installed plugin archive '{path}' blob '{blob_hash}' is missing"),
-            ));
-        };
-        plugins.push(load_installed_plugin_from_archive_bytes(
-            &plugin_key,
-            path,
-            &archive_bytes,
-        )?);
-    }
-    Ok(plugins)
-}
-
-pub(crate) fn select_plugin_for_path<'a>(
-    plugins: &'a [InstalledPlugin],
-    path: &str,
-) -> Option<&'a InstalledPlugin> {
-    // Plugin ownership is path-based. File bytes, especially empty bytes, are
-    // not reliable for deciding which plugin is active for a path.
-    select_best_glob_match(
-        path,
-        None::<()>,
-        plugins,
-        |plugin| plugin.path_glob.as_str(),
-        |_plugin| None::<()>,
-    )
 }
 
 pub(crate) async fn detect_changes_with_plugin(
@@ -84,6 +33,26 @@ pub(crate) async fn detect_changes_with_plugin(
         file,
     )
     .await?;
+    normalize_detected_changes(changes)
+}
+
+/// Executes a component that was resolved from the warm hash cache before any
+/// CAS read. Keeping the exact `Arc` avoids a key-only cache race with another
+/// branch that has a different component version under the same plugin key.
+pub(crate) async fn detect_changes_with_component_instance(
+    instance: &Arc<dyn WasmComponentInstance>,
+    active_state: &[MaterializedLiveStateRow],
+    file: WasmPluginFile,
+) -> Result<Vec<PluginDetectedChange>, LixError> {
+    let changes = instance
+        .detect_changes(plugin_entity_state_from_live_rows(active_state)?, file)
+        .await?;
+    normalize_detected_changes(changes)
+}
+
+fn normalize_detected_changes(
+    changes: Vec<crate::wasm::WasmPluginDetectedChange>,
+) -> Result<Vec<PluginDetectedChange>, LixError> {
     changes
         .into_iter()
         .map(|change| {
@@ -112,6 +81,15 @@ pub(crate) async fn render_plugin_state(
     .await
 }
 
+pub(crate) async fn render_plugin_state_with_component_instance(
+    instance: &Arc<dyn WasmComponentInstance>,
+    active_state: &[MaterializedLiveStateRow],
+) -> Result<Vec<u8>, LixError> {
+    instance
+        .render(plugin_entity_state_from_live_rows(active_state)?)
+        .await
+}
+
 pub(crate) async fn render_materialized_plugin_file(
     host: &impl PluginComponentHost,
     plugin: &InstalledPlugin,
@@ -128,9 +106,16 @@ pub(crate) async fn render_materialized_plugin_file(
 
 pub(crate) fn retain_plugin_state_rows(
     plugin: &InstalledPlugin,
+    rows: Vec<MaterializedLiveStateRow>,
+) -> Vec<MaterializedLiveStateRow> {
+    retain_plugin_state_rows_for_schema_keys(&plugin.schema_keys, rows)
+}
+
+pub(crate) fn retain_plugin_state_rows_for_schema_keys(
+    schema_keys: &[String],
     mut rows: Vec<MaterializedLiveStateRow>,
 ) -> Vec<MaterializedLiveStateRow> {
-    let schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
+    let schema_keys = schema_keys.iter().collect::<BTreeSet<_>>();
     rows.retain(|row| schema_keys.contains(&row.schema_key) && row.snapshot_content.is_some());
     rows
 }

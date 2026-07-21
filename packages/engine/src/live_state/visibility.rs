@@ -25,6 +25,7 @@ pub(crate) trait StagedLiveStateRows {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn staged_file_rows(
         &self,
         request: &LiveStateFileScanRequest,
@@ -136,6 +137,7 @@ where
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn overlay_scan_file_rows<S>(
     base: &dyn LiveStateReader,
     staged: &S,

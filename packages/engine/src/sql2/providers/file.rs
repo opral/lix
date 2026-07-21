@@ -27,7 +27,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, future::try_join_all};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
@@ -41,15 +41,15 @@ use crate::filesystem::{
 };
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
-    LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
-    LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    InstalledPlugin, PluginRuntimeHost, is_plugin_storage_path,
-    load_installed_plugins_from_filesystem, plugin_key_from_archive_path,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
+    PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
+    plugin_key_from_archive_file_id, plugin_key_from_archive_path,
     plugin_state_live_state_projection, plugin_storage_archive_file_id,
-    reject_normal_plugin_storage_mutation, render_materialized_plugin_file,
-    retain_plugin_state_rows, select_plugin_for_path,
+    render_plugin_state_with_component_instance,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -64,6 +64,7 @@ use crate::sql2::write_normalization::{
     lix_file_data_type_error, lix_file_data_type_error_with_value, scalar_is_binary_or_null,
 };
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::wasm::WasmComponentInstance;
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -330,6 +331,7 @@ impl LixFileSpec {
         target_file_ids: FileIdConstraint,
         indexed_matches: Option<FilesystemPathSelection>,
         needs_data: bool,
+        needs_plugin_ownership: bool,
         capture_path_resolver_rows: bool,
         captured: SharedLixFileDmlSourceState,
     ) -> RowSource {
@@ -343,6 +345,7 @@ impl LixFileSpec {
                 target_file_ids,
                 indexed_matches,
                 needs_data,
+                needs_plugin_ownership,
                 capture_path_resolver_rows,
                 captured,
             ),
@@ -355,6 +358,7 @@ impl LixFileSpec {
                 target_file_ids,
                 indexed_matches,
                 needs_data,
+                needs_plugin_ownership,
                 capture_path_resolver_rows,
                 captured,
             )| async move {
@@ -385,13 +389,15 @@ impl LixFileSpec {
                     )
                 };
                 let prepared = prepared.map_err(lix_error_to_datafusion_error)?;
-                let plugin_render = if prepared.needs_plugin_render(needs_data) {
+                let plugin_render = if prepared.needs_plugin_render(needs_data)
+                    || (needs_plugin_ownership && !prepared.file_rows.is_empty())
+                {
                     plugin_render_context_for_lix_file_scan(
                         live_state,
-                        &blob_reader,
                         &request,
                         plugin_host,
-                        needs_data,
+                        &prepared,
+                        needs_plugin_ownership,
                     )
                     .await
                     .map_err(|error| {
@@ -689,10 +695,10 @@ impl TableSpec for LixFileSpec {
                     let plugin_render = if prepared.needs_plugin_render(needs_data) {
                         plugin_render_context_for_lix_file_scan(
                             Arc::clone(&live_state),
-                            &blob_reader,
                             &request,
                             plugin_host,
-                            true,
+                            &prepared,
+                            false,
                         )
                         .await
                         .map_err(|error| {
@@ -773,6 +779,8 @@ impl TableSpec for LixFileSpec {
         filters: &[Expr],
         options: DmlPlanOptions,
     ) -> Result<PlannedDml> {
+        let plugin_archive_delete_target =
+            exact_plugin_archive_delete_target_from_filters(filters)?;
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
             || options.returning_columns.contains("data");
         let target_file_ids = file_id_constraint_from_filters(filters)?;
@@ -795,6 +803,7 @@ impl TableSpec for LixFileSpec {
             indexed_matches,
             needs_data,
             false,
+            false,
             Arc::clone(&captured),
         );
         let branch_binding = self.branch_binding.clone();
@@ -802,12 +811,14 @@ impl TableSpec for LixFileSpec {
             let write_ctx = write_ctx.clone();
             let branch_binding = branch_binding.clone();
             let captured = Arc::clone(&captured);
+            let plugin_archive_delete_target = plugin_archive_delete_target.clone();
             async move {
                 let source_state = lix_file_dml_source_state(&captured, "DELETE")?;
                 let staged = lix_file_delete_stage_from_batch(
                     &matched_batch,
                     branch_binding.active_branch_id(),
                     &source_state.blob_ref_keys,
+                    plugin_archive_delete_target.as_deref(),
                 )?;
                 let count = staged.count;
 
@@ -863,6 +874,7 @@ impl TableSpec for LixFileSpec {
             target_file_ids,
             indexed_matches,
             needs_data,
+            update_columns.updates_path() && !update_columns.data,
             capture_path_resolver_rows,
             Arc::clone(&captured),
         );
@@ -1107,10 +1119,10 @@ impl UpsertSupport for LixFileSpec {
         let plugin_render = if prepared.needs_plugin_render(true) {
             plugin_render_context_for_lix_file_scan(
                 live_state,
-                &self.blob_reader,
                 &request,
                 self.plugin_host.clone(),
-                true,
+                &prepared,
+                false,
             )
             .await
             .map_err(|error| {
@@ -1189,7 +1201,8 @@ impl UpsertSupport for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let live_state: Arc<dyn LiveStateReader> =
+            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
             .await
             .map_err(lix_error_to_datafusion_error)?;
@@ -1197,19 +1210,31 @@ impl UpsertSupport for LixFileSpec {
             blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
 
         let plugin_rewrite_file_ids = if update_columns.updates_path() && !update_columns.data {
-            let plugin_render = plugin_render_context_for_lix_file_scan(
-                live_state.clone(),
-                &self.blob_reader,
-                &request,
-                self.plugin_host.clone(),
-                true,
-            )
-            .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_file plugin discovery failed: {error}"
-                ))
-            })?;
+            let plugin_host = self.plugin_host.clone();
+            let branches =
+                load_plugin_render_branches(Arc::clone(&live_state), &request, &plugin_host)
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file plugin discovery failed: {error}"
+                        ))
+                    })?;
+            let plugin_render = if branches.is_empty() {
+                None
+            } else {
+                plugin_render_context_with_branches(
+                    live_state.clone(),
+                    plugin_host,
+                    branches,
+                    plugin_owner_candidates_from_batch(augmented, branch_binding)?,
+                )
+                .await
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "sql2 lix_file plugin discovery failed: {error}"
+                    ))
+                })?
+            };
             path_update_plugin_rewrite_file_ids(
                 plugin_render.as_ref(),
                 augmented,
@@ -1495,15 +1520,23 @@ impl FileDescriptorRecord {
 struct PluginRenderContext {
     live_state: Arc<dyn LiveStateReader>,
     host: PluginRuntimeHost,
-    installed_plugins_by_branch: BTreeMap<String, Vec<InstalledPlugin>>,
+    branches: BTreeMap<String, BranchPluginRenderContext>,
+    owners_by_file: BTreeMap<FilesystemDescriptorKey, PluginFileOwner>,
+}
+
+#[derive(Clone)]
+struct BranchPluginRenderContext {
+    registry: PluginRegistry,
+    catalog: Arc<CompiledPluginCatalog>,
 }
 
 impl PluginRenderContext {
-    fn installed_plugins_for_branch(&self, branch_id: &str) -> &[InstalledPlugin] {
-        self.installed_plugins_by_branch
-            .get(branch_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    fn branch(&self, branch_id: &str) -> Option<&BranchPluginRenderContext> {
+        self.branches.get(branch_id)
+    }
+
+    fn owner_for_file(&self, key: &FilesystemDescriptorKey) -> Option<&PluginFileOwner> {
+        self.owners_by_file.get(key)
     }
 }
 
@@ -1803,7 +1836,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
             &mut staged,
             existing.id,
             Some(path),
-            None,
+            Some(existing.name),
             data.clone(),
             context,
             has_blob_ref,
@@ -1891,13 +1924,13 @@ fn lix_file_delete_stage_from_batch(
     batch: &RecordBatch,
     branch_binding: Option<&str>,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
+    plugin_archive_delete_target: Option<&str>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
     for row_index in 0..batch.num_rows() {
-        if let Some(path) = optional_string_value(batch, row_index, "path")? {
-            parse_normal_write_file_path(&path, TransactionWriteOperation::Delete)?;
-        }
         let file_id = required_string_value(batch, row_index, "id")?;
+        let path = optional_string_value(batch, row_index, "path")?;
+        validate_lix_file_delete_target(path.as_deref(), &file_id, plugin_archive_delete_target)?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         staged
             .extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
@@ -1909,6 +1942,52 @@ fn lix_file_delete_stage_from_batch(
             .map_err(lix_error_to_datafusion_error)?;
     }
     Ok(staged)
+}
+
+fn validate_lix_file_delete_target(
+    path: Option<&str>,
+    file_id: &str,
+    plugin_archive_delete_target: Option<&str>,
+) -> Result<()> {
+    let archive_id_plugin_key = plugin_key_from_archive_file_id(file_id);
+    let Some(path) = path else {
+        if archive_id_plugin_key.is_some() {
+            return Err(rejected_plugin_archive_delete_error(None, file_id));
+        }
+        return Ok(());
+    };
+    LixPath::try_from_file_path(path).map_err(lix_error_to_datafusion_error)?;
+    let archive_path_plugin_key = plugin_key_from_archive_path(path);
+    if !is_plugin_storage_path(path) && archive_id_plugin_key.is_none() {
+        return Ok(());
+    }
+
+    match (
+        archive_path_plugin_key.as_deref(),
+        archive_id_plugin_key.as_deref(),
+        plugin_archive_delete_target,
+    ) {
+        (Some(path_key), Some(id_key), Some(target_key))
+            if path_key == id_key && id_key == target_key =>
+        {
+            Ok(())
+        }
+        _ => Err(rejected_plugin_archive_delete_error(Some(path), file_id)),
+    }
+}
+
+fn rejected_plugin_archive_delete_error(path: Option<&str>, file_id: &str) -> DataFusionError {
+    lix_error_to_datafusion_error(
+        LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "DELETE FROM lix_file may only uninstall one exact canonical plugin archive; got path {path:?} and file id {file_id:?}"
+            ),
+        )
+        .with_hint(
+            "Delete one canonical /.lix/plugins/<key>.lixplugin path or its deterministic archive file ID.",
+        ),
+    )
 }
 
 fn blob_ref_keys_from_live_rows(
@@ -2034,6 +2113,13 @@ fn lix_file_existing_update_stage_from_batch(
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
+            let data_filename = match data_filename {
+                Some(filename) => Some(filename),
+                None if batch.schema().index_of("name").is_ok() => {
+                    optional_string_value(batch, row_index, "name")?
+                }
+                None => None,
+            };
             let path = if include_descriptor_writes {
                 match data_path {
                     Some(path) => Some(path),
@@ -2331,14 +2417,14 @@ fn path_update_plugin_rewrite_file_ids(
 
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
-        let plugins = plugin_render.installed_plugins_for_branch(&context.branch_id);
-        if plugins.is_empty() {
-            continue;
-        }
-        let existing_plugin = select_plugin_for_path(plugins, &existing_path);
-        let assigned_plugin = select_plugin_for_path(plugins, &assigned_path);
-        let existing_plugin_key = existing_plugin.map(|plugin| plugin.key.as_str());
-        let assigned_plugin_key = assigned_plugin.map(|plugin| plugin.key.as_str());
+        let file_key = FilesystemDescriptorKey::from_context(&context, &file_id);
+        let existing_plugin_key = plugin_render
+            .owner_for_file(&file_key)
+            .map(PluginFileOwner::plugin_key);
+        let assigned_plugin_key = plugin_render
+            .branch(&context.branch_id)
+            .and_then(|branch| branch.catalog.select(&assigned_path))
+            .map(PluginRegistryEntry::key);
         if existing_plugin_key != assigned_plugin_key {
             file_ids.insert(file_id);
         }
@@ -2589,7 +2675,8 @@ fn stage_lix_file_data_update_write(
         context.global,
         context.untracked,
         data,
-    );
+    )
+    .with_had_blob_ref(has_blob_ref);
     if file_payload.is_empty() {
         if has_blob_ref {
             let mut row = blob_ref_tombstone_row(file_id, context.clone());
@@ -2742,11 +2829,46 @@ struct PreparedLixFileRows {
 impl PreparedLixFileRows {
     fn needs_plugin_render(&self, needs_data: bool) -> bool {
         needs_data
-            && self
-                .file_rows
-                .values()
-                .any(|file| !self.blob_rows.contains_key(&file.blob_ref_key()))
+            && self.file_rows.values().any(|file| {
+                plugin_file_can_have_durable_owner(file)
+                    && !self.blob_rows.contains_key(&file.blob_ref_key())
+            })
     }
+
+    fn plugin_owner_candidates(&self, include_blob_backed: bool) -> Vec<FilesystemDescriptorKey> {
+        self.file_rows
+            .values()
+            .filter(|file| {
+                plugin_file_can_have_durable_owner(file)
+                    && (include_blob_backed || !self.blob_rows.contains_key(&file.blob_ref_key()))
+            })
+            .map(|file| file.key.clone())
+            .collect()
+    }
+}
+
+fn plugin_file_can_have_durable_owner(file: &FileDescriptorRecord) -> bool {
+    plugin_descriptor_key_can_have_durable_owner(&file.key)
+}
+
+fn plugin_descriptor_key_can_have_durable_owner(key: &FilesystemDescriptorKey) -> bool {
+    !key.global() && !key.is_untracked() && key.file_id().is_none()
+}
+
+fn plugin_owner_candidates_from_batch(
+    batch: &RecordBatch,
+    branch_binding: Option<&str>,
+) -> Result<Vec<FilesystemDescriptorKey>> {
+    let mut candidates = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        let file_id = required_string_value(batch, row_index, "id")?;
+        let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
+        let key = FilesystemDescriptorKey::from_context(&context, &file_id);
+        if plugin_descriptor_key_can_have_durable_owner(&key) {
+            candidates.push(key);
+        }
+    }
+    Ok(candidates)
 }
 
 fn prepare_lix_file_rows(
@@ -3215,6 +3337,20 @@ async fn lix_file_record_batch_from_prepared(
 
     let file_keys =
         path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect::<Vec<_>>());
+    let mut rendered_plugin_bytes = match &plugin_render {
+        Some(plugin_render) if needs_data => {
+            render_plugin_files_for_sql(
+                plugin_render,
+                blob_reader,
+                &file_keys,
+                &file_rows,
+                &blob_rows,
+                &file_paths,
+            )
+            .await?
+        }
+        _ => BTreeMap::new(),
+    };
     for key in file_keys {
         let file = file_rows
             .remove(&key)
@@ -3226,15 +3362,7 @@ async fn lix_file_record_batch_from_prepared(
         let data = if needs_data {
             match blob_bytes.take(&blob_key) {
                 Some(data) => data,
-                None => {
-                    let rendered = match &plugin_render {
-                        Some(plugin_render) => {
-                            render_plugin_file_for_sql(plugin_render, &file, &path).await?
-                        }
-                        None => None,
-                    };
-                    Some(rendered.unwrap_or_default())
-                }
+                None => Some(rendered_plugin_bytes.remove(&key).unwrap_or_default()),
             }
         } else {
             Some(Vec::new())
@@ -3336,83 +3464,423 @@ async fn load_blob_bytes_for_files(
     })
 }
 
-async fn render_plugin_file_for_sql(
+async fn render_plugin_files_for_sql(
     plugin_render: &PluginRenderContext,
-    file: &FileDescriptorRecord,
-    path: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let installed_plugins = plugin_render.installed_plugins_for_branch(&file.live.branch_id);
-    let Some(plugin) = select_plugin_for_path(installed_plugins, path) else {
-        return Ok(None);
-    };
-    let rows = plugin_render
-        .live_state
-        .scan_file_rows(&LiveStateFileScanRequest {
-            branch_ids: vec![file.live.branch_id.clone()],
-            file_id: file.id.clone(),
-            schema_keys: plugin.schema_keys.clone(),
-            projection: plugin_state_live_state_projection(),
-            ..Default::default()
-        })
-        .await?;
-    let active_state = retain_plugin_state_rows(plugin, rows);
-    render_materialized_plugin_file(&plugin_render.host, plugin, &active_state).await
-}
-
-async fn load_installed_plugins_for_lix_file_scan(
-    live_state: Arc<dyn LiveStateReader>,
     blob_reader: &Arc<dyn BlobDataReader>,
-    request: &LiveStateScanRequest,
-) -> Result<BTreeMap<String, Vec<InstalledPlugin>>, LixError> {
-    let mut plugin_request = request.clone();
-    plugin_request.filter.schema_keys = vec![
-        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        BLOB_REF_SCHEMA_KEY.to_string(),
-        DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-    ];
-    plugin_request.filter.entity_pks.clear();
-    plugin_request.filter.file_ids.clear();
-    plugin_request.projection = LiveStateProjection::default();
-    plugin_request.limit = None;
+    file_keys: &[FilesystemDescriptorKey],
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+    file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
+) -> Result<BTreeMap<FilesystemDescriptorKey, Vec<u8>>, LixError> {
+    let owned_file_keys = file_keys
+        .iter()
+        .filter(|key| {
+            let file = file_rows
+                .get(*key)
+                .expect("prepared lix_file order should reference a descriptor");
+            let path = file_paths
+                .get(*key)
+                .expect("prepared lix_file descriptor should have a path");
+            let active_owner = plugin_render.owner_for_file(key).is_some_and(|owner| {
+                plugin_render
+                    .branch(key.branch_id())
+                    .is_some_and(|branch| branch.catalog.matches_plugin(owner.plugin_key(), path))
+            });
+            !blob_rows.contains_key(&file.blob_ref_key()) && active_owner
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if owned_file_keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
 
-    let rows = live_state.scan_rows(&plugin_request).await?;
-    let mut rows_by_branch = BTreeMap::<String, Vec<MaterializedLiveStateRow>>::new();
-    for row in rows {
-        rows_by_branch
-            .entry(row.branch_id.clone())
+    let mut execution_keys = BTreeSet::<(String, String)>::new();
+    for file_key in &owned_file_keys {
+        let owner = plugin_render
+            .owner_for_file(file_key)
+            .expect("owned file key was selected above");
+        execution_keys.insert((
+            file_key.branch_id().to_string(),
+            owner.plugin_key().to_string(),
+        ));
+    }
+
+    let mut component_instances =
+        BTreeMap::<(String, String), Arc<dyn WasmComponentInstance>>::new();
+    let mut cold_entries = BTreeMap::<(String, String), PluginRegistryEntry>::new();
+    for (branch_id, plugin_key) in &execution_keys {
+        let entry = plugin_render
+            .branch(branch_id)
+            .and_then(|branch| branch.registry.get(plugin_key))
+            .ok_or_else(|| invalid_plugin_read_state(format!(
+                "owner references plugin '{plugin_key}' absent from branch '{branch_id}' registry"
+            )))?;
+        let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+        let key = (branch_id.clone(), plugin_key.clone());
+        if let Some(instance) = plugin_render
+            .host
+            .cached_plugin_component(entry.key(), hash)?
+        {
+            component_instances.insert(key, instance);
+        } else {
+            cold_entries.insert(key, entry.clone());
+        }
+    }
+
+    let wasm_hash_hexes = cold_entries
+        .values()
+        .map(|entry| entry.wasm_blob_hash().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let wasm_hashes = wasm_hash_hexes
+        .iter()
+        .map(|hash| BlobHash::from_hex(hash))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let wasm_values = if wasm_hashes.is_empty() {
+        Vec::new()
+    } else {
+        blob_reader.load_bytes_many(&wasm_hashes).await?.into_vec()
+    };
+    if wasm_values.len() != wasm_hashes.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "blob reader returned {} values for {} plugin WASM hashes",
+                wasm_values.len(),
+                wasm_hashes.len()
+            ),
+        ));
+    }
+    let mut wasm_by_hash = BTreeMap::<String, Vec<u8>>::new();
+    for (hash, bytes) in wasm_hash_hexes.into_iter().zip(wasm_values) {
+        let bytes = bytes.ok_or_else(|| {
+            invalid_plugin_read_state(format!(
+                "plugin registry references missing WASM blob '{hash}'"
+            ))
+        })?;
+        wasm_by_hash.insert(hash, bytes);
+    }
+
+    for (key, entry) in cold_entries {
+        let wasm = wasm_by_hash
+            .get(entry.wasm_blob_hash())
+            .expect("distinct plugin WASM hash was loaded")
+            .clone();
+        let plugin = entry.to_installed_plugin(wasm)?;
+        let instance =
+            crate::plugin::load_or_init_plugin_component(&plugin_render.host, &plugin).await?;
+        component_instances.insert(key, instance);
+    }
+
+    let mut file_ids_by_plugin = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    let mut file_key_by_branch_and_id =
+        BTreeMap::<(String, String), FilesystemDescriptorKey>::new();
+    for file_key in &owned_file_keys {
+        let owner = plugin_render
+            .owner_for_file(file_key)
+            .expect("owned file key was selected above");
+        let branch_id = file_key.branch_id().to_string();
+        let file_id = file_key.descriptor_id().to_string();
+        file_ids_by_plugin
+            .entry((branch_id.clone(), owner.plugin_key().to_string()))
             .or_default()
-            .push(row);
+            .insert(file_id.clone());
+        if file_key_by_branch_and_id
+            .insert((branch_id.clone(), file_id.clone()), file_key.clone())
+            .is_some()
+        {
+            return Err(invalid_plugin_read_state(format!(
+                "branch '{branch_id}' has multiple plugin-render candidates for file id '{file_id}'"
+            )));
+        }
     }
 
-    let mut installed_plugins_by_branch = BTreeMap::new();
-    for (branch_id, rows) in rows_by_branch {
-        let filesystem = FilesystemIndex::from_live_rows(rows)?;
-        let installed_plugins =
-            load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await?;
-        installed_plugins_by_branch.insert(branch_id, installed_plugins);
+    let state_scans = file_ids_by_plugin
+        .into_iter()
+        .map(|(execution_key, file_ids)| {
+            let live_state = Arc::clone(&plugin_render.live_state);
+            let schema_keys = plugin_render
+                .branch(&execution_key.0)
+                .and_then(|branch| branch.registry.get(&execution_key.1))
+                .expect("registry entry exists for every state group")
+                .schema_keys()
+                .to_vec();
+            async move {
+                let branch_id = execution_key.0.clone();
+                let mut rows = live_state
+                    .scan_tracked_rows(&LiveStateScanRequest {
+                        filter: LiveStateFilter {
+                            schema_keys: schema_keys.clone(),
+                            branch_ids: vec![branch_id.clone()],
+                            file_ids: file_ids
+                                .iter()
+                                .cloned()
+                                .map(crate::NullableKeyFilter::Value)
+                                .collect(),
+                            untracked: Some(false),
+                            ..LiveStateFilter::default()
+                        },
+                        projection: plugin_state_live_state_projection(),
+                        limit: None,
+                    })
+                    .await?;
+                rows.retain(|row| {
+                    row.branch_id == branch_id
+                        && !row.global
+                        && !row.untracked
+                        && row
+                            .file_id
+                            .as_ref()
+                            .is_some_and(|file_id| file_ids.contains(file_id))
+                        && row.snapshot_content.is_some()
+                        && schema_keys.binary_search(&row.schema_key).is_ok()
+                });
+                Ok::<_, LixError>((execution_key, rows))
+            }
+        });
+    let state_groups = try_join_all(state_scans).await?;
+    let mut state_by_file = owned_file_keys
+        .iter()
+        .cloned()
+        .map(|key| (key, Vec::<MaterializedLiveStateRow>::new()))
+        .collect::<BTreeMap<_, _>>();
+    for ((branch_id, _plugin_key), rows) in state_groups {
+        for row in rows {
+            let Some(file_id) = row.file_id.as_deref() else {
+                continue;
+            };
+            let key = file_key_by_branch_and_id
+                .get(&(branch_id.clone(), file_id.to_string()))
+                .ok_or_else(|| {
+                    invalid_plugin_read_state(format!(
+                        "plugin state scan returned unexpected file id '{file_id}' in branch '{branch_id}'"
+                    ))
+                })?;
+            state_by_file
+                .get_mut(key)
+                .expect("owned file state bucket exists")
+                .push(row);
+        }
     }
-    Ok(installed_plugins_by_branch)
+    for rows in state_by_file.values_mut() {
+        rows.sort_by(|left, right| {
+            (&left.schema_key, &left.entity_pk).cmp(&(&right.schema_key, &right.entity_pk))
+        });
+    }
+
+    let mut rendered = BTreeMap::new();
+    for file_key in owned_file_keys {
+        let owner = plugin_render
+            .owner_for_file(&file_key)
+            .expect("owned file key was selected above");
+        let execution_key = (
+            file_key.branch_id().to_string(),
+            owner.plugin_key().to_string(),
+        );
+        let component = component_instances
+            .get(&execution_key)
+            .expect("resolved component exists for owned file");
+        let active_state = state_by_file.remove(&file_key).unwrap_or_default();
+        // The owner row, not the presence of plugin state rows, is the durable
+        // materialization signal. Plugins that intentionally emit zero state
+        // must still receive render([]).
+        let bytes = render_plugin_state_with_component_instance(component, &active_state).await?;
+        rendered.insert(file_key, bytes);
+    }
+    Ok(rendered)
 }
 
 async fn plugin_render_context_for_lix_file_scan(
     live_state: Arc<dyn LiveStateReader>,
-    blob_reader: &Arc<dyn BlobDataReader>,
     request: &LiveStateScanRequest,
     host: PluginRuntimeHost,
-    needs_data: bool,
+    prepared: &PreparedLixFileRows,
+    include_blob_backed_candidates: bool,
 ) -> Result<Option<PluginRenderContext>, LixError> {
-    if !needs_data {
+    let branches = load_plugin_render_branches(Arc::clone(&live_state), request, &host).await?;
+    if branches.is_empty() {
+        return Ok(None);
+    }
+    let mut candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
+    if !include_blob_backed_candidates {
+        candidates.retain(|key| {
+            prepared.file_paths.get(key).is_some_and(|path| {
+                branches
+                    .get(key.branch_id())
+                    .and_then(|branch| branch.catalog.select(path))
+                    .is_some()
+            })
+        });
+    }
+    plugin_render_context_with_branches(live_state, host, branches, candidates).await
+}
+
+async fn load_plugin_render_branches(
+    live_state: Arc<dyn LiveStateReader>,
+    request: &LiveStateScanRequest,
+    host: &PluginRuntimeHost,
+) -> Result<BTreeMap<String, BranchPluginRenderContext>, LixError> {
+    let branch_ids = request
+        .filter
+        .branch_ids
+        .iter()
+        .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let registry_reads = branch_ids.into_iter().map(|branch_id| {
+        let live_state = Arc::clone(&live_state);
+        async move {
+            let rows = live_state
+                .scan_tracked_rows(&LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec!["lix_key_value".to_string()],
+                        entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                        branch_ids: vec![branch_id.clone()],
+                        file_ids: vec![crate::NullableKeyFilter::Null],
+                        untracked: Some(false),
+                        ..LiveStateFilter::default()
+                    },
+                    projection: plugin_control_live_state_projection(),
+                    limit: Some(1),
+                })
+                .await?;
+            let row = rows.into_iter().find(|row| {
+                row.schema_key == "lix_key_value"
+                    && row.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
+                    && row.file_id.is_none()
+                    && row.branch_id == branch_id
+                    && !row.global
+                    && !row.untracked
+            });
+            let registry = PluginRegistry::from_optional_live_state_row(row.as_ref(), &branch_id)?;
+            Ok::<_, LixError>((branch_id, registry))
+        }
+    });
+
+    let mut branches = BTreeMap::<String, BranchPluginRenderContext>::new();
+    for (branch_id, registry) in try_join_all(registry_reads).await? {
+        if registry.is_empty() {
+            continue;
+        }
+        let catalog = host.compiled_plugin_catalog(&registry)?;
+        branches.insert(branch_id, BranchPluginRenderContext { registry, catalog });
+    }
+    // This is the O(1)-shape no-plugin path: exact registry lookups above are
+    // the only reads. No owner/state scan, CAS read, matcher compilation, or
+    // WASM work is reachable when every requested registry is absent/empty.
+    Ok(branches)
+}
+
+async fn plugin_render_context_with_branches(
+    live_state: Arc<dyn LiveStateReader>,
+    host: PluginRuntimeHost,
+    branches: BTreeMap<String, BranchPluginRenderContext>,
+    candidates: Vec<FilesystemDescriptorKey>,
+) -> Result<Option<PluginRenderContext>, LixError> {
+    if candidates.is_empty() {
         return Ok(None);
     }
 
-    let installed_plugins_by_branch =
-        load_installed_plugins_for_lix_file_scan(Arc::clone(&live_state), blob_reader, request)
-            .await?;
+    let mut candidate_keys_by_branch =
+        BTreeMap::<String, BTreeMap<String, FilesystemDescriptorKey>>::new();
+    for candidate in candidates {
+        if !branches.contains_key(candidate.branch_id()) {
+            continue;
+        }
+        let branch_id = candidate.branch_id().to_string();
+        let file_id = candidate.descriptor_id().to_string();
+        if candidate_keys_by_branch
+            .entry(branch_id.clone())
+            .or_default()
+            .insert(file_id.clone(), candidate)
+            .is_some()
+        {
+            return Err(invalid_plugin_read_state(format!(
+                "branch '{branch_id}' has multiple plugin-owner candidates for file id '{file_id}'"
+            )));
+        }
+    }
+
+    let owner_reads = candidate_keys_by_branch
+        .iter()
+        .map(|(branch_id, candidate_keys)| {
+            let live_state = Arc::clone(&live_state);
+            let branch_id = branch_id.clone();
+            let file_ids = candidate_keys.keys().cloned().collect::<BTreeSet<_>>();
+            async move {
+                let rows = live_state
+                    .scan_tracked_rows(&LiveStateScanRequest {
+                        filter: LiveStateFilter {
+                            schema_keys: vec!["lix_key_value".to_string()],
+                            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+                            branch_ids: vec![branch_id.clone()],
+                            file_ids: file_ids
+                                .iter()
+                                .cloned()
+                                .map(crate::NullableKeyFilter::Value)
+                                .collect(),
+                            untracked: Some(false),
+                            ..LiveStateFilter::default()
+                        },
+                        projection: plugin_control_live_state_projection(),
+                        limit: None,
+                    })
+                    .await?;
+                Ok::<_, LixError>((branch_id, file_ids, rows))
+            }
+        });
+    let mut owners_by_file = BTreeMap::new();
+    for (branch_id, file_ids, rows) in try_join_all(owner_reads).await? {
+        for row in rows {
+            let Some(file_id) = row.file_id.as_deref() else {
+                continue;
+            };
+            if row.schema_key != "lix_key_value"
+                || row.entity_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+                || row.branch_id != branch_id
+                || row.global
+                || row.untracked
+                || !file_ids.contains(file_id)
+            {
+                continue;
+            }
+            let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
+                continue;
+            };
+            let candidate_key = candidate_keys_by_branch
+                .get(&branch_id)
+                .and_then(|candidate_keys| candidate_keys.get(file_id))
+                .expect("owner row was filtered to candidate file ids")
+                .clone();
+            // Keep a well-formed stale owner even when its plugin is currently
+            // absent. Rendering checks the current registry, while path moves
+            // still need the old key to force reconciliation; reinstall can
+            // then resume from the durable owner.
+            if owners_by_file.insert(candidate_key, owner).is_some() {
+                return Err(invalid_plugin_read_state(format!(
+                    "branch '{branch_id}' returned duplicate plugin owners for file id '{file_id}'"
+                )));
+            }
+        }
+    }
+
     Ok(Some(PluginRenderContext {
         live_state,
         host,
-        installed_plugins_by_branch,
+        branches,
+        owners_by_file,
     }))
+}
+
+fn invalid_plugin_read_state(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_INTERNAL_ERROR, message)
+}
+
+fn plugin_control_live_state_projection() -> LiveStateProjection {
+    LiveStateProjection {
+        columns: vec!["snapshot_content".to_string()],
+    }
 }
 
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
@@ -3630,6 +4098,34 @@ impl FileIdConstraint {
 
 fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
     exact_string_column_constraint_from_filters(filters, "id")
+}
+
+fn exact_plugin_archive_delete_target_from_filters(filters: &[Expr]) -> Result<Option<String>> {
+    let path_plugin_key = single_exact_string_constraint(
+        exact_string_column_constraint_from_filters(filters, "path")?,
+    )
+    .as_deref()
+    .and_then(plugin_key_from_archive_path);
+    let id_plugin_key = single_exact_string_constraint(file_id_constraint_from_filters(filters)?)
+        .as_deref()
+        .and_then(plugin_key_from_archive_file_id);
+
+    match (path_plugin_key, id_plugin_key) {
+        (Some(path_key), Some(id_key)) if path_key != id_key => Ok(None),
+        (Some(path_key), _) => Ok(Some(path_key)),
+        (_, Some(id_key)) => Ok(Some(id_key)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn single_exact_string_constraint(constraint: FileIdConstraint) -> Option<String> {
+    let FileIdConstraint::Ids(values) = constraint else {
+        return None;
+    };
+    if values.len() != 1 {
+        return None;
+    }
+    values.into_iter().next()
 }
 
 pub(super) fn exact_string_column_constraint_from_filters(
@@ -4121,16 +4617,6 @@ fn physical_expr_contains_column(expr: &Arc<dyn PhysicalExpr>, column_name: &str
         .any(|child| physical_expr_contains_column(child, column_name))
 }
 
-fn parse_normal_write_file_path(
-    path: &str,
-    operation: TransactionWriteOperation,
-) -> Result<String> {
-    LixPath::try_from_file_path(path).map_err(lix_error_to_datafusion_error)?;
-    reject_normal_plugin_storage_mutation(path, lix_file_write_operation_label(operation))
-        .map_err(lix_error_to_datafusion_error)?;
-    Ok(path.to_string())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedFileWritePath {
     path: String,
@@ -4541,13 +5027,20 @@ mod tests {
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::plugin::PluginRuntimeHost;
+    use crate::plugin::{
+        PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
+        PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime, PluginRuntimeHost,
+        plugin_storage_archive_file_id, plugin_storage_archive_path,
+    };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteContextBranchRefReader};
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::wasm::UnsupportedWasmRuntime;
+    use crate::wasm::{
+        UnsupportedWasmRuntime, WasmComponentInstance, WasmLimits, WasmPluginDetectedChange,
+        WasmPluginEntityState, WasmPluginFile, WasmRuntime,
+    };
     use crate::{LixError, NullableKeyFilter};
 
     use super::{
@@ -4846,6 +5339,52 @@ mod tests {
             vec![string_literal("file-a")],
             true,
         ))));
+    }
+
+    #[test]
+    fn plugin_archive_delete_target_requires_one_exact_canonical_path_or_id() {
+        let path = "/.lix/plugins/plugin_sentinel.lixplugin";
+        let file_id = "lix_plugin_archive::plugin_sentinel";
+
+        for filters in [
+            vec![eq_filter("path", path)],
+            vec![eq_filter("id", file_id)],
+        ] {
+            assert_eq!(
+                super::exact_plugin_archive_delete_target_from_filters(&filters).unwrap(),
+                Some("plugin_sentinel".to_string())
+            );
+        }
+
+        for filters in [
+            Vec::new(),
+            vec![lower_path_contains_filter("%/.lix/plugins/%")],
+            vec![Expr::InList(InList::new(
+                Box::new(column("path")),
+                vec![
+                    string_literal(path),
+                    string_literal("/.lix/plugins/plugin_other.lixplugin"),
+                ],
+                false,
+            ))],
+        ] {
+            assert_eq!(
+                super::exact_plugin_archive_delete_target_from_filters(&filters).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_archive_delete_target_rejects_conflicting_exact_identities() {
+        assert_eq!(
+            super::exact_plugin_archive_delete_target_from_filters(&[
+                eq_filter("path", "/.lix/plugins/plugin_sentinel.lixplugin"),
+                eq_filter("id", "lix_plugin_archive::plugin_other"),
+            ])
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6025,6 +6564,21 @@ mod tests {
         bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
     }
 
+    struct RecordingBlobReader {
+        bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
+        requests: Arc<Mutex<Vec<Vec<BlobHash>>>>,
+    }
+
+    struct RecordingRenderRuntime {
+        rendered_states: Arc<Mutex<Vec<Vec<WasmPluginEntityState>>>>,
+        rendered_bytes: Vec<u8>,
+    }
+
+    struct RecordingRenderComponent {
+        rendered_states: Arc<Mutex<Vec<Vec<WasmPluginEntityState>>>>,
+        rendered_bytes: Vec<u8>,
+    }
+
     impl StaticBlobReader {
         fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
             Self {
@@ -6065,6 +6619,55 @@ mod tests {
                     .map(|hash| self.bytes_by_hash.get(hash).cloned())
                     .collect(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl BlobDataReader for RecordingBlobReader {
+        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            self.requests
+                .lock()
+                .expect("blob request mutex should not be poisoned")
+                .push(hashes.to_vec());
+            Ok(BlobBytesBatch::new(
+                hashes
+                    .iter()
+                    .map(|hash| self.bytes_by_hash.get(hash).cloned())
+                    .collect(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl WasmRuntime for RecordingRenderRuntime {
+        async fn init_component(
+            &self,
+            _bytes: Vec<u8>,
+            _limits: WasmLimits,
+        ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+            Ok(Arc::new(RecordingRenderComponent {
+                rendered_states: Arc::clone(&self.rendered_states),
+                rendered_bytes: self.rendered_bytes.clone(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl WasmComponentInstance for RecordingRenderComponent {
+        async fn detect_changes(
+            &self,
+            _state: Vec<WasmPluginEntityState>,
+            _file: WasmPluginFile,
+        ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
+            self.rendered_states
+                .lock()
+                .expect("rendered state mutex should not be poisoned")
+                .push(state);
+            Ok(self.rendered_bytes.clone())
         }
     }
 
@@ -6378,6 +6981,75 @@ mod tests {
         )
     }
 
+    fn test_plugin_registry_entry(
+        key: &str,
+        path_glob: &str,
+        schema_key: &str,
+        wasm: &[u8],
+    ) -> PluginRegistryEntry {
+        let manifest_json = serde_json::json!({
+            "api_version": "0.1.0",
+            "entry": "plugin.wasm",
+            "key": key,
+            "match": { "path_glob": path_glob },
+            "runtime": "wasm-component-v1",
+            "schemas": ["schema/plugin.json"],
+        })
+        .to_string();
+        PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: key.to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            path_glob: path_glob.to_string(),
+            entry: "plugin.wasm".to_string(),
+            schema_keys: vec![schema_key.to_string()],
+            manifest_json,
+            archive_file_id: plugin_storage_archive_file_id(key),
+            archive_path: plugin_storage_archive_path(key),
+            archive_blob_hash: BlobHash::from_content(format!("archive-{key}").as_bytes()).to_hex(),
+            wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
+        })
+        .expect("test plugin registry entry should be valid")
+    }
+
+    fn live_plugin_registry_row(
+        branch_id: &str,
+        entries: Vec<PluginRegistryEntry>,
+    ) -> MaterializedLiveStateRow {
+        let registry = PluginRegistry::new(entries).expect("test plugin registry should be valid");
+        let mut row = live_file_row(
+            PLUGIN_REGISTRY_KEY,
+            branch_id,
+            &registry
+                .to_snapshot()
+                .expect("registry snapshot should serialize")
+                .to_string(),
+        );
+        row.schema_key = "lix_key_value".to_string();
+        row
+    }
+
+    fn live_plugin_owner_row(
+        branch_id: &str,
+        file_id: &str,
+        plugin_key: &str,
+        schema_keys: Vec<String>,
+    ) -> MaterializedLiveStateRow {
+        let owner = PluginFileOwner::new(file_id, plugin_key, schema_keys)
+            .expect("test plugin owner should be valid");
+        let mut row = live_file_row(
+            PLUGIN_OWNER_KEY,
+            branch_id,
+            &owner
+                .to_snapshot()
+                .expect("owner snapshot should serialize")
+                .to_string(),
+        );
+        row.schema_key = "lix_key_value".to_string();
+        row.file_id = Some(file_id.to_string());
+        row
+    }
+
     fn plugin_archive(path_glob: &str, schema_key: &str) -> Vec<u8> {
         const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
         let manifest_json = format!(
@@ -6416,35 +7088,6 @@ mod tests {
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap().into_inner()
-    }
-
-    fn plugin_install_rows(branch_id: &str, archive_bytes: &[u8]) -> Vec<MaterializedLiveStateRow> {
-        let archive_file_id = "lix_plugin_archive::plugin_sentinel";
-        let blob_hash = BlobHash::from_content(archive_bytes).to_hex();
-        vec![
-            live_directory_row(
-                "dir-lix-system",
-                branch_id,
-                r#"{"id":"dir-lix-system","parent_id":null,"name":".lix"}"#,
-            ),
-            live_directory_row(
-                "dir-lix-system-plugins",
-                branch_id,
-                r#"{"id":"dir-lix-system-plugins","parent_id":"dir-lix-system","name":"plugins"}"#,
-            ),
-            live_file_row(
-                archive_file_id,
-                branch_id,
-                r#"{"id":"lix_plugin_archive::plugin_sentinel","directory_id":"dir-lix-system-plugins","name":"plugin_sentinel.lixplugin"}"#,
-            ),
-            live_blob_ref_row(
-                archive_file_id,
-                branch_id,
-                archive_file_id,
-                &blob_hash,
-                archive_bytes.len(),
-            ),
-        ]
     }
 
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
@@ -6626,8 +7269,12 @@ mod tests {
     }
 
     fn file_delete_batch_with_path(path: Option<&str>) -> RecordBatch {
+        file_delete_batch_with_id_and_path("file-readme", path)
+    }
+
+    fn file_delete_batch_with_id_and_path(file_id: &str, path: Option<&str>) -> RecordBatch {
         let mut fields = vec![Field::new("id", DataType::Utf8, false)];
-        let mut columns = vec![string_column(vec![Some("file-readme")])];
+        let mut columns = vec![string_column(vec![Some(file_id)])];
         if let Some(path) = path {
             fields.push(Field::new("path", DataType::Utf8, false));
             columns.push(string_column(vec![Some(path)]));
@@ -6885,19 +7532,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_discovery_keeps_duplicate_archive_paths_branch_scoped() {
-        let archive_a = plugin_archive("*.branch-a", "plugin_note_a");
-        let archive_b = plugin_archive("*.branch-b", "plugin_note_b");
-        let mut rows = plugin_install_rows("branch-a", &archive_a);
-        rows.extend(plugin_install_rows("branch-b", &archive_b));
-        let blob_reader = Arc::new(StaticBlobReader::from_blobs(vec![
-            archive_a.clone(),
-            archive_b.clone(),
-        ])) as Arc<dyn BlobDataReader>;
-
-        let installed_plugins = super::load_installed_plugins_for_lix_file_scan(
+    async fn plugin_registry_catalogs_remain_branch_scoped() {
+        let wasm = b"test wasm";
+        let rows = vec![
+            live_plugin_registry_row(
+                "branch-a",
+                vec![test_plugin_registry_entry(
+                    "plugin_sentinel",
+                    "*.branch-a",
+                    "plugin_note_a",
+                    wasm,
+                )],
+            ),
+            live_plugin_registry_row(
+                "branch-b",
+                vec![test_plugin_registry_entry(
+                    "plugin_sentinel",
+                    "*.branch-b",
+                    "plugin_note_b",
+                    wasm,
+                )],
+            ),
+        ];
+        let prepared = super::prepare_lix_file_rows(
+            vec![
+                live_file_row(
+                    "file-a",
+                    "branch-a",
+                    r#"{"id":"file-a","directory_id":null,"name":"note.branch-a"}"#,
+                ),
+                live_file_row(
+                    "file-b",
+                    "branch-b",
+                    r#"{"id":"file-b","directory_id":null,"name":"note.branch-b"}"#,
+                ),
+            ],
+            &super::FilePathPredicate::All,
+        )
+        .expect("plugin candidates should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
             Arc::new(RowsLiveStateReader { rows }) as Arc<dyn LiveStateReader>,
-            &blob_reader,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
                     branch_ids: vec!["branch-a".to_string(), "branch-b".to_string()],
@@ -6905,22 +7579,332 @@ mod tests {
                 },
                 ..Default::default()
             },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            false,
         )
         .await
-        .expect("duplicate plugin paths in different branches should not collide");
+        .expect("branch registries should load")
+        .expect("non-empty registries should create a render context");
 
-        let branch_a_plugins = installed_plugins
-            .get("branch-a")
-            .expect("branch-a plugins should load");
-        let branch_b_plugins = installed_plugins
-            .get("branch-b")
-            .expect("branch-b plugins should load");
-        assert_eq!(branch_a_plugins.len(), 1);
-        assert_eq!(branch_b_plugins.len(), 1);
-        assert_eq!(branch_a_plugins[0].path_glob, "*.branch-a");
-        assert_eq!(branch_b_plugins[0].path_glob, "*.branch-b");
-        assert_eq!(branch_a_plugins[0].schema_keys, vec!["plugin_note_a"]);
-        assert_eq!(branch_b_plugins[0].schema_keys, vec!["plugin_note_b"]);
+        assert_eq!(
+            context
+                .branch("branch-a")
+                .and_then(|branch| branch.catalog.select("/note.branch-a"))
+                .map(PluginRegistryEntry::key),
+            Some("plugin_sentinel")
+        );
+        assert!(
+            context
+                .branch("branch-a")
+                .and_then(|branch| branch.catalog.select("/note.branch-b"))
+                .is_none()
+        );
+        assert_eq!(
+            context
+                .branch("branch-b")
+                .and_then(|branch| branch.catalog.select("/note.branch-b"))
+                .map(PluginRegistryEntry::key),
+            Some("plugin_sentinel")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_plugin_registry_stops_after_one_exact_tracked_read() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("blobless file should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::new(RecordingLiveStateReader {
+                rows: Vec::new(),
+                scan_requests: Arc::clone(&requests),
+            }) as Arc<dyn LiveStateReader>,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            false,
+        )
+        .await
+        .expect("missing registry is the empty registry");
+
+        assert!(context.is_none());
+        let requests = requests.lock().expect("scan request mutex");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].filter.schema_keys, vec!["lix_key_value"]);
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
+        );
+        assert_eq!(requests[0].filter.branch_ids, vec!["branch-b"]);
+        assert_eq!(requests[0].filter.file_ids, vec![NullableKeyFilter::Null]);
+        assert_eq!(requests[0].filter.untracked, Some(false));
+        assert_eq!(requests[0].limit, Some(1));
+    }
+
+    #[tokio::test]
+    async fn installed_nonmatching_plugin_skips_owner_scan_for_blobless_files() {
+        let wasm = b"test wasm";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                r#"{"id":"file-note","directory_id":null,"name":"note.txt"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("blobless raw file should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::new(RecordingLiveStateReader {
+                rows: vec![live_plugin_registry_row(
+                    "branch-b",
+                    vec![test_plugin_registry_entry(
+                        "plugin_sentinel",
+                        "*.sentinel",
+                        "plugin_note",
+                        wasm,
+                    )],
+                )],
+                scan_requests: Arc::clone(&requests),
+            }) as Arc<dyn LiveStateReader>,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            false,
+        )
+        .await
+        .expect("nonmatching registry lookup should succeed");
+
+        assert!(context.is_none());
+        let requests = requests.lock().expect("scan request mutex");
+        assert_eq!(requests.len(), 1, "only the exact registry row is read");
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_owner_renders_empty_state_with_one_wasm_batch() {
+        let wasm = b"test wasm".to_vec();
+        let entry =
+            test_plugin_registry_entry("plugin_sentinel", "*.sentinel", "plugin_note", &wasm);
+        let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let live_state = Arc::new(RecordingLiveStateReader {
+            rows: vec![
+                live_plugin_registry_row("branch-b", vec![entry]),
+                live_plugin_owner_row(
+                    "branch-b",
+                    "file-note",
+                    "plugin_sentinel",
+                    vec!["plugin_note".to_string()],
+                ),
+            ],
+            scan_requests: Arc::clone(&scan_requests),
+        }) as Arc<dyn LiveStateReader>;
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("owned blobless file should prepare");
+        let rendered_states = Arc::new(Mutex::new(Vec::new()));
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::clone(&live_state),
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(RecordingRenderRuntime {
+                rendered_states: Arc::clone(&rendered_states),
+                rendered_bytes: b"rendered empty state".to_vec(),
+            })),
+            &prepared,
+            false,
+        )
+        .await
+        .expect("plugin render context should load")
+        .expect("installed plugin should create a render context");
+        let blob_requests = Arc::new(Mutex::new(Vec::new()));
+        let blob_reader = Arc::new(RecordingBlobReader {
+            bytes_by_hash: BTreeMap::from([(BlobHash::from_content(&wasm), wasm)]),
+            requests: Arc::clone(&blob_requests),
+        }) as Arc<dyn BlobDataReader>;
+
+        let batch = super::lix_file_record_batch_from_prepared(
+            &super::lix_file_schema(),
+            &blob_reader,
+            Some(context.clone()),
+            true,
+            prepared,
+        )
+        .await
+        .expect("owned file should render");
+
+        let data = batch
+            .column(batch.schema().index_of("data").unwrap())
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("data should be a large binary array");
+        assert_eq!(data.value(0), b"rendered empty state");
+        assert_eq!(
+            rendered_states
+                .lock()
+                .expect("rendered state mutex")
+                .as_slice(),
+            &[Vec::<WasmPluginEntityState>::new()]
+        );
+        assert_eq!(
+            blob_requests.lock().expect("blob request mutex").as_slice(),
+            &[vec![BlobHash::from_content(b"test wasm")]]
+        );
+
+        let warm_prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-note",
+                "branch-b",
+                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("warm owned file should prepare");
+        super::lix_file_record_batch_from_prepared(
+            &super::lix_file_schema(),
+            &blob_reader,
+            Some(context),
+            true,
+            warm_prepared,
+        )
+        .await
+        .expect("warm owned file should render without loading component bytes");
+        assert_eq!(
+            blob_requests.lock().expect("blob request mutex").as_slice(),
+            &[vec![BlobHash::from_content(b"test wasm")]],
+            "warm render must hit the hash cache before CAS"
+        );
+        assert_eq!(
+            rendered_states.lock().expect("rendered state mutex").len(),
+            2
+        );
+        let requests = scan_requests.lock().expect("scan request mutex");
+        assert_eq!(
+            requests.len(),
+            4,
+            "registry, owners, then one grouped state scan per render"
+        );
+        assert_eq!(
+            requests[1].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
+        );
+        assert_eq!(
+            requests[2].filter.file_ids,
+            vec![NullableKeyFilter::Value("file-note".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn path_update_uses_stale_owner_and_current_catalog() {
+        let wasm = b"test wasm";
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"note.removed"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("blobless file should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::new(RowsLiveStateReader {
+                rows: vec![
+                    live_plugin_registry_row(
+                        "branch-b",
+                        vec![test_plugin_registry_entry(
+                            "plugin_active",
+                            "*.active",
+                            "plugin_active_state",
+                            wasm,
+                        )],
+                    ),
+                    live_plugin_owner_row(
+                        "branch-b",
+                        "file-readme",
+                        "plugin_removed",
+                        vec!["plugin_removed_state".to_string()],
+                    ),
+                ],
+            }) as Arc<dyn LiveStateReader>,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            true,
+        )
+        .await
+        .expect("plugin ownership should load")
+        .expect("the active registry should create a context");
+        let batch = path_update_batch_with_path("/note.removed");
+        let assignments = vec![literal_assignment(
+            "path",
+            ScalarValue::Utf8(Some("/note.active".to_string())),
+        )];
+        let assignment_values = super::UpdateAssignmentValues::evaluate(&batch, &assignments)
+            .expect("path assignment should evaluate");
+
+        let rewritten = super::path_update_plugin_rewrite_file_ids(
+            Some(&context),
+            &batch,
+            &assignment_values,
+            Some("branch-b"),
+        )
+        .expect("path ownership comparison should succeed");
+
+        assert_eq!(rewritten, BTreeSet::from(["file-readme".to_string()]));
+        assert_eq!(
+            context
+                .owners_by_file
+                .values()
+                .next()
+                .map(PluginFileOwner::plugin_key),
+            Some("plugin_removed")
+        );
+        assert_eq!(
+            context
+                .branch("branch-b")
+                .and_then(|branch| branch.catalog.select("/note.active"))
+                .map(PluginRegistryEntry::key),
+            Some("plugin_active")
+        );
     }
 
     #[test]
@@ -7084,18 +8068,73 @@ mod tests {
     }
 
     #[test]
-    fn file_delete_rejects_plugin_storage_path() {
+    fn file_delete_rejects_plugin_storage_path_without_exact_target() {
         let error = lix_file_delete_stage_from_batch(
-            &file_delete_batch_with_path(Some("/.lix/plugins/plugin_sentinel.lixplugin")),
+            &file_delete_batch_with_id_and_path(
+                "lix_plugin_archive::plugin_sentinel",
+                Some("/.lix/plugins/plugin_sentinel.lixplugin"),
+            ),
             None,
             &BTreeSet::new(),
+            None,
         )
-        .expect_err("normal file delete should reject installed archive path");
+        .expect_err("non-exact file delete should reject installed archive path");
 
         assert!(
-            error.to_string().contains("reserved plugin storage path"),
+            error
+                .to_string()
+                .contains("one exact canonical plugin archive"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn file_delete_allows_exact_canonical_plugin_archive_target() {
+        let staged = lix_file_delete_stage_from_batch(
+            &file_delete_batch_with_id_and_path(
+                "lix_plugin_archive::plugin_sentinel",
+                Some("/.lix/plugins/plugin_sentinel.lixplugin"),
+            ),
+            None,
+            &BTreeSet::new(),
+            Some("plugin_sentinel"),
+        )
+        .expect("exact canonical plugin archive delete should stage");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 1);
+        assert_eq!(staged.state_rows[0].schema_key, "lix_file_descriptor");
+        assert_eq!(staged.state_rows[0].snapshot, None);
+    }
+
+    #[test]
+    fn file_delete_rejects_noncanonical_plugin_archive_identity() {
+        for (file_id, path) in [
+            ("file-arbitrary", "/.lix/plugins/plugin_sentinel.lixplugin"),
+            (
+                "lix_plugin_archive::plugin_other",
+                "/.lix/plugins/plugin_sentinel.lixplugin",
+            ),
+            (
+                "lix_plugin_archive::plugin_sentinel",
+                "/.lix/plugins/nested/plugin_sentinel.lixplugin",
+            ),
+        ] {
+            let error = lix_file_delete_stage_from_batch(
+                &file_delete_batch_with_id_and_path(file_id, Some(path)),
+                None,
+                &BTreeSet::new(),
+                Some("plugin_sentinel"),
+            )
+            .expect_err("noncanonical plugin archive delete should fail");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("one exact canonical plugin archive"),
+                "unexpected error for {file_id} at {path}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -7516,6 +8555,7 @@ mod tests {
             &batch,
             None,
             &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
+            None,
         )
         .expect("decode file delete");
 
@@ -7549,7 +8589,7 @@ mod tests {
     #[test]
     fn file_delete_without_blob_ref_stages_only_descriptor_tombstone() {
         let batch = file_delete_batch();
-        let staged = lix_file_delete_stage_from_batch(&batch, None, &BTreeSet::new())
+        let staged = lix_file_delete_stage_from_batch(&batch, None, &BTreeSet::new(), None)
             .expect("decode file delete");
 
         assert_eq!(staged.count, 1);
@@ -7569,6 +8609,7 @@ mod tests {
             &batch,
             None,
             &BTreeSet::from([blob_ref_key("branch-a", false, false, "file-readme")]),
+            None,
         )
         .expect("decode file delete");
 
@@ -7783,6 +8824,7 @@ mod tests {
             panic!("data update should stage rows and file data");
         };
         assert!(file_data[0].data().is_empty());
+        assert!(file_data[0].had_blob_ref);
         assert!(
             rows.iter().any(|row| {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
@@ -7881,6 +8923,7 @@ mod tests {
         assert_eq!(file_data.len(), 1);
         assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
         assert_eq!(file_data[0].data(), b"new");
+        assert!(file_data[0].had_blob_ref);
     }
 
     #[tokio::test]
@@ -7953,6 +8996,7 @@ mod tests {
                 assert_eq!(file_data[0].file_id, "file-readme");
                 assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
                 assert_eq!(file_data[0].data(), b"hello");
+                assert!(!file_data[0].had_blob_ref);
             }
             other => panic!("expected insert with file data staged write, got {other:?}"),
         }

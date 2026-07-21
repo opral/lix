@@ -32,6 +32,7 @@ pub(crate) trait LiveStateReader: Send + Sync {
         self.scan_rows(&request).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn scan_file_rows(
         &self,
         request: &LiveStateFileScanRequest,

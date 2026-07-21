@@ -6,14 +6,24 @@ use zip::CompressionMethod;
 use zip::read::{ArchiveOffset, Config, ZipArchive};
 
 use crate::LixError;
+use crate::binary_cas::BlobHash;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
 use super::{InstalledPlugin, InstalledPluginMetadata, PluginManifest, parse_plugin_manifest_json};
 
-#[derive(Debug, Clone)]
+/// Fully validated plugin package data needed by the install transaction.
+///
+/// The original ZIP remains the immutable filesystem artifact. This value is
+/// the parse-once install view: callers can write schema and registry rows and
+/// stage the extracted component in the binary CAS without reopening the ZIP.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParsedPluginArchive {
     pub manifest: PluginManifest,
+    pub normalized_manifest_json: String,
     pub schemas: Vec<JsonValue>,
+    pub schema_keys: Vec<String>,
+    pub wasm_bytes: Vec<u8>,
+    pub wasm_hash: BlobHash,
 }
 
 const KIB: u64 = 1024;
@@ -100,9 +110,17 @@ pub(crate) fn parse_plugin_archive_for_install(
     archive_bytes: &[u8],
 ) -> Result<ParsedPluginArchive, LixError> {
     let loaded = load_plugin_archive(archive_bytes, true, PluginArchiveLimits::DEFAULT)?;
+    let wasm_bytes = loaded
+        .wasm
+        .expect("full plugin archive load should include WASM bytes");
+    let wasm_hash = BlobHash::from_content(&wasm_bytes);
     Ok(ParsedPluginArchive {
         manifest: loaded.manifest,
+        normalized_manifest_json: loaded.normalized_manifest_json,
         schemas: loaded.schemas,
+        schema_keys: loaded.schema_keys,
+        wasm_bytes,
+        wasm_hash,
     })
 }
 
@@ -118,6 +136,10 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             loaded.manifest.key
         )));
     }
+    let wasm = loaded
+        .wasm
+        .expect("full plugin archive load should include WASM bytes");
+    let wasm_hash = BlobHash::from_content(&wasm);
 
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
@@ -128,9 +150,8 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
         entry: loaded.manifest.entry,
         schema_keys: loaded.schema_keys,
         manifest_json: loaded.normalized_manifest_json,
-        wasm: loaded
-            .wasm
-            .expect("full plugin archive load should include WASM bytes"),
+        wasm_hash,
+        wasm,
     })
 }
 
@@ -808,6 +829,7 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use crate::LixError;
+    use crate::binary_cas::BlobHash;
 
     use super::{
         BoundedPluginArchive, PluginArchiveLimits, PluginArchiveReadKind, declared_zip_entry_count,
@@ -876,6 +898,21 @@ mod tests {
                 .expect("canonical plugin archive should parse");
             assert_eq!(parsed.manifest.key, "plugin_test");
             assert_eq!(parsed.schemas.len(), 1);
+            assert_eq!(parsed.schema_keys, ["plugin_test_note"]);
+            assert_eq!(parsed.wasm_bytes, WASM);
+            assert_eq!(parsed.wasm_hash, BlobHash::from_content(WASM));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&parsed.normalized_manifest_json)
+                    .expect("normalized manifest should remain JSON")["key"],
+                "plugin_test"
+            );
+            let installed = load_installed_plugin_from_archive_bytes(
+                "plugin_test",
+                "/.lix/plugins/plugin_test.lixplugin",
+                &archive,
+            )
+            .expect("canonical plugin archive should materialize");
+            assert_eq!(installed.wasm_hash, BlobHash::from_content(WASM));
         }
     }
 

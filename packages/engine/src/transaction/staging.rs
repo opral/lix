@@ -414,19 +414,44 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged file data lock",
             )
         })?;
-        let mut bytes_by_hash = BTreeMap::<BlobHash, Vec<u8>>::new();
-        for write in file_data_guard.iter() {
+        let mut requested = hashes
+            .iter()
+            .copied()
+            .map(|hash| (hash, None))
+            .collect::<BTreeMap<BlobHash, Option<&[u8]>>>();
+        let mut remaining = requested.len();
+        'writes: for write in file_data_guard.iter() {
             let hash = write
                 .blob_hash()
                 .unwrap_or_else(|| BlobHash::from_content(write.data()));
-            bytes_by_hash
-                .entry(hash)
-                .or_insert_with(|| write.data().to_vec());
+            if let Some(bytes) = requested.get_mut(&hash)
+                && bytes.is_none()
+            {
+                *bytes = Some(write.data());
+                remaining -= 1;
+                if remaining == 0 {
+                    break 'writes;
+                }
+            }
+            for payload in write.auxiliary_payloads() {
+                let hash = payload
+                    .hash()
+                    .unwrap_or_else(|| BlobHash::from_content(payload.bytes()));
+                if let Some(bytes) = requested.get_mut(&hash)
+                    && bytes.is_none()
+                {
+                    *bytes = Some(payload.bytes());
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break 'writes;
+                    }
+                }
+            }
         }
         Ok(BlobBytesBatch::new(
             hashes
                 .iter()
-                .map(|hash| bytes_by_hash.get(hash).cloned())
+                .map(|hash| requested.get(hash).copied().flatten().map(<[u8]>::to_vec))
                 .collect(),
         ))
     }
@@ -493,9 +518,8 @@ impl TransactionWriteBuffer {
         }
         for mut row in rows {
             let identity = PreparedStateRowIdentity::from(&row);
-            if mode == Some(TransactionWriteMode::Insert)
-                && by_identity_guard.contains_key(&identity)
-            {
+            let is_insert = row_is_insert(mode, &row);
+            if is_insert && by_identity_guard.contains_key(&identity) {
                 return Err(duplicate_insert_identity_error(&row));
             }
             let existing_slot = by_identity_guard.get(&identity).copied();
@@ -506,11 +530,6 @@ impl TransactionWriteBuffer {
             }
             add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &functions);
             let identity = PreparedStateRowIdentity::from(&row);
-            let is_insert = mode == Some(TransactionWriteMode::Insert)
-                && !row
-                    .origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.operation == TransactionWriteOperation::Update);
             if is_insert {
                 insert_identities_guard.insert(
                     identity.clone(),
@@ -566,6 +585,14 @@ impl TransactionWriteBuffer {
         }
         (state_rows, file_data_writes)
     }
+}
+
+fn row_is_insert(mode: Option<TransactionWriteMode>, row: &PreparedStateRow) -> bool {
+    mode == Some(TransactionWriteMode::Insert)
+        && !row
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.operation == TransactionWriteOperation::Update)
 }
 
 /// Read overlay derived from staged transaction writes.
@@ -989,6 +1016,58 @@ mod tests {
     use crate::live_state::{LiveStateFilter, LiveStateRowRequest};
 
     #[tokio::test]
+    async fn update_origin_rows_replace_staged_identity_under_outer_insert_mode() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![state_row("engine-owned-key", "first")],
+            })
+            .expect("initial internal identity should stage");
+
+        let mut replacement = state_row("engine-owned-key", "second");
+        replacement.origin = Some(TransactionWriteOrigin {
+            surface: "plugin_reconciliation".to_string(),
+            operation: TransactionWriteOperation::Update,
+            primary_key: None,
+        });
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![replacement],
+            })
+            .expect("derived update row should replace under outer insert mode");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert!(drained.insert_identities.is_empty());
+        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(
+            drained.state_rows[0]
+                .snapshot
+                .as_ref()
+                .expect("replacement snapshot")
+                .normalized
+                .as_ref(),
+            "{\"key\":\"engine-owned-key\",\"value\":\"second\"}"
+        );
+
+        let normal_insert = test_staged_writes();
+        normal_insert
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![state_row("public-key", "first")],
+            })
+            .expect("initial public identity should stage");
+        let error = normal_insert
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![state_row("public-key", "second")],
+            })
+            .expect_err("ordinary insert must still reject a staged duplicate");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
     async fn staging_overlay_uses_last_staged_row_for_exact_load() {
         let staged_writes = test_staged_writes();
 
@@ -1197,6 +1276,56 @@ mod tests {
         assert_eq!(drained.file_data_writes.len(), 1);
         assert_eq!(drained.file_data_writes[0].file_id, "file-readme");
         assert_eq!(drained.file_data_writes[0].data(), b"hello");
+    }
+
+    #[test]
+    fn staged_file_byte_lookup_filters_main_and_auxiliary_payloads_before_copying() {
+        let staged_writes = test_staged_writes();
+        let mut requested_write = TransactionFileData::new(
+            "requested-file".to_string(),
+            Some("/requested.bin".to_string()),
+            Some("requested.bin".to_string()),
+            "global".to_string(),
+            true,
+            true,
+            b"requested-main".to_vec(),
+        );
+        requested_write.add_auxiliary_payload(b"requested-auxiliary".to_vec());
+        let unrelated_write = TransactionFileData::new(
+            "unrelated-file".to_string(),
+            Some("/unrelated.bin".to_string()),
+            Some("unrelated.bin".to_string()),
+            "global".to_string(),
+            true,
+            true,
+            b"unrelated-main".to_vec(),
+        );
+        staged_writes
+            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+                mode: TransactionWriteMode::Replace,
+                rows: Vec::new(),
+                file_data: vec![unrelated_write, requested_write],
+                count: 2,
+            })
+            .expect("file payloads should stage");
+
+        let auxiliary_hash = BlobHash::from_content(b"requested-auxiliary");
+        let missing_hash = BlobHash::from_content(b"missing");
+        let main_hash = BlobHash::from_content(b"requested-main");
+        let loaded = staged_writes
+            .load_staged_file_bytes_many(&[auxiliary_hash, missing_hash, main_hash, auxiliary_hash])
+            .expect("staged payload lookup should succeed")
+            .into_vec();
+
+        assert_eq!(
+            loaded,
+            vec![
+                Some(b"requested-auxiliary".to_vec()),
+                None,
+                Some(b"requested-main".to_vec()),
+                Some(b"requested-auxiliary".to_vec()),
+            ]
+        );
     }
 
     #[tokio::test]
