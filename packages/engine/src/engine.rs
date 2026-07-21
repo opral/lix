@@ -214,7 +214,9 @@ where
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
     /// state. The current branch head is read from the live-state facade so
-    /// rebuild uses the same moving-ref visibility as normal execution.
+    /// rebuild uses the same moving-ref visibility as normal execution. The
+    /// rebuilt root receives the full changelog coverage audit against its
+    /// staged chunks before the replacement root is published.
     pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
@@ -240,7 +242,7 @@ where
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .map(|_| ())
-            .map_err(Into::into)
+            .map_err(LixError::from)
     }
 }
 

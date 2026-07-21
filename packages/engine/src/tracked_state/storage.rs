@@ -7,6 +7,10 @@
 use std::collections::HashMap;
 
 use crate::changelog::CommitId;
+use crate::storage::{
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ScanChunk,
+    ScanOptions, SpaceId, StorageError,
+};
 use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, StorageWriteSet};
 use crate::storage_adapter::{
     StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId, StorageValue,
@@ -29,10 +33,11 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
     TRACKED_STATE_COMMIT_ROOT_NAMESPACE,
 );
 
-// Version the root metadata independently of storage backends. Version 2 is a
-// hard format cut: roots written before commit rows became derived state must
-// not be inherited by a new commit and silently carry those rows forever.
-const TRACKED_STATE_COMMIT_ROOT_MAGIC: &[u8] = b"LXTR2";
+// Version the root metadata independently of storage backends. Version 3 is a
+// hard cut for derived commit rows, prefix-friendly keys, and compact tree
+// nodes. Reject older roots before their differently ordered state can be
+// inherited or traversed.
+const TRACKED_STATE_COMMIT_ROOT_MAGIC: &[u8] = b"LXTR3";
 
 async fn get_one(
     store: &(impl StorageAdapterRead + ?Sized),
@@ -173,6 +178,107 @@ impl TrackedStateChunkOverlay {
     }
 }
 
+/// Point-read overlay used to audit rebuilt roots before their write set is
+/// published. Changelog reads fall through to the coherent base snapshot;
+/// commit-root and tree-chunk reads see bytes staged by the root writer first.
+#[derive(Debug)]
+pub(crate) struct TrackedStateStagedRead<'a, S: ?Sized> {
+    store: &'a S,
+    commit_roots: HashMap<[u8; 16], Bytes>,
+    chunks: &'a TrackedStateChunkOverlay,
+}
+
+impl<'a, S> TrackedStateStagedRead<'a, S>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    pub(crate) fn new<'root>(
+        store: &'a S,
+        commit_roots: impl IntoIterator<Item = &'root TrackedStateCommitRoot>,
+        chunks: &'a TrackedStateChunkOverlay,
+    ) -> Result<Self, LixError> {
+        let mut encoded_roots = HashMap::new();
+        for metadata in commit_roots {
+            let key = *metadata.commit_id.as_uuid().as_bytes();
+            let value = Bytes::from(encode_commit_root(metadata)?);
+            if let Some(existing) = encoded_roots.insert(key, value.clone())
+                && existing != value
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state staged audit contains conflicting commit roots",
+                ));
+            }
+        }
+        Ok(Self {
+            store,
+            commit_roots: encoded_roots,
+            chunks,
+        })
+    }
+
+    fn staged_bytes(&self, space: SpaceId, key: &Key) -> Option<&[u8]> {
+        if space == TRACKED_STATE_COMMIT_ROOT_SPACE.id {
+            let key = <&[u8; 16]>::try_from(key.0.as_ref()).ok()?;
+            return self.commit_roots.get(key).map(AsRef::as_ref);
+        }
+        if space == TRACKED_STATE_TREE_CHUNK_SPACE.id {
+            let key = <&[u8; TRACKED_STATE_HASH_BYTES]>::try_from(key.0.as_ref()).ok()?;
+            return self.chunks.staged_chunk(key);
+        }
+        None
+    }
+}
+
+impl<S> StorageAdapterRead for TrackedStateStagedRead<'_, S>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    async fn get_many(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> Result<GetManyResult, StorageError> {
+        let mut result = self.store.get_many(space, keys, opts).await?;
+        if result.values.len() != keys.len() {
+            return Err(StorageError::Corruption(format!(
+                "tracked-state staged audit requested {} point reads but storage returned {} slots",
+                keys.len(),
+                result.values.len()
+            )));
+        }
+        for (key, slot) in keys.iter().zip(&mut result.values) {
+            let Some(bytes) = self.staged_bytes(space, key) else {
+                continue;
+            };
+            *slot = Some(match opts.projection {
+                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                CoreProjection::FullValue => {
+                    ProjectedValue::FullValue(Bytes::copy_from_slice(bytes))
+                }
+            });
+        }
+        Ok(result)
+    }
+
+    async fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, StorageError> {
+        if space == TRACKED_STATE_COMMIT_ROOT_SPACE.id || space == TRACKED_STATE_TREE_CHUNK_SPACE.id
+        {
+            return Err(StorageError::Io(
+                "tracked-state staged audit supports point reads only for overlay spaces"
+                    .to_string(),
+            ));
+        }
+        self.store.scan(space, range, opts).await
+    }
+}
+
 fn key(bytes: Vec<u8>) -> StorageKey {
     StorageKey(Bytes::from(bytes))
 }
@@ -293,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_root_codec_rejects_unversioned_musli_roots() {
+    fn commit_root_codec_rejects_pre_v3_roots() {
         let metadata = TrackedStateCommitRoot {
             commit_id: CommitId::for_test_label("legacy"),
             root_id: TrackedStateRootId::new([7; 32]),
@@ -304,18 +410,22 @@ mod tests {
             primary_chunk_count: 1,
             primary_chunk_bytes: 128,
         };
-        let old_bytes = crate::storage_codec::encode("tracked_state commit_root", &metadata)
-            .expect("legacy commit root should encode");
+        let unversioned = crate::storage_codec::encode("tracked_state commit_root", &metadata)
+            .expect("pre-v3 commit root should encode");
+        let mut v2 = b"LXTR2".to_vec();
+        v2.extend_from_slice(&unversioned);
 
-        let error = decode_commit_root(&old_bytes)
-            .expect_err("unversioned commit roots must not enter the new layout");
+        for old_bytes in [&unversioned, &v2] {
+            let error = decode_commit_root(old_bytes)
+                .expect_err("pre-v3 roots must not enter the v3 tree layout");
 
-        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
-        assert!(
-            error
-                .message
-                .contains("unsupported format; recreate the repository")
-        );
+            assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+            assert!(
+                error
+                    .message
+                    .contains("unsupported format; recreate the repository")
+            );
+        }
     }
 
     #[test]

@@ -73,8 +73,13 @@ pub(crate) enum TrackedStateDiffKind {
     Removed,
 }
 
-/// Diffs two tracked-state commit roots.
+/// Diffs two tracked-state commit roots with hash-guided subtree skipping.
 ///
+/// Commit-root first-parent metadata is bound to the changelog. Every emitted
+/// row point-loads its change record and validates identity, deletion, and
+/// update time. Winner reachability, inherited creation time, and absence of
+/// omitted unchanged rows belong to the explicit full-root integrity audit;
+/// proving those here would make sparse diff O(total rows).
 pub(crate) async fn diff_commits<S>(
     reader: &mut TrackedStateStoreReader<S>,
     left_commit_id: &str,
@@ -84,34 +89,10 @@ pub(crate) async fn diff_commits<S>(
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
-    diff_commits_with_validation(reader, left_commit_id, right_commit_id, request, true, true).await
-}
-
-pub(crate) async fn diff_commits_with_validation<S>(
-    reader: &mut TrackedStateStoreReader<S>,
-    left_commit_id: &str,
-    right_commit_id: &str,
-    request: &TrackedStateDiffRequest,
-    validate_left_root: bool,
-    validate_right_root: bool,
-) -> Result<TrackedStateDiff, LixError>
-where
-    S: crate::storage_adapter::StorageAdapterRead,
-{
     let scan_request = scan_request_for_diff(request);
     let tree_entries = reader
         .diff_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
         .await?;
-    if validate_left_root {
-        reader
-            .validate_tree_rows_at_commit_against_changelog(left_commit_id, &scan_request)
-            .await?;
-    }
-    if validate_right_root && left_commit_id != right_commit_id {
-        reader
-            .validate_tree_rows_at_commit_against_changelog(right_commit_id, &scan_request)
-            .await?;
-    }
     let mut raw_rows = Vec::with_capacity(tree_entries.len());
     for tree_entry in tree_entries {
         let before = tree_entry
@@ -123,22 +104,27 @@ where
         raw_rows.push((before, after));
     }
 
+    // Validate only rows exposed by the hash-guided tree diff. Whole-root
+    // coverage validation is an explicit integrity audit; doing it here would
+    // turn every sparse diff back into an O(total rows) scan.
+    let mut rows_to_validate = Vec::with_capacity(raw_rows.len().saturating_mul(2));
+    for (before, after) in &raw_rows {
+        if let Some(before) = before {
+            rows_to_validate.push(before);
+        }
+        if let Some(after) = after {
+            rows_to_validate.push(after);
+        }
+    }
+    let payloads = reader
+        .validate_diff_rows_and_load_payloads(&rows_to_validate)
+        .await?;
+
     // Rows are identity-only; payload equality needs the change records when
     // a live/live pair carries different change ids (cross-branch writes can
     // produce identical content under distinct changes, which must classify
-    // as no-diff). Same change id == same change == equal payload, no load.
-    let mut fallback_ids = Vec::new();
-    for (before, after) in &raw_rows {
-        if let (Some(left), Some(right)) =
-            (is_live_row(before.as_ref()), is_live_row(after.as_ref()))
-        {
-            if left.change_id != right.change_id {
-                fallback_ids.push(left.change_id);
-                fallback_ids.push(right.change_id);
-            }
-        }
-    }
-    let payloads = reader.load_change_payloads(&fallback_ids).await?;
+    // as no-diff). Reuse the records loaded for changed-row validation instead
+    // of issuing a second changelog read.
 
     let mut entries = Vec::with_capacity(raw_rows.len());
     for (before, after) in raw_rows {
@@ -606,7 +592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_update_with_arbitrary_forged_created_at() {
+    async fn full_root_audit_rejects_update_with_arbitrary_forged_created_at() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -674,13 +660,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "child")
             .await
             .expect_err("arbitrary forged created_at must be rejected");
 
@@ -794,7 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_stale_ancestor_row_that_is_not_root_winner() {
+    async fn full_root_audit_rejects_stale_ancestor_row_that_is_not_root_winner() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -845,13 +825,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "child")
             .await
             .expect_err("stale ancestor winner must be rejected");
 
@@ -862,7 +836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_valid_change_from_unreachable_commit_root() {
+    async fn full_root_audit_rejects_valid_change_from_unreachable_commit_root() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -948,13 +922,7 @@ mod tests {
         };
         assert_eq!(result.row_count, 1);
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "right-corrupt", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "right-corrupt")
             .await
             .expect_err("unreachable valid change must be rejected");
 
@@ -965,7 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_second_parent_row_without_commit_root_proof() {
+    async fn full_root_audit_rejects_second_parent_row_without_commit_root_proof() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -1030,13 +998,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "merge", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "merge")
             .await
             .expect_err("second-parent row without commit-root proof must be rejected");
 
@@ -1471,7 +1433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_omitted_inherited_row_even_when_diff_is_non_empty() {
+    async fn full_root_audit_rejects_omitted_inherited_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
@@ -1525,13 +1487,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "child")
             .await
             .expect_err("omitted inherited row must be rejected");
 
@@ -1542,7 +1498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_omitted_updated_row_even_when_diff_is_non_empty() {
+    async fn full_root_audit_rejects_omitted_updated_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
@@ -1599,13 +1555,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "child")
             .await
             .expect_err("omitted updated row must be rejected");
 
@@ -1616,7 +1566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_shared_omitted_row_even_when_diff_is_non_empty() {
+    async fn full_root_audit_rejects_shared_omitted_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
@@ -1710,13 +1660,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "right", &TrackedStateDiffRequest::default())
+        let error = audit_root(&storage, &tracked_state, "left")
             .await
             .expect_err("shared hidden omission must be rejected");
 
@@ -1727,7 +1671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_validates_roots_even_when_tree_diff_is_empty() {
+    async fn full_root_audit_validates_even_when_tree_diff_is_empty() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(
@@ -1781,22 +1725,71 @@ mod tests {
         )
         .await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits(
-                "left-corrupt",
-                "right-corrupt",
-                &TrackedStateDiffRequest::default(),
-            )
+        let error = audit_root(&storage, &tracked_state, "left-corrupt")
             .await
             .expect_err("identical corrupt roots must still be validated");
 
         assert!(
             is_commit_root_validation_error(&error),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_root_audit_rejects_forged_parent_metadata_on_empty_root() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_committed_for_test(&storage, &tracked_state, "parent", None, &[])
+            .await
+            .expect("parent root should write");
+        write_root_committed_for_test(&storage, &tracked_state, "unrelated", None, &[])
+            .await
+            .expect("unrelated root should write");
+        write_root_committed_for_test(&storage, &tracked_state, "child", Some("parent"), &[])
+            .await
+            .expect("child root should write");
+
+        stage_corrupt_commit_root(
+            &storage,
+            "child",
+            Vec::new(),
+            vec![TrackedStateCommitRootParent {
+                commit_id: CommitId::for_test_label("unrelated"),
+                root_id: tracked_state_root_id(&storage, "unrelated").await,
+            }],
+        )
+        .await;
+
+        let error = audit_root(&storage, &tracked_state, "child")
+            .await
+            .expect_err("forged empty-root parent metadata must be rejected");
+
+        assert!(
+            is_commit_root_validation_error(&error),
+            "unexpected error: {error}"
+        );
+
+        stage_corrupt_commit_root(
+            &storage,
+            "child",
+            Vec::new(),
+            vec![
+                TrackedStateCommitRootParent {
+                    commit_id: CommitId::for_test_label("parent"),
+                    root_id: tracked_state_root_id(&storage, "parent").await,
+                },
+                TrackedStateCommitRootParent {
+                    commit_id: CommitId::for_test_label("unrelated"),
+                    root_id: tracked_state_root_id(&storage, "unrelated").await,
+                },
+            ],
+        )
+        .await;
+        let error = audit_root(&storage, &tracked_state, "child")
+            .await
+            .expect_err("extra commit-root parents must be rejected");
+        assert!(
+            error.message.contains("more than one first-parent root"),
             "unexpected error: {error}"
         );
     }
@@ -1947,6 +1940,21 @@ mod tests {
             .diff_commits("left", "right", &TrackedStateDiffRequest::default())
             .await
             .expect("diff should load")
+    }
+
+    async fn audit_root(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        tracked_state
+            .reader(read)
+            .validate_commit_root_against_changelog(commit_id)
+            .await
     }
 
     async fn seed_roots(

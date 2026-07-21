@@ -94,7 +94,7 @@ impl LixTimestamp {
     }
 
     #[expect(clippy::cast_possible_wrap)]
-    fn from_packed(packed: u64) -> Result<Self, String> {
+    pub(crate) fn from_packed(packed: u64) -> Result<Self, String> {
         let timestamp = Self(packed);
         if !valid_offset_minutes(timestamp.offset_minutes()) {
             return Err(format!(

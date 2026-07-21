@@ -60,7 +60,7 @@ where
         TrackedStateDiff::default()
     } else {
         reader
-            .diff_commits_with_validation(&base_commit_id, &target_commit_id, &request, false, true)
+            .diff_commits(&base_commit_id, &target_commit_id, &request)
             .await?
     };
 

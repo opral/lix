@@ -20,7 +20,6 @@ use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{
     TrackedStateDiff, TrackedStateDiffRequest, TrackedStateDiffRow, diff_commits,
-    diff_commits_with_validation,
 };
 use crate::tracked_state::materialize_rows_from_index_entries;
 #[cfg(test)]
@@ -223,58 +222,14 @@ where
         diff_commits(self, left_commit_id, right_commit_id, request).await
     }
 
-    pub(crate) async fn diff_commits_with_validation(
-        &mut self,
-        left_commit_id: &str,
-        right_commit_id: &str,
-        request: &TrackedStateDiffRequest,
-        validate_left_root: bool,
-        validate_right_root: bool,
-    ) -> Result<TrackedStateDiff, LixError> {
-        diff_commits_with_validation(
-            self,
-            left_commit_id,
-            right_commit_id,
-            request,
-            validate_left_root,
-            validate_right_root,
-        )
-        .await
-    }
-
     pub(crate) async fn validate_diff_rows_for_commits_against_changelog(
         &mut self,
         rows: &[(&TrackedStateDiffRow, &str)],
     ) -> Result<(), LixError> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut change_ids = rows
-            .iter()
-            .map(|(row, _)| row.change_id)
-            .collect::<Vec<_>>();
-        change_ids.sort();
-        change_ids.dedup();
-
-        let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
-        let loaded_changes = changelog_reader
-            .load_changes(ChangeLoadRequest {
-                change_ids: &change_ids,
-            })
-            .await?;
-        let mut changes = HashMap::new();
-        for (change_id, loaded) in change_ids.into_iter().zip(loaded_changes.entries) {
-            let Some(change) = loaded else {
-                return Err(LixError::unknown(format!(
-                    "tracked-state diff row references missing changelog change '{change_id}'"
-                )));
-            };
-            changes.insert(change_id, change);
-        }
+        let row_refs = rows.iter().map(|(row, _)| *row).collect::<Vec<_>>();
+        let changes = self.load_and_validate_diff_row_changes(&row_refs).await?;
         let mut validation_cache = DiffCommitRootValidationCache::new();
         for (row, expected_commit_id) in rows {
-            validate_diff_row_against_changelog(row, &changes)?;
             let change_created_at = changes
                 .get(&row.change_id)
                 .map(|change| change.created_at)
@@ -293,6 +248,53 @@ where
             .await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn validate_diff_rows_and_load_payloads(
+        &mut self,
+        rows: &[&TrackedStateDiffRow],
+    ) -> Result<
+        HashMap<ChangeId, (crate::json_store::JsonSlot, crate::json_store::JsonSlot)>,
+        LixError,
+    > {
+        let changes = self.load_and_validate_diff_row_changes(rows).await?;
+        Ok(changes
+            .into_iter()
+            .map(|(change_id, change)| (change_id, (change.snapshot, change.metadata)))
+            .collect())
+    }
+
+    async fn load_and_validate_diff_row_changes(
+        &mut self,
+        rows: &[&TrackedStateDiffRow],
+    ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut change_ids = rows.iter().map(|row| row.change_id).collect::<Vec<_>>();
+        change_ids.sort();
+        change_ids.dedup();
+
+        let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
+        let loaded_changes = changelog_reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &change_ids,
+            })
+            .await?;
+        let mut changes = HashMap::new();
+        for (change_id, loaded) in change_ids.into_iter().zip(loaded_changes.entries) {
+            let Some(change) = loaded else {
+                return Err(LixError::unknown(format!(
+                    "tracked-state diff row references missing changelog change '{change_id}'"
+                )));
+            };
+            changes.insert(change_id, change);
+        }
+        for row in rows {
+            validate_diff_row_against_changelog(row, &changes)?;
+        }
+        Ok(changes)
     }
 
     async fn validate_diff_row_commit_root_membership(
@@ -323,11 +325,11 @@ where
                 )));
             }
 
-            let winners = self
-                .load_cached_commit_ref_winners(&current_commit_id, cache)
+            let winner_change_id = self
+                .load_cached_commit_ref_winner(&current_commit_id, &identity, cache)
                 .await?;
-            if let Some(winner_change_id) = winners.get(&identity) {
-                if winner_change_id != &row.change_id {
+            if let Some(winner_change_id) = winner_change_id {
+                if winner_change_id != row.change_id {
                     return Err(LixError::unknown(format!(
                         "tracked-state diff row references changelog change '{}' that is not the first-parent winner for commit '{}' and identity {:?}",
                         row.change_id, root_commit_id, identity
@@ -372,6 +374,11 @@ where
         metadata: &TrackedStateCommitRoot,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<(), LixError> {
+        if metadata.parent_roots.len() > 1 {
+            return Err(LixError::unknown(format!(
+                "tracked-state commit-root metadata for commit '{commit_id}' has more than one first-parent root"
+            )));
+        }
         let changelog_first_parent = self
             .load_cached_changelog_first_parent(commit_id, cache)
             .await?;
@@ -443,8 +450,37 @@ where
         commit_id: &str,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<HashMap<TrackedStateIdentity, ChangeId>, LixError> {
-        if let Some(winners) = cache.commit_ref_winners.get(commit_id) {
-            return Ok(winners.clone());
+        self.ensure_cached_commit_ref_winners(commit_id, cache)
+            .await?;
+        Ok(cache
+            .commit_ref_winners
+            .get(commit_id)
+            .cloned()
+            .expect("commit-ref winners should be cached after loading"))
+    }
+
+    async fn load_cached_commit_ref_winner(
+        &mut self,
+        commit_id: &str,
+        identity: &TrackedStateIdentity,
+        cache: &mut DiffCommitRootValidationCache,
+    ) -> Result<Option<ChangeId>, LixError> {
+        self.ensure_cached_commit_ref_winners(commit_id, cache)
+            .await?;
+        Ok(cache
+            .commit_ref_winners
+            .get(commit_id)
+            .and_then(|winners| winners.get(identity))
+            .copied())
+    }
+
+    async fn ensure_cached_commit_ref_winners(
+        &mut self,
+        commit_id: &str,
+        cache: &mut DiffCommitRootValidationCache,
+    ) -> Result<(), LixError> {
+        if cache.commit_ref_winners.contains_key(commit_id) {
+            return Ok(());
         }
         let commit_ids = [CommitId::parse_lix(
             commit_id,
@@ -500,8 +536,8 @@ where
         }
         cache
             .commit_ref_winners
-            .insert(commit_id.to_string(), winners.clone());
-        Ok(winners)
+            .insert(commit_id.to_string(), winners);
+        Ok(())
     }
 
     async fn load_cached_commit_root_metadata(
@@ -703,12 +739,38 @@ where
         Ok(parent_value.map(|value| value.created_at()))
     }
 
-    pub(crate) async fn validate_tree_rows_at_commit_against_changelog(
+    /// Runs the full O(total rows) tracked-root coverage audit.
+    ///
+    /// Normal diff validates root metadata and changed rows only. Maintenance
+    /// and repair tooling can call this when it deliberately needs fsck-level
+    /// assurance for every unchanged row too.
+    pub(crate) async fn validate_commit_root_against_changelog(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        self.validate_tree_rows_at_commit_against_changelog(
+            commit_id,
+            &TrackedStateTreeScanRequest::default(),
+        )
+        .await
+    }
+
+    async fn validate_tree_rows_at_commit_against_changelog(
         &mut self,
         commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<(), LixError> {
-        let root = self.load_ensured_root(commit_id).await?;
+        let mut validation_cache = DiffCommitRootValidationCache::new();
+        let metadata = self
+            .load_cached_commit_root_metadata(commit_id, &mut validation_cache)
+            .await?;
+        self.validate_commit_root_parent_matches_changelog(
+            commit_id,
+            &metadata,
+            &mut validation_cache,
+        )
+        .await?;
+        let root = metadata.root_id;
         let rows = self.tree.scan(&self.store, &root, request).await?;
         self.validate_commit_root_coverage(commit_id, request, &rows)
             .await?;
@@ -805,11 +867,32 @@ where
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
-        let left_root = self.load_ensured_root(left_commit_id).await?;
-        let right_root = self.load_ensured_root(right_commit_id).await?;
+        let mut cache = DiffCommitRootValidationCache::new();
+        let left_root = self
+            .load_validated_diff_root(left_commit_id, &mut cache)
+            .await?;
+        let right_root = if left_commit_id == right_commit_id {
+            left_root.clone()
+        } else {
+            self.load_validated_diff_root(right_commit_id, &mut cache)
+                .await?
+        };
         self.tree
             .diff(&self.store, Some(&left_root), Some(&right_root), request)
             .await
+    }
+
+    async fn load_validated_diff_root(
+        &mut self,
+        commit_id: &str,
+        cache: &mut DiffCommitRootValidationCache,
+    ) -> Result<TrackedStateRootId, LixError> {
+        let metadata = self
+            .load_cached_commit_root_metadata(commit_id, cache)
+            .await?;
+        self.validate_commit_root_parent_matches_changelog(commit_id, &metadata, cache)
+            .await?;
+        Ok(metadata.root_id)
     }
 
     async fn load_ensured_root(&mut self, commit_id: &str) -> Result<TrackedStateRootId, LixError> {
@@ -884,6 +967,21 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    pub(crate) async fn validate_staged_commit_root_against_changelog(
+        &self,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let read = storage::TrackedStateStagedRead::new(
+            self.store,
+            self.staged_roots.values(),
+            &self.chunk_overlay,
+        )?;
+        TrackedStateContext::new()
+            .reader(read)
+            .validate_commit_root_against_changelog(commit_id)
+            .await
+    }
+
     pub(crate) async fn stage_commit_root<'a, I>(
         &mut self,
         commit_id: &str,
@@ -1260,6 +1358,70 @@ mod tests {
         assert!(metadata.tree_height >= 1);
         assert!(metadata.primary_chunk_count >= 1);
         assert!(metadata.primary_chunk_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn staged_root_audit_failure_does_not_publish_replacement() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "commit-a",
+            None,
+            &[row("entity-a", "change-a", "commit-a")],
+        )
+        .await
+        .expect("committed root should write");
+        let original_root = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("original-root read should open");
+            storage::load_root(&read, "commit-a")
+                .await
+                .expect("original root should load")
+                .expect("original root should exist")
+        };
+
+        {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("staged-root read should open");
+            let mut writes = storage.new_write_set();
+            let mut writer = tracked_state.writer(&read, &mut writes);
+            let replacement = writer
+                .stage_commit_root(
+                    "commit-a",
+                    None,
+                    std::iter::empty::<TrackedStateDeltaRef<'_>>(),
+                )
+                .await
+                .expect("invalid replacement should stage before audit");
+            assert_ne!(replacement.root_id, original_root);
+
+            let error = writer
+                .validate_staged_commit_root_against_changelog("commit-a")
+                .await
+                .expect_err("audit must reject a root that omits the changelog winner");
+            assert!(
+                error.message.contains("omits current changelog change"),
+                "unexpected error: {error}"
+            );
+            // Dropping the failed staged write set is the publication fence.
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        assert_eq!(
+            storage::load_root(&read, "commit-a")
+                .await
+                .expect("published root should load"),
+            Some(original_root)
+        );
     }
 
     #[tokio::test]
