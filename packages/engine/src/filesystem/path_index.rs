@@ -169,9 +169,16 @@ impl FilesystemPathSelection {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FilesystemPathIndex {
     entries: Vec<FilesystemPathEntry>,
+    file_indices_by_id: Vec<FilesystemFileIdIndexEntry>,
     file_count: usize,
     directory_count: usize,
     estimated_heap_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FilesystemFileIdIndexEntry {
+    hash: u64,
+    path_index: usize,
 }
 
 impl FilesystemPathIndex {
@@ -241,6 +248,7 @@ impl FilesystemPathIndex {
         let mut entries = Vec::<FilesystemPathEntry>::with_capacity(
             directory_rows.len().saturating_add(file_rows.len()),
         );
+        let file_count = file_rows.len();
 
         for (key, record) in &directory_rows {
             let path = directory_paths.get(key).ok_or_else(|| {
@@ -308,19 +316,30 @@ impl FilesystemPathIndex {
                 .then_with(|| left.key.cmp(&right.key))
                 .then_with(|| left.kind.cmp(&right.kind))
         });
-        let file_count = entries
-            .iter()
-            .filter(|entry| entry.kind == FilesystemPathKind::File)
-            .count();
+        let mut file_indices_by_id = Vec::with_capacity(file_count);
+        file_indices_by_id.extend(
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.kind == FilesystemPathKind::File)
+                .map(|(index, entry)| FilesystemFileIdIndexEntry {
+                    hash: xxhash_rust::xxh3::xxh3_64(entry.id().as_bytes()),
+                    path_index: index,
+                }),
+        );
+        radix_sort_file_indices_by_hash(&mut file_indices_by_id);
+        debug_assert_eq!(file_indices_by_id.len(), file_count);
         let directory_count = entries.len().saturating_sub(file_count);
         let estimated_heap_bytes = size_of::<Self>()
             + entries.capacity() * size_of::<FilesystemPathEntry>()
+            + file_indices_by_id.capacity() * size_of::<FilesystemFileIdIndexEntry>()
             + entries
                 .iter()
                 .map(FilesystemPathEntry::estimated_heap_bytes)
                 .sum::<usize>();
         Ok(Self {
             entries,
+            file_indices_by_id,
             file_count,
             directory_count,
             estimated_heap_bytes,
@@ -335,6 +354,25 @@ impl FilesystemPathIndex {
             .entries
             .partition_point(|entry| entry.path.as_str() <= path);
         start..end
+    }
+
+    /// Primary path-ordered indices for every file descriptor with this ID.
+    pub(crate) fn exact_file_id_indices<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let hash = xxhash_rust::xxh3::xxh3_64(id.as_bytes());
+        let start = self
+            .file_indices_by_id
+            .partition_point(|candidate| candidate.hash < hash);
+        let end = self
+            .file_indices_by_id
+            .partition_point(|candidate| candidate.hash <= hash);
+        self.file_indices_by_id[start..end]
+            .iter()
+            .filter_map(move |candidate| {
+                (self.entries[candidate.path_index].id() == id).then_some(candidate.path_index)
+            })
     }
 
     pub(crate) fn range_indices(
@@ -384,6 +422,43 @@ impl FilesystemPathIndex {
 
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         self.estimated_heap_bytes
+    }
+}
+
+/// Sort fingerprints in linear time. Entries start in primary path order, and
+/// the stable passes preserve that order inside each equal-hash bucket.
+fn radix_sort_file_indices_by_hash(entries: &mut Vec<FilesystemFileIdIndexEntry>) {
+    const RADIX_BITS: usize = 11;
+    const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
+    const RADIX_MASK: u64 = RADIX_BUCKETS as u64 - 1;
+
+    if entries.len() < 2 {
+        return;
+    }
+    let mut scratch = vec![
+        FilesystemFileIdIndexEntry {
+            hash: 0,
+            path_index: 0,
+        };
+        entries.len()
+    ];
+    for shift in (0..u64::BITS as usize).step_by(RADIX_BITS) {
+        let mut offsets = [0_usize; RADIX_BUCKETS];
+        for entry in entries.iter() {
+            offsets[((entry.hash >> shift) & RADIX_MASK) as usize] += 1;
+        }
+        let mut next_offset = 0;
+        for offset in &mut offsets {
+            let count = *offset;
+            *offset = next_offset;
+            next_offset += count;
+        }
+        for entry in entries.iter() {
+            let bucket = ((entry.hash >> shift) & RADIX_MASK) as usize;
+            scratch[offsets[bucket]] = *entry;
+            offsets[bucket] += 1;
+        }
+        std::mem::swap(entries, &mut scratch);
     }
 }
 
@@ -686,6 +761,78 @@ mod tests {
             vec!["/docs/", "/docs/", "/docs/a.md", "/docs/a.md", "/docs/b.md"]
         );
         assert!(index.estimated_heap_bytes() > 0);
+    }
+
+    #[test]
+    fn exact_file_id_indices_keep_every_file_lane_and_exclude_directories() {
+        let index = FilesystemPathIndex::from_live_rows(vec![
+            directory_row("shared", None, "directory", "branch-a", false),
+            file_row("shared", None, "z-tracked.md", "branch-a", false),
+            file_row("shared", None, "a-global.md", "branch-a", true),
+            file_row("other", None, "other.md", "branch-a", false),
+        ])
+        .expect("path index should build");
+
+        let matches = index
+            .exact_file_id_indices("shared")
+            .map(|candidate| index.entry(candidate))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a-global.md", "/z-tracked.md"]
+        );
+        assert!(
+            matches
+                .iter()
+                .all(|entry| entry.kind == FilesystemPathKind::File)
+        );
+        assert!(index.exact_file_id_indices("missing").next().is_none());
+
+        let expected_heap_bytes = size_of::<FilesystemPathIndex>()
+            + index.entries.capacity() * size_of::<FilesystemPathEntry>()
+            + index.file_indices_by_id.capacity() * size_of::<FilesystemFileIdIndexEntry>()
+            + index
+                .entries
+                .iter()
+                .map(FilesystemPathEntry::estimated_heap_bytes)
+                .sum::<usize>();
+        assert_eq!(index.estimated_heap_bytes(), expected_heap_bytes);
+        assert!(index.file_indices_by_id.capacity() >= 3);
+    }
+
+    #[test]
+    fn radix_sort_orders_hashes_and_preserves_primary_order_for_ties() {
+        let mut entries = vec![
+            FilesystemFileIdIndexEntry {
+                hash: u64::MAX,
+                path_index: 0,
+            },
+            FilesystemFileIdIndexEntry {
+                hash: 1,
+                path_index: 1,
+            },
+            FilesystemFileIdIndexEntry {
+                hash: u64::MAX,
+                path_index: 2,
+            },
+            FilesystemFileIdIndexEntry {
+                hash: 0,
+                path_index: 3,
+            },
+        ];
+
+        radix_sort_file_indices_by_hash(&mut entries);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.hash, entry.path_index))
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (1, 1), (u64::MAX, 0), (u64::MAX, 2)]
+        );
     }
 
     #[test]

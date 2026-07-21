@@ -3840,16 +3840,19 @@ fn indexed_file_id_matches(
     file_ids: &BTreeSet<String>,
     path_predicate: &FilePathPredicate,
 ) -> FilesystemPathSelection {
-    let indices = index
-        .entries()
-        .enumerate()
-        .filter(|(_, entry)| {
-            entry.kind == FilesystemPathKind::File
-                && file_ids.contains(entry.id())
-                && path_predicate.matches(&entry.path)
+    let mut indices = file_ids
+        .iter()
+        .flat_map(|file_id| index.exact_file_id_indices(file_id))
+        .filter(|candidate| {
+            let entry = index.entry(*candidate);
+            debug_assert_eq!(entry.kind, FilesystemPathKind::File);
+            path_predicate.matches(&entry.path)
         })
-        .map(|(index, _)| index)
-        .collect();
+        .collect::<Vec<_>>();
+    // Each equal-ID range is path-ordered, but multiple ranges arrive in ID
+    // order. Restore the primary index order promised to DataFusion before
+    // LIMIT is applied.
+    indices.sort_unstable();
     FilesystemPathSelection::new(index, indices)
 }
 
@@ -4503,9 +4506,11 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 #[expect(trivial_casts)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::hint::black_box;
     use std::io::{Cursor, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{
@@ -4559,6 +4564,174 @@ mod tests {
 
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
+    }
+
+    #[test]
+    #[ignore = "filesystem path index exact-ID lifecycle benchmark probe"]
+    fn filesystem_path_id_lookup_benchmark_probe() {
+        let file_count = benchmark_env_usize("LIX_PATH_INDEX_BENCH_FILES", 10_000);
+        let operation = std::env::var("LIX_PATH_INDEX_BENCH_OPERATION")
+            .unwrap_or_else(|_| "lookup".to_string());
+        let default_rounds = if operation == "build" { 20 } else { 2_000 };
+        let default_warmups = if operation == "build" { 3 } else { 100 };
+        let rounds = benchmark_env_usize("LIX_PATH_INDEX_BENCH_ROUNDS", default_rounds);
+        let warmups = benchmark_env_usize("LIX_PATH_INDEX_BENCH_WARMUPS", default_warmups);
+        assert!(file_count > 0, "benchmark needs at least one file");
+        assert!(rounds > 0, "benchmark needs at least one measured round");
+
+        let id_order = benchmark_shuffled_indices(file_count);
+        let target_id = format!("file-{:08}", id_order[file_count - 1]);
+        let rows = id_order
+            .into_iter()
+            .enumerate()
+            .map(|(path_index, id_index)| {
+                let id = format!("file-{id_index:08}");
+                let snapshot = serde_json::json!({
+                    "id": id,
+                    "directory_id": JsonValue::Null,
+                    "name": format!("path-{path_index:08}.txt"),
+                })
+                .to_string();
+                live_file_row(&id, "branch-b", &snapshot)
+            })
+            .collect::<Vec<_>>();
+
+        let mut samples = Vec::with_capacity(rounds);
+        let mut heap_bytes = 0;
+        match operation.as_str() {
+            "lookup" => {
+                let index = Arc::new(
+                    FilesystemPathIndex::from_live_rows(rows)
+                        .expect("benchmark path index should build"),
+                );
+                heap_bytes = index.estimated_heap_bytes();
+                let target_ids = BTreeSet::from([target_id]);
+                for iteration in 0..warmups.saturating_add(rounds) {
+                    let started = Instant::now();
+                    let selection = super::indexed_file_id_matches(
+                        Arc::clone(&index),
+                        &target_ids,
+                        &super::FilePathPredicate::All,
+                    );
+                    let elapsed = started.elapsed();
+                    assert_eq!(black_box(selection.len()), 1);
+                    if iteration >= warmups {
+                        samples.push(elapsed);
+                    }
+                }
+            }
+            "build" => {
+                for iteration in 0..warmups.saturating_add(rounds) {
+                    let input = rows.clone();
+                    let started = Instant::now();
+                    let index = FilesystemPathIndex::from_live_rows(input)
+                        .expect("benchmark path index should build");
+                    let elapsed = started.elapsed();
+                    heap_bytes = index.estimated_heap_bytes();
+                    assert_eq!(
+                        black_box(index.kind_count(super::FilesystemPathKind::File)),
+                        file_count
+                    );
+                    if iteration >= warmups {
+                        samples.push(elapsed);
+                    }
+                }
+            }
+            other => {
+                panic!("LIX_PATH_INDEX_BENCH_OPERATION must be lookup or build; got {other:?}")
+            }
+        }
+
+        samples.sort_unstable();
+        let p50 = benchmark_percentile(&samples, 50);
+        let p95 = benchmark_percentile(&samples, 95);
+        eprintln!(
+            "filesystem_path_id_probe operation={operation} files={file_count} rounds={rounds} p50_ns={} p95_ns={} heap_bytes={heap_bytes} heap_bytes_per_file={}",
+            p50.as_nanos(),
+            p95.as_nanos(),
+            heap_bytes / file_count,
+        );
+    }
+
+    fn benchmark_env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name} must be an integer: {error}"))
+        })
+    }
+
+    fn benchmark_percentile(samples: &[Duration], percentile: usize) -> Duration {
+        samples[(samples.len() - 1) * percentile / 100]
+    }
+
+    fn benchmark_shuffled_indices(len: usize) -> Vec<usize> {
+        let mut indices = (0..len).collect::<Vec<_>>();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for upper in (1..len).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let modulus = u64::try_from(upper + 1).expect("benchmark size should fit u64");
+            let selected = usize::try_from(state % modulus)
+                .expect("shuffled benchmark index should fit usize");
+            indices.swap(upper, selected);
+        }
+        indices
+    }
+
+    #[test]
+    fn indexed_file_id_matches_restores_path_order_and_applies_path_predicate() {
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(vec![
+                live_file_row(
+                    "file-z",
+                    "branch-b",
+                    r#"{"id":"file-z","directory_id":null,"name":"a.txt"}"#,
+                ),
+                live_file_row(
+                    "file-a",
+                    "branch-b",
+                    r#"{"id":"file-a","directory_id":null,"name":"z.txt"}"#,
+                ),
+                live_file_row(
+                    "file-middle",
+                    "branch-b",
+                    r#"{"id":"file-middle","directory_id":null,"name":"middle.txt"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let ids = BTreeSet::from(["file-a".to_string(), "file-z".to_string()]);
+
+        let matches = super::indexed_file_id_matches(
+            Arc::clone(&index),
+            &ids,
+            &super::FilePathPredicate::All,
+        );
+        assert_eq!(
+            matches
+                .entries()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a.txt", "/z.txt"]
+        );
+
+        let filtered = super::indexed_file_id_matches(
+            index,
+            &ids,
+            &super::FilePathPredicate::Comparison {
+                operation: super::FilePathComparison::GreaterThan,
+                value: "/middle.txt".to_string(),
+            },
+        );
+        assert_eq!(
+            filtered
+                .entries()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/z.txt"]
+        );
     }
 
     fn string_literal(value: &str) -> Expr {
