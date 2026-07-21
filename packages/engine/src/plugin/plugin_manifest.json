@@ -34,7 +34,8 @@
       "properties": {
         "path_glob": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 1024
         },
         "content_type": {
           "type": "string",
@@ -44,14 +45,18 @@
     },
     "entry": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 512
     },
     "schemas": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 512
       }
     }
   }

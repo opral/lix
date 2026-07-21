@@ -267,7 +267,55 @@ async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
         .await
         .expect_err("SQL update should reject invalid plugin archive data");
 
-    assert!(error.message.contains("valid zip file"));
+    assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+    assert!(error.message.contains("ZIP"));
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn sql_invalid_plugin_manifest_writes_are_atomic() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+    let path = "/.lix/plugins/plugin_sentinel.lixplugin";
+    let invalid = invalid_glob_sentinel_plugin_archive();
+
+    let error = install_plugin(&session, "plugin_sentinel", &invalid)
+        .await
+        .expect_err("a fresh install with an invalid glob must fail");
+    assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+    assert!(error.message.contains("path_glob"));
+    assert_eq!(
+        read_file(&session, path)
+            .await
+            .expect("failed install archive lookup should succeed"),
+        None
+    );
+    assert_eq!(registered_plugin_note_schema_count(&session).await, 0);
+
+    let original = sentinel_plugin_archive();
+    install_plugin(&session, "plugin_sentinel", &original)
+        .await
+        .expect("valid plugin install should succeed");
+    let error = install_plugin(&session, "plugin_sentinel", &invalid)
+        .await
+        .expect_err("an update with an invalid glob must fail");
+    assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+    assert_eq!(
+        read_file(&session, path)
+            .await
+            .expect("installed archive lookup should succeed")
+            .as_deref(),
+        Some(original.as_slice())
+    );
+    assert_eq!(registered_plugin_note_schema_count(&session).await, 1);
 
     session.close().await.expect("session should close");
 }
@@ -771,6 +819,21 @@ where
     }
 }
 
+async fn registered_plugin_note_schema_count<S>(session: &S) -> usize
+where
+    S: TestSession + Sync + ?Sized,
+{
+    session
+        .execute_sql(
+            "SELECT value FROM lix_registered_schema \
+             WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
+            &[],
+        )
+        .await
+        .expect("plugin schema lookup should succeed")
+        .len()
+}
+
 async fn mkdir<S>(session: &S, path: &str) -> Result<(), LixError>
 where
     S: TestSession + Sync + ?Sized,
@@ -1014,6 +1077,18 @@ fn sentinel_plugin_archive() -> Vec<u8> {
         "runtime": "wasm-component-v1",
         "api_version": "0.1.0",
         "match": { "path_glob": "*.sentinel" },
+        "entry": "plugin.wasm",
+        "schemas": ["schema/plugin_note.json"]
+    }"#;
+    plugin_archive(MANIFEST_JSON)
+}
+
+fn invalid_glob_sentinel_plugin_archive() -> Vec<u8> {
+    const MANIFEST_JSON: &[u8] = br#"{
+        "key": "plugin_sentinel",
+        "runtime": "wasm-component-v1",
+        "api_version": "0.1.0",
+        "match": { "path_glob": "*.{sentinel" },
         "entry": "plugin.wasm",
         "schemas": ["schema/plugin_note.json"]
     }"#;

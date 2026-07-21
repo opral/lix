@@ -89,6 +89,11 @@ impl LixError {
     /// An internal engine invariant failed.
     pub const CODE_INTERNAL_ERROR: &'static str = "LIX_INTERNAL_ERROR";
 
+    /// A plugin ZIP package or manifest is malformed, unsafe, or exceeds the
+    /// static resource bounds accepted by the engine. Invalid embedded Lix
+    /// schema definitions retain [`Self::CODE_SCHEMA_DEFINITION`].
+    pub const CODE_INVALID_PLUGIN: &'static str = "LIX_ERROR_INVALID_PLUGIN";
+
     /// Write-time failure where user data did not conform to a registered
     /// schema (type mismatch, missing required field, pattern violation,
     /// additionalProperties, etc.). Raised from the JSON-Schema validator
