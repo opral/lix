@@ -1483,33 +1483,29 @@ fn indexed_directory_parent_matches(
     index: Arc<crate::filesystem::FilesystemPathIndex>,
     parent_ids: &BTreeSet<String>,
 ) -> FilesystemPathSelection {
-    let indices = index
+    let entries = index
         .entries()
-        .enumerate()
-        .filter(|(_, entry)| {
+        .into_iter()
+        .filter(|entry| {
             entry.kind == FilesystemPathKind::Directory
                 && entry
                     .parent_id
                     .as_ref()
                     .is_some_and(|parent_id| parent_ids.contains(parent_id))
         })
-        .map(|(index, _)| index)
         .collect();
-    FilesystemPathSelection::new(index, indices)
+    FilesystemPathSelection::new(index, entries)
 }
 
 fn indexed_directory_root_matches(
     index: Arc<crate::filesystem::FilesystemPathIndex>,
 ) -> FilesystemPathSelection {
-    let indices = index
+    let entries = index
         .entries()
-        .enumerate()
-        .filter(|(_, entry)| {
-            entry.kind == FilesystemPathKind::Directory && entry.parent_id.is_none()
-        })
-        .map(|(index, _)| index)
+        .into_iter()
+        .filter(|entry| entry.kind == FilesystemPathKind::Directory && entry.parent_id.is_none())
         .collect();
-    FilesystemPathSelection::new(index, indices)
+    FilesystemPathSelection::new(index, entries)
 }
 
 fn is_null_column_filter(expr: &Expr, column_name: &str) -> bool {

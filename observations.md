@@ -8,21 +8,6 @@ measured in the PR stack. Entries stay until measurement shows they are not
 worthwhile, at which point their status and rationale should be updated rather
 than silently removed.
 
-## Active: incrementally maintain the filesystem path index
-
-- **Evidence:** The path index makes indexed reads fast, but an invalidated
-  branch still rebuilds descriptors from live state before the first indexed
-  read can use it.
-- **Potential:** Applying committed filesystem descriptor deltas to the cached
-  index could turn the cold rebuild cost from `O(files)` into `O(changes)` and
-  benefit many read paths at once.
-- **Why it is not a small PR:** It crosses transaction staging, branch views,
-  cache invalidation, and correctness recovery. It needs a clear rebuild
-  fallback and memory-growth policy.
-- **Next measurement:** Profile index construction, memory use, and write
-  invalidation frequency on 2.5k, 10k, and 50k-file fixtures.
-- **Status:** observing; deferred while targeted pushdowns remain available.
-
 ## Active: cache stable plugin reconciliation discovery beyond one batch
 
 - **Evidence:** PR #621 removes repeated filesystem scans inside one

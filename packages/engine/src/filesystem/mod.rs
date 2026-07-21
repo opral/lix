@@ -1,17 +1,20 @@
 mod descriptor_path;
 mod keys;
 mod path_index;
+mod persistent_map;
 mod planner;
 mod read;
 mod visibility;
 
 pub(crate) use self::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
 pub(crate) use self::path_index::{
-    FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
+    FilesystemPathEntry, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemPathSelection,
     UncachedFilesystemPathIndexReader, build_path_index, load_path_index_revision,
     stage_path_index_revision,
 };
+#[cfg(test)]
+pub(crate) use self::path_index::{full_rebuild_stats, reset_full_rebuild_stats};
 pub(crate) use self::planner::directory_path_resolvers_from_state_rows;
 pub(crate) use self::planner::{
     BlobRefRowInput, DirectoryDescriptorWriteIntent, DirectoryPathResolver, FileDeleteInput,
