@@ -37,6 +37,16 @@ test("loadChanges validates and parses fragments", () => {
 	]);
 });
 
+test("loadChanges rejects major releases", () => {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
+	mkdirSync(join(root, ".changenotes"));
+	writeFileSync(
+		join(root, ".changenotes", "breaking-change.md"),
+		`---\ntype: major\n---\n\nChanged a user-facing API.\n`,
+	);
+	assert.throws(() => loadChanges(root), /type must be one of minor, patch/);
+});
+
 test("loadChanges preserves changelog summary and explainer paragraphs", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, ".changenotes"));
@@ -125,6 +135,7 @@ test("updateCargoToml bumps internal path dependency versions", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
 	mkdirSync(join(root, "packages", "rs-sdk-tests"), { recursive: true });
+	mkdirSync(join(root, "packages", "server-protocol"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
 		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_sqlite_storage = { path = "packages/sqlite-storage", version = "0.6.2" }\nlix_rocksdb_storage = { path = "packages/rocksdb-storage", version = "0.6.2" }\nlix_slatedb_storage = { path = "packages/slatedb-storage", version = "0.6.2" }\nlix_engine = { path = "packages/engine", version = "0.6.2" }\n`,
@@ -137,6 +148,10 @@ test("updateCargoToml bumps internal path dependency versions", () => {
 		join(root, "packages", "rs-sdk-tests", "Cargo.toml"),
 		`[package]\nname = "lix_sdk_tests"\nversion = "0.6.2"\n\n[dependencies]\nlix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false }\n`,
 	);
+	writeFileSync(
+		join(root, "packages", "server-protocol", "Cargo.toml"),
+		`[package]\nname = "lix_server_protocol"\nversion.workspace = true\n\n[dependencies]\nlix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false }\n`,
+	);
 
 	updateCargoToml(root, "0.7.0");
 
@@ -147,6 +162,7 @@ test("updateCargoToml bumps internal path dependency versions", () => {
 	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /version = "0\.7\.0"/);
 	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
+	assert.match(readFileSync(join(root, "packages", "server-protocol", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
 });
 
 test("updatePackageVersion pins native optional dependencies", () => {

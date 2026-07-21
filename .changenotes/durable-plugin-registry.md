@@ -1,5 +1,5 @@
 ---
-type: major
+type: minor
 ---
 
 Plugin execution now uses a durable branch-local registry and per-file owner

@@ -1,5 +1,5 @@
 ---
-type: major
+type: minor
 ---
 
 Tracked-state roots no longer store derived `lix_commit` rows.

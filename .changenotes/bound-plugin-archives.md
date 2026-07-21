@@ -1,5 +1,5 @@
 ---
-type: major
+type: minor
 ---
 
 Plugin packages now have explicit validation and resource limits.

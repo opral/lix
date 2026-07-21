@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "no
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-export const CHANGE_TYPES = ["major", "minor", "patch"];
+export const CHANGE_TYPES = ["minor", "patch"];
 export const JS_SDK_NATIVE_PACKAGES = [
 	"@lix-js/sdk-darwin-arm64",
 	"@lix-js/sdk-linux-arm64",
@@ -98,14 +98,13 @@ export function loadChanges(root) {
 }
 
 export function highestChangeType(changes) {
-	if (changes.some((change) => change.type === "major")) return "major";
 	if (changes.some((change) => change.type === "minor")) return "minor";
 	if (changes.some((change) => change.type === "patch")) return "patch";
 	return null;
 }
 
 export function changelogEntry(version, date, changes) {
-	const labels = { major: "Major", minor: "Minor", patch: "Patch" };
+	const labels = { minor: "Minor", patch: "Patch" };
 	let entry = `## ${version} - ${date}\n`;
 	for (const type of CHANGE_TYPES) {
 		const typed = changes.filter((change) => change.type === type);
@@ -177,7 +176,11 @@ export function updateCargoToml(root, version) {
 	text = updatePathDependencyVersions(text, version);
 	writeText(root, "Cargo.toml", text);
 
-	for (const path of ["packages/js-sdk/Cargo.toml", "packages/rs-sdk-tests/Cargo.toml"]) {
+	for (const path of [
+		"packages/js-sdk/Cargo.toml",
+		"packages/rs-sdk-tests/Cargo.toml",
+		"packages/server-protocol/Cargo.toml",
+	]) {
 		let packageText = readText(root, path);
 		packageText = updatePackageVersionField(packageText, version);
 		packageText = updatePathDependencyVersions(packageText, version);
