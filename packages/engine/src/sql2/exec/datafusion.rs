@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::functions::FunctionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
+use crate::sql2::bind::primary_key_read::{PrimaryKeyReadBinding, bind_primary_key_read};
 use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
@@ -39,12 +40,13 @@ use crate::sql2::result_metadata::{
     LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
 };
 use crate::sql2::session::{
-    SqlWriteSessionOptions, build_read_session, build_transaction_read_session,
-    build_write_session_with_options,
+    PreparedReadSession, SqlWriteSessionOptions, build_read_session_from_prepared,
+    build_transaction_read_session, build_write_session_with_options, prepare_read_session,
 };
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
 
+use super::primary_key_read::execute_primary_key_read;
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
 
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
@@ -82,20 +84,26 @@ where
     // Keep read-backed DataFusion providers scoped to this call. The returned
     // value is fully materialized, so callers cannot retain a plan/provider
     // that may carry an execution read handle.
-    let plan = create_logical_plan_from_parsed(ctx, sql, statement).await?;
+    crate::sql2::bind_read_statement(sql, &statement)?;
+    let prepared = prepare_read_session(ctx).await?;
+    if let PrimaryKeyReadBinding::Ready(read) =
+        bind_primary_key_read(&statement, prepared.catalog.as_ref(), params)
+    {
+        return execute_primary_key_read(ctx, &prepared, &read).await;
+    }
+    let plan = create_logical_plan_from_parsed(ctx, statement, &prepared).await?;
     execute_logical_plan(plan, params).await
 }
 
 async fn create_logical_plan_from_parsed<C>(
     ctx: &C,
-    sql: &str,
     statement: DataFusionStatement,
+    prepared: &PreparedReadSession,
 ) -> Result<SqlLogicalPlan, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    crate::sql2::bind_read_statement(sql, &statement)?;
-    let session = build_read_session(ctx).await?;
+    let session = build_read_session_from_prepared(ctx, prepared).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
@@ -1431,7 +1439,7 @@ fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> L
     crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
-fn query_result_from_batches(
+pub(super) fn query_result_from_batches(
     result_fields: &[Field],
     batches: &[RecordBatch],
 ) -> Result<SqlQueryResult, LixError> {

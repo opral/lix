@@ -6,23 +6,57 @@ use crate::LixError;
 use crate::branch::BranchRefReader;
 
 use super::branch_ref::CachingBranchRefReader;
+use super::catalog::PublicCatalog;
 use super::providers;
 use super::udfs::register_sql2_functions;
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
-pub(crate) async fn build_read_session<C>(ctx: &C) -> Result<SessionContext, LixError>
+pub(crate) struct PreparedReadSession {
+    pub(crate) branch_ref: Arc<dyn BranchRefReader>,
+    pub(crate) active_branch_commit_id: Option<String>,
+    pub(crate) catalog: Arc<PublicCatalog>,
+}
+
+pub(crate) async fn prepare_read_session<C>(ctx: &C) -> Result<PreparedReadSession, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let session = new_sql_session_context();
     let branch_ref: Arc<dyn BranchRefReader> =
         Arc::new(CachingBranchRefReader::new(ctx.branch_ref()));
     let active_branch_commit_id = branch_ref
         .load_head(ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
-    register_sql2_functions(&session, ctx.functions(), active_branch_commit_id);
-    providers::register_read(&session, ctx, branch_ref).await?;
+    let catalog = Arc::new(PublicCatalog::from_visible_schemas(
+        &ctx.list_visible_schemas()?,
+    )?);
+    Ok(PreparedReadSession {
+        branch_ref,
+        active_branch_commit_id,
+        catalog,
+    })
+}
+
+pub(crate) async fn build_read_session_from_prepared<C>(
+    ctx: &C,
+    prepared: &PreparedReadSession,
+) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let session = new_sql_session_context();
+    register_sql2_functions(
+        &session,
+        ctx.functions(),
+        prepared.active_branch_commit_id.clone(),
+    );
+    providers::register_read_with_catalog(
+        &session,
+        ctx,
+        Arc::clone(&prepared.branch_ref),
+        prepared.catalog.as_ref(),
+    )
+    .await?;
 
     Ok(session)
 }

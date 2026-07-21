@@ -4,7 +4,9 @@
 //! are only formatted on the error path.
 
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::common::{Column, DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::expr::InList;
 
 pub(super) fn required_string_value(
     batch: &RecordBatch,
@@ -88,8 +90,8 @@ pub(super) fn optional_scalar_value(
 
 /// Extract a string literal from a logical expression, shared by the specs
 /// that parse pushed-down filters.
-pub(super) fn string_expr_literal(expr: &datafusion::logical_expr::Expr) -> Option<String> {
-    let datafusion::logical_expr::Expr::Literal(literal, _) = expr else {
+pub(super) fn string_expr_literal(expr: &Expr) -> Option<String> {
+    let Expr::Literal(literal, _) = expr else {
         return None;
     };
     match literal {
@@ -98,4 +100,18 @@ pub(super) fn string_expr_literal(expr: &datafusion::logical_expr::Expr) -> Opti
         | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
         _ => None,
     }
+}
+
+/// Build the exact string `IN` predicate understood by the file and entity
+/// provider filter analyzers.
+pub(super) fn string_in_filter(column_name: &str, values: &[String]) -> Expr {
+    Expr::InList(InList::new(
+        Box::new(Expr::Column(Column::from_name(column_name))),
+        values
+            .iter()
+            .cloned()
+            .map(|value| Expr::Literal(ScalarValue::Utf8(Some(value)), None))
+            .collect(),
+        false,
+    ))
 }

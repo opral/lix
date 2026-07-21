@@ -31,7 +31,8 @@ use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
-    SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
+    SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
+    WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
@@ -47,8 +48,77 @@ use super::spec::{
 };
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
+    string_in_filter,
 };
 use crate::storage_adapter::StorageAdapterRead;
+
+/// Load active entity rows by exact logical primary key while reusing the
+/// entity provider's branch validation, live-state projection, and Arrow
+/// materialization semantics.
+pub(crate) async fn load_active_entity_pks<C>(
+    ctx: &C,
+    branch_ref: Arc<dyn BranchRefReader>,
+    spec: Arc<EntitySurfaceSpec>,
+    projection: &[usize],
+    entity_pks: &[EntityPk],
+) -> std::result::Result<RecordBatch, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let primary_key_columns = spec.flat_string_primary_key_columns().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!(
+                "native exact-key reads require entity surface '{}' to have a non-empty flat string primary key",
+                spec.schema_key
+            ),
+        )
+    })?;
+    if entity_pks
+        .iter()
+        .any(|entity_pk| entity_pk.parts.len() != primary_key_columns.len())
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!(
+                "native exact-key read received an invalid primary-key tuple for entity surface '{}'",
+                spec.schema_key
+            ),
+        ));
+    }
+
+    let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+    let projection = projection.to_vec();
+    if entity_pks.is_empty() {
+        return Ok(RecordBatch::new_empty(projected_schema(
+            &schema,
+            Some(&projection),
+        )));
+    }
+
+    let encoded_pks = entity_pks
+        .iter()
+        .map(EntityPk::as_json_array_text)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let provider = EntitySpec::active(
+        spec,
+        ctx.live_state(),
+        branch_ref,
+        ctx.active_branch_id().to_string(),
+    );
+    let planned = provider
+        .plan_scan(
+            Some(&projection),
+            &[string_in_filter("lixcol_entity_pk", &encoded_pks)],
+            None,
+            &ExecutionProps::new(),
+        )
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    (planned.load)()
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
 
 pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
@@ -673,7 +743,7 @@ fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr)
 impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
     fn new(spec: &'a EntitySurfaceSpec) -> Self {
         Self {
-            primary_key_columns: string_primary_key_columns(spec),
+            primary_key_columns: spec.flat_string_primary_key_columns().unwrap_or_default(),
         }
     }
 
@@ -991,20 +1061,6 @@ fn entity_filter_values_equal(
         ) => *actual as f64 == *expected,
         _ => actual == expected,
     }
-}
-
-fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
-    spec.primary_key_paths
-        .iter()
-        .map(|path| {
-            let [column_name] = path.as_slice() else {
-                return None;
-            };
-            let column = spec.visible_column(column_name)?;
-            (column.column_type == EntityColumnType::String).then_some(column.name.as_str())
-        })
-        .collect::<Option<Vec<_>>>()
-        .unwrap_or_default()
 }
 
 fn entity_pk_constraint_from_binary_filter(

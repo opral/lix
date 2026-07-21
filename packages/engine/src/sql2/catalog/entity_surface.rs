@@ -53,6 +53,36 @@ impl EntitySurfaceSpec {
             .iter()
             .find(|column| column.name == column_name)
     }
+
+    /// Return the public columns that can losslessly form exact live-state
+    /// entity-primary-key filters.
+    ///
+    /// The native point-read route deliberately accepts only the common
+    /// schema shape: a non-empty primary key made entirely from top-level
+    /// string properties. Nested JSON pointers and non-string components
+    /// keep using the regular DataFusion route.
+    pub(crate) fn flat_string_primary_key_columns(&self) -> Option<Vec<&str>> {
+        if self.primary_key_paths.is_empty() {
+            return None;
+        }
+
+        let mut seen = BTreeSet::new();
+        self.primary_key_paths
+            .iter()
+            .map(|path| {
+                let [column_name] = path.as_slice() else {
+                    return None;
+                };
+                let column = self.visible_column(column_name)?;
+                if column.column_type != EntityColumnType::String
+                    || !seen.insert(column.name.as_str())
+                {
+                    return None;
+                }
+                Some(column.name.as_str())
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn derive_entity_surface_spec_from_schema(
@@ -294,5 +324,64 @@ fn collect_entity_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a s
                 collect_entity_type_kinds(branch, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EntityColumnType, EntitySurfaceColumn, EntitySurfaceSpec,
+        derive_entity_surface_spec_from_schema,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn flat_string_primary_key_columns_accepts_only_flat_string_components() {
+        let flat = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "project_item",
+            "x-lix-primary-key": ["/workspace", "/id"],
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string" },
+                "id": { "type": "string" },
+                "revision": { "type": "integer" }
+            }
+        }))
+        .expect("flat entity schema should derive");
+        assert_eq!(
+            flat.flat_string_primary_key_columns(),
+            Some(vec!["workspace", "id"])
+        );
+
+        let no_primary_key = EntitySurfaceSpec {
+            schema_key: "no_primary_key".to_string(),
+            primary_key_paths: Vec::new(),
+            columns: flat.columns.clone(),
+        };
+        assert_eq!(no_primary_key.flat_string_primary_key_columns(), None);
+
+        let nested = EntitySurfaceSpec {
+            schema_key: "nested".to_string(),
+            primary_key_paths: vec![vec!["scope".to_string(), "id".to_string()]],
+            columns: flat.columns.clone(),
+        };
+        assert_eq!(nested.flat_string_primary_key_columns(), None);
+
+        let non_string = EntitySurfaceSpec {
+            schema_key: "non_string".to_string(),
+            primary_key_paths: vec![vec!["revision".to_string()]],
+            columns: vec![EntitySurfaceColumn {
+                name: "revision".to_string(),
+                column_type: EntityColumnType::Integer,
+            }],
+        };
+        assert_eq!(non_string.flat_string_primary_key_columns(), None);
+
+        let duplicate = EntitySurfaceSpec {
+            schema_key: "duplicate".to_string(),
+            primary_key_paths: vec![vec!["id".to_string()], vec!["id".to_string()]],
+            columns: flat.columns,
+        };
+        assert_eq!(duplicate.flat_string_primary_key_columns(), None);
     }
 }

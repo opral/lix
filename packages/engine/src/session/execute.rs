@@ -1232,4 +1232,107 @@ mod tests {
             serde_json::json!("value")
         );
     }
+
+    #[tokio::test]
+    async fn exact_primary_key_reads_match_datafusion_fallback_results() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('native-file-a', '/native-a.bin', X'6100'), \
+                 ('native-file-b', '/native-b.bin', X'6200')",
+                &[],
+            )
+            .await
+            .expect("file fixtures should insert");
+
+        let file_params = [
+            Value::Text("native-file-b".to_string()),
+            Value::Text("native-file-a".to_string()),
+        ];
+        let native_files = session
+            .execute(
+                "SELECT id AS file_id, path, data AS bytes \
+                 FROM lix_file WHERE id IN ($1, $2)",
+                &file_params,
+            )
+            .await
+            .expect("native file read should succeed");
+        // The tautology is deliberately outside the native binder's exact-key
+        // language, forcing the same projection through DataFusion.
+        let datafusion_files = session
+            .execute(
+                "SELECT id AS file_id, path, data AS bytes \
+                 FROM lix_file WHERE id IN ($1, $2) AND id = id",
+                &file_params,
+            )
+            .await
+            .expect("DataFusion file read should succeed");
+        assert_eq!(native_files, datafusion_files);
+
+        let schema = serde_json::json!({
+            "x-lix-key": "native_pk_message",
+            "x-lix-primary-key": ["/workspace_id", "/id"],
+            "type": "object",
+            "properties": {
+                "workspace_id": { "type": "string" },
+                "id": { "type": "string" },
+                "payload": { "type": "object" }
+            },
+            "required": ["workspace_id", "id", "payload"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_registered_schema \
+                     (value, lixcol_global, lixcol_untracked) \
+                     VALUES (lix_json('{}'), false, false)",
+                    schema
+                ),
+                &[],
+            )
+            .await
+            .expect("entity schema should register");
+        session
+            .execute(
+                "INSERT INTO native_pk_message (workspace_id, id, payload) VALUES \
+                 ('workspace', 'alpha', lix_json('{\"kind\":\"first\"}')), \
+                 ('workspace', 'beta', lix_json('{\"kind\":\"second\"}'))",
+                &[],
+            )
+            .await
+            .expect("entity fixtures should insert");
+
+        let entity_params = [
+            Value::Text("workspace".to_string()),
+            Value::Text("beta".to_string()),
+            Value::Text("alpha".to_string()),
+        ];
+        let native_entities = session
+            .execute(
+                "SELECT id AS message_id, payload AS document \
+                 FROM native_pk_message \
+                 WHERE workspace_id = $1 AND id IN ($2, $3)",
+                &entity_params,
+            )
+            .await
+            .expect("native entity read should succeed");
+        let datafusion_entities = session
+            .execute(
+                "SELECT id AS message_id, payload AS document \
+                 FROM native_pk_message \
+                 WHERE workspace_id = $1 AND id IN ($2, $3) \
+                 AND workspace_id = workspace_id",
+                &entity_params,
+            )
+            .await
+            .expect("DataFusion entity read should succeed");
+        assert_eq!(native_entities, datafusion_entities);
+        assert!(
+            native_entities.rows()[0]
+                .value("document")
+                .is_ok_and(|value| matches!(value, Value::Json(_)))
+        );
+    }
 }

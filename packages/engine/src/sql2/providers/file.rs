@@ -84,7 +84,8 @@ use crate::filesystem::{
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
+    SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
+    WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
@@ -98,6 +99,49 @@ use super::spec::{
 use super::upsert::{
     StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport, validate_target_columns,
 };
+use super::values::string_in_filter;
+
+/// Load active `lix_file` rows by exact file id while reusing the provider's
+/// path-index, blob, and plugin-rendering lanes.
+pub(crate) async fn load_active_lix_file_ids<C>(
+    ctx: &C,
+    branch_ref: Arc<dyn BranchRefReader>,
+    projection: &[usize],
+    file_ids: &[String],
+) -> std::result::Result<RecordBatch, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let schema = lix_file_schema();
+    let projection = projection.to_vec();
+    let projected_schema = projected_schema(&schema, Some(&projection))
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    if file_ids.is_empty() {
+        return Ok(RecordBatch::new_empty(projected_schema));
+    }
+
+    let provider = LixFileSpec::active_branch(
+        ctx.active_branch_id(),
+        ctx.live_state(),
+        ctx.filesystem_path_index(),
+        branch_ref,
+        ctx.blob_reader(),
+        ctx.plugin_host(),
+        ctx.functions(),
+    );
+    let planned = provider
+        .plan_scan(
+            Some(&projection),
+            &[string_in_filter("id", file_ids)],
+            None,
+            &ExecutionProps::new(),
+        )
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    (planned.load)()
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
 
 pub(super) async fn register_lix_file_active_provider(
     session: &SessionContext,

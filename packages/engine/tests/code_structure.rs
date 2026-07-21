@@ -2743,11 +2743,15 @@ fn sql2_read_session_does_not_register_write_surfaces() {
     let read_session = source_between(
         relative,
         &source,
-        "pub(crate) async fn build_read_session",
+        "pub(crate) async fn build_read_session_from_prepared",
         "pub(crate) async fn build_transaction_read_session",
     );
 
-    assert_source_contains_all(relative, read_session, &["providers::register_read"]);
+    assert_source_contains_all(
+        relative,
+        read_session,
+        &["providers::register_read_with_catalog"],
+    );
     assert_source_contains_none(
         relative,
         read_session,

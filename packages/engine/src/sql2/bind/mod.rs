@@ -1,6 +1,7 @@
 pub(crate) mod classify;
 pub(crate) mod error;
 pub(crate) mod expr;
+pub(crate) mod primary_key_read;
 mod public_udf;
 pub(crate) mod read;
 pub(crate) mod statement;

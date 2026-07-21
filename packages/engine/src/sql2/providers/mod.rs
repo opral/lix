@@ -30,9 +30,10 @@ use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
 use datafusion::catalog::TableProvider;
 
+pub(crate) use entity::load_active_entity_pks;
 pub(crate) use file::{
     FastLixFilePathWriteConflict, execute_fast_lix_file_data_update_by_id,
-    execute_fast_lix_file_path_writes,
+    execute_fast_lix_file_path_writes, load_active_lix_file_ids,
 };
 pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
@@ -115,9 +116,27 @@ pub(crate) async fn register_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
+    register_read_with_catalog(session, ctx, branch_ref, &catalog).await
+}
+
+/// Register read providers from a catalog the caller has already built.
+///
+/// Exact-primary-key reads inspect the same catalog before deciding whether to
+/// use their narrow provider path. Reusing it on fallback avoids deriving every
+/// public surface twice for candidate-shaped statements that DataFusion must
+/// ultimately execute.
+pub(crate) async fn register_read_with_catalog<C>(
+    session: &SessionContext,
+    ctx: &C,
+    branch_ref: Arc<dyn BranchRefReader>,
+    catalog: &PublicCatalog,
+) -> Result<(), LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let history_query_source = ctx.history_query_source();
     let changelog_query_source = ctx.changelog_query_source();
-    let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
     for surface in catalog.surfaces() {
         match &surface.kind {
             PublicSurfaceKind::LixState => {
@@ -247,7 +266,7 @@ where
         Arc::clone(&branch_ref),
         Arc::new(tokio::sync::Mutex::new(ctx.commit_graph())),
         history_query_source,
-        &catalog,
+        catalog,
     )
     .await?;
 
