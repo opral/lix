@@ -139,6 +139,110 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	await lix.close();
 });
 
+test("remote executeReadBatch sends an explicit branch and decodes revision bytes", async () => {
+	const requests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				return new URL(request.url).pathname.endsWith("/lix/v1/")
+					? Response.json({ protocolVersion: 1, activeBranchId: "main-id" })
+					: Response.json({
+							branchId: "draft-id",
+							branchCommitId: "draft-commit-id",
+							storageMutationRevision: { kind: "blob", base64: "AQID" },
+							results: [
+								{
+									columns: ["value"],
+									rows: [[{ kind: "text", value: "draft" }]],
+									rowsAffected: 0,
+									notices: [],
+								},
+							],
+						});
+			},
+		},
+	});
+
+	const batch = await lix.executeReadBatch({
+		branchId: "draft-id",
+		statements: [{ sql: "SELECT $1 AS value", params: ["draft"] }],
+	});
+
+	expect(batch).toMatchObject({
+		branchId: "draft-id",
+		branchCommitId: "draft-commit-id",
+	});
+	expect(batch.storageMutationRevision).toEqual(new Uint8Array([1, 2, 3]));
+	expect(batch.results[0]?.rows[0]?.get("value")).toBe("draft");
+	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
+		"/@acme/workspace/lix/v1/read-batch",
+	);
+	expect(await requests[1]?.json()).toEqual({
+		branchId: "draft-id",
+		statements: [
+			{
+				sql: "SELECT $1 AS value",
+				params: [{ kind: "text", value: "draft" }],
+			},
+		],
+	});
+
+	await lix.close();
+});
+
+test("remote executeReadBatch rejects mismatched branches and result counts", async () => {
+	let readBatchCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+					});
+				}
+				readBatchCalls += 1;
+				return Response.json({
+					branchId: readBatchCalls === 1 ? "wrong-branch" : "draft-id",
+					branchCommitId: "draft-commit-id",
+					storageMutationRevision: null,
+					results:
+						readBatchCalls === 1
+							? [
+									{
+										columns: ["value"],
+										rows: [[{ kind: "int", value: 1 }]],
+										rowsAffected: 0,
+										notices: [],
+									},
+								]
+							: [],
+				});
+			},
+		},
+	});
+	const request = {
+		branchId: "draft-id",
+		statements: [{ sql: "SELECT 1 AS value" }],
+	};
+
+	await expect(lix.executeReadBatch(request)).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+	});
+	await expect(lix.executeReadBatch(request)).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+	});
+
+	await lix.close();
+});
+
 test("remote branches preserve local Lix branch semantics", async () => {
 	const requests: Request[] = [];
 	let activeBranchId = "main-id";

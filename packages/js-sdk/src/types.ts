@@ -79,6 +79,11 @@ export type LixBatchOptions = {
 	originKey?: string;
 };
 
+export type ReadBatchOptions = {
+	branchId: string;
+	statements: readonly LixBatchStatement[];
+};
+
 export type ExecuteResult = {
 	columns: string[];
 	rows: RowLike[];
@@ -88,6 +93,13 @@ export type ExecuteResult = {
 		message: string;
 		hint?: string;
 	}>;
+};
+
+export type ReadBatchResult = {
+	branchId: string;
+	branchCommitId: string;
+	storageMutationRevision: Uint8Array | null;
+	results: readonly ExecuteResult[];
 };
 
 export type ObserveEvent = {

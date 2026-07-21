@@ -70,14 +70,14 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::{Engine, EngineOptions};
 pub use init::InitReceipt;
 pub use session::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ObserveEvent,
-    ObserveEvents, Row, RowRef, TryFromValue,
-};
-pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
     MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+};
+pub use session::{
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, MAX_READ_BATCH_STATEMENTS, ObserveEvent,
+    ObserveEvents, ReadBatchResult, Row, RowRef, TryFromValue,
 };
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::conformance::{

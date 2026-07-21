@@ -36,6 +36,13 @@ export type BindingBatchStatement = {
 	params: BindingParam[];
 };
 
+export type BindingReadBatchResult = {
+	branchId: string;
+	branchCommitId: string;
+	storageMutationRevision?: Uint8Array | null;
+	results: BindingExecuteResult[];
+};
+
 export type LixBinding = {
 	execute(
 		sql: string,
@@ -46,6 +53,10 @@ export type LixBinding = {
 		statements: BindingBatchStatement[],
 		options?: LixBatchOptions,
 	): Promise<BindingExecuteResult[]>;
+	executeReadBatch(
+		branchId: string,
+		statements: BindingBatchStatement[],
+	): Promise<BindingReadBatchResult>;
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;

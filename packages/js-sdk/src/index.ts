@@ -30,6 +30,8 @@ export type {
 	MergeConflict,
 	MergeConflictSide,
 	ObserveEvent,
+	ReadBatchOptions,
+	ReadBatchResult,
 	OpenLixOptions,
 	LixTelemetryOptions,
 	LixTelemetrySpan,

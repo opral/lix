@@ -94,6 +94,11 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 					operation.statements,
 					operation.options,
 				);
+			case "executeReadBatch":
+				return requiredLix().executeReadBatch(
+					operation.branchId,
+					operation.statements,
+				);
 			case "beginTransaction": {
 				const transaction = await requiredLix().beginTransaction();
 				const transactionId = nextTransactionId++;

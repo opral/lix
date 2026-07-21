@@ -7,6 +7,7 @@ import type {
 	CreateBranchOptions,
 	ExecuteOptions,
 	LixBatchOptions,
+	ReadBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
 	LixTelemetrySpan,
@@ -29,6 +30,11 @@ export type WorkerOperation =
 			kind: "executeBatch";
 			statements: BindingBatchStatement[];
 			options?: LixBatchOptions;
+	  }
+	| {
+			kind: "executeReadBatch";
+			branchId: ReadBatchOptions["branchId"];
+			statements: BindingBatchStatement[];
 	  }
 	| { kind: "beginTransaction" }
 	| {

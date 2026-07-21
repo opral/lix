@@ -37,7 +37,8 @@ pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, create_write_logical_plan_from_parsed, execute_read_statement_from_parsed,
-    execute_transaction_read_statement_from_parsed, execute_write_logical_plan_result,
+    execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
+    execute_write_logical_plan_result, prepare_read_session, prepare_read_session_at_head,
 };
 #[cfg(test)]
 pub(crate) use exec::{

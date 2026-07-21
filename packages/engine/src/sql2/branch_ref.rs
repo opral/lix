@@ -21,6 +21,13 @@ impl CachingBranchRefReader {
             heads: Mutex::new(HashMap::new()),
         }
     }
+
+    pub(super) fn with_head(inner: Arc<dyn BranchRefReader>, head: BranchHead) -> Self {
+        Self {
+            inner,
+            heads: Mutex::new(HashMap::from([(head.branch_id.clone(), Some(head))])),
+        }
+    }
 }
 
 #[async_trait]
@@ -137,6 +144,18 @@ mod tests {
             Some(head("branch-a", "commit-a"))
         );
         assert_eq!(inner.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.load_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn supplied_head_avoids_underlying_load() {
+        let inner = Arc::new(CountingBranchRefReader::new(Vec::new()));
+        let cached = CachingBranchRefReader::with_head(inner.clone(), head("branch-a", "commit-a"));
+
+        assert_eq!(
+            cached.load_head("branch-a").await.unwrap(),
+            Some(head("branch-a", "commit-a"))
+        );
         assert_eq!(inner.load_count.load(Ordering::Relaxed), 0);
     }
 }

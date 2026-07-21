@@ -3,8 +3,8 @@ use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
     ExecuteOptions, ExecuteResult, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
-    SwitchBranchOptions, SwitchBranchReceipt, Value,
+    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, ReadBatchResult, SessionContext,
+    Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -145,6 +145,16 @@ where
         self.session
             .execute_batch_with_options(statements, options)
             .await
+    }
+
+    /// Executes read-only statements against one explicit branch and coherent
+    /// storage snapshot.
+    pub async fn execute_read_batch(
+        &self,
+        branch_id: &str,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<ReadBatchResult, LixError> {
+        self.session.execute_read_batch(branch_id, statements).await
     }
 
     pub fn observe(

@@ -22,8 +22,8 @@ pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Row, RowRef,
-    TryFromValue,
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, MAX_READ_BATCH_STATEMENTS,
+    ReadBatchResult, Row, RowRef, TryFromValue,
 };
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,

@@ -195,6 +195,65 @@ export function registerMemoryStorageContract({
 			}
 		});
 
+		test("executes coherent reads against an explicit branch without switching", async () => {
+			const { openLix } = await loadSdk();
+			const lix = await wait(openLix(), "open memory Lix");
+
+			try {
+				const main = await lix.activeBranchId();
+				await writeFile(lix, "/read-batch.txt", "main");
+				const draft = await lix.createBranch({ name: "Read batch draft" });
+				await lix.switchBranch({ branchId: draft.id });
+				await writeFile(lix, "/read-batch.txt", "draft");
+				await lix.switchBranch({ branchId: main });
+
+				const batch = await lix.executeReadBatch({
+					branchId: draft.id,
+					statements: [
+						{
+							sql: "SELECT data FROM lix_file WHERE path = $1",
+							params: ["/read-batch.txt"],
+						},
+						{ sql: "SELECT lix_active_branch_commit_id() AS commit_id" },
+					],
+				});
+
+				expect(batch.branchId).toBe(draft.id);
+				expect(batch.storageMutationRevision).toBeInstanceOf(Uint8Array);
+				expect(batch.results).toHaveLength(2);
+				const bytes = batch.results[0]?.rows[0]?.value("data").asBytes();
+				expect(bytes && new TextDecoder().decode(bytes)).toBe("draft");
+				expect(batch.results[1]?.rows[0]?.get("commit_id")).toBe(
+					batch.branchCommitId,
+				);
+				expect(await lix.activeBranchId()).toBe(main);
+
+				await expect(
+					lix.executeReadBatch({
+						branchId: draft.id,
+						statements: [
+							{
+								sql: "DELETE FROM lix_file WHERE path = $1",
+								params: ["/read-batch.txt"],
+							},
+						],
+					}),
+				).rejects.toMatchObject({
+					name: "LixError",
+					code: "LIX_INVALID_PARAM",
+					details: { statementIndex: 0 },
+				});
+				await expect(
+					lix.executeReadBatch({ branchId: draft.id, statements: [] }),
+				).rejects.toMatchObject({
+					code: "LIX_INVALID_ARGUMENT",
+					details: { operation: "executeReadBatch", argument: "statements" },
+				});
+			} finally {
+				await lix.close();
+			}
+		});
+
 		test("creates, switches, previews, and merges branches", async () => {
 			const { openLix } = await loadSdk();
 			const lix = await wait(openLix(), "open memory Lix");

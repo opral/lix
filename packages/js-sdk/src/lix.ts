@@ -1,6 +1,7 @@
 import { invalidArgument } from "./errors.js";
 import type {
 	BindingObserveEvent,
+	BindingReadBatchResult,
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
@@ -18,6 +19,8 @@ import type {
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	ObserveEvent,
+	ReadBatchOptions,
+	ReadBatchResult,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
@@ -68,6 +71,19 @@ export class Lix {
 			options,
 		);
 		return results.map(wrapExecuteResult);
+	}
+
+	async executeReadBatch(options: ReadBatchOptions): Promise<ReadBatchResult> {
+		assertReadBatchOptions(options);
+		const result = await this.binding.executeReadBatch(
+			options.branchId,
+			normalizeBatchStatements(
+				options.statements,
+				undefined,
+				"executeReadBatch",
+			),
+		);
+		return wrapReadBatchResult(result);
 	}
 
 	observe(sql: string, params: SqlParam[] = []): ObserveEvents {
@@ -276,10 +292,11 @@ function assertSqlArgs(
 function normalizeBatchStatements(
 	statements: readonly LixBatchStatement[],
 	options?: LixBatchOptions,
+	operation = "executeBatch",
 ) {
 	if (!Array.isArray(statements)) {
 		throw invalidArgument(
-			"executeBatch",
+			operation,
 			"statements",
 			"array",
 			typeof statements,
@@ -287,7 +304,7 @@ function normalizeBatchStatements(
 	}
 	if (statements.length === 0) {
 		throw invalidArgument(
-			"executeBatch",
+			operation,
 			"statements",
 			"non-empty array",
 			"empty array",
@@ -302,7 +319,7 @@ function normalizeBatchStatements(
 				Array.isArray(statement)
 			) {
 				throw invalidArgument(
-					"executeBatch",
+					operation,
 					`statements[${statementIndex}]`,
 					"object",
 					Array.isArray(statement) ? "array" : typeof statement,
@@ -310,7 +327,7 @@ function normalizeBatchStatements(
 			}
 			if (typeof statement.sql !== "string") {
 				throw invalidArgument(
-					"executeBatch",
+					operation,
 					`statements[${statementIndex}].sql`,
 					"string",
 					typeof statement.sql,
@@ -319,7 +336,7 @@ function normalizeBatchStatements(
 			const params = statement.params ?? [];
 			if (!Array.isArray(params)) {
 				throw invalidArgument(
-					"executeBatch",
+					operation,
 					`statements[${statementIndex}].params`,
 					"array",
 					typeof params,
@@ -337,15 +354,45 @@ function normalizeBatchStatements(
 	});
 }
 
+function assertReadBatchOptions(
+	options: ReadBatchOptions,
+): asserts options is ReadBatchOptions {
+	if (!options || typeof options !== "object" || Array.isArray(options)) {
+		throw invalidArgument(
+			"executeReadBatch",
+			"options",
+			"object",
+			Array.isArray(options) ? "array" : typeof options,
+		);
+	}
+	if (typeof options.branchId !== "string" || options.branchId.trim() === "") {
+		throw invalidArgument(
+			"executeReadBatch",
+			"options.branchId",
+			"non-empty string",
+			typeof options.branchId === "string"
+				? "empty string"
+				: typeof options.branchId,
+		);
+	}
+}
+
+function wrapReadBatchResult(result: BindingReadBatchResult): ReadBatchResult {
+	return {
+		branchId: result.branchId,
+		branchCommitId: result.branchCommitId,
+		storageMutationRevision:
+			result.storageMutationRevision == null
+				? null
+				: new Uint8Array(result.storageMutationRevision),
+		results: result.results.map(wrapExecuteResult),
+	};
+}
+
 function assertBatchOptions(options?: LixBatchOptions) {
 	if (options === undefined) return;
 	if (!options || typeof options !== "object" || Array.isArray(options)) {
-		throw invalidArgument(
-			"executeBatch",
-			"options",
-			"object",
-			typeof options,
-		);
+		throw invalidArgument("executeBatch", "options", "object", typeof options);
 	}
 	if (options.originKey !== undefined && typeof options.originKey !== "string") {
 		throw invalidArgument(

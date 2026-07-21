@@ -2,6 +2,7 @@ import type {
 	BindingExecuteResult,
 	BindingBatchStatement,
 	BindingObserveEvent,
+	BindingReadBatchResult,
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
@@ -23,6 +24,7 @@ import {
 	decodeExecuteResult,
 	decodeHandshake,
 	decodeObserveEvent,
+	decodeReadBatchResult,
 	encodeWireValue,
 	errorFromResponseBody,
 	protocolError,
@@ -125,6 +127,38 @@ class RemoteLixBinding implements LixBinding {
 				throw protocolError("execute batch response must be an array");
 			}
 			return value.map(decodeExecuteResult);
+		});
+	}
+
+	async executeReadBatch(
+		branchId: string,
+		statements: BindingBatchStatement[],
+	): Promise<BindingReadBatchResult> {
+		this.#assertOpen();
+		return this.#enqueue(async () => {
+			const result = decodeReadBatchResult(
+				await this.#requestJson("read-batch", {
+					method: "POST",
+					body: JSON.stringify({
+						branchId,
+						statements: statements.map((statement) => ({
+							sql: statement.sql,
+							params: statement.params.map(encodeWireValue),
+						})),
+					}),
+				}),
+			);
+			if (result.branchId !== branchId) {
+				throw protocolError(
+					`read batch result branchId ${JSON.stringify(result.branchId)} does not match requested branchId ${JSON.stringify(branchId)}`,
+				);
+			}
+			if (result.results.length !== statements.length) {
+				throw protocolError(
+					`read batch result count ${result.results.length} does not match statement count ${statements.length}`,
+				);
+			}
+			return result;
 		});
 	}
 

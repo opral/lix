@@ -862,8 +862,8 @@ where
         Ok(LixSnapshotRead {
             snapshot,
             revision: LixRevision {
-                active_branch_id: batch.active_branch_id,
-                active_branch_commit_id: batch.active_branch_commit_id,
+                active_branch_id: batch.branch_id,
+                active_branch_commit_id: batch.branch_commit_id,
                 storage_mutation_revision: batch.storage_mutation_revision,
             },
         })
@@ -872,8 +872,8 @@ where
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
         let batch = self.session.execute_coherent_read_batch(&[]).await?;
         Ok(LixRevision {
-            active_branch_id: batch.active_branch_id,
-            active_branch_commit_id: batch.active_branch_commit_id,
+            active_branch_id: batch.branch_id,
+            active_branch_commit_id: batch.branch_commit_id,
             storage_mutation_revision: batch.storage_mutation_revision,
         })
     }

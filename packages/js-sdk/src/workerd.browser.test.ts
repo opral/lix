@@ -134,3 +134,62 @@ test("Workerd executeBatch accepts nested statement parameters", async () => {
 		await lix.close();
 	}
 });
+
+test("Workerd executeReadBatch uses an explicit branch and returns revision bytes", async () => {
+	const lix = await openMemoryLix();
+	try {
+		const main = await lix.activeBranchId();
+		await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+			{ kind: "text", value: "/read-batch.txt" },
+			{
+				kind: "blob",
+				value: null,
+				blob: new TextEncoder().encode("main"),
+			},
+		]);
+		const draft = await lix.createBranch({ name: "Workerd read batch" });
+		await lix.switchBranch({ branchId: draft.id });
+		await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+			{
+				kind: "blob",
+				value: null,
+				blob: new TextEncoder().encode("draft"),
+			},
+			{ kind: "text", value: "/read-batch.txt" },
+		]);
+		await lix.switchBranch({ branchId: main });
+
+		const batch = await lix.executeReadBatch(draft.id, [
+			{
+				sql: "SELECT data FROM lix_file WHERE path = $1",
+				params: [{ kind: "text", value: "/read-batch.txt" }],
+			},
+			{ sql: "SELECT lix_active_branch_commit_id() AS commit_id", params: [] },
+		]);
+
+		expect(batch.branchId).toBe(draft.id);
+		expect(batch.storageMutationRevision).toBeInstanceOf(Uint8Array);
+		expect(batch.results[0]?.rows[0]?.[0]).toMatchObject({ kind: "blob" });
+		expect(batch.results[1]?.rows[0]?.[0]).toMatchObject({
+			kind: "text",
+			value: batch.branchCommitId,
+		});
+		expect(await lix.activeBranchId()).toBe(main);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("Workerd executeReadBatch identifies raw binding validation errors", async () => {
+	const lix = await openMemoryLix();
+	try {
+		await expect(
+			lix.executeReadBatch("main", null as unknown as []),
+		).rejects.toMatchObject({
+			code: "LIX_INVALID_PARAM",
+			message: expect.stringContaining("executeReadBatch"),
+		});
+	} finally {
+		await lix.close();
+	}
+});

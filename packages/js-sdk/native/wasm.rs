@@ -15,7 +15,7 @@ use lix_sdk::{
     ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
     Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
-    OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
+    OpenLixOptions as RsOpenLixOptions, ReadBatchResult as RsReadBatchResult, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, WasmComponentInstance,
     WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime,
     open_lix, open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
@@ -135,7 +135,7 @@ impl WasmLix {
         statements: JsValue,
         options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let statements = batch_statements_from_js(statements)?;
+        let statements = batch_statements_from_js(statements, "executeBatch")?;
         let options = execute_options_from_js(options)?;
         let results = self
             .inner
@@ -148,6 +148,22 @@ impl WasmLix {
             .collect::<Result<Vec<_>, _>>()
             .map_err(lix_error_to_js)?;
         to_js(&results)
+    }
+
+    #[wasm_bindgen(js_name = executeReadBatch)]
+    pub async fn execute_read_batch(
+        &self,
+        branch_id: String,
+        statements: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let statements = batch_statements_from_js(statements, "executeReadBatch")?;
+        let result = self
+            .inner
+            .execute_read_batch(&branch_id, &statements)
+            .await
+            .map_err(lix_error_to_js)?;
+        let result = ReadBatchResultDto::try_from(result).map_err(lix_error_to_js)?;
+        to_js(&result)
     }
 
     #[wasm_bindgen(js_name = observe)]
@@ -556,11 +572,14 @@ fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
         .map_err(lix_error_to_js)
 }
 
-fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
+fn batch_statements_from_js(
+    value: JsValue,
+    operation: &str,
+) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
     if !Array::is_array(&value) {
-        return Err(lix_error_to_js(invalid_param(
-            "executeBatch statements must be an array",
-        )));
+        return Err(lix_error_to_js(invalid_param(format!(
+            "{operation} statements must be an array"
+        ))));
     }
     Array::from(&value)
         .iter()
@@ -571,7 +590,7 @@ fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatemen
                 .and_then(|value| value.as_string())
                 .ok_or_else(|| {
                     lix_error_to_js(invalid_param(format!(
-                        "executeBatch statement at index {index} must include SQL text"
+                        "{operation} statement at index {index} must include SQL text"
                     )))
                 })?;
             let params = Reflect::get(&statement, &JsValue::from_str("params"))?;
@@ -653,6 +672,32 @@ struct ExecuteResultDto {
     rows: Vec<Vec<LixValueDto>>,
     rows_affected: f64,
     notices: Vec<LixNoticeDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadBatchResultDto {
+    branch_id: String,
+    branch_commit_id: String,
+    storage_mutation_revision: Option<ByteBuf>,
+    results: Vec<ExecuteResultDto>,
+}
+
+impl TryFrom<RsReadBatchResult> for ReadBatchResultDto {
+    type Error = LixError;
+
+    fn try_from(batch: RsReadBatchResult) -> Result<Self, Self::Error> {
+        Ok(Self {
+            branch_id: batch.branch_id,
+            branch_commit_id: batch.branch_commit_id,
+            storage_mutation_revision: batch.storage_mutation_revision.map(ByteBuf::from),
+            results: batch
+                .results
+                .into_iter()
+                .map(ExecuteResultDto::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
 }
 
 impl TryFrom<RsExecuteResult> for ExecuteResultDto {

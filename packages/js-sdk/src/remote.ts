@@ -20,6 +20,8 @@ export type {
 	MergeConflict,
 	MergeConflictSide,
 	ObserveEvent,
+	ReadBatchOptions,
+	ReadBatchResult,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
 	SqlParam,

@@ -54,6 +54,8 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 			client.request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
 			client.request({ kind: "executeBatch", statements, options }),
+		executeReadBatch: (branchId, statements) =>
+			client.request({ kind: "executeReadBatch", branchId, statements }),
 		observe: async (sql, params) => {
 			const observeId = await client.request<number>({
 				kind: "observe",

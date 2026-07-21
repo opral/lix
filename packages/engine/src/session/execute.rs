@@ -12,7 +12,7 @@ use crate::storage_adapter::{
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
-use crate::{LixError, LixNotice, SqlQueryResult, Value};
+use crate::{BranchId, LixError, LixNotice, SqlQueryResult, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
@@ -31,13 +31,20 @@ pub struct ExecuteResult {
     notices: Vec<LixNotice>,
 }
 
-#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct CoherentReadBatch {
-    pub active_branch_id: String,
-    pub active_branch_commit_id: String,
+pub struct ReadBatchResult {
+    pub branch_id: String,
+    pub branch_commit_id: String,
     pub storage_mutation_revision: Option<Vec<u8>>,
     pub results: Vec<ExecuteResult>,
+}
+
+/// Maximum number of read statements accepted by one coherent batch.
+pub const MAX_READ_BATCH_STATEMENTS: usize = 100;
+
+enum ReadBatchBranch {
+    ActiveWorkspace,
+    Explicit(String),
 }
 
 impl ExecuteResult {
@@ -581,17 +588,54 @@ where
         .await
     }
 
+    /// Executes read-only statements against one explicit branch and storage
+    /// snapshot.
+    ///
+    /// Statements run sequentially and return in input order. The branch head,
+    /// storage mutation revision, visible schemas, and query results are all
+    /// resolved from the same storage read. This method never reads or mutates
+    /// the workspace's active-branch selector.
+    pub async fn execute_read_batch(
+        &self,
+        branch_id: &str,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<ReadBatchResult, LixError> {
+        self.execute_read_batch_for_branch(
+            ReadBatchBranch::Explicit(branch_id.to_string()),
+            statements,
+            false,
+        )
+        .await
+    }
+
     #[doc(hidden)]
     pub async fn execute_coherent_read_batch(
         &self,
         statements: &[(&str, &[Value])],
-    ) -> Result<CoherentReadBatch, LixError> {
+    ) -> Result<ReadBatchResult, LixError> {
+        let statements = statements
+            .iter()
+            .map(|(sql, params)| ExecuteBatchStatement {
+                sql: (*sql).to_string(),
+                params: (*params).to_vec(),
+            })
+            .collect::<Vec<_>>();
+        self.execute_read_batch_for_branch(ReadBatchBranch::ActiveWorkspace, &statements, true)
+            .await
+    }
+
+    async fn execute_read_batch_for_branch(
+        &self,
+        branch: ReadBatchBranch,
+        statements: &[ExecuteBatchStatement],
+        allow_empty: bool,
+    ) -> Result<ReadBatchResult, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
             TelemetrySpanKind::SqlCoherentReadBatch,
             statements.len(),
         );
-        let operation = self.execute_coherent_read_batch_inner(statements);
+        let operation = self.execute_read_batch_inner(branch, statements, allow_empty);
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
             None => operation.await,
@@ -602,27 +646,70 @@ where
         result
     }
 
-    async fn execute_coherent_read_batch_inner(
+    async fn execute_read_batch_inner(
         &self,
-        statements: &[(&str, &[Value])],
-    ) -> Result<CoherentReadBatch, LixError> {
+        branch: ReadBatchBranch,
+        statements: &[ExecuteBatchStatement],
+        allow_empty: bool,
+    ) -> Result<ReadBatchResult, LixError> {
         self.ensure_open()?;
+        if statements.is_empty() && !allow_empty {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_read_batch requires at least one statement",
+            )
+            .with_details(serde_json::json!({
+                "operation": "executeReadBatch",
+                "argument": "statements",
+                "expected": "array with 1 to 100 statements",
+            })));
+        }
+        if statements.len() > MAX_READ_BATCH_STATEMENTS {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "execute_read_batch accepts at most {MAX_READ_BATCH_STATEMENTS} statements"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "operation": "executeReadBatch",
+                "argument": "statements",
+                "expected": "array with 1 to 100 statements",
+                "actualCount": statements.len(),
+            })));
+        }
+        let branch = match branch {
+            ReadBatchBranch::ActiveWorkspace => ReadBatchBranch::ActiveWorkspace,
+            ReadBatchBranch::Explicit(branch_id) => {
+                ReadBatchBranch::Explicit(BranchId::new(branch_id)?.into_inner())
+            }
+        };
         let parsed = statements
             .iter()
-            .map(|(sql, _)| {
-                let statement = sql2::parse_statement(sql)?;
-                if sql2::statement_has_durable_runtime_function(&statement) {
+            .enumerate()
+            .map(|(statement_index, statement)| {
+                let parsed = sql2::parse_statement(&statement.sql)
+                    .map_err(|error| with_batch_statement_index(error, statement_index))?;
+                if sql2::statement_has_durable_runtime_function(&parsed) {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
-                        "execute_coherent_read_batch does not support durable runtime functions",
-                    ));
+                        "execute_read_batch does not support durable runtime functions",
+                    )
+                    .with_details(serde_json::json!({
+                        "statementIndex": statement_index,
+                    })));
                 }
-                match sql2::bind_statement_route(&statement)? {
-                    sql2::BoundStatementRoute::Read => Ok(statement),
+                match sql2::bind_statement_route(&parsed)
+                    .map_err(|error| with_batch_statement_index(error, statement_index))?
+                {
+                    sql2::BoundStatementRoute::Read => Ok(parsed),
                     sql2::BoundStatementRoute::Write => Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
-                        "execute_coherent_read_batch only accepts read statements",
-                    )),
+                        "execute_read_batch only accepts read statements",
+                    )
+                    .with_details(serde_json::json!({
+                        "statementIndex": statement_index,
+                    }))),
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
@@ -633,29 +720,30 @@ where
             .begin_read(StorageReadOptions::default())
             .await?;
         with_static_session_sql_read::<StorageImpl, _, _, _>(read_scope, |read_store| async move {
-            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-            let active_branch_commit_id = self
+            let (branch_id, branch_role) = match branch {
+                ReadBatchBranch::ActiveWorkspace => (
+                    self.active_branch_id_from_reader(&read_store).await?,
+                    "active branch",
+                ),
+                ReadBatchBranch::Explicit(branch_id) => (branch_id, "requested branch"),
+            };
+            let branch_head = self
                 .branch_ctx
                 .ref_reader(read_store.clone())
-                .load_head(&active_branch_id)
+                .load_head(&branch_id)
                 .await?
                 .ok_or_else(|| {
-                    LixError::branch_not_found(
-                        active_branch_id.clone(),
-                        "execute coherent read batch",
-                        "active branch",
-                    )
-                })?
-                .commit_id
-                .to_string();
+                    LixError::branch_not_found(branch_id.clone(), "execute read batch", branch_role)
+                })?;
+            let branch_commit_id = branch_head.commit_id.to_string();
             let storage_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read_store)
                     .await?
                     .map(|revision| revision.to_vec());
             if parsed.is_empty() {
-                return Ok(CoherentReadBatch {
-                    active_branch_id,
-                    active_branch_commit_id,
+                return Ok(ReadBatchResult {
+                    branch_id,
+                    branch_commit_id,
                     storage_mutation_revision,
                     results: Vec::new(),
                 });
@@ -664,10 +752,10 @@ where
                 Arc::new(self.live_state.reader(read_store.clone()));
             let visible_schemas = self
                 .catalog_context
-                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &branch_id)
                 .await?;
             let ctx = SessionSqlExecutionContext {
-                active_branch_id: &active_branch_id,
+                active_branch_id: &branch_id,
                 read_store,
                 live_state: Arc::clone(&self.live_state),
                 binary_cas: Arc::clone(&self.binary_cas),
@@ -676,21 +764,30 @@ where
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
             };
+            let read_session = sql2::prepare_read_session_at_head(&ctx, branch_head).await?;
             let mut results = Vec::with_capacity(statements.len());
-            for (statement_index, ((sql, params), statement)) in
-                statements.iter().zip(parsed).enumerate()
-            {
+            for (statement_index, (input, statement)) in statements.iter().zip(parsed).enumerate() {
                 let telemetry = SqlStatementTelemetry::start(
                     self.telemetry.as_ref(),
-                    sql,
+                    &input.sql,
                     "coherent_read_batch",
                     Some(statement_index),
                 );
                 let operation = async {
-                    sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params)
-                        .await
-                        .map(ExecuteResult::from_sql_query_result)
-                        .map_err(|error| normalize_sql_surface_error(error, sql))
+                    sql2::execute_read_statement_in_session_from_parsed(
+                        &read_session,
+                        &input.sql,
+                        statement,
+                        &input.params,
+                    )
+                    .await
+                    .map(ExecuteResult::from_sql_query_result)
+                    .map_err(|error| {
+                        with_batch_statement_index(
+                            normalize_sql_surface_error(error, &input.sql),
+                            statement_index,
+                        )
+                    })
                 };
                 let result = match telemetry.as_ref() {
                     Some(telemetry) => telemetry.instrument(operation).await,
@@ -701,11 +798,12 @@ where
                 }
                 results.push(result?);
             }
+            drop(read_session);
             drop(ctx);
             drop(live_state);
-            Ok(CoherentReadBatch {
-                active_branch_id,
-                active_branch_commit_id,
+            Ok(ReadBatchResult {
+                branch_id,
+                branch_commit_id,
                 storage_mutation_revision,
                 results,
             })
@@ -1110,7 +1208,7 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Engine, Memory};
+    use crate::{CreateBranchOptions, Engine, Memory, SwitchBranchOptions};
 
     async fn open_session() -> SessionContext<Memory> {
         let storage = Memory::default();
@@ -1159,15 +1257,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coherent_read_batch_rejects_write_statements() {
+    async fn read_batch_rejects_write_statements_with_input_index() {
         let session = open_session().await;
-        let statements: [(&str, &[Value]); 1] = [(
-            "INSERT INTO lix_key_value (key, value) VALUES ('batch-write', 'value')",
-            &[],
-        )];
+        let branch_id = session.active_branch_id().await.unwrap();
+        let statements = [ExecuteBatchStatement {
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ('batch-write', 'value')"
+                .to_string(),
+            params: Vec::new(),
+        }];
 
         let error = session
-            .execute_coherent_read_batch(&statements)
+            .execute_read_batch(&branch_id, &statements)
             .await
             .expect_err("write statement should be rejected");
 
@@ -1175,8 +1275,9 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("execute_coherent_read_batch only accepts read statements")
+                .contains("execute_read_batch only accepts read statements")
         );
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
     }
 
     #[tokio::test]
@@ -1217,8 +1318,8 @@ mod tests {
             .await
             .expect("coherent read batch should execute");
 
-        assert_eq!(batch.active_branch_id, active_branch_id);
-        assert_eq!(batch.active_branch_commit_id, active_branch_commit_id);
+        assert_eq!(batch.branch_id, active_branch_id);
+        assert_eq!(batch.branch_commit_id, active_branch_commit_id);
         assert_eq!(batch.storage_mutation_revision, storage_mutation_revision);
         assert_eq!(batch.results.len(), 2);
         assert_eq!(
@@ -1231,5 +1332,171 @@ mod tests {
             row.get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("value")
         );
+    }
+
+    #[tokio::test]
+    async fn read_batch_uses_explicit_branch_without_switching_workspace_selector() {
+        let session = open_session().await;
+        let main_branch_id = session.active_branch_id().await.unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('branch-value', 'main')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let draft = session
+            .create_branch(CreateBranchOptions {
+                id: Some("read-batch-draft".to_string()),
+                name: "read batch draft".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        session
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft.id.clone(),
+            })
+            .await
+            .unwrap();
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'draft' WHERE key = 'branch-value'",
+                &[],
+            )
+            .await
+            .unwrap();
+        session
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let statements = [
+            ExecuteBatchStatement {
+                sql: "SELECT value FROM lix_key_value WHERE key = 'branch-value'".to_string(),
+                params: Vec::new(),
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT lix_active_branch_commit_id() AS commit_id".to_string(),
+                params: Vec::new(),
+            },
+        ];
+        let batch = session
+            .execute_read_batch(&draft.id, &statements)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.branch_id, draft.id);
+        assert_eq!(
+            batch.results[0].rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("draft")
+        );
+        assert_eq!(
+            batch.results[1].rows()[0]
+                .get::<String>("commit_id")
+                .unwrap(),
+            batch.branch_commit_id
+        );
+        assert_eq!(session.active_branch_id().await.unwrap(), main_branch_id);
+    }
+
+    #[tokio::test]
+    async fn read_batch_rejects_empty_and_oversized_requests_before_execution() {
+        let session = open_session().await;
+        let branch_id = session.active_branch_id().await.unwrap();
+
+        let empty = session
+            .execute_read_batch(&branch_id, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(empty.code, LixError::CODE_INVALID_PARAM);
+
+        let statements = (0..=MAX_READ_BATCH_STATEMENTS)
+            .map(|_| ExecuteBatchStatement {
+                sql: "SELECT 1".to_string(),
+                params: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let oversized = session
+            .execute_read_batch(&branch_id, &statements)
+            .await
+            .unwrap_err();
+        assert_eq!(oversized.code, LixError::CODE_INVALID_PARAM);
+        assert_eq!(
+            oversized.details.unwrap()["actualCount"],
+            MAX_READ_BATCH_STATEMENTS + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn read_batch_keeps_parameters_statement_local_and_recovers_after_indexed_error() {
+        let session = open_session().await;
+        let branch_id = session.active_branch_id().await.unwrap();
+        let statements = [
+            ExecuteBatchStatement {
+                sql: "SELECT $1 AS value".to_string(),
+                params: vec![Value::Integer(11)],
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT $1 AS value".to_string(),
+                params: vec![Value::Integer(22)],
+            },
+        ];
+
+        let batch = session
+            .execute_read_batch(&branch_id, &statements)
+            .await
+            .unwrap();
+        assert_eq!(batch.results[0].rows()[0].get::<i64>("value").unwrap(), 11);
+        assert_eq!(batch.results[1].rows()[0].get::<i64>("value").unwrap(), 22);
+
+        let failing = [
+            ExecuteBatchStatement {
+                sql: "SELECT 1".to_string(),
+                params: Vec::new(),
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT * FROM missing_read_batch_table".to_string(),
+                params: Vec::new(),
+            },
+        ];
+        let error = session
+            .execute_read_batch(&branch_id, &failing)
+            .await
+            .unwrap_err();
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+
+        let after = session.execute("SELECT 7 AS value", &[]).await.unwrap();
+        assert_eq!(after.rows()[0].get::<i64>("value").unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn read_batch_rejects_missing_branches_and_durable_runtime_functions() {
+        let session = open_session().await;
+        let read = [ExecuteBatchStatement {
+            sql: "SELECT 1".to_string(),
+            params: Vec::new(),
+        }];
+        let missing = session
+            .execute_read_batch("missing-read-batch-branch", &read)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, LixError::CODE_BRANCH_NOT_FOUND);
+
+        let branch_id = session.active_branch_id().await.unwrap();
+        let durable = [ExecuteBatchStatement {
+            sql: "SELECT lix_uuid_v7()".to_string(),
+            params: Vec::new(),
+        }];
+        let error = session
+            .execute_read_batch(&branch_id, &durable)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
     }
 }

@@ -12,7 +12,8 @@ use axum::{
 };
 use lix_sdk::{
     CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Lix, LixError,
-    ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, WireValue,
+    MAX_READ_BATCH_STATEMENTS, ObserveEvent, ObserveEvents, ReadBatchResult, Storage,
+    SwitchBranchOptions, Value, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -146,6 +147,7 @@ where
         .route("/lix/v1/", get(handshake::<S>))
         .route("/lix/v1/execute", post(execute::<S>))
         .route("/lix/v1/execute-batch", post(execute_batch::<S>))
+        .route("/lix/v1/read-batch", post(execute_read_batch::<S>))
         .route("/lix/v1/branch/create", post(create_branch::<S>))
         .route("/lix/v1/branch/switch", post(switch_branch::<S>))
         .route("/lix/v1/observe", post(observe::<S>))
@@ -215,6 +217,38 @@ where
             .map(ExecuteResponse::try_from)
             .collect::<Result<Vec<_>, _>>()?,
     ))
+}
+
+async fn execute_read_batch<S>(
+    State(state): State<HandlerState<S>>,
+    Json(request): Json<ExecuteReadBatchRequest>,
+) -> Result<Json<ExecuteReadBatchResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let branch_id = request
+        .branch_id
+        .ok_or_else(|| ApiError::bad_request("branchId is required"))?;
+    validate_read_batch_statement_count(request.statements.len())?;
+    let statements = request
+        .statements
+        .into_iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            Ok(ExecuteBatchStatement {
+                // Preserve blank SQL so the engine remains the single source
+                // of truth for statement parsing and indexed batch errors.
+                sql: statement
+                    .sql
+                    .ok_or_else(|| ApiError::bad_request("statements[].sql is required"))?,
+                params: decode_params_at(statement.params, Some(index))?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let result = state
+        .run(move |lix| async move { lix.execute_read_batch(&branch_id, &statements).await })
+        .await?;
+    Ok(Json(ExecuteReadBatchResponse::try_from(result)?))
 }
 
 async fn create_branch<S>(
@@ -429,6 +463,39 @@ fn required_non_empty(value: Option<String>, field: &'static str) -> Result<Stri
     }
 }
 
+fn validate_read_batch_statement_count(count: usize) -> Result<(), ApiError> {
+    if count == 0 {
+        return Err(ApiError::from(
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_read_batch requires at least one statement",
+            )
+            .with_details(serde_json::json!({
+                "operation": "executeReadBatch",
+                "argument": "statements",
+                "expected": "array with 1 to 100 statements",
+            })),
+        ));
+    }
+    if count > MAX_READ_BATCH_STATEMENTS {
+        return Err(ApiError::from(
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "execute_read_batch accepts at most {MAX_READ_BATCH_STATEMENTS} statements"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "operation": "executeReadBatch",
+                "argument": "statements",
+                "expected": "array with 1 to 100 statements",
+                "actualCount": count,
+            })),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -554,6 +621,14 @@ struct ExecuteBatchRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecuteReadBatchRequest {
+    branch_id: Option<String>,
+    #[serde(default)]
+    statements: Vec<ExecuteBatchStatementRequest>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ExecuteBatchStatementRequest {
     sql: Option<String>,
     #[serde(default)]
@@ -567,6 +642,35 @@ struct ExecuteResponse {
     rows: Vec<Vec<WireValue>>,
     rows_affected: u64,
     notices: Vec<lix_sdk::LixNotice>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecuteReadBatchResponse {
+    branch_id: String,
+    branch_commit_id: String,
+    storage_mutation_revision: Option<WireValue>,
+    results: Vec<ExecuteResponse>,
+}
+
+impl TryFrom<ReadBatchResult> for ExecuteReadBatchResponse {
+    type Error = LixError;
+
+    fn try_from(result: ReadBatchResult) -> Result<Self, Self::Error> {
+        Ok(Self {
+            branch_id: result.branch_id,
+            branch_commit_id: result.branch_commit_id,
+            storage_mutation_revision: result
+                .storage_mutation_revision
+                .map(|revision| WireValue::try_from_engine(&Value::Blob(revision)))
+                .transpose()?,
+            results: result
+                .results
+                .into_iter()
+                .map(ExecuteResponse::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
 }
 
 impl TryFrom<ExecuteResult> for ExecuteResponse {
@@ -867,6 +971,181 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn read_batch_reads_explicit_branch_without_switching_workspace_selector() {
+        let app = app().await;
+        let handshake = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/lix/v1/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let main = response_json(handshake).await["activeBranchId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let seeded = json_request(
+            app.clone(),
+            "POST",
+            "/lix/v1/execute",
+            json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('read-batch', 'main')"
+            }),
+        )
+        .await;
+        assert_eq!(seeded.status(), StatusCode::OK);
+        let created = json_request(
+            app.clone(),
+            "POST",
+            "/lix/v1/branch/create",
+            json!({ "id": "protocol-read-batch-draft", "name": "Draft" }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let draft = response_json(created).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for branch_id in [&draft, &main] {
+            if branch_id == &draft {
+                let switched = json_request(
+                    app.clone(),
+                    "POST",
+                    "/lix/v1/branch/switch",
+                    json!({ "branchId": branch_id }),
+                )
+                .await;
+                assert_eq!(switched.status(), StatusCode::OK);
+                let updated = json_request(
+                    app.clone(),
+                    "POST",
+                    "/lix/v1/execute",
+                    json!({
+                        "sql": "UPDATE lix_key_value SET value = 'draft' WHERE key = 'read-batch'"
+                    }),
+                )
+                .await;
+                assert_eq!(updated.status(), StatusCode::OK);
+            } else {
+                let switched = json_request(
+                    app.clone(),
+                    "POST",
+                    "/lix/v1/branch/switch",
+                    json!({ "branchId": branch_id }),
+                )
+                .await;
+                assert_eq!(switched.status(), StatusCode::OK);
+            }
+        }
+
+        let response = json_request(
+            app.clone(),
+            "POST",
+            "/lix/v1/read-batch",
+            json!({
+                "branchId": draft,
+                "statements": [
+                    { "sql": "SELECT value FROM lix_key_value WHERE key = 'read-batch'" },
+                    { "sql": "SELECT lix_active_branch_commit_id() AS commit_id" }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["branchId"], draft);
+        assert_eq!(
+            body["results"][0]["rows"][0][0],
+            json!({ "kind": "json", "value": "draft" })
+        );
+        assert_eq!(
+            body["results"][1]["rows"][0][0]["value"],
+            body["branchCommitId"]
+        );
+        assert_eq!(body["storageMutationRevision"]["kind"], "blob");
+        assert!(body["storageMutationRevision"]["base64"].is_string());
+
+        let after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lix/v1/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response_json(after).await["activeBranchId"], main);
+    }
+
+    #[tokio::test]
+    async fn read_batch_rejects_missing_empty_and_oversized_inputs() {
+        let app = app().await;
+        let missing_branch = json_request(
+            app.clone(),
+            "POST",
+            "/lix/v1/read-batch",
+            json!({ "statements": [{ "sql": "SELECT 1" }] }),
+        )
+        .await;
+        assert_eq!(missing_branch.status(), StatusCode::BAD_REQUEST);
+
+        let empty = json_request(
+            app.clone(),
+            "POST",
+            "/lix/v1/read-batch",
+            json!({ "branchId": "main", "statements": [] }),
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        let empty_body = response_json(empty).await;
+        assert_eq!(empty_body["error"]["code"], LixError::CODE_INVALID_PARAM);
+        assert_eq!(
+            empty_body["error"]["details"]["operation"],
+            "executeReadBatch"
+        );
+
+        let oversized = json_request(
+            app.clone(),
+            "POST",
+            "/lix/v1/read-batch",
+            json!({
+                "branchId": "main",
+                "statements": (0..=MAX_READ_BATCH_STATEMENTS)
+                    .map(|_| json!({ "sql": "SELECT 1" }))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        let oversized_body = response_json(oversized).await;
+        assert_eq!(
+            oversized_body["error"]["code"],
+            LixError::CODE_INVALID_PARAM
+        );
+        assert_eq!(
+            oversized_body["error"]["details"]["actualCount"],
+            MAX_READ_BATCH_STATEMENTS + 1
+        );
+
+        let blank_sql = json_request(
+            app,
+            "POST",
+            "/lix/v1/read-batch",
+            json!({
+                "branchId": "main",
+                "statements": [{ "sql": "  " }]
+            }),
+        )
+        .await;
+        assert_eq!(blank_sql.status(), StatusCode::BAD_REQUEST);
+        let blank_sql_body = response_json(blank_sql).await;
+        assert_eq!(blank_sql_body["error"]["details"]["statementIndex"], 0);
     }
 
     #[tokio::test]

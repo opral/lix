@@ -1,6 +1,7 @@
 import type {
 	BindingExecuteResult,
 	BindingObserveEvent,
+	BindingReadBatchResult,
 } from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
@@ -32,11 +33,23 @@ export type RemoteExecuteBatchRequest = {
 	options?: { originKey?: string };
 };
 
+export type RemoteExecuteReadBatchRequest = {
+	branchId: string;
+	statements: Array<{ sql: string; params: WireValue[] }>;
+};
+
 export type RemoteExecuteResponse = {
 	columns: string[];
 	rows: WireValue[][];
 	rowsAffected: number;
 	notices: Array<{ code: string; message: string; hint?: string }>;
+};
+
+export type RemoteReadBatchResponse = {
+	branchId: string;
+	branchCommitId: string;
+	storageMutationRevision: Extract<WireValue, { kind: "blob" }> | null;
+	results: RemoteExecuteResponse[];
 };
 
 export type RemoteObserveRequest = Omit<RemoteExecuteRequest, "options">;
@@ -159,6 +172,40 @@ export function decodeExecuteResult(value: unknown): BindingExecuteResult {
 		};
 	});
 	return { columns, rows, rowsAffected: result.rowsAffected, notices };
+}
+
+export function decodeReadBatchResult(value: unknown): BindingReadBatchResult {
+	const batch = record(value, "read batch result");
+	if (typeof batch.branchId !== "string" || batch.branchId.length === 0) {
+		throw protocolError("read batch result requires branchId");
+	}
+	if (
+		typeof batch.branchCommitId !== "string" ||
+		batch.branchCommitId.length === 0
+	) {
+		throw protocolError("read batch result requires branchCommitId");
+	}
+	let storageMutationRevision: Uint8Array | null;
+	if (batch.storageMutationRevision === null) {
+		storageMutationRevision = null;
+	} else {
+		const revision = decodeWireValue(batch.storageMutationRevision);
+		if (revision.kind !== "blob") {
+			throw protocolError(
+				"read batch result storageMutationRevision must be a blob or null",
+			);
+		}
+		storageMutationRevision = revision.blob;
+	}
+	if (!Array.isArray(batch.results)) {
+		throw protocolError("read batch result results must be an array");
+	}
+	return {
+		branchId: batch.branchId,
+		branchCommitId: batch.branchCommitId,
+		storageMutationRevision,
+		results: batch.results.map(decodeExecuteResult),
+	};
 }
 
 export function decodeHandshake(value: unknown): RemoteHandshake {
