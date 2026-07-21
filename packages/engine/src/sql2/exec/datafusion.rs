@@ -20,7 +20,9 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::marker::PhantomData;
 
+use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurface};
@@ -39,8 +41,8 @@ use crate::sql2::result_metadata::{
     LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
 };
 use crate::sql2::session::{
-    SqlWriteSessionOptions, build_read_session, build_transaction_read_session,
-    build_write_session_with_options,
+    SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
+    build_transaction_read_session, build_write_session_with_options,
 };
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
@@ -61,6 +63,12 @@ pub(crate) struct SessionReadSqlResult {
     pub(crate) query: SqlQueryResult,
 }
 
+/// DataFusion catalog and providers scoped to one immutable storage read.
+pub(crate) struct ReadSqlSession<'ctx> {
+    session: SessionContext,
+    _context: PhantomData<&'ctx ()>,
+}
+
 #[cfg(test)]
 async fn execute_sql<C>(ctx: &C, sql: &str, params: &[Value]) -> Result<SqlQueryResult, LixError>
 where
@@ -79,31 +87,59 @@ pub(crate) async fn execute_read_statement_from_parsed<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    // Keep read-backed DataFusion providers scoped to this call. The returned
-    // value is fully materialized, so callers cannot retain a plan/provider
-    // that may carry an execution read handle.
-    let plan = create_logical_plan_from_parsed(ctx, sql, statement).await?;
-    execute_logical_plan(plan, params).await
+    let session = prepare_read_session(ctx).await?;
+    execute_read_statement_in_session_from_parsed(&session, sql, statement, params).await
 }
 
-async fn create_logical_plan_from_parsed<C>(
-    ctx: &C,
-    sql: &str,
-    statement: DataFusionStatement,
-) -> Result<SqlLogicalPlan, LixError>
+pub(crate) async fn prepare_read_session<'ctx, C>(
+    ctx: &'ctx C,
+) -> Result<ReadSqlSession<'ctx>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
+    Ok(ReadSqlSession {
+        session: build_read_session(ctx).await?,
+        _context: PhantomData,
+    })
+}
+
+pub(crate) async fn prepare_read_session_at_head<'ctx, C>(
+    ctx: &'ctx C,
+    active_head: BranchHead,
+) -> Result<ReadSqlSession<'ctx>, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    Ok(ReadSqlSession {
+        session: build_read_session_at_head(ctx, active_head).await?,
+        _context: PhantomData,
+    })
+}
+
+pub(crate) async fn execute_read_statement_in_session_from_parsed(
+    session: &ReadSqlSession<'_>,
+    sql: &str,
+    statement: DataFusionStatement,
+    params: &[Value],
+) -> Result<SqlQueryResult, LixError> {
+    let plan = create_logical_plan_in_session_from_parsed(session, sql, statement).await?;
+    execute_logical_plan(plan, params).await
+}
+
+async fn create_logical_plan_in_session_from_parsed(
+    session: &ReadSqlSession<'_>,
+    sql: &str,
+    statement: DataFusionStatement,
+) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
-    let session = build_read_session(ctx).await?;
-    let plan = create_logical_plan_from_statement(&session, statement).await?;
+    let plan = create_logical_plan_from_statement(&session.session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-        session,
+        session: session.session.clone(),
         plan,
         notices,
         json_predicate_params,

@@ -21,6 +21,13 @@ impl CachingBranchRefReader {
             heads: Mutex::new(HashMap::new()),
         }
     }
+
+    pub(super) fn with_head(inner: Arc<dyn BranchRefReader>, head: BranchHead) -> Self {
+        Self {
+            inner,
+            heads: Mutex::new(HashMap::from([(head.branch_id.clone(), Some(head))])),
+        }
+    }
 }
 
 #[async_trait]
