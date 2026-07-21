@@ -19,12 +19,23 @@ type PendingRequest = {
 	reject(error: unknown): void;
 };
 
+type RequestWorker = <T>(operation: WorkerOperation) => Promise<T>;
+type NotifyWorker = (notification: WorkerNotification) => void;
+
+const MAX_IDLE_WORKERS = 1;
+// The common serial reopen path retains one worker so its prepared plugin cache
+// survives close(). Concurrent opens still receive isolated workers.
+const idleWorkers: LixWorkerClient[] = [];
+
 export async function openLixWorker(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
 ): Promise<LixWorkerClient> {
-	const client = new LixWorkerClient(onDisposed, undefined, telemetry);
+	let client = idleWorkers.pop();
+	while (client?.isDisposed) client = idleWorkers.pop();
+	client ??= new LixWorkerClient();
+	client.beginLease(onDisposed, telemetry);
 	try {
 		await client.request({
 			kind: "open",
@@ -49,90 +60,134 @@ export async function openLixWorkerBinding(
 }
 
 function workerBinding(client: LixWorkerClient): LixBinding {
+	let closed = false;
+	const request: RequestWorker = (operation) => {
+		if (closed) return Promise.reject(workerClosedError());
+		return client.request(operation);
+	};
+	const notify: NotifyWorker = (notification) => {
+		if (!closed) client.notify(notification);
+	};
+
 	return {
 		execute: (sql, params, options) =>
-			client.request({ kind: "execute", sql, params, options }),
+			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
-			client.request({ kind: "executeBatch", statements, options }),
+			request({ kind: "executeBatch", statements, options }),
 		observe: async (sql, params) => {
-			const observeId = await client.request<number>({
+			const observeId = await request<number>({
 				kind: "observe",
 				sql,
 				params,
 			});
-			return workerObserveBinding(client, observeId);
+			return workerObserveBinding(request, notify, observeId);
 		},
 		beginTransaction: async () => {
-			const transactionId = await client.request<number>({
+			const transactionId = await request<number>({
 				kind: "beginTransaction",
 			});
-			return workerTransactionBinding(client, transactionId);
+			return workerTransactionBinding(request, transactionId);
 		},
-		activeBranchId: () => client.request({ kind: "activeBranchId" }),
+		activeBranchId: () => request({ kind: "activeBranchId" }),
 		createBranch: (options) =>
-			client.request({ kind: "createBranch", options }),
+			request({ kind: "createBranch", options }),
 		switchBranch: (options) =>
-			client.request({ kind: "switchBranch", options }),
+			request({ kind: "switchBranch", options }),
 		importFilesystemPaths: (paths) =>
-			client.request({ kind: "importFilesystemPaths", paths }),
+			request({ kind: "importFilesystemPaths", paths }),
 		mergeBranchPreview: (options) =>
-			client.request({ kind: "mergeBranchPreview", options }),
-		mergeBranch: (options) =>
-			client.request({ kind: "mergeBranch", options }),
-		syncDiskToLix: () => client.request({ kind: "syncDiskToLix" }),
+			request({ kind: "mergeBranchPreview", options }),
+		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
+		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
 		close: async () => {
-			await client.request({ kind: "close" });
-			await client.terminate();
+			if (closed) return;
+			await request({ kind: "close" });
+			closed = true;
+			await releaseWorker(client);
 		},
 	};
 }
 
 function workerTransactionBinding(
-	client: LixWorkerClient,
+	request: RequestWorker,
 	transactionId: number,
 ): LixTransactionBinding {
 	return {
 		execute: (sql, params, options) =>
-			client.request({
+			request({
 				kind: "transaction.execute",
 				transactionId,
 				sql,
 				params,
 				options,
 			}),
-		commit: () =>
-			client.request({ kind: "transaction.commit", transactionId }),
-		rollback: () =>
-			client.request({ kind: "transaction.rollback", transactionId }),
+		commit: () => request({ kind: "transaction.commit", transactionId }),
+		rollback: () => request({ kind: "transaction.rollback", transactionId }),
 	};
 }
 
 function workerObserveBinding(
-	client: LixWorkerClient,
+	request: RequestWorker,
+	notify: NotifyWorker,
 	observeId: number,
 ): ObserveEventsBinding {
 	return {
-		next: () => client.request({ kind: "observe.next", observeId }),
-		close: () => client.notify({ kind: "observe.close", observeId }),
+		next: () => request({ kind: "observe.next", observeId }),
+		close: () => notify({ kind: "observe.close", observeId }),
 	};
+}
+
+async function releaseWorker(client: LixWorkerClient): Promise<void> {
+	client.endLease();
+	if (!client.isDisposed && idleWorkers.length < MAX_IDLE_WORKERS) {
+		idleWorkers.push(client);
+		return;
+	}
+	await client.terminate();
 }
 
 export class LixWorkerClient {
 	private nextRequestId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
 	private disposed = false;
+	private leased = false;
+	private onDisposed?: () => void;
+	private telemetry?: LixTelemetryOptions;
 
 	constructor(
-		private readonly onDisposed?: () => void,
 		private readonly connection: WorkerConnection = createWorkerConnection(),
-		private readonly telemetry?: LixTelemetryOptions,
 	) {
 		connection.onMessage((message) => this.handleMessage(message));
 		connection.onFatal((error) => this.handleFatal(error));
 	}
 
+	get isDisposed(): boolean {
+		return this.disposed;
+	}
+
+	beginLease(
+		onDisposed?: () => void,
+		telemetry?: LixTelemetryOptions,
+	): void {
+		if (this.disposed || this.leased) throw workerClosedError();
+		this.leased = true;
+		this.onDisposed = onDisposed;
+		this.telemetry = telemetry;
+	}
+
+	endLease(): void {
+		if (!this.leased) return;
+		this.leased = false;
+		const onDisposed = this.onDisposed;
+		this.onDisposed = undefined;
+		this.telemetry = undefined;
+		onDisposed?.();
+	}
+
 	request<T>(operation: WorkerOperation): Promise<T> {
-		if (this.disposed) return Promise.reject(workerClosedError());
+		if (this.disposed || !this.leased) {
+			return Promise.reject(workerClosedError());
+		}
 		const id = this.nextRequestId++;
 		if (this.pending.size === 0) this.connection.ref();
 		return new Promise<T>((resolve, reject) => {
@@ -151,7 +206,7 @@ export class LixWorkerClient {
 	}
 
 	notify(notification: WorkerNotification): void {
-		if (this.disposed) return;
+		if (this.disposed || !this.leased) return;
 		try {
 			this.connection.postMessage(notification);
 		} catch {
@@ -166,7 +221,7 @@ export class LixWorkerClient {
 		try {
 			await this.connection.terminate();
 		} finally {
-			this.onDisposed?.();
+			this.endLease();
 		}
 	}
 
@@ -194,7 +249,7 @@ export class LixWorkerClient {
 		fatal.name = "LixError";
 		fatal.code ??= "LIX_WORKER_TERMINATED";
 		this.rejectPending(fatal);
-		this.onDisposed?.();
+		this.endLease();
 	}
 
 	private rejectPending(error: Error): void {
@@ -202,7 +257,6 @@ export class LixWorkerClient {
 		this.pending.clear();
 		this.connection.unref();
 	}
-
 }
 
 function workerClosedError(): Error & { code: string } {

@@ -174,6 +174,18 @@ test("committed writes survive close and reopen", async () => {
 	await second.close();
 });
 
+test("a closed handle stays closed after its worker is reused", async () => {
+	const first = await openLix();
+	await first.close();
+
+	const second = await openLix();
+	await expect(first.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
+	expect(get(await second.execute("SELECT 1 AS ok"), "ok")).toBe(1);
+	await second.close();
+});
+
 test("observe close reliably resolves pending next calls", async () => {
 	const lix = await openLix();
 
