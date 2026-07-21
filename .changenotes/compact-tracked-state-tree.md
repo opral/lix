@@ -1,5 +1,5 @@
 ---
-type: major
+type: minor
 ---
 
 Reduced tracked-state write amplification with the v3 tree codec.
