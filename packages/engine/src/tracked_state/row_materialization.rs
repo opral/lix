@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use crate::changelog::{
     ChangeId, ChangeRecordProjection, MaterializedChangePayload, materialize_change_payloads,
 };
-use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
@@ -33,17 +32,14 @@ where
     }
 
     let mut remaining_payload_uses = HashMap::<ChangeId, usize>::new();
-    for (_, value) in entries
-        .iter()
-        .filter(|(key, value)| !value.deleted && key.schema_key != COMMIT_SCHEMA_KEY)
-    {
+    for (_, value) in entries.iter().filter(|(_, value)| !value.deleted) {
         *remaining_payload_uses.entry(value.change_id).or_default() += 1;
     }
     let mut payloads = materialize_change_payloads(
         store,
         entries
             .iter()
-            .filter(|(key, value)| !value.deleted && key.schema_key != COMMIT_SCHEMA_KEY)
+            .filter(|(_, value)| !value.deleted)
             .map(|(_, value)| value.change_id),
         *materialization,
         "tracked-state row",
@@ -54,17 +50,6 @@ where
     for (key, value) in entries {
         let (snapshot_content, metadata) = if value.deleted {
             (None, None)
-        } else if key.schema_key == COMMIT_SCHEMA_KEY {
-            // Commit rows have no change record; their snapshot is fully
-            // derivable from the key (the entity pk is the commit id).
-            (
-                if materialization.snapshot_content {
-                    Some(commit_row_snapshot_json(&key.entity_pk)?)
-                } else {
-                    None
-                },
-                None,
-            )
         } else {
             let payload =
                 take_payload(&mut payloads, &mut remaining_payload_uses, value.change_id)?;
@@ -129,18 +114,6 @@ fn take_payload(
             ),
         )
     })
-}
-
-const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-
-fn commit_row_snapshot_json(entity_pk: &EntityPk) -> Result<String, LixError> {
-    let Some(commit_id) = entity_pk.parts.first() else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "lix_commit row has an empty entity pk",
-        ));
-    };
-    crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
 fn materialize_entry_without_json(

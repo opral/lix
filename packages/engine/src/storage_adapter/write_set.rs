@@ -289,6 +289,28 @@ impl StorageWriteSet {
         } = self;
 
         for mut group in groups {
+            #[cfg(feature = "storage-benches")]
+            if std::env::var_os("LIX_WRITE_SET_SPACE_STATS").is_some() {
+                let key_bytes = group
+                    .puts
+                    .iter()
+                    .map(|put| put.key.0.len())
+                    .chain(group.deletes.iter().map(|key| key.0.len()))
+                    .sum::<usize>();
+                let value_bytes = group
+                    .puts
+                    .iter()
+                    .map(|put| put.value.bytes.len())
+                    .sum::<usize>();
+                eprintln!(
+                    "write-set-space space={} puts={} deletes={} key_bytes={} value_bytes={}",
+                    group.space.name,
+                    group.puts.len(),
+                    group.deletes.len(),
+                    key_bytes,
+                    value_bytes,
+                );
+            }
             // Lower each space batch in ascending key order. Hash-keyed
             // spaces such as json_store produce effectively random insertion
             // order; sorted batches let B-tree storage implementations write with cursor

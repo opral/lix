@@ -132,11 +132,6 @@ where
         if let (Some(left), Some(right)) =
             (is_live_row(before.as_ref()), is_live_row(after.as_ref()))
         {
-            // Commit rows have no change records and are skipped by
-            // classification; loading their ids would always miss.
-            if left.schema_key == "lix_commit" {
-                continue;
-            }
             if left.change_id != right.change_id {
                 fallback_ids.push(left.change_id);
                 fallback_ids.push(right.change_id);
@@ -151,9 +146,6 @@ where
             Some(row) => TrackedStateDiffIdentity::from(row),
             None => continue,
         };
-        if identity.schema_key == "lix_commit" {
-            continue;
-        }
         let Some(entry) = classify_diff(identity, before, after, &payloads) else {
             continue;
         };
@@ -309,11 +301,6 @@ mod tests {
 
     fn change_id(label: &str) -> String {
         ChangeId::for_test_label(label).to_string()
-    }
-
-    fn commit_row_change_id(commit_id: &str) -> String {
-        let commit_id = CommitId::for_test_label(commit_id);
-        ChangeId::for_test_label(&format!("{commit_id}:commit")).to_string()
     }
 
     #[tokio::test]
@@ -676,20 +663,10 @@ mod tests {
         let updated_at = value.updated_at().to_string();
         value.created_at = LixTimestamp::expect_parse("created_at", "2026-01-03T00:00:00Z");
         value.updated_at = LixTimestamp::expect_parse("updated_at", &updated_at);
-        let parent_commit_row = commit_root_row_entry(
-            "parent",
-            &commit_row_change_id("parent"),
-            "2026-01-01T00:00:00Z",
-        );
-        let commit_row = commit_root_row_entry(
-            "child",
-            &commit_row_change_id("child"),
-            "2026-01-02T00:00:00Z",
-        );
         stage_corrupt_commit_root(
             &storage,
             "child",
-            vec![(key, value), parent_commit_row, commit_row],
+            vec![(key, value)],
             vec![TrackedStateCommitRootParent {
                 commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
@@ -2149,29 +2126,6 @@ mod tests {
                 .message
                 .contains("does not preserve inherited identity")
             || error.message.contains("but changelog winner is")
-    }
-
-    fn commit_root_row_entry(
-        commit_id: &str,
-        change_id: &str,
-        created_at: &str,
-    ) -> (TrackedStateKey, TrackedStateIndexValue) {
-        let commit_id = CommitId::for_test_label(commit_id);
-        let commit_id_text = commit_id.to_string();
-        (
-            TrackedStateKey {
-                schema_key: "lix_commit".to_string(),
-                file_id: None,
-                entity_pk: EntityPk::single(&commit_id_text),
-            },
-            TrackedStateIndexValue {
-                change_id: ChangeId::for_test_label(change_id),
-                commit_id,
-                deleted: false,
-                created_at: LixTimestamp::expect_parse("created_at", created_at),
-                updated_at: LixTimestamp::expect_parse("updated_at", created_at),
-            },
-        )
     }
 
     fn tombstone(

@@ -223,8 +223,7 @@ where
     .await?;
 
     {
-        let commit_row_change = seed_commit_row_change_record(&plan.commit)?;
-        let mut deltas = authored_changes
+        let deltas = authored_changes
             .iter()
             .map(|change| TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
@@ -237,16 +236,6 @@ where
                 updated_at: change.created_at,
             })
             .collect::<Vec<_>>();
-        deltas.push(TrackedStateDeltaRef {
-            schema_key: &commit_row_change.schema_key,
-            file_id: commit_row_change.file_id.as_deref(),
-            entity_pk: &commit_row_change.entity_pk,
-            change_id: commit_row_change.change_id,
-            commit_id: plan.commit.id,
-            deleted: commit_row_change.snapshot.is_none(),
-            created_at: commit_row_change.created_at,
-            updated_at: commit_row_change.created_at,
-        });
         tracked_state
             .writer(&read, &mut writes)
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
@@ -309,28 +298,13 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
     }
 }
 
-fn seed_commit_row_change_record(commit: &InitSeedCommit) -> Result<ChangeRecord, LixError> {
-    let snapshot_content = commit_row_snapshot_content(&commit.id.to_string())?;
-    Ok(ChangeRecord {
-        format_version: 1,
-        change_id: commit.change_id,
-        entity_pk: EntityPk::single(commit.id),
-        schema_key: "lix_commit".to_string(),
-        file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
-        metadata: crate::json_store::JsonSlot::None,
-        created_at: commit.created_at,
-        origin_key: None,
-    })
-}
-
 fn stage_init_json_payloads(
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
 ) -> Result<(), LixError> {
     // Only payloads above the inline threshold need store rows; inline
-    // payloads live in their change records, and the commit-row snapshot
-    // is derived from the key at read time.
+    // Payloads live in their change records. Commit rows are derived directly
+    // from changelog.commit and never enter the tracked-state tree.
     JsonStoreContext::new().writer().stage_batch(
         writes,
         JsonWritePlacementRef::OutOfBand,
@@ -374,10 +348,6 @@ async fn stage_init_changelog_commit(
             commit_change_refs: vec![commit_change_refs],
         })
         .await
-}
-
-fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-    crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
 fn untracked_row(
@@ -696,8 +666,8 @@ mod tests {
             .await
             .expect("tracked initial root should scan");
         assert!(
-            rows.iter().any(|row| row.change_id == commit_change_id),
-            "initial commit root should surface its lix_commit row"
+            rows.is_empty(),
+            "initial commit rows are derived from changelog.commit, not stored in tracked roots"
         );
     }
 

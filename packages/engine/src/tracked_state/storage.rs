@@ -29,6 +29,11 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
     TRACKED_STATE_COMMIT_ROOT_NAMESPACE,
 );
 
+// Version the root metadata independently of storage backends. Version 2 is a
+// hard format cut: roots written before commit rows became derived state must
+// not be inherited by a new commit and silently carry those rows forever.
+const TRACKED_STATE_COMMIT_ROOT_MAGIC: &[u8] = b"LXTR2";
+
 async fn get_one(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
@@ -186,11 +191,21 @@ fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
 }
 
 fn encode_commit_root(metadata: &TrackedStateCommitRoot) -> Result<Vec<u8>, LixError> {
-    storage_codec::encode("tracked_state commit_root", metadata)
+    let payload = storage_codec::encode("tracked_state commit_root", metadata)?;
+    let mut encoded = Vec::with_capacity(TRACKED_STATE_COMMIT_ROOT_MAGIC.len() + payload.len());
+    encoded.extend_from_slice(TRACKED_STATE_COMMIT_ROOT_MAGIC);
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
 }
 
 fn decode_commit_root(bytes: &[u8]) -> Result<TrackedStateCommitRoot, LixError> {
-    storage_codec::decode("tracked_state commit_root", bytes)
+    let Some(payload) = bytes.strip_prefix(TRACKED_STATE_COMMIT_ROOT_MAGIC) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_root has an unsupported format; recreate the repository",
+        ));
+    };
+    storage_codec::decode("tracked_state commit_root", payload)
 }
 
 #[cfg(test)]
@@ -199,6 +214,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use crate::LixError;
     use crate::binary_cas::kv::{
         BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
     };
@@ -210,8 +226,8 @@ mod tests {
     };
 
     use super::{
-        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_root,
-        encode_commit_root,
+        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
+        TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_root, encode_commit_root,
     };
 
     #[test]
@@ -258,6 +274,7 @@ mod tests {
         };
 
         let encoded = encode_commit_root(&metadata).expect("commit root should encode");
+        assert!(encoded.starts_with(TRACKED_STATE_COMMIT_ROOT_MAGIC));
         let decoded = decode_commit_root(&encoded).expect("commit root should decode");
 
         assert_eq!(decoded, metadata);
@@ -266,12 +283,38 @@ mod tests {
     #[test]
     fn commit_root_codec_rejects_malformed_storage_bytes() {
         let error = decode_commit_root(b"LXTR1not-musli")
-            .expect_err("old hand-rolled bytes should not decode as musli");
+            .expect_err("old commit-root versions must fail loudly");
 
         assert!(
             error
                 .to_string()
-                .contains("failed to decode tracked_state commit_root")
+                .contains("unsupported format; recreate the repository")
+        );
+    }
+
+    #[test]
+    fn commit_root_codec_rejects_unversioned_musli_roots() {
+        let metadata = TrackedStateCommitRoot {
+            commit_id: CommitId::for_test_label("legacy"),
+            root_id: TrackedStateRootId::new([7; 32]),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: 128,
+        };
+        let old_bytes = crate::storage_codec::encode("tracked_state commit_root", &metadata)
+            .expect("legacy commit root should encode");
+
+        let error = decode_commit_root(&old_bytes)
+            .expect_err("unversioned commit roots must not enter the new layout");
+
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("unsupported format; recreate the repository")
         );
     }
 

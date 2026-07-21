@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -12,6 +13,12 @@ use futures_util::stream::{self, BoxStream};
 use lix_engine::storage::{
     GetOptions as StorageGetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId,
     StorageRead, StorageWrite, StoredValue, WriteOptions,
+};
+#[cfg(feature = "storage-benches")]
+use lix_engine::storage_adapter::StorageAdapter;
+#[cfg(feature = "storage-benches")]
+use lix_engine::transaction::bench::{
+    BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
 };
 use lix_engine::{Engine, SessionContext, Storage, Value};
 use lix_slatedb_storage::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
@@ -37,6 +44,10 @@ const CONCURRENCY_DELAY_MS: u64 = 10;
 const CONCURRENCY_REQUESTS: usize = 4;
 const CONCURRENCY_VALUE_BYTES: usize = 16 * 1024;
 const CONCURRENCY_SPACE: SpaceId = SpaceId(0x00ff_0001);
+#[cfg(feature = "storage-benches")]
+const SINGLETON_ACCOUNTING_ROWS: usize = 1_000;
+#[cfg(feature = "storage-benches")]
+const SINGLETON_ACCOUNTING_SAMPLES: usize = 50;
 
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -45,6 +56,9 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("create tokio runtime for slatedb_file_api benchmarks");
+    maybe_print_write_accounting(&runtime);
+    #[cfg(feature = "storage-benches")]
+    maybe_print_singleton_write_accounting(&runtime);
     let mut group = c.benchmark_group("slatedb_file_api_warm_cache");
     group.sample_size(10);
 
@@ -99,6 +113,184 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
     cached_preloaded_request_benches(c, &runtime);
     fresh_engine_select_benches(c, &runtime);
     storage_concurrency_benches(c);
+}
+
+#[cfg(feature = "storage-benches")]
+fn maybe_print_singleton_write_accounting(runtime: &tokio::runtime::Runtime) {
+    if std::env::var_os("LIX_SLATEDB_SINGLETON_ACCOUNTING").is_none() {
+        return;
+    }
+    let samples = std::env::var("LIX_SLATEDB_SINGLETON_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(SINGLETON_ACCOUNTING_SAMPLES)
+        .max(1);
+
+    let mut fixture = runtime.block_on(SingletonWriteFixture::new());
+    fixture.object_store.reset_write_stats();
+    let bulk_started = Instant::now();
+    let bulk_accounting = runtime.block_on(fixture.transaction.insert_all_accounting());
+    let bulk_elapsed = bulk_started.elapsed();
+    print_singleton_sample(
+        "insert_1k",
+        Duration::ZERO,
+        bulk_elapsed,
+        bulk_accounting,
+        &fixture.object_store.write_stats(),
+    );
+
+    for delay in [Duration::ZERO, Duration::from_millis(25)] {
+        fixture.object_store.set_delay(delay);
+        let mut elapsed = Vec::with_capacity(samples);
+        let mut logical_value_bytes = 0u64;
+        let mut staged_puts = 0u64;
+        let mut object_put_calls = 0u64;
+        let mut object_put_bytes = 0u64;
+        let mut wal_put_calls = 0u64;
+        let mut wal_put_bytes = 0u64;
+        for _ in 0..samples {
+            fixture.object_store.reset_write_stats();
+            let started = Instant::now();
+            let accounting = runtime.block_on(fixture.transaction.update_one_by_pk_accounting());
+            elapsed.push(started.elapsed());
+            let stats = fixture.object_store.write_stats();
+            let wal = stats.wal_totals();
+            logical_value_bytes += accounting.written_bytes;
+            staged_puts += accounting.staged_puts;
+            object_put_calls += stats.put_calls;
+            object_put_bytes += stats.put_bytes;
+            wal_put_calls += wal.put_calls;
+            wal_put_bytes += wal.put_bytes;
+        }
+        elapsed.sort_unstable();
+        let p50 = percentile(&elapsed, 50);
+        let p95 = percentile(&elapsed, 95);
+        let sample_count = u64::try_from(samples).expect("sample count fits u64");
+        println!(
+            "slatedb-singleton-update delay_ms={} samples={samples} p50_ns={} p95_ns={} staged_puts_avg={} logical_value_bytes_avg={} object_put_calls_avg={} object_put_bytes_avg={} wal_put_calls_avg={} wal_put_bytes_avg={}",
+            delay.as_millis(),
+            p50.as_nanos(),
+            p95.as_nanos(),
+            staged_puts / sample_count,
+            logical_value_bytes / sample_count,
+            object_put_calls / sample_count,
+            object_put_bytes / sample_count,
+            wal_put_calls / sample_count,
+            wal_put_bytes / sample_count,
+        );
+    }
+
+    let mut delete_fixture = runtime.block_on(SingletonWriteFixture::new());
+    runtime.block_on(delete_fixture.transaction.seed());
+    delete_fixture.object_store.reset_write_stats();
+    let delete_started = Instant::now();
+    let delete_accounting =
+        runtime.block_on(delete_fixture.transaction.delete_one_by_pk_accounting());
+    let delete_elapsed = delete_started.elapsed();
+    print_singleton_sample(
+        "delete_one",
+        Duration::ZERO,
+        delete_elapsed,
+        delete_accounting,
+        &delete_fixture.object_store.write_stats(),
+    );
+}
+
+#[cfg(feature = "storage-benches")]
+fn print_singleton_sample(
+    operation: &str,
+    delay: Duration,
+    elapsed: Duration,
+    accounting: BenchWriteAccounting,
+    stats: &ObjectStoreWriteStats,
+) {
+    let wal = stats.wal_totals();
+    println!(
+        "slatedb-singleton-sample operation={operation} delay_ms={} elapsed_ns={} logical_rows={} staged_puts={} staged_deletes={} logical_value_bytes={} object_put_calls={} object_put_bytes={} wal_put_calls={} wal_put_bytes={}",
+        delay.as_millis(),
+        elapsed.as_nanos(),
+        accounting.logical_rows,
+        accounting.staged_puts,
+        accounting.staged_deletes,
+        accounting.written_bytes,
+        stats.put_calls,
+        stats.put_bytes,
+        wal.put_calls,
+        wal.put_bytes,
+    );
+}
+
+#[cfg(feature = "storage-benches")]
+fn percentile(samples: &[Duration], percentile: usize) -> Duration {
+    let index = (samples.len() - 1) * percentile / 100;
+    samples[index]
+}
+
+#[cfg(feature = "storage-benches")]
+struct SingletonWriteFixture {
+    transaction: BenchTransactionFixture<SlateDB>,
+    object_store: Arc<DelayedObjectStore>,
+}
+
+#[cfg(feature = "storage-benches")]
+impl SingletonWriteFixture {
+    async fn new() -> Self {
+        let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
+        let db_path = format!("slatedb-singleton-bench-{}-{db_id}", std::process::id());
+        let object_store = Arc::new(DelayedObjectStore::new(
+            Arc::new(InMemory::new()),
+            Duration::ZERO,
+        ));
+        let storage = SlateDB::open_object_store(db_path, object_store_handle(&object_store))
+            .expect("open SlateDB singleton accounting storage");
+        let rows = (0..SINGLETON_ACCOUNTING_ROWS)
+            .map(|index| {
+                let path = format!("/singleton/{index:04}");
+                BenchTransactionRow {
+                    schema_key: "json_pointer".to_string(),
+                    file_id: None,
+                    entity_pk: path.clone(),
+                    value: json!({"path": path, "value": format!("seed-{index:04}")}),
+                    updated_value: json!({
+                        "path": format!("/singleton/{index:04}"),
+                        "value": format!("updated-{index:04}"),
+                    }),
+                }
+            })
+            .collect();
+        let transaction =
+            BenchTransactionFixture::new_deterministic(StorageAdapter::new(storage), rows).await;
+        object_store.reset_write_stats();
+        Self {
+            transaction,
+            object_store,
+        }
+    }
+}
+
+fn maybe_print_write_accounting(runtime: &tokio::runtime::Runtime) {
+    if std::env::var_os("LIX_SLATEDB_WRITE_ACCOUNTING").is_none() {
+        return;
+    }
+    let fixture = runtime.block_on(UploadBenchFixture::seeded(Duration::ZERO));
+    black_box(runtime.block_on(fixture.upload_overwrite_file()));
+    fixture.object_store.reset_write_stats();
+    let started = Instant::now();
+    let rows_affected = runtime.block_on(fixture.upload_overwrite_file());
+    let elapsed = started.elapsed();
+    let stats = fixture.object_store.write_stats();
+    println!(
+        "slatedb-write-accounting rows_affected={rows_affected} elapsed_ns={} put_calls={} put_bytes={}",
+        elapsed.as_nanos(),
+        stats.put_calls,
+        stats.put_bytes,
+    );
+    for (path, path_stats) in stats.by_path {
+        println!(
+            "slatedb-object-write path={path} put_calls={} put_bytes={}",
+            path_stats.put_calls, path_stats.put_bytes,
+        );
+    }
 }
 
 fn cached_cold_lifecycle_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
@@ -326,6 +518,7 @@ impl SeededStore {
 struct UploadBenchFixture {
     session: SessionContext<SlateDB>,
     _cache_dir: TempDir,
+    object_store: Arc<DelayedObjectStore>,
     next_upload_version: AtomicU64,
     upload_path: String,
 }
@@ -352,6 +545,7 @@ impl UploadBenchFixture {
         Self {
             session,
             _cache_dir: cache_dir,
+            object_store: seeded.object_store,
             next_upload_version: AtomicU64::new(0),
             upload_path: seeded.upload_path,
         }
@@ -920,6 +1114,38 @@ fn cached_object_store_options(cache_dir: &TempDir) -> SlateDBObjectStoreOptions
 struct DelayedObjectStore {
     inner: Arc<dyn ObjectStore>,
     delay_nanos: Arc<AtomicU64>,
+    record_write_stats: Arc<AtomicBool>,
+    write_stats: Arc<Mutex<ObjectStoreWriteStats>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObjectStoreWriteStats {
+    put_calls: u64,
+    put_bytes: u64,
+    by_path: BTreeMap<String, ObjectStorePathWriteStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObjectStorePathWriteStats {
+    put_calls: u64,
+    put_bytes: u64,
+}
+
+impl ObjectStoreWriteStats {
+    #[cfg(feature = "storage-benches")]
+    fn wal_totals(&self) -> ObjectStorePathWriteStats {
+        self.by_path
+            .iter()
+            .filter(|(path, _)| path.split('/').any(|segment| segment == "wal"))
+            .fold(
+                ObjectStorePathWriteStats::default(),
+                |mut total, (_, stats)| {
+                    total.put_calls += stats.put_calls;
+                    total.put_bytes += stats.put_bytes;
+                    total
+                },
+            )
+    }
 }
 
 impl DelayedObjectStore {
@@ -927,6 +1153,8 @@ impl DelayedObjectStore {
         Self {
             inner,
             delay_nanos: Arc::new(AtomicU64::new(duration_nanos(delay))),
+            record_write_stats: Arc::new(AtomicBool::new(false)),
+            write_stats: Arc::new(Mutex::new(ObjectStoreWriteStats::default())),
         }
     }
 
@@ -937,6 +1165,19 @@ impl DelayedObjectStore {
 
     fn delay(&self) -> Duration {
         Duration::from_nanos(self.delay_nanos.load(Ordering::Relaxed))
+    }
+
+    fn reset_write_stats(&self) {
+        *self.write_stats.lock().expect("object write stats mutex") =
+            ObjectStoreWriteStats::default();
+        self.record_write_stats.store(true, Ordering::Relaxed);
+    }
+
+    fn write_stats(&self) -> ObjectStoreWriteStats {
+        self.write_stats
+            .lock()
+            .expect("object write stats mutex")
+            .clone()
     }
 }
 
@@ -959,6 +1200,16 @@ impl ObjectStore for DelayedObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        if self.record_write_stats.load(Ordering::Relaxed) {
+            let bytes = u64::try_from(payload.content_length())
+                .expect("object-store benchmark payload length fits u64");
+            let mut stats = self.write_stats.lock().expect("object write stats mutex");
+            stats.put_calls += 1;
+            stats.put_bytes += bytes;
+            let path_stats = stats.by_path.entry(location.to_string()).or_default();
+            path_stats.put_calls += 1;
+            path_stats.put_bytes += bytes;
+        }
         delay_once(self.delay()).await;
         self.inner.put_opts(location, payload, opts).await
     }

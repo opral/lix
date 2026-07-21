@@ -232,8 +232,6 @@ fn index_prepared_rows(rows: &[PreparedStateRow]) -> Result<PreparedRowIndex, Li
 struct StagedChangelogCommit {
     change_ids: Vec<ChangeId>,
     selected_change_refs: Vec<StagedCommitChangeRef>,
-    commit_change_id: ChangeId,
-    commit_created_at: LixTimestamp,
 }
 
 async fn stage_changelog_commits(
@@ -299,8 +297,6 @@ async fn stage_changelog_commits(
             StagedChangelogCommit {
                 change_ids,
                 selected_change_refs: commit_row.selected_change_refs.clone(),
-                commit_change_id: commit_row.change_id,
-                commit_created_at: commit_row.created_at,
             },
         );
     }
@@ -712,24 +708,16 @@ async fn stage_tracked_roots(
                 ),
             ));
         }
-        let commit_entity_pk = EntityPk::single(root.commit_id.to_string());
-        let mut deltas = state_row_indices
+        let deltas = state_row_indices
             .iter()
             .map(|&row_index| tracked_delta_from_state_row(&state_rows[row_index]))
             .chain(staged.selected_change_refs.iter().map(|change_ref| {
                 tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
             }))
             .collect::<Result<Vec<_>, _>>()?;
-        deltas.push(TrackedStateDeltaRef {
-            schema_key: "lix_commit",
-            file_id: None,
-            entity_pk: &commit_entity_pk,
-            change_id: staged.commit_change_id,
-            commit_id: root.commit_id,
-            deleted: false,
-            created_at: staged.commit_created_at,
-            updated_at: staged.commit_created_at,
-        });
+        // Commit facts are canonical in changelog.commit and live-state derives
+        // lix_commit rows from the commit graph. Keeping them out of this tree
+        // also preserves the one-mutation path for ordinary singleton writes.
         let commit_id_text = root.commit_id.to_string();
         let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
         tracked_writer
@@ -1110,10 +1098,31 @@ mod tests {
             .await
             .expect("commit root should scan");
         assert!(
-            commit_rows
+            commit_rows.is_empty(),
+            "commit rows are derived from changelog.commit, not stored in tracked roots"
+        );
+        let derived_commit_rows = live_state_context()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("read should open"),
+            )
+            .scan_rows(&crate::live_state::LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec!["lix_commit".to_string()],
+                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("derived commit rows should scan");
+        assert!(
+            derived_commit_rows
                 .iter()
-                .any(|row| row.change_id == record.change_id && row.snapshot_content.is_some()),
-            "commit root should surface the derived lix_commit row"
+                .any(|row| row.change_id == Some(record.change_id)),
+            "live state should derive the commit row from changelog.commit"
         );
 
         let loaded_head = branch_ctx
