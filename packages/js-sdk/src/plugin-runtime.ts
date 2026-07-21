@@ -67,6 +67,15 @@ type InstantiationModule = {
 	): Promise<{ api?: PluginApi }>;
 };
 
+type PreparedComponent = {
+	generatedModule: InstantiationModule;
+	getCoreModule(path: string): Promise<object>;
+};
+
+const PREPARED_COMPONENT_CACHE_SIZE = 8;
+const preparedComponents = new Map<string, PreparedComponent>();
+const componentPreparations = new Map<string, Promise<PreparedComponent>>();
+
 class WasmPluginRuntime {
 	private nextComponentId = 1;
 	private readonly components = new Map<number, PluginApi>();
@@ -100,19 +109,7 @@ class WasmPluginRuntime {
 		}
 		const componentId = this.nextComponentId;
 		this.nextComponentId += 1;
-		const name = "lix_plugin";
-		const transpiled = await transpileBytes(request.componentBytes, {
-			name,
-			emitTypescriptDeclarations: false,
-			instantiation: "async",
-			nodejsCompat: false,
-		});
-		const files = new Map(Object.entries(transpiled.files));
-		const moduleSource = requiredFile(files, `${name}.js`);
-		const moduleUrl = `data:text/javascript;base64,${bytesToBase64(moduleSource)}`;
-		const generatedModule = (await import(
-			/* @vite-ignore */ moduleUrl
-		)) as InstantiationModule;
+		const prepared = await prepareComponent(request.componentBytes);
 		const wasi = new WASIShim({
 			sandbox: {
 				preopens: {},
@@ -121,9 +118,8 @@ class WasmPluginRuntime {
 				enableNetwork: false,
 			},
 		});
-		const instance = await generatedModule.instantiate(
-			async (path) =>
-				await webAssembly.compile(copyArrayBuffer(requiredFile(files, path))),
+		const instance = await prepared.generatedModule.instantiate(
+			prepared.getCoreModule,
 			wasi.getImportObject() as Record<string, unknown>,
 		);
 		if (!instance.api) {
@@ -169,6 +165,83 @@ class WasmPluginRuntime {
 
 export function createPluginRuntimeDispatch(): WasmPluginRuntime["dispatch"] {
 	return new WasmPluginRuntime().dispatch;
+}
+
+async function prepareComponent(
+	componentBytes: Uint8Array,
+): Promise<PreparedComponent> {
+	const cacheKey = await contentHash(componentBytes);
+	const cached = preparedComponents.get(cacheKey);
+	if (cached) {
+		preparedComponents.delete(cacheKey);
+		preparedComponents.set(cacheKey, cached);
+		return cached;
+	}
+
+	let preparation = componentPreparations.get(cacheKey);
+	if (!preparation) {
+		preparation = transpileAndCompile(componentBytes).then((prepared) => {
+			preparedComponents.set(cacheKey, prepared);
+			while (preparedComponents.size > PREPARED_COMPONENT_CACHE_SIZE) {
+				const oldest = preparedComponents.keys().next().value;
+				if (oldest === undefined) break;
+				preparedComponents.delete(oldest);
+			}
+			return prepared;
+		});
+		componentPreparations.set(cacheKey, preparation);
+	}
+
+	try {
+		return await preparation;
+	} finally {
+		if (componentPreparations.get(cacheKey) === preparation) {
+			componentPreparations.delete(cacheKey);
+		}
+	}
+}
+
+async function transpileAndCompile(
+	componentBytes: Uint8Array,
+): Promise<PreparedComponent> {
+	const name = "lix_plugin";
+	const transpiled = await transpileBytes(componentBytes, {
+		name,
+		emitTypescriptDeclarations: false,
+		instantiation: "async",
+		nodejsCompat: false,
+	});
+	const files = new Map(Object.entries(transpiled.files));
+	const moduleSource = requiredFile(files, `${name}.js`);
+	const moduleUrl = `data:text/javascript;base64,${bytesToBase64(moduleSource)}`;
+	const generatedModule = (await import(
+		/* @vite-ignore */ moduleUrl
+	)) as InstantiationModule;
+	const compiledCoreModules = new Map<string, Promise<object>>();
+
+	return {
+		generatedModule,
+		async getCoreModule(path) {
+			let compilation = compiledCoreModules.get(path);
+			if (!compilation) {
+				compilation = webAssembly
+					.compile(copyArrayBuffer(requiredFile(files, path)))
+					.catch((cause) => {
+						compiledCoreModules.delete(path);
+						throw cause;
+					});
+				compiledCoreModules.set(path, compilation);
+			}
+			return await compilation;
+		},
+	};
+}
+
+async function contentHash(bytes: Uint8Array): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", copyArrayBuffer(bytes));
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
