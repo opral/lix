@@ -171,6 +171,9 @@ async function prepareComponent(
 	componentBytes: Uint8Array,
 ): Promise<PreparedComponent> {
 	const cacheKey = await contentHash(componentBytes);
+	if (cacheKey === undefined) {
+		return await transpileAndCompile(componentBytes);
+	}
 	const cached = preparedComponents.get(cacheKey);
 	if (cached) {
 		preparedComponents.delete(cacheKey);
@@ -237,11 +240,19 @@ async function transpileAndCompile(
 	};
 }
 
-async function contentHash(bytes: Uint8Array): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", copyArrayBuffer(bytes));
-	return Array.from(new Uint8Array(digest), (byte) =>
-		byte.toString(16).padStart(2, "0"),
-	).join("");
+async function contentHash(bytes: Uint8Array): Promise<string | undefined> {
+	const subtle = globalThis.crypto?.subtle;
+	if (!subtle) return undefined;
+	try {
+		const digest = await subtle.digest("SHA-256", copyArrayBuffer(bytes));
+		return Array.from(new Uint8Array(digest), (byte) =>
+			byte.toString(16).padStart(2, "0"),
+		).join("");
+	} catch {
+		// Caching is optional. Preserve plugin initialization in runtimes where
+		// Web Crypto is unavailable or rejects digest operations.
+		return undefined;
+	}
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

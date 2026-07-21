@@ -33,7 +33,10 @@ beforeEach(() => {
 	});
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+	vi.restoreAllMocks();
+	vi.unstubAllGlobals();
+});
 
 test("shares singleflight preparation while keeping plugin instances fresh", async () => {
 	const compile = vi.spyOn(WebAssembly, "compile");
@@ -55,7 +58,6 @@ test("shares singleflight preparation while keeping plugin instances fresh", asy
 		secondRuntime({ operation: "render", componentId: second.componentId }),
 	]);
 	expect(renders.map((render) => render.bytes?.[0]).sort()).toEqual([1, 2]);
-
 });
 
 test("retries failed preparation", async () => {
@@ -74,4 +76,24 @@ test("retries failed preparation", async () => {
 	expect(first.errorMessage).toContain("transpile failed");
 	expect(second.errorMessage).toBeUndefined();
 	expect(transpileBytes).toHaveBeenCalledTimes(2);
+});
+
+test("initializes without caching when SubtleCrypto is unavailable", async () => {
+	vi.stubGlobal("crypto", {});
+	const compile = vi.spyOn(WebAssembly, "compile");
+	const componentBytes = new Uint8Array([9, 10, 11, 12]);
+
+	const first = await createPluginRuntimeDispatch()({
+		operation: "initComponent",
+		componentBytes,
+	});
+	const second = await createPluginRuntimeDispatch()({
+		operation: "initComponent",
+		componentBytes,
+	});
+
+	expect(first.errorMessage).toBeUndefined();
+	expect(second.errorMessage).toBeUndefined();
+	expect(transpileBytes).toHaveBeenCalledTimes(2);
+	expect(compile).toHaveBeenCalledTimes(2);
 });
