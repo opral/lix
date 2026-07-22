@@ -87,18 +87,19 @@ pub(crate) async fn execute_read_statement_from_parsed<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let session = prepare_read_session(ctx).await?;
+    let session = prepare_read_session(ctx, std::slice::from_ref(&statement)).await?;
     execute_read_statement_in_session_from_parsed(&session, sql, statement, params).await
 }
 
 pub(crate) async fn prepare_read_session<'ctx, C>(
     ctx: &'ctx C,
+    statements: &[DataFusionStatement],
 ) -> Result<ReadSqlSession<'ctx>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
     Ok(ReadSqlSession {
-        session: build_read_session(ctx).await?,
+        session: build_read_session(ctx, statements).await?,
         _context: PhantomData,
     })
 }
@@ -106,12 +107,13 @@ where
 pub(crate) async fn prepare_read_session_at_head<'ctx, C>(
     ctx: &'ctx C,
     active_head: BranchHead,
+    statements: &[DataFusionStatement],
 ) -> Result<ReadSqlSession<'ctx>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
     Ok(ReadSqlSession {
-        session: build_read_session_at_head(ctx, active_head).await?,
+        session: build_read_session_at_head(ctx, active_head, statements).await?,
         _context: PhantomData,
     })
 }
@@ -168,7 +170,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
-    let session = build_transaction_read_session(read_ctx, write_ctx).await?;
+    let session = build_transaction_read_session(read_ctx, write_ctx, &statement).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
