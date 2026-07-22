@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value as JsonValue;
@@ -22,13 +24,16 @@ const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
 
 /// Engine schema visibility boundary.
 ///
-/// SQL planning receives a schema snapshot from live state. System schemas are
-/// seeded as ordinary `lix_registered_schema` rows during initialization, so
-/// runtime schema visibility has one source of truth. The context also owns
+/// Dynamic SQL planning receives a schema snapshot from live state. System
+/// schemas are also seeded as ordinary `lix_registered_schema` rows for
+/// validation and introspection, while fixed-surface reads may use their
+/// compile-time definitions without loading those rows. The context also owns
 /// the engine-wide cache of compiled catalog snapshots, keyed by fact content.
 pub(crate) struct CatalogContext {
     compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
     compiled_catalogs_by_rows: Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>>,
+    #[cfg(test)]
+    sql_read_schema_loads: AtomicUsize,
 }
 
 /// Fingerprint of the raw catalog rows visible to a domain, hashed before any
@@ -44,6 +49,8 @@ impl CatalogContext {
         Self {
             compiled_catalogs: Mutex::new(HashMap::new()),
             compiled_catalogs_by_rows: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            sql_read_schema_loads: AtomicUsize::new(0),
         }
     }
 
@@ -148,6 +155,8 @@ impl CatalogContext {
     where
         R: LiveStateReader + ?Sized,
     {
+        #[cfg(test)]
+        self.sql_read_schema_loads.fetch_add(1, Ordering::Relaxed);
         let facts = self
             .schema_facts_for_domain(live_state, &Domain::schema_catalog(branch_id, true))
             .await?;
@@ -168,6 +177,11 @@ impl CatalogContext {
             }
         }
         Ok(schemas.into_values().collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sql_read_schema_load_count_for_test(&self) -> usize {
+        self.sql_read_schema_loads.load(Ordering::Relaxed)
     }
 
     /// Loads schema facts reachable from a row domain.
@@ -387,6 +401,30 @@ mod tests {
         assert!(schemas.iter().any(|schema| {
             schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
+    }
+
+    #[tokio::test]
+    async fn compiled_catalog_projects_the_same_sql_visible_schemas() {
+        let context = CatalogContext::new();
+        let mut tracked = registered_schema_row("zeta_tracked_schema");
+        tracked.untracked = false;
+        let reader = RowsLiveStateReader::new(vec![
+            registered_schema_row("alpha_untracked_schema"),
+            tracked,
+        ]);
+        let domain = Domain::schema_catalog("global", true);
+
+        let durable_projection = context
+            .schema_jsons_for_sql_read_planning(&reader, "global")
+            .await
+            .expect("SQL schema visibility should load");
+        let compiled_projection = context
+            .compiled_catalog_for_domain(&reader, &domain)
+            .await
+            .expect("catalog should compile")
+            .schema_jsons();
+
+        assert_eq!(compiled_projection, durable_projection);
     }
 
     #[tokio::test]

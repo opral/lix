@@ -37,6 +37,7 @@ use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
 
+use super::ReadProviderSelection;
 use super::entity_history::register_entity_history_surface;
 use datafusion::physical_plan::ExecutionPlan;
 
@@ -55,16 +56,21 @@ pub(crate) async fn register_entity_providers<S>(
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    commit_graph: Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
+    query_source: Option<SqlHistoryQuerySource<S>>,
     catalog: &PublicCatalog,
+    include_write_surfaces: bool,
+    selection: &ReadProviderSelection,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     for surface in catalog.surfaces() {
+        if !selection.includes(surface) {
+            continue;
+        }
         match &surface.kind {
-            PublicSurfaceKind::EntityBase { schema_key } => {
+            PublicSurfaceKind::EntityBase { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
@@ -78,7 +84,7 @@ where
                     WriteAccess::read_only(),
                 )?;
             }
-            PublicSurfaceKind::EntityByBranch { schema_key } => {
+            PublicSurfaceKind::EntityByBranch { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
@@ -92,12 +98,20 @@ where
                 )?;
             }
             PublicSurfaceKind::EntityHistory { schema_key } => {
+                let (Some(commit_graph), Some(query_source)) =
+                    (commit_graph.as_ref(), query_source.as_ref())
+                else {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "selected entity history provider is missing its history context",
+                    ));
+                };
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 register_entity_history_surface(
                     ctx,
                     &surface.name,
                     spec,
-                    Arc::clone(&commit_graph),
+                    Arc::clone(commit_graph),
                     query_source.clone(),
                 )?;
             }
@@ -113,8 +127,12 @@ pub(crate) async fn register_entity_write_providers(
     write_ctx: SqlWriteContext,
     branch_ref: Arc<dyn BranchRefReader>,
     catalog: &PublicCatalog,
+    selection: &ReadProviderSelection,
 ) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
+        if !selection.includes(surface) {
+            continue;
+        }
         match &surface.kind {
             PublicSurfaceKind::EntityBase { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;

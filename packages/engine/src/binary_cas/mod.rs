@@ -2,7 +2,7 @@ mod chunking;
 mod codec;
 mod context;
 pub(crate) mod kv;
-mod metrics;
+pub(crate) mod metrics;
 #[cfg(test)]
 mod stats;
 mod types;

@@ -348,6 +348,53 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     );
 });
 
+simulation_test!(
+    cached_read_syntax_uses_a_fresh_storage_snapshot,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let reader = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("reader session should open"),
+            &engine,
+        );
+        let writer = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("writer session should open"),
+            &engine,
+        );
+        let select_sql = "SELECT data FROM lix_file WHERE id = $1";
+        let params = [Value::Text("fresh-snapshot-file".to_string())];
+
+        let before = reader
+            .execute(select_sql, &params)
+            .await
+            .expect("initial cached-syntax read should succeed");
+        assert_eq!(before.len(), 0);
+
+        writer
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text("fresh-snapshot-file".to_string()),
+                    Value::Text("/fresh-snapshot.txt".to_string()),
+                    Value::Blob(b"fresh".to_vec()),
+                ],
+            )
+            .await
+            .expect("intervening write should commit");
+
+        let after = reader
+            .execute(select_sql, &params)
+            .await
+            .expect("repeated syntax should use a fresh provider snapshot");
+        assert_eq!(after.rows()[0].values(), &[Value::Blob(b"fresh".to_vec())]);
+    }
+);
+
 fn assert_read_only_error(error: LixError, schema_key: &str, hint_fragment: &str) {
     assert_eq!(error.code, LixError::CODE_READ_ONLY);
     assert!(

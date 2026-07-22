@@ -255,9 +255,12 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 			},
 		},
 	});
-	const first = new Uint8Array(32 * 1024).fill(97);
-	const second = new Uint8Array(first);
-	second[16 * 1024] = 98;
+	const firstBacking = new Uint8Array(32 * 1024 + 3).fill(97);
+	const first = firstBacking.subarray(3);
+	const secondBacking = new Uint8Array(first.byteLength + 5);
+	secondBacking.set(first, 5);
+	const second = secondBacking.subarray(5);
+	second[16 * 1024 + 3] = 98;
 	const prototype = Uint8Array.prototype as Uint8Array & {
 		toBase64?: () => string;
 	};
@@ -294,8 +297,8 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 	expect(bodies[1]?.cacheBlobs).toBe(true);
 	expect(delta).toMatchObject({
 		kind: "blob-splice",
-		prefixBytes: 16 * 1024,
-		suffixBytes: 16 * 1024 - 1,
+		prefixBytes: 16 * 1024 + 3,
+		suffixBytes: 16 * 1024 - 4,
 		insertBase64: "Yg==",
 	});
 	expect(delta?.baseSha256).toMatch(/^[0-9a-f]{64}$/);

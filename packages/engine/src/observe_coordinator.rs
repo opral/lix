@@ -122,12 +122,49 @@ pub(crate) struct ObserveQueryState {
     changes: watch::Sender<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObserveSharedContent {
+    pub(crate) generation: u64,
+    pub(crate) compared_generation: Option<u64>,
+    pub(crate) matches_compared_generation: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ObserveQueryEvaluation {
+    pub(crate) rows: ExecuteResult,
+    pub(crate) shared_content: Option<ObserveSharedContent>,
+}
+
+impl ObserveQueryEvaluation {
+    pub(crate) fn unshared(rows: ExecuteResult) -> Self {
+        Self {
+            rows,
+            shared_content: None,
+        }
+    }
+
+    pub(crate) fn rows_changed_since(
+        &self,
+        last_rows: Option<&ExecuteResult>,
+        last_shared_content: Option<ObserveSharedContent>,
+    ) -> bool {
+        if let (Some(previous), Some(current)) = (last_shared_content, self.shared_content)
+            && current.compared_generation == Some(previous.generation)
+        {
+            return !current.matches_compared_generation;
+        }
+
+        last_rows.is_none_or(|last_rows| *last_rows != self.rows)
+    }
+}
+
 impl ObserveQueryState {
     pub(crate) async fn evaluate<F, Fut>(
         &self,
         generation: u64,
+        compare_results: bool,
         evaluate: F,
-    ) -> Result<ExecuteResult, LixError>
+    ) -> Result<ObserveQueryEvaluation, LixError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<ExecuteResult, LixError>>,
@@ -137,8 +174,8 @@ impl ObserveQueryState {
         loop {
             {
                 let mut inner = self.lock();
-                if let Some(rows) = inner.cached.get(&generation) {
-                    return Ok(rows.clone());
+                if let Some(cached) = inner.cached.get(&generation) {
+                    return Ok(cached.evaluation(generation));
                 }
 
                 if inner.in_flight.insert(generation) {
@@ -149,16 +186,13 @@ impl ObserveQueryState {
             }
 
             if changes.changed().await.is_err() {
-                return evaluate().await;
+                return evaluate().await.map(ObserveQueryEvaluation::unshared);
             }
         }
 
-        let guard = InFlightGuard::new(self, generation);
+        let guard = InFlightGuard::new(self, generation, compare_results);
         match evaluate().await {
-            Ok(rows) => {
-                guard.finish_success(rows.clone());
-                Ok(rows)
-            }
+            Ok(rows) => Ok(guard.finish_success(rows)),
             Err(error) => {
                 guard.finish_without_cache();
                 Err(error)
@@ -191,43 +225,82 @@ impl ObserveQueryState {
 
 #[derive(Debug, Default)]
 struct ObserveQueryStateInner {
-    cached: BTreeMap<u64, ExecuteResult>,
+    cached: BTreeMap<u64, CachedObserveResult>,
     in_flight: BTreeSet<u64>,
     change_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedObserveResult {
+    rows: ExecuteResult,
+    compared_generation: Option<u64>,
+    matches_compared_generation: bool,
+}
+
+impl CachedObserveResult {
+    fn evaluation(&self, generation: u64) -> ObserveQueryEvaluation {
+        ObserveQueryEvaluation {
+            rows: self.rows.clone(),
+            shared_content: Some(ObserveSharedContent {
+                generation,
+                compared_generation: self.compared_generation,
+                matches_compared_generation: self.matches_compared_generation,
+            }),
+        }
+    }
 }
 
 struct InFlightGuard<'a> {
     state: &'a ObserveQueryState,
     generation: u64,
+    compare_results: bool,
     active: bool,
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn new(state: &'a ObserveQueryState, generation: u64) -> Self {
+    fn new(state: &'a ObserveQueryState, generation: u64, compare_results: bool) -> Self {
         Self {
             state,
             generation,
+            compare_results,
             active: true,
         }
     }
 
-    fn finish_success(mut self, rows: ExecuteResult) {
-        self.finish(Some(rows));
+    fn finish_success(mut self, rows: ExecuteResult) -> ObserveQueryEvaluation {
+        self.finish(Some(rows))
+            .expect("successful observe evaluation must produce a cached result")
     }
 
     fn finish_without_cache(mut self) {
-        self.finish(None);
+        let _ = self.finish(None);
     }
 
-    fn finish(&mut self, rows: Option<ExecuteResult>) {
+    fn finish(&mut self, rows: Option<ExecuteResult>) -> Option<ObserveQueryEvaluation> {
         if !self.active {
-            return;
+            return None;
         }
         self.active = false;
         let mut inner = self.state.lock();
         inner.in_flight.remove(&self.generation);
-        if let Some(rows) = rows {
-            inner.cached.insert(self.generation, rows);
+        let evaluation = rows.map(|rows| {
+            let (compared_generation, matches_compared_generation) = if self.compare_results {
+                inner
+                    .cached
+                    .range(..self.generation)
+                    .next_back()
+                    .map(|(generation, cached)| (Some(*generation), cached.rows == rows))
+                    .unwrap_or((None, false))
+            } else {
+                (None, false)
+            };
+            let cached = CachedObserveResult {
+                rows,
+                compared_generation,
+                matches_compared_generation,
+            };
+            let evaluation = cached.evaluation(self.generation);
+            inner.cached.insert(self.generation, cached);
             while inner.cached.len() > MAX_CACHED_GENERATIONS_PER_QUERY {
                 let Some(oldest_generation) = inner.cached.first_key_value().map(|(key, _)| *key)
                 else {
@@ -235,15 +308,17 @@ impl<'a> InFlightGuard<'a> {
                 };
                 inner.cached.remove(&oldest_generation);
             }
-        }
+            evaluation
+        });
         inner.change_sequence = inner.change_sequence.saturating_add(1);
         self.state.send_change(inner.change_sequence);
+        evaluation
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.finish(None);
+        let _ = self.finish(None);
     }
 }
 
@@ -256,8 +331,22 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use super::ObserveQueryState;
-    use crate::ExecuteResult;
+    use super::{ObserveQueryEvaluation, ObserveQueryState, ObserveSharedContent};
+    use crate::{ExecuteResult, Value};
+
+    fn blob_result(byte: u8) -> ExecuteResult {
+        ExecuteResult::from_rows(
+            vec!["data".to_string()],
+            vec![vec![Value::Blob(vec![byte; 1024])]],
+        )
+    }
+
+    fn blob_pointer(result: &ExecuteResult) -> *const u8 {
+        match result.rows()[0].get_index(0) {
+            Some(Value::Blob(bytes)) => bytes.as_ptr(),
+            value => panic!("expected blob result, got {value:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn evaluate_cleans_up_in_flight_generation_when_leader_is_cancelled() {
@@ -266,7 +355,7 @@ mod tests {
         let leader_state = Arc::clone(&state);
         let leader = tokio::spawn(async move {
             leader_state
-                .evaluate(1, || async move {
+                .evaluate(1, false, || async move {
                     let _ = started_tx.send(());
                     std::future::pending().await
                 })
@@ -281,13 +370,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            state.evaluate(1, || async { Ok(ExecuteResult::from_rows_affected(0)) }),
+            state.evaluate(1, false, || async {
+                Ok(ExecuteResult::from_rows_affected(0))
+            }),
         )
         .await
         .expect("cancelled in-flight generation should not strand followers")
         .expect("replacement evaluation should succeed");
 
-        assert_eq!(result, ExecuteResult::from_rows_affected(0));
+        assert_eq!(result.rows, ExecuteResult::from_rows_affected(0));
     }
 
     #[tokio::test]
@@ -297,7 +388,7 @@ mod tests {
 
         let first_attempts = Arc::clone(&attempts);
         let first = state
-            .evaluate(1, || async move {
+            .evaluate(1, false, || async move {
                 first_attempts.fetch_add(1, Ordering::SeqCst);
                 Err(crate::LixError::new(crate::LixError::CODE_UNKNOWN, "boom"))
             })
@@ -306,18 +397,129 @@ mod tests {
 
         let second_attempts = Arc::clone(&attempts);
         let second = state
-            .evaluate(1, || async move {
+            .evaluate(1, false, || async move {
                 second_attempts.fetch_add(1, Ordering::SeqCst);
                 Ok(ExecuteResult::from_rows_affected(0))
             })
             .await
             .expect("second evaluation should not reuse the first error");
 
-        assert_eq!(second, ExecuteResult::from_rows_affected(0));
+        assert_eq!(second.rows, ExecuteResult::from_rows_affected(0));
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             2,
             "failed evaluations must not be cached for followers"
         );
     }
+
+    #[tokio::test]
+    async fn identical_generations_share_one_comparison_without_reusing_results() {
+        let state = ObserveQueryState::new();
+        let first = state
+            .evaluate(1, true, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("first evaluation should succeed");
+        let second = state
+            .evaluate(2, true, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("second evaluation should succeed");
+
+        let first_content = first
+            .shared_content
+            .expect("coordinated result should carry comparison metadata");
+        let second_content = second
+            .shared_content
+            .expect("coordinated result should carry comparison metadata");
+        assert_eq!(first_content.compared_generation, None);
+        assert_eq!(second_content.compared_generation, Some(1));
+        assert!(second_content.matches_compared_generation);
+        assert_ne!(
+            blob_pointer(&first.rows),
+            blob_pointer(&second.rows),
+            "each generation must retain its freshly evaluated result"
+        );
+    }
+
+    #[tokio::test]
+    async fn comparison_starts_without_losing_single_observer_generation_identity() {
+        let state = ObserveQueryState::new();
+        let first = state
+            .evaluate(1, false, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("first evaluation should succeed");
+        let second = state
+            .evaluate(2, false, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("second evaluation should succeed");
+        let third = state
+            .evaluate(3, true, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("fanout evaluation should succeed");
+
+        let first_content = first
+            .shared_content
+            .expect("first generation should carry its identity");
+        let second_content = second
+            .shared_content
+            .expect("second generation should carry its identity");
+        let third_content = third
+            .shared_content
+            .expect("fanout generation should carry its comparison");
+        assert_eq!(first_content.generation, 1);
+        assert_eq!(first_content.compared_generation, None);
+        assert_eq!(second_content.generation, 2);
+        assert_eq!(second_content.compared_generation, None);
+        assert_eq!(third_content.compared_generation, Some(2));
+        assert!(third_content.matches_compared_generation);
+    }
+
+    #[tokio::test]
+    async fn changed_and_out_of_order_generations_keep_direct_comparisons() {
+        let state = ObserveQueryState::new();
+        let first = state
+            .evaluate(1, true, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("first evaluation should succeed");
+        let third = state
+            .evaluate(3, true, || async { Ok(blob_result(b'a')) })
+            .await
+            .expect("third evaluation should succeed");
+        let second = state
+            .evaluate(2, true, || async { Ok(blob_result(b'b')) })
+            .await
+            .expect("late second evaluation should succeed");
+
+        let first_content = first.shared_content.expect("first comparison metadata");
+        let third_content = third.shared_content.expect("third comparison metadata");
+        let second_content = second.shared_content.expect("second comparison metadata");
+        assert_eq!(first_content.compared_generation, None);
+        assert_eq!(third_content.compared_generation, Some(1));
+        assert!(third_content.matches_compared_generation);
+        assert_eq!(second_content.compared_generation, Some(1));
+        assert!(!second_content.matches_compared_generation);
+
+        let skipped_equal = ObserveQueryEvaluation {
+            rows: blob_result(b'a'),
+            shared_content: Some(ObserveSharedContent {
+                generation: 4,
+                compared_generation: Some(3),
+                matches_compared_generation: false,
+            }),
+        };
+        assert!(
+            !skipped_equal.rows_changed_since(Some(&first.rows), Some(first_content)),
+            "a skipped comparison must fall back to exact row equality"
+        );
+
+        let cached_third = state
+            .evaluate(3, true, || async {
+                panic!("cached generation must not re-evaluate")
+            })
+            .await
+            .expect("cached third evaluation should succeed");
+        assert_eq!(cached_third.shared_content, Some(third_content));
+    }
 }
+
+#[cfg(test)]
+mod performance_tests;

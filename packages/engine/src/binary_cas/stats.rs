@@ -3,7 +3,8 @@ use std::ops::Bound;
 use crate::LixError;
 use crate::binary_cas::codec::{BinaryCasManifest, decode_binary_cas_manifest};
 use crate::binary_cas::kv::{
-    BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
+    BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
+    BINARY_CAS_MANIFEST_SPACE,
 };
 use crate::storage_adapter::{
     StorageAdapterRead, StorageCoreProjection, StorageError, StorageKeyRange,
@@ -17,6 +18,7 @@ pub(crate) struct BinaryCasStorageStats {
     pub single_chunk_blob_rows: u64,
     pub chunked_blob_rows: u64,
     pub manifest_chunk_rows: u64,
+    pub chunk_presence_rows: u64,
     pub chunk_rows: u64,
     pub total_chunk_refs: u64,
     pub logical_blob_bytes: u64,
@@ -59,6 +61,7 @@ where
     )
     .await?;
     stats.manifest_chunk_rows = count_space(read, BINARY_CAS_MANIFEST_CHUNK_SPACE.id).await?;
+    stats.chunk_presence_rows = count_space(read, BINARY_CAS_CHUNK_PRESENCE_SPACE.id).await?;
     stats.chunk_rows = count_space(read, BINARY_CAS_CHUNK_SPACE.id).await?;
     Ok(stats)
 }
@@ -206,6 +209,7 @@ mod tests {
                 single_chunk_blob_rows: 1,
                 chunked_blob_rows: 1,
                 manifest_chunk_rows: 2,
+                chunk_presence_rows: 3,
                 chunk_rows: 3,
                 total_chunk_refs: 3,
                 logical_blob_bytes: 14,

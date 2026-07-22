@@ -90,7 +90,7 @@ pub struct SlateDBRead {
 pub struct SlateDBWrite {
     worker: SlateDBWorker,
     _writer_permit: OwnedMutexGuard<()>,
-    base: Arc<DbSnapshot>,
+    base: Option<Arc<DbSnapshot>>,
     overlay: BTreeMap<Key, Option<Bytes>>,
     stats: WriteStats,
 }
@@ -230,14 +230,10 @@ impl Storage for SlateDB {
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             let writer_permit = self.write_gate.acquire().await;
-            let base = self
-                .worker
-                .call(|db| async move { db.snapshot().await.map_err(slatedb_error) })
-                .await?;
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 _writer_permit: writer_permit,
-                base,
+                base: None,
                 overlay: BTreeMap::new(),
                 stats: WriteStats::default(),
             })
@@ -405,7 +401,18 @@ impl StorageWrite for SlateDBWrite {
                 return Ok(());
             }
 
-            let base = Arc::clone(&self.base);
+            if self.base.is_none() {
+                self.base = Some(
+                    self.worker
+                        .call(|db| async move { db.snapshot().await.map_err(slatedb_error) })
+                        .await?,
+                );
+            }
+            let base = Arc::clone(
+                self.base
+                    .as_ref()
+                    .expect("SlateDB write base snapshot is initialized"),
+            );
             let base_keys = self
                 .worker
                 .call(move |_db| collect_snapshot_keys(base, bounds))
