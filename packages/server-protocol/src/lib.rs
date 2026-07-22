@@ -1627,7 +1627,15 @@ enum MultiplexObserveMessage {
 
 struct BlobDeltaBase {
     sequence: u64,
-    bytes: Vec<u8>,
+    // ExecuteResult has immutable shared backing, so retaining the transport
+    // base does not copy the point-read blob for every subscription.
+    rows: ExecuteResult,
+}
+
+impl BlobDeltaBase {
+    fn bytes(&self) -> &[u8] {
+        point_blob_bytes(&self.rows).expect("blob delta bases are point blob results")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1673,9 +1681,9 @@ fn multiplex_observe_payload(
     event: ObserveEvent,
     base: Option<&BlobDeltaBase>,
 ) -> Result<(MultiplexObservePayload, Option<BlobDeltaBase>), LixError> {
-    let next_base = point_blob_bytes(&event.rows).map(|bytes| BlobDeltaBase {
+    let next_base = point_blob_bytes(&event.rows).map(|_| BlobDeltaBase {
         sequence: event.sequence,
-        bytes: bytes.to_vec(),
+        rows: event.rows.clone(),
     });
     let delta = match base.zip(next_base.as_ref()) {
         Some((base, next)) if base.sequence.checked_add(1) == Some(event.sequence) => {
@@ -1720,31 +1728,30 @@ fn single_blob_splice(
     base: &BlobDeltaBase,
     next: &BlobDeltaBase,
 ) -> Result<Option<SingleBlobSplice>, LixError> {
-    if next.bytes.len() < MIN_BLOB_DELTA_BYTES {
+    if next.bytes().len() < MIN_BLOB_DELTA_BYTES {
         return Ok(None);
     }
-    let prefix_bytes = base
-        .bytes
+    let base_bytes = base.bytes();
+    let next_bytes = next.bytes();
+    let prefix_bytes = base_bytes
         .iter()
-        .zip(&next.bytes)
+        .zip(next_bytes)
         .take_while(|(left, right)| left == right)
         .count();
-    let max_suffix = base
-        .bytes
+    let max_suffix = base_bytes
         .len()
         .saturating_sub(prefix_bytes)
-        .min(next.bytes.len().saturating_sub(prefix_bytes));
-    let suffix_bytes = base
-        .bytes
+        .min(next_bytes.len().saturating_sub(prefix_bytes));
+    let suffix_bytes = base_bytes
         .iter()
         .rev()
-        .zip(next.bytes.iter().rev())
+        .zip(next_bytes.iter().rev())
         .take(max_suffix)
         .take_while(|(left, right)| left == right)
         .count();
-    let insert_end = next.bytes.len().saturating_sub(suffix_bytes);
-    let insert = &next.bytes[prefix_bytes..insert_end];
-    let Some(full_base64_bytes) = padded_base64_len(next.bytes.len()) else {
+    let insert_end = next_bytes.len().saturating_sub(suffix_bytes);
+    let insert = &next_bytes[prefix_bytes..insert_end];
+    let Some(full_base64_bytes) = padded_base64_len(next_bytes.len()) else {
         return Ok(None);
     };
     let Some(delta_base64_bytes) = padded_base64_len(insert.len()) else {
@@ -2783,6 +2790,17 @@ mod tests {
     }
 
     #[test]
+    fn multiplex_blob_delta_base_reuses_event_storage() {
+        let event = point_blob_event(0, vec![b'a'; 1024 * 1024]);
+        let event_bytes = point_blob_bytes(&event.rows).expect("point blob event");
+        let event_ptr = event_bytes.as_ptr();
+        let (_, base) = multiplex_observe_payload(event, None).expect("initial payload");
+        let base = base.expect("blob base");
+
+        assert_eq!(base.bytes().as_ptr(), event_ptr);
+    }
+
+    #[test]
     fn multiplex_blob_delta_roundtrips_replace_insert_and_delete() {
         let initial = vec![b'a'; 100 * 1024];
         let (payload, mut base) =
@@ -2869,6 +2887,57 @@ mod tests {
             apply_blob_splice(&replacement, payload.delta.expect("localized splice")),
             localized
         );
+    }
+
+    #[test]
+    #[ignore = "manual observation fanout performance diagnostic"]
+    fn multiplex_blob_delta_fanout_perf() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const SAMPLES: usize = 60;
+        for size_mib in [1_usize, 10] {
+            let initial = vec![b'a'; size_mib * 1024 * 1024];
+            let mut localized = initial.clone();
+            let middle = localized.len() / 2;
+            localized[middle] = b'b';
+            let event = point_blob_event(1, localized);
+            for fanout in [1_usize, 4, 16] {
+                let bases = (0..fanout)
+                    .map(|_| {
+                        multiplex_observe_payload(point_blob_event(0, initial.clone()), None)
+                            .expect("initial payload")
+                            .1
+                            .expect("blob base")
+                    })
+                    .collect::<Vec<_>>();
+                let mut samples = Vec::with_capacity(SAMPLES);
+                for _ in 0..SAMPLES {
+                    let started = Instant::now();
+                    for base in &bases {
+                        black_box(
+                            multiplex_observe_payload(event.clone(), Some(base))
+                                .expect("delta payload"),
+                        );
+                    }
+                    samples.push(started.elapsed());
+                }
+                samples.sort_unstable();
+                let p50 = samples[SAMPLES / 2];
+                let p95 = samples[SAMPLES * 95 / 100];
+                let total_bytes = u32::try_from(size_mib * 1024 * 1024 * fanout)
+                    .expect("diagnostic byte count should fit u32");
+                let throughput = |elapsed: Duration| {
+                    f64::from(total_bytes) / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+                };
+                eprintln!(
+                    "observe_fanout size_mib={size_mib} subscribers={fanout} p50_us={} p95_us={} logical_mib_s_p50={:.1}",
+                    p50.as_micros(),
+                    p95.as_micros(),
+                    throughput(p50),
+                );
+            }
+        }
     }
 
     #[tokio::test]
