@@ -1838,6 +1838,7 @@ mod tests {
         schema_definitions: Vec<JsonValue>,
     }
 
+    #[async_trait]
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
         type ReadStore = SharedStorageAdapterRead<MemoryRead>;
 
@@ -1888,7 +1889,7 @@ mod tests {
             Arc::new(DummyBranchRefReader)
         }
 
-        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
     }
