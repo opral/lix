@@ -208,9 +208,7 @@ class RemoteLixBinding implements LixBinding {
 		params: NativeLixValue[],
 	): Promise<ObserveEventsBinding> {
 		this.#assertOpen();
-		return this.#enqueue(async () =>
-			this.#observationHub.observe(sql, params.map(encodeWireValue)),
-		);
+		return this.#observationHub.observe(sql, params.map(encodeWireValue));
 	}
 
 	async beginTransaction(): Promise<LixTransactionBinding> {
@@ -375,6 +373,7 @@ class RemoteLixBinding implements LixBinding {
 				{ details: { cause: errorMessage(cause) } },
 			);
 		}
+		signal.throwIfAborted();
 		if (this.#sessionId === undefined) {
 			throw protocolError("remote observation started without a session");
 		}
@@ -390,6 +389,7 @@ class RemoteLixBinding implements LixBinding {
 		if (prepared.compressed) {
 			headers.set("content-encoding", "gzip");
 		}
+		signal.throwIfAborted();
 		try {
 			return await this.#fetch(new URL("observe/multiplex", this.#baseUrl), {
 				method: "POST",
@@ -706,6 +706,7 @@ class RemoteObservationHub {
 	#retryAttempt = 0;
 	#serverRetryMs: number | undefined;
 	#generation = 0;
+	#startQueued = false;
 	#closed = false;
 
 	constructor(options: RemoteObservationHubOptions) {
@@ -744,7 +745,12 @@ class RemoteObservationHub {
 
 	#restartStream(): void {
 		this.#stopStream();
-		this.#startStream();
+		if (this.#startQueued) return;
+		this.#startQueued = true;
+		queueMicrotask(() => {
+			this.#startQueued = false;
+			this.#startStream();
+		});
 	}
 
 	#startStream(): void {
