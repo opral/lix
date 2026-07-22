@@ -47,6 +47,13 @@ struct BlobWritePlan {
     receipt: BlobWriteReceipt,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedChunk {
+    start: usize,
+    end: usize,
+    hash: BlobHash,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvBlobManifestChunk {
     pub(crate) chunk_hash: [u8; 32],
@@ -559,8 +566,9 @@ where
         return Ok(receipt);
     }
 
-    let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, bytes, &plan).await?;
-    stage_prepared_blob_write(writes, bytes, &plan, |chunk_hash| {
+    let chunks = prepare_chunks(bytes, &plan);
+    let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, &plan, &chunks).await?;
+    stage_prepared_blob_write(writes, bytes, &plan, &chunks, |chunk_hash| {
         Ok(chunk_hashes_to_stage.remove(&chunk_hash))
     })?;
     Ok(receipt)
@@ -614,10 +622,30 @@ fn prepare_blob_write(
     })
 }
 
+fn prepare_chunks(bytes: &[u8], plan: &BlobWritePlan) -> Vec<PreparedChunk> {
+    if !matches!(plan.layout, BlobLayout::Chunked { .. }) {
+        return Vec::new();
+    }
+
+    plan.chunk_ranges
+        .iter()
+        .map(|&(start, end)| PreparedChunk {
+            start,
+            end,
+            hash: if start == 0 && end == bytes.len() {
+                plan.blob_hash
+            } else {
+                BlobHash::from_content(&bytes[start..end])
+            },
+        })
+        .collect()
+}
+
 fn stage_prepared_blob_write(
     writes: &mut StorageWriteSet,
     bytes: &[u8],
     plan: &BlobWritePlan,
+    chunks: &[PreparedChunk],
     mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
 ) -> Result<(), LixError> {
     match &plan.layout {
@@ -658,9 +686,9 @@ fn stage_prepared_blob_write(
                 },
             );
 
-            for (chunk_index, (start, end)) in plan.chunk_ranges.iter().copied().enumerate() {
-                let chunk_data = &bytes[start..end];
-                let chunk_hash = BlobHash::from_content(chunk_data);
+            for (chunk_index, chunk) in chunks.iter().copied().enumerate() {
+                let chunk_data = &bytes[chunk.start..chunk.end];
+                let chunk_hash = chunk.hash;
                 if should_stage_chunk(chunk_hash)? {
                     stage_chunk(
                         writes,
@@ -689,8 +717,8 @@ fn stage_prepared_blob_write(
 async fn missing_chunk_hashes(
     store: &(impl StorageAdapterRead + ?Sized),
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
-    bytes: &[u8],
     plan: &BlobWritePlan,
+    chunks: &[PreparedChunk],
 ) -> Result<HashSet<BlobHash>, LixError> {
     let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
     match &plan.layout {
@@ -699,9 +727,8 @@ async fn missing_chunk_hashes(
             collect_chunk_lookup_candidate(*chunk_hash, transaction_chunk_keys, &mut candidates);
         }
         BlobLayout::Chunked { .. } => {
-            for (start, end) in plan.chunk_ranges.iter().copied() {
-                let chunk_hash = BlobHash::from_content(&bytes[start..end]);
-                collect_chunk_lookup_candidate(chunk_hash, transaction_chunk_keys, &mut candidates);
+            for chunk in chunks {
+                collect_chunk_lookup_candidate(chunk.hash, transaction_chunk_keys, &mut candidates);
             }
         }
     }
@@ -1185,10 +1212,22 @@ mod tests {
                 layout: BlobLayout::Chunked { chunk_count: 2 },
             },
         };
+        let chunks = vec![
+            PreparedChunk {
+                start: 0,
+                end: 3,
+                hash: chunk_hash,
+            },
+            PreparedChunk {
+                start: 3,
+                end: 6,
+                hash: chunk_hash,
+            },
+        ];
         let mut writes = StorageWriteSet::new();
         let mut chunk_hashes_to_stage = HashSet::from([chunk_hash]);
 
-        stage_prepared_blob_write(&mut writes, data, &plan, |chunk_hash| {
+        stage_prepared_blob_write(&mut writes, data, &plan, &chunks, |chunk_hash| {
             Ok(chunk_hashes_to_stage.remove(&chunk_hash))
         })
         .expect("duplicate chunk payload write should stage");
