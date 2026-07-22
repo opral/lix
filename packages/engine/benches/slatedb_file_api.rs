@@ -33,7 +33,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 const DELAYS_MS: &[u64] = &[0, 10, 25, 50];
-const SEED_FILE_COUNT: usize = 100;
+const DEFAULT_SEED_FILE_COUNT: usize = 100;
 const FILE_SIZE_BYTES: usize = 4096;
 const UPLOAD_BATCH_SIZE: usize = 10;
 const LIXRAY_UPLOAD_BATCH_FILES: usize = 10;
@@ -341,15 +341,33 @@ fn maybe_print_write_accounting(runtime: &tokio::runtime::Runtime) {
     if std::env::var_os("LIX_SLATEDB_WRITE_ACCOUNTING").is_none() {
         return;
     }
+    let samples = std::env::var("LIX_SLATEDB_WRITE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let operation =
+        std::env::var("LIX_SLATEDB_WRITE_OPERATION").unwrap_or_else(|_| "overwrite".to_string());
     let fixture = runtime.block_on(UploadBenchFixture::seeded(Duration::ZERO));
     black_box(runtime.block_on(fixture.upload_overwrite_file()));
     runtime
         .block_on(fixture.storage.flush())
         .expect("flush upload accounting warmup");
     fixture.object_store.reset_write_stats();
-    let started = Instant::now();
-    let rows_affected = runtime.block_on(fixture.upload_overwrite_file());
-    let accepted = started.elapsed();
+    let mut accepted = Vec::with_capacity(samples);
+    let mut rows_affected = 0;
+    for _ in 0..samples {
+        let started = Instant::now();
+        rows_affected += match operation.as_str() {
+            "overwrite" => runtime.block_on(fixture.upload_overwrite_file()),
+            "insert" => runtime.block_on(fixture.upload_new_file()),
+            other => panic!("unsupported LIX_SLATEDB_WRITE_OPERATION {other:?}"),
+        };
+        accepted.push(started.elapsed());
+    }
+    accepted.sort_unstable();
+    let p50 = accepted[(accepted.len() - 1) * 50 / 100];
+    let p95 = accepted[(accepted.len() - 1) * 95 / 100];
     let flush_started = Instant::now();
     runtime
         .block_on(fixture.storage.flush())
@@ -357,8 +375,10 @@ fn maybe_print_write_accounting(runtime: &tokio::runtime::Runtime) {
     let flush = flush_started.elapsed();
     let stats = fixture.object_store.write_stats();
     println!(
-        "slatedb-write-accounting rows_affected={rows_affected} accepted_ns={} flush_ns={} put_calls={} put_bytes={}",
-        accepted.as_nanos(),
+        "slatedb-write-accounting operation={operation} seed_files={} samples={samples} rows_affected={rows_affected} accepted_p50_ns={} accepted_p95_ns={} flush_ns={} put_calls={} put_bytes={}",
+        seed_file_count(),
+        p50.as_nanos(),
+        p95.as_nanos(),
         flush.as_nanos(),
         stats.put_calls,
         stats.put_bytes,
@@ -768,6 +788,26 @@ impl UploadBenchFixture {
             .execute(&self.upload_batch_sql, &params)
             .await
             .expect("overwrite benchmark file batch");
+        result.rows_affected()
+    }
+
+    async fn upload_new_file(&self) -> u64 {
+        let version = self.next_upload_version.fetch_add(1, Ordering::Relaxed);
+        let path = format!("/bench-new-{version:020}.bin");
+        let result = self
+            .session
+            .execute(
+                "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+                 lixcol_metadata = excluded.lixcol_metadata",
+                &[
+                    Value::Text(path),
+                    Value::Blob(upload_file_bytes(version)),
+                    upload_file_metadata(version),
+                ],
+            )
+            .await
+            .expect("insert benchmark file");
         result.rows_affected()
     }
 }
@@ -1240,8 +1280,10 @@ async fn read_storage_key(storage: &SlateDB, key: &Key) -> usize {
 }
 
 async fn seed_files(session: &SessionContext<SlateDB>) {
-    for chunk_start in (0..SEED_FILE_COUNT).step_by(UPLOAD_BATCH_SIZE) {
-        let chunk_end = (chunk_start + UPLOAD_BATCH_SIZE).min(SEED_FILE_COUNT);
+    let seed_file_count = seed_file_count();
+    let upload_batch_size = seed_upload_batch_size();
+    for chunk_start in (0..seed_file_count).step_by(upload_batch_size) {
+        let chunk_end = (chunk_start + upload_batch_size).min(seed_file_count);
         let mut placeholders = Vec::with_capacity(chunk_end - chunk_start);
         let mut params = Vec::with_capacity((chunk_end - chunk_start) * 3);
 
@@ -1302,10 +1344,26 @@ fn file_metadata() -> Value {
 }
 
 fn upload_file_bytes(version: u64) -> Vec<u8> {
-    let seed_file_count = u64::try_from(SEED_FILE_COUNT).expect("seed file count fits in u64");
+    let seed_file_count = u64::try_from(seed_file_count()).expect("seed file count fits in u64");
     let byte = u8::try_from((version % 251 + seed_file_count % 251) % 251)
         .expect("upload byte pattern fits in u8");
     vec![byte; FILE_SIZE_BYTES]
+}
+
+fn seed_file_count() -> usize {
+    std::env::var("LIX_SLATEDB_SEED_FILE_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SEED_FILE_COUNT)
+        .max(1)
+}
+
+fn seed_upload_batch_size() -> usize {
+    std::env::var("LIX_SLATEDB_SEED_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(UPLOAD_BATCH_SIZE)
+        .max(1)
 }
 
 fn upload_file_metadata(version: u64) -> Value {

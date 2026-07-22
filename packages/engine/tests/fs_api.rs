@@ -928,6 +928,65 @@ async fn plugin_detect_changes_receives_descriptor_filename() {
 }
 
 #[tokio::test]
+async fn non_empty_plugin_overwrite_does_not_stage_blob_ref_tombstone() {
+    let storage = Memory::new();
+    let receipt = Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(storage, runtime)
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_session(receipt.main_branch_id.clone())
+        .await
+        .expect("workspace session should open");
+
+    install_plugin(&session, "plugin_sentinel", &sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+    write_file(&session, "/owned.sentinel", b"first".to_vec())
+        .await
+        .expect("plugin file write should succeed");
+    let file = session
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/owned.sentinel'",
+            &[],
+        )
+        .await
+        .expect("plugin file id should load");
+    let [Value::Text(file_id)] = file.rows()[0].values() else {
+        panic!("expected plugin file id");
+    };
+    assert_eq!(blob_ref_count(&session, file_id).await, 0);
+
+    write_file(&session, "/owned.sentinel", b"second".to_vec())
+        .await
+        .expect("plugin file overwrite should succeed");
+    let commit_id = engine
+        .load_branch_head_commit_id(&receipt.main_branch_id)
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist");
+    let blob_ref_history = session
+        .execute(
+            &format!(
+                "SELECT entity_pk FROM lix_state_history \
+                 WHERE start_commit_id = '{commit_id}' \
+                   AND schema_key = 'lix_binary_blob_ref' \
+                   AND entity_pk = lix_json('[\"{file_id}\"]')"
+            ),
+            &[],
+        )
+        .await
+        .expect("blob ref history should load");
+
+    assert_eq!(blob_ref_history.len(), 0);
+    assert_eq!(blob_ref_count(&session, file_id).await, 0);
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
 async fn plugin_stale_writes_preserve_disjoint_entity_edits() {
     let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
     write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
