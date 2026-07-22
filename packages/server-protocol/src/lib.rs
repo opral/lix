@@ -32,6 +32,13 @@ use tokio::{
     sync::{Mutex as AsyncMutex, mpsc},
     task::JoinHandle,
 };
+use tower_http::{
+    compression::{
+        CompressionLayer, CompressionLevel,
+        predicate::{DefaultPredicate, Predicate as _, SizeAbove},
+    },
+    decompression::RequestDecompressionLayer,
+};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 /// Stable URL prefix owned by the Lix server protocol.
@@ -48,6 +55,7 @@ pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// so 64 MiB carries the engine's 32 MiB maximum plugin archive with room for
 /// the SQL envelope and also covers ordinary larger document blobs.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MIN_COMPRESSION_BODY_BYTES: u16 = 32 * 1024;
 /// Maximum number of queries multiplexed onto one observation stream.
 pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
 
@@ -384,9 +392,20 @@ where
             .route("/lix/v1/", get(handshake::<S>))
             .route("/lix/v1/session", delete(delete_session::<S>))
             .merge(protected)
+            .layer(
+                CompressionLayer::new()
+                    .gzip(true)
+                    .quality(CompressionLevel::Precise(2))
+                    .compress_when(
+                        DefaultPredicate::new().and(SizeAbove::new(MIN_COMPRESSION_BODY_BYTES)),
+                    ),
+            )
             .layer(DefaultBodyLimit::max(
                 self.inner.options.max_request_body_bytes,
             ))
+            // This must be outside DefaultBodyLimit so the configured limit
+            // applies to expanded JSON rather than attacker-controlled gzip.
+            .layer(RequestDecompressionLayer::new().gzip(true))
             .with_state(state)
     }
 
@@ -1246,12 +1265,16 @@ impl Drop for ObserveTaskGuard {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix_sdk::{
         Memory, OpenLixOptions, TracingTelemetrySink, open_lix, open_lix_with_telemetry,
     };
     use serde_json::{Value as JsonValue, json};
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::{Read as _, Write as _},
+        sync::{Arc, Mutex},
+    };
     use tower::ServiceExt as _;
     use tracing::Subscriber;
     use tracing_subscriber::{
@@ -1378,6 +1401,29 @@ mod tests {
             .expect("body")
             .to_bytes();
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).expect("gzip input");
+        encoder.finish().expect("finish gzip")
+    }
+
+    async fn gzip_response_json(response: Response) -> JsonValue {
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_ENCODING),
+            Some(&axum::http::HeaderValue::from_static("gzip"))
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("compressed body")
+            .to_bytes();
+        let mut decoder = GzDecoder::new(bytes.as_ref());
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).expect("decode gzip");
+        serde_json::from_slice(&decoded).expect("compressed json")
     }
 
     async fn error_code(response: Response) -> String {
@@ -1599,6 +1645,134 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn compressed_execute_requests_are_expanded_before_json_extraction() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let request_body = json!({
+            "sql": "SELECT $1",
+            "params": [{ "kind": "text", "value": "x".repeat(64 * 1024) }]
+        })
+        .to_string();
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/execute")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(axum::http::header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from(gzip(request_body.as_bytes())))
+                    .expect("compressed request"),
+            )
+            .await
+            .expect("compressed response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["rows"][0][0]["value"],
+            "x".repeat(64 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_body_limit_applies_to_expanded_json() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_request_body_bytes: 1_024,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (session_id, _) = new_session(&app.router).await;
+        let request_body = json!({
+            "sql": "SELECT $1",
+            "params": [{ "kind": "text", "value": "x".repeat(2_048) }]
+        })
+        .to_string();
+        let response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/execute")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(axum::http::header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from(gzip(request_body.as_bytes())))
+                    .expect("compressed request"),
+            )
+            .await
+            .expect("compressed response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn large_finite_json_responses_use_gzip_but_sse_does_not() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let request_body = json!({
+            "sql": "SELECT $1",
+            "params": [{ "kind": "text", "value": "x".repeat(64 * 1024) }]
+        });
+        let mut request_builder = Request::builder()
+            .method("POST")
+            .uri("/lix/v1/execute")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip")
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                request_builder
+                    .body(Body::from(request_body.to_string()))
+                    .expect("gzip response request"),
+            )
+            .await
+            .expect("gzip response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gzip_response_json(response).await["rows"][0][0]["value"],
+            "x".repeat(64 * 1024)
+        );
+
+        let observe_body = json!({
+            "subscriptions": [{
+                "id": "large",
+                "sql": "SELECT $1",
+                "params": [{ "kind": "text", "value": "x".repeat(64 * 1024) }]
+            }]
+        });
+        request_builder = Request::builder()
+            .method("POST")
+            .uri("/lix/v1/observe/multiplex")
+            .header(SESSION_ID_HEADER, session_id)
+            .header(axum::http::header::ACCEPT_ENCODING, "gzip")
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        let response = app
+            .router
+            .oneshot(
+                request_builder
+                    .body(Body::from(observe_body.to_string()))
+                    .expect("SSE response request"),
+            )
+            .await
+            .expect("SSE response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static("text/event-stream"))
+        );
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .is_none()
+        );
     }
 
     #[tokio::test]
