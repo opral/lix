@@ -2369,7 +2369,17 @@ mod tests {
         Arc<Mutex<CapturingStagedWrites>>,
         Arc<AtomicUsize>,
     ) {
-        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        counting_write_context_with_blob_reader(rows, Arc::new(DummyBlobReader))
+    }
+
+    fn counting_write_context_with_blob_reader(
+        rows: Vec<MaterializedLiveStateRow>,
+        blob_reader: Arc<dyn BlobDataReader>,
+    ) -> (
+        DummySqlWriteExecutionContext<'static>,
+        Arc<Mutex<CapturingStagedWrites>>,
+        Arc<AtomicUsize>,
+    ) {
         let scans = Arc::new(AtomicUsize::new(0));
         let live_state: Arc<dyn LiveStateReader> = Arc::new(CountingRowsLiveStateReader {
             rows,
@@ -4648,6 +4658,176 @@ mod tests {
         assert_eq!(scans.load(Ordering::SeqCst), 1);
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         assert_eq!(staged_writes.deltas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_path_data_metadata_params_use_fast_stage() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data, lixcol_metadata) \
+             VALUES ($1, $2, $3), ($4, $5, $6)",
+            &[
+                Value::Text("/multi/param-a.md".to_string()),
+                Value::Blob(b"param-a".to_vec()),
+                Value::Json(json!({"source": "json-param"})),
+                Value::Text("/multi/param-b.md".to_string()),
+                Value::Blob(b"param-b".to_vec()),
+                Value::Text(r#"{"source":"text-param"}"#.to_string()),
+            ],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("parameterized path/data/metadata insert should use the fast writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let mut descriptor_metadata = overlay
+            .visible_semantic_rows(false, "lix_file_descriptor")
+            .into_iter()
+            .filter_map(|row| row.metadata)
+            .collect::<Vec<_>>();
+        descriptor_metadata.sort();
+        assert_eq!(
+            descriptor_metadata,
+            vec![
+                r#"{"source":"json-param"}"#.to_string(),
+                r#"{"source":"text-param"}"#.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_lix_file_metadata_upsert_fast_path_matches_datafusion() {
+        let mut existing =
+            live_file_row("file-existing", "branch-a", Some("dir-docs"), "existing.md");
+        existing.metadata = Some(r#"{"source":"old"}"#.to_string());
+        let rows = vec![
+            live_directory_row("dir-docs", "branch-a", None, "docs"),
+            existing,
+            live_blob_ref_row("file-existing", "branch-a", b"old"),
+        ];
+        let fast_blob_reader: Arc<dyn BlobDataReader> = Arc::new(StaticBlobReader {
+            bytes: b"old".to_vec(),
+        });
+        let datafusion_blob_reader: Arc<dyn BlobDataReader> = Arc::new(StaticBlobReader {
+            bytes: b"old".to_vec(),
+        });
+        let (mut fast_ctx, fast_staged, fast_scans) =
+            counting_write_context_with_blob_reader(rows.clone(), fast_blob_reader);
+        let (mut datafusion_ctx, datafusion_staged, datafusion_scans) =
+            counting_write_context_with_blob_reader(rows, datafusion_blob_reader);
+        let sql = "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
+                   ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+                   lixcol_metadata = excluded.lixcol_metadata";
+        let params = [
+            Value::Text("/docs/existing.md".to_string()),
+            Value::Blob(b"updated".to_vec()),
+            Value::Json(json!({"source": "upload"})),
+        ];
+
+        let (fast_result, fast_path) =
+            execute_write_sql_trace(&mut fast_ctx, sql, &params, WriteExecutorMode::ForceFast)
+                .await
+                .expect("metadata upsert should use the bound fast path");
+        let (datafusion_result, datafusion_path) = execute_write_sql_trace(
+            &mut datafusion_ctx,
+            sql,
+            &params,
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("reference metadata upsert should succeed");
+
+        assert_eq!(fast_path, WriteExecutorPath::Fast);
+        assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
+        assert_eq!(fast_result.rows, datafusion_result.rows);
+        assert_eq!(fast_scans.load(Ordering::SeqCst), 1);
+        assert_eq!(datafusion_scans.load(Ordering::SeqCst), 3);
+
+        let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
+            .pending_write_overlay()
+            .expect("fast staged delta should project")
+            .visible_all_semantic_rows();
+        let datafusion_rows = datafusion_staged
+            .lock()
+            .expect("DataFusion writes lock")
+            .deltas[0]
+            .pending_write_overlay()
+            .expect("DataFusion staged delta should project")
+            .visible_all_semantic_rows();
+        assert_eq!(fast_rows, datafusion_rows);
+        let descriptor = fast_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("metadata upsert should rewrite the descriptor");
+        assert_eq!(
+            descriptor.metadata.as_deref(),
+            Some(r#"{"source":"upload"}"#)
+        );
+        assert_eq!(descriptor.file_id, None);
+        let snapshot: JsonValue = serde_json::from_str(
+            descriptor
+                .snapshot_content
+                .as_deref()
+                .expect("descriptor snapshot"),
+        )
+        .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "existing.md");
+    }
+
+    #[tokio::test]
+    async fn execute_sql_lix_file_metadata_fast_path_validates_before_staging() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3)",
+            &[
+                Value::Text("/invalid.md".to_string()),
+                Value::Blob(b"data".to_vec()),
+                Value::Json(json!(["not", "an", "object"])),
+            ],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("non-object metadata should fail before the fast writer scans or stages");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_lix_file_metadata_do_nothing_stays_on_datafusion() {
+        let (mut ctx, _, _) = counting_write_context(Vec::new());
+        let sql = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+                   VALUES ($1, $2, $3) ON CONFLICT (path) DO NOTHING";
+        let plan = create_write_logical_plan(&mut ctx, sql)
+            .await
+            .expect("metadata DO NOTHING should plan");
+        let crate::sql2::exec::SqlLogicalPlan::Write(plan) = plan else {
+            panic!("metadata DO NOTHING should produce a write plan");
+        };
+
+        assert!(
+            !crate::sql2::exec::bound_public_write::supports_bound_public_write(&plan.plan),
+            "metadata DO NOTHING must preserve DataFusion's skipped-row validation semantics"
+        );
     }
 
     #[tokio::test]
