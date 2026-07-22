@@ -3831,7 +3831,11 @@ async fn render_plugin_files_for_sql(
                         .owner_change_id_for_file(&file_key)
                         .expect("rendered plugin owner should have a change id")
                         .to_string(),
-                    rows: active_state.clone(),
+                    // Rendering only borrows the materialized state and this
+                    // is its final consumer. Move the row graph into the
+                    // session acknowledgement instead of deep-cloning every
+                    // entity on each exact blob read.
+                    rows: active_state.into(),
                 },
             );
         }
