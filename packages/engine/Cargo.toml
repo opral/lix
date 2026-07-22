@@ -64,6 +64,12 @@ path = "benches/slatedb_file_api.rs"
 harness = false
 required-features = ["slatedb"]
 
+[[bench]]
+name = "large_blob_updates"
+path = "benches/large_blob_updates.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"

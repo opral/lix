@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use crate::catalog::CatalogFingerprint;
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
+use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
 use crate::telemetry::TelemetrySink;
@@ -23,6 +25,7 @@ pub struct SessionTransaction<StorageImpl: Storage = Memory> {
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,
     observe_invalidation: Arc<ObserveInvalidation>,
+    pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
     write_access: Option<SessionWriteAccess>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
@@ -49,6 +52,7 @@ where
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
         )
         .await
@@ -69,6 +73,7 @@ where
             runtime_functions: opened.runtime_functions,
             transaction_manager: self.transaction_manager(),
             observe_invalidation: Arc::clone(&self.observe_invalidation),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             _deterministic_runtime_guard: deterministic_runtime_guard,
             write_access: Some(write_access),
             telemetry: self.telemetry.clone(),

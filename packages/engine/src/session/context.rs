@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
@@ -11,7 +12,7 @@ use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
 };
-use crate::catalog::CatalogContext;
+use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
@@ -23,7 +24,7 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
@@ -60,6 +61,7 @@ pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) file_views: SessionFileViews,
@@ -81,6 +83,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -96,6 +99,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             observe_coordinator,
@@ -115,6 +119,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -132,6 +137,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             observe_coordinator,
@@ -149,6 +155,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -164,6 +171,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             observe_coordinator,
@@ -183,6 +191,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -200,6 +209,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             file_views,
@@ -464,6 +474,7 @@ where
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
         )
         .await?;
@@ -533,12 +544,13 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
-    pub(super) visible_schemas: Vec<JsonValue>,
+    pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) file_views: Option<SessionFileViews>,
 }
 
+#[async_trait]
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
@@ -590,8 +602,11 @@ where
         Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
     }
 
-    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        Ok(self.visible_schemas.clone())
+    async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        let live_state = self.live_state();
+        self.catalog_context
+            .schema_jsons_for_sql_read_planning(live_state.as_ref(), self.active_branch_id)
+            .await
     }
 
     fn plugin_host(&self) -> PluginRuntimeHost {
