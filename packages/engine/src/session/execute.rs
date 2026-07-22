@@ -675,19 +675,13 @@ where
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
-                let visible_schemas = self
-                    .catalog_context
-                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                    .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
-                    visible_schemas,
+                    catalog_context: Arc::clone(&self.catalog_context),
                     functions: FunctionProviderHandle::system(),
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
@@ -730,7 +724,6 @@ where
                 }
                 drop(read_session);
                 drop(ctx);
-                drop(live_state);
                 let file_view_mutations = file_view_collector
                     .map(|collector| collector.plugin_file_mutations())
                     .unwrap_or_default();
@@ -831,19 +824,13 @@ where
                         Vec::new(),
                     ));
                 }
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
-                let visible_schemas = self
-                    .catalog_context
-                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                    .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
-                    visible_schemas,
+                    catalog_context: Arc::clone(&self.catalog_context),
                     functions: FunctionProviderHandle::system(),
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
@@ -882,7 +869,6 @@ where
                 }
                 drop(read_session);
                 drop(ctx);
-                drop(live_state);
                 let file_view_mutations = file_view_collector
                     .map(|collector| collector.plugin_file_mutations())
                     .unwrap_or_default();
@@ -1001,17 +987,13 @@ where
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
         let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-        let visible_schemas = self
-            .catalog_context
-            .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-            .await?;
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
             read_store,
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
-            visible_schemas,
+            catalog_context: Arc::clone(&self.catalog_context),
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
             file_views: file_view_collector.clone(),
@@ -1591,7 +1573,10 @@ where
 }
 
 fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
-    if error.code.starts_with("LIX_ERROR_PATH_") && sql_uses_public_filesystem_path_surface(sql) {
+    if (error.code.starts_with("LIX_ERROR_PATH_") && sql_uses_public_filesystem_path_surface(sql))
+        || (error.code == LixError::CODE_SCHEMA_DEFINITION
+            && error.message.to_ascii_lowercase().contains("system schema"))
+    {
         return LixError {
             code: LixError::CODE_INVALID_PARAM.to_string(),
             ..error
@@ -1869,6 +1854,117 @@ mod tests {
             .await
             .expect("information_schema should retain catalog-wide visibility");
         assert!(catalog.rows()[0].get::<i64>("surfaces").unwrap() > 1);
+    }
+
+    #[tokio::test]
+    async fn read_provider_selection_loads_storage_catalog_only_for_dynamic_visibility() {
+        let session = open_session().await;
+        let schema_loads = || {
+            session
+                .catalog_context
+                .sql_read_schema_load_count_for_test()
+        };
+
+        let before = schema_loads();
+        session
+            .execute("SELECT 1 AS one", &[])
+            .await
+            .expect("table-free read should execute");
+        assert_eq!(schema_loads(), before, "SELECT 1 needs no SQL catalog");
+
+        session
+            .execute("SELECT COUNT(*) AS rows FROM lix_key_value", &[])
+            .await
+            .expect("fixed entity surface should execute");
+        assert_eq!(
+            schema_loads(),
+            before,
+            "fixed entity metadata comes from compile-time schemas"
+        );
+
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_key_value_history \
+                 WHERE lixcol_start_commit_id = lix_active_branch_commit_id()",
+                &[],
+            )
+            .await
+            .expect("fixed history surface should execute");
+        assert_eq!(
+            schema_loads(),
+            before,
+            "fixed history metadata comes from compile-time schemas"
+        );
+
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_key_value AS kv \
+                 JOIN lix_state AS state ON false",
+                &[],
+            )
+            .await
+            .expect("join of fixed surfaces should execute");
+        assert_eq!(
+            schema_loads(),
+            before,
+            "a join remains storage-free when every table is fixed"
+        );
+
+        session
+            .execute(
+                "SELECT COUNT(*) AS surfaces FROM information_schema.tables",
+                &[],
+            )
+            .await
+            .expect("information schema should execute");
+        assert_eq!(
+            schema_loads(),
+            before + 1,
+            "catalog-wide visibility must load dynamic schemas"
+        );
+
+        let custom_schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "custom_catalog_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false,
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(custom_schema.to_string())],
+            )
+            .await
+            .expect("custom schema should register");
+        let before_custom_read = schema_loads();
+
+        session
+            .execute("SELECT COUNT(*) AS rows FROM custom_catalog_probe", &[])
+            .await
+            .expect("custom entity should execute");
+        assert_eq!(
+            schema_loads(),
+            before_custom_read + 1,
+            "custom entity metadata must load the visible catalog"
+        );
+
+        let before_mixed_join = schema_loads();
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_key_value AS kv \
+                 JOIN custom_catalog_probe AS custom ON false",
+                &[],
+            )
+            .await
+            .expect("mixed fixed/custom join should execute");
+        assert_eq!(
+            schema_loads(),
+            before_mixed_join + 1,
+            "one custom table makes the whole session use the visible catalog"
+        );
     }
 
     #[tokio::test]

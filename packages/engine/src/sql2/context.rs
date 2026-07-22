@@ -51,6 +51,7 @@ pub(crate) struct ChangelogQuerySource<S> {
 /// `SqlWriteExecutionContext` so transaction-scoped reads and staging stay in
 /// the transaction capability instead of flowing through committed read
 /// sources.
+#[async_trait]
 pub(crate) trait SqlExecutionContext {
     type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
 
@@ -65,7 +66,9 @@ pub(crate) trait SqlExecutionContext {
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
-    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+    /// Loads runtime-defined SQL entity metadata when provider selection could
+    /// not be satisfied entirely by compile-time system surfaces.
+    async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
