@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentskills.io/ax-eval/index.schema.json",
+  "title": "ax-eval per-tool index",
+  "description": "Index of all ax-eval rounds for a single tool. Newest entry first. Updated atomically (write to index.json.tmp then rename).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "tool_slug", "rounds"],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "const": 1
+    },
+    "tool_slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "rounds": {
+      "type": "array",
+      "description": "Newest first.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ts", "name", "dir", "median_final", "success_rate"],
+        "properties": {
+          "ts": { "type": "string", "format": "date-time" },
+          "name": { "type": "string", "description": "Slugified round name." },
+          "dir": {
+            "type": "string",
+            "description": "Directory name relative to ~/.ax-eval/{tool_slug}/, e.g. '2026-04-16T20:11:03Z_after-readme-rewrite'."
+          },
+          "median_final": { "type": "number", "minimum": 0, "maximum": 100 },
+          "success_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    }
+  }
+}

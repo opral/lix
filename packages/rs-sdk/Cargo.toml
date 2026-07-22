@@ -35,6 +35,10 @@ notify-debouncer-full = { version = "0.7.0", default-features = false, features 
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
+lix_rocksdb_storage.workspace = true
+lix_slatedb_storage.workspace = true
+object_store = { version = "0.14", default-features = false, features = ["fs"] }
+plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
@@ -45,6 +49,7 @@ zip = { version = "8", default-features = false }
 default = ["default_wasm_runtime"]
 default_wasm_runtime = ["dep:blake3", "dep:lru", "dep:wasmtime", "dep:wasmtime-wasi"]
 local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
+profile_wasm_memory = []
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
 
 [[example]]
@@ -66,7 +71,7 @@ required-features = ["sqlite"]
 name = "profile_merge_10k"
 path = "benches/profile_merge_10k.rs"
 harness = false
-required-features = ["sqlite"]
+required-features = ["default_wasm_runtime", "local_filesystem", "profile_wasm_memory"]
 
 [[example]]
 name = "profile_fs_open"
