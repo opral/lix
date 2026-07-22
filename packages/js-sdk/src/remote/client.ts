@@ -36,6 +36,10 @@ import { readSseEvents } from "./sse.js";
 const OBSERVE_RETRY_BASE_MS = 100;
 const OBSERVE_RETRY_MAX_MS = 5_000;
 const REMOTE_SESSION_HEADER = "Lix-Session-Id";
+const MIN_COMPRESSIBLE_JSON_BYTES = 32 * 1024;
+const COMPRESSION_SAMPLE_BYTES = 32 * 1024;
+const MAX_COMPRESSION_SAMPLE_RATIO = 0.7;
+const MAX_COMPRESSED_BODY_RATIO = 0.9;
 
 export async function openRemoteLixBinding(
 	options: RemoteLixServerOptions,
@@ -254,11 +258,23 @@ class RemoteLixBinding implements LixBinding {
 		if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
 		else headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
 		headers.set("accept", "application/json");
-		if (init.body !== undefined) headers.set("content-type", "application/json");
+		headers.delete("content-encoding");
+		let requestInit = init;
+		if (init.body !== undefined) {
+			headers.set("content-type", "application/json");
+			if (
+				typeof init.body === "string" &&
+				init.body.length >= MIN_COMPRESSIBLE_JSON_BYTES
+			) {
+				const prepared = await prepareJsonRequestBody(init.body);
+				requestInit = { ...init, body: prepared.body };
+				if (prepared.compressed) headers.set("content-encoding", "gzip");
+			}
+		}
 		let response: Response;
 		try {
 			response = await this.#fetch(new URL(path, this.#baseUrl), {
-				...init,
+				...requestInit,
 				headers,
 			});
 		} catch (cause) {
@@ -300,11 +316,20 @@ class RemoteLixBinding implements LixBinding {
 		headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
 		headers.set("accept", "text/event-stream");
 		headers.set("content-type", "application/json");
+		headers.delete("content-encoding");
+		const observeBody = JSON.stringify({ subscriptions });
+		const prepared =
+			observeBody.length < MIN_COMPRESSIBLE_JSON_BYTES
+				? { body: observeBody, compressed: false }
+				: await prepareJsonRequestBody(observeBody);
+		if (prepared.compressed) {
+			headers.set("content-encoding", "gzip");
+		}
 		try {
 			return await this.#fetch(new URL("observe/multiplex", this.#baseUrl), {
 				method: "POST",
 				headers,
-				body: JSON.stringify({ subscriptions }),
+				body: prepared.body,
 				signal,
 			});
 		} catch (cause) {
@@ -700,6 +725,53 @@ class RemoteObservation implements ObserveEventsBinding {
 		this.#terminalError = error;
 		for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
 	}
+}
+
+async function prepareJsonRequestBody(
+	body: string,
+): Promise<{ body: BodyInit; compressed: boolean }> {
+	const bytes = new TextEncoder().encode(body);
+	if (bytes.byteLength < MIN_COMPRESSIBLE_JSON_BYTES) {
+		return { body, compressed: false };
+	}
+	const sample = bytes.subarray(
+		0,
+		Math.min(bytes.byteLength, COMPRESSION_SAMPLE_BYTES),
+	);
+	const compressedSample = await gzipBytes(sample);
+	if (
+		compressedSample.byteLength >
+		sample.byteLength * MAX_COMPRESSION_SAMPLE_RATIO
+	) {
+		return { body, compressed: false };
+	}
+	const compressed = await gzipBytes(bytes);
+	if (compressed.byteLength > bytes.byteLength * MAX_COMPRESSED_BODY_RATIO) {
+		return { body, compressed: false };
+	}
+	const transportBody = new ArrayBuffer(compressed.byteLength);
+	new Uint8Array(transportBody).set(compressed);
+	return { body: transportBody, compressed: true };
+}
+
+async function gzipBytes(bytes: Uint8Array): Promise<Uint8Array> {
+	const CompressionStreamConstructor = (
+		globalThis as typeof globalThis & {
+			CompressionStream?: new (
+				format: "gzip",
+			) => TransformStream<Uint8Array, Uint8Array>;
+		}
+	).CompressionStream;
+	if (typeof CompressionStreamConstructor === "function") {
+		const stream = new CompressionStreamConstructor("gzip");
+		const output = new Response(stream.readable).arrayBuffer();
+		const writer = stream.writable.getWriter();
+		await writer.write(bytes);
+		await writer.close();
+		return new Uint8Array(await output);
+	}
+	const { gzipSync } = await import("fflate");
+	return gzipSync(bytes, { level: 1 });
 }
 
 async function resolveHeaders(

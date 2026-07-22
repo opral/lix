@@ -1,4 +1,5 @@
 import { expect, test, vi } from "vitest";
+import { gunzipSync } from "fflate";
 import { openLix } from "../index.js";
 
 test("remote mode uses the workspace protocol without loading a local engine", async () => {
@@ -98,6 +99,72 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	);
 	expect(requests[3]?.method).toBe("DELETE");
 	expect(requests[3]?.headers.get("lix-session-id")).toBe("session-1");
+});
+
+test("remote mode compresses only large compressible JSON requests", async () => {
+	const executeRequests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (pathname.endsWith("/lix/v1/execute")) {
+					executeRequests.push(request.clone());
+					return Response.json({
+						columns: [],
+						rows: [],
+						rowsAffected: 1,
+						notices: [],
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				throw new Error(`Unexpected request: ${request.url}`);
+			},
+		},
+	});
+
+	const compressible = new Uint8Array(100 * 1024).fill(0x41);
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
+		compressible,
+		"file-1",
+	]);
+	expect(executeRequests[0]?.headers.get("content-encoding")).toBe("gzip");
+	const compressedBody = new Uint8Array(
+		await executeRequests[0]!.arrayBuffer(),
+	);
+	const decodedBody = JSON.parse(
+		new TextDecoder().decode(gunzipSync(compressedBody)),
+	);
+	expect(decodedBody.params[0].base64).toBe("QUFB".repeat(34_133) + "QQ==");
+
+	let random = 0x1234_5678;
+	const incompressible = Uint8Array.from({ length: 100 * 1024 }, () => {
+		random ^= random << 13;
+		random ^= random >>> 17;
+		random ^= random << 5;
+		return random & 0xff;
+	});
+	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
+		incompressible,
+		"file-1",
+	]);
+	expect(executeRequests[1]?.headers.has("content-encoding")).toBe(false);
+	expect(await executeRequests[1]?.json()).toMatchObject({
+		params: [{ kind: "blob" }, { kind: "text", value: "file-1" }],
+	});
+
+	await lix.close();
 });
 
 test("remote executeBatch uses the first-class atomic batch endpoint", async () => {
