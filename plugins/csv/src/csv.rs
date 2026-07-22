@@ -357,7 +357,7 @@ pub(crate) fn render_projection(projection: &Projection) -> Result<Vec<u8>, Plug
     }
     let mut writer = writer_builder.from_writer(Vec::new());
 
-    for row in projection.to_rows() {
+    for row in &projection.rows {
         writer.write_record(&row.cells).map_err(|error| {
             PluginError::Internal(format!("failed to render CSV row '{}': {error}", row.id))
         })?;
