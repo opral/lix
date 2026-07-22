@@ -34,8 +34,9 @@ pub trait Storage: Send + Sync {
     /// Opens one storage-owned write transaction.
     ///
     /// The storage is the concurrency boundary. Implementations are responsible
-    /// for their own durability and write concurrency semantics. A storage that
-    /// cannot safely support overlapping write transactions must serialize,
+    /// for their own persistence and write concurrency semantics. A storage may
+    /// publish a commit before its background durability boundary. A storage
+    /// that cannot safely support overlapping write transactions must serialize,
     /// use native transactional locking, or reject the second writer with a
     /// deterministic error.
     ///

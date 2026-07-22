@@ -7,8 +7,8 @@
 //! `Transaction` directly or using session-level read helpers inside writes.
 //!
 //! MVP boundary: session close can cancel queued or pre-boundary writes until
-//! the durable commit point-of-no-return. After that point, close waits for
-//! commit completion. Durability itself is the storage's responsibility.
+//! the storage commit point-of-no-return. After that point, close waits for
+//! commit completion. Crash persistence is provider-defined.
 
 mod context;
 mod create_branch;

@@ -68,7 +68,7 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
         let delay_label = format!("{delay_ms}ms");
 
         group.bench_with_input(
-            BenchmarkId::new("upload_overwrite_file_after_preload", &delay_label),
+            BenchmarkId::new("accept_overwrite_file_after_preload", &delay_label),
             &delay,
             |b, &delay| {
                 b.iter_custom(|iterations| {
@@ -146,10 +146,16 @@ fn maybe_print_singleton_write_accounting(runtime: &tokio::runtime::Runtime) {
     let bulk_started = Instant::now();
     let bulk_accounting = runtime.block_on(fixture.transaction.insert_all_accounting());
     let bulk_elapsed = bulk_started.elapsed();
+    let bulk_flush_started = Instant::now();
+    runtime
+        .block_on(fixture.storage.flush())
+        .expect("flush singleton bulk insert");
+    let bulk_flush_elapsed = bulk_flush_started.elapsed();
     print_singleton_sample(
         "insert_1k",
         Duration::ZERO,
         bulk_elapsed,
+        bulk_flush_elapsed,
         bulk_accounting,
         &fixture.object_store.write_stats(),
     );
@@ -159,53 +165,60 @@ fn maybe_print_singleton_write_accounting(runtime: &tokio::runtime::Runtime) {
         let mut elapsed = Vec::with_capacity(samples);
         let mut logical_value_bytes = 0u64;
         let mut staged_puts = 0u64;
-        let mut object_put_calls = 0u64;
-        let mut object_put_bytes = 0u64;
-        let mut wal_put_calls = 0u64;
-        let mut wal_put_bytes = 0u64;
+        fixture.object_store.reset_write_stats();
         for _ in 0..samples {
-            fixture.object_store.reset_write_stats();
             let started = Instant::now();
             let accounting = runtime.block_on(fixture.transaction.update_one_by_pk_accounting());
             elapsed.push(started.elapsed());
-            let stats = fixture.object_store.write_stats();
-            let wal = stats.wal_totals();
             logical_value_bytes += accounting.written_bytes;
             staged_puts += accounting.staged_puts;
-            object_put_calls += stats.put_calls;
-            object_put_bytes += stats.put_bytes;
-            wal_put_calls += wal.put_calls;
-            wal_put_bytes += wal.put_bytes;
         }
+        let flush_started = Instant::now();
+        runtime
+            .block_on(fixture.storage.flush())
+            .expect("flush singleton update burst");
+        let flush_elapsed = flush_started.elapsed();
+        let stats = fixture.object_store.write_stats();
+        let wal = stats.wal_totals();
         elapsed.sort_unstable();
         let p50 = percentile(&elapsed, 50);
         let p95 = percentile(&elapsed, 95);
         let sample_count = u64::try_from(samples).expect("sample count fits u64");
         println!(
-            "slatedb-singleton-update delay_ms={} samples={samples} p50_ns={} p95_ns={} staged_puts_avg={} logical_value_bytes_avg={} object_put_calls_avg={} object_put_bytes_avg={} wal_put_calls_avg={} wal_put_bytes_avg={}",
+            "slatedb-singleton-update delay_ms={} samples={samples} accepted_p50_ns={} accepted_p95_ns={} flush_ns={} staged_puts_avg={} logical_value_bytes_avg={} object_put_calls_total={} object_put_bytes_total={} wal_put_calls_total={} wal_put_bytes_total={}",
             delay.as_millis(),
             p50.as_nanos(),
             p95.as_nanos(),
+            flush_elapsed.as_nanos(),
             staged_puts / sample_count,
             logical_value_bytes / sample_count,
-            object_put_calls / sample_count,
-            object_put_bytes / sample_count,
-            wal_put_calls / sample_count,
-            wal_put_bytes / sample_count,
+            stats.put_calls,
+            stats.put_bytes,
+            wal.put_calls,
+            wal.put_bytes,
         );
     }
 
     let mut delete_fixture = runtime.block_on(SingletonWriteFixture::new());
     runtime.block_on(delete_fixture.transaction.seed());
+    runtime
+        .block_on(delete_fixture.storage.flush())
+        .expect("flush singleton delete seed");
     delete_fixture.object_store.reset_write_stats();
     let delete_started = Instant::now();
     let delete_accounting =
         runtime.block_on(delete_fixture.transaction.delete_one_by_pk_accounting());
     let delete_elapsed = delete_started.elapsed();
+    let delete_flush_started = Instant::now();
+    runtime
+        .block_on(delete_fixture.storage.flush())
+        .expect("flush singleton delete");
+    let delete_flush_elapsed = delete_flush_started.elapsed();
     print_singleton_sample(
         "delete_one",
         Duration::ZERO,
         delete_elapsed,
+        delete_flush_elapsed,
         delete_accounting,
         &delete_fixture.object_store.write_stats(),
     );
@@ -215,15 +228,17 @@ fn maybe_print_singleton_write_accounting(runtime: &tokio::runtime::Runtime) {
 fn print_singleton_sample(
     operation: &str,
     delay: Duration,
-    elapsed: Duration,
+    accepted: Duration,
+    flush: Duration,
     accounting: BenchWriteAccounting,
     stats: &ObjectStoreWriteStats,
 ) {
     let wal = stats.wal_totals();
     println!(
-        "slatedb-singleton-sample operation={operation} delay_ms={} elapsed_ns={} logical_rows={} staged_puts={} staged_deletes={} logical_value_bytes={} object_put_calls={} object_put_bytes={} wal_put_calls={} wal_put_bytes={}",
+        "slatedb-singleton-sample operation={operation} delay_ms={} accepted_ns={} flush_ns={} logical_rows={} staged_puts={} staged_deletes={} logical_value_bytes={} object_put_calls={} object_put_bytes={} wal_put_calls={} wal_put_bytes={}",
         delay.as_millis(),
-        elapsed.as_nanos(),
+        accepted.as_nanos(),
+        flush.as_nanos(),
         accounting.logical_rows,
         accounting.staged_puts,
         accounting.staged_deletes,
@@ -244,6 +259,7 @@ fn percentile(samples: &[Duration], percentile: usize) -> Duration {
 #[cfg(feature = "storage-benches")]
 struct SingletonWriteFixture {
     transaction: BenchTransactionFixture<SlateDB>,
+    storage: SlateDB,
     object_store: Arc<DelayedObjectStore>,
 }
 
@@ -274,10 +290,16 @@ impl SingletonWriteFixture {
             })
             .collect();
         let transaction =
-            BenchTransactionFixture::new_deterministic(StorageAdapter::new(storage), rows).await;
+            BenchTransactionFixture::new_deterministic(StorageAdapter::new(storage.clone()), rows)
+                .await;
+        storage
+            .flush()
+            .await
+            .expect("flush singleton accounting setup");
         object_store.reset_write_stats();
         Self {
             transaction,
+            storage,
             object_store,
         }
     }
@@ -289,14 +311,23 @@ fn maybe_print_write_accounting(runtime: &tokio::runtime::Runtime) {
     }
     let fixture = runtime.block_on(UploadBenchFixture::seeded(Duration::ZERO));
     black_box(runtime.block_on(fixture.upload_overwrite_file()));
+    runtime
+        .block_on(fixture.storage.flush())
+        .expect("flush upload accounting warmup");
     fixture.object_store.reset_write_stats();
     let started = Instant::now();
     let rows_affected = runtime.block_on(fixture.upload_overwrite_file());
-    let elapsed = started.elapsed();
+    let accepted = started.elapsed();
+    let flush_started = Instant::now();
+    runtime
+        .block_on(fixture.storage.flush())
+        .expect("flush upload accounting write");
+    let flush = flush_started.elapsed();
     let stats = fixture.object_store.write_stats();
     println!(
-        "slatedb-write-accounting rows_affected={rows_affected} elapsed_ns={} put_calls={} put_bytes={}",
-        elapsed.as_nanos(),
+        "slatedb-write-accounting rows_affected={rows_affected} accepted_ns={} flush_ns={} put_calls={} put_bytes={}",
+        accepted.as_nanos(),
+        flush.as_nanos(),
         stats.put_calls,
         stats.put_bytes,
     );
@@ -532,6 +563,7 @@ impl SeededStore {
 
 struct UploadBenchFixture {
     session: SessionContext<SlateDB>,
+    storage: SlateDB,
     _cache_dir: TempDir,
     object_store: Arc<DelayedObjectStore>,
     next_upload_version: AtomicU64,
@@ -550,7 +582,7 @@ impl UploadBenchFixture {
             cached_object_store_options(&cache_dir),
         )
         .expect("reopen delayed SlateDB storage for upload benchmark");
-        let engine = Engine::new(storage)
+        let engine = Engine::new(storage.clone())
             .await
             .expect("open SlateDB upload benchmark engine");
         let session = engine
@@ -561,6 +593,7 @@ impl UploadBenchFixture {
 
         Self {
             session,
+            storage,
             _cache_dir: cache_dir,
             object_store: seeded.object_store,
             next_upload_version: AtomicU64::new(0),
