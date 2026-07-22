@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Lix Schema Definition",
-  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions) and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers to required string properties) to make the schema writable. Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
+  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions) and `additionalProperties: false`; runtime registrations must not collide with fixed system SQL surfaces. Add `x-lix-primary-key` (array of JSON Pointers to required string properties) to make the schema writable. Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
   "examples": [
     {
       "x-lix-key": "library_book",
@@ -145,7 +145,7 @@
         "x-lix-key": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_]*$",
-          "description": "The schema identifier. Must be snake_case (lowercase, underscores) to safely embed in SQL identifiers. Prefix keys with a plugin, app, or domain namespace such as `library_book` or `csv_plugin_cell` to avoid collisions with other schemas.",
+          "description": "The schema identifier. Must be snake_case (lowercase, underscores) to safely embed in SQL identifiers. Runtime registrations must not generate base, `_by_branch`, or `_history` table names that collide with fixed system SQL surfaces. Prefix application keys with a plugin, app, or domain namespace such as `library_book` or `csv_plugin_cell` to avoid collisions with other schemas.",
           "examples": [
             "library_book",
             "csv_plugin_cell"

@@ -1469,7 +1469,7 @@ fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> L
     crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
-fn query_result_from_batches(
+pub(crate) fn query_result_from_batches(
     result_fields: &[Field],
     batches: &[RecordBatch],
 ) -> Result<SqlQueryResult, LixError> {
@@ -1838,6 +1838,7 @@ mod tests {
         schema_definitions: Vec<JsonValue>,
     }
 
+    #[async_trait]
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
         type ReadStore = SharedStorageAdapterRead<MemoryRead>;
 
@@ -1888,7 +1889,7 @@ mod tests {
             Arc::new(DummyBranchRefReader)
         }
 
-        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
     }

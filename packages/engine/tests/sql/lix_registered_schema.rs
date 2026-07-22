@@ -211,7 +211,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_system_schema_key,
+    lix_registered_schema_insert_rejects_fixed_system_surface_collisions,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -222,24 +222,50 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
+        for (schema_key, collision_kind) in [
+            ("lix_file", "fixed base surface"),
+            ("lix_key_value_history", "generated system history surface"),
+        ] {
+            let schema = json!({
+                "x-lix-key": schema_key,
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false,
+            });
+            let error = session
+                .execute(
+                    "INSERT INTO lix_registered_schema \
+                     (value, lixcol_global, lixcol_untracked) \
+                     VALUES ($1, false, false)",
+                    &[Value::Json(schema)],
+                )
+                .await
+                .expect_err(collision_kind);
+
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+            assert!(error.message.contains("fixed system schema"), "{error:?}");
+            assert!(error.message.contains(schema_key), "{error:?}");
+        }
+
+        let noncolliding_schema = json!({
+            "x-lix-key": "lix_plugin_note",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false,
+        });
+        session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 lix_json('{\"x-lix-key\":\"lix_change\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
-                &[],
+                "INSERT INTO lix_registered_schema \
+                 (value, lixcol_global, lixcol_untracked) \
+                 VALUES ($1, false, false)",
+                &[Value::Json(noncolliding_schema)],
             )
             .await
-            .expect_err("system schema keys should not be user-registerable");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            error.message.contains("system schema"),
-            "unexpected error: {error:?}"
-        );
+            .expect("a noncolliding lix-prefixed key remains registerable");
     }
 );
 

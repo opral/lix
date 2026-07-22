@@ -1822,6 +1822,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     plugin_host: PluginRuntimeHost,
 }
 
+#[async_trait]
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
@@ -1884,7 +1885,7 @@ where
         })
     }
 
-    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+    async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.visible_schemas.clone())
     }
 

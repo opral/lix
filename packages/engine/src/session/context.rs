@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
@@ -543,12 +544,13 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
-    pub(super) visible_schemas: Vec<JsonValue>,
+    pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) file_views: Option<SessionFileViews>,
 }
 
+#[async_trait]
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
@@ -600,8 +602,11 @@ where
         Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
     }
 
-    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        Ok(self.visible_schemas.clone())
+    async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        let live_state = self.live_state();
+        self.catalog_context
+            .schema_jsons_for_sql_read_planning(live_state.as_ref(), self.active_branch_id)
+            .await
     }
 
     fn plugin_host(&self) -> PluginRuntimeHost {

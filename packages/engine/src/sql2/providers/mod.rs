@@ -32,7 +32,8 @@ use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 use datafusion::catalog::TableProvider;
 
 pub(crate) use file::{
-    FastLixFilePathWriteConflict, execute_fast_lix_file_data_update_by_id,
+    ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
+    execute_exact_lix_file_read, execute_fast_lix_file_data_update_by_id,
     execute_fast_lix_file_path_writes,
 };
 pub(crate) use spec::DmlReturning;
@@ -117,12 +118,21 @@ pub(crate) async fn register_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
+    if selection.is_empty() {
+        return Ok(());
+    }
+    let dynamic_catalog;
+    let catalog = if selection.requires_visible_schemas() {
+        dynamic_catalog = PublicCatalog::from_visible_schemas(&ctx.load_visible_schemas().await?)?;
+        &dynamic_catalog
+    } else {
+        PublicCatalog::fixed_system()
+    };
     register_read_from_catalog(
         session,
         ctx,
         branch_ref,
-        &catalog,
+        catalog,
         ReadProviderScope::All,
         selection,
     )
@@ -147,10 +157,32 @@ pub(crate) enum ReadProviderSelection {
 }
 
 impl ReadProviderSelection {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Only(names) if names.is_empty())
+    }
+
     fn includes(&self, surface: &PublicSurfaceContract) -> bool {
         match self {
             Self::All => true,
             Self::Only(names) => names.contains(&surface.name),
+        }
+    }
+
+    /// Whether resolving this selection requires the storage-backed catalog.
+    ///
+    /// Table-free reads and references satisfied by the immutable system catalog
+    /// can install providers without scanning `lix_registered_schema` rows.
+    /// Runtime registration rejects schema keys whose generated table names
+    /// would shadow these fixed providers.
+    /// `All` and every unknown name remain conservative: they load the full
+    /// visible catalog so information-schema, custom entities, and normal
+    /// unknown-table errors keep their current semantics.
+    fn requires_visible_schemas(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(names) => names
+                .iter()
+                .any(|name| PublicCatalog::fixed_system().surface(name).is_none()),
         }
     }
 }
@@ -670,6 +702,28 @@ mod tests {
         assert_eq!(
             selection_for_sql(&["SHOW TABLES"]),
             ReadProviderSelection::All
+        );
+    }
+
+    #[test]
+    fn visible_schema_loading_boundary_is_conservative() {
+        assert!(!selection_for_sql(&["SELECT 1"]).requires_visible_schemas());
+        assert!(!selection_for_sql(&["SELECT * FROM lix_key_value"]).requires_visible_schemas());
+        assert!(
+            !selection_for_sql(&["SELECT * FROM lix_key_value_history"]).requires_visible_schemas()
+        );
+        assert!(
+            !selection_for_sql(&["SELECT * FROM lix_key_value JOIN lix_state ON false"])
+                .requires_visible_schemas()
+        );
+        assert!(selection_for_sql(&["SELECT * FROM custom_entity"]).requires_visible_schemas());
+        assert!(
+            selection_for_sql(&["SELECT * FROM lix_key_value JOIN custom_entity ON false",])
+                .requires_visible_schemas()
+        );
+        assert!(
+            selection_for_sql(&["SELECT * FROM information_schema.tables"])
+                .requires_visible_schemas()
         );
     }
 
