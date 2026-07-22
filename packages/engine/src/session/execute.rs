@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
@@ -17,8 +17,9 @@ use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, LimitClause, Select, SelectFlavor, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor,
+    BinaryOperator, Expr, GroupByExpr, Ident, LimitClause, OrderByKind, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableAlias, TableFactor,
+    Value as SqlValue, Visit, Visitor,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -484,11 +485,16 @@ where
         }
 
         let exact_lix_file_read = exact_lix_file_read_route(&statement, params);
+        let late_file_data_read = exact_lix_file_read
+            .is_none()
+            .then(|| late_materialized_lix_file_data_read(&statement))
+            .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params)
             || matches!(
                 &exact_lix_file_read,
                 Some(ExactLixFileRead::PathDataBatch(_))
-            );
+            )
+            || late_file_data_read.is_some();
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -524,6 +530,7 @@ where
                     params,
                     acknowledge_file_views,
                     exact_lix_file_read,
+                    late_file_data_read,
                     has_durable_runtime_function,
                 )
                 .await
@@ -981,6 +988,7 @@ where
         params: &[Value],
         acknowledge_file_views: bool,
         exact_lix_file_read: Option<ExactLixFileRead>,
+        late_file_data_read: Option<LateMaterializedLixFileDataRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
         (
@@ -1053,9 +1061,13 @@ where
         let functions = runtime_functions
             .as_ref()
             .map_or_else(FunctionProviderHandle::system, FunctionContext::provider);
+        let (statement, late_file_data_column) = match late_file_data_read {
+            Some(plan) => (*plan.statement, Some(plan.data_column_index)),
+            None => (statement, None),
+        };
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
-            read_store,
+            read_store: read_store.clone(),
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
@@ -1065,8 +1077,29 @@ where
             file_views: file_view_collector.clone(),
         };
 
-        let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
+        let mut query =
+            sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
         drop(ctx);
+        if let Some(data_column_index) = late_file_data_column {
+            let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let branch_ref: Arc<dyn BranchRefReader> =
+                Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+            let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
+                Arc::new(self.binary_cas.reader(read_store));
+            hydrate_lix_file_data_result(
+                &active_branch_id,
+                Arc::clone(&live_state),
+                filesystem_path_index,
+                branch_ref,
+                blob_reader,
+                self.plugin_host.clone(),
+                file_view_collector.clone(),
+                &mut query,
+                data_column_index,
+            )
+            .await?;
+        }
         drop(live_state);
         let file_view_mutations = file_view_collector
             .map(|collector| collector.plugin_file_mutations())
@@ -1079,6 +1112,78 @@ where
             file_view_mutations,
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_lix_file_data_result(
+    active_branch_id: &str,
+    live_state: Arc<dyn crate::live_state::LiveStateReader>,
+    filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    plugin_host: crate::plugin::PluginRuntimeHost,
+    session_file_views: Option<sql2::SessionFileViews>,
+    query: &mut SqlQueryResult,
+    data_column_index: usize,
+) -> Result<(), LixError> {
+    let mut paths = BTreeSet::new();
+    for row in &query.rows {
+        let Some(Value::Text(path)) = row.get(data_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file data placeholder was not a path",
+            ));
+        };
+        paths.insert(path.clone());
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let hydrated = sql2::execute_exact_lix_file_batch_read(
+        active_branch_id,
+        live_state,
+        filesystem_path_index,
+        branch_ref,
+        blob_reader,
+        plugin_host,
+        session_file_views,
+        &paths,
+    )
+    .await?;
+    let mut data_by_path = BTreeMap::new();
+    for mut row in hydrated.rows {
+        let [Value::Text(path), data] = row.as_mut_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file data hydration returned an invalid row",
+            ));
+        };
+        data_by_path.insert(path.clone(), std::mem::replace(data, Value::Null));
+    }
+    query.notices.extend(hydrated.notices);
+
+    for row in &mut query.rows {
+        let Some(placeholder) = row.get_mut(data_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file data result was missing its placeholder column",
+            ));
+        };
+        let Value::Text(path) = std::mem::replace(placeholder, Value::Null) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file data placeholder was not a path",
+            ));
+        };
+        *placeholder = data_by_path.remove(&path).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("late lix_file data hydration did not return '{path}'"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Runs one session SQL read using a widened storage-read lifetime.
@@ -1326,7 +1431,18 @@ struct SimplePointRead<'a> {
     exact_table_shape: bool,
 }
 
-fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<'_>> {
+struct SimpleSingleTableSelect<'a> {
+    query: &'a Query,
+    select: &'a Select,
+    table_identifier: &'a Ident,
+    table_name: String,
+    unqualified_unquoted_table: bool,
+    alias: Option<&'a TableAlias>,
+}
+
+fn simple_single_table_select(
+    statement: &DataFusionStatement,
+) -> Option<SimpleSingleTableSelect<'_>> {
     let DataFusionStatement::Statement(statement) = statement else {
         return None;
     };
@@ -1334,9 +1450,6 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
         return None;
     };
     if query.with.is_some()
-        || query.order_by.is_some()
-        || !point_read_limit_is_safe(query.limit_clause.as_ref())
-        || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
@@ -1403,19 +1516,218 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
     {
         return None;
     }
-    let table_name = name.0.last().and_then(|part| part.as_ident())?;
-    let unquoted_table = table_name.quote_style.is_none();
-    let table_name = table_name.value.to_ascii_lowercase();
+    let table_identifier = name.0.last().and_then(|part| part.as_ident())?;
+    let table_name = table_identifier.value.to_ascii_lowercase();
 
-    select.selection.as_ref()?;
-    Some(SimplePointRead {
+    Some(SimpleSingleTableSelect {
+        query,
         select,
+        table_identifier,
         table_name,
-        exact_table_shape: name.0.len() == 1
-            && unquoted_table
-            && alias.is_none()
-            && query.limit_clause.is_none(),
+        unqualified_unquoted_table: name.0.len() == 1 && table_identifier.quote_style.is_none(),
+        alias: alias.as_ref(),
     })
+}
+
+fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<'_>> {
+    let simple = simple_single_table_select(statement)?;
+    if simple.query.order_by.is_some()
+        || !point_read_limit_is_safe(simple.query.limit_clause.as_ref())
+        || simple.query.fetch.is_some()
+    {
+        return None;
+    }
+
+    simple.select.selection.as_ref()?;
+    Some(SimplePointRead {
+        select: simple.select,
+        table_name: simple.table_name,
+        exact_table_shape: simple.unqualified_unquoted_table
+            && simple.alias.is_none()
+            && simple.query.limit_clause.is_none(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LateMaterializedLixFileDataRead {
+    statement: Box<DataFusionStatement>,
+    data_column_index: usize,
+}
+
+/// Defers an unchanged `lix_file.data` projection until DataFusion has applied
+/// metadata predicates, ordering, and limits. This keeps SQL semantics in
+/// DataFusion while preventing large file bytes from entering Arrow at all.
+fn late_materialized_lix_file_data_read(
+    statement: &DataFusionStatement,
+) -> Option<LateMaterializedLixFileDataRead> {
+    let simple = simple_single_table_select(statement)?;
+    if simple.table_name != "lix_file"
+        || !simple.unqualified_unquoted_table
+        || simple.alias.is_some_and(|alias| !alias.columns.is_empty())
+    {
+        return None;
+    }
+    let qualifier = simple
+        .alias
+        .map_or(simple.table_identifier, |alias| &alias.name)
+        .clone();
+
+    let mut statement = statement.clone();
+    let DataFusionStatement::Statement(sql_statement) = &mut statement else {
+        return None;
+    };
+    let SqlStatement::Query(query) = sql_statement.as_mut() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+
+    let mut data_column_index = None;
+    let mut data_output_name = None;
+    for (index, item) in select.projection.iter_mut().enumerate() {
+        let expression = match item {
+            SelectItem::UnnamedExpr(expression)
+            | SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => expression,
+            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
+        };
+        let projected_column = direct_projection_identifier(expression)?;
+        if identifier_matches(projected_column, "data") {
+            if data_column_index.is_some() {
+                return None;
+            }
+            let (path_expression, output_name) =
+                replaceable_lix_file_data_projection(item, &qualifier)?;
+            *item = SelectItem::ExprWithAlias {
+                expr: path_expression,
+                alias: output_name.clone(),
+            };
+            data_column_index = Some(index);
+            data_output_name = Some(output_name.value.to_ascii_lowercase());
+        }
+    }
+    let data_column_index = data_column_index?;
+    let data_output_name = data_output_name?;
+
+    if select
+        .selection
+        .as_ref()
+        .is_some_and(|selection| expression_mentions_column(selection, "data"))
+    {
+        return None;
+    }
+    if let Some(order_by) = &query.order_by {
+        if order_by.interpolate.is_some() {
+            return None;
+        }
+        let OrderByKind::Expressions(expressions) = &order_by.kind else {
+            return None;
+        };
+        if expressions.iter().any(|order| {
+            order.with_fill.is_some()
+                || direct_column_name(&order.expr)
+                    .is_none_or(|column| column == "data" || column == data_output_name)
+        }) {
+            return None;
+        }
+    }
+
+    Some(LateMaterializedLixFileDataRead {
+        statement: Box::new(statement),
+        data_column_index,
+    })
+}
+
+fn replaceable_lix_file_data_projection(
+    item: &SelectItem,
+    qualifier: &Ident,
+) -> Option<(Expr, Ident)> {
+    let (expression, output_name) = match item {
+        SelectItem::UnnamedExpr(expression) => {
+            let output_name = direct_projection_identifier(expression)?.clone();
+            (expression, output_name)
+        }
+        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.clone()),
+        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
+    };
+    let path_expression = direct_file_data_path_expression(expression, qualifier)?;
+    Some((path_expression, output_name))
+}
+
+fn direct_file_data_path_expression(expression: &Expr, qualifier: &Ident) -> Option<Expr> {
+    match expression {
+        Expr::Identifier(identifier) if identifier_matches(identifier, "data") => {
+            let mut path = identifier.clone();
+            path.value = "path".to_string();
+            Some(Expr::Identifier(path))
+        }
+        Expr::CompoundIdentifier(identifiers) => {
+            let [expression_qualifier, identifier] = identifiers.as_slice() else {
+                return None;
+            };
+            if !identifiers_match(expression_qualifier, qualifier)
+                || !identifier_matches(identifier, "data")
+            {
+                return None;
+            }
+            let mut identifiers = identifiers.clone();
+            identifiers.last_mut()?.value = "path".to_string();
+            Some(Expr::CompoundIdentifier(identifiers))
+        }
+        _ => None,
+    }
+}
+
+fn direct_projection_identifier(expression: &Expr) -> Option<&Ident> {
+    match expression {
+        Expr::Identifier(identifier) => Some(identifier),
+        Expr::CompoundIdentifier(identifiers) => identifiers.last(),
+        _ => None,
+    }
+}
+
+fn identifier_matches(identifier: &Ident, expected: &str) -> bool {
+    if identifier.quote_style.is_some() {
+        identifier.value == expected
+    } else {
+        identifier.value.eq_ignore_ascii_case(expected)
+    }
+}
+
+fn identifiers_match(left: &Ident, right: &Ident) -> bool {
+    if left.quote_style.is_some() || right.quote_style.is_some() {
+        left.quote_style == right.quote_style && left.value == right.value
+    } else {
+        left.value.eq_ignore_ascii_case(&right.value)
+    }
+}
+
+fn expression_mentions_column(expression: &Expr, column: &str) -> bool {
+    let mut visitor = ColumnReferenceVisitor {
+        column,
+        found: false,
+    };
+    let _ = expression.visit(&mut visitor);
+    visitor.found
+}
+
+struct ColumnReferenceVisitor<'a> {
+    column: &'a str,
+    found: bool,
+}
+
+impl Visitor for ColumnReferenceVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if direct_column_name(expression).as_deref() == Some(self.column) {
+            self.found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2000,6 +2312,51 @@ mod tests {
     }
 
     #[test]
+    fn late_file_data_read_rewrites_only_unchanged_blob_projections() {
+        let statement = sql2::parse_statement(
+            "SELECT path, data FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2",
+        )
+        .unwrap();
+        let plan = late_materialized_lix_file_data_read(&statement).unwrap();
+        assert_eq!(plan.data_column_index, 1);
+        assert_eq!(
+            plan.statement.to_string(),
+            "SELECT path, path AS data FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2"
+        );
+
+        let aliased = sql2::parse_statement(
+            "SELECT file.data AS bytes, file.path AS label FROM lix_file AS file WHERE file.path LIKE $1 ORDER BY file.path",
+        )
+        .unwrap();
+        let plan = late_materialized_lix_file_data_read(&aliased).unwrap();
+        assert_eq!(plan.data_column_index, 0);
+        assert_eq!(
+            plan.statement.to_string(),
+            "SELECT file.path AS bytes, file.path AS label FROM lix_file AS file WHERE file.path LIKE $1 ORDER BY file.path"
+        );
+
+        for sql in [
+            "SELECT path, length(data) FROM lix_file",
+            "SELECT data, upper(path) FROM lix_file",
+            "SELECT data FROM lix_file WHERE data = $1",
+            "SELECT data FROM lix_file ORDER BY data",
+            "SELECT data AS bytes FROM lix_file ORDER BY bytes",
+            "SELECT data FROM lix_file ORDER BY 1",
+            "SELECT DISTINCT data FROM lix_file",
+            "SELECT data, data FROM lix_file",
+            "SELECT * FROM lix_file",
+            "SELECT file.data FROM lix_file AS file JOIN lix_file AS other ON file.id = other.id",
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                late_materialized_lix_file_data_read(&statement),
+                None,
+                "unexpected late materialization for {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn execute_batch_classifies_only_pure_reads_for_the_fast_path() {
         let cache = sql2::SqlPlanningCache::default();
         assert!(matches!(
@@ -2107,6 +2464,50 @@ mod tests {
         assert_eq!(
             result.rows()[1].value("data").unwrap(),
             &Value::Blob(b"bravo".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn late_file_data_read_preserves_metadata_filters_order_and_limit() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4), ($5, $6)",
+                &[
+                    Value::Text("/a.txt".to_string()),
+                    Value::Blob(b"alpha".to_vec()),
+                    Value::Text("/b.txt".to_string()),
+                    Value::Blob(b"bravo".to_vec()),
+                    Value::Text("/c.txt".to_string()),
+                    Value::Blob(b"charlie".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let result = session
+            .execute(
+                "SELECT path, data FROM lix_file WHERE path LIKE $1 ORDER BY path DESC LIMIT 2",
+                &[Value::Text("%.txt".to_string())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns(), &["path", "data"]);
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("/c.txt".to_string()),
+                Value::Blob(b"charlie".to_vec()),
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Text("/b.txt".to_string()),
+                Value::Blob(b"bravo".to_vec()),
+            ]
         );
     }
 
