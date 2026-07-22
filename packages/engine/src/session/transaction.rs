@@ -49,6 +49,7 @@ where
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            self.file_views.clone(),
         )
         .await
         {

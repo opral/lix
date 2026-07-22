@@ -7,13 +7,10 @@
 use std::collections::HashMap;
 
 use crate::changelog::CommitId;
-use crate::storage::{
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ScanChunk,
-    ScanOptions, SpaceId, StorageError,
-};
-use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, StorageWriteSet};
 use crate::storage_adapter::{
-    StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId, StorageValue,
+    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageError, StorageGetManyResult,
+    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
+    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
@@ -217,7 +214,7 @@ where
         })
     }
 
-    fn staged_bytes(&self, space: SpaceId, key: &Key) -> Option<&[u8]> {
+    fn staged_bytes(&self, space: StorageSpaceId, key: &StorageKey) -> Option<&[u8]> {
         if space == TRACKED_STATE_COMMIT_ROOT_SPACE.id {
             let key = <&[u8; 16]>::try_from(key.0.as_ref()).ok()?;
             return self.commit_roots.get(key).map(AsRef::as_ref);
@@ -236,10 +233,10 @@ where
 {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
-    ) -> Result<GetManyResult, StorageError> {
+        space: StorageSpaceId,
+        keys: &[StorageKey],
+        opts: StorageGetOptions,
+    ) -> Result<StorageGetManyResult, StorageError> {
         let mut result = self.store.get_many(space, keys, opts).await?;
         if result.values.len() != keys.len() {
             return Err(StorageError::Corruption(format!(
@@ -253,9 +250,9 @@ where
                 continue;
             };
             *slot = Some(match opts.projection {
-                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-                CoreProjection::FullValue => {
-                    ProjectedValue::FullValue(Bytes::copy_from_slice(bytes))
+                StorageCoreProjection::KeyOnly => StorageProjectedValue::KeyOnly,
+                StorageCoreProjection::FullValue => {
+                    StorageProjectedValue::FullValue(Bytes::copy_from_slice(bytes))
                 }
             });
         }
@@ -264,10 +261,10 @@ where
 
     async fn scan(
         &self,
-        space: SpaceId,
-        range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        space: StorageSpaceId,
+        range: StorageKeyRange,
+        opts: StorageScanOptions,
+    ) -> Result<StorageScanChunk, StorageError> {
         if space == TRACKED_STATE_COMMIT_ROOT_SPACE.id || space == TRACKED_STATE_TREE_CHUNK_SPACE.id
         {
             return Err(StorageError::Io(

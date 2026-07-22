@@ -27,6 +27,10 @@ mod plugin_bindings {
 }
 
 const COMPILED_COMPONENT_CACHE_CAPACITY: usize = 16;
+const MAX_PLUGIN_INSTANCES: usize = 64;
+const MAX_PLUGIN_MEMORIES: usize = 1;
+const MAX_PLUGIN_TABLES: usize = 8;
+const MAX_PLUGIN_TABLE_ELEMENTS: usize = 1_000_000;
 
 pub(crate) fn runtime() -> Result<Arc<dyn WasmRuntime>, LixError> {
     Ok(Arc::new(WasmtimePluginRuntime::new()?))
@@ -320,6 +324,10 @@ fn create_store(engine: &Engine, limits: WasmLimits) -> Result<Store<WasiHostSta
     })?;
     let store_limits = StoreLimitsBuilder::new()
         .memory_size(max_memory_bytes)
+        .instances(MAX_PLUGIN_INSTANCES)
+        .memories(MAX_PLUGIN_MEMORIES)
+        .tables(MAX_PLUGIN_TABLES)
+        .table_elements(MAX_PLUGIN_TABLE_ELEMENTS)
         .build();
     let mut store = Store::new(engine, WasiHostState::new(store_limits));
     store.limiter(|state| &mut state.limits);
@@ -387,16 +395,23 @@ impl WasmtimePluginComponent {
     }
 
     fn reset_limits(&self, store: &mut Store<WasiHostState>) -> Result<(), LixError> {
-        if let Some(max_fuel) = self.limits.max_fuel {
-            store
-                .set_fuel(max_fuel)
-                .map_err(|error| wasm_runtime_error("failed to reset WASM fuel", error))?;
-        }
-        if let Some(timeout_ms) = self.limits.timeout_ms {
-            store.set_epoch_deadline(timeout_ms.max(1));
-        }
-        Ok(())
+        reset_store_limits(store, self.limits)
     }
+}
+
+fn reset_store_limits(
+    store: &mut Store<WasiHostState>,
+    limits: WasmLimits,
+) -> Result<(), LixError> {
+    if let Some(max_fuel) = limits.max_fuel {
+        store
+            .set_fuel(max_fuel)
+            .map_err(|error| wasm_runtime_error("failed to reset WASM fuel", error))?;
+    }
+    if let Some(timeout_ms) = limits.timeout_ms {
+        store.set_epoch_deadline(timeout_ms.max(1));
+    }
+    Ok(())
 }
 
 struct TimeoutTickerRegistry {
@@ -562,7 +577,11 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
 
-    use wasm_encoder::{ComponentBuilder, MemorySection, MemoryType, Module, ModuleArg};
+    use wasm_encoder::{
+        BlockType, CodeSection, ComponentBuilder, ComponentExportKind, ComponentValType,
+        ExportKind, ExportSection, Function, FunctionSection, Instruction, MemorySection,
+        MemoryType, Module, ModuleArg, TypeSection,
+    };
 
     use super::*;
 
@@ -800,6 +819,79 @@ mod tests {
             .expect_err("one byte below two pages must reject the initial memory");
     }
 
+    #[test]
+    fn store_rejects_more_than_one_linear_memory_across_component_instances() {
+        let engine = create_engine(false, false).expect("test engine should initialize");
+        let component = Component::new(&engine, component_with_initial_memories(2, 1))
+            .expect("test component should compile");
+        let linker = Linker::<WasiHostState>::new(&engine);
+        let mut store =
+            create_store(&engine, WasmLimits::default()).expect("test Store should initialize");
+
+        linker
+            .instantiate(&mut store, &component)
+            .expect_err("the Store-wide memory count must reject a second linear memory");
+    }
+
+    #[test]
+    fn component_timeout_resets_and_interrupts_a_non_terminating_guest() {
+        const TEST_TIMEOUT_MS: u64 = 20;
+
+        let shared = WasmtimeSharedRuntime::new().expect("shared runtime should initialize");
+        let profile = CompileProfile::Timeout;
+        let _ticker = shared
+            .timeout_ticker(profile)
+            .expect("ticker registry should be healthy")
+            .expect("timeout profile should start a ticker");
+        let engine = shared.engine(profile);
+        let component = Component::new(engine, component_with_timeout_test_functions())
+            .expect("test component should compile");
+        let linker = Linker::<WasiHostState>::new(engine);
+        let limits = WasmLimits {
+            timeout_ms: Some(TEST_TIMEOUT_MS),
+            ..WasmLimits::default()
+        };
+        let mut store = create_store(engine, limits).expect("test Store should initialize");
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .expect("test component should instantiate");
+        let quick = instance
+            .get_typed_func::<(), ()>(&mut store, "quick")
+            .expect("quick export should have the expected type");
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .expect("spin export should have the expected type");
+
+        // Let the Store's previous deadline expire before each quick call. A
+        // successful call therefore demonstrates that reset_store_limits made
+        // the timeout relative to this invocation rather than component init.
+        for invocation in 1..=2 {
+            std::thread::sleep(Duration::from_millis(TEST_TIMEOUT_MS * 2));
+            reset_store_limits(&mut store, limits)
+                .expect("each invocation should receive a fresh deadline");
+            quick
+                .call(&mut store, ())
+                .unwrap_or_else(|error| panic!("invocation {invocation} should run: {error:#}"));
+        }
+
+        reset_store_limits(&mut store, limits)
+            .expect("non-terminating invocation should receive a fresh deadline");
+        let started = std::time::Instant::now();
+        let error = spin
+            .call(&mut store, ())
+            .expect_err("non-terminating guest call must be interrupted");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::Interrupt),
+            "guest should trap because its epoch deadline elapsed: {error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "guest exceeded the bounded test window: {elapsed:?}"
+        );
+    }
+
     fn empty_component() -> Component {
         let engine = create_engine(false, false).expect("test engine should initialize");
         Component::new(&engine, wasm_encoder::Component::new().finish())
@@ -807,24 +899,75 @@ mod tests {
     }
 
     fn component_with_initial_memory(pages: u64) -> Vec<u8> {
-        let mut memories = MemorySection::new();
-        memories.memory(MemoryType {
-            minimum: pages,
-            maximum: Some(pages),
-            memory64: false,
-            shared: false,
-            page_size_log2: None,
-        });
+        component_with_initial_memories(1, pages)
+    }
+
+    fn component_with_initial_memories(count: usize, pages: u64) -> Vec<u8> {
+        let mut component = ComponentBuilder::default();
+        for _ in 0..count {
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: pages,
+                maximum: Some(pages),
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut module = Module::new();
+            module.section(&memories);
+            let module = component.core_module(None, &module);
+            component.core_instantiate(
+                None,
+                module,
+                std::iter::empty::<(&'static str, ModuleArg)>(),
+            );
+        }
+        component.finish()
+    }
+
+    fn component_with_timeout_test_functions() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(0);
+        let mut exports = ExportSection::new();
+        exports.export("quick", ExportKind::Func, 0);
+        exports.export("spin", ExportKind::Func, 1);
+        let mut quick = Function::new([]);
+        quick.instruction(&Instruction::End);
+        let mut spin = Function::new([]);
+        spin.instruction(&Instruction::Loop(BlockType::Empty));
+        spin.instruction(&Instruction::Br(0));
+        spin.instruction(&Instruction::End);
+        spin.instruction(&Instruction::End);
+        let mut code = CodeSection::new();
+        code.function(&quick);
+        code.function(&spin);
         let mut module = Module::new();
-        module.section(&memories);
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
 
         let mut component = ComponentBuilder::default();
-        let module = component.core_module(None, &module);
-        component.core_instantiate(
-            None,
+        let module = component.core_module(Some("timeout-test"), &module);
+        let instance = component.core_instantiate(
+            Some("timeout-test"),
             module,
             std::iter::empty::<(&'static str, ModuleArg)>(),
         );
+        let quick = component.core_alias_export(Some("quick"), instance, "quick", ExportKind::Func);
+        let spin = component.core_alias_export(Some("spin"), instance, "spin", ExportKind::Func);
+        let (function_type, mut encoder) = component.type_function(Some("timeout-test"));
+        encoder
+            .params(std::iter::empty::<(&'static str, ComponentValType)>())
+            .result(None);
+        let quick = component.lift_func(Some("quick"), quick, function_type, std::iter::empty());
+        let spin = component.lift_func(Some("spin"), spin, function_type, std::iter::empty());
+        component.export("quick", ComponentExportKind::Func, quick, None);
+        component.export("spin", ComponentExportKind::Func, spin, None);
         component.finish()
     }
 }

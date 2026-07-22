@@ -19,6 +19,7 @@ export type WireValue =
 export type RemoteHandshake = {
 	protocolVersion: number;
 	activeBranchId: string;
+	sessionId: string;
 };
 
 export type RemoteExecuteRequest = {
@@ -174,9 +175,16 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 	) {
 		throw protocolError("remote handshake requires activeBranchId");
 	}
+	if (
+		typeof handshake.sessionId !== "string" ||
+		!/^[\x21-\x7e]{1,256}$/.test(handshake.sessionId)
+	) {
+		throw protocolError("remote handshake requires a valid sessionId");
+	}
 	return {
 		protocolVersion: REMOTE_PROTOCOL_VERSION,
 		activeBranchId: handshake.activeBranchId,
+		sessionId: handshake.sessionId,
 	};
 }
 

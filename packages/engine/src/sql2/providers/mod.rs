@@ -176,6 +176,7 @@ where
                     ctx.blob_reader(),
                     ctx.plugin_host(),
                     ctx.functions(),
+                    ctx.session_file_views(),
                 )
                 .await?;
             }
@@ -189,6 +190,7 @@ where
                     ctx.blob_reader(),
                     ctx.plugin_host(),
                     ctx.functions(),
+                    ctx.session_file_views(),
                 )
                 .await?;
             }

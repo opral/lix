@@ -10,6 +10,7 @@ test("remote observe streams native Lix results", async () => {
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
+				if (request.method === "DELETE") return closedSession();
 				return new URL(request.url).pathname.endsWith("/lix/v1/")
 					? handshake()
 					: sseResponse(
@@ -28,6 +29,7 @@ test("remote observe streams native Lix results", async () => {
 	expect(initial?.mutationSequence).toBe(7);
 	expect(initial?.result.rows[0]?.get("value")).toBe("hello");
 	expect(requests[1]?.headers.get("accept")).toBe("text/event-stream");
+	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
 		"/@acme/workspace/lix/v1/observe/multiplex",
 	);
@@ -58,6 +60,7 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) return handshake();
+				if (request.method === "DELETE") return closedSession();
 				if (pathname.endsWith("/execute")) {
 					return Response.json({
 						columns: ["value"],
@@ -151,6 +154,7 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
+					if (request.method === "DELETE") return closedSession();
 					observeRequests += 1;
 					liveObserveRequests += 1;
 					request.signal.addEventListener(
@@ -195,6 +199,7 @@ test("remote observe can continue after a semantic SSE error", async () => {
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
+					if (request.method === "DELETE") return closedSession();
 					observeRequests += 1;
 					return observeRequests === 1
 						? sseResponse(
@@ -246,10 +251,12 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 		server: {
 			mode: "remote",
 			url: "https://lixray.test/@acme/workspace",
-			fetch: async (input) => {
-				if (new URL(input.toString()).pathname.endsWith("/lix/v1/")) {
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 					return handshake();
 				}
+				if (request.method === "DELETE") return closedSession();
 				observeRequests += 1;
 				return sseResponse(
 					sseFrame("error", {
@@ -288,6 +295,7 @@ test("a successful branch switch updates observations on the existing server str
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) return handshake();
+				if (request.method === "DELETE") return closedSession();
 				if (pathname.endsWith("/branch/switch")) {
 					const body = (await request.json()) as { branchId: string };
 					if (body.branchId === "missing-id") {
@@ -355,6 +363,7 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		let headerCalls = 0;
 		let observeRequests = 0;
 		const observedAuthorization: Array<string | null> = [];
+		const observedSessionIds: Array<string | null> = [];
 		const lix = await openLix({
 			server: {
 				mode: "remote",
@@ -365,8 +374,10 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
+					if (request.method === "DELETE") return closedSession();
 					observeRequests += 1;
 					observedAuthorization.push(request.headers.get("authorization"));
+					observedSessionIds.push(request.headers.get("lix-session-id"));
 					if (observeRequests <= 2) {
 						return sseResponse(
 							sseFrame(
@@ -402,6 +413,11 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 			"Bearer token-3",
 			"Bearer token-4",
 		]);
+		expect(observedSessionIds).toEqual([
+			"session-1",
+			"session-1",
+			"session-1",
+		]);
 
 		events.close();
 		await lix.close();
@@ -417,6 +433,7 @@ test("closing Lix resolves pending remote observation reads", async () => {
 			url: "https://lixray.test/@acme/workspace",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
+				if (request.method === "DELETE") return closedSession();
 				return new URL(request.url).pathname.endsWith("/lix/v1/")
 					? handshake()
 					: heldSseResponse("", request.signal);
@@ -442,6 +459,7 @@ test("closing Lix stops observations before an earlier finite request settles", 
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) return handshake();
+				if (request.method === "DELETE") return closedSession();
 				if (pathname.endsWith("/observe/multiplex")) {
 					return heldSseResponse("", request.signal);
 				}
@@ -468,7 +486,15 @@ test("closing Lix stops observations before an earlier finite request settles", 
 });
 
 function handshake(): Response {
-	return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
+	return Response.json({
+		protocolVersion: 1,
+		activeBranchId: "main-id",
+		sessionId: "session-1",
+	});
+}
+
+function closedSession(): Response {
+	return new Response(null, { status: 204 });
 }
 
 function observePayload(value: string, sequence: number, mutationSequence: number) {

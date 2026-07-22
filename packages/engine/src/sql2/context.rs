@@ -25,6 +25,8 @@ use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::wasm::UnsupportedWasmRuntime;
 
+use super::SessionFileViews;
+
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 pub(crate) type SqlJsonReader<S> = JsonStoreReader<S>;
@@ -67,6 +69,10 @@ pub(crate) trait SqlExecutionContext {
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
+    }
+
+    fn session_file_views(&self) -> Option<SessionFileViews> {
+        None
     }
 }
 

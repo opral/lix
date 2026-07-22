@@ -1,6 +1,7 @@
 #[macro_use]
 mod support;
 
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -868,6 +869,436 @@ async fn plugin_detect_changes_receives_descriptor_filename() {
 }
 
 #[tokio::test]
+async fn plugin_stale_writes_preserve_disjoint_entity_edits() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"a=0\nb=0\n".to_vec())
+    );
+    assert_eq!(
+        read_file(&session_b, "/shared.keyed").await.unwrap(),
+        Some(b"a=0\nb=0\n".to_vec())
+    );
+
+    write_file(&session_a, "/shared.keyed", b"a=A\nb=0\n".to_vec())
+        .await
+        .expect("session A edit should write");
+    write_file(&session_b, "/shared.keyed", b"a=0\nb=B\n".to_vec())
+        .await
+        .expect("session B stale edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"a=A\nb=B\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string())
+        ])
+    );
+}
+
+#[tokio::test]
+async fn plugin_blind_write_uses_current_identity_hint_without_delete_authority() {
+    let runtime = Arc::new(KeyedPluginRuntime::default());
+    let (_engine, session_a, session_b) =
+        keyed_collaboration_sessions_with_runtime(Memory::new(), Arc::clone(&runtime)).await;
+    write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    runtime.take_detect_states();
+
+    // Session B deliberately never reads the file. Current shared state is an
+    // identity hint, not delete authority: the omitted `b` must survive.
+    write_file(&session_b, "/shared.keyed", b"a=B\n".to_vec())
+        .await
+        .expect("blind semantic write should succeed");
+    assert_eq!(
+        runtime.take_detect_states(),
+        vec![BTreeMap::from([
+            ("a".to_string(), "0".to_string()),
+            ("b".to_string(), "0".to_string()),
+        ])]
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("a".to_string(), "B".to_string()),
+            ("b".to_string(), "0".to_string()),
+        ])
+    );
+
+    // The successful submission, rather than the merged shared result, is B's
+    // next private base. B may delete its own `a`, but still cannot delete the
+    // unseen `b` that was preserved above.
+    write_file(&session_b, "/shared.keyed", Vec::new())
+        .await
+        .expect("submitted entity deletion should succeed");
+    assert_eq!(
+        runtime.take_detect_states(),
+        vec![BTreeMap::from([("a".to_string(), "B".to_string())])]
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([("b".to_string(), "0".to_string())])
+    );
+
+    // An acknowledged empty base is distinct from a missing base. Falling
+    // back to current state here would incorrectly expose `b` to deletion.
+    write_file(&session_b, "/shared.keyed", b"x=X\n".to_vec())
+        .await
+        .expect("write from acknowledged empty base should succeed");
+    assert_eq!(runtime.take_detect_states(), vec![BTreeMap::new()]);
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("b".to_string(), "0".to_string()),
+            ("x".to_string(), "X".to_string()),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn plugin_concurrent_writes_preserve_disjoint_entity_edits() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_a, "/shared.keyed").await.unwrap();
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    let (write_a, write_b) = tokio::join!(
+        write_file(&session_a, "/shared.keyed", b"a=A\nb=0\n".to_vec()),
+        write_file(&session_b, "/shared.keyed", b"a=0\nb=B\n".to_vec()),
+    );
+    write_a.expect("session A concurrent edit should write");
+    write_b.expect("session B concurrent edit should write");
+
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string())
+        ])
+    );
+}
+
+#[tokio::test]
+async fn slatedb_plugin_concurrent_writes_preserve_disjoint_entity_edits() {
+    let temp_dir = tempfile::tempdir().expect("SlateDB temp directory should create");
+    let storage = lix_slatedb_storage::SlateDB::open(temp_dir.path().join("collaboration"))
+        .expect("SlateDB storage should open");
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions_with_storage(storage).await;
+    write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_a, "/shared.keyed").await.unwrap();
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    let (write_a, write_b) = tokio::join!(
+        write_file(&session_a, "/shared.keyed", b"a=A\nb=0\n".to_vec()),
+        write_file(&session_b, "/shared.keyed", b"a=0\nb=B\n".to_vec()),
+    );
+    write_a.expect("session A concurrent edit should write");
+    write_b.expect("session B concurrent edit should write");
+
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string())
+        ])
+    );
+}
+
+#[tokio::test]
+async fn plugin_stale_writes_use_last_writer_wins_for_same_entity() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"a=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_a, "/shared.keyed").await.unwrap();
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    write_file(&session_a, "/shared.keyed", b"a=A\n".to_vec())
+        .await
+        .expect("session A edit should write");
+    write_file(&session_b, "/shared.keyed", b"a=B\n".to_vec())
+        .await
+        .expect("session B edit should write last");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"a=B\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([("a".to_string(), "B".to_string())])
+    );
+}
+
+#[tokio::test]
+async fn raw_stale_writes_use_whole_file_last_writer_wins() {
+    let storage = Memory::new();
+    let receipt = Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
+    let session_a = engine
+        .open_session(receipt.main_branch_id.clone())
+        .await
+        .expect("session A should open");
+    let session_b = engine
+        .open_session(receipt.main_branch_id)
+        .await
+        .expect("session B should open");
+
+    write_file(&session_a, "/shared.bin", b"seed".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_a, "/shared.bin").await.unwrap();
+    read_file(&session_b, "/shared.bin").await.unwrap();
+    write_file(&session_a, "/shared.bin", b"first".to_vec())
+        .await
+        .expect("first raw write should succeed");
+    write_file(&session_b, "/shared.bin", b"last".to_vec())
+        .await
+        .expect("last raw write should succeed");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.bin").await.unwrap(),
+        Some(b"last".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn plugin_omission_deletes_entity_seen_by_writer() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_a, "/shared.keyed").await.unwrap();
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    write_file(&session_a, "/shared.keyed", b"remote=R\nroot=0\n".to_vec())
+        .await
+        .expect("remote entity should write");
+    assert_eq!(
+        read_file(&session_b, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=0\n".to_vec())
+    );
+    read_file(&session_a, "/shared.keyed").await.unwrap();
+    write_file(&session_a, "/shared.keyed", b"remote=R\nroot=A\n".to_vec())
+        .await
+        .expect("unrelated later edit should write");
+
+    write_file(&session_b, "/shared.keyed", b"root=0\n".to_vec())
+        .await
+        .expect("seen remote entity omission should delete it");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"root=A\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([("root".to_string(), "A".to_string())])
+    );
+}
+
+#[tokio::test]
+async fn plugin_stale_omission_preserves_unseen_remote_entity() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_a, "/shared.keyed").await.unwrap();
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    write_file(&session_a, "/shared.keyed", b"remote=R\nroot=0\n".to_vec())
+        .await
+        .expect("remote entity should write");
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("stale session edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=B\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("remote".to_string(), "R".to_string()),
+            ("root".to_string(), "B".to_string()),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn atelier_markdown_point_read_acknowledges_only_delivered_plugin_state() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\nseen=S\n".to_vec())
+        .await
+        .expect("seed file should write");
+    let file = session_a
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/shared.keyed".to_string())],
+        )
+        .await
+        .expect("file id should load");
+    let [Value::Text(file_id)] = file.rows()[0].values() else {
+        panic!("expected keyed file id");
+    };
+
+    // This is the point-read shape emitted by Atelier's Kysely Markdown view:
+    // a projected branch constant precedes the identity placeholder and the
+    // unique row is guarded by LIMIT 1.
+    let delivered = session_b
+        .execute(
+            "SELECT file.data AS data, file.path AS path, \
+                    file.lixcol_change_id AS change_id, ? AS active_branch_id \
+             FROM lix_file AS file WHERE file.id = ? LIMIT 1",
+            &[
+                Value::Text("main-branch".to_string()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect("Atelier-shaped point read should execute");
+    assert_eq!(delivered.len(), 1);
+
+    write_file(
+        &session_a,
+        "/shared.keyed",
+        b"remote=R\nroot=0\nseen=S\n".to_vec(),
+    )
+    .await
+    .expect("remote entity should write");
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("stale Atelier edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=B\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("remote".to_string(), "R".to_string()),
+            ("root".to_string(), "B".to_string()),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn observe_point_read_acknowledges_delivered_plugin_state_per_session() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+
+    let query = "SELECT data FROM lix_file WHERE path = $1";
+    let params = [Value::Text("/shared.keyed".to_string())];
+    let mut evaluator_events = session_a
+        .observe(query, &params)
+        .expect("evaluator observation should open");
+    let mut events = session_b
+        .observe(query, &params)
+        .expect("plugin file observation should open");
+    evaluator_events
+        .next()
+        .await
+        .expect("shared observation evaluator should execute")
+        .expect("shared evaluator event should be delivered");
+    let initial = events
+        .next()
+        .await
+        .expect("initial observation should execute")
+        .expect("initial observation should be delivered");
+    assert_eq!(
+        initial.rows.rows()[0].values(),
+        &[Value::Blob(b"a=0\nb=0\n".to_vec())]
+    );
+
+    write_file(&session_a, "/shared.keyed", b"a=A\nb=0\n".to_vec())
+        .await
+        .expect("concurrent edit should write");
+    write_file(&session_b, "/shared.keyed", b"a=0\nb=B\n".to_vec())
+        .await
+        .expect("stale observed edit should merge");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"a=A\nb=B\n".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn plugin_data_used_by_aggregate_does_not_acknowledge_remote_entities() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    write_file(&session_a, "/shared.keyed", b"remote=R\nroot=0\n".to_vec())
+        .await
+        .expect("remote entity should write");
+    let count = session_b
+        .execute(
+            "SELECT COUNT(data) AS file_count FROM lix_file WHERE path = $1",
+            &[Value::Text("/shared.keyed".to_string())],
+        )
+        .await
+        .expect("aggregate should read successfully");
+    assert_eq!(count.rows()[0].values(), &[Value::Integer(1)]);
+
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("stale session edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=B\n".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn plugin_point_read_filtered_by_null_does_not_acknowledge_remote_entities() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+    read_file(&session_b, "/shared.keyed").await.unwrap();
+
+    write_file(&session_a, "/shared.keyed", b"remote=R\nroot=0\n".to_vec())
+        .await
+        .expect("remote entity should write");
+    let filtered = session_b
+        .execute("SELECT data FROM lix_file WHERE path = $1", &[Value::Null])
+        .await
+        .expect("null point read should execute");
+    assert!(filtered.is_empty());
+
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("stale session edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=B\n".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn durable_owner_drives_raw_plugin_raw_path_transitions() {
     let storage = Memory::new();
     Engine::initialize(storage.clone())
@@ -937,6 +1368,55 @@ async fn durable_owner_drives_raw_plugin_raw_path_transitions() {
     assert_eq!(blob_ref_count(&session, &file_id).await, 1);
 
     session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn remote_plugin_raw_plugin_transition_does_not_reuse_stale_session_view() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"a=0\n".to_vec())
+        .await
+        .expect("plugin file should write");
+    read_file(&session_b, "/shared.keyed")
+        .await
+        .expect("session B should cache the plugin incarnation");
+
+    session_a
+        .execute(
+            "UPDATE lix_file SET path = '/shared.bin' WHERE path = '/shared.keyed'",
+            &[],
+        )
+        .await
+        .expect("plugin-to-raw transition should succeed");
+    assert_eq!(
+        read_file(&session_a, "/shared.bin").await.unwrap(),
+        Some(b"a=0\n".to_vec())
+    );
+    write_file(&session_a, "/shared.bin", b"a=new\n".to_vec())
+        .await
+        .expect("raw incarnation should update");
+
+    session_a
+        .execute(
+            "UPDATE lix_file SET path = '/shared.keyed' WHERE path = '/shared.bin'",
+            &[],
+        )
+        .await
+        .expect("raw-to-plugin transition should succeed");
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"a=new\n".to_vec())
+    );
+
+    // B's pre-transition view has the same plugin key and generation, but an
+    // older durable owner incarnation. Its omission must not delete the new
+    // incarnation's same-ID entity.
+    write_file(&session_b, "/shared.keyed", Vec::new())
+        .await
+        .expect("stale pre-transition write should succeed conservatively");
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([("a".to_string(), "new".to_string())])
+    );
 }
 
 #[tokio::test]
@@ -1248,7 +1728,10 @@ trait TestSession {
 }
 
 #[async_trait(?Send)]
-impl TestSession for SessionContext {
+impl<StorageImpl> TestSession for SessionContext<StorageImpl>
+where
+    StorageImpl: lix_engine::storage::Storage + Clone + Send + Sync + 'static,
+{
     async fn execute_sql(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.execute(sql, params).await
     }
@@ -1271,6 +1754,92 @@ where
         archive.to_vec(),
     )
     .await
+}
+
+async fn keyed_collaboration_sessions() -> (Engine, SessionContext, SessionContext) {
+    keyed_collaboration_sessions_with_storage(Memory::new()).await
+}
+
+async fn keyed_collaboration_sessions_with_storage<StorageImpl>(
+    storage: StorageImpl,
+) -> (
+    Engine<StorageImpl>,
+    SessionContext<StorageImpl>,
+    SessionContext<StorageImpl>,
+)
+where
+    StorageImpl: lix_engine::storage::Storage + Clone + Send + Sync + 'static,
+{
+    keyed_collaboration_sessions_with_runtime(storage, Arc::new(KeyedPluginRuntime::default()))
+        .await
+}
+
+async fn keyed_collaboration_sessions_with_runtime<StorageImpl>(
+    storage: StorageImpl,
+    runtime: Arc<KeyedPluginRuntime>,
+) -> (
+    Engine<StorageImpl>,
+    SessionContext<StorageImpl>,
+    SessionContext<StorageImpl>,
+)
+where
+    StorageImpl: lix_engine::storage::Storage + Clone + Send + Sync + 'static,
+{
+    let receipt = Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new_with_wasm_runtime(storage, runtime)
+        .await
+        .expect("engine should open with keyed plugin runtime");
+    let installer = engine
+        .open_session(receipt.main_branch_id.clone())
+        .await
+        .expect("installer session should open");
+    install_plugin(&installer, "plugin_keyed", &keyed_plugin_archive())
+        .await
+        .expect("keyed plugin should install");
+    installer.close().await.expect("installer should close");
+    let session_a = engine
+        .open_session(receipt.main_branch_id.clone())
+        .await
+        .expect("session A should open");
+    let session_b = engine
+        .open_session(receipt.main_branch_id)
+        .await
+        .expect("session B should open");
+    (engine, session_a, session_b)
+}
+
+async fn keyed_entity_values<S>(session: &S, path: &str) -> BTreeMap<String, String>
+where
+    S: TestSession + Sync + ?Sized,
+{
+    let file = session
+        .execute_sql(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await
+        .expect("keyed file id should load");
+    let [Value::Text(file_id)] = file.rows()[0].values() else {
+        panic!("expected keyed file id");
+    };
+    let entities = session
+        .execute_sql(
+            "SELECT id, value FROM plugin_note \
+             WHERE lixcol_file_id = $1 ORDER BY id",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("keyed entities should load");
+    entities
+        .rows()
+        .iter()
+        .map(|row| match row.values() {
+            [Value::Text(id), Value::Text(value)] => (id.clone(), value.clone()),
+            other => panic!("expected keyed id/value row, got {other:?}"),
+        })
+        .collect()
 }
 
 async fn write_file<S>(session: &S, path: &str, data: Vec<u8>) -> Result<(), LixError>
@@ -1555,6 +2124,122 @@ fn test_parse_error(error: impl std::fmt::Display) -> LixError {
 }
 
 #[derive(Default)]
+struct KeyedPluginRuntime {
+    detect_states: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+}
+
+impl KeyedPluginRuntime {
+    fn take_detect_states(&self) -> Vec<BTreeMap<String, String>> {
+        std::mem::take(
+            &mut *self
+                .detect_states
+                .lock()
+                .expect("detect state lock should not be poisoned"),
+        )
+    }
+}
+
+struct KeyedPluginComponent {
+    detect_states: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+}
+
+#[async_trait]
+impl WasmRuntime for KeyedPluginRuntime {
+    async fn init_component(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+        Ok(Arc::new(KeyedPluginComponent {
+            detect_states: Arc::clone(&self.detect_states),
+        }))
+    }
+}
+
+#[async_trait]
+impl WasmComponentInstance for KeyedPluginComponent {
+    async fn detect_changes(
+        &self,
+        state: Vec<WasmPluginEntityState>,
+        file: WasmPluginFile,
+    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+        let current = keyed_values_from_state(state)?;
+        self.detect_states
+            .lock()
+            .expect("detect state lock should not be poisoned")
+            .push(current.clone());
+        let submitted = keyed_values_from_bytes(&file.data)?;
+        let mut changes = Vec::new();
+        for id in current.keys() {
+            if !submitted.contains_key(id) {
+                changes.push(WasmPluginDetectedChange {
+                    entity_pk: vec![id.clone()],
+                    schema_key: "plugin_note".to_string(),
+                    snapshot_content: None,
+                    metadata: None,
+                });
+            }
+        }
+        for (id, value) in &submitted {
+            if current.get(id) != Some(value) {
+                changes.push(WasmPluginDetectedChange {
+                    entity_pk: vec![id.clone()],
+                    schema_key: "plugin_note".to_string(),
+                    snapshot_content: Some(json!({ "id": id, "value": value }).to_string()),
+                    metadata: None,
+                });
+            }
+        }
+        Ok(changes)
+    }
+
+    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
+        let values = keyed_values_from_state(state)?;
+        let mut bytes = Vec::new();
+        for (id, value) in values {
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    }
+}
+
+fn keyed_values_from_state(
+    state: Vec<WasmPluginEntityState>,
+) -> Result<BTreeMap<String, String>, LixError> {
+    let mut values = BTreeMap::new();
+    for entity in state {
+        let snapshot: serde_json::Value = serde_json::from_str(&entity.snapshot_content)
+            .map_err(|error| test_parse_error(format!("invalid keyed snapshot: {error}")))?;
+        let id = snapshot
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| test_parse_error("keyed snapshot is missing id"))?;
+        let value = snapshot
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| test_parse_error("keyed snapshot is missing value"))?;
+        values.insert(id.to_string(), value.to_string());
+    }
+    Ok(values)
+}
+
+fn keyed_values_from_bytes(bytes: &[u8]) -> Result<BTreeMap<String, String>, LixError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| test_parse_error(format!("keyed file is not UTF-8: {error}")))?;
+    let mut values = BTreeMap::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let (id, value) = line
+            .split_once('=')
+            .ok_or_else(|| test_parse_error(format!("invalid keyed line: {line}")))?;
+        values.insert(id.to_string(), value.to_string());
+    }
+    Ok(values)
+}
+
+#[derive(Default)]
 struct SentinelPluginRuntime {
     render_calls: Arc<AtomicUsize>,
     detect_filenames: Arc<Mutex<Vec<Option<String>>>>,
@@ -1619,6 +2304,18 @@ fn sentinel_plugin_archive() -> Vec<u8> {
         "runtime": "wasm-component-v1",
         "api_version": "0.1.0",
         "match": { "path_glob": "*.sentinel" },
+        "entry": "plugin.wasm",
+        "schemas": ["schema/plugin_note.json"]
+    }"#;
+    plugin_archive(MANIFEST_JSON)
+}
+
+fn keyed_plugin_archive() -> Vec<u8> {
+    const MANIFEST_JSON: &[u8] = br#"{
+        "key": "plugin_keyed",
+        "runtime": "wasm-component-v1",
+        "api_version": "0.1.0",
+        "match": { "path_glob": "*.keyed" },
         "entry": "plugin.wasm",
         "schemas": ["schema/plugin_note.json"]
     }"#;

@@ -46,7 +46,8 @@ use crate::plugin::{
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::{
-    ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
+    ChangelogQuerySource, HistoryQuerySource, SessionFileViewKey, SessionFileViewMutation,
+    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
 use crate::storage_adapter::Storage;
@@ -144,6 +145,8 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     functions: FunctionProviderHandle,
     commit_boundary: Option<TransactionCommitBoundary>,
     origin_key: Option<String>,
+    session_file_views: SessionFileViews,
+    pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
 }
 
 #[derive(Default)]
@@ -303,6 +306,7 @@ where
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        session_file_views: SessionFileViews,
     ) -> Result<OpenTransaction<StorageImpl>, LixError> {
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
@@ -363,6 +367,8 @@ where
                 functions,
                 commit_boundary: None,
                 origin_key: None,
+                session_file_views,
+                pending_file_view_mutations: BTreeMap::new(),
             },
             runtime_functions,
         })
@@ -459,6 +465,9 @@ where
                 );
             }
         }
+        transaction
+            .session_file_views
+            .apply_mutations(transaction.pending_file_view_mutations.into_values());
         Ok(TransactionCommitOutcome { storage_stats })
     }
 
@@ -497,7 +506,7 @@ where
         }
         self.require_existing_transaction_write_branch_ids(&write)
             .await?;
-        let write = self.reconcile_plugin_write(write).await?;
+        let (write, file_view_mutations) = self.reconcile_plugin_write(write).await?;
         require_valid_transaction_write_storage_scopes(&write)?;
         let write = self.prepare_transaction_write(write).await?;
         if prepared_transaction_write_affects_filesystem_path_index(&write) {
@@ -506,7 +515,9 @@ where
             self.filesystem_path_index_epoch
                 .fetch_add(1, Ordering::SeqCst);
         }
-        self.staged_writes.stage_write(write)
+        let outcome = self.staged_writes.stage_write(write)?;
+        self.pending_file_view_mutations.extend(file_view_mutations);
+        Ok(outcome)
     }
 
     async fn scan_visible_live_state(
@@ -540,7 +551,13 @@ where
     async fn reconcile_plugin_write(
         &mut self,
         write: TransactionWrite,
-    ) -> Result<TransactionWrite, LixError> {
+    ) -> Result<
+        (
+            TransactionWrite,
+            BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+        ),
+        LixError,
+    > {
         match write {
             TransactionWrite::Rows { mode, mut rows } => {
                 reject_external_plugin_registry_rows(&rows)?;
@@ -549,7 +566,10 @@ where
                     .await?;
                 mark_plugin_reconciliation_rows(&mut reconciliation.rows);
                 rows.extend(reconciliation.rows);
-                Ok(TransactionWrite::Rows { mode, rows })
+                Ok((
+                    TransactionWrite::Rows { mode, rows },
+                    reconciliation.file_view_mutations,
+                ))
             }
             TransactionWrite::RowsWithFileData {
                 mode,
@@ -562,6 +582,7 @@ where
                 let PluginWriteReconciliation {
                     file_keys,
                     rows: mut plugin_rows,
+                    file_view_mutations,
                 } = self
                     .plugin_write_reconciliation(&rows, &mut file_data)
                     .await?;
@@ -574,14 +595,47 @@ where
                         !file_keys.contains(&PluginFileWriteKey::from(write)) && !write.is_empty()
                     })
                     .collect();
-                Ok(TransactionWrite::RowsWithFileData {
-                    mode,
-                    rows,
-                    file_data,
-                    count,
-                })
+                Ok((
+                    TransactionWrite::RowsWithFileData {
+                        mode,
+                        rows,
+                        file_data,
+                        count,
+                    },
+                    file_view_mutations,
+                ))
             }
         }
+    }
+
+    fn acknowledged_session_plugin_state(
+        &self,
+        key: &SessionFileViewKey,
+        plugin: &PluginRegistryEntry,
+        owner_change_id: &str,
+    ) -> Option<Vec<MaterializedLiveStateRow>> {
+        if let Some(mutation) = self.pending_file_view_mutations.get(key) {
+            return match mutation {
+                SessionFileViewMutation::Set { view, .. }
+                    if view.plugin_key == plugin.key()
+                        && view.plugin_generation == plugin.archive_blob_hash()
+                        && view.owner_change_id == owner_change_id =>
+                {
+                    Some(view.rows.clone())
+                }
+                SessionFileViewMutation::Set { .. } | SessionFileViewMutation::Remove { .. } => {
+                    None
+                }
+            };
+        }
+        self.session_file_views
+            .plugin_file_view(
+                key,
+                plugin.key(),
+                plugin.archive_blob_hash(),
+                owner_change_id,
+            )
+            .map(|view| view.rows)
     }
 
     /// Reconciles plugin lifecycle, ownership, and state for one logical write
@@ -739,11 +793,9 @@ where
         }
 
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let storage = self.storage.clone();
+        let read =
+            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let base = self.live_state.reader(read.clone());
 
         if !lifecycle_schema_rows.is_empty() {
@@ -959,6 +1011,19 @@ where
             .cloned()
             .collect::<BTreeSet<_>>();
         if active_branch_ids.is_empty() && deleted_file_keys.is_empty() {
+            for write in file_data.iter().filter(|write| {
+                !write.global
+                    && !write.untracked
+                    && write
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| !is_plugin_storage_path(path))
+            }) {
+                reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                    &write.branch_id,
+                    &write.file_id,
+                ));
+            }
             return Ok(reconciliation);
         }
 
@@ -1007,23 +1072,34 @@ where
         )
         .await?;
         let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
+        let mut owner_change_ids = BTreeMap::<PluginFileWriteKey, String>::new();
         for row in owner_rows {
             let branch_id = row.branch_id.clone();
             let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
                 continue;
             };
+            let owner_change_id = row.change_id.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "durable plugin owner for file '{}' on branch '{branch_id}' is missing change_id",
+                        owner.file_id()
+                    ),
+                )
+            })?;
             let key = PluginFileWriteKey {
                 branch_id,
                 global: false,
                 untracked: false,
                 file_id: owner.file_id().to_string(),
             };
-            if owners.insert(key, owner).is_some() {
+            if owners.insert(key.clone(), owner).is_some() {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "durable plugin owner lookup returned duplicate file rows",
                 ));
             }
+            owner_change_ids.insert(key, owner_change_id.to_string());
         }
 
         let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
@@ -1235,6 +1311,10 @@ where
             }
 
             let Some(selected) = selected else {
+                reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                    &write.branch_id,
+                    &write.file_id,
+                ));
                 if owner.is_some() {
                     reconciliation.rows.push(PluginFileOwner::delete_row(
                         write.file_id.clone(),
@@ -1251,7 +1331,8 @@ where
             let component = component_instances
                 .get(&installed_key)
                 .expect("selected plugin should have a resolved component");
-            let active_state = if owner.is_some_and(|owner| owner.plugin_key() == selected.key()) {
+            let same_plugin_owner = owner.is_some_and(|owner| owner.plugin_key() == selected.key());
+            if same_plugin_owner {
                 let selected_schema_keys = selected.schema_keys().iter().collect::<BTreeSet<_>>();
                 let obsolete_state = old_state
                     .iter()
@@ -1263,39 +1344,103 @@ where
                     &write.file_id,
                     &context,
                 ));
-                retain_plugin_state_rows_for_schema_keys(selected.schema_keys(), old_state)
+            }
+            let session_file_view_key = SessionFileViewKey::new(&write.branch_id, &write.file_id);
+            let current_owner_change_id = same_plugin_owner
+                .then(|| owner_change_ids.get(&file_key).cloned())
+                .flatten();
+            let acknowledged_state = same_plugin_owner
+                .then(|| {
+                    current_owner_change_id
+                        .as_deref()
+                        .and_then(|owner_change_id| {
+                            self.acknowledged_session_plugin_state(
+                                &session_file_view_key,
+                                selected,
+                                owner_change_id,
+                            )
+                        })
+                })
+                .flatten();
+            let allow_inferred_deletions = acknowledged_state.is_some();
+            let detection_state = if same_plugin_owner {
+                acknowledged_state.unwrap_or_else(|| {
+                    // A blind blob replacement still needs the current rows as
+                    // an identity-matching hint. It does not, however, gain
+                    // authority to delete rows merely because the submitted
+                    // file omitted them; those tombstones are filtered below.
+                    retain_plugin_state_rows_for_schema_keys(selected.schema_keys(), old_state)
+                })
             } else {
+                // A missing or different durable owner means this is a fresh
+                // raw/plugin ownership transition. A session may still cache
+                // an older incarnation of this file; reusing it would make
+                // unchanged submitted entities disappear.
                 Vec::new()
             };
             let changes = detect_changes_with_component_instance(
                 component,
-                &active_state,
+                &detection_state,
                 WasmPluginFile {
                     filename: write.filename.clone(),
                     data: write.data().to_vec(),
                 },
             )
             .await?;
+            let submitted_state = session_plugin_state_after_changes(
+                &session_file_view_key,
+                detection_state,
+                &changes,
+            );
             if write.had_blob_ref {
                 reconciliation.rows.push(blob_ref_tombstone_row(
                     write.file_id.clone(),
                     context.clone(),
                 ));
             }
-            reconciliation.rows.extend(plugin_change_rows(
+            let mut change_rows = plugin_change_rows(
                 selected,
                 changes,
                 &write.file_id,
                 &context,
                 "plugin detect-changes",
-            )?);
+            )?;
+            if !allow_inferred_deletions {
+                change_rows.retain(|row| row.snapshot.is_some());
+            }
+            reconciliation.rows.extend(change_rows);
             let desired_owner =
                 PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?;
-            if plugin_owner_needs_write(owner, &desired_owner) {
-                reconciliation
-                    .rows
-                    .push(desired_owner.write_row(&write.branch_id)?);
-            }
+            let owner_needs_write = plugin_owner_needs_write(owner, &desired_owner);
+            let owner_change_id = if owner_needs_write {
+                let owner_change_id = self.functions.call_uuid_v7().to_string();
+                let mut owner_row = desired_owner.write_row(&write.branch_id)?;
+                owner_row.change_id = Some(owner_change_id.clone());
+                reconciliation.rows.push(owner_row);
+                owner_change_id
+            } else {
+                current_owner_change_id.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "durable plugin owner for file '{}' is missing its incarnation",
+                            write.file_id
+                        ),
+                    )
+                })?
+            };
+            reconciliation.file_view_mutations.insert(
+                session_file_view_key.clone(),
+                SessionFileViewMutation::Set {
+                    key: session_file_view_key,
+                    view: SessionPluginFileView {
+                        plugin_key: selected.key().to_string(),
+                        plugin_generation: selected.archive_blob_hash().to_string(),
+                        owner_change_id,
+                        rows: submitted_state,
+                    },
+                },
+            );
             reconciliation.file_keys.insert(file_key.clone());
             reconciled_file_keys.insert(file_key);
         }
@@ -1305,8 +1450,16 @@ where
                 continue;
             }
             let Some(owner) = owners.get(&file_key) else {
+                reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                    &file_key.branch_id,
+                    &file_key.file_id,
+                ));
                 continue;
             };
+            reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                &file_key.branch_id,
+                &file_key.file_id,
+            ));
             let active_state = state_by_file
                 .get(&PluginStateFileKey {
                     branch_id: file_key.branch_id.clone(),
@@ -1620,7 +1773,7 @@ where
 
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) async fn tracked_state_reader(
-        &mut self,
+        &self,
     ) -> TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
         let read = self
             .storage
@@ -2015,6 +2168,7 @@ pub(crate) async fn open_transaction<StorageImpl>(
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
+    session_file_views: SessionFileViews,
 ) -> Result<OpenTransaction<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -2028,6 +2182,7 @@ where
         plugin_host,
         branch_ctx,
         catalog_context,
+        session_file_views,
     )
     .await
 }
@@ -2236,6 +2391,14 @@ impl From<&TransactionFileData> for PluginFileWriteKey {
 struct PluginWriteReconciliation {
     file_keys: BTreeSet<PluginFileWriteKey>,
     rows: Vec<TransactionWriteRow>,
+    file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+}
+
+impl PluginWriteReconciliation {
+    fn remove_session_file_view(&mut self, key: SessionFileViewKey) {
+        self.file_view_mutations
+            .insert(key.clone(), SessionFileViewMutation::Remove { key });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2261,6 +2424,48 @@ struct PluginStateFileKey {
     branch_id: String,
     plugin_key: String,
     file_id: String,
+}
+
+fn session_plugin_state_after_changes(
+    key: &SessionFileViewKey,
+    base: Vec<MaterializedLiveStateRow>,
+    changes: &[PluginDetectedChange],
+) -> Vec<MaterializedLiveStateRow> {
+    let mut rows = base
+        .into_iter()
+        .filter(|row| row.snapshot_content.is_some())
+        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
+        .collect::<BTreeMap<_, _>>();
+
+    for change in changes {
+        let identity = (change.schema_key.clone(), change.entity_pk.clone());
+        let Some(snapshot_content) = change.snapshot_content.clone() else {
+            rows.remove(&identity);
+            continue;
+        };
+        let row = rows
+            .entry(identity)
+            .or_insert_with(|| MaterializedLiveStateRow {
+                entity_pk: change.entity_pk.clone(),
+                schema_key: change.schema_key.clone(),
+                file_id: Some(key.file_id.clone()),
+                snapshot_content: None,
+                metadata: None,
+                deleted: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+                global: false,
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                branch_id: key.branch_id.clone(),
+            });
+        row.snapshot_content = Some(snapshot_content);
+        row.metadata.clone_from(&change.metadata);
+        row.deleted = false;
+    }
+
+    rows.into_values().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2792,6 +2997,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
+            SessionFileViews::default(),
         )
         .await
         .expect("transaction should open");
@@ -3013,6 +3219,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
+            SessionFileViews::default(),
         )
         .await
         .expect("transaction should open");
@@ -3295,6 +3502,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             catalog_context,
+            SessionFileViews::default(),
         )
         .await
         .expect("transaction should open");

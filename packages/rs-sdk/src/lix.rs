@@ -44,7 +44,7 @@ pub struct Lix<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    _engine: Engine<StorageImpl>,
+    engine: Engine<StorageImpl>,
     session: SessionContext<StorageImpl>,
 }
 
@@ -86,10 +86,7 @@ where
     let engine =
         open_or_initialize_engine(options.storage, options.wasm_runtime, telemetry).await?;
     let session = engine.open_workspace_session().await?;
-    Ok(Lix {
-        _engine: engine,
-        session,
-    })
+    Ok(Lix { engine, session })
 }
 
 pub async fn open_lix_with_storage<StorageImpl>(
@@ -105,6 +102,27 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Opens another workspace session on this handle's existing engine.
+    ///
+    /// The returned handle has independent session-local state, including its
+    /// acknowledged plugin file views and lifecycle. It deliberately clones
+    /// the existing [`Engine`] instead of constructing another engine over the
+    /// same storage, so engine-wide collaboration and runtime gates remain
+    /// shared by every session.
+    pub async fn open_workspace_session(&self) -> Result<Self, LixError> {
+        if self.session.is_closed() {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot open a workspace session from a closed Lix handle",
+            ));
+        }
+        let session = self.engine.open_workspace_session().await?;
+        Ok(Self {
+            engine: self.engine.clone(),
+            session,
+        })
+    }
+
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
@@ -291,4 +309,39 @@ fn default_wasm_runtime() -> Result<Option<Arc<dyn WasmRuntime>>, LixError> {
 #[cfg(not(feature = "default_wasm_runtime"))]
 fn default_wasm_runtime() -> Result<Option<Arc<dyn WasmRuntime>>, LixError> {
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workspace_sessions_share_one_engine_but_have_independent_lifecycles() {
+        let root = open_lix(OpenLixOptions::<Memory>::default())
+            .await
+            .expect("open root Lix");
+        let first = root
+            .open_workspace_session()
+            .await
+            .expect("open first child session");
+        let second = root
+            .open_workspace_session()
+            .await
+            .expect("open second child session");
+
+        first.close().await.expect("close first child session");
+        let error = first
+            .execute("SELECT 1", &[])
+            .await
+            .expect_err("closed child session must reject work");
+        assert_eq!(error.code, LixError::CODE_CLOSED);
+
+        second
+            .execute("SELECT 2", &[])
+            .await
+            .expect("second child remains open");
+        root.execute("SELECT 3", &[])
+            .await
+            .expect("root remains open");
+    }
 }

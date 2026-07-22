@@ -10,6 +10,18 @@ use crate::wasm::{
 
 use super::{CompiledPluginCatalog, InstalledPlugin, PluginCatalogCache, PluginRegistry};
 
+/// Installed plugins are untrusted workspace data. Bound every component
+/// instantiation and exported call so malformed or adversarial guest code
+/// cannot occupy a server executor indefinitely.
+const DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 5_000;
+
+fn default_plugin_wasm_limits() -> WasmLimits {
+    WasmLimits {
+        timeout_ms: Some(DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS),
+        ..WasmLimits::default()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CachedPluginComponent {
     pub(crate) wasm_hash: BlobHash,
@@ -114,7 +126,7 @@ pub(crate) async fn load_or_init_plugin_component(
 
     let initialized = host
         .wasm_runtime()
-        .init_component(plugin.wasm.clone(), WasmLimits::default())
+        .init_component(plugin.wasm.clone(), default_plugin_wasm_limits())
         .await?;
     let mut guard = host
         .plugin_component_cache()
@@ -182,6 +194,7 @@ mod tests {
     #[derive(Default)]
     struct CountingRuntime {
         init_calls: Arc<AtomicUsize>,
+        init_limits: Arc<Mutex<Vec<WasmLimits>>>,
     }
 
     struct NoopComponent;
@@ -191,9 +204,13 @@ mod tests {
         async fn init_component(
             &self,
             _bytes: Vec<u8>,
-            _limits: WasmLimits,
+            limits: WasmLimits,
         ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
             self.init_calls.fetch_add(1, Ordering::SeqCst);
+            self.init_limits
+                .lock()
+                .expect("recorded WASM limits lock should be healthy")
+                .push(limits);
             Ok(Arc::new(NoopComponent))
         }
     }
@@ -247,6 +264,19 @@ mod tests {
             .await
             .expect("changed wasm should reinitialize instance");
         assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            runtime
+                .init_limits
+                .lock()
+                .expect("recorded WASM limits lock should be healthy")
+                .iter()
+                .all(|limits| {
+                    limits.timeout_ms == Some(DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS)
+                        && limits.max_memory_bytes == WasmLimits::default().max_memory_bytes
+                        && limits.max_fuel.is_none()
+                }),
+            "every installed component must retain the memory cap and receive an execution deadline"
+        );
     }
 
     #[tokio::test]

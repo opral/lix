@@ -35,6 +35,7 @@ import { readSseEvents } from "./sse.js";
 
 const OBSERVE_RETRY_BASE_MS = 100;
 const OBSERVE_RETRY_MAX_MS = 5_000;
+const REMOTE_SESSION_HEADER = "Lix-Session-Id";
 
 export async function openRemoteLixBinding(
 	options: RemoteLixServerOptions,
@@ -49,8 +50,10 @@ class RemoteLixBinding implements LixBinding {
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #observationHub: RemoteObservationHub;
+	#sessionId: string | undefined;
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
+	#closePromise: Promise<void> | undefined;
 
 	constructor(options: RemoteLixServerOptions) {
 		if (!options || typeof options !== "object") {
@@ -82,7 +85,10 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async open(): Promise<void> {
-		decodeHandshake(await this.#requestJson("", { method: "GET" }));
+		const handshake = decodeHandshake(
+			await this.#requestJson("", { method: "GET" }),
+		);
+		this.#sessionId = handshake.sessionId;
 	}
 
 	async execute(
@@ -145,10 +151,15 @@ class RemoteLixBinding implements LixBinding {
 
 	async activeBranchId(): Promise<string> {
 		this.#assertOpen();
-		return this.#enqueue(async () =>
-			decodeHandshake(await this.#requestJson("", { method: "GET" }))
-				.activeBranchId,
-		);
+		return this.#enqueue(async () => {
+			const handshake = decodeHandshake(
+				await this.#requestJson("", { method: "GET" }),
+			);
+			if (handshake.sessionId !== this.#sessionId) {
+				throw protocolError("remote handshake changed sessionId");
+			}
+			return handshake.activeBranchId;
+		});
 	}
 
 	async createBranch(
@@ -224,14 +235,24 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async close(): Promise<void> {
-		if (!this.#acceptingOperations) return this.#operationQueue;
+		if (this.#closePromise !== undefined) return this.#closePromise;
 		this.#acceptingOperations = false;
 		this.#observationHub.close();
-		return this.#enqueue(async () => this.#observationHub.close());
+		this.#closePromise = this.#enqueue(async () => {
+			this.#observationHub.close();
+			await this.#requestJson("session", { method: "DELETE" }, "empty");
+		});
+		return this.#closePromise;
 	}
 
-	async #requestJson(path: string, init: RequestInit): Promise<unknown> {
+	async #requestJson(
+		path: string,
+		init: RequestInit,
+		responseKind: "json" | "empty" = "json",
+	): Promise<unknown> {
 		const headers = new Headers(await resolveHeaders(this.#headers));
+		if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
+		else headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
 		headers.set("accept", "application/json");
 		if (init.body !== undefined) headers.set("content-type", "application/json");
 		let response: Response;
@@ -248,6 +269,7 @@ class RemoteLixBinding implements LixBinding {
 			);
 		}
 		if (!response.ok) throw await errorFromHttpResponse(response);
+		if (responseKind === "empty" || response.status === 204) return undefined;
 		const text = await response.text();
 		try {
 			return JSON.parse(text);
@@ -272,6 +294,10 @@ class RemoteLixBinding implements LixBinding {
 				{ details: { cause: errorMessage(cause) } },
 			);
 		}
+		if (this.#sessionId === undefined) {
+			throw protocolError("remote observation started without a session");
+		}
+		headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
 		headers.set("accept", "text/event-stream");
 		headers.set("content-type", "application/json");
 		try {

@@ -1297,7 +1297,11 @@ mod tests {
                     state % 1000
                 )
                 .into_bytes();
-                let value = raw_value(state.to_le_bytes()[0], (index % 3) as u8, (index % 5) as u8);
+                let value = raw_value(
+                    state.to_le_bytes()[0],
+                    (index % 3).to_le_bytes()[0],
+                    (index % 5).to_le_bytes()[0],
+                );
                 (key, value)
             })
             .collect::<Vec<_>>();
@@ -1345,7 +1349,11 @@ mod tests {
         let mut entries = Vec::new();
         for index in 0..300usize {
             let key = format!("rows/{index:05}").into_bytes();
-            let value = raw_value(index.to_le_bytes()[0], (index % 3) as u8, (index % 5) as u8);
+            let value = raw_value(
+                index.to_le_bytes()[0],
+                (index % 3).to_le_bytes()[0],
+                (index % 5).to_le_bytes()[0],
+            );
             entries.push((key, value));
         }
         entries.sort();
@@ -1420,7 +1428,7 @@ mod tests {
             .map(|index| {
                 (
                     format!("rows/{index:05}").into_bytes(),
-                    raw_value(index as u8, 9, (index % 4 + 1) as u8),
+                    raw_value(index.to_le_bytes()[0], 9, (index % 4 + 1).to_le_bytes()[0]),
                 )
             })
             .collect::<Vec<_>>();
