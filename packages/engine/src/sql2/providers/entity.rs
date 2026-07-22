@@ -19,7 +19,8 @@ use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
@@ -28,7 +29,7 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
-use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
+use crate::{GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value};
 
 use crate::sql2::{
     SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
@@ -165,6 +166,72 @@ pub(crate) async fn register_entity_write_providers(
     }
 
     Ok(())
+}
+
+/// Executes Atelier's exact active-branch key/value observer read without
+/// constructing a DataFusion catalog and plan. The live-state exact reader
+/// retains the normal branch-over-global visibility rules while lowering the
+/// primary-key predicate to one correlated point read.
+pub(crate) async fn execute_exact_lix_key_value_read(
+    active_branch_id: &str,
+    live_state: Arc<dyn LiveStateReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    key: &str,
+) -> Result<SqlQueryResult, LixError> {
+    let branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &BranchBinding::active(active_branch_id),
+        Vec::new(),
+    )
+    .await?;
+    let branch_id = branch_ids.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact lix_key_value read resolved an empty active branch scope",
+        )
+    })?;
+    let mut rows = live_state
+        .load_exact_rows(&LiveStateExactBatchRequest {
+            rows: vec![LiveStateExactRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id,
+                entity_pk: EntityPk::single(key),
+                file_id: None,
+            }],
+            projection: LiveStateProjection {
+                columns: vec!["snapshot_content".to_string()],
+            },
+            untracked: None,
+            include_tombstones: false,
+        })
+        .await?;
+    if rows.len() != 1 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "exact lix_key_value read expected one aligned result slot, got {}",
+                rows.len()
+            ),
+        ));
+    }
+
+    let rows = match rows.pop().flatten() {
+        None => Vec::new(),
+        Some(row) => {
+            let snapshot = parse_snapshot(row.snapshot_content.as_deref())
+                .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+            let value = match snapshot.as_ref().and_then(|snapshot| snapshot.get("value")) {
+                None | Some(JsonValue::Null) => Value::Null,
+                Some(value) => Value::Json(value.clone()),
+            };
+            vec![vec![value]]
+        }
+    };
+    Ok(SqlQueryResult {
+        columns: vec!["value".to_string()],
+        rows,
+        notices: Vec::new(),
+    })
 }
 
 fn catalog_entity_spec(

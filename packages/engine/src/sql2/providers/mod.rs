@@ -31,6 +31,7 @@ use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
 use datafusion::catalog::TableProvider;
 
+pub(crate) use entity::execute_exact_lix_key_value_read;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_read, execute_fast_lix_file_data_update_by_id,

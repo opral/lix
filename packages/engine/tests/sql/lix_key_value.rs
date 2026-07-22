@@ -1,6 +1,121 @@
 use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
+use serde_json::json;
+
+simulation_test!(
+    lix_key_value_parameter_point_read_preserves_active_global_and_missing_rows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let global_session = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+
+        global_session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
+                 VALUES ('kv-point-global', lix_json('{\"source\":\"global\"}'), true)",
+                &[],
+            )
+            .await
+            .expect("global point-read fixture should insert");
+
+        let global_fallback = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text("kv-point-global".to_string())],
+            )
+            .await
+            .expect("active branch should read the global fallback");
+        assert_eq!(
+            global_fallback.rows()[0].values(),
+            &[Value::Json(json!({"source": "global"}))]
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('kv-point-global', lix_json('{\"source\":\"active\"}')) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("active override should insert");
+        let active_override = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text("kv-point-global".to_string())],
+            )
+            .await
+            .expect("active branch should prefer its override");
+        assert_eq!(
+            active_override.rows()[0].values(),
+            &[Value::Json(json!({"source": "active"}))]
+        );
+
+        let aliased_fallback = session
+            .execute(
+                "SELECT value AS observed_value FROM lix_key_value WHERE key = $1",
+                &[Value::Text("kv-point-global".to_string())],
+            )
+            .await
+            .expect("non-matching alias shape should retain generic SQL behavior");
+        assert_eq!(aliased_fallback.columns(), &["observed_value"]);
+        assert_eq!(
+            aliased_fallback.rows()[0].values(),
+            &[Value::Json(json!({"source": "active"}))]
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('kv-point-null', lix_json('null'))",
+                &[],
+            )
+            .await
+            .expect("JSON null fixture should insert");
+        let json_null = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text("kv-point-null".to_string())],
+            )
+            .await
+            .expect("JSON null point read should succeed");
+        assert_eq!(json_null.rows()[0].values(), &[Value::Null]);
+
+        let missing = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text("kv-point-missing".to_string())],
+            )
+            .await
+            .expect("missing point read should succeed");
+        assert!(missing.is_empty());
+
+        let global_still_global = global_session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text("kv-point-global".to_string())],
+            )
+            .await
+            .expect("global session should retain the global value");
+        assert_eq!(
+            global_still_global.rows()[0].values(),
+            &[Value::Json(json!({"source": "global"}))]
+        );
+    }
+);
 
 simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     let engine = sim.boot_engine().await;

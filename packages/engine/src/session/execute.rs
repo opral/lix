@@ -485,6 +485,7 @@ where
 
         let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params);
         let exact_lix_file_read = exact_lix_file_read(&statement, params);
+        let exact_lix_key_value_read = exact_lix_key_value_read(&statement, params);
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -520,6 +521,7 @@ where
                     params,
                     acknowledge_file_views,
                     exact_lix_file_read,
+                    exact_lix_key_value_read,
                     has_durable_runtime_function,
                 )
                 .await
@@ -977,6 +979,7 @@ where
         params: &[Value],
         acknowledge_file_views: bool,
         exact_lix_file_read: Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)>,
+        exact_lix_key_value_read: Option<String>,
         has_durable_runtime_function: bool,
     ) -> Result<
         (
@@ -987,6 +990,26 @@ where
     > {
         let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
         let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        if let Some(key) = exact_lix_key_value_read {
+            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let branch_ref: Arc<dyn BranchRefReader> =
+                Arc::new(self.branch_ctx.ref_reader(read_store));
+            let query = sql2::execute_exact_lix_key_value_read(
+                &active_branch_id,
+                live_state,
+                branch_ref,
+                &key,
+            )
+            .await?;
+            return Ok((
+                sql2::SessionReadSqlResult {
+                    runtime_functions: None,
+                    query,
+                },
+                Vec::new(),
+            ));
+        }
         if let Some((selector, column)) = exact_lix_file_read {
             let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                 Arc::new(self.live_state.reader(read_store.clone()));
@@ -1429,6 +1452,24 @@ fn exact_lix_file_read(
     Some((selector, column))
 }
 
+fn exact_lix_key_value_read(statement: &DataFusionStatement, params: &[Value]) -> Option<String> {
+    let point_read = simple_point_read(statement)?;
+    if point_read.table_name != "lix_key_value" || !point_read.exact_table_shape {
+        return None;
+    }
+    let [SelectItem::UnnamedExpr(Expr::Identifier(projection))] =
+        point_read.select.projection.as_slice()
+    else {
+        return None;
+    };
+    if projection.quote_style.is_some() || !projection.value.eq_ignore_ascii_case("value") {
+        return None;
+    }
+    let selection = point_read.select.selection.as_ref()?;
+    let (identity_column, identity_value) = exact_point_identity(selection, params)?;
+    (identity_column == "key").then_some(identity_value)
+}
+
 fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, String)> {
     let Expr::BinaryOp {
         left,
@@ -1843,6 +1884,71 @@ mod tests {
                 exact_lix_file_read(&statement, &params),
                 None,
                 "unexpected fast-path match for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_lix_key_value_read_recognizes_only_the_atelier_observer_shape() {
+        for sql in [
+            "SELECT value FROM lix_key_value WHERE key = $1",
+            "select VALUE from LIX_KEY_VALUE where KEY = ?",
+            "SELECT value FROM lix_key_value WHERE $1 = key",
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                exact_lix_key_value_read(&statement, &[Value::Text("observer-key".to_string())]),
+                Some("observer-key".to_string()),
+                "expected exact key/value match for {sql}"
+            );
+        }
+
+        for (sql, params) in [
+            (
+                "SELECT key, value FROM lix_key_value WHERE key = $1",
+                vec![Value::Text("observer-key".to_string())],
+            ),
+            (
+                "SELECT value AS observed_value FROM lix_key_value WHERE key = $1",
+                vec![Value::Text("observer-key".to_string())],
+            ),
+            (
+                "SELECT value FROM lix_key_value AS kv WHERE key = $1",
+                vec![Value::Text("observer-key".to_string())],
+            ),
+            (
+                "SELECT value FROM lix_key_value WHERE key = 'observer-key'",
+                vec![],
+            ),
+            (
+                "SELECT value FROM lix_key_value WHERE key = $1 LIMIT 1",
+                vec![Value::Text("observer-key".to_string())],
+            ),
+            (
+                "SELECT value FROM lix_key_value WHERE key = $1 AND true",
+                vec![Value::Text("observer-key".to_string())],
+            ),
+            (
+                "SELECT value FROM lix_key_value_by_branch WHERE key = $1",
+                vec![Value::Text("observer-key".to_string())],
+            ),
+            (
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                vec![Value::Null],
+            ),
+            (
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                vec![
+                    Value::Text("observer-key".to_string()),
+                    Value::Text("extra".to_string()),
+                ],
+            ),
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                exact_lix_key_value_read(&statement, &params),
+                None,
+                "unexpected exact key/value match for {sql}"
             );
         }
     }
