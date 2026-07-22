@@ -288,6 +288,7 @@ where
             crate::plugin::PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::new(crate::sql2::SqlPlanningCache::default()),
             crate::sql2::SessionFileViews::default(),
         )
         .await

@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use crate::observe_coordinator::{ObserveQueryKey, ObserveQueryState, ObserveSessionScope};
+use crate::observe_coordinator::{
+    ObserveQueryEvaluation, ObserveQueryKey, ObserveQueryState, ObserveSessionScope,
+    ObserveSharedContent,
+};
 use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
 use crate::{ExecuteResult, LixError, Value, sql2};
@@ -47,6 +50,7 @@ where
     receiver: watch::Receiver<u64>,
     sequence: u64,
     last_rows: Option<ExecuteResult>,
+    last_shared_content: Option<ObserveSharedContent>,
     closed: bool,
 }
 
@@ -60,11 +64,14 @@ where
             return Ok(None);
         }
         if self.last_rows.is_none() {
-            let Some((mutation_sequence, rows)) = self.evaluate_stable_snapshot().await? else {
+            let Some((mutation_sequence, evaluation)) = self.evaluate_stable_snapshot().await?
+            else {
                 return Ok(None);
             };
+            let rows = evaluation.rows;
             self.acknowledge_delivered_file_views(&rows);
             self.last_rows = Some(rows.clone());
+            self.last_shared_content = evaluation.shared_content;
             return Ok(Some(ObserveEvent {
                 sequence: self.sequence,
                 mutation_sequence,
@@ -88,14 +95,15 @@ where
                 return Ok(None);
             }
 
-            let Some((mutation_sequence, rows)) = self.evaluate_stable_snapshot().await? else {
+            let Some((mutation_sequence, evaluation)) = self.evaluate_stable_snapshot().await?
+            else {
                 return Ok(None);
             };
-            if self
-                .last_rows
-                .as_ref()
-                .is_none_or(|last_rows| *last_rows != rows)
-            {
+            let changed =
+                evaluation.rows_changed_since(self.last_rows.as_ref(), self.last_shared_content);
+            self.last_shared_content = evaluation.shared_content;
+            if changed {
+                let rows = evaluation.rows;
                 self.acknowledge_delivered_file_views(&rows);
                 self.sequence += 1;
                 self.last_rows = Some(rows.clone());
@@ -122,7 +130,9 @@ where
         Ok(self.receiver.changed().await.is_ok())
     }
 
-    async fn evaluate_stable_snapshot(&mut self) -> Result<Option<(u64, ExecuteResult)>, LixError> {
+    async fn evaluate_stable_snapshot(
+        &mut self,
+    ) -> Result<Option<(u64, ObserveQueryEvaluation)>, LixError> {
         loop {
             let operation_guard = self.session.begin_waitable_session_operation().await?;
             #[cfg(not(target_family = "wasm"))]
@@ -148,16 +158,17 @@ where
         }
     }
 
-    async fn execute_or_share(&self, generation: u64) -> Result<ExecuteResult, LixError> {
+    async fn execute_or_share(&self, generation: u64) -> Result<ObserveQueryEvaluation, LixError> {
         let Some(shared_state) = &self.query.shared_state else {
             return self
                 .session
                 .execute_for_observe(&self.query.sql, &self.query.params)
-                .await;
+                .await
+                .map(ObserveQueryEvaluation::unshared);
         };
 
         shared_state
-            .evaluate(generation, || async {
+            .evaluate(generation, Arc::strong_count(shared_state) > 1, || async {
                 self.session
                     .execute_for_observe(&self.query.sql, &self.query.params)
                     .await
@@ -191,7 +202,7 @@ where
                 "observe requires a non-empty SQL string",
             ));
         }
-        let statement = sql2::parse_statement(sql)?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -213,6 +224,7 @@ where
             receiver: self.observe_invalidation.subscribe(),
             sequence: 0,
             last_rows: None,
+            last_shared_content: None,
             closed: false,
         })
     }
