@@ -87,18 +87,19 @@ pub(crate) async fn execute_read_statement_from_parsed<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let session = prepare_read_session(ctx).await?;
+    let session = prepare_read_session(ctx, std::slice::from_ref(&statement)).await?;
     execute_read_statement_in_session_from_parsed(&session, sql, statement, params).await
 }
 
 pub(crate) async fn prepare_read_session<'ctx, C>(
     ctx: &'ctx C,
+    statements: &[DataFusionStatement],
 ) -> Result<ReadSqlSession<'ctx>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
     Ok(ReadSqlSession {
-        session: build_read_session(ctx).await?,
+        session: build_read_session(ctx, statements).await?,
         _context: PhantomData,
     })
 }
@@ -106,12 +107,13 @@ where
 pub(crate) async fn prepare_read_session_at_head<'ctx, C>(
     ctx: &'ctx C,
     active_head: BranchHead,
+    statements: &[DataFusionStatement],
 ) -> Result<ReadSqlSession<'ctx>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
     Ok(ReadSqlSession {
-        session: build_read_session_at_head(ctx, active_head).await?,
+        session: build_read_session_at_head(ctx, active_head, statements).await?,
         _context: PhantomData,
     })
 }
@@ -168,7 +170,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
-    let session = build_transaction_read_session(read_ctx, write_ctx).await?;
+    let session = build_transaction_read_session(read_ctx, write_ctx, &statement).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
@@ -1836,6 +1838,7 @@ mod tests {
         schema_definitions: Vec<JsonValue>,
     }
 
+    #[async_trait]
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
         type ReadStore = SharedStorageAdapterRead<MemoryRead>;
 
@@ -1886,7 +1889,7 @@ mod tests {
             Arc::new(DummyBranchRefReader)
         }
 
-        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
     }
@@ -1897,6 +1900,11 @@ mod tests {
         live_state: Arc<dyn LiveStateReader>,
         staged_writes: Arc<Mutex<CapturingStagedWrites>>,
         schema_definitions: Vec<JsonValue>,
+    }
+
+    struct CountingWriteSessionContext<'a> {
+        inner: DummySqlWriteExecutionContext<'a>,
+        branch_head_loads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1957,6 +1965,50 @@ mod tests {
                 .deltas
                 .push(CapturedStageWrite { rows });
             Ok(TransactionWriteOutcome { count })
+        }
+    }
+
+    #[async_trait]
+    impl SqlWriteExecutionContext for CountingWriteSessionContext<'_> {
+        fn active_branch_id(&self) -> &str {
+            self.inner.active_branch_id()
+        }
+
+        fn functions(&self) -> FunctionProviderHandle {
+            self.inner.functions()
+        }
+
+        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+            self.inner.list_visible_schemas()
+        }
+
+        async fn load_bytes_many(
+            &mut self,
+            hashes: &[crate::binary_cas::BlobHash],
+        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            self.inner.load_bytes_many(hashes).await
+        }
+
+        async fn scan_live_state(
+            &mut self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.inner.scan_live_state(request).await
+        }
+
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<CommitId>, LixError> {
+            self.branch_head_loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_branch_head(branch_id).await
+        }
+
+        async fn stage_write(
+            &mut self,
+            write: TransactionWrite,
+        ) -> Result<TransactionWriteOutcome, LixError> {
+            self.inner.stage_write(write).await
         }
     }
 
@@ -5189,6 +5241,73 @@ mod tests {
             .expect("DataFusion staged delta should project")
             .visible_all_semantic_rows();
         assert_eq!(fast_rows, datafusion_rows);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_guarded_file_data_fallback_builds_one_write_session() {
+        let rows = vec![
+            live_directory_row("dir-docs", "branch-a", None, "docs"),
+            live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
+            live_blob_ref_row("file-readme", "branch-a", b"old"),
+        ];
+        let (inner, staged_writes, scans) = counting_write_context_with_blob_reader(
+            rows,
+            Arc::new(StaticBlobReader {
+                bytes: b"old".to_vec(),
+            }),
+        );
+        let branch_head_loads = Arc::new(AtomicUsize::new(0));
+        let mut ctx = CountingWriteSessionContext {
+            inner,
+            branch_head_loads: Arc::clone(&branch_head_loads),
+        };
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3",
+            &[
+                Value::Blob(b"new".to_vec()),
+                Value::Text("file-readme".to_string()),
+                Value::Blob(b"old".to_vec()),
+            ],
+            WriteExecutorMode::Auto,
+        )
+        .await
+        .expect("guarded file update should use the DataFusion fallback");
+
+        assert_eq!(path, WriteExecutorPath::DataFusion);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(
+            branch_head_loads.load(Ordering::SeqCst),
+            1,
+            "the fallback should build and initialize one DataFusion write session"
+        );
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the descriptor and blob-ref reads should run once, during execution"
+        );
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let blob_refs = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_refs.len(), 1);
+        let snapshot: JsonValue = serde_json::from_str(
+            blob_refs[0]
+                .snapshot_content
+                .as_deref()
+                .expect("blob ref snapshot"),
+        )
+        .expect("blob ref snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["size_bytes"], 3);
+        assert_eq!(
+            snapshot["blob_hash"],
+            crate::binary_cas::BlobHash::from_content(b"new").to_hex()
+        );
     }
 
     #[tokio::test]

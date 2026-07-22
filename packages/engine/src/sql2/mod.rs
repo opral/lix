@@ -29,6 +29,7 @@ pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement, bind_statement_route,
     statement_has_durable_runtime_function,
 };
+pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource, SqlJsonReader, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,

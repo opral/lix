@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::branch::BranchRefReader;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -29,12 +29,18 @@ use super::transaction::SessionTransaction;
 ///
 /// Column names live once at the result-set level. Individual rows only own
 /// values, which keeps the public API row-oriented without copying schema
-/// metadata into every row.
+/// metadata into every row. Result storage is immutable and reference counted
+/// so observation fanout does not copy large blob values per subscriber.
 #[derive(Debug, Clone)]
 pub struct ExecuteResult {
-    columns: Vec<String>,
-    rows: Vec<Row>,
+    backing: Arc<ExecuteResultBacking>,
     rows_affected: u64,
+}
+
+#[derive(Debug)]
+struct ExecuteResultBacking {
+    columns: Arc<[String]>,
+    rows: Vec<Row>,
     notices: Vec<LixNotice>,
     // Observe evaluations can be shared across sessions. Carry the exact
     // rendered plugin state with the rows so each receiving session can
@@ -44,10 +50,11 @@ pub struct ExecuteResult {
 
 impl PartialEq for ExecuteResult {
     fn eq(&self, other: &Self) -> bool {
-        self.columns == other.columns
-            && self.rows == other.rows
-            && self.rows_affected == other.rows_affected
-            && self.notices == other.notices
+        self.rows_affected == other.rows_affected
+            && (Arc::ptr_eq(&self.backing, &other.backing)
+                || (self.backing.columns == other.backing.columns
+                    && self.backing.rows == other.backing.rows
+                    && self.backing.notices == other.backing.notices))
     }
 }
 
@@ -62,14 +69,7 @@ pub struct CoherentReadBatch {
 
 impl ExecuteResult {
     fn from_sql_query_result(result: SqlQueryResult) -> Self {
-        Self {
-            columns: result.columns,
-            rows: Vec::new(),
-            rows_affected: 0,
-            notices: result.notices,
-            file_view_mutations: Vec::new(),
-        }
-        .with_rows(result.rows)
+        Self::from_query_parts(result.columns, result.rows, 0, result.notices)
     }
 
     fn from_sql_write_result(result: sql2::SqlWriteResult) -> Self {
@@ -78,86 +78,86 @@ impl ExecuteResult {
             returning,
         } = result;
         match returning {
-            Some(result) => Self {
-                columns: result.columns,
-                rows: Vec::new(),
-                rows_affected,
-                notices: result.notices,
-                file_view_mutations: Vec::new(),
+            Some(result) => {
+                Self::from_query_parts(result.columns, result.rows, rows_affected, result.notices)
             }
-            .with_rows(result.rows),
             None => Self::from_rows_affected(rows_affected),
         }
     }
 
     pub fn from_rows_affected(rows_affected: u64) -> Self {
         Self {
-            columns: Vec::new(),
-            rows: Vec::new(),
+            backing: empty_execute_result_backing(),
             rows_affected,
-            notices: Vec::new(),
-            file_view_mutations: Vec::new(),
         }
     }
 
     pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
-        Self {
-            columns,
-            rows: Vec::new(),
-            rows_affected: 0,
-            notices: Vec::new(),
-            file_view_mutations: Vec::new(),
-        }
-        .with_rows(rows)
+        Self::from_query_parts(columns, rows, 0, Vec::new())
     }
 
-    fn with_rows(mut self, rows: Vec<Vec<Value>>) -> Self {
-        let columns = Arc::<[String]>::from(self.columns.clone().into_boxed_slice());
-        self.rows = rows
+    fn from_query_parts(
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        rows_affected: u64,
+        notices: Vec<LixNotice>,
+    ) -> Self {
+        let columns: Arc<[String]> = columns.into();
+        let rows = rows
             .into_iter()
             .map(|values| Row {
                 columns: Arc::clone(&columns),
                 values,
             })
             .collect();
-        self
+        Self {
+            backing: Arc::new(ExecuteResultBacking {
+                columns,
+                rows,
+                notices,
+                file_view_mutations: Vec::new(),
+            }),
+            rows_affected,
+        }
     }
 
     fn with_file_view_mutations(mut self, mutations: Vec<sql2::SessionFileViewMutation>) -> Self {
-        self.file_view_mutations = mutations;
+        Arc::get_mut(&mut self.backing)
+            .expect("fresh execute result backing must be uniquely owned")
+            .file_view_mutations = mutations;
         self
     }
 
     pub(crate) fn file_view_mutations(&self) -> &[sql2::SessionFileViewMutation] {
-        &self.file_view_mutations
+        &self.backing.file_view_mutations
     }
 
     /// Returns the result-set column names in row value order.
     pub fn columns(&self) -> &[String] {
-        &self.columns
+        self.backing.columns.as_ref()
     }
 
     /// Returns the owned rows. Use `iter()` for name-based access.
     pub fn rows(&self) -> &[Row] {
-        &self.rows
+        &self.backing.rows
     }
 
     /// Iterates rows with borrowed access to the shared column metadata.
     pub fn iter(&self) -> impl Iterator<Item = RowRef<'_>> {
-        self.rows.iter().map(|row| RowRef {
-            columns: self.columns.as_slice(),
+        self.backing.rows.iter().map(|row| RowRef {
+            columns: self.backing.columns.as_ref(),
             values: row.values.as_slice(),
         })
     }
 
     /// Returns the number of rows in this result set.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.backing.rows.len()
     }
 
     /// Returns true when this result set has no rows.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.backing.rows.is_empty()
     }
 
     /// Returns the number of rows affected by a mutation statement.
@@ -167,7 +167,7 @@ impl ExecuteResult {
 
     /// Returns non-fatal diagnostics produced while executing the statement.
     pub fn notices(&self) -> &[LixNotice] {
-        &self.notices
+        &self.backing.notices
     }
 
     /// Looks up the value for `column_name` on an owned row from this set.
@@ -178,8 +178,23 @@ impl ExecuteResult {
 
     /// Returns the index for a column name.
     pub fn column_index(&self, column_name: &str) -> Option<usize> {
-        self.columns.iter().position(|column| column == column_name)
+        self.backing
+            .columns
+            .iter()
+            .position(|column| column == column_name)
     }
+}
+
+fn empty_execute_result_backing() -> Arc<ExecuteResultBacking> {
+    static EMPTY: OnceLock<Arc<ExecuteResultBacking>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| {
+        Arc::new(ExecuteResultBacking {
+            columns: Vec::new().into(),
+            rows: Vec::new(),
+            notices: Vec::new(),
+            file_view_mutations: Vec::new(),
+        })
+    }))
 }
 
 /// One owned row returned by a query.
@@ -662,24 +677,18 @@ where
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
-                let visible_schemas = self
-                    .catalog_context
-                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                    .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
-                    visible_schemas,
+                    catalog_context: Arc::clone(&self.catalog_context),
                     functions: FunctionProviderHandle::system(),
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
                 };
-                let read_session = sql2::prepare_read_session(&ctx).await?;
+                let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, (statement, parsed)) in
                     statements.iter().zip(parsed).enumerate()
@@ -717,7 +726,6 @@ where
                 }
                 drop(read_session);
                 drop(ctx);
-                drop(live_state);
                 let file_view_mutations = file_view_collector
                     .map(|collector| collector.plugin_file_mutations())
                     .unwrap_or_default();
@@ -818,25 +826,19 @@ where
                         Vec::new(),
                     ));
                 }
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
-                let visible_schemas = self
-                    .catalog_context
-                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                    .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
-                    visible_schemas,
+                    catalog_context: Arc::clone(&self.catalog_context),
                     functions: FunctionProviderHandle::system(),
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
                 };
                 let read_session =
-                    sql2::prepare_read_session_at_head(&ctx, active_branch_head).await?;
+                    sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed).await?;
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, ((sql, params), statement)) in
                     statements.iter().zip(parsed).enumerate()
@@ -869,7 +871,6 @@ where
                 }
                 drop(read_session);
                 drop(ctx);
-                drop(live_state);
                 let file_view_mutations = file_view_collector
                     .map(|collector| collector.plugin_file_mutations())
                     .unwrap_or_default();
@@ -1021,17 +1022,13 @@ where
             Arc::new(self.live_state.reader(read_store.clone()));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
-        let visible_schemas = self
-            .catalog_context
-            .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-            .await?;
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
             read_store,
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
-            visible_schemas,
+            catalog_context: Arc::clone(&self.catalog_context),
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
             file_views: file_view_collector.clone(),
@@ -1711,7 +1708,10 @@ where
 }
 
 fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
-    if error.code.starts_with("LIX_ERROR_PATH_") && sql_uses_public_filesystem_path_surface(sql) {
+    if (error.code.starts_with("LIX_ERROR_PATH_") && sql_uses_public_filesystem_path_surface(sql))
+        || (error.code == LixError::CODE_SCHEMA_DEFINITION
+            && error.message.to_ascii_lowercase().contains("system schema"))
+    {
         return LixError {
             code: LixError::CODE_INVALID_PARAM.to_string(),
             ..error
@@ -1906,6 +1906,18 @@ mod tests {
     }
 
     #[test]
+    fn execute_result_clone_shares_immutable_backing() {
+        let result = ExecuteResult::from_rows(
+            vec!["data".to_string()],
+            vec![vec![Value::Blob(vec![b'x'; 1024 * 1024])]],
+        );
+        let cloned = result.clone();
+
+        assert!(Arc::ptr_eq(&result.backing, &cloned.backing));
+        assert_eq!(result, cloned);
+    }
+
+    #[test]
     fn row_get_errors_on_missing_column_and_wrong_type() {
         let result = ExecuteResult::from_rows(
             vec!["title".to_string()],
@@ -1994,5 +2006,204 @@ mod tests {
             row.get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("value")
         );
+    }
+
+    #[tokio::test]
+    async fn coherent_read_batch_registers_union_of_referenced_providers() {
+        let session = open_session().await;
+        let statements: [(&str, &[Value]); 3] = [
+            ("SELECT 1 AS one", &[]),
+            ("SELECT COUNT(*) AS files FROM lix_file", &[]),
+            ("SELECT COUNT(*) AS states FROM lix_state", &[]),
+        ];
+
+        let batch = session
+            .execute_coherent_read_batch(&statements)
+            .await
+            .expect("coherent batch should register every referenced provider");
+
+        assert_eq!(batch.results.len(), 3);
+        assert_eq!(batch.results[0].rows()[0].get::<i64>("one").unwrap(), 1);
+        assert_eq!(batch.results[1].rows()[0].get::<i64>("files").unwrap(), 0);
+        assert!(batch.results[2].rows()[0].get::<i64>("states").unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn referenced_provider_reads_preserve_complex_and_catalog_wide_queries() {
+        let session = open_session().await;
+        let complex = session
+            .execute(
+                "WITH files AS (SELECT id FROM lix_file) \
+                 SELECT COUNT(*) AS row_count \
+                 FROM files AS file_a \
+                 JOIN files AS file_b ON file_a.id = file_b.id \
+                 LEFT JOIN (\
+                     SELECT entity_pk FROM lix_state \
+                     UNION ALL \
+                     SELECT entity_pk FROM lix_state\
+                 ) AS states ON false",
+                &[],
+            )
+            .await
+            .expect("nested CTE, self-join, and UNION should resolve providers");
+        assert_eq!(complex.rows()[0].get::<i64>("row_count").unwrap(), 0);
+
+        let catalog = session
+            .execute(
+                "SELECT COUNT(*) AS surfaces \
+                 FROM information_schema.tables \
+                 WHERE table_schema = 'public'",
+                &[],
+            )
+            .await
+            .expect("information_schema should retain catalog-wide visibility");
+        assert!(catalog.rows()[0].get::<i64>("surfaces").unwrap() > 1);
+    }
+
+    #[tokio::test]
+    async fn read_provider_selection_loads_storage_catalog_only_for_dynamic_visibility() {
+        let session = open_session().await;
+        let schema_loads = || {
+            session
+                .catalog_context
+                .sql_read_schema_load_count_for_test()
+        };
+
+        let before = schema_loads();
+        session
+            .execute("SELECT 1 AS one", &[])
+            .await
+            .expect("table-free read should execute");
+        assert_eq!(schema_loads(), before, "SELECT 1 needs no SQL catalog");
+
+        session
+            .execute("SELECT COUNT(*) AS rows FROM lix_key_value", &[])
+            .await
+            .expect("fixed entity surface should execute");
+        assert_eq!(
+            schema_loads(),
+            before,
+            "fixed entity metadata comes from compile-time schemas"
+        );
+
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_key_value_history \
+                 WHERE lixcol_start_commit_id = lix_active_branch_commit_id()",
+                &[],
+            )
+            .await
+            .expect("fixed history surface should execute");
+        assert_eq!(
+            schema_loads(),
+            before,
+            "fixed history metadata comes from compile-time schemas"
+        );
+
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_key_value AS kv \
+                 JOIN lix_state AS state ON false",
+                &[],
+            )
+            .await
+            .expect("join of fixed surfaces should execute");
+        assert_eq!(
+            schema_loads(),
+            before,
+            "a join remains storage-free when every table is fixed"
+        );
+
+        session
+            .execute(
+                "SELECT COUNT(*) AS surfaces FROM information_schema.tables",
+                &[],
+            )
+            .await
+            .expect("information schema should execute");
+        assert_eq!(
+            schema_loads(),
+            before + 1,
+            "catalog-wide visibility must load dynamic schemas"
+        );
+
+        let custom_schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "custom_catalog_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false,
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(custom_schema.to_string())],
+            )
+            .await
+            .expect("custom schema should register");
+        let before_custom_read = schema_loads();
+
+        session
+            .execute("SELECT COUNT(*) AS rows FROM custom_catalog_probe", &[])
+            .await
+            .expect("custom entity should execute");
+        assert_eq!(
+            schema_loads(),
+            before_custom_read + 1,
+            "custom entity metadata must load the visible catalog"
+        );
+
+        let before_mixed_join = schema_loads();
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM lix_key_value AS kv \
+                 JOIN custom_catalog_probe AS custom ON false",
+                &[],
+            )
+            .await
+            .expect("mixed fixed/custom join should execute");
+        assert_eq!(
+            schema_loads(),
+            before_mixed_join + 1,
+            "one custom table makes the whole session use the visible catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_referenced_provider_reads_see_staged_writes() {
+        let session = open_session().await;
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('selected-provider-file', '/selected.txt')",
+                &[],
+            )
+            .await
+            .expect("file should stage");
+
+        let result = transaction
+            .execute(
+                "WITH selected AS (\
+                     SELECT id FROM lix_file WHERE id = 'selected-provider-file'\
+                 ) \
+                 SELECT id FROM selected",
+                &[],
+            )
+            .await
+            .expect("selected overlay provider should expose staged writes");
+        assert_eq!(
+            result.rows()[0].get::<String>("id").unwrap(),
+            "selected-provider-file"
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
     }
 }
