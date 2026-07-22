@@ -163,10 +163,12 @@ async fn execute_write_logical_plan_with_mode_inner(
     }
 
     if mode != WriteExecutorModeInner::ForceDataFusion {
-        super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
-        if let Some(fast_plan) =
-            crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan)?
-        {
+        let fast_plan = crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan)?;
+        if requires_standalone_datafusion_validation(&write_plan, fast_plan.is_some(), mode) {
+            super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan, params)
+                .await?;
+        }
+        if let Some(fast_plan) = fast_plan {
             let rows_affected =
                 crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
                     .await?;
@@ -186,6 +188,24 @@ async fn execute_write_logical_plan_with_mode_inner(
     let result =
         super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
     Ok((result, WriteExecutorPath::DataFusion))
+}
+
+/// Fast executors rely on the DataFusion writer to preserve validation
+/// behavior that is outside their deliberately narrow implementations.
+///
+/// A regular DataFusion fallback does not need this separate pass: its
+/// executor performs the same input, session, provider, expression, and
+/// filter validation immediately before execution. Empty scopes and upserts
+/// retain the standalone pass because their execution paths can return early.
+fn requires_standalone_datafusion_validation(
+    plan: &LogicalWritePlan,
+    has_fast_plan: bool,
+    mode: WriteExecutorModeInner,
+) -> bool {
+    has_fast_plan
+        || mode == WriteExecutorModeInner::ForceFast
+        || plan.bound.branch_scope == BranchScope::Empty
+        || plan.bound.conflict.is_some()
 }
 
 fn resolve_parameterized_branch_scope(
@@ -699,4 +719,74 @@ fn validate_write_parameter_count(
             .map(|index| format!("${index}"))
             .collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regular_datafusion_fallback_uses_execution_validation() {
+        let plan = plan_sql("UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3");
+        let has_fast_plan = crate::sql2::optimize::simple_write::try_make_fast_write_plan(&plan)
+            .expect("fast-plan eligibility should be computable")
+            .is_some();
+        assert!(!has_fast_plan);
+
+        assert!(!requires_standalone_datafusion_validation(
+            &plan,
+            has_fast_plan,
+            WriteExecutorModeInner::Auto,
+        ));
+    }
+
+    #[test]
+    fn early_or_fast_paths_keep_standalone_datafusion_validation() {
+        let fallback = plan_sql("UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3");
+        assert!(requires_standalone_datafusion_validation(
+            &fallback,
+            false,
+            WriteExecutorModeInner::ForceFast,
+        ));
+
+        let empty_scope = plan_sql(
+            "UPDATE lix_state_by_branch SET metadata = '{}' \
+             WHERE branch_id = 'branch-a' AND branch_id = 'branch-b'",
+        );
+        assert_eq!(empty_scope.bound.branch_scope, BranchScope::Empty);
+        assert!(requires_standalone_datafusion_validation(
+            &empty_scope,
+            false,
+            WriteExecutorModeInner::Auto,
+        ));
+
+        let conflict = plan_sql(
+            "INSERT INTO lix_file (path, data) VALUES ('/readme.md', X'41') \
+             ON CONFLICT (path) DO NOTHING",
+        );
+        assert!(conflict.bound.conflict.is_some());
+        assert!(requires_standalone_datafusion_validation(
+            &conflict,
+            false,
+            WriteExecutorModeInner::Auto,
+        ));
+
+        let fast = plan_sql("DELETE FROM lix_state WHERE false");
+        let has_fast_plan = crate::sql2::optimize::simple_write::try_make_fast_write_plan(&fast)
+            .expect("fast-plan eligibility should be computable")
+            .is_some();
+        assert!(has_fast_plan);
+        assert!(requires_standalone_datafusion_validation(
+            &fast,
+            has_fast_plan,
+            WriteExecutorModeInner::Auto,
+        ));
+    }
+
+    fn plan_sql(sql: &str) -> LogicalWritePlan {
+        let statement = crate::sql2::parse_statement(sql).expect("SQL should parse");
+        let bound =
+            crate::sql2::bind_statement(&statement, &[], "branch-a").expect("SQL should bind");
+        crate::sql2::plan_write(bound).expect("SQL write should plan")
+    }
 }

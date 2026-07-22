@@ -41,6 +41,7 @@ const OBSERVE_RETRY_MAX_MS = 5_000;
 const REMOTE_SESSION_HEADER = "Lix-Session-Id";
 const REQUEST_BLOB_DELTA_MIN_BYTES = 32 * 1024;
 const REQUEST_BLOB_DELTA_MIN_WIRE_RATIO = 0.9;
+const REQUEST_BLOB_COMPARE_WORD_BYTES = 8;
 const REQUEST_BLOB_BASE_MAX_ENTRIES = 8;
 const REQUEST_BLOB_BASE_MAX_BYTES = 2 * 1024 * 1024;
 const REMOTE_BLOB_BASE_MISSING = "LIX_REMOTE_BLOB_BASE_MISSING";
@@ -208,9 +209,7 @@ class RemoteLixBinding implements LixBinding {
 		params: NativeLixValue[],
 	): Promise<ObserveEventsBinding> {
 		this.#assertOpen();
-		return this.#enqueue(async () =>
-			this.#observationHub.observe(sql, params.map(encodeWireValue)),
-		);
+		return this.#observationHub.observe(sql, params.map(encodeWireValue));
 	}
 
 	async beginTransaction(): Promise<LixTransactionBinding> {
@@ -375,6 +374,7 @@ class RemoteLixBinding implements LixBinding {
 				{ details: { cause: errorMessage(cause) } },
 			);
 		}
+		signal.throwIfAborted();
 		if (this.#sessionId === undefined) {
 			throw protocolError("remote observation started without a session");
 		}
@@ -390,6 +390,7 @@ class RemoteLixBinding implements LixBinding {
 		if (prepared.compressed) {
 			headers.set("content-encoding", "gzip");
 		}
+		signal.throwIfAborted();
 		try {
 			return await this.#fetch(new URL("observe/multiplex", this.#baseUrl), {
 				method: "POST",
@@ -576,8 +577,26 @@ function planBlobSplice(
 	result: Uint8Array,
 	resultSha256: string,
 ): BlobSplicePlan {
+	const baseView = new DataView(
+		base.bytes.buffer,
+		base.bytes.byteOffset,
+		base.bytes.byteLength,
+	);
+	const resultView = new DataView(
+		result.buffer,
+		result.byteOffset,
+		result.byteLength,
+	);
 	let prefixBytes = 0;
 	const prefixLimit = Math.min(base.bytes.byteLength, result.byteLength);
+	while (
+		prefixLimit - prefixBytes >= REQUEST_BLOB_COMPARE_WORD_BYTES &&
+		baseView.getUint32(prefixBytes) === resultView.getUint32(prefixBytes) &&
+		baseView.getUint32(prefixBytes + 4) ===
+			resultView.getUint32(prefixBytes + 4)
+	) {
+		prefixBytes += REQUEST_BLOB_COMPARE_WORD_BYTES;
+	}
 	while (
 		prefixBytes < prefixLimit &&
 		base.bytes[prefixBytes] === result[prefixBytes]
@@ -590,6 +609,20 @@ function planBlobSplice(
 		base.bytes.byteLength - prefixBytes,
 		result.byteLength - prefixBytes,
 	);
+	while (suffixLimit - suffixBytes >= REQUEST_BLOB_COMPARE_WORD_BYTES) {
+		const baseOffset =
+			base.bytes.byteLength - suffixBytes - REQUEST_BLOB_COMPARE_WORD_BYTES;
+		const resultOffset =
+			result.byteLength - suffixBytes - REQUEST_BLOB_COMPARE_WORD_BYTES;
+		if (
+			baseView.getUint32(baseOffset) !== resultView.getUint32(resultOffset) ||
+			baseView.getUint32(baseOffset + 4) !==
+				resultView.getUint32(resultOffset + 4)
+		) {
+			break;
+		}
+		suffixBytes += REQUEST_BLOB_COMPARE_WORD_BYTES;
+	}
 	while (
 		suffixBytes < suffixLimit &&
 		base.bytes[base.bytes.byteLength - suffixBytes - 1] ===
@@ -706,6 +739,7 @@ class RemoteObservationHub {
 	#retryAttempt = 0;
 	#serverRetryMs: number | undefined;
 	#generation = 0;
+	#startQueued = false;
 	#closed = false;
 
 	constructor(options: RemoteObservationHubOptions) {
@@ -744,7 +778,12 @@ class RemoteObservationHub {
 
 	#restartStream(): void {
 		this.#stopStream();
-		this.#startStream();
+		if (this.#startQueued) return;
+		this.#startQueued = true;
+		queueMicrotask(() => {
+			this.#startQueued = false;
+			this.#startStream();
+		});
 	}
 
 	#startStream(): void {
