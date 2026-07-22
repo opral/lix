@@ -2343,8 +2343,7 @@ fn current_sql2_data_sink_exec_violations() -> Vec<SqlRuntimeOwnershipViolation>
     violations.into_iter().collect()
 }
 
-fn current_session_transaction_durable_commit_boundary_violations() -> Vec<RawSqlExecutionViolation>
-{
+fn current_session_transaction_commit_boundary_violations() -> Vec<RawSqlExecutionViolation> {
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
@@ -2918,8 +2917,8 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
 }
 
 #[test]
-fn session_transaction_durable_commits_go_through_commit_boundary() {
-    let violations = current_session_transaction_durable_commit_boundary_violations();
+fn session_transaction_commits_go_through_commit_boundary() {
+    let violations = current_session_transaction_commit_boundary_violations();
 
     assert!(
         violations.is_empty(),

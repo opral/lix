@@ -228,6 +228,14 @@ discards the staged mutations.
 contract does not promise reads through a write handle or read-your-writes
 behavior.
 
+SlateDB publishes commits from its in-memory WAL immediately and flushes that
+WAL to object storage in the background (every 100 ms by default). Nearby
+commits therefore share an object-store write. `SlateDB::flush()` remains an
+explicit durability barrier for callers that need one, and orderly shutdown
+attempts to flush outstanding writes. Final-handle drop cannot report a flush
+failure, so callers that require an observed durability guarantee must call
+`flush()` explicitly.
+
 ## Required guarantees
 
 1. **Space isolation.** Identical keys in different `SpaceId` values never
@@ -238,9 +246,10 @@ behavior.
    order and pagination respects the exclusive cursor.
 4. **Atomic commits.** A successful `commit` publishes all staged mutations;
    failed or rolled-back writes do not publish a partial result.
-5. **Durability.** Persistent implementations honor the requested durability
-   and retain successful commits across process restart. `Memory` is explicitly
-   ephemeral.
+5. **Persistence.** Persistent implementations define their own durability
+   boundary. A storage may acknowledge visible commits before a background
+   flush; only commits that cross the provider's durability boundary are
+   guaranteed across process loss. `Memory` is explicitly ephemeral.
 
 Read handles release snapshots and other resources through `Drop`; there is no
 read `close` or `rollback` method. The `Storage` trait also does not prescribe

@@ -910,7 +910,7 @@ mod tests {
 
         gate.release();
         join_thread(committer, "blocked committer")
-            .expect("commit already at durable boundary should finish");
+            .expect("commit already at storage boundary should finish");
         assert_close_finishes(close.as_mut(), "close after commit exits").await;
         assert!(
             !session.commit_in_progress_for_test(),

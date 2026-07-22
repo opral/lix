@@ -7,9 +7,9 @@
 //!   concurrent sessions beyond each storage read snapshot.
 //! - `SessionContext::close()` is a lifecycle boundary. It waits for in-flight
 //!   reads, rejects live explicit transactions, cancels queued or pre-boundary
-//!   writes, and waits once a commit has entered the durable point-of-no-return.
-//! - Crash durability is delegated to the storage. The MVP does not add an
-//!   engine WAL, fsync policy, or recovery protocol above storage commits.
+//!   writes, and waits once a commit has entered the storage point-of-no-return.
+//! - Crash durability is provider-defined. The MVP does not add an engine WAL,
+//!   fsync policy, or recovery protocol above storage commits.
 //! - `storage` and `storage_adapter` are low-level surfaces. Code that bypasses
 //!   `Engine`/`SessionContext` also bypasses session lifecycle accounting and
 //!   relies on storage-provided serialization.
@@ -86,11 +86,11 @@ pub use storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
 pub use storage::{
-    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange,
-    MAX_SCAN_PAGE_ROWS, Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix,
-    ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-    StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
+    Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix, ProjectedValue,
+    PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
+    WriteOptions, WriteStats,
 };
 
 pub(crate) const GLOBAL_BRANCH_ID: &str = "global";

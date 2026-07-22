@@ -184,7 +184,7 @@ async fn cached_slatedb_rebuilds_after_local_cache_is_deleted() {
 }
 
 #[tokio::test]
-async fn cached_slatedb_does_not_acknowledge_failed_remote_writes() {
+async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
     let object_store = Arc::new(InMemory::new());
     let db_path = "cached-slatedb-write-failure";
     let cache_parent = tempfile::tempdir().expect("create SlateDB failure cache parent");
@@ -214,9 +214,14 @@ async fn cached_slatedb_does_not_acknowledge_failed_remote_writes() {
         .expect("open cached failure-test storage");
         fault_store.fail_writes.store(true, Ordering::Relaxed);
 
-        let error = write_one(&storage, space, rejected_key.clone(), b"not-persisted")
+        write_one(&storage, space, rejected_key.clone(), b"not-persisted")
             .await
-            .expect_err("remote write failure must fail the storage commit");
+            .expect("commit should accept the visible write");
+
+        let error = storage
+            .flush()
+            .await
+            .expect_err("remote write failure must fail the explicit flush");
         assert!(format!("{error}").contains("not supported"));
     }
 
@@ -242,11 +247,11 @@ async fn cached_slatedb_does_not_acknowledge_failed_remote_writes() {
 }
 
 #[tokio::test]
-async fn slatedb_commit_flushes_one_wal_write_immediately() {
+async fn slatedb_explicit_flush_makes_visible_commit_durable() {
     let object_store = Arc::new(InMemory::new());
     let counting_store = Arc::new(FaultStore::new(object_store));
-    let storage = SlateDB::open_object_store("slatedb-immediate-wal-flush", counting_store.clone())
-        .expect("open immediate WAL flush storage");
+    let storage = SlateDB::open_object_store("slatedb-explicit-wal-flush", counting_store.clone())
+        .expect("open explicit WAL flush storage");
     counting_store.reset_write_count();
 
     write_one(
@@ -256,18 +261,19 @@ async fn slatedb_commit_flushes_one_wal_write_immediately() {
         b"value",
     )
     .await
-    .expect("commit immediately durable value");
+    .expect("publish visible value");
 
-    assert_eq!(counting_store.write_count(), 1);
+    storage.flush().await.expect("flush visible value");
+    assert_eq!(
+        counting_store.write_count(),
+        1,
+        "the visible commit should require one WAL write"
+    );
     storage
         .flush()
         .await
         .expect("flush already durable storage");
-    assert_eq!(
-        counting_store.write_count(),
-        1,
-        "an explicit flush after commit should not issue another remote write"
-    );
+    assert_eq!(counting_store.write_count(), 1);
 }
 
 async fn write_one(

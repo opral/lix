@@ -101,18 +101,11 @@ pub enum ReadConsistency {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteOptions {
     pub base_snapshot: Option<SnapshotRef>,
-    pub durability: Durability,
     pub idempotency_key: Option<Bytes>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotRef(pub Bytes);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Durability {
-    #[default]
-    Durable,
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteStats {
