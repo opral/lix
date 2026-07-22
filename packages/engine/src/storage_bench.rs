@@ -15,6 +15,32 @@ static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BinaryCasWriteAccounting {
+    pub chunk_lookup_count: u64,
+    pub chunk_lookup_batch_count: u64,
+    pub chunk_lookup_hit_count: u64,
+    pub chunk_lookup_miss_count: u64,
+    pub chunk_lookup_elapsed_ns: u64,
+    pub transaction_duplicate_chunk_count: u64,
+}
+
+pub fn reset_binary_cas_write_accounting() {
+    crate::binary_cas::metrics::reset_binary_cas_write_metrics();
+}
+
+pub fn binary_cas_write_accounting() -> BinaryCasWriteAccounting {
+    let metrics = crate::binary_cas::metrics::binary_cas_write_metrics_snapshot();
+    BinaryCasWriteAccounting {
+        chunk_lookup_count: metrics.chunk_lookup_count,
+        chunk_lookup_batch_count: metrics.chunk_lookup_batch_count,
+        chunk_lookup_hit_count: metrics.chunk_lookup_hit_count,
+        chunk_lookup_miss_count: metrics.chunk_lookup_miss_count,
+        chunk_lookup_elapsed_ns: metrics.chunk_lookup_elapsed_ns,
+        transaction_duplicate_chunk_count: metrics.transaction_duplicate_chunk_count,
+    }
+}
+
 pub(crate) fn record_transaction_rows_staged(count: usize) {
     TRANSACTION_ROWS_STAGED.fetch_add(count as u64, Ordering::Relaxed);
 }
@@ -107,6 +133,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,
