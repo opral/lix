@@ -43,7 +43,7 @@ use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
 #[cfg(test)]
 use crate::transaction::types::PreparedStateRow;
-use crate::transaction::types::TransactionWriteOrigin;
+use crate::transaction::types::{TransactionWriteOperation, TransactionWriteOrigin};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -552,12 +552,69 @@ async fn validate_filesystem_namespace(
     // projected globals do not participate in branch-local constraint checks.
     let domains = staged_filesystem_namespace_domains(staged_rows);
     for domain in domains {
+        if !filesystem_namespace_domain_changed(input, staged_rows, &domain).await? {
+            continue;
+        }
         let mut occupants =
             committed_filesystem_namespace_occupants(input.live_state, &domain).await?;
         apply_staged_filesystem_namespace_rows(staged_rows, &domain, &mut occupants)?;
         validate_filesystem_namespace_occupants(&domain, occupants)?;
     }
     Ok(())
+}
+
+async fn filesystem_namespace_domain_changed(
+    input: &TransactionValidationInput<'_>,
+    staged_rows: &[PreparedValidationRow<'_>],
+    domain: &Domain,
+) -> Result<bool, LixError> {
+    // Existing occupants that keep the same kind, identity, parent, and name
+    // cannot introduce a namespace collision. Every uncertain case falls back
+    // to validating the complete domain below.
+    let mut descriptor_rows = staged_rows.iter().copied().filter(|row| {
+        row.domain() == *domain
+            && (row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
+    });
+    let Some(row) = descriptor_rows.next() else {
+        return Ok(false);
+    };
+    if descriptor_rows.next().is_some() {
+        return Ok(true);
+    }
+    if row
+        .origin()
+        .is_some_and(|origin| origin.operation == TransactionWriteOperation::Insert)
+        || input
+            .staged_writes
+            .insert_identities()
+            .any(|(identity, untracked, _)| {
+                identity.domain(untracked) == row.domain()
+                    && identity.schema_key() == row.schema_key()
+                    && identity.entity_pk() == row.entity_pk()
+            })
+    {
+        return Ok(true);
+    }
+    let Some(snapshot) = row.snapshot_json() else {
+        return Ok(true);
+    };
+    let Some(committed) = load_committed_constraint_row(
+        input.live_state,
+        domain,
+        row.schema_key(),
+        row.entity_pk().clone(),
+        false,
+    )
+    .await?
+    else {
+        return Ok(true);
+    };
+    let Some((_, committed_occupant)) = filesystem_namespace_occupant_from_live_row(&committed)?
+    else {
+        return Ok(true);
+    };
+    Ok(committed_occupant != filesystem_namespace_occupant_from_staged_row(row, snapshot)?)
 }
 
 fn staged_filesystem_namespace_domains(
@@ -2800,6 +2857,61 @@ mod tests {
         TransactionValidationInput::new(validation_set, catalog, &EmptyLiveStateReader)
     }
 
+    async fn filesystem_namespace_domain_changed_for_test(
+        staged_rows: Vec<PreparedStateRow>,
+        committed_rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<bool, LixError> {
+        let staged_writes = PreparedWriteSet {
+            state_rows: staged_rows,
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let staged_rows = validation_set.rows().collect::<Vec<_>>();
+        let domain = staged_rows
+            .first()
+            .expect("namespace test requires a staged descriptor")
+            .domain();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])?;
+        let live_state = StrictStaticLiveStateReader {
+            rows: committed_rows,
+        };
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        filesystem_namespace_domain_changed(&input, &staged_rows, &domain).await
+    }
+
+    async fn assert_filesystem_namespace_domain_changed(
+        staged_rows: Vec<PreparedStateRow>,
+        committed_rows: Vec<MaterializedLiveStateRow>,
+        expected: bool,
+        scenario: &str,
+    ) {
+        let actual = filesystem_namespace_domain_changed_for_test(staged_rows, committed_rows)
+            .await
+            .unwrap_or_else(|error| panic!("{scenario}: {error}"));
+        assert_eq!(actual, expected, "{scenario}");
+    }
+
+    async fn filesystem_namespace_validation_scan_count_for_test(
+        staged_writes: PreparedWriteSet,
+    ) -> Result<usize, LixError> {
+        let validation_set = staged_writes.validation_set_for_tests();
+        let staged_rows = validation_set.rows().collect::<Vec<_>>();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])?;
+        let live_state = CountingStaticLiveStateReader {
+            rows: Vec::new(),
+            scan_count: AtomicUsize::new(0),
+        };
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        validate_filesystem_namespace(&input, &staged_rows).await?;
+        Ok(live_state.scan_count.load(Ordering::Relaxed))
+    }
+
     fn catalog_from_transaction_input<'a>(
         input: &'a TransactionValidationInput<'a>,
     ) -> Result<&'a CatalogSnapshot, LixError> {
@@ -3137,6 +3249,141 @@ mod tests {
         assert_eq!(catalog.len(), 3);
         assert!(catalog.contains("visible_schema"));
         assert!(catalog.contains("pending_schema"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_namespace_change_detection_skips_unchanged_exact_occupants() {
+        let mut tracked = staged_file_descriptor_row("file-a", "branch-a");
+        tracked.metadata = Some(test_stage_json(r#"{"revision":2}"#));
+        let mut untracked = staged_file_descriptor_row("file-u", "branch-a");
+        mark_prepared_row_untracked(&mut untracked);
+        let mut committed_untracked = committed_file_descriptor_row("file-u", "branch-a");
+        mark_live_row_untracked(&mut committed_untracked);
+        let directory = directory_descriptor_row("dir-a", None, "dir", "branch-a");
+
+        let cases = vec![
+            (
+                vec![tracked],
+                vec![committed_file_descriptor_row("file-a", "branch-a")],
+                "tracked descriptor",
+            ),
+            (
+                vec![untracked],
+                vec![committed_untracked],
+                "untracked descriptor",
+            ),
+            (
+                vec![staged_file_descriptor_row(
+                    "global-file",
+                    crate::GLOBAL_BRANCH_ID,
+                )],
+                vec![committed_file_descriptor_row(
+                    "global-file",
+                    crate::GLOBAL_BRANCH_ID,
+                )],
+                "global descriptor",
+            ),
+            (
+                vec![directory.clone()],
+                vec![MaterializedLiveStateRow::from(directory)],
+                "directory descriptor",
+            ),
+        ];
+        for (staged, committed, scenario) in cases {
+            assert_filesystem_namespace_domain_changed(staged, committed, false, scenario).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_namespace_change_detection_falls_back_for_namespace_mutations() {
+        let committed_file = committed_file_descriptor_row("file-a", "branch-a");
+
+        let mut renamed = staged_file_descriptor_row("file-a", "branch-a");
+        renamed.snapshot = Some(test_stage_json(
+            r#"{"id":"file-a","directory_id":null,"name":"renamed"}"#,
+        ));
+        let mut moved = staged_file_descriptor_row("file-a", "branch-a");
+        moved.snapshot = Some(test_stage_json(
+            r#"{"id":"file-a","directory_id":"dir-a","name":"file-a"}"#,
+        ));
+        let mut deleted = staged_file_descriptor_row("file-a", "branch-a");
+        deleted.snapshot = None;
+        let mut untracked = staged_file_descriptor_row("file-a", "branch-a");
+        mark_prepared_row_untracked(&mut untracked);
+        let mut renamed_directory = directory_descriptor_row("dir-a", None, "before", "branch-a");
+        let committed_directory = MaterializedLiveStateRow::from(renamed_directory.clone());
+        renamed_directory.snapshot = Some(test_stage_json(
+            r#"{"id":"dir-a","parent_id":null,"name":"after"}"#,
+        ));
+
+        let cases = vec![
+            (vec![renamed], vec![committed_file.clone()], "rename"),
+            (vec![moved], vec![committed_file.clone()], "move"),
+            (vec![deleted], vec![committed_file.clone()], "delete"),
+            (
+                vec![
+                    staged_file_descriptor_row("file-a", "branch-a"),
+                    staged_file_descriptor_row("file-new", "branch-a"),
+                ],
+                vec![committed_file.clone()],
+                "mixed existing/new descriptors",
+            ),
+            (
+                vec![
+                    staged_file_descriptor_row("file-a", "branch-a"),
+                    staged_file_descriptor_row("file-b", "branch-a"),
+                ],
+                vec![
+                    committed_file.clone(),
+                    committed_file_descriptor_row("file-b", "branch-a"),
+                ],
+                "multiple unchanged descriptors",
+            ),
+            (vec![untracked], vec![committed_file], "durability mismatch"),
+            (
+                vec![renamed_directory],
+                vec![committed_directory],
+                "directory rename",
+            ),
+        ];
+        for (staged, committed, scenario) in cases {
+            assert_filesystem_namespace_domain_changed(staged, committed, true, scenario).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_namespace_inserts_do_not_add_a_point_read_before_full_validation() {
+        let mut logical_insert = staged_file_descriptor_row("logical-insert", "branch-a");
+        logical_insert.origin = Some(TransactionWriteOrigin {
+            surface: "lix_file".to_string(),
+            operation: TransactionWriteOperation::Insert,
+            primary_key: None,
+        });
+        let logical_write = PreparedWriteSet {
+            state_rows: vec![logical_insert],
+            ..empty_staged_write_set()
+        };
+        assert_eq!(
+            filesystem_namespace_validation_scan_count_for_test(logical_write)
+                .await
+                .expect("logical insert validation should succeed"),
+            1,
+            "logical inserts should perform only the complete namespace scan"
+        );
+
+        let explicit_insert = staged_file_descriptor_row("explicit-insert", "branch-a");
+        let mut explicit_write = PreparedWriteSet {
+            state_rows: vec![explicit_insert.clone()],
+            ..empty_staged_write_set()
+        };
+        explicit_write.remember_insert_identity_for_tests(&explicit_insert);
+        assert_eq!(
+            filesystem_namespace_validation_scan_count_for_test(explicit_write)
+                .await
+                .expect("explicit insert validation should succeed"),
+            1,
+            "explicit inserts should perform only the complete namespace scan"
+        );
     }
 
     #[test]

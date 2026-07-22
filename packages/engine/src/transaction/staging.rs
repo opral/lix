@@ -136,6 +136,12 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
+    pub(crate) fn origin(&self) -> Option<&TransactionWriteOrigin> {
+        match self {
+            Self::State(row) => row.origin.as_ref(),
+        }
+    }
+
     pub(crate) fn is_tombstone(&self) -> bool {
         match self {
             Self::State(row) => row.snapshot.is_none(),
@@ -270,6 +276,17 @@ impl PreparedWriteSet {
             rows,
             insert_identities,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remember_insert_identity_for_tests(&mut self, row: &PreparedStateRow) {
+        self.insert_identities.insert(
+            PreparedStateRowIdentity::from(row),
+            PreparedInsertIdentity {
+                untracked: row.untracked,
+                origin: row.origin.clone(),
+            },
+        );
     }
 }
 
