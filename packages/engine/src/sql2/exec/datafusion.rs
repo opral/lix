@@ -60,7 +60,7 @@ pub(crate) struct DataFusionLogicalPlan {
 }
 
 pub(crate) struct SessionReadSqlResult {
-    pub(crate) runtime_functions: FunctionContext,
+    pub(crate) runtime_functions: Option<FunctionContext>,
     pub(crate) query: SqlQueryResult,
 }
 

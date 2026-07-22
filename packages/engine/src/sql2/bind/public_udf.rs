@@ -70,6 +70,12 @@ pub(crate) fn validate_public_udf_calls_in_datafusion_statement(
     visit_datafusion_statement(statement, &mut visitor)
 }
 
+/// Conservatively reports whether a read statement can invoke an engine UDF
+/// whose state must be loaded before execution and persisted afterward.
+///
+/// This classifier runs before provider/session construction, so every
+/// inspectable nested expression must be visited and unknown statement shapes
+/// must fail toward doing the durable setup.
 pub(crate) fn statement_has_durable_runtime_function(statement: &DataFusionStatement) -> bool {
     let mut visitor = DurableRuntimeFunctionVisitor { found: false };
     visit_datafusion_statement_for_durable_runtime_function(statement, &mut visitor);
@@ -130,7 +136,13 @@ fn visit_datafusion_statement_for_durable_runtime_function(
                 visitor,
             );
         }
-        _ => {}
+        // Extension statements are currently rejected by statement routing,
+        // but keep this detector conservative if one becomes readable later.
+        // Skipping durable setup on an AST shape we did not inspect would be
+        // a correctness bug; doing the setup unnecessarily is only slower.
+        DataFusionStatement::CreateExternalTable(_)
+        | DataFusionStatement::CopyTo(_)
+        | DataFusionStatement::Reset(_) => visitor.found = true,
     }
 }
 
@@ -202,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_durable_runtime_functions() {
+    fn marks_direct_durable_runtime_functions() {
         assert!(statement_has_durable_runtime_function(&parse_statement(
             "SELECT lix_uuid_v7()"
         )));
@@ -212,5 +224,27 @@ mod tests {
         assert!(!statement_has_durable_runtime_function(&parse_statement(
             "SELECT lix_json('{\"x\":1}')"
         )));
+        assert!(!statement_has_durable_runtime_function(&parse_statement(
+            "SELECT 'lix_uuid_v7()' AS literal"
+        )));
+        assert!(!statement_has_durable_runtime_function(&parse_statement(
+            "SELECT 1 /* lix_timestamp() */"
+        )));
+    }
+
+    #[test]
+    fn marks_nested_aliased_and_explained_durable_runtime_functions() {
+        for sql in [
+            "WITH generated AS (SELECT lix_uuid_v7() AS value) SELECT value FROM generated",
+            "SELECT value FROM (SELECT lix_timestamp() AS value) AS generated",
+            "SELECT lix_uuid_v7() AS generated_id",
+            "SELECT CASE WHEN true THEN lix_timestamp() ELSE 'never' END AS value",
+            "EXPLAIN SELECT lix_uuid_v7()",
+        ] {
+            assert!(
+                statement_has_durable_runtime_function(&parse_statement(sql)),
+                "nested or aliased durable function should be detected in: {sql}"
+            );
+        }
     }
 }
