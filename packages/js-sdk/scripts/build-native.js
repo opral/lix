@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDir = join(__dirname, "..");
 const manifestPath = join(packageDir, "Cargo.toml");
-const profile = process.env.LIX_NATIVE_PROFILE ?? "release";
-const isRelease = profile === "release";
+const requestedProfile = process.env.LIX_NATIVE_PROFILE ?? "release";
+const cargoProfile = requestedProfile === "debug" ? "dev" : requestedProfile;
+const artifactProfile =
+	cargoProfile === "dev" || cargoProfile === "test" ? "debug" : cargoProfile;
 const artifactName =
 	process.platform === "darwin"
 		? "liblix_js_sdk.dylib"
@@ -64,11 +66,17 @@ async function cargoTargetDir() {
 	return metadata.target_directory;
 }
 
-const args = ["build", "--manifest-path", manifestPath];
-if (isRelease) {
-	args.push("--release");
-}
+const args = [
+	"build",
+	"--manifest-path",
+	manifestPath,
+	"--profile",
+	cargoProfile,
+];
 
 await run("cargo", args);
 await mkdir(packageDir, { recursive: true });
-await cp(join(await cargoTargetDir(), profile, artifactName), destination);
+await cp(
+	join(await cargoTargetDir(), artifactProfile, artifactName),
+	destination,
+);
