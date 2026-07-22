@@ -2060,15 +2060,19 @@ async fn stage_exact_existing_file_path_writes(
                 context.file_id = Some(entry.id().to_string());
             }
             FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
+                let metadata_changed =
+                    entry.metadata() != write.metadata.as_ref().map(TransactionJson::normalized);
                 context.metadata = write.metadata;
-                staged
-                    .state_rows
-                    .push(file_descriptor_row(FileDescriptorRowInput {
-                        id: entry.id().to_string(),
-                        directory_id: entry.parent_id.clone(),
-                        name: entry.name.clone(),
-                        context: context.clone(),
-                    }));
+                if metadata_changed {
+                    staged
+                        .state_rows
+                        .push(file_descriptor_row(FileDescriptorRowInput {
+                            id: entry.id().to_string(),
+                            directory_id: entry.parent_id.clone(),
+                            name: entry.name.clone(),
+                            context: context.clone(),
+                        }));
+                }
             }
             FastLixFilePathWriteConflict::None | FastLixFilePathWriteConflict::DoNothing => {
                 unreachable!("exact existing path route only handles conflict updates")

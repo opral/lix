@@ -2,6 +2,7 @@ use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
 use lix_engine::{CreateBranchOptions, MergeBranchOptions, MergeBranchOutcome};
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -2362,6 +2363,218 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
         .expect("blob ref state read should succeed");
     assert_eq!(blob_ref_result.len(), 0);
 });
+
+simulation_test!(
+    lix_file_equal_normalized_metadata_skips_descriptor_history,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let upsert = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+                      VALUES ($1, $2, $3) \
+                      ON CONFLICT (path) DO UPDATE SET \
+                        data = excluded.data, \
+                        lixcol_metadata = excluded.lixcol_metadata";
+        let metadata = json!({"a": 1, "z": 2});
+        session
+            .execute(
+                upsert,
+                &[
+                    Value::Text("/equal-metadata.bin".to_string()),
+                    Value::Blob(b"before".to_vec()),
+                    Value::Json(metadata.clone()),
+                ],
+            )
+            .await
+            .expect("initial file upsert should succeed");
+        let file = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/equal-metadata.bin'",
+                &[],
+            )
+            .await
+            .expect("file id should load");
+        let [Value::Text(file_id)] = file.rows()[0].values() else {
+            panic!("expected file id");
+        };
+
+        session
+            .execute(
+                upsert,
+                &[
+                    Value::Text("/equal-metadata.bin".to_string()),
+                    Value::Blob(b"after".to_vec()),
+                    Value::Json(metadata.clone()),
+                ],
+            )
+            .await
+            .expect("equal-metadata overwrite should succeed");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("branch head should load")
+            .expect("branch head should exist");
+
+        let current = session
+            .execute(
+                "SELECT data, lixcol_metadata \
+                 FROM lix_file WHERE path = '/equal-metadata.bin'",
+                &[],
+            )
+            .await
+            .expect("updated file should load");
+        assert_eq!(
+            current.rows()[0].values(),
+            &[Value::Blob(b"after".to_vec()), Value::Json(metadata),]
+        );
+        assert_eq!(
+            file_descriptor_event_count(&session, &commit_id, file_id).await,
+            0
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_changed_and_null_metadata_keep_descriptor_history_exact,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let upsert = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+                      VALUES ($1, $2, $3) \
+                      ON CONFLICT (path) DO UPDATE SET \
+                        data = excluded.data, \
+                        lixcol_metadata = excluded.lixcol_metadata";
+        session
+            .execute(
+                upsert,
+                &[
+                    Value::Text("/changed-metadata.bin".to_string()),
+                    Value::Blob(b"one".to_vec()),
+                    Value::Json(json!({"version": 1})),
+                ],
+            )
+            .await
+            .expect("initial file upsert should succeed");
+        let file = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/changed-metadata.bin'",
+                &[],
+            )
+            .await
+            .expect("file id should load");
+        let [Value::Text(file_id)] = file.rows()[0].values() else {
+            panic!("expected file id");
+        };
+
+        session
+            .execute(
+                upsert,
+                &[
+                    Value::Text("/changed-metadata.bin".to_string()),
+                    Value::Blob(b"two".to_vec()),
+                    Value::Json(json!({"version": 2})),
+                ],
+            )
+            .await
+            .expect("changed-metadata overwrite should succeed");
+        let changed_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("branch head should load")
+            .expect("branch head should exist");
+        assert_eq!(
+            file_descriptor_event_count(&session, &changed_commit_id, file_id).await,
+            1
+        );
+
+        session
+            .execute(
+                upsert,
+                &[
+                    Value::Text("/changed-metadata.bin".to_string()),
+                    Value::Blob(b"three".to_vec()),
+                    Value::Null,
+                ],
+            )
+            .await
+            .expect("metadata removal should succeed");
+        let removed_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("branch head should load")
+            .expect("branch head should exist");
+        assert_eq!(
+            file_descriptor_event_count(&session, &removed_commit_id, file_id).await,
+            1
+        );
+
+        session
+            .execute(
+                upsert,
+                &[
+                    Value::Text("/changed-metadata.bin".to_string()),
+                    Value::Blob(b"four".to_vec()),
+                    Value::Null,
+                ],
+            )
+            .await
+            .expect("equal null metadata overwrite should succeed");
+        let equal_null_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("branch head should load")
+            .expect("branch head should exist");
+        assert_eq!(
+            file_descriptor_event_count(&session, &equal_null_commit_id, file_id).await,
+            0
+        );
+        let current = session
+            .execute(
+                "SELECT data, lixcol_metadata \
+                 FROM lix_file WHERE path = '/changed-metadata.bin'",
+                &[],
+            )
+            .await
+            .expect("null-metadata file should load");
+        assert_eq!(
+            current.rows()[0].values(),
+            &[Value::Blob(b"four".to_vec()), Value::Null]
+        );
+    }
+);
+
+async fn file_descriptor_event_count(
+    session: &crate::support::simulation_test::engine::SimSession,
+    commit_id: &str,
+    file_id: &str,
+) -> usize {
+    session
+        .execute(
+            &format!(
+                "SELECT entity_pk FROM lix_state_history \
+                 WHERE start_commit_id = '{commit_id}' \
+                   AND depth = 0 \
+                   AND schema_key = 'lix_file_descriptor' \
+                   AND entity_pk = lix_json('[\"{file_id}\"]')"
+            ),
+            &[],
+        )
+        .await
+        .expect("descriptor history should load")
+        .len()
+}
 
 simulation_test!(
     lix_file_update_empty_data_on_empty_file_does_not_stage_blob_ref_tombstone,
