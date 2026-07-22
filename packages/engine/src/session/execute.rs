@@ -520,6 +520,7 @@ where
                     params,
                     acknowledge_file_views,
                     exact_lix_file_read,
+                    has_durable_runtime_function,
                 )
                 .await
             },
@@ -530,12 +531,16 @@ where
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
-        let runtime_storage_stats = self
-            .persist_runtime_functions_if_needed(
-                &read_result.runtime_functions,
-                runtime_write_access.as_ref(),
-            )
-            .await?;
+        let runtime_storage_stats = match read_result.runtime_functions.as_ref() {
+            Some(runtime_functions) => {
+                self.persist_runtime_functions_if_needed(
+                    runtime_functions,
+                    runtime_write_access.as_ref(),
+                )
+                .await?
+            }
+            None => None,
+        };
         drop(runtime_write_access);
         if let Some(stats) = runtime_storage_stats {
             self.observe_invalidation.bump_if_storage_changed(&stats);
@@ -972,6 +977,7 @@ where
         params: &[Value],
         acknowledge_file_views: bool,
         exact_lix_file_read: Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)>,
+        has_durable_runtime_function: bool,
     ) -> Result<
         (
             sql2::SessionReadSqlResult,
@@ -1007,7 +1013,7 @@ where
                 .unwrap_or_default();
             return Ok((
                 sql2::SessionReadSqlResult {
-                    runtime_functions: FunctionContext::system_for_function_free_read(),
+                    runtime_functions: None,
                     query,
                 },
                 file_view_mutations,
@@ -1015,8 +1021,17 @@ where
         }
         let live_state: Arc<dyn crate::live_state::LiveStateReader> =
             Arc::new(self.live_state.reader(read_store.clone()));
-        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-        let functions = runtime_functions.provider();
+        let runtime_functions = if has_durable_runtime_function {
+            Some(FunctionContext::prepare(live_state.as_ref()).await?)
+        } else {
+            None
+        };
+        // Read providers do not consume durable function state themselves;
+        // only the registered timestamp/UUID SQL UDFs do. Keep their AST
+        // classifier conservative if new readable statement shapes appear.
+        let functions = runtime_functions
+            .as_ref()
+            .map_or_else(FunctionProviderHandle::system, FunctionContext::provider);
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
             read_store,

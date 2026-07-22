@@ -2400,7 +2400,16 @@ async fn validate_committed_unique_constraints(
         PendingUniqueConstraintScope,
         BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
     >::new();
+    let can_skip_unchanged = pending_constraints.unique_values.len() == 1;
     for (key, pending_entity_pk) in &pending_constraints.unique_values {
+        let is_insert =
+            can_skip_unchanged && pending_unique_owner_is_insert(input, key, pending_entity_pk);
+        if can_skip_unchanged
+            && !is_insert
+            && committed_unique_value_is_unchanged(input.live_state, key, pending_entity_pk).await?
+        {
+            continue;
+        }
         pending_by_scope
             .entry(PendingUniqueConstraintScope::from(key))
             .or_default()
@@ -2466,6 +2475,57 @@ async fn validate_committed_unique_constraints(
         }
     }
     Ok(())
+}
+
+fn pending_unique_owner_is_insert(
+    input: &TransactionValidationInput<'_>,
+    key: &PendingUniqueKey,
+    entity_pk: &EntityPk,
+) -> bool {
+    // Conflict-aware inserts use Replace mode, but retain their logical Insert
+    // origin when the row is new. Both forms must keep the original single scan.
+    input
+        .staged_writes
+        .insert_identities()
+        .any(|(identity, untracked, _)| {
+            identity.schema_key() == key.schema_key
+                && identity.entity_pk() == entity_pk
+                && identity.domain(untracked) == key.domain
+        })
+        || input.staged_writes.rows().any(|row| {
+            row.schema_key() == key.schema_key
+                && row.entity_pk() == entity_pk
+                && row.domain() == key.domain
+                && row
+                    .origin()
+                    .is_some_and(|origin| origin.operation == TransactionWriteOperation::Insert)
+        })
+}
+
+async fn committed_unique_value_is_unchanged(
+    live_state: &dyn LiveStateReader,
+    key: &PendingUniqueKey,
+    entity_pk: &EntityPk,
+) -> Result<bool, LixError> {
+    let Some(committed) = load_committed_constraint_row(
+        live_state,
+        &key.domain,
+        &key.schema_key,
+        entity_pk.clone(),
+        false,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let Some(snapshot_content) = committed.snapshot_content.as_deref() else {
+        return Ok(false);
+    };
+    let snapshot = parse_committed_snapshot(&committed, snapshot_content)?;
+    Ok(
+        UniqueConstraintValue::from_snapshot(&snapshot, &key.pointer_group).as_ref()
+            == Some(&key.value),
+    )
 }
 
 fn committed_row_is_in_exact_unique_scope(
@@ -4455,6 +4515,66 @@ mod tests {
         ))
         .await
         .expect("same identity should update committed unique owner");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_unique_update_to_another_committed_value() {
+        let visible_schemas = vec![unique_schema()];
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![unique_row("post-1", "second-slug", "updated")],
+            ..empty_staged_write_set()
+        };
+        let live_state = StaticLiveStateReader {
+            rows: vec![
+                committed_unique_row("post-1", "hello-world", "first"),
+                committed_unique_row("post-2", "second-slug", "second"),
+            ],
+        };
+
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("changing to another committed unique value should conflict");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
+    async fn validation_insert_origin_keeps_single_committed_unique_scan() {
+        let visible_schemas = vec![unique_schema()];
+        let mut inserted = unique_row("post-new", "new-slug", "new");
+        inserted.file_id = None;
+        // Models INSERT ... ON CONFLICT: Replace mode has no insert identity,
+        // while the newly inserted physical row retains its logical origin.
+        inserted.origin = Some(TransactionWriteOrigin {
+            surface: "lix_file".to_string(),
+            operation: TransactionWriteOperation::Insert,
+            primary_key: None,
+        });
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![inserted],
+            ..empty_staged_write_set()
+        };
+        let mut committed = committed_unique_row("post-1", "hello-world", "first");
+        committed.file_id = None;
+        let live_state = CountingStaticLiveStateReader {
+            rows: vec![committed],
+            scan_count: AtomicUsize::new(0),
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect("insert with a distinct unique value should succeed");
+
+        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

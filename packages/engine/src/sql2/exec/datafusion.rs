@@ -37,6 +37,7 @@ use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
 use crate::sql2::predicate_typecheck::{
     json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
 };
+use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
     LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
 };
@@ -59,7 +60,7 @@ pub(crate) struct DataFusionLogicalPlan {
 }
 
 pub(crate) struct SessionReadSqlResult {
-    pub(crate) runtime_functions: FunctionContext,
+    pub(crate) runtime_functions: Option<FunctionContext>,
     pub(crate) query: SqlQueryResult,
 }
 
@@ -302,8 +303,11 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
     validate_bound_write_input(plan, params)?;
-    let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
+    let provider_selection = write_provider_selection(plan, &table_name);
+    let session =
+        build_write_session_with_options(ctx, write_session_options(plan), &provider_selection)
+            .await?;
     let table = session
         .table_provider(&table_name)
         .await
@@ -434,8 +438,11 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
     params: &[Value],
 ) -> Result<(), LixError> {
     validate_bound_write_input(plan, params)?;
-    let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
+    let provider_selection = write_provider_selection(plan, &table_name);
+    let session =
+        build_write_session_with_options(ctx, write_session_options(plan), &provider_selection)
+            .await?;
     let table = session
         .table_provider(&table_name)
         .await
@@ -765,6 +772,20 @@ fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
     }
     SqlWriteSessionOptions {
         omitted_insert_columns,
+    }
+}
+
+fn write_provider_selection(plan: &LogicalWritePlan, target_table_name: &str) -> ProviderSelection {
+    // Bound VALUES, UPDATE, and DELETE expressions can reference only the
+    // target surface. Query-backed inserts may read any visible surface, so
+    // keep their existing catalog-wide registration until source selection is
+    // derived from the bound query itself.
+    match (&plan.bound.op, &plan.bound.input) {
+        (BoundWriteOp::Insert, BoundWriteInput::Values(_))
+        | (BoundWriteOp::Update | BoundWriteOp::Delete, BoundWriteInput::None) => {
+            ProviderSelection::Only(BTreeSet::from([target_table_name.to_string()]))
+        }
+        _ => ProviderSelection::All,
     }
 }
 
@@ -1680,6 +1701,7 @@ fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Va
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1691,7 +1713,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SqlExecutionContext, SqlWriteExecutionContext, execute_sql, scalar_value_to_lix_value,
+        SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
+        execute_sql, scalar_value_to_lix_value, write_provider_selection, write_session_options,
+        write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -2057,6 +2081,144 @@ mod tests {
             },
             path,
         ))
+    }
+
+    #[tokio::test]
+    async fn target_only_write_shapes_construct_only_the_target_provider() {
+        for sql in [
+            "UPDATE lix_file SET data = X'41' WHERE id = 'file-readme'",
+            "DELETE FROM lix_file WHERE id = 'file-readme' RETURNING id, path",
+            "INSERT INTO lix_file (path, data) VALUES ('/readme.md', X'41') \
+             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        ] {
+            let (mut ctx, _, _) = counting_write_context(Vec::new());
+            let plan = create_write_logical_plan(&mut ctx, sql)
+                .await
+                .unwrap_or_else(|error| panic!("target-only write should plan: {sql}: {error}"));
+            let crate::sql2::exec::SqlLogicalPlan::Write(plan) = plan else {
+                panic!("target-only SQL should produce a write plan: {sql}");
+            };
+            let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
+            let selection = write_provider_selection(&plan.plan, &table_name);
+
+            assert_eq!(
+                selection,
+                crate::sql2::providers::ProviderSelection::Only(BTreeSet::from([
+                    "lix_file".to_string()
+                ])),
+                "{sql}"
+            );
+
+            let session = build_write_session_with_options(
+                &mut ctx,
+                write_session_options(&plan.plan),
+                &selection,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("target-only write session should build: {sql}: {error}")
+            });
+            let public = session
+                .catalog("datafusion")
+                .expect("default catalog should exist")
+                .schema("public")
+                .expect("public schema should exist");
+            let mut table_names = public.table_names();
+            table_names.sort();
+
+            assert_eq!(table_names, vec!["lix_file"], "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn query_backed_insert_keeps_catalog_wide_provider_registration() {
+        let (mut ctx, _, _) = counting_write_context(Vec::new());
+        let insert_select = create_write_logical_plan(
+            &mut ctx,
+            "INSERT INTO lix_file (id, path) SELECT 'copied', '/copied.md'",
+        )
+        .await
+        .expect("query-backed insert should plan");
+        let crate::sql2::exec::SqlLogicalPlan::Write(insert_select) = insert_select else {
+            panic!("query-backed insert should produce a write plan");
+        };
+        let table_name =
+            write_target_table_name(&insert_select.plan).expect("target should resolve");
+        let selection = write_provider_selection(&insert_select.plan, &table_name);
+
+        assert_eq!(selection, crate::sql2::providers::ProviderSelection::All,);
+
+        let session = build_write_session_with_options(
+            &mut ctx,
+            write_session_options(&insert_select.plan),
+            &selection,
+        )
+        .await
+        .expect("query-backed insert session should build");
+        let public = session
+            .catalog("datafusion")
+            .expect("default catalog should exist")
+            .schema("public")
+            .expect("public schema should exist");
+        let mut table_names = public.table_names();
+        table_names.sort();
+
+        assert_eq!(
+            table_names,
+            vec![
+                "lix_branch",
+                "lix_directory",
+                "lix_directory_by_branch",
+                "lix_file",
+                "lix_file_by_branch",
+                "lix_state",
+                "lix_state_by_branch",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn target_only_delete_returning_executes_with_selected_provider() {
+        let (mut ctx, staged_writes, _) = counting_write_context(vec![live_file_row(
+            "file-readme",
+            "branch-a",
+            None,
+            "readme.md",
+        )]);
+        let plan = create_write_logical_plan(
+            &mut ctx,
+            "DELETE FROM lix_file WHERE id = 'file-readme' RETURNING id, path",
+        )
+        .await
+        .expect("DELETE RETURNING should plan");
+        let (result, path) = crate::sql2::execute_write_logical_plan_with_mode_and_trace_result(
+            &mut ctx,
+            plan,
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("target-only DELETE RETURNING should execute");
+
+        assert_eq!(path, WriteExecutorPath::DataFusion);
+        assert_eq!(result.rows_affected, 1);
+        let returning = result.returning.expect("RETURNING rows should be present");
+        assert_eq!(returning.columns, vec!["id", "path"]);
+        assert_eq!(
+            returning.rows,
+            vec![vec![
+                Value::Text("file-readme".to_string()),
+                Value::Text("/readme.md".to_string()),
+            ]]
+        );
+        assert_eq!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .len(),
+            1
+        );
     }
 
     #[async_trait]

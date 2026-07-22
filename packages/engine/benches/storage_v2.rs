@@ -1462,6 +1462,35 @@ where
         }
     }
 
+    for rows in [100_u32, 1_000, 10_000] {
+        for requested_keys in [1_usize, 32] {
+            let case_name = format!("direct_get_many_missing_m{requested_keys}_s{rows}");
+            if should_run(&case_name) {
+                let point_storage = storage_family.seed_points(SpaceId(1), rows, 32);
+                let point_keys = missing_point_request_keys(requested_keys);
+                group.throughput(Throughput::Elements(
+                    u64::try_from(requested_keys).expect("requested key count fits u64"),
+                ));
+                group.bench_function(case_name, |b| {
+                    b.iter(|| {
+                        let read = block_on(point_storage.begin_read(ReadOptions::default()))
+                            .expect("begin direct missing-key point read");
+                        let result = block_on(read.get_many(
+                            SpaceId(1),
+                            black_box(&point_keys),
+                            GetOptions::default(),
+                        ))
+                        .expect("direct missing-key get_many");
+                        assert_eq!(result.values.len(), requested_keys);
+                        assert!(result.values.iter().all(Option::is_none));
+                        drop(read);
+                        black_box(result);
+                    });
+                });
+            }
+        }
+    }
+
     if should_run("direct_get_many_unique_u1000") {
         let point_storage = storage_family.seed_points(SpaceId(1), 1_000, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 1_000);
@@ -2083,6 +2112,12 @@ fn physical_point_request_keys(
     // Keys are logical under the space-aware interface; the space travels
     // as a parameter on the storage calls.
     point_request_keys(requested_keys, unique_keys)
+}
+
+fn missing_point_request_keys(requested_keys: usize) -> Vec<Key> {
+    (0..requested_keys)
+        .map(|index| key(format!("missing-point-{index:04}")))
+        .collect()
 }
 
 fn physical_point_scan_range(_space_id: u32) -> KeyRange {
