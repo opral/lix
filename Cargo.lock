@@ -3426,6 +3426,7 @@ dependencies = [
  "async-stream",
  "axum",
  "futures-core",
+ "getrandom 0.3.4",
  "http-body-util",
  "lix_sdk",
  "serde",

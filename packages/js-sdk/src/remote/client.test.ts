@@ -8,7 +8,11 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 		const request = new Request(input, init);
 		requests.push(request);
 		if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
-			return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
+			return Response.json({
+				protocolVersion: 1,
+				activeBranchId: "main-id",
+				sessionId: "session-1",
+			});
 		}
 		if (new URL(request.url).pathname.endsWith("/lix/v1/execute")) {
 			return Response.json({
@@ -24,6 +28,9 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 				notices: [],
 			});
 		}
+		if (request.method === "DELETE") {
+			return new Response(null, { status: 204 });
+		}
 		throw new Error(`Unexpected request: ${request.url}`);
 	});
 	const lix = await openLix({
@@ -33,7 +40,10 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 			fetch: remoteFetch as typeof fetch,
 			headers: () => {
 				headerCalls += 1;
-				return { Authorization: `Bearer token-${headerCalls}` };
+				return {
+					Authorization: `Bearer token-${headerCalls}`,
+					"Lix-Session-Id": "caller-must-not-control-this",
+				};
 			},
 		},
 	});
@@ -65,6 +75,9 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 		"/@acme/workspace/lix/v1/execute",
 	]);
 	expect(requests[2]?.headers.get("authorization")).toBe("Bearer token-3");
+	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
+	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
+	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
 	expect(await requests[2]?.json()).toEqual({
 		sql: "SELECT $1, $2, $3, $4, $5, $6, $7",
 		params: [
@@ -80,6 +93,11 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	});
 
 	await lix.close();
+	expect(new URL(requests[3]?.url ?? "").pathname).toBe(
+		"/@acme/workspace/lix/v1/session",
+	);
+	expect(requests[3]?.method).toBe("DELETE");
+	expect(requests[3]?.headers.get("lix-session-id")).toBe("session-1");
 });
 
 test("remote executeBatch uses the first-class atomic batch endpoint", async () => {
@@ -92,7 +110,11 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				return new URL(request.url).pathname.endsWith("/lix/v1/")
-					? Response.json({ protocolVersion: 1, activeBranchId: "main-id" })
+					? Response.json({
+							protocolVersion: 1,
+							activeBranchId: "main-id",
+							sessionId: "session-1",
+						})
 					: Response.json([
 							{
 								columns: ["value"],
@@ -154,6 +176,7 @@ test("remote branches preserve local Lix branch semantics", async () => {
 					return Response.json({
 						protocolVersion: 1,
 						activeBranchId,
+						sessionId: "session-1",
 					});
 				}
 				if (pathname.endsWith("/branch/switch")) {
@@ -168,6 +191,9 @@ test("remote branches preserve local Lix branch semantics", async () => {
 						hidden: false,
 						commitId: "commit-id",
 					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
 				}
 				throw new Error(`Unexpected request: ${pathname}`);
 			}) as typeof fetch,
@@ -194,10 +220,18 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 		server: {
 			mode: "remote",
 			url: "https://lixray.test/@acme/workspace",
-			fetch: (async (input: RequestInfo | URL) => {
-				const pathname = new URL(input.toString()).pathname;
+			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
 				return pathname.endsWith("/lix/v1/")
-					? Response.json({ protocolVersion: 1, activeBranchId: "main-id" })
+					? Response.json({
+							protocolVersion: 1,
+							activeBranchId: "main-id",
+							sessionId: "session-1",
+						})
 					: Response.json(
 							{
 								error: {
@@ -228,15 +262,25 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 
 test("remote clients share the same workspace active branch", async () => {
 	let activeBranchId = "main-id";
+	let nextSessionId = 0;
 	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 		const request = new Request(input, init);
 		const pathname = new URL(request.url).pathname;
 		if (pathname.endsWith("/lix/v1/")) {
-			return Response.json({ protocolVersion: 1, activeBranchId });
+			return Response.json({
+				protocolVersion: 1,
+				activeBranchId,
+				sessionId:
+					request.headers.get("lix-session-id") ??
+					`session-${++nextSessionId}`,
+			});
 		}
 		if (pathname.endsWith("/branch/switch")) {
 			activeBranchId = ((await request.json()) as { branchId: string }).branchId;
 			return Response.json({ branchId: activeBranchId });
+		}
+		if (request.method === "DELETE") {
+			return new Response(null, { status: 204 });
 		}
 		throw new Error(`Unexpected request: ${pathname}`);
 	};
@@ -272,7 +316,11 @@ test("remote operations preserve normal Lix call ordering", async () => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) {
-					return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
 				}
 				if (pathname.endsWith("/branch/switch")) {
 					requestOrder.push("switch");
@@ -288,6 +336,9 @@ test("remote operations preserve normal Lix call ordering", async () => {
 						rowsAffected: 0,
 						notices: [],
 					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
 				}
 				throw new Error(`Unexpected request: ${pathname}`);
 			},
@@ -313,10 +364,18 @@ test("remote responses reject malformed rows and non-JSON HTTP errors", async ()
 		server: {
 			mode: "remote",
 			url: "https://lixray.test/@acme/workspace",
-			fetch: async (input) => {
-				const pathname = new URL(input.toString()).pathname;
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) {
-					return Response.json({ protocolVersion: 1, activeBranchId: "main-id" });
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
 				}
 				executeCalls += 1;
 				return executeCalls === 1
@@ -352,6 +411,7 @@ test("remote mode rejects unsupported local-only operations honestly", async () 
 				Response.json({
 					protocolVersion: 1,
 					activeBranchId: "main-id",
+					sessionId: "session-1",
 				})) as typeof fetch,
 		},
 	});
@@ -384,3 +444,153 @@ test("remote mode rejects incompatible protocol versions", async () => {
 		}),
 	).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
 });
+
+test.each([
+	undefined,
+	"",
+	" contains-space",
+	"contains\nnewline",
+	42,
+])("remote mode rejects an invalid handshake sessionId: %j", async (sessionId) => {
+	await expect(
+		openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/workspace",
+				fetch: (async () =>
+					Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId,
+					})) as typeof fetch,
+			},
+		}),
+	).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
+});
+
+test("a later handshake cannot silently replace the remote session", async () => {
+	let handshakeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				handshakeCalls += 1;
+				return Response.json({
+					protocolVersion: 1,
+					activeBranchId: "main-id",
+					sessionId: handshakeCalls === 1 ? "session-1" : "session-2",
+				});
+			},
+		},
+	});
+
+	await expect(lix.activeBranchId()).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote handshake changed sessionId",
+	});
+	await lix.close();
+});
+
+test("an expired session mutation is propagated without a new handshake or retry", async () => {
+	let handshakeCalls = 0;
+	let executeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				executeCalls += 1;
+				return Response.json(
+					{
+						error: {
+							code: "LIX_REMOTE_SESSION_EXPIRED",
+							message: "Remote session expired",
+						},
+					},
+					{ status: 410 },
+				);
+			},
+		},
+	});
+
+	await expect(lix.execute("UPDATE lix_file SET data = $1")).rejects.toMatchObject({
+		code: "LIX_REMOTE_SESSION_EXPIRED",
+		status: 410,
+	});
+	expect(handshakeCalls).toBe(1);
+	expect(executeCalls).toBe(1);
+	await lix.close();
+});
+
+test("close waits for queued operations before deleting the remote session", async () => {
+	const executeStarted = deferred<void>();
+	const releaseExecute = deferred<void>();
+	const order: string[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (request.method === "DELETE") {
+					order.push("delete");
+					expect(request.headers.get("lix-session-id")).toBe("session-1");
+					return new Response(null, { status: 204 });
+				}
+				order.push("execute-start");
+				executeStarted.resolve();
+				await releaseExecute.promise;
+				order.push("execute-finish");
+				return Response.json({
+					columns: [],
+					rows: [],
+					rowsAffected: 1,
+					notices: [],
+				});
+			},
+		},
+	});
+
+	const executing = lix.execute("UPDATE lix_file SET data = $1");
+	await executeStarted.promise;
+	const closing = lix.close();
+	await Promise.resolve();
+	expect(order).toEqual(["execute-start"]);
+	releaseExecute.resolve();
+	await Promise.all([executing, closing]);
+	expect(order).toEqual(["execute-start", "execute-finish", "delete"]);
+});
+
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}

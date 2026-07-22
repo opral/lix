@@ -22,8 +22,8 @@ use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
 use crate::sql2::{
-    ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource,
+    ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
@@ -61,6 +61,8 @@ pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
     pub(super) plugin_host: PluginRuntimeHost,
@@ -80,6 +82,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -94,6 +97,7 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            collaboration_write_gate,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
@@ -112,6 +116,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -128,6 +133,7 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            collaboration_write_gate,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
@@ -144,6 +150,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -158,11 +165,13 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            collaboration_write_gate,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
             telemetry,
             SessionTransactionManager::new(),
+            SessionFileViews::default(),
         )
     }
 
@@ -175,11 +184,13 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
         transaction_manager: SessionTransactionManager,
+        file_views: SessionFileViews,
     ) -> Self {
         Self {
             mode,
@@ -190,6 +201,8 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            collaboration_write_gate,
+            file_views,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
@@ -274,7 +287,7 @@ where
 
     pub(super) async fn begin_session_write_access(&self) -> Result<SessionWriteAccess, LixError> {
         let write_lease = self.begin_session_write_lease().await?;
-        self.begin_session_write_access_with_lease(write_lease)
+        self.begin_session_write_access_with_lease(write_lease, true)
             .await
     }
 
@@ -282,16 +295,31 @@ where
         &self,
     ) -> Result<SessionWriteAccess, LixError> {
         let write_lease = self.begin_explicit_session_write_lease()?;
-        self.begin_session_write_access_with_lease(write_lease)
+        // Explicit transactions can remain open across arbitrary application
+        // awaits. Serializing them for their entire lifetime would allow one
+        // client to block every engine writer indefinitely. The collaboration
+        // MVP serializes bounded implicit statements and execute batches.
+        self.begin_session_write_access_with_lease(write_lease, false)
             .await
     }
 
     async fn begin_session_write_access_with_lease(
         &self,
         write_lease: SessionWriteLease,
+        serialize_collaboration_write: bool,
     ) -> Result<SessionWriteAccess, LixError> {
+        let collaboration_write_guard = if serialize_collaboration_write {
+            Some(
+                Arc::clone(&self.collaboration_write_gate)
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let write_access = SessionWriteAccess {
             _write_lease: write_lease,
+            _collaboration_write_guard: collaboration_write_guard,
         };
         self.ensure_open()?;
         Ok(write_access)
@@ -436,6 +464,7 @@ where
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            self.file_views.clone(),
         )
         .await?;
         self.ensure_open()?;
@@ -486,6 +515,7 @@ where
 
 pub(super) struct SessionWriteAccess {
     _write_lease: SessionWriteLease,
+    _collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 pub(super) fn closed_error() -> LixError {
@@ -506,6 +536,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
+    pub(super) file_views: Option<SessionFileViews>,
 }
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
@@ -565,6 +596,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn session_file_views(&self) -> Option<SessionFileViews> {
+        self.file_views.clone()
     }
 }
 

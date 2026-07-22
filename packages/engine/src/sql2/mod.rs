@@ -7,6 +7,7 @@ mod context;
 mod dml;
 mod error;
 mod exec;
+mod file_view;
 mod history_projection;
 mod history_route;
 mod optimize;
@@ -46,6 +47,9 @@ pub(crate) use exec::{
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
     execute_write_logical_plan_with_mode_result,
+};
+pub(crate) use file_view::{
+    SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;

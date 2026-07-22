@@ -63,6 +63,7 @@ use crate::sql2::write_normalization::{
     InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
     lix_file_data_type_error, lix_file_data_type_error_with_value, scalar_is_binary_or_null,
 };
+use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::WasmComponentInstance;
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
@@ -109,19 +110,23 @@ pub(super) async fn register_lix_file_active_provider(
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
+    session_file_views: Option<SessionFileViews>,
 ) -> Result<(), LixError> {
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixFileSpec::active_branch(
-            active_branch_id,
-            live_state,
-            filesystem_path_index,
-            branch_ref,
-            blob_reader,
-            plugin_host,
-            functions,
-        )),
+        Arc::new(
+            LixFileSpec::active_branch(
+                active_branch_id,
+                live_state,
+                filesystem_path_index,
+                branch_ref,
+                blob_reader,
+                plugin_host,
+                functions,
+            )
+            .with_session_file_views(session_file_views),
+        ),
         WriteAccess::read_only(),
     )
 }
@@ -135,18 +140,22 @@ pub(super) async fn register_lix_file_by_branch_provider(
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
+    session_file_views: Option<SessionFileViews>,
 ) -> Result<(), LixError> {
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixFileSpec::by_branch(
-            live_state,
-            filesystem_path_index,
-            branch_ref,
-            blob_reader,
-            plugin_host,
-            functions,
-        )),
+        Arc::new(
+            LixFileSpec::by_branch(
+                live_state,
+                filesystem_path_index,
+                branch_ref,
+                blob_reader,
+                plugin_host,
+                functions,
+            )
+            .with_session_file_views(session_file_views),
+        ),
         WriteAccess::read_only(),
     )
 }
@@ -199,6 +208,7 @@ struct LixFileSpec {
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
     options: SqlWriteSessionOptions,
+    session_file_views: Option<SessionFileViews>,
 }
 
 struct LixFileDmlSourceState {
@@ -258,6 +268,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             options: SqlWriteSessionOptions::default(),
+            session_file_views: None,
         }
     }
 
@@ -282,6 +293,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             options,
+            session_file_views: None,
         }
     }
 
@@ -303,6 +315,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             options: SqlWriteSessionOptions::default(),
+            session_file_views: None,
         }
     }
 
@@ -326,7 +339,13 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             options,
+            session_file_views: None,
         }
+    }
+
+    fn with_session_file_views(mut self, session_file_views: Option<SessionFileViews>) -> Self {
+        self.session_file_views = session_file_views;
+        self
     }
 
     /// Build the unprojected candidate-row source for UPDATE/DELETE: scan the
@@ -624,6 +643,7 @@ impl TableSpec for LixFileSpec {
                     path_predicate,
                     indexed_matches,
                     physical_filters,
+                    self.session_file_views.clone(),
                     needs_data,
                     needs_blob_rows,
                     limit,
@@ -640,6 +660,7 @@ impl TableSpec for LixFileSpec {
                     path_predicate,
                     indexed_matches,
                     filters,
+                    session_file_views,
                     needs_data,
                     needs_blob_rows,
                     limit,
@@ -728,6 +749,7 @@ impl TableSpec for LixFileSpec {
                                 Box::new(lix_error_to_datafusion_error(error)),
                             )
                         })?
+                        .map(|context| context.with_session_file_views(session_file_views))
                     } else {
                         None
                     };
@@ -1572,6 +1594,8 @@ struct PluginRenderContext {
     host: PluginRuntimeHost,
     branches: BTreeMap<String, BranchPluginRenderContext>,
     owners_by_file: BTreeMap<FilesystemDescriptorKey, PluginFileOwner>,
+    owner_change_ids_by_file: BTreeMap<FilesystemDescriptorKey, String>,
+    session_file_views: Option<SessionFileViews>,
 }
 
 #[derive(Clone)]
@@ -1587,6 +1611,15 @@ impl PluginRenderContext {
 
     fn owner_for_file(&self, key: &FilesystemDescriptorKey) -> Option<&PluginFileOwner> {
         self.owners_by_file.get(key)
+    }
+
+    fn owner_change_id_for_file(&self, key: &FilesystemDescriptorKey) -> Option<&str> {
+        self.owner_change_ids_by_file.get(key).map(String::as_str)
+    }
+
+    fn with_session_file_views(mut self, session_file_views: Option<SessionFileViews>) -> Self {
+        self.session_file_views = session_file_views;
+        self
     }
 }
 
@@ -3746,6 +3779,24 @@ async fn render_plugin_files_for_sql(
         // materialization signal. Plugins that intentionally emit zero state
         // must still receive render([]).
         let bytes = render_plugin_state_with_component_instance(component, &active_state).await?;
+        if let Some(session_file_views) = &plugin_render.session_file_views {
+            let plugin = plugin_render
+                .branch(file_key.branch_id())
+                .and_then(|branch| branch.registry.get(owner.plugin_key()))
+                .expect("rendered plugin should remain in the branch registry");
+            session_file_views.remember_plugin_file_view(
+                SessionFileViewKey::new(file_key.branch_id(), file_key.descriptor_id()),
+                SessionPluginFileView {
+                    plugin_key: owner.plugin_key().to_string(),
+                    plugin_generation: plugin.archive_blob_hash().to_string(),
+                    owner_change_id: plugin_render
+                        .owner_change_id_for_file(&file_key)
+                        .expect("rendered plugin owner should have a change id")
+                        .to_string(),
+                    rows: active_state.clone(),
+                },
+            );
+        }
         rendered.insert(file_key, bytes);
     }
     Ok(rendered)
@@ -3886,6 +3937,7 @@ async fn plugin_render_context_with_branches(
             }
         });
     let mut owners_by_file = BTreeMap::new();
+    let mut owner_change_ids_by_file = BTreeMap::new();
     for (branch_id, file_ids, rows) in try_join_all(owner_reads).await? {
         for row in rows {
             let Some(file_id) = row.file_id.as_deref() else {
@@ -3908,15 +3960,24 @@ async fn plugin_render_context_with_branches(
                 .and_then(|candidate_keys| candidate_keys.get(file_id))
                 .expect("owner row was filtered to candidate file ids")
                 .clone();
+            let owner_change_id = row.change_id.ok_or_else(|| {
+                invalid_plugin_read_state(format!(
+                    "branch '{branch_id}' plugin owner for file id '{file_id}' is missing change_id"
+                ))
+            })?;
             // Keep a well-formed stale owner even when its plugin is currently
             // absent. Rendering checks the current registry, while path moves
             // still need the old key to force reconciliation; reinstall can
             // then resume from the durable owner.
-            if owners_by_file.insert(candidate_key, owner).is_some() {
+            if owners_by_file
+                .insert(candidate_key.clone(), owner)
+                .is_some()
+            {
                 return Err(invalid_plugin_read_state(format!(
                     "branch '{branch_id}' returned duplicate plugin owners for file id '{file_id}'"
                 )));
             }
+            owner_change_ids_by_file.insert(candidate_key, owner_change_id.to_string());
         }
     }
 
@@ -3929,6 +3990,8 @@ async fn plugin_render_context_with_branches(
         host,
         branches,
         owners_by_file,
+        owner_change_ids_by_file,
+        session_file_views: None,
     }))
 }
 

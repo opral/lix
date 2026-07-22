@@ -1,23 +1,63 @@
 # Lix server protocol
 
-`lix_server_protocol::handler` exposes the canonical HTTP protocol for one
-workspace-mode `lix_sdk::Lix` handle. A host owns authentication, workspace
-routing, storage construction, and process lifecycle, then merges this handler
-into its HTTP application.
+`lix_server_protocol::LixProtocolServer` exposes the canonical HTTP protocol
+for one workspace. A host owns authentication, workspace routing, storage
+construction, and process lifecycle. The protocol server owns the root
+`lix_sdk::Lix` handle and a bounded registry of independent remote sessions.
 
 ```rust,no_run
 use std::sync::Arc;
 use axum::Router;
 use lix_sdk::{OpenLixOptions, open_lix};
+use lix_server_protocol::LixProtocolServer;
 
 # async fn example() -> Result<(), lix_sdk::LixError> {
-let lix = Arc::new(open_lix(OpenLixOptions::default()).await?);
-let app = Router::new().merge(lix_server_protocol::handler(lix));
+let root = Arc::new(open_lix(OpenLixOptions::default()).await?);
+let protocol = LixProtocolServer::new(root);
+let app = Router::new().merge(protocol.router());
+
+// During workspace shutdown:
+protocol.close().await?;
 # let _ = app;
 # Ok(())
 # }
 ```
 
-The handler owns `/lix/v1`, request validation, wire values, Lix error mapping,
-and multiplexed observations. Host-specific routes such as authentication,
-health checks, and compare-and-swap filesystem mutations stay outside it.
+The host must retain one `LixProtocolServer` for the workspace lifetime. It
+must not reconstruct the server for each HTTP request, because the in-memory
+session registry is part of the protocol's correctness boundary. Requests for
+one workspace must also reach that same in-process instance; a restart or a
+route to another instance intentionally makes the old session return `410`.
+
+## Session lifecycle
+
+An initial `GET /lix/v1` without `Lix-Session-Id` opens an independent
+workspace session on the root handle's existing engine. Its response contains
+`protocolVersion`, `activeBranchId`, and a cryptographically random
+`sessionId`. The client sends that value as `Lix-Session-Id` on every later
+request, including a resumed handshake and observation streams.
+
+Missing or malformed identifiers return `400`. Unknown, expired, evicted, or
+closed identifiers return `410 Gone`; the client must open a new logical
+session and reload stale application state before mutating rather than
+silently continuing with a different acknowledged view. Handshake responses
+send `Cache-Control: no-store` so a browser or intermediary cannot reuse one
+client's session capability for another client.
+`DELETE /lix/v1/session` closes the identified session. Repeating that delete
+with the same well-formed identifier returns `204 No Content`, so client close
+is idempotent.
+
+Sessions use a 30-minute idle timeout and a 64-session workspace cap by
+default. JSON requests have an explicit 64 MiB ceiling so base64-encoded blobs
+can carry the engine's 32 MiB maximum plugin archive; multiplex observation
+streams accept at most 32 subscriptions. `ProtocolServerOptions` can override
+the session limits and request ceiling. Expired sessions are
+removed opportunistically. At capacity, the least-recently-used idle session
+is evicted; if every session is leased by an active HTTP request or SSE stream,
+the new handshake returns `503` instead of closing active work.
+
+The protocol server owns `/lix/v1`, request validation, wire values, Lix error
+mapping, and multiplexed observations. Host-specific routes such as
+authentication, health checks, and compare-and-swap filesystem mutations stay
+outside it. Session identifiers are opaque capabilities: hosts should not log
+or persist them.

@@ -33,6 +33,9 @@ pub struct WasmLimits {
     /// pages that fit below this bound.
     pub max_memory_bytes: u64,
     pub max_fuel: Option<u64>,
+    /// Approximate wall-clock deadline for guest execution. Runtime
+    /// implementations must renew the deadline before every exported guest
+    /// invocation so a warm component receives a fresh budget on each call.
     pub timeout_ms: Option<u64>,
 }
 

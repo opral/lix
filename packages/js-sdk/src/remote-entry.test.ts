@@ -3,7 +3,11 @@ import { openLix } from "./remote.js";
 
 test("the remote-only entrypoint opens the same Lix facade", async () => {
 	const remoteFetch = vi.fn(async () =>
-		Response.json({ protocolVersion: 1, activeBranchId: "main-id" }),
+		Response.json({
+			protocolVersion: 1,
+			activeBranchId: "main-id",
+			sessionId: "session-1",
+		}),
 	);
 	const lix = await openLix({
 		server: {

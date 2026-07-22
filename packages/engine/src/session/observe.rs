@@ -63,6 +63,7 @@ where
             let Some((mutation_sequence, rows)) = self.evaluate_stable_snapshot().await? else {
                 return Ok(None);
             };
+            self.acknowledge_delivered_file_views(&rows);
             self.last_rows = Some(rows.clone());
             return Ok(Some(ObserveEvent {
                 sequence: self.sequence,
@@ -95,6 +96,7 @@ where
                 .as_ref()
                 .is_none_or(|last_rows| *last_rows != rows)
             {
+                self.acknowledge_delivered_file_views(&rows);
                 self.sequence += 1;
                 self.last_rows = Some(rows.clone());
                 return Ok(Some(ObserveEvent {
@@ -108,6 +110,12 @@ where
 
     pub fn close(&mut self) {
         self.closed = true;
+    }
+
+    fn acknowledge_delivered_file_views(&self, rows: &ExecuteResult) {
+        self.session
+            .file_views
+            .apply_mutations(rows.file_view_mutations().iter().cloned());
     }
 
     async fn wait_for_invalidation(&mut self) -> Result<bool, LixError> {

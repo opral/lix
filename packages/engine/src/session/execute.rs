@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::branch::BranchRefReader;
@@ -13,6 +15,11 @@ use crate::storage_adapter::{
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
+use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::sqlparser::ast::{
+    BinaryOperator, Expr, GroupByExpr, LimitClause, SelectFlavor, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor,
+};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
@@ -23,12 +30,25 @@ use super::transaction::SessionTransaction;
 /// Column names live once at the result-set level. Individual rows only own
 /// values, which keeps the public API row-oriented without copying schema
 /// metadata into every row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExecuteResult {
     columns: Vec<String>,
     rows: Vec<Row>,
     rows_affected: u64,
     notices: Vec<LixNotice>,
+    // Observe evaluations can be shared across sessions. Carry the exact
+    // rendered plugin state with the rows so each receiving session can
+    // acknowledge it only when `ObserveEvents::next()` delivers the event.
+    file_view_mutations: Vec<sql2::SessionFileViewMutation>,
+}
+
+impl PartialEq for ExecuteResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns == other.columns
+            && self.rows == other.rows
+            && self.rows_affected == other.rows_affected
+            && self.notices == other.notices
+    }
 }
 
 #[doc(hidden)]
@@ -47,6 +67,7 @@ impl ExecuteResult {
             rows: Vec::new(),
             rows_affected: 0,
             notices: result.notices,
+            file_view_mutations: Vec::new(),
         }
         .with_rows(result.rows)
     }
@@ -62,6 +83,7 @@ impl ExecuteResult {
                 rows: Vec::new(),
                 rows_affected,
                 notices: result.notices,
+                file_view_mutations: Vec::new(),
             }
             .with_rows(result.rows),
             None => Self::from_rows_affected(rows_affected),
@@ -74,6 +96,7 @@ impl ExecuteResult {
             rows: Vec::new(),
             rows_affected,
             notices: Vec::new(),
+            file_view_mutations: Vec::new(),
         }
     }
 
@@ -83,6 +106,7 @@ impl ExecuteResult {
             rows: Vec::new(),
             rows_affected: 0,
             notices: Vec::new(),
+            file_view_mutations: Vec::new(),
         }
         .with_rows(rows)
     }
@@ -97,6 +121,15 @@ impl ExecuteResult {
             })
             .collect();
         self
+    }
+
+    fn with_file_view_mutations(mut self, mutations: Vec<sql2::SessionFileViewMutation>) -> Self {
+        self.file_view_mutations = mutations;
+        self
+    }
+
+    pub(crate) fn file_view_mutations(&self) -> &[sql2::SessionFileViewMutation] {
+        &self.file_view_mutations
     }
 
     /// Returns the result-set column names in row value order.
@@ -384,7 +417,8 @@ where
     ) -> Result<ExecuteResult, LixError> {
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, execution_kind, None);
-        let operation = self.execute_with_options_inner(sql, params, options);
+        let operation =
+            self.execute_with_options_inner(sql, params, options, execution_kind == "observe");
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
             None => operation.await,
@@ -400,6 +434,7 @@ where
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
+        defer_file_view_acknowledgement: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
@@ -437,6 +472,7 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
+        let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params);
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -465,11 +501,17 @@ where
         let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store| async move {
-                self.execute_read_statement_with_store(read_store, sql, statement, params)
-                    .await
+                self.execute_read_statement_with_store(
+                    read_store,
+                    sql,
+                    statement,
+                    params,
+                    acknowledge_file_views,
+                )
+                .await
             },
         );
-        let read_result = match read_result.await {
+        let (read_result, file_view_mutations) = match read_result.await {
             Ok(result) => result,
             Err(error) => {
                 return Err(normalize_sql_surface_error(error, sql));
@@ -485,7 +527,13 @@ where
         if let Some(stats) = runtime_storage_stats {
             self.observe_invalidation.bump_if_storage_changed(&stats);
         }
-        Ok(ExecuteResult::from_sql_query_result(read_result.query))
+        let result = ExecuteResult::from_sql_query_result(read_result.query)
+            .with_file_view_mutations(file_view_mutations);
+        if !defer_file_view_acknowledgement {
+            self.file_views
+                .apply_mutations(result.file_view_mutations().iter().cloned());
+        }
+        Ok(result)
     }
 
     /// Executes SQL statements sequentially against one atomic snapshot.
@@ -598,70 +646,85 @@ where
         statements: &[ExecuteBatchStatement],
         parsed: Vec<datafusion::sql::parser::Statement>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
+        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, statement)| {
+            is_acknowledgeable_file_data_read(parsed, &statement.params)
+        });
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        with_static_session_sql_read::<StorageImpl, _, _, _>(read_scope, |read_store| async move {
-            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
-            let visible_schemas = self
-                .catalog_context
-                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                .await?;
-            let ctx = SessionSqlExecutionContext {
-                active_branch_id: &active_branch_id,
-                read_store,
-                live_state: Arc::clone(&self.live_state),
-                binary_cas: Arc::clone(&self.binary_cas),
-                branch_ctx: Arc::clone(&self.branch_ctx),
-                visible_schemas,
-                functions: FunctionProviderHandle::system(),
-                plugin_host: self.plugin_host.clone(),
-            };
-            let read_session = sql2::prepare_read_session(&ctx).await?;
-            let mut results = Vec::with_capacity(statements.len());
-            for (statement_index, (statement, parsed)) in statements.iter().zip(parsed).enumerate()
-            {
-                let telemetry = SqlStatementTelemetry::start(
-                    self.telemetry.as_ref(),
-                    &statement.sql,
-                    "batch",
-                    Some(statement_index),
-                );
-                let operation = async {
-                    sql2::execute_read_statement_in_session_from_parsed(
-                        &read_session,
+        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
+            read_scope,
+            |read_store| async move {
+                let file_view_collector =
+                    acknowledge_file_views.then(sql2::SessionFileViews::default);
+                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                    Arc::new(self.live_state.reader(read_store.clone()));
+                let visible_schemas = self
+                    .catalog_context
+                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+                    .await?;
+                let ctx = SessionSqlExecutionContext {
+                    active_branch_id: &active_branch_id,
+                    read_store,
+                    live_state: Arc::clone(&self.live_state),
+                    binary_cas: Arc::clone(&self.binary_cas),
+                    branch_ctx: Arc::clone(&self.branch_ctx),
+                    visible_schemas,
+                    functions: FunctionProviderHandle::system(),
+                    plugin_host: self.plugin_host.clone(),
+                    file_views: file_view_collector.clone(),
+                };
+                let read_session = sql2::prepare_read_session(&ctx).await?;
+                let mut results = Vec::with_capacity(statements.len());
+                for (statement_index, (statement, parsed)) in
+                    statements.iter().zip(parsed).enumerate()
+                {
+                    let telemetry = SqlStatementTelemetry::start(
+                        self.telemetry.as_ref(),
                         &statement.sql,
-                        parsed,
-                        &statement.params,
-                    )
-                    .await
-                    .map(ExecuteResult::from_sql_query_result)
-                    .map_err(|error| {
-                        with_batch_statement_index(
-                            normalize_sql_surface_error(error, &statement.sql),
-                            statement_index,
+                        "batch",
+                        Some(statement_index),
+                    );
+                    let operation = async {
+                        sql2::execute_read_statement_in_session_from_parsed(
+                            &read_session,
+                            &statement.sql,
+                            parsed,
+                            &statement.params,
                         )
-                    })
-                };
-                let result = match telemetry.as_ref() {
-                    Some(telemetry) => telemetry.instrument(operation).await,
-                    None => operation.await,
-                };
-                if let Some(telemetry) = telemetry {
-                    telemetry.finish(&result);
+                        .await
+                        .map(ExecuteResult::from_sql_query_result)
+                        .map_err(|error| {
+                            with_batch_statement_index(
+                                normalize_sql_surface_error(error, &statement.sql),
+                                statement_index,
+                            )
+                        })
+                    };
+                    let result = match telemetry.as_ref() {
+                        Some(telemetry) => telemetry.instrument(operation).await,
+                        None => operation.await,
+                    };
+                    if let Some(telemetry) = telemetry {
+                        telemetry.finish(&result);
+                    }
+                    results.push(result?);
                 }
-                results.push(result?);
-            }
-            drop(read_session);
-            drop(ctx);
-            drop(live_state);
-            Ok(results)
-        })
-        .await
+                drop(read_session);
+                drop(ctx);
+                drop(live_state);
+                let file_view_mutations = file_view_collector
+                    .map(|collector| collector.plugin_file_mutations())
+                    .unwrap_or_default();
+                Ok((results, file_view_mutations))
+            },
+        )
+        .await?;
+        self.file_views.apply_mutations(file_view_mutations);
+        Ok(results)
     }
 
     #[doc(hidden)]
@@ -709,97 +772,119 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
+        let acknowledge_file_views = parsed
+            .iter()
+            .zip(statements)
+            .all(|(parsed, (_, params))| is_acknowledgeable_file_data_read(parsed, params));
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        with_static_session_sql_read::<StorageImpl, _, _, _>(read_scope, |read_store| async move {
-            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-            let active_branch_head = self
-                .branch_ctx
-                .ref_reader(read_store.clone())
-                .load_head(&active_branch_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::branch_not_found(
-                        active_branch_id.clone(),
-                        "execute coherent read batch",
-                        "active branch",
-                    )
-                })?;
-            let active_branch_commit_id = active_branch_head.commit_id.to_string();
-            let storage_mutation_revision =
-                StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read_store)
+        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
+            read_scope,
+            |read_store| async move {
+                let file_view_collector =
+                    acknowledge_file_views.then(sql2::SessionFileViews::default);
+                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let active_branch_head = self
+                    .branch_ctx
+                    .ref_reader(read_store.clone())
+                    .load_head(&active_branch_id)
                     .await?
-                    .map(|revision| revision.to_vec());
-            if parsed.is_empty() {
-                return Ok(CoherentReadBatch {
-                    active_branch_id,
-                    active_branch_commit_id,
-                    storage_mutation_revision,
-                    results: Vec::new(),
-                });
-            }
-            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
-            let visible_schemas = self
-                .catalog_context
-                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                .await?;
-            let ctx = SessionSqlExecutionContext {
-                active_branch_id: &active_branch_id,
-                read_store,
-                live_state: Arc::clone(&self.live_state),
-                binary_cas: Arc::clone(&self.binary_cas),
-                branch_ctx: Arc::clone(&self.branch_ctx),
-                visible_schemas,
-                functions: FunctionProviderHandle::system(),
-                plugin_host: self.plugin_host.clone(),
-            };
-            let read_session = sql2::prepare_read_session_at_head(&ctx, active_branch_head).await?;
-            let mut results = Vec::with_capacity(statements.len());
-            for (statement_index, ((sql, params), statement)) in
-                statements.iter().zip(parsed).enumerate()
-            {
-                let telemetry = SqlStatementTelemetry::start(
-                    self.telemetry.as_ref(),
-                    sql,
-                    "coherent_read_batch",
-                    Some(statement_index),
-                );
-                let operation = async {
-                    sql2::execute_read_statement_in_session_from_parsed(
-                        &read_session,
-                        sql,
-                        statement,
-                        params,
-                    )
-                    .await
-                    .map(ExecuteResult::from_sql_query_result)
-                    .map_err(|error| normalize_sql_surface_error(error, sql))
-                };
-                let result = match telemetry.as_ref() {
-                    Some(telemetry) => telemetry.instrument(operation).await,
-                    None => operation.await,
-                };
-                if let Some(telemetry) = telemetry {
-                    telemetry.finish(&result);
+                    .ok_or_else(|| {
+                        LixError::branch_not_found(
+                            active_branch_id.clone(),
+                            "execute coherent read batch",
+                            "active branch",
+                        )
+                    })?;
+                let active_branch_commit_id = active_branch_head.commit_id.to_string();
+                let storage_mutation_revision =
+                    StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read_store)
+                        .await?
+                        .map(|revision| revision.to_vec());
+                if parsed.is_empty() {
+                    return Ok((
+                        CoherentReadBatch {
+                            active_branch_id,
+                            active_branch_commit_id,
+                            storage_mutation_revision,
+                            results: Vec::new(),
+                        },
+                        Vec::new(),
+                    ));
                 }
-                results.push(result?);
-            }
-            drop(read_session);
-            drop(ctx);
-            drop(live_state);
-            Ok(CoherentReadBatch {
-                active_branch_id,
-                active_branch_commit_id,
-                storage_mutation_revision,
-                results,
-            })
-        })
-        .await
+                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                    Arc::new(self.live_state.reader(read_store.clone()));
+                let visible_schemas = self
+                    .catalog_context
+                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+                    .await?;
+                let ctx = SessionSqlExecutionContext {
+                    active_branch_id: &active_branch_id,
+                    read_store,
+                    live_state: Arc::clone(&self.live_state),
+                    binary_cas: Arc::clone(&self.binary_cas),
+                    branch_ctx: Arc::clone(&self.branch_ctx),
+                    visible_schemas,
+                    functions: FunctionProviderHandle::system(),
+                    plugin_host: self.plugin_host.clone(),
+                    file_views: file_view_collector.clone(),
+                };
+                let read_session =
+                    sql2::prepare_read_session_at_head(&ctx, active_branch_head).await?;
+                let mut results = Vec::with_capacity(statements.len());
+                for (statement_index, ((sql, params), statement)) in
+                    statements.iter().zip(parsed).enumerate()
+                {
+                    let telemetry = SqlStatementTelemetry::start(
+                        self.telemetry.as_ref(),
+                        sql,
+                        "coherent_read_batch",
+                        Some(statement_index),
+                    );
+                    let operation = async {
+                        sql2::execute_read_statement_in_session_from_parsed(
+                            &read_session,
+                            sql,
+                            statement,
+                            params,
+                        )
+                        .await
+                        .map(ExecuteResult::from_sql_query_result)
+                        .map_err(|error| normalize_sql_surface_error(error, sql))
+                    };
+                    let result = match telemetry.as_ref() {
+                        Some(telemetry) => telemetry.instrument(operation).await,
+                        None => operation.await,
+                    };
+                    if let Some(telemetry) = telemetry {
+                        telemetry.finish(&result);
+                    }
+                    results.push(result?);
+                }
+                drop(read_session);
+                drop(ctx);
+                drop(live_state);
+                let file_view_mutations = file_view_collector
+                    .map(|collector| collector.plugin_file_mutations())
+                    .unwrap_or_default();
+                Ok((
+                    CoherentReadBatch {
+                        active_branch_id,
+                        active_branch_commit_id,
+                        storage_mutation_revision,
+                        results,
+                    },
+                    file_view_mutations,
+                ))
+            },
+        )
+        .await?;
+        self.file_views.apply_mutations(file_view_mutations);
+        Ok(batch)
     }
 
     #[cfg(test)]
@@ -887,7 +972,15 @@ where
         sql: &str,
         statement: datafusion::sql::parser::Statement,
         params: &[Value],
-    ) -> Result<sql2::SessionReadSqlResult, LixError> {
+        acknowledge_file_views: bool,
+    ) -> Result<
+        (
+            sql2::SessionReadSqlResult,
+            Vec<sql2::SessionFileViewMutation>,
+        ),
+        LixError,
+    > {
+        let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
         let live_state: Arc<dyn crate::live_state::LiveStateReader> =
             Arc::new(self.live_state.reader(read_store.clone()));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
@@ -906,15 +999,22 @@ where
             visible_schemas,
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
+            file_views: file_view_collector.clone(),
         };
 
         let query = sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
         drop(ctx);
         drop(live_state);
-        Ok(sql2::SessionReadSqlResult {
-            runtime_functions,
-            query,
-        })
+        let file_view_mutations = file_view_collector
+            .map(|collector| collector.plugin_file_mutations())
+            .unwrap_or_default();
+        Ok((
+            sql2::SessionReadSqlResult {
+                runtime_functions,
+                query,
+            },
+            file_view_mutations,
+        ))
     }
 }
 
@@ -1089,6 +1189,283 @@ where
     .await;
     transaction.replace_origin_key(previous_origin_key);
     result
+}
+
+/// Returns true only when SQL directly delivers one file's bytes to the
+/// caller. Materializing `data` inside an aggregate, join, filter, or derived
+/// expression is not acknowledgement: the caller did not receive those bytes
+/// and must not gain the ability to delete entities that only existed there.
+///
+/// This intentionally recognizes a narrow, predictable MVP surface. False
+/// negatives merely preserve an omitted entity; false positives can lose one.
+fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
+    let DataFusionStatement::Statement(statement) = statement else {
+        return false;
+    };
+    let SqlStatement::Query(query) = statement.as_ref() else {
+        return false;
+    };
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || !point_read_limit_is_safe(query.limit_clause.as_ref())
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return false;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    if select.flavor != SelectFlavor::Standard
+        || select.optimizer_hint.is_some()
+        || select.distinct.is_some()
+        || select.select_modifiers.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !group_by_is_empty(&select.group_by)
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+    {
+        return false;
+    }
+
+    if !select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::UnnamedExpr(expression)
+                | SelectItem::ExprWithAlias {
+                    expr: expression,
+                    ..
+                } if direct_column_name(expression).as_deref() == Some("data")
+        )
+    }) {
+        return false;
+    }
+
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    if !from.joins.is_empty() {
+        return false;
+    }
+    let TableFactor::Table {
+        name,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+        ..
+    } = &from.relation
+    else {
+        return false;
+    };
+    if args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || *with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return false;
+    }
+    let Some(table_name) = name.0.last().and_then(|part| part.as_ident()) else {
+        return false;
+    };
+    let table_name = table_name.value.to_ascii_lowercase();
+
+    let Some(selection) = select.selection.as_ref() else {
+        return false;
+    };
+    let mut equality_columns = BTreeSet::new();
+    // Anonymous placeholders are bound in textual order. Atelier's point read
+    // projects the active branch as `? AS active_branch_id` before filtering
+    // by `file.id = ?`, so start the WHERE binder after projection params.
+    let mut anonymous_placeholder_index = select
+        .projection
+        .iter()
+        .map(anonymous_placeholders_in_select_item)
+        .sum();
+    if !collect_literal_equalities(
+        selection,
+        &mut equality_columns,
+        params,
+        &mut anonymous_placeholder_index,
+    ) {
+        return false;
+    }
+    match table_name.as_str() {
+        "lix_file" => {
+            equality_columns.len() == 1
+                && (equality_columns.contains("id") || equality_columns.contains("path"))
+        }
+        "lix_file_by_branch" => {
+            equality_columns.len() == 2
+                && equality_columns.contains("lixcol_branch_id")
+                && (equality_columns.contains("id") || equality_columns.contains("path"))
+        }
+        _ => false,
+    }
+}
+
+/// A unique id/path predicate can return at most one row. `LIMIT 1` therefore
+/// leaves that delivered row unchanged, while offsets and dynamic limits can
+/// hide a materialized row and must remain non-acknowledging.
+fn point_read_limit_is_safe(limit_clause: Option<&LimitClause>) -> bool {
+    let Some(limit_clause) = limit_clause else {
+        return true;
+    };
+    let LimitClause::LimitOffset {
+        limit,
+        offset,
+        limit_by,
+    } = limit_clause
+    else {
+        return false;
+    };
+    if offset.is_some() || !limit_by.is_empty() {
+        return false;
+    }
+    let Some(Expr::Value(value)) = limit else {
+        // `LIMIT ALL` does not remove the unique point row.
+        return limit.is_none();
+    };
+    matches!(&value.value, SqlValue::Number(number, _) if number.parse::<u64>().is_ok_and(|number| number > 0))
+}
+
+fn anonymous_placeholders_in_select_item(item: &SelectItem) -> usize {
+    let expression = match item {
+        SelectItem::UnnamedExpr(expression)
+        | SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } => expression,
+        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return 0,
+    };
+    let mut visitor = AnonymousPlaceholderCounter::default();
+    let _ = expression.visit(&mut visitor);
+    visitor.count
+}
+
+#[derive(Default)]
+struct AnonymousPlaceholderCounter {
+    count: usize,
+}
+
+impl Visitor for AnonymousPlaceholderCounter {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if matches!(
+            expression,
+            Expr::Value(value) if matches!(&value.value, SqlValue::Placeholder(placeholder) if placeholder == "?")
+        ) {
+            self.count = self.count.saturating_add(1);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
+    matches!(group_by, GroupByExpr::Expressions(expressions, modifiers)
+        if expressions.is_empty() && modifiers.is_empty())
+}
+
+fn direct_column_name(expression: &Expr) -> Option<String> {
+    let identifier = match expression {
+        Expr::Identifier(identifier) => identifier,
+        Expr::CompoundIdentifier(identifiers) => identifiers.last()?,
+        Expr::Nested(expression) => return direct_column_name(expression),
+        _ => return None,
+    };
+    Some(identifier.value.to_ascii_lowercase())
+}
+
+fn collect_literal_equalities(
+    expression: &Expr,
+    columns: &mut BTreeSet<String>,
+    params: &[Value],
+    anonymous_placeholder_index: &mut usize,
+) -> bool {
+    match expression {
+        Expr::Nested(expression) => {
+            collect_literal_equalities(expression, columns, params, anonymous_placeholder_index)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_literal_equalities(left, columns, params, anonymous_placeholder_index)
+                && collect_literal_equalities(right, columns, params, anonymous_placeholder_index)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let column = match (direct_column_name(left), direct_column_name(right)) {
+                (Some(column), None)
+                    if point_identity_value_is_text(right, params, anonymous_placeholder_index) =>
+                {
+                    column
+                }
+                (None, Some(column))
+                    if point_identity_value_is_text(left, params, anonymous_placeholder_index) =>
+                {
+                    column
+                }
+                _ => return false,
+            };
+            columns.insert(column)
+        }
+        _ => false,
+    }
+}
+
+fn point_identity_value_is_text(
+    expression: &Expr,
+    params: &[Value],
+    anonymous_placeholder_index: &mut usize,
+) -> bool {
+    let Expr::Value(value) = expression else {
+        return false;
+    };
+    match &value.value {
+        SqlValue::Placeholder(placeholder) => {
+            let index = if placeholder == "?" {
+                let index = *anonymous_placeholder_index;
+                *anonymous_placeholder_index += 1;
+                Some(index)
+            } else {
+                placeholder
+                    .strip_prefix('$')
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| index.checked_sub(1))
+            };
+            index
+                .and_then(|index| params.get(index))
+                .is_some_and(|value| matches!(value, Value::Text(_)))
+        }
+        value => value.clone().into_string().is_some(),
+    }
 }
 
 fn classify_execute_batch(
