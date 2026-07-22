@@ -80,7 +80,6 @@ impl CatalogSnapshot {
         Self::from_entries(self.entries.clone())
     }
 
-    #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> &CatalogFingerprint {
         &self.fingerprint
     }
@@ -240,6 +239,18 @@ impl CatalogSnapshot {
 
     pub(crate) fn plans(&self) -> impl Iterator<Item = &SchemaPlan> {
         self.plans.iter()
+    }
+
+    /// Returns the schema definitions represented by this compiled snapshot.
+    ///
+    /// SQL surface binding needs the authoritative catalog snapshot captured
+    /// when a transaction opens. Project it from that snapshot instead of
+    /// rescanning durable schema rows through live state.
+    pub(crate) fn schema_jsons(&self) -> Vec<JsonValue> {
+        self.by_key
+            .values()
+            .map(|plan_id| self.plans[plan_id.index()].schema.as_ref().clone())
+            .collect()
     }
 
     pub(crate) fn plan(&self, plan_id: SchemaPlanId) -> Option<&SchemaPlan> {
@@ -1141,6 +1152,27 @@ mod tests {
             .expect("child-first facts should bind as the same domain snapshot");
 
         assert_eq!(parent_first.fingerprint(), child_first.fingerprint());
+    }
+
+    #[test]
+    fn schema_jsons_project_compiled_catalog_in_schema_key_order() {
+        let zeta = schema_json("zeta_schema");
+        let alpha = schema_json("alpha_schema");
+        let catalog = CatalogSnapshot::from_schema_facts(&[
+            SchemaCatalogFact::new(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("zeta_schema"),
+                zeta.clone(),
+            ),
+            SchemaCatalogFact::new(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("alpha_schema"),
+                alpha.clone(),
+            ),
+        ])
+        .expect("catalog should bind");
+
+        assert_eq!(catalog.schema_jsons(), vec![alpha, zeta]);
     }
 
     #[test]

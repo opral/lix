@@ -20,6 +20,8 @@ use rocksdb::Snapshot;
 use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
 use tempfile::TempDir;
 
+const OWNED_VALUE_MIN_BYTES: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub struct RocksDBFactory {
     temp_dir: TempDir,
@@ -195,11 +197,7 @@ impl StorageRead for RocksDBRead<'_> {
                 .multi_get(physical_keys.iter().map(|key| key.0.as_ref()))
             {
                 let value = value.map_err(rocksdb_error)?;
-                values.push(
-                    value
-                        .as_ref()
-                        .map(|value| project_value(value.as_ref(), opts.projection)),
-                );
+                values.push(value.map(|value| project_owned_value(value, opts.projection)));
             }
             Ok(GetManyResult::new(values))
         }
@@ -244,7 +242,7 @@ impl StorageRead for RocksDBRead<'_> {
                 }
                 entries.push(ReadEntry {
                     key: Key(Bytes::copy_from_slice(&encoded_key[4..])),
-                    value: project_value(value.as_ref(), opts.projection),
+                    value: project_owned_value(value, opts.projection),
                 });
             }
             Ok(ScanChunk {
@@ -473,10 +471,19 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
     value.bytes
 }
 
-fn project_value(value: &[u8], projection: CoreProjection) -> ProjectedValue {
+fn project_owned_value<T>(value: T, projection: CoreProjection) -> ProjectedValue
+where
+    T: AsRef<[u8]>,
+    Bytes: From<T>,
+{
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
+        CoreProjection::FullValue if value.as_ref().len() >= OWNED_VALUE_MIN_BYTES => {
+            ProjectedValue::FullValue(Bytes::from(value))
+        }
+        CoreProjection::FullValue => {
+            ProjectedValue::FullValue(Bytes::copy_from_slice(value.as_ref()))
+        }
     }
 }
 

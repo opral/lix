@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BinaryCasWriteMetrics {
     pub chunk_lookup_count: u64,
@@ -19,7 +19,7 @@ static CHUNK_LOOKUP_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 static CHUNK_LOOKUP_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_DUPLICATE_CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn reset_binary_cas_write_metrics() {
     CHUNK_LOOKUP_COUNT.store(0, Ordering::Relaxed);
     CHUNK_LOOKUP_BATCH_COUNT.store(0, Ordering::Relaxed);
@@ -29,7 +29,7 @@ pub(crate) fn reset_binary_cas_write_metrics() {
     TRANSACTION_DUPLICATE_CHUNK_COUNT.store(0, Ordering::Relaxed);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn binary_cas_write_metrics_snapshot() -> BinaryCasWriteMetrics {
     BinaryCasWriteMetrics {
         chunk_lookup_count: CHUNK_LOOKUP_COUNT.load(Ordering::Relaxed),

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lix_engine::wasm::{
@@ -102,6 +103,64 @@ simulation_test!(
             .await
             .expect("blob ref state read should succeed");
         assert_eq!(blob_ref_result.len(), 0);
+    }
+);
+
+simulation_test!(
+    exact_lix_file_point_reads_match_generic_sql_across_visible_lanes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_global) VALUES \
+                 ('shared-point-file', '/shared-point.bin', X'61', false), \
+                 ('shared-point-file', '/shared-point.bin', X'62', true)",
+                &[],
+            )
+            .await
+            .expect("branch and global point-read fixtures should insert");
+
+        for (fast_sql, generic_sql, parameter) in [
+            (
+                "SELECT data FROM lix_file WHERE id = $1",
+                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "shared-point-file",
+            ),
+            (
+                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT data FROM lix_file WHERE path = $1 AND true",
+                "/shared-point.bin",
+            ),
+            (
+                "SELECT lixcol_change_id FROM lix_file WHERE id = $1",
+                "SELECT lixcol_change_id FROM lix_file WHERE id = $1 AND true",
+                "shared-point-file",
+            ),
+            (
+                "SELECT data FROM lix_file WHERE id = $1",
+                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "missing-point-file",
+            ),
+        ] {
+            let params = [Value::Text(parameter.to_string())];
+            let fast = session
+                .execute(fast_sql, &params)
+                .await
+                .expect("exact point read should execute");
+            let generic = session
+                .execute(generic_sql, &params)
+                .await
+                .expect("generic comparison read should execute");
+            assert_eq!(fast, generic, "point read differed for {fast_sql}");
+        }
     }
 );
 
@@ -1297,6 +1356,90 @@ async fn observe_point_read_acknowledges_delivered_plugin_state_per_session() {
     assert_eq!(
         read_file(&session_a, "/shared.keyed").await.unwrap(),
         Some(b"a=A\nb=B\n".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn observe_late_subscriber_acknowledges_fresh_plugin_incarnation_after_unchanged_bytes() {
+    let (engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    let session_c = engine
+        .open_session(
+            session_a
+                .active_branch_id()
+                .await
+                .expect("active branch should load"),
+        )
+        .await
+        .expect("late subscriber session should open");
+    write_file(&session_a, "/shared.keyed", b"a=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+
+    let query = "SELECT data FROM lix_file WHERE path = $1";
+    let params = [Value::Text("/shared.keyed".to_string())];
+    let mut first = session_a
+        .observe(query, &params)
+        .expect("first observation should open");
+    let mut peer = session_b
+        .observe(query, &params)
+        .expect("peer observation should open");
+    first
+        .next()
+        .await
+        .expect("first observation should execute")
+        .expect("first snapshot should be delivered");
+    peer.next()
+        .await
+        .expect("peer observation should execute")
+        .expect("peer snapshot should be delivered");
+
+    // Recreate the plugin owner while preserving the rendered bytes. The next
+    // shared evaluation must keep the fresh owner incarnation even though its
+    // visible rows compare equal to the prior generation.
+    session_a
+        .execute(
+            "UPDATE lix_file SET path = '/shared.bin' WHERE path = '/shared.keyed'",
+            &[],
+        )
+        .await
+        .expect("plugin-to-raw transition should succeed");
+    session_a
+        .execute(
+            "UPDATE lix_file SET path = '/shared.keyed' WHERE path = '/shared.bin'",
+            &[],
+        )
+        .await
+        .expect("raw-to-plugin transition should succeed");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), first.next())
+            .await
+            .is_err(),
+        "unchanged bytes should not emit an observation"
+    );
+
+    let mut late = session_c
+        .observe(query, &params)
+        .expect("late observation should open");
+    let late_initial = late
+        .next()
+        .await
+        .expect("late observation should execute")
+        .expect("late initial snapshot should be delivered");
+    assert_eq!(
+        late_initial.rows.rows()[0].values(),
+        &[Value::Blob(b"a=0\n".to_vec())]
+    );
+
+    write_file(&session_a, "/shared.keyed", b"a=0\nb=remote\n".to_vec())
+        .await
+        .expect("remote entity should write");
+    write_file(&session_c, "/shared.keyed", Vec::new())
+        .await
+        .expect("late subscriber deletion should write");
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([("b".to_string(), "remote".to_string())]),
+        "the late subscriber may delete acknowledged state but not unseen state"
     );
 }
 

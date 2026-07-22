@@ -98,6 +98,78 @@ simulation_test!(
 );
 
 simulation_test!(
+    sql_catalog_templates_follow_committed_transaction_snapshots,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        transaction
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema registration should stage");
+
+        let insert_sql = "INSERT INTO sql_template_snapshot_note (id, text) VALUES ($1, $2)";
+        transaction
+            .execute(
+                insert_sql,
+                &[
+                    Value::Text("note-1".to_string()),
+                    Value::Text("after commit".to_string()),
+                ],
+            )
+            .await
+            .expect_err("SQL binding should keep the transaction-opening catalog snapshot");
+
+        transaction
+            .commit()
+            .await
+            .expect("schema transaction should commit");
+
+        let inserted = session
+            .execute(
+                insert_sql,
+                &[
+                    Value::Text("note-1".to_string()),
+                    Value::Text("after commit".to_string()),
+                ],
+            )
+            .await
+            .expect("the next transaction should bind against the committed catalog");
+        assert_eq!(inserted.rows_affected(), 1);
+
+        let selected = session
+            .execute(
+                "SELECT text FROM sql_template_snapshot_note WHERE id = $1",
+                &[Value::Text("note-1".to_string())],
+            )
+            .await
+            .expect("new entity surface should be readable after commit");
+        assert_rows_eq(
+            selected,
+            vec![vec![Value::Text("after commit".to_string())]],
+        );
+    }
+);
+
+simulation_test!(
     untracked_registered_schema_does_not_authorize_tracked_state_write,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -139,7 +211,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_system_schema_key,
+    lix_registered_schema_insert_rejects_fixed_system_surface_collisions,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -150,24 +222,50 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
+        for (schema_key, collision_kind) in [
+            ("lix_file", "fixed base surface"),
+            ("lix_key_value_history", "generated system history surface"),
+        ] {
+            let schema = json!({
+                "x-lix-key": schema_key,
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false,
+            });
+            let error = session
+                .execute(
+                    "INSERT INTO lix_registered_schema \
+                     (value, lixcol_global, lixcol_untracked) \
+                     VALUES ($1, false, false)",
+                    &[Value::Json(schema)],
+                )
+                .await
+                .expect_err(collision_kind);
+
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+            assert!(error.message.contains("fixed system schema"), "{error:?}");
+            assert!(error.message.contains(schema_key), "{error:?}");
+        }
+
+        let noncolliding_schema = json!({
+            "x-lix-key": "lix_plugin_note",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false,
+        });
+        session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 lix_json('{\"x-lix-key\":\"lix_change\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
-                &[],
+                "INSERT INTO lix_registered_schema \
+                 (value, lixcol_global, lixcol_untracked) \
+                 VALUES ($1, false, false)",
+                &[Value::Json(noncolliding_schema)],
             )
             .await
-            .expect_err("system schema keys should not be user-registerable");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            error.message.contains("system schema"),
-            "unexpected error: {error:?}"
-        );
+            .expect("a noncolliding lix-prefixed key remains registerable");
     }
 );
 

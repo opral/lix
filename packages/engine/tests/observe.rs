@@ -565,6 +565,55 @@ async fn observe_identical_queries_share_one_evaluation_per_generation() {
 }
 
 simulation_test!(
+    observe_new_subscriber_receives_current_rows_after_unchanged_generation,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('observe-current', 'v0')",
+                &[],
+            )
+            .await
+            .expect("target insert should commit");
+
+        let mut first = observe_key(&raw_session, "observe-current");
+        let first_initial = next_event(&mut first, "first current snapshot").await;
+        assert_key_value_row(&first_initial, "observe-current", "v0");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('observe-unrelated', 'v0')",
+                &[],
+            )
+            .await
+            .expect("unrelated insert should commit");
+
+        let mut newcomer = observe_key(&raw_session, "observe-current");
+        let newcomer_initial = next_event(&mut newcomer, "new subscriber snapshot").await;
+        assert_eq!(newcomer_initial.sequence, 0);
+        assert!(
+            newcomer_initial.mutation_sequence > first_initial.mutation_sequence,
+            "new subscriber should evaluate the current generation"
+        );
+        assert_key_value_row(&newcomer_initial, "observe-current", "v0");
+        expect_no_event(&mut first, "unchanged result for first subscriber").await;
+
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'v1' WHERE key = 'observe-current'",
+                &[],
+            )
+            .await
+            .expect("target update should commit");
+        let first_update = next_event(&mut first, "first changed result").await;
+        let newcomer_update = next_event(&mut newcomer, "newcomer changed result").await;
+        assert_key_value_row(&first_update, "observe-current", "v1");
+        assert_key_value_row(&newcomer_update, "observe-current", "v1");
+    }
+);
+
+simulation_test!(
     observe_rejects_durable_runtime_functions,
     |sim| async move {
         let engine = sim.boot_engine().await;

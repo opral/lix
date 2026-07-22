@@ -66,7 +66,9 @@ use crate::sql2::write_normalization::{
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::WasmComponentInstance;
-use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
+use crate::{
+    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, parse_row_metadata_value, serialize_row_metadata,
+};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -216,6 +218,27 @@ struct LixFileDmlSourceState {
     plugin_render: Option<PluginRenderContext>,
     path_resolver_rows: Option<Vec<MaterializedLiveStateRow>>,
     path_index: Option<FilesystemPathSelection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactLixFileReadColumn {
+    Data,
+    ChangeId,
+}
+
+impl ExactLixFileReadColumn {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::ChangeId => "lixcol_change_id",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExactLixFileReadSelector {
+    Id(String),
+    Path(String),
 }
 
 type SharedLixFileDmlSourceState = Arc<Mutex<Option<LixFileDmlSourceState>>>;
@@ -469,6 +492,87 @@ impl LixFileSpec {
             },
         )
     }
+}
+
+/// Executes the narrow active-branch point-read shape without constructing a
+/// DataFusion catalog and plan. Row selection, branch visibility, blob
+/// loading, plugin rendering, and session acknowledgement all stay on the
+/// regular `lix_file` provider helpers below.
+pub(crate) async fn execute_exact_lix_file_read(
+    active_branch_id: &str,
+    live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    session_file_views: Option<SessionFileViews>,
+    selector: &ExactLixFileReadSelector,
+    column: ExactLixFileReadColumn,
+) -> Result<SqlQueryResult, LixError> {
+    let base_schema = lix_file_schema();
+    let column_index = base_schema.index_of(column.name()).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("exact lix_file projection is missing: {error}"),
+        )
+    })?;
+    let schema = Arc::new(Schema::new(vec![
+        base_schema.field(column_index).as_ref().clone(),
+    ]));
+    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
+
+    let index = filesystem_path_index
+        .path_index(&FilesystemPathIndexRequest::new(
+            request.filter.branch_ids.clone(),
+        ))
+        .await?;
+    let matches = match selector {
+        ExactLixFileReadSelector::Id(file_id) => indexed_file_id_matches(
+            index,
+            &BTreeSet::from([file_id.clone()]),
+            &FilePathPredicate::All,
+        ),
+        ExactLixFileReadSelector::Path(path) => indexed_file_matches(
+            index,
+            &FilePathPredicate::Comparison {
+                operation: FilePathComparison::Equal,
+                value: path.clone(),
+            },
+        ),
+    };
+    let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let load_data = column == ExactLixFileReadColumn::Data;
+    let plugin_render = if prepared.needs_plugin_render(load_data) {
+        plugin_render_context_for_lix_file_scan(live_state, &request, plugin_host, &prepared, false)
+            .await?
+            .map(|context| context.with_session_file_views(session_file_views))
+    } else {
+        None
+    };
+    let batch = lix_file_record_batch_from_prepared(
+        &schema,
+        &blob_reader,
+        plugin_render,
+        load_data,
+        prepared,
+    )
+    .await?;
+    crate::sql2::exec::datafusion::query_result_from_batches(
+        &schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+        &[batch],
+    )
 }
 
 fn lix_file_dml_source_state(

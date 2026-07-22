@@ -25,6 +25,7 @@ use web_time::Instant;
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
+pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
 pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
@@ -33,6 +34,10 @@ pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::n
 );
 pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
+pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0005_0004),
+    BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
+);
 
 #[derive(Debug)]
 struct BlobWritePlan {
@@ -140,6 +145,16 @@ pub(crate) fn stage_chunk(
     uncompressed_len: u64,
     payload: &[u8],
 ) {
+    // The storage API's key-only projection still has to materialize a value
+    // on backends without an exact exists primitive. Keep an empty marker in
+    // a separate space so content-addressed dedupe never reads chunk payloads
+    // merely to prove that their hash is present. The marker and payload are
+    // staged in the same canonical write set and become visible atomically.
+    writes.put(
+        BINARY_CAS_CHUNK_PRESENCE_SPACE,
+        key(chunk_key(chunk_hash)),
+        value(Vec::new()),
+    );
     writes.put(
         BINARY_CAS_CHUNK_SPACE,
         key(chunk_key(chunk_hash)),
@@ -762,7 +777,7 @@ async fn chunk_keys_exist(
     keys: Vec<StorageKey>,
 ) -> Result<Vec<bool>, LixError> {
     let started = Instant::now();
-    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_SPACE, keys)
+    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_PRESENCE_SPACE, keys)
         .materialize(
             store,
             StorageGetOptions {
@@ -1052,7 +1067,7 @@ mod tests {
             writer
                 .stage_payload(&payload)
                 .expect("initial blob write should stage");
-            assert_eq!(writes.stats().staged_puts, 2);
+            assert_eq!(writes.stats().staged_puts, 3);
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1063,6 +1078,16 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        assert_eq!(
+            get_one(
+                &store,
+                BINARY_CAS_CHUNK_PRESENCE_SPACE,
+                chunk_key(BlobHash::from_content(data)),
+            )
+            .await
+            .expect("chunk presence marker should load"),
+            Some(Vec::new())
+        );
         let mut writes = storage.new_write_set();
         let mut writer =
             BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
@@ -1071,7 +1096,11 @@ mod tests {
             .await
             .expect("repeat blob write should stage");
 
-        assert_eq!(writes.stats().staged_puts, 1);
+        assert_eq!(
+            writes.stats().staged_puts,
+            1,
+            "a persisted marker should make the repeat write stage only its manifest"
+        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1184,7 +1213,7 @@ mod tests {
         })
         .expect("duplicate chunk payload write should stage");
 
-        assert_eq!(writes.stats().staged_puts, 4);
+        assert_eq!(writes.stats().staged_puts, 5);
         writes
             .validate()
             .expect("duplicate chunk payload should be staged only once");

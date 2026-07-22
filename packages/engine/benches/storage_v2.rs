@@ -1427,6 +1427,41 @@ where
         }
     }
 
+    for (case_name, rows, value_size) in [
+        ("direct_get_many_unique_u1_v4096", 1, 4_096),
+        ("direct_get_many_unique_u100_v4096", 100, 4_096),
+        ("direct_get_many_unique_u1_v65536", 1, 65_536),
+        ("direct_get_many_unique_u100_v65536", 100, 65_536),
+    ] {
+        if should_run(case_name) {
+            let point_storage = storage_family.seed_points(SpaceId(1), rows, value_size);
+            let point_keys = physical_point_request_keys(1, rows as usize, rows as usize);
+            group.throughput(Throughput::Bytes(
+                u64::from(rows)
+                    * u64::try_from(value_size).expect("point read value size fits u64"),
+            ));
+            group.bench_function(case_name, |b| {
+                b.iter(|| {
+                    let read = block_on(point_storage.begin_read(ReadOptions::default()))
+                        .expect("begin direct unique large-value point read");
+                    let result = block_on(read.get_many(
+                        SpaceId(1),
+                        black_box(&point_keys),
+                        GetOptions::default(),
+                    ))
+                    .expect("direct unique large-value get_many");
+                    assert_eq!(result.values.len(), rows as usize);
+                    assert_eq!(
+                        result.values.iter().filter(|value| value.is_some()).count(),
+                        rows as usize
+                    );
+                    drop(read);
+                    black_box(result);
+                });
+            });
+        }
+    }
+
     if should_run("direct_get_many_unique_u1000") {
         let point_storage = storage_family.seed_points(SpaceId(1), 1_000, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 1_000);
@@ -1474,6 +1509,37 @@ where
                     ))
                     .expect("direct materialized scan");
                     assert_eq!(chunk.entries.len(), 1_000);
+                    assert!(!chunk.has_more);
+                    drop(read);
+                    black_box(chunk);
+                });
+            });
+        }
+    }
+
+    for (case_name, rows) in [
+        ("direct_scan_full_q1_v65536", 1),
+        ("direct_scan_full_q100_v65536", 100),
+    ] {
+        if should_run(case_name) {
+            let scan_storage = storage_family.seed_points(SpaceId(1), rows, 65_536);
+            let scan_range = physical_point_scan_range(1);
+            group.throughput(Throughput::Bytes(u64::from(rows) * 65_536));
+            group.bench_function(case_name, |b| {
+                b.iter(|| {
+                    let read = block_on(scan_storage.begin_read(ReadOptions::default()))
+                        .expect("begin direct full-value scan read");
+                    let chunk = block_on(materialize_storage_scan(
+                        &read,
+                        scan_range.clone(),
+                        ScanOptions {
+                            limit_rows: rows as usize + 1,
+                            projection: CoreProjection::FullValue,
+                            ..ScanOptions::default()
+                        },
+                    ))
+                    .expect("direct full-value scan");
+                    assert_eq!(chunk.entries.len(), rows as usize);
                     assert!(!chunk.has_more);
                     drop(read);
                     black_box(chunk);

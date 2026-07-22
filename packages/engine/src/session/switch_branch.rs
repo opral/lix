@@ -77,6 +77,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
             Arc::clone(&self.collaboration_write_gate),
             Arc::clone(&self.observe_coordinator),

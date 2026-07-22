@@ -11,9 +11,9 @@ use crate::domain::Domain;
 use crate::entity_pk::{EntityPk, EntityPkError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
-    is_seed_schema_key, schema_from_registered_snapshot, validate_lix_schema,
-    validate_lix_schema_definition,
+    SchemaKey, schema_from_registered_snapshot, validate_lix_schema, validate_lix_schema_definition,
 };
+use crate::sql2::PublicCatalog;
 use crate::transaction::types::{PreparedRowFacts, TransactionJson, TransactionWriteRow};
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -244,18 +244,27 @@ pub(crate) fn remember_pending_registered_schema(
         validate_lix_schema(registered_schema_definition, snapshot)?;
     }
     let (key, schema) = schema_from_registered_snapshot(snapshot)?;
-    if is_seed_schema_key(&key.schema_key) {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!(
-                "schema '{}' is a system schema and cannot be registered at runtime",
-                key.schema_key
-            ),
-        ));
-    }
+    reject_fixed_system_schema_collision(&key)?;
     validate_lix_schema_definition(&schema)?;
     schema_catalog.insert_schema_for_domain(domain, key, schema)?;
     Ok(())
+}
+
+pub(crate) fn reject_fixed_system_schema_collision(key: &SchemaKey) -> Result<(), LixError> {
+    let Some(surface_name) = PublicCatalog::fixed_system_collision_for_schema_key(&key.schema_key)
+    else {
+        return Ok(());
+    };
+    Err(LixError::new(
+        LixError::CODE_SCHEMA_DEFINITION,
+        format!(
+            "schema '{}' conflicts with fixed system schema or public SQL surface '{}' and cannot be registered at runtime",
+            key.schema_key, surface_name
+        ),
+    )
+    .with_hint(
+        "Choose a schema key whose base, `_by_branch`, and `_history` table names do not overlap a fixed Lix surface.",
+    ))
 }
 
 #[cfg(test)]
@@ -512,6 +521,61 @@ mod tests {
             dynamic.row.entity_pk.as_ref(),
             Some(&EntityPk::single("dynamic-1"))
         );
+    }
+
+    #[test]
+    fn normalization_rejects_fixed_and_generated_system_surface_schema_keys() {
+        let mut catalog = catalog_with(vec![
+            seed_schema_definition(REGISTERED_SCHEMA_KEY)
+                .expect("registered schema builtin")
+                .clone(),
+        ]);
+
+        for (schema_key, collision_kind) in [
+            ("lix_file", "fixed base surface"),
+            ("lix_key_value_history", "generated system history surface"),
+        ] {
+            let mut schema = dynamic_schema_definition();
+            schema["x-lix-key"] = json!(schema_key);
+            let registered = TransactionWriteRow {
+                entity_pk: None,
+                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                snapshot: Some(transaction_json(json!({ "value": schema }))),
+                ..base_stage_row()
+            };
+
+            let error = normalize_transaction_write_row(registered, &mut catalog, functions())
+                .expect_err(collision_kind);
+
+            assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+            assert!(error.message.contains("fixed system schema"), "{error:?}");
+            assert!(error.message.contains(schema_key), "{error:?}");
+            assert!(
+                !catalog.snapshot().contains(schema_key),
+                "rejected schema must not enter the transaction catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_allows_noncolliding_lix_prefixed_schema_key() {
+        let mut catalog = catalog_with(vec![
+            seed_schema_definition(REGISTERED_SCHEMA_KEY)
+                .expect("registered schema builtin")
+                .clone(),
+        ]);
+        let mut schema = dynamic_schema_definition();
+        schema["x-lix-key"] = json!("lix_plugin_note");
+        let registered = TransactionWriteRow {
+            entity_pk: None,
+            schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+            snapshot: Some(transaction_json(json!({ "value": schema }))),
+            ..base_stage_row()
+        };
+
+        normalize_transaction_write_row(registered, &mut catalog, functions())
+            .expect("a noncolliding lix-prefixed key remains valid");
+        assert!(catalog.snapshot().contains("lix_plugin_note"));
     }
 
     #[test]
