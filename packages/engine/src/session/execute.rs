@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::branch::BranchRefReader;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -29,12 +29,18 @@ use super::transaction::SessionTransaction;
 ///
 /// Column names live once at the result-set level. Individual rows only own
 /// values, which keeps the public API row-oriented without copying schema
-/// metadata into every row.
+/// metadata into every row. Result storage is immutable and reference counted
+/// so observation fanout does not copy large blob values per subscriber.
 #[derive(Debug, Clone)]
 pub struct ExecuteResult {
-    columns: Vec<String>,
-    rows: Vec<Row>,
+    backing: Arc<ExecuteResultBacking>,
     rows_affected: u64,
+}
+
+#[derive(Debug)]
+struct ExecuteResultBacking {
+    columns: Arc<[String]>,
+    rows: Vec<Row>,
     notices: Vec<LixNotice>,
     // Observe evaluations can be shared across sessions. Carry the exact
     // rendered plugin state with the rows so each receiving session can
@@ -44,10 +50,11 @@ pub struct ExecuteResult {
 
 impl PartialEq for ExecuteResult {
     fn eq(&self, other: &Self) -> bool {
-        self.columns == other.columns
-            && self.rows == other.rows
-            && self.rows_affected == other.rows_affected
-            && self.notices == other.notices
+        self.rows_affected == other.rows_affected
+            && (Arc::ptr_eq(&self.backing, &other.backing)
+                || (self.backing.columns == other.backing.columns
+                    && self.backing.rows == other.backing.rows
+                    && self.backing.notices == other.backing.notices))
     }
 }
 
@@ -62,14 +69,7 @@ pub struct CoherentReadBatch {
 
 impl ExecuteResult {
     fn from_sql_query_result(result: SqlQueryResult) -> Self {
-        Self {
-            columns: result.columns,
-            rows: Vec::new(),
-            rows_affected: 0,
-            notices: result.notices,
-            file_view_mutations: Vec::new(),
-        }
-        .with_rows(result.rows)
+        Self::from_query_parts(result.columns, result.rows, 0, result.notices)
     }
 
     fn from_sql_write_result(result: sql2::SqlWriteResult) -> Self {
@@ -78,86 +78,86 @@ impl ExecuteResult {
             returning,
         } = result;
         match returning {
-            Some(result) => Self {
-                columns: result.columns,
-                rows: Vec::new(),
-                rows_affected,
-                notices: result.notices,
-                file_view_mutations: Vec::new(),
+            Some(result) => {
+                Self::from_query_parts(result.columns, result.rows, rows_affected, result.notices)
             }
-            .with_rows(result.rows),
             None => Self::from_rows_affected(rows_affected),
         }
     }
 
     pub fn from_rows_affected(rows_affected: u64) -> Self {
         Self {
-            columns: Vec::new(),
-            rows: Vec::new(),
+            backing: empty_execute_result_backing(),
             rows_affected,
-            notices: Vec::new(),
-            file_view_mutations: Vec::new(),
         }
     }
 
     pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
-        Self {
-            columns,
-            rows: Vec::new(),
-            rows_affected: 0,
-            notices: Vec::new(),
-            file_view_mutations: Vec::new(),
-        }
-        .with_rows(rows)
+        Self::from_query_parts(columns, rows, 0, Vec::new())
     }
 
-    fn with_rows(mut self, rows: Vec<Vec<Value>>) -> Self {
-        let columns = Arc::<[String]>::from(self.columns.clone().into_boxed_slice());
-        self.rows = rows
+    fn from_query_parts(
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        rows_affected: u64,
+        notices: Vec<LixNotice>,
+    ) -> Self {
+        let columns: Arc<[String]> = columns.into();
+        let rows = rows
             .into_iter()
             .map(|values| Row {
                 columns: Arc::clone(&columns),
                 values,
             })
             .collect();
-        self
+        Self {
+            backing: Arc::new(ExecuteResultBacking {
+                columns,
+                rows,
+                notices,
+                file_view_mutations: Vec::new(),
+            }),
+            rows_affected,
+        }
     }
 
     fn with_file_view_mutations(mut self, mutations: Vec<sql2::SessionFileViewMutation>) -> Self {
-        self.file_view_mutations = mutations;
+        Arc::get_mut(&mut self.backing)
+            .expect("fresh execute result backing must be uniquely owned")
+            .file_view_mutations = mutations;
         self
     }
 
     pub(crate) fn file_view_mutations(&self) -> &[sql2::SessionFileViewMutation] {
-        &self.file_view_mutations
+        &self.backing.file_view_mutations
     }
 
     /// Returns the result-set column names in row value order.
     pub fn columns(&self) -> &[String] {
-        &self.columns
+        self.backing.columns.as_ref()
     }
 
     /// Returns the owned rows. Use `iter()` for name-based access.
     pub fn rows(&self) -> &[Row] {
-        &self.rows
+        &self.backing.rows
     }
 
     /// Iterates rows with borrowed access to the shared column metadata.
     pub fn iter(&self) -> impl Iterator<Item = RowRef<'_>> {
-        self.rows.iter().map(|row| RowRef {
-            columns: self.columns.as_slice(),
+        self.backing.rows.iter().map(|row| RowRef {
+            columns: self.backing.columns.as_ref(),
             values: row.values.as_slice(),
         })
     }
 
     /// Returns the number of rows in this result set.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.backing.rows.len()
     }
 
     /// Returns true when this result set has no rows.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.backing.rows.is_empty()
     }
 
     /// Returns the number of rows affected by a mutation statement.
@@ -167,7 +167,7 @@ impl ExecuteResult {
 
     /// Returns non-fatal diagnostics produced while executing the statement.
     pub fn notices(&self) -> &[LixNotice] {
-        &self.notices
+        &self.backing.notices
     }
 
     /// Looks up the value for `column_name` on an owned row from this set.
@@ -178,8 +178,23 @@ impl ExecuteResult {
 
     /// Returns the index for a column name.
     pub fn column_index(&self, column_name: &str) -> Option<usize> {
-        self.columns.iter().position(|column| column == column_name)
+        self.backing
+            .columns
+            .iter()
+            .position(|column| column == column_name)
     }
+}
+
+fn empty_execute_result_backing() -> Arc<ExecuteResultBacking> {
+    static EMPTY: OnceLock<Arc<ExecuteResultBacking>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| {
+        Arc::new(ExecuteResultBacking {
+            columns: Vec::new().into(),
+            rows: Vec::new(),
+            notices: Vec::new(),
+            file_view_mutations: Vec::new(),
+        })
+    }))
 }
 
 /// One owned row returned by a query.
@@ -1699,6 +1714,18 @@ mod tests {
             row.value("title").unwrap(),
             &Value::Text("Hello".to_string())
         );
+    }
+
+    #[test]
+    fn execute_result_clone_shares_immutable_backing() {
+        let result = ExecuteResult::from_rows(
+            vec!["data".to_string()],
+            vec![vec![Value::Blob(vec![b'x'; 1024 * 1024])]],
+        );
+        let cloned = result.clone();
+
+        assert!(Arc::ptr_eq(&result.backing, &cloned.backing));
+        assert_eq!(result, cloned);
     }
 
     #[test]
