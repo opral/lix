@@ -36,7 +36,7 @@ use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
-    FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
+    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
     FilesystemPathSelection,
 };
 use crate::functions::FunctionProviderHandle;
@@ -1743,6 +1743,18 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     let active_branch_id = ctx.active_branch_id().to_string();
     let parsed_writes = parse_fast_lix_file_path_writes(writes)?;
 
+    if matches!(
+        conflict,
+        FastLixFilePathWriteConflict::UpdateData
+            | FastLixFilePathWriteConflict::UpdateDataAndMetadata
+    ) && let Some(existing) =
+        exact_existing_file_entries(ctx, &active_branch_id, &parsed_writes).await?
+    {
+        return stage_exact_existing_file_path_writes(ctx, parsed_writes, existing, conflict)
+            .await
+            .map(Some);
+    }
+
     let live_rows = ctx
         .scan_live_state(&LiveStateScanRequest {
             filter: LiveStateFilter {
@@ -1883,6 +1895,136 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         | FastLixFilePathWriteConflict::UpdateDataAndMetadata => TransactionWriteMode::Replace,
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await.map(Some)
+}
+
+async fn exact_existing_file_entries(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    active_branch_id: &str,
+    writes: &[FastLixFilePathWrite],
+) -> Result<Option<Vec<Arc<FilesystemPathEntry>>>, LixError> {
+    let index = ctx
+        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+            active_branch_id.to_string(),
+        ]))
+        .await?;
+    let mut existing = Vec::with_capacity(writes.len());
+    for write in writes {
+        let entries = index.exact_entries(&write.parsed.path);
+        let [entry] = entries.as_slice() else {
+            return Ok(None);
+        };
+        if entry.kind != FilesystemPathKind::File {
+            return Ok(None);
+        }
+        existing.push(Arc::clone(entry));
+    }
+    Ok(Some(existing))
+}
+
+async fn stage_exact_existing_file_path_writes(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    writes: Vec<FastLixFilePathWrite>,
+    existing: Vec<Arc<FilesystemPathEntry>>,
+    conflict: FastLixFilePathWriteConflict,
+) -> Result<u64, LixError> {
+    debug_assert_eq!(writes.len(), existing.len());
+    debug_assert!(matches!(
+        conflict,
+        FastLixFilePathWriteConflict::UpdateData
+            | FastLixFilePathWriteConflict::UpdateDataAndMetadata
+    ));
+    for (write, entry) in writes.iter().zip(&existing) {
+        validate_fast_lix_file_path_conflict_pair(entry.key.is_untracked(), &write.parsed.path)?;
+    }
+    let blob_backed = load_exact_existing_blob_keys(ctx, &existing).await?;
+    let mut staged = LixFileStagedBatch::default();
+
+    for (write, entry) in writes.into_iter().zip(existing) {
+        let has_blob_ref = blob_backed.contains(&entry.key);
+        let mut context = FilesystemRowContext {
+            branch_id: entry.key.branch_id().to_string(),
+            global: entry.key.global(),
+            untracked: entry.key.is_untracked(),
+            file_id: entry.key.file_id().map(str::to_string),
+            metadata: None,
+        };
+        if context.global {
+            context.branch_id = GLOBAL_BRANCH_ID.to_string();
+        }
+        match conflict {
+            FastLixFilePathWriteConflict::UpdateData => {
+                context.file_id = Some(entry.id().to_string());
+            }
+            FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
+                context.metadata = write.metadata;
+                staged
+                    .state_rows
+                    .push(file_descriptor_row(FileDescriptorRowInput {
+                        id: entry.id().to_string(),
+                        directory_id: entry.parent_id.clone(),
+                        name: entry.name.clone(),
+                        context: context.clone(),
+                    }));
+            }
+            FastLixFilePathWriteConflict::None | FastLixFilePathWriteConflict::DoNothing => {
+                unreachable!("exact existing path route only handles conflict updates")
+            }
+        }
+        stage_lix_file_data_update_write(
+            &mut staged,
+            entry.id().to_string(),
+            Some(write.parsed.path),
+            Some(entry.name.clone()),
+            write.data,
+            context,
+            has_blob_ref,
+            None,
+        )
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        staged.add_count(1)?;
+    }
+
+    stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
+}
+
+async fn load_exact_existing_blob_keys(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    entries: &[Arc<FilesystemPathEntry>],
+) -> Result<BTreeSet<FilesystemDescriptorKey>, LixError> {
+    if entries.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let unique = entries
+        .iter()
+        .map(|entry| (entry.key.clone(), Arc::clone(entry)))
+        .collect::<BTreeMap<_, _>>();
+    let request = LiveStateExactBatchRequest {
+        rows: unique
+            .values()
+            .map(|entry| LiveStateExactRowRequest {
+                branch_id: entry.key.branch_id().to_string(),
+                schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                entity_pk: EntityPk::single(entry.id()),
+                file_id: Some(entry.id().to_string()),
+            })
+            .collect(),
+        projection: LiveStateProjection::default(),
+        untracked: Some(false),
+        include_tombstones: false,
+    };
+    let rows = ctx.load_exact_live_state_rows(&request).await?;
+    Ok(unique
+        .into_keys()
+        .zip(rows)
+        .filter_map(|(key, row)| {
+            row.filter(|row| {
+                row.branch_id == key.branch_id()
+                    && row.global == key.global()
+                    && row.untracked == key.is_untracked()
+            })
+            .map(|_| key)
+        })
+        .collect())
 }
 
 pub(crate) async fn execute_fast_lix_file_data_update_by_id(
@@ -4482,10 +4624,7 @@ pub(super) fn indexed_path_matches(
         index: &crate::filesystem::FilesystemPathIndex,
         predicate: &FilePathPredicate,
         kind: FilesystemPathKind,
-    ) -> BTreeMap<
-        (FilesystemPathKind, FilesystemDescriptorKey),
-        Arc<crate::filesystem::FilesystemPathEntry>,
-    > {
+    ) -> BTreeMap<(FilesystemPathKind, FilesystemDescriptorKey), Arc<FilesystemPathEntry>> {
         let candidates = match predicate {
             FilePathPredicate::All => index.entries(),
             FilePathPredicate::Comparison { operation, value } => match operation {
@@ -9631,6 +9770,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fast_file_path_upsert_uses_exact_index_without_scanning_blob_state() {
+        let old_data = b"old";
+        let rows = vec![
+            live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            ),
+            live_blob_ref_row(
+                "file-readme",
+                "branch-b",
+                "file-readme",
+                &BlobHash::from_content(old_data).to_hex(),
+                old_data.len(),
+            ),
+        ];
+        let mut write_context = CapturingWriteContext {
+            rows,
+            ..CapturingWriteContext::default()
+        };
+
+        let outcome = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![(
+                "/readme.md".to_string(),
+                b"new".to_vec(),
+                Some(TransactionJson::from_value_for_test(
+                    serde_json::json!({"source": "upload"}),
+                )),
+            )],
+            super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+        )
+        .await
+        .expect("existing path upsert should stage");
+
+        assert!(outcome.is_some());
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
+        assert_eq!(write_context.scan_count, 0);
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("path upsert should stage descriptor, blob, and file data");
+        };
+        assert_eq!(file_data.len(), 1);
+        assert_eq!(file_data[0].path.as_deref(), Some("/readme.md"));
+        assert_eq!(file_data[0].data(), b"new");
+        assert!(file_data[0].had_blob_ref);
+        let descriptor = rows
+            .iter()
+            .find(|row| row.schema_key == super::FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("metadata upsert should rewrite the descriptor");
+        assert_eq!(
+            descriptor.metadata.as_ref(),
+            Some(&TransactionJson::from_value_for_test(
+                serde_json::json!({"source": "upload"})
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_file_path_upsert_does_not_cross_blob_ref_scope_lanes() {
+        let local_descriptor = live_file_row(
+            "file-local",
+            "branch-b",
+            r#"{"id":"file-local","directory_id":null,"name":"local.md"}"#,
+        );
+        let mut global_fallback = live_blob_ref_row(
+            "file-local",
+            crate::GLOBAL_BRANCH_ID,
+            "file-local",
+            &BlobHash::from_content(b"global").to_hex(),
+            6,
+        );
+        global_fallback.global = true;
+
+        let mut global_descriptor = live_file_row(
+            "file-global",
+            "branch-b",
+            r#"{"id":"file-global","directory_id":null,"name":"global.md"}"#,
+        );
+        global_descriptor.global = true;
+        let branch_override = live_blob_ref_row(
+            "file-global",
+            "branch-b",
+            "file-global",
+            &BlobHash::from_content(b"branch").to_hex(),
+            6,
+        );
+        let mut write_context = CapturingWriteContext {
+            rows: vec![
+                local_descriptor,
+                global_fallback,
+                global_descriptor,
+                branch_override,
+            ],
+            ..CapturingWriteContext::default()
+        };
+
+        let outcome = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![
+                ("/local.md".to_string(), b"new-local".to_vec(), None),
+                ("/global.md".to_string(), b"new-global".to_vec(), None),
+            ],
+            super::FastLixFilePathWriteConflict::UpdateData,
+        )
+        .await
+        .expect("scope-isolated path upsert should stage");
+
+        assert!(outcome.is_some());
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 2);
+        assert_eq!(write_context.scan_count, 0);
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("scope-isolated path upsert should stage file data");
+        };
+        assert_eq!(file_data.len(), 2);
+        assert!(file_data.iter().all(|write| !write.had_blob_ref));
+        assert!(rows.iter().all(|row| row.snapshot.is_some()));
+    }
+
+    #[tokio::test]
+    async fn fast_empty_file_path_upsert_loads_exact_prior_blob() {
+        let old_data = b"old";
+        let rows = vec![
+            live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            ),
+            live_blob_ref_row(
+                "file-readme",
+                "branch-b",
+                "file-readme",
+                &BlobHash::from_content(old_data).to_hex(),
+                old_data.len(),
+            ),
+        ];
+        let mut write_context = CapturingWriteContext {
+            rows,
+            ..CapturingWriteContext::default()
+        };
+
+        let outcome = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![("/readme.md".to_string(), Vec::new(), None)],
+            super::FastLixFilePathWriteConflict::UpdateData,
+        )
+        .await
+        .expect("empty existing path upsert should stage");
+
+        assert!(outcome.is_some());
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
+        assert_eq!(write_context.scan_count, 0);
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("empty path upsert should stage a blob tombstone and file data");
+        };
+        assert!(file_data[0].data().is_empty());
+        assert!(file_data[0].had_blob_ref);
+        assert!(
+            rows.iter().any(|row| {
+                row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn fast_file_path_write_declines_ambiguous_cross_scope_paths() {
         let tracked = live_file_row(
             "file-tracked",
@@ -9657,6 +9975,7 @@ mod tests {
         .expect("ambiguous legacy topology should decline the fast path");
 
         assert_eq!(outcome, None);
+        assert_eq!(write_context.path_index_count, 1);
         assert_eq!(write_context.scan_count, 1);
         assert!(write_context.writes.is_empty());
     }
