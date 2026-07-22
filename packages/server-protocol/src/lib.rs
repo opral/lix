@@ -1672,6 +1672,7 @@ struct MultiplexObserveEventResponse {
 }
 
 const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
+const BLOB_DELTA_COMPARE_CHUNK_BYTES: usize = 64;
 // Compared with only the full blob's Base64 length, this deliberately
 // overestimates every delta-only JSON/SSE field. The shared event envelope is
 // omitted from both sides, so passing the 90% test guarantees >10% savings.
@@ -1733,22 +1734,12 @@ fn single_blob_splice(
     }
     let base_bytes = base.bytes();
     let next_bytes = next.bytes();
-    let prefix_bytes = base_bytes
-        .iter()
-        .zip(next_bytes)
-        .take_while(|(left, right)| left == right)
-        .count();
+    let prefix_bytes = common_blob_prefix_len(base_bytes, next_bytes);
     let max_suffix = base_bytes
         .len()
         .saturating_sub(prefix_bytes)
         .min(next_bytes.len().saturating_sub(prefix_bytes));
-    let suffix_bytes = base_bytes
-        .iter()
-        .rev()
-        .zip(next_bytes.iter().rev())
-        .take(max_suffix)
-        .take_while(|(left, right)| left == right)
-        .count();
+    let suffix_bytes = common_blob_suffix_len(base_bytes, next_bytes, max_suffix);
     let insert_end = next_bytes.len().saturating_sub(suffix_bytes);
     let insert = &next_bytes[prefix_bytes..insert_end];
     let Some(full_base64_bytes) = padded_base64_len(next_bytes.len()) else {
@@ -1787,6 +1778,54 @@ fn single_blob_splice(
         })?,
         insert_base64,
     }))
+}
+
+#[inline]
+fn common_blob_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    if left.first() != right.first() {
+        return 0;
+    }
+    let limit = left.len().min(right.len());
+    let mut matched = 0;
+    while limit - matched >= BLOB_DELTA_COMPARE_CHUNK_BYTES {
+        let end = matched + BLOB_DELTA_COMPARE_CHUNK_BYTES;
+        if left[matched..end] != right[matched..end] {
+            break;
+        }
+        matched = end;
+    }
+    while matched < limit && left[matched] == right[matched] {
+        matched += 1;
+    }
+    matched
+}
+
+#[inline]
+fn common_blob_suffix_len(left: &[u8], right: &[u8], limit: usize) -> usize {
+    debug_assert!(limit <= left.len().min(right.len()));
+    if limit == 0 || left.last() != right.last() {
+        return 0;
+    }
+    let mut matched = 0;
+    while limit - matched >= BLOB_DELTA_COMPARE_CHUNK_BYTES {
+        let left_start = left.len() - matched - BLOB_DELTA_COMPARE_CHUNK_BYTES;
+        let right_start = right.len() - matched - BLOB_DELTA_COMPARE_CHUNK_BYTES;
+        if left[left_start..left_start + BLOB_DELTA_COMPARE_CHUNK_BYTES]
+            != right[right_start..right_start + BLOB_DELTA_COMPARE_CHUNK_BYTES]
+        {
+            break;
+        }
+        matched += BLOB_DELTA_COMPARE_CHUNK_BYTES;
+    }
+    while matched < limit {
+        let left_index = left.len() - matched - 1;
+        let right_index = right.len() - matched - 1;
+        if left[left_index] != right[right_index] {
+            break;
+        }
+        matched += 1;
+    }
+    matched
 }
 
 fn padded_base64_len(bytes: usize) -> Option<usize> {
@@ -2787,6 +2826,57 @@ mod tests {
         next.extend_from_slice(&insert);
         next.extend_from_slice(&base[base.len() - suffix..]);
         next
+    }
+
+    #[test]
+    fn chunked_blob_edge_detection_matches_scalar_reference() {
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 4_096] {
+            let left = vec![b'a'; len];
+            let mut variants = vec![left.clone()];
+            if len > 0 {
+                for index in [0, len / 2, len - 1] {
+                    let mut changed = left.clone();
+                    changed[index] = b'b';
+                    variants.push(changed);
+                }
+            }
+            let mut longer = left.clone();
+            longer.push(b'b');
+            variants.push(longer);
+
+            for right in variants {
+                let expected_prefix = left
+                    .iter()
+                    .zip(&right)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                let suffix_limit = left
+                    .len()
+                    .saturating_sub(expected_prefix)
+                    .min(right.len().saturating_sub(expected_prefix));
+                let expected_suffix = left
+                    .iter()
+                    .rev()
+                    .zip(right.iter().rev())
+                    .take(suffix_limit)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                assert_eq!(
+                    common_blob_prefix_len(&left, &right),
+                    expected_prefix,
+                    "prefix mismatch for lengths {} and {}",
+                    left.len(),
+                    right.len()
+                );
+                assert_eq!(
+                    common_blob_suffix_len(&left, &right, suffix_limit),
+                    expected_suffix,
+                    "suffix mismatch for lengths {} and {}",
+                    left.len(),
+                    right.len()
+                );
+            }
+        }
     }
 
     #[test]
