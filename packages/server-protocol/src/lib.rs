@@ -390,6 +390,23 @@ where
             .with_state(state)
     }
 
+    /// Returns whether this server can be dropped without invalidating a live
+    /// remote session.
+    ///
+    /// Expired, unleased sessions are idle. Concurrent registry work is
+    /// conservatively treated as active so an eviction decision cannot race a
+    /// handshake, request lease, session release, or shutdown.
+    pub fn is_idle(&self) -> bool {
+        let Ok(registry) = self.inner.registry.try_lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        registry
+            .sessions
+            .values()
+            .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
+    }
+
     /// Closes every child session and finally the root workspace session.
     /// Repeated calls are safe.
     pub async fn close(&self) -> Result<(), LixError> {
@@ -1645,6 +1662,38 @@ mod tests {
         let expired = request(&app.router, "GET", "/lix/v1", Some(&session_id), None).await;
         assert_eq!(expired.status(), StatusCode::GONE);
         assert_eq!(error_code(expired).await, "LIX_ERROR_PROTOCOL_SESSION_GONE");
+    }
+
+    #[tokio::test]
+    async fn server_idleness_tracks_live_expired_and_mutating_sessions() {
+        let app = app().await;
+        assert!(app.server.is_idle());
+
+        let (session_id, _) = new_session(&app.router).await;
+        assert!(!app.server.is_idle());
+
+        let registry = app.server.inner.registry.lock().await;
+        assert!(!app.server.is_idle());
+        drop(registry);
+
+        let deleted = request(
+            &app.router,
+            "DELETE",
+            "/lix/v1/session",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert!(app.server.is_idle());
+
+        let expired = app_with_options(ProtocolServerOptions {
+            session_idle_timeout: Duration::ZERO,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (_session_id, _) = new_session(&expired.router).await;
+        assert!(expired.server.is_idle());
     }
 
     #[tokio::test]
