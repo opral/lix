@@ -677,7 +677,7 @@ where
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
                 };
-                let read_session = sql2::prepare_read_session(&ctx).await?;
+                let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, (statement, parsed)) in
                     statements.iter().zip(parsed).enumerate()
@@ -834,7 +834,7 @@ where
                     file_views: file_view_collector.clone(),
                 };
                 let read_session =
-                    sql2::prepare_read_session_at_head(&ctx, active_branch_head).await?;
+                    sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed).await?;
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, ((sql, params), statement)) in
                     statements.iter().zip(parsed).enumerate()
@@ -1790,5 +1790,93 @@ mod tests {
             row.get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("value")
         );
+    }
+
+    #[tokio::test]
+    async fn coherent_read_batch_registers_union_of_referenced_providers() {
+        let session = open_session().await;
+        let statements: [(&str, &[Value]); 3] = [
+            ("SELECT 1 AS one", &[]),
+            ("SELECT COUNT(*) AS files FROM lix_file", &[]),
+            ("SELECT COUNT(*) AS states FROM lix_state", &[]),
+        ];
+
+        let batch = session
+            .execute_coherent_read_batch(&statements)
+            .await
+            .expect("coherent batch should register every referenced provider");
+
+        assert_eq!(batch.results.len(), 3);
+        assert_eq!(batch.results[0].rows()[0].get::<i64>("one").unwrap(), 1);
+        assert_eq!(batch.results[1].rows()[0].get::<i64>("files").unwrap(), 0);
+        assert!(batch.results[2].rows()[0].get::<i64>("states").unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn referenced_provider_reads_preserve_complex_and_catalog_wide_queries() {
+        let session = open_session().await;
+        let complex = session
+            .execute(
+                "WITH files AS (SELECT id FROM lix_file) \
+                 SELECT COUNT(*) AS row_count \
+                 FROM files AS file_a \
+                 JOIN files AS file_b ON file_a.id = file_b.id \
+                 LEFT JOIN (\
+                     SELECT entity_pk FROM lix_state \
+                     UNION ALL \
+                     SELECT entity_pk FROM lix_state\
+                 ) AS states ON false",
+                &[],
+            )
+            .await
+            .expect("nested CTE, self-join, and UNION should resolve providers");
+        assert_eq!(complex.rows()[0].get::<i64>("row_count").unwrap(), 0);
+
+        let catalog = session
+            .execute(
+                "SELECT COUNT(*) AS surfaces \
+                 FROM information_schema.tables \
+                 WHERE table_schema = 'public'",
+                &[],
+            )
+            .await
+            .expect("information_schema should retain catalog-wide visibility");
+        assert!(catalog.rows()[0].get::<i64>("surfaces").unwrap() > 1);
+    }
+
+    #[tokio::test]
+    async fn transaction_referenced_provider_reads_see_staged_writes() {
+        let session = open_session().await;
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('selected-provider-file', '/selected.txt')",
+                &[],
+            )
+            .await
+            .expect("file should stage");
+
+        let result = transaction
+            .execute(
+                "WITH selected AS (\
+                     SELECT id FROM lix_file WHERE id = 'selected-provider-file'\
+                 ) \
+                 SELECT id FROM selected",
+                &[],
+            )
+            .await
+            .expect("selected overlay provider should expose staged writes");
+        assert_eq!(
+            result.rows()[0].get::<String>("id").unwrap(),
+            "selected-provider-file"
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
     }
 }

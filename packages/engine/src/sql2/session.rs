@@ -1,4 +1,5 @@
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::sql::parser::Statement as DataFusionStatement;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -10,26 +11,31 @@ use super::providers;
 use super::udfs::register_sql2_functions;
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
-pub(crate) async fn build_read_session<C>(ctx: &C) -> Result<SessionContext, LixError>
+pub(crate) async fn build_read_session<C>(
+    ctx: &C,
+    statements: &[DataFusionStatement],
+) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    build_read_session_with_active_head(ctx, None).await
+    build_read_session_with_active_head(ctx, None, statements).await
 }
 
 pub(crate) async fn build_read_session_at_head<C>(
     ctx: &C,
     active_head: BranchHead,
+    statements: &[DataFusionStatement],
 ) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    build_read_session_with_active_head(ctx, Some(active_head)).await
+    build_read_session_with_active_head(ctx, Some(active_head), statements).await
 }
 
 async fn build_read_session_with_active_head<C>(
     ctx: &C,
     active_head: Option<BranchHead>,
+    statements: &[DataFusionStatement],
 ) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
@@ -58,7 +64,8 @@ where
             .map(|head| head.commit_id.to_string()),
     };
     register_sql2_functions(&session, ctx.functions(), active_branch_commit_id);
-    providers::register_read(&session, ctx, branch_ref).await?;
+    let provider_selection = providers::read_provider_selection(&session, statements);
+    providers::register_read(&session, ctx, branch_ref, &provider_selection).await?;
 
     Ok(session)
 }
@@ -66,6 +73,7 @@ where
 pub(crate) async fn build_transaction_read_session<C>(
     read_ctx: &C,
     write_ctx: &mut dyn SqlWriteExecutionContext,
+    statement: &DataFusionStatement,
 ) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
@@ -82,6 +90,8 @@ where
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
     ));
+    let provider_selection =
+        providers::read_provider_selection(&session, std::slice::from_ref(statement));
     providers::register_transaction(
         &session,
         read_ctx,
@@ -89,6 +99,7 @@ where
         write_ctx,
         write_branch_ref,
         SqlWriteSessionOptions::default(),
+        &provider_selection,
     )
     .await?;
     Ok(session)

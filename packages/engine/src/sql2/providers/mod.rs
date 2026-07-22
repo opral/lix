@@ -1,5 +1,6 @@
 #![allow(clippy::cloned_ref_to_slice_refs, clippy::match_same_arms)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
@@ -111,12 +112,102 @@ pub(crate) async fn register_read<C>(
     session: &SessionContext,
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
+    selection: &ReadProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
     let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
-    register_read_from_catalog(session, ctx, branch_ref, &catalog, ReadProviderScope::All).await
+    register_read_from_catalog(
+        session,
+        ctx,
+        branch_ref,
+        &catalog,
+        ReadProviderScope::All,
+        selection,
+    )
+    .await
+}
+
+/// Snapshot-local providers needed to plan a set of already-parsed reads.
+///
+/// DataFusion's resolver is deliberately used here instead of maintaining a
+/// second SQL AST walker. It is the same resolver called by
+/// `SessionState::statement_to_plan`, including its CTE scoping and identifier
+/// normalization rules. The selection retains names only; providers and plans
+/// remain scoped to the current storage snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadProviderSelection {
+    /// Register every surface when catalog-wide visibility is part of the SQL
+    /// semantics (notably `information_schema` and rewritten `SHOW` queries),
+    /// or when reference resolution cannot prove a narrower set is sufficient.
+    All,
+    /// Register the union of concrete table names referenced by the statements.
+    Only(BTreeSet<String>),
+}
+
+impl ReadProviderSelection {
+    fn includes(&self, surface: &PublicSurfaceContract) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(names) => names.contains(&surface.name),
+        }
+    }
+}
+
+pub(crate) fn read_provider_selection(
+    session: &SessionContext,
+    statements: &[datafusion::sql::parser::Statement],
+) -> ReadProviderSelection {
+    let mut names = BTreeSet::new();
+    let state = session.state();
+    for statement in statements {
+        if statement_requires_all_providers(statement) {
+            return ReadProviderSelection::All;
+        }
+        let Ok(references) = state.resolve_table_references(statement) else {
+            return ReadProviderSelection::All;
+        };
+        for reference in references {
+            if reference.schema() == Some("information_schema") {
+                return ReadProviderSelection::All;
+            }
+            names.insert(reference.table().to_string());
+        }
+    }
+    ReadProviderSelection::Only(names)
+}
+
+fn statement_requires_all_providers(statement: &datafusion::sql::parser::Statement) -> bool {
+    use datafusion::sql::parser::Statement as DataFusionStatement;
+    use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
+
+    fn sql_statement_requires_all_providers(statement: &SqlStatement) -> bool {
+        match statement {
+            SqlStatement::ShowFunctions { .. }
+            | SqlStatement::ShowVariable { .. }
+            | SqlStatement::ShowStatus { .. }
+            | SqlStatement::ShowVariables { .. }
+            | SqlStatement::ShowCreate { .. }
+            | SqlStatement::ShowColumns { .. }
+            | SqlStatement::ShowTables { .. }
+            | SqlStatement::ShowCollation { .. } => true,
+            SqlStatement::Explain { statement, .. } => {
+                sql_statement_requires_all_providers(statement)
+            }
+            _ => false,
+        }
+    }
+
+    match statement {
+        DataFusionStatement::Statement(statement) => {
+            sql_statement_requires_all_providers(statement)
+        }
+        DataFusionStatement::Explain(explain) => {
+            statement_requires_all_providers(explain.statement.as_ref())
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,14 +232,33 @@ async fn register_read_from_catalog<C>(
     branch_ref: Arc<dyn BranchRefReader>,
     catalog: &PublicCatalog,
     scope: ReadProviderScope,
+    selection: &ReadProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let history_query_source = ctx.history_query_source();
-    let changelog_query_source = ctx.changelog_query_source();
+    let needs_history_query_source = catalog.surfaces().any(|surface| {
+        scope.includes(surface)
+            && selection.includes(surface)
+            && matches!(
+                &surface.kind,
+                PublicSurfaceKind::History
+                    | PublicSurfaceKind::FileHistory
+                    | PublicSurfaceKind::DirectoryHistory
+                    | PublicSurfaceKind::EntityHistory { .. }
+            )
+    });
+    let history_query_source = needs_history_query_source.then(|| ctx.history_query_source());
+    let history_query_source_for_provider = || {
+        history_query_source.clone().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected history provider is missing its query source",
+            )
+        })
+    };
     for surface in catalog.surfaces() {
-        if !scope.includes(surface) {
+        if !scope.includes(surface) || !selection.includes(surface) {
             continue;
         }
         match &surface.kind {
@@ -184,7 +294,7 @@ where
                 change::register_lix_change_read_provider(
                     session,
                     &surface.name,
-                    changelog_query_source.clone(),
+                    ctx.changelog_query_source(),
                 )
                 .await?;
             }
@@ -193,7 +303,7 @@ where
                     session,
                     &surface.name,
                     ctx.commit_graph(),
-                    history_query_source.clone(),
+                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -231,7 +341,7 @@ where
                     session,
                     &surface.name,
                     ctx.commit_graph(),
-                    history_query_source.clone(),
+                    history_query_source_for_provider()?,
                     ctx.blob_reader(),
                     ctx.plugin_host(),
                 )
@@ -265,7 +375,7 @@ where
                     session,
                     &surface.name,
                     ctx.commit_graph(),
-                    history_query_source.clone(),
+                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -274,15 +384,25 @@ where
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
+    let needs_entity_history = catalog.surfaces().any(|surface| {
+        scope.includes(surface)
+            && selection.includes(surface)
+            && matches!(&surface.kind, PublicSurfaceKind::EntityHistory { .. })
+    });
     entity::register_entity_providers(
         session,
         ctx.active_branch_id(),
         ctx.live_state(),
         Arc::clone(&branch_ref),
-        Arc::new(tokio::sync::Mutex::new(ctx.commit_graph())),
-        history_query_source,
+        needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
+        if needs_entity_history {
+            Some(history_query_source_for_provider()?)
+        } else {
+            None
+        },
         catalog,
         scope == ReadProviderScope::All,
+        selection,
     )
     .await?;
 
@@ -296,7 +416,15 @@ pub(crate) async fn register_write(
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
     let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
-    register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog).await
+    register_write_from_catalog(
+        session,
+        write_ctx,
+        branch_ref,
+        options,
+        &catalog,
+        &ReadProviderSelection::All,
+    )
+    .await
 }
 
 pub(crate) async fn register_transaction<C>(
@@ -306,6 +434,7 @@ pub(crate) async fn register_transaction<C>(
     write_ctx: SqlWriteContext,
     write_branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
+    selection: &ReadProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
@@ -320,9 +449,18 @@ where
         read_branch_ref,
         &catalog,
         ReadProviderScope::ReadOnly,
+        selection,
     )
     .await?;
-    register_write_from_catalog(session, write_ctx, write_branch_ref, options, &catalog).await
+    register_write_from_catalog(
+        session,
+        write_ctx,
+        write_branch_ref,
+        options,
+        &catalog,
+        selection,
+    )
+    .await
 }
 
 async fn register_write_from_catalog(
@@ -331,8 +469,12 @@ async fn register_write_from_catalog(
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     catalog: &PublicCatalog,
+    selection: &ReadProviderSelection,
 ) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
+        if !selection.includes(surface) {
+            continue;
+        }
         match &surface.kind {
             PublicSurfaceKind::LixState => {
                 lix_state::register_lix_state_active_write_provider(
@@ -408,12 +550,14 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
-    entity::register_entity_write_providers(session, write_ctx, branch_ref, catalog).await?;
+    entity::register_entity_write_providers(session, write_ctx, branch_ref, catalog, selection)
+        .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -440,9 +584,116 @@ mod tests {
     };
 
     use super::{
-        ReadProviderScope, branch, change, directory, directory_history, entity, file,
-        file_history, history, is_write_surface, lix_state,
+        ReadProviderScope, ReadProviderSelection, branch, change, directory, directory_history,
+        entity, file, file_history, history, is_write_surface, lix_state, read_provider_selection,
     };
+
+    fn selection_for_sql(sql: &[&str]) -> ReadProviderSelection {
+        let statements = sql
+            .iter()
+            .map(|sql| crate::sql2::parse_statement(sql).expect("SQL should parse"))
+            .collect::<Vec<_>>();
+        read_provider_selection(&SessionContext::new(), &statements)
+    }
+
+    fn selected_names(names: &[&str]) -> ReadProviderSelection {
+        ReadProviderSelection::Only(names.iter().map(|name| (*name).to_string()).collect())
+    }
+
+    #[test]
+    fn referenced_provider_selection_uses_datafusion_cte_and_set_operation_resolution() {
+        let selection = selection_for_sql(&["WITH shadowed AS (\
+                 SELECT entity_pk FROM lix_state \
+                 WHERE EXISTS (SELECT 1 FROM lix_file)\
+             ) \
+             SELECT left_side.entity_pk \
+             FROM shadowed AS left_side \
+             JOIN (\
+                 SELECT entity_pk FROM lix_change \
+                 UNION ALL \
+                 SELECT entity_pk FROM lix_change\
+             ) AS right_side \
+               ON left_side.entity_pk = right_side.entity_pk \
+             JOIN public.\"lix_directory\" AS directory_a ON true \
+             JOIN public.\"lix_directory\" AS directory_b ON true"]);
+
+        assert_eq!(
+            selection,
+            selected_names(&["lix_change", "lix_directory", "lix_file", "lix_state"])
+        );
+    }
+
+    #[test]
+    fn referenced_provider_selection_excludes_shadowed_and_recursive_cte_names() {
+        assert_eq!(
+            selection_for_sql(&["WITH lix_file AS (SELECT entity_pk FROM lix_state) \
+                 SELECT * FROM lix_file",]),
+            selected_names(&["lix_state"])
+        );
+        assert_eq!(
+            selection_for_sql(&["WITH RECURSIVE walk(id) AS (\
+                     SELECT id FROM lix_branch \
+                     UNION ALL \
+                     SELECT branch.id FROM lix_branch AS branch \
+                     JOIN walk ON branch.id = walk.id\
+                 ) \
+                 SELECT * FROM walk",]),
+            selected_names(&["lix_branch"])
+        );
+    }
+
+    #[test]
+    fn referenced_provider_selection_unions_batches_and_preserves_unknown_names() {
+        assert_eq!(
+            selection_for_sql(&[
+                "SELECT * FROM lix_file",
+                "SELECT * FROM public.lix_state JOIN \"UnknownTable\" ON true",
+            ]),
+            selected_names(&["UnknownTable", "lix_file", "lix_state"])
+        );
+    }
+
+    #[test]
+    fn referenced_provider_selection_registers_none_for_table_free_queries() {
+        assert_eq!(
+            selection_for_sql(&["SELECT 1, lix_uuid_v7()"]),
+            ReadProviderSelection::Only(BTreeSet::new())
+        );
+    }
+
+    #[test]
+    fn referenced_provider_selection_keeps_catalog_wide_information_schema_semantics() {
+        assert_eq!(
+            selection_for_sql(&["SELECT * FROM information_schema.tables"]),
+            ReadProviderSelection::All
+        );
+        assert_eq!(
+            selection_for_sql(&["SHOW TABLES"]),
+            ReadProviderSelection::All
+        );
+    }
+
+    #[test]
+    fn referenced_provider_selection_filters_transaction_capabilities_symmetrically() {
+        let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
+        let selection = selected_names(&["lix_file", "lix_state_history"]);
+
+        let committed_read_names = catalog
+            .surfaces()
+            .filter(|surface| {
+                ReadProviderScope::ReadOnly.includes(surface) && selection.includes(surface)
+            })
+            .map(|surface| surface.name.as_str())
+            .collect::<Vec<_>>();
+        let overlay_write_names = catalog
+            .surfaces()
+            .filter(|surface| is_write_surface(surface) && selection.includes(surface))
+            .map(|surface| surface.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(committed_read_names, vec!["lix_state_history"]);
+        assert_eq!(overlay_write_names, vec!["lix_file"]);
+    }
 
     #[test]
     fn transaction_registration_partitions_provider_construction_once() {
@@ -604,10 +855,13 @@ mod tests {
             "branch-a",
             Arc::new(EmptyLiveStateReader),
             Arc::new(EmptyBranchRefReader),
-            Arc::new(tokio::sync::Mutex::new(Box::new(EmptyCommitGraphReader))),
-            empty_history_query_source().await,
+            Some(Arc::new(tokio::sync::Mutex::new(Box::new(
+                EmptyCommitGraphReader,
+            )))),
+            Some(empty_history_query_source().await),
             &catalog,
             true,
+            &ReadProviderSelection::All,
         )
         .await
         .expect("entity providers should register");
