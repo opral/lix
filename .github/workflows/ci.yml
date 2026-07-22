@@ -29,8 +29,8 @@ jobs:
       - name: Validate change fragments
         run: node scripts/validate-changes.mjs
 
-  cargo-test:
-    name: Cargo Test
+  test:
+    name: Cargo + JS SDK Test
     runs-on: blacksmith-32vcpu-ubuntu-2404
 
     steps:
@@ -39,7 +39,7 @@ jobs:
 
       - name: set envs
         run: |
-          grep -v "^#" << "EOF" >> $GITHUB_ENV
+          grep -v "^#" << "EOF" >> "$GITHUB_ENV"
           CARGO_TERM_COLOR=always
           CARGO_INCREMENTAL=0
           # keep aligned with config.toml
@@ -49,7 +49,7 @@ jobs:
           CARGO_PROFILE_BENCH_DEBUG=0
           CARGO_NET_RETRY=10
           RUSTUP_MAX_RETRIES=10
-          NODE_ENV=production
+          LIX_NATIVE_PROFILE=test
           GIT_AUTHOR_NAME=github-actions[bot]
           GIT_COMMITTER_NAME=github-actions[bot]
           GIT_AUTHOR_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
@@ -66,31 +66,7 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ github.job }}
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace --all-features
-
-  js-sdk-test:
-    name: JS SDK Binding Test
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install LLVM build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang
-
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ github.job }}
+          shared-key: ci
 
       - name: Install WebAssembly build target
         run: rustup target add wasm32-unknown-unknown
@@ -109,20 +85,36 @@ jobs:
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
-        run: npm install
-
-      - name: Run JS SDK binding tests
-        working-directory: packages/js-sdk
-        run: npm test
+        run: npm ci
 
       - name: Install Chromium
         working-directory: packages/js-sdk
         run: npx playwright install --with-deps chromium
 
-      - name: Run JS SDK browser tests
-        working-directory: packages/js-sdk
-        run: npm run test:browser:built
+      - name: Lint Rust workspace
+        run: cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
 
-      - name: Run packed Vite production smoke
+      - name: Compile Rust workspace tests
+        run: cargo test --profile test --workspace --all-features --no-run
+
+      - name: Build JS SDK bindings
         working-directory: packages/js-sdk
-        run: node ./scripts/test-packed-vite.js
+        run: npm run build
+
+      - name: Run Rust and JS SDK tests in parallel
+        run: |
+          cargo test --profile test --workspace --all-features &
+          cargo_test_pid=$!
+
+          (
+            cd packages/js-sdk
+            npm exec -- vitest run
+            npm run test:browser:built
+            node ./scripts/test-packed-vite.js
+          ) &
+          js_sdk_test_pid=$!
+
+          failed=0
+          wait "$cargo_test_pid" || failed=1
+          wait "$js_sdk_test_pid" || failed=1
+          exit "$failed"
