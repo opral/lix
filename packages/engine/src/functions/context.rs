@@ -21,6 +21,17 @@ pub(crate) struct FunctionContext {
 }
 
 impl FunctionContext {
+    /// Creates the runtime bookkeeping context for a read that cannot invoke
+    /// SQL functions. Such a read never advances deterministic state, so it
+    /// does not need to load the persisted deterministic-mode rows first.
+    pub(crate) fn system_for_function_free_read() -> Self {
+        let mut bookkeeping_functions = SystemFunctionProvider;
+        Self {
+            functions: FunctionProviderHandle::system(),
+            bookkeeping_timestamp: bookkeeping_functions.timestamp(),
+        }
+    }
+
     /// Prepares the runtime function provider for one execution.
     ///
     /// If deterministic mode is absent or disabled, the context uses system
@@ -29,11 +40,7 @@ impl FunctionContext {
     pub(crate) async fn prepare(live_state: &dyn LiveStateReader) -> Result<Self, LixError> {
         let mode = state::load_mode(live_state).await?;
         if !mode.enabled {
-            let mut bookkeeping_functions = SystemFunctionProvider;
-            return Ok(Self {
-                functions: FunctionProviderHandle::system(),
-                bookkeeping_timestamp: bookkeeping_functions.timestamp(),
-            });
+            return Ok(Self::system_for_function_free_read());
         }
 
         let sequence = state::load_sequence(live_state).await?;

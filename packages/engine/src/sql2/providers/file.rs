@@ -66,7 +66,9 @@ use crate::sql2::write_normalization::{
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::WasmComponentInstance;
-use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
+use crate::{
+    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, parse_row_metadata_value, serialize_row_metadata,
+};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -216,6 +218,27 @@ struct LixFileDmlSourceState {
     plugin_render: Option<PluginRenderContext>,
     path_resolver_rows: Option<Vec<MaterializedLiveStateRow>>,
     path_index: Option<FilesystemPathSelection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactLixFileReadColumn {
+    Data,
+    ChangeId,
+}
+
+impl ExactLixFileReadColumn {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::ChangeId => "lixcol_change_id",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExactLixFileReadSelector {
+    Id(String),
+    Path(String),
 }
 
 type SharedLixFileDmlSourceState = Arc<Mutex<Option<LixFileDmlSourceState>>>;
@@ -469,6 +492,87 @@ impl LixFileSpec {
             },
         )
     }
+}
+
+/// Executes the narrow active-branch point-read shape without constructing a
+/// DataFusion catalog and plan. Row selection, branch visibility, blob
+/// loading, plugin rendering, and session acknowledgement all stay on the
+/// regular `lix_file` provider helpers below.
+pub(crate) async fn execute_exact_lix_file_read(
+    active_branch_id: &str,
+    live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    session_file_views: Option<SessionFileViews>,
+    selector: &ExactLixFileReadSelector,
+    column: ExactLixFileReadColumn,
+) -> Result<SqlQueryResult, LixError> {
+    let base_schema = lix_file_schema();
+    let column_index = base_schema.index_of(column.name()).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("exact lix_file projection is missing: {error}"),
+        )
+    })?;
+    let schema = Arc::new(Schema::new(vec![
+        base_schema.field(column_index).as_ref().clone(),
+    ]));
+    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
+
+    let index = filesystem_path_index
+        .path_index(&FilesystemPathIndexRequest::new(
+            request.filter.branch_ids.clone(),
+        ))
+        .await?;
+    let matches = match selector {
+        ExactLixFileReadSelector::Id(file_id) => indexed_file_id_matches(
+            index,
+            &BTreeSet::from([file_id.clone()]),
+            &FilePathPredicate::All,
+        ),
+        ExactLixFileReadSelector::Path(path) => indexed_file_matches(
+            index,
+            &FilePathPredicate::Comparison {
+                operation: FilePathComparison::Equal,
+                value: path.clone(),
+            },
+        ),
+    };
+    let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let load_data = column == ExactLixFileReadColumn::Data;
+    let plugin_render = if prepared.needs_plugin_render(load_data) {
+        plugin_render_context_for_lix_file_scan(live_state, &request, plugin_host, &prepared, false)
+            .await?
+            .map(|context| context.with_session_file_views(session_file_views))
+    } else {
+        None
+    };
+    let batch = lix_file_record_batch_from_prepared(
+        &schema,
+        &blob_reader,
+        plugin_render,
+        load_data,
+        prepared,
+    )
+    .await?;
+    crate::sql2::exec::datafusion::query_result_from_batches(
+        &schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+        &[batch],
+    )
 }
 
 fn lix_file_dml_source_state(
@@ -1747,12 +1851,18 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         conflict,
         FastLixFilePathWriteConflict::UpdateData
             | FastLixFilePathWriteConflict::UpdateDataAndMetadata
-    ) && let Some(existing) =
-        exact_existing_file_entries(ctx, &active_branch_id, &parsed_writes).await?
+    ) && let Some(indexed) =
+        indexed_file_path_writes(ctx, &active_branch_id, &parsed_writes).await?
     {
-        return stage_exact_existing_file_path_writes(ctx, parsed_writes, existing, conflict)
-            .await
-            .map(Some);
+        return stage_indexed_file_path_writes(
+            ctx,
+            &active_branch_id,
+            parsed_writes,
+            indexed,
+            conflict,
+        )
+        .await
+        .map(Some);
     }
 
     let live_rows = ctx
@@ -1897,11 +2007,16 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     stage_lix_file_fast_batch(ctx, mode, staged).await.map(Some)
 }
 
-async fn exact_existing_file_entries(
+struct IndexedFilePathWrites {
+    existing: Vec<Option<Arc<FilesystemPathEntry>>>,
+    path_resolvers: Option<BTreeMap<String, DirectoryPathResolver>>,
+}
+
+async fn indexed_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
     active_branch_id: &str,
     writes: &[FastLixFilePathWrite],
-) -> Result<Option<Vec<Arc<FilesystemPathEntry>>>, LixError> {
+) -> Result<Option<IndexedFilePathWrites>, LixError> {
     let index = ctx
         .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
             active_branch_id.to_string(),
@@ -1910,82 +2025,153 @@ async fn exact_existing_file_entries(
     let mut existing = Vec::with_capacity(writes.len());
     for write in writes {
         let entries = index.exact_entries(&write.parsed.path);
-        let [entry] = entries.as_slice() else {
-            return Ok(None);
-        };
-        if entry.kind != FilesystemPathKind::File {
-            return Ok(None);
+        match entries.as_slice() {
+            [] => {
+                if write.parsed.parsed_path.segments().count() == 1
+                    && !index
+                        .exact_entries(&format!("{}/", write.parsed.path))
+                        .is_empty()
+                {
+                    return Ok(None);
+                }
+                existing.push(None);
+            }
+            [entry] if entry.kind == FilesystemPathKind::File => {
+                existing.push(Some(Arc::clone(entry)));
+            }
+            _ => return Ok(None),
         }
-        existing.push(Arc::clone(entry));
     }
-    Ok(Some(existing))
+    let has_missing = existing.iter().any(Option::is_none);
+    let has_missing_nested = writes
+        .iter()
+        .zip(&existing)
+        .any(|(write, entry)| entry.is_none() && write.parsed.parsed_path.segments().count() > 1);
+    let path_resolvers = if has_missing_nested {
+        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
+            Ok(resolvers) => Some(resolvers),
+            Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    } else if has_missing {
+        Some(BTreeMap::from([(
+            filesystem_storage_scope_key(active_branch_id, false, false, None),
+            DirectoryPathResolver::default(),
+        )]))
+    } else {
+        None
+    };
+    Ok(Some(IndexedFilePathWrites {
+        existing,
+        path_resolvers,
+    }))
 }
 
-async fn stage_exact_existing_file_path_writes(
+async fn stage_indexed_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
+    active_branch_id: &str,
     writes: Vec<FastLixFilePathWrite>,
-    existing: Vec<Arc<FilesystemPathEntry>>,
+    mut indexed: IndexedFilePathWrites,
     conflict: FastLixFilePathWriteConflict,
 ) -> Result<u64, LixError> {
-    debug_assert_eq!(writes.len(), existing.len());
+    debug_assert_eq!(writes.len(), indexed.existing.len());
     debug_assert!(matches!(
         conflict,
         FastLixFilePathWriteConflict::UpdateData
             | FastLixFilePathWriteConflict::UpdateDataAndMetadata
     ));
-    for (write, entry) in writes.iter().zip(&existing) {
-        validate_fast_lix_file_path_conflict_pair(entry.key.is_untracked(), &write.parsed.path)?;
+    for (write, entry) in writes.iter().zip(&indexed.existing) {
+        if let Some(entry) = entry {
+            validate_fast_lix_file_path_conflict_pair(
+                entry.key.is_untracked(),
+                &write.parsed.path,
+            )?;
+        }
     }
+    let existing = indexed
+        .existing
+        .iter()
+        .filter_map(|entry| entry.as_ref().map(Arc::clone))
+        .collect::<Vec<_>>();
     let blob_backed = load_exact_existing_blob_keys(ctx, &existing).await?;
     let mut staged = LixFileStagedBatch::default();
 
-    for (write, entry) in writes.into_iter().zip(existing) {
-        let has_blob_ref = blob_backed.contains(&entry.key);
-        let mut context = FilesystemRowContext {
-            branch_id: entry.key.branch_id().to_string(),
-            global: entry.key.global(),
-            untracked: entry.key.is_untracked(),
-            file_id: entry.key.file_id().map(str::to_string),
-            metadata: None,
-        };
-        if context.global {
-            context.branch_id = GLOBAL_BRANCH_ID.to_string();
-        }
-        match conflict {
-            FastLixFilePathWriteConflict::UpdateData => {
-                context.file_id = Some(entry.id().to_string());
+    for (write, entry) in writes.into_iter().zip(indexed.existing) {
+        if let Some(entry) = entry {
+            let has_blob_ref = blob_backed.contains(&entry.key);
+            let mut context = FilesystemRowContext {
+                branch_id: entry.key.branch_id().to_string(),
+                global: entry.key.global(),
+                untracked: entry.key.is_untracked(),
+                file_id: entry.key.file_id().map(str::to_string),
+                metadata: None,
+            };
+            if context.global {
+                context.branch_id = GLOBAL_BRANCH_ID.to_string();
             }
-            FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
-                let metadata_changed =
-                    entry.metadata() != write.metadata.as_ref().map(TransactionJson::normalized);
-                context.metadata = write.metadata;
-                if metadata_changed {
-                    staged
-                        .state_rows
-                        .push(file_descriptor_row(FileDescriptorRowInput {
-                            id: entry.id().to_string(),
-                            directory_id: entry.parent_id.clone(),
-                            name: entry.name.clone(),
-                            context: context.clone(),
-                        }));
+            match conflict {
+                FastLixFilePathWriteConflict::UpdateData => {
+                    context.file_id = Some(entry.id().to_string());
+                }
+                FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
+                    let metadata_changed = entry.metadata()
+                        != write.metadata.as_ref().map(TransactionJson::normalized);
+                    context.metadata = write.metadata;
+                    if metadata_changed {
+                        staged
+                            .state_rows
+                            .push(file_descriptor_row(FileDescriptorRowInput {
+                                id: entry.id().to_string(),
+                                directory_id: entry.parent_id.clone(),
+                                name: entry.name.clone(),
+                                context: context.clone(),
+                            }));
+                    }
+                }
+                FastLixFilePathWriteConflict::None | FastLixFilePathWriteConflict::DoNothing => {
+                    unreachable!("indexed path route only handles conflict updates")
                 }
             }
-            FastLixFilePathWriteConflict::None | FastLixFilePathWriteConflict::DoNothing => {
-                unreachable!("exact existing path route only handles conflict updates")
-            }
+            stage_lix_file_data_update_write(
+                &mut staged,
+                entry.id().to_string(),
+                Some(write.parsed.path),
+                Some(entry.name.clone()),
+                write.data,
+                context,
+                has_blob_ref,
+                None,
+            )
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+            staged.add_count(1)?;
+        } else {
+            let context = FilesystemRowContext {
+                branch_id: active_branch_id.to_string(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: write.metadata,
+            };
+            let file_id = write
+                .parsed
+                .plugin_key
+                .as_deref()
+                .map(plugin_storage_archive_file_id)
+                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
+            let mut plan = plan_parsed_file_path_write_with_resolvers(
+                indexed
+                    .path_resolvers
+                    .as_mut()
+                    .expect("missing indexed path should have directory resolvers"),
+                write.parsed.parsed_path,
+                Some(file_id.clone()),
+                Some(write.data),
+                context,
+                &mut || ctx.functions().call_uuid_v7().to_string(),
+            )?;
+            attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
+            staged.extend_filesystem_plan(plan)?;
         }
-        stage_lix_file_data_update_write(
-            &mut staged,
-            entry.id().to_string(),
-            Some(write.parsed.path),
-            Some(entry.name.clone()),
-            write.data,
-            context,
-            has_blob_ref,
-            None,
-        )
-        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-        staged.add_count(1)?;
     }
 
     stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
@@ -9834,6 +10020,144 @@ mod tests {
                 serde_json::json!({"source": "upload"})
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn fast_file_path_upsert_mixes_existing_and_missing_without_full_scan() {
+        let old_data = b"old";
+        let rows = vec![
+            live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            ),
+            live_blob_ref_row(
+                "file-readme",
+                "branch-b",
+                "file-readme",
+                &BlobHash::from_content(old_data).to_hex(),
+                old_data.len(),
+            ),
+        ];
+        let mut write_context = CapturingWriteContext {
+            rows,
+            ..CapturingWriteContext::default()
+        };
+
+        let outcome = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![
+                ("/readme.md".to_string(), b"updated".to_vec(), None),
+                ("/new.md".to_string(), b"new".to_vec(), None),
+            ],
+            super::FastLixFilePathWriteConflict::UpdateData,
+        )
+        .await
+        .expect("mixed path upsert should stage");
+
+        assert!(outcome.is_some());
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
+        assert_eq!(write_context.scan_count, 0);
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("mixed path upsert should stage file data");
+        };
+        assert_eq!(file_data.len(), 2);
+        assert!(file_data[0].had_blob_ref);
+        assert!(!file_data[1].had_blob_ref);
+        assert!(rows.iter().any(|row| {
+            row.schema_key == super::FILE_DESCRIPTOR_SCHEMA_KEY
+                && row.origin.as_ref().is_some_and(|origin| {
+                    origin.operation == super::TransactionWriteOperation::Insert
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn fast_file_path_upsert_creates_nested_directories_from_index() {
+        let mut write_context = CapturingWriteContext::default();
+
+        let outcome = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![("/new/nested/file.md".to_string(), b"new".to_vec(), None)],
+            super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+        )
+        .await
+        .expect("nested missing path upsert should stage");
+
+        assert!(outcome.is_some());
+        assert_eq!(write_context.path_index_count, 1);
+        assert!(write_context.exact_load_requests.is_empty());
+        assert_eq!(write_context.scan_count, 0);
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("nested path upsert should stage descriptors and file data");
+        };
+        assert_eq!(file_data.len(), 1);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.schema_key == super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.schema_key == super::FILE_DESCRIPTOR_SCHEMA_KEY)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_file_path_upsert_rejects_duplicate_missing_paths_before_staging() {
+        let mut write_context = CapturingWriteContext::default();
+
+        let error = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![
+                ("/duplicate.md".to_string(), b"first".to_vec(), None),
+                ("/duplicate.md".to_string(), b"second".to_vec(), None),
+            ],
+            super::FastLixFilePathWriteConflict::UpdateData,
+        )
+        .await
+        .expect_err("duplicate missing path should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.scan_count, 0);
+        assert!(write_context.writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fast_file_path_upsert_preserves_root_directory_namespace_collision() {
+        let mut write_context = CapturingWriteContext {
+            rows: vec![live_directory_row(
+                "dir-docs",
+                "branch-b",
+                r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+            )],
+            ..CapturingWriteContext::default()
+        };
+
+        let error = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![("/docs".to_string(), b"file".to_vec(), None)],
+            super::FastLixFilePathWriteConflict::UpdateData,
+        )
+        .await
+        .expect_err("file should not overwrite a same-name root directory");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.scan_count, 1);
+        assert!(write_context.writes.is_empty());
     }
 
     #[tokio::test]

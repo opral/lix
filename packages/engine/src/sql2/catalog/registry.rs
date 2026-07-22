@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -41,6 +42,25 @@ impl PublicCatalog {
         Ok(catalog)
     }
 
+    /// Compile-time SQL surfaces whose shape cannot be changed at runtime.
+    ///
+    /// Alongside the hand-written state/filesystem surfaces, Lix seeds a fixed
+    /// set of system entity schemas. Runtime registration rejects schema keys
+    /// whose generated base, `_by_branch`, or `_history` surface would shadow
+    /// this metadata, so it does not need a storage-backed visible-schema
+    /// snapshot.
+    pub(crate) fn fixed_system() -> &'static Self {
+        static FIXED_SYSTEM_CATALOG: OnceLock<PublicCatalog> = OnceLock::new();
+        FIXED_SYSTEM_CATALOG.get_or_init(|| {
+            let schemas = crate::schema::seed_schema_definitions()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            Self::from_visible_schemas(&schemas)
+                .expect("compile-time Lix schemas must form a valid SQL catalog")
+        })
+    }
+
     pub(crate) fn insert(&mut self, surface: PublicSurfaceContract) -> Result<(), LixError> {
         if self.surfaces.contains_key(&surface.name) {
             return Err(LixError::new(
@@ -54,6 +74,21 @@ impl PublicCatalog {
 
     pub(crate) fn surface(&self, table_name: &str) -> Option<&PublicSurfaceContract> {
         self.surfaces.get(table_name)
+    }
+
+    /// Returns the fixed schema or SQL surface shadowed by a runtime schema key.
+    pub(crate) fn fixed_system_collision_for_schema_key(schema_key: &str) -> Option<String> {
+        if crate::schema::is_seed_schema_key(schema_key) {
+            return Some(schema_key.to_string());
+        }
+
+        [
+            schema_key.to_string(),
+            format!("{schema_key}_by_branch"),
+            format!("{schema_key}_history"),
+        ]
+        .into_iter()
+        .find(|surface_name| Self::fixed_system().surface(surface_name).is_some())
     }
 
     pub(crate) fn surfaces(&self) -> impl Iterator<Item = &PublicSurfaceContract> {

@@ -32,12 +32,11 @@ use crate::live_state::{
     MaterializedLiveStateRow,
 };
 #[cfg(test)]
-use crate::schema::{
-    SchemaKey, is_seed_schema_key, validate_lix_schema, validate_lix_schema_definition,
-};
+use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{
     format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
 };
+use crate::transaction::normalization::reject_fixed_system_schema_collision;
 #[cfg(test)]
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::staging::duplicate_insert_identity_message;
@@ -304,6 +303,12 @@ async fn validate_registered_schema_identity_is_canonical(
     }
 
     for pending_row in pending_schema_rows {
+        let pending_snapshot = pending_row
+            .snapshot_json()
+            .expect("pending registered schema row has snapshot_content");
+        let (key, _) = schema_from_registered_snapshot(pending_snapshot)?;
+        reject_fixed_system_schema_collision(&key)?;
+
         let Some(row) = load_committed_constraint_row(
             input.live_state,
             &pending_row.domain().with_exact_file_scope(None),
@@ -319,9 +324,6 @@ async fn validate_registered_schema_identity_is_canonical(
             continue;
         };
         let snapshot = parse_registered_schema_snapshot(snapshot_content)?;
-        let pending_snapshot = pending_row
-            .snapshot_json()
-            .expect("pending registered schema row has snapshot_content");
         if &snapshot != pending_snapshot {
             let (key, pending_schema) = schema_from_registered_snapshot(pending_snapshot)?;
             let (_, committed_schema) = schema_from_registered_snapshot(&snapshot)?;
@@ -2754,24 +2756,10 @@ fn validate_pending_registered_schema(
     // `lix_registered_schema` schema, and the inner definition must be a valid
     // Lix schema before it can extend the transaction-visible catalog.
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
-    reject_seed_schema_registration(&key)?;
+    reject_fixed_system_schema_collision(&key)?;
     validate_lix_schema_definition(&schema)?;
     validate_lix_schema(registered_schema_definition, &snapshot)?;
     Ok((key, schema))
-}
-
-#[cfg(test)]
-fn reject_seed_schema_registration(key: &SchemaKey) -> Result<(), LixError> {
-    if is_seed_schema_key(&key.schema_key) {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!(
-                "schema '{}' is a system schema and cannot be registered at runtime",
-                key.schema_key
-            ),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

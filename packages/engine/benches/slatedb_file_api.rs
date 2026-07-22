@@ -122,11 +122,43 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
         );
     }
 
+    for &delay_ms in FRESH_ENGINE_DELAYS_MS {
+        let delay = Duration::from_millis(delay_ms);
+        let delay_label = format!("{delay_ms}ms");
+
+        group.bench_with_input(
+            BenchmarkId::new("guarded_update_file_after_preload", &delay_label),
+            &delay,
+            |b, &delay| {
+                b.iter_custom(|iterations| {
+                    let fixture = runtime.block_on(UploadBenchFixture::seeded(delay));
+                    black_box(runtime.block_on(fixture.guarded_update_file()));
+                    measure_iterations(iterations, || {
+                        runtime.block_on(fixture.guarded_update_file())
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("fast_update_file_after_preload", delay_label),
+            &delay,
+            |b, &delay| {
+                b.iter_custom(|iterations| {
+                    let fixture = runtime.block_on(UploadBenchFixture::seeded(delay));
+                    black_box(runtime.block_on(fixture.fast_update_file()));
+                    measure_iterations(iterations, || runtime.block_on(fixture.fast_update_file()))
+                });
+            },
+        );
+    }
+
     group.finish();
 
     cached_cold_lifecycle_benches(c, &runtime);
     cached_preloaded_request_benches(c, &runtime);
     fresh_engine_select_benches(c, &runtime);
+    storage_direct_benches(c, &runtime);
     storage_concurrency_benches(c);
 }
 
@@ -494,6 +526,55 @@ fn storage_concurrency_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn storage_direct_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
+    let mut group = c.benchmark_group("slatedb_storage_direct");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    group.bench_function("accept_put_u1_v4096", |b| {
+        b.iter_custom(|iterations| {
+            let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
+            let storage = SlateDB::open_object_store(
+                format!("slatedb-direct-bench-{}-{db_id}", std::process::id()),
+                Arc::new(InMemory::new()),
+            )
+            .expect("open direct SlateDB benchmark storage");
+            let key = Key(Bytes::from_static(b"direct-key"));
+            let value = Bytes::from(vec![0x5a; FILE_SIZE_BYTES]);
+            runtime.block_on(write_direct_storage_value(&storage, &key, &value));
+            measure_iterations(iterations, || {
+                runtime.block_on(write_direct_storage_value(&storage, &key, &value))
+            })
+        });
+    });
+
+    group.finish();
+}
+
+async fn write_direct_storage_value(storage: &SlateDB, key: &Key, value: &Bytes) -> u64 {
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("begin direct SlateDB write");
+    write
+        .put_many(
+            CONCURRENCY_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        )
+        .await
+        .expect("stage direct SlateDB value");
+    let commit = write.commit().await.expect("commit direct SlateDB value");
+    commit.stats.put_entries
+}
+
 fn measure_iterations<T>(iterations: u64, mut operation: impl FnMut() -> T) -> Duration {
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
@@ -590,6 +671,8 @@ struct UploadBenchFixture {
     _cache_dir: TempDir,
     object_store: Arc<DelayedObjectStore>,
     next_upload_version: AtomicU64,
+    next_update_version: AtomicU64,
+    file_id: String,
     upload_path: String,
     upload_batch_paths: Vec<String>,
     upload_batch_sql: String,
@@ -620,6 +703,8 @@ impl UploadBenchFixture {
             _cache_dir: cache_dir,
             object_store: seeded.object_store,
             next_upload_version: AtomicU64::new(0),
+            next_update_version: AtomicU64::new(0),
+            file_id: seeded.file_id,
             upload_path: seeded.upload_path,
             upload_batch_paths: (0..LIXRAY_UPLOAD_BATCH_FILES).map(file_path).collect(),
             upload_batch_sql: upload_batch_sql(LIXRAY_UPLOAD_BATCH_FILES),
@@ -662,6 +747,51 @@ impl UploadBenchFixture {
             .await
             .expect("overwrite benchmark file with unchanged metadata");
         result.rows_affected()
+    }
+
+    async fn guarded_update_file(&self) -> u64 {
+        let version = self.next_update_version.fetch_add(1, Ordering::Relaxed);
+        let expected = if version == 0 {
+            file_bytes(0)
+        } else {
+            upload_file_bytes(version - 1)
+        };
+        let result = self
+            .session
+            .execute(
+                "UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3",
+                &[
+                    Value::Blob(upload_file_bytes(version)),
+                    Value::Text(self.file_id.clone()),
+                    Value::Blob(expected),
+                ],
+            )
+            .await
+            .expect("guarded-update benchmark file");
+        let rows_affected = result.rows_affected();
+        assert_eq!(
+            rows_affected, 1,
+            "guarded-update benchmark must keep its expected bytes in sync"
+        );
+        rows_affected
+    }
+
+    async fn fast_update_file(&self) -> u64 {
+        let version = self.next_update_version.fetch_add(1, Ordering::Relaxed);
+        let result = self
+            .session
+            .execute(
+                "UPDATE lix_file SET data = $1 WHERE id = $2",
+                &[
+                    Value::Blob(upload_file_bytes(version)),
+                    Value::Text(self.file_id.clone()),
+                ],
+            )
+            .await
+            .expect("fast-update benchmark file");
+        let rows_affected = result.rows_affected();
+        assert_eq!(rows_affected, 1);
+        rows_affected
     }
 
     async fn upload_overwrite_file_batch(&self) -> u64 {
