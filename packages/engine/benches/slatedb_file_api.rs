@@ -36,6 +36,7 @@ const DELAYS_MS: &[u64] = &[0, 10, 25, 50];
 const SEED_FILE_COUNT: usize = 100;
 const FILE_SIZE_BYTES: usize = 4096;
 const UPLOAD_BATCH_SIZE: usize = 10;
+const LIXRAY_UPLOAD_BATCH_FILES: usize = 10;
 const BENCH_DISK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const BENCH_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const BENCH_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
@@ -75,6 +76,20 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
                     black_box(runtime.block_on(fixture.upload_overwrite_file()));
                     measure_iterations(iterations, || {
                         runtime.block_on(fixture.upload_overwrite_file())
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("upload_overwrite_10_files_after_preload", &delay_label),
+            &delay,
+            |b, &delay| {
+                b.iter_custom(|iterations| {
+                    let fixture = runtime.block_on(UploadBenchFixture::seeded(delay));
+                    black_box(runtime.block_on(fixture.upload_overwrite_file_batch()));
+                    measure_iterations(iterations, || {
+                        runtime.block_on(fixture.upload_overwrite_file_batch())
                     })
                 });
             },
@@ -521,6 +536,8 @@ struct UploadBenchFixture {
     object_store: Arc<DelayedObjectStore>,
     next_upload_version: AtomicU64,
     upload_path: String,
+    upload_batch_paths: Vec<String>,
+    upload_batch_sql: String,
 }
 
 impl UploadBenchFixture {
@@ -548,6 +565,8 @@ impl UploadBenchFixture {
             object_store: seeded.object_store,
             next_upload_version: AtomicU64::new(0),
             upload_path: seeded.upload_path,
+            upload_batch_paths: (0..LIXRAY_UPLOAD_BATCH_FILES).map(file_path).collect(),
+            upload_batch_sql: upload_batch_sql(LIXRAY_UPLOAD_BATCH_FILES),
         }
     }
 
@@ -569,6 +588,44 @@ impl UploadBenchFixture {
             .expect("overwrite benchmark file");
         result.rows_affected()
     }
+
+    async fn upload_overwrite_file_batch(&self) -> u64 {
+        let version = self.next_upload_version.fetch_add(1, Ordering::Relaxed);
+        let mut params = Vec::with_capacity(self.upload_batch_paths.len() * 3);
+        for (file_index, path) in self.upload_batch_paths.iter().enumerate() {
+            let file_version = version
+                .wrapping_mul(self.upload_batch_paths.len() as u64)
+                .wrapping_add(file_index as u64);
+            params.push(Value::Text(path.clone()));
+            params.push(Value::Blob(upload_file_bytes(file_version)));
+            params.push(upload_file_metadata(file_version));
+        }
+        let result = self
+            .session
+            .execute(&self.upload_batch_sql, &params)
+            .await
+            .expect("overwrite benchmark file batch");
+        result.rows_affected()
+    }
+}
+
+fn upload_batch_sql(row_count: usize) -> String {
+    let placeholders = (0..row_count)
+        .map(|row_index| {
+            format!(
+                "(${}, ${}, ${})",
+                row_index * 3 + 1,
+                row_index * 3 + 2,
+                row_index * 3 + 3
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES {} \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+         lixcol_metadata = excluded.lixcol_metadata",
+        placeholders.join(", ")
+    )
 }
 
 struct ReadBenchFixture {

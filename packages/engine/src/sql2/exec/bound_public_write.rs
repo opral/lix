@@ -55,10 +55,11 @@ pub(crate) async fn try_execute_bound_public_write(
         }
         BoundWriteTarget::File(surface) => {
             if let Some(shape) = fast_file_path_write_shape(plan, surface) {
-                execute_file_path_write(ctx, plan, params, shape)
-                    .await
-                    .map(SqlWriteResult::affected)
-                    .map(BoundPublicWriteExecution::Executed)
+                Ok(execute_file_path_write(ctx, plan, params, shape)
+                    .await?
+                    .map_or(BoundPublicWriteExecution::Unsupported, |count| {
+                        BoundPublicWriteExecution::Executed(SqlWriteResult::affected(count))
+                    }))
             } else if let Some(shape) = fast_file_data_update_shape(plan, surface) {
                 execute_file_data_update(ctx, params, &shape)
                     .await
@@ -225,6 +226,7 @@ async fn load_active_branch_commit_id(
 struct FastFilePathWriteShape {
     path_index: usize,
     data_index: usize,
+    metadata_index: Option<usize>,
     conflict: crate::sql2::providers::FastLixFilePathWriteConflict,
 }
 
@@ -233,7 +235,7 @@ async fn execute_file_path_write(
     plan: &LogicalWritePlan,
     params: &[Value],
     shape: FastFilePathWriteShape,
-) -> Result<u64, LixError> {
+) -> Result<Option<u64>, LixError> {
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -245,6 +247,11 @@ async fn execute_file_path_write(
         writes.push((
             eval_fast_file_text(&row[shape.path_index], params, "path")?,
             eval_fast_file_blob(&row[shape.data_index], params, "data")?,
+            shape
+                .metadata_index
+                .map(|index| eval_fast_file_metadata(&row[index], params))
+                .transpose()?
+                .flatten(),
         ));
     }
     crate::sql2::providers::execute_fast_lix_file_path_writes(ctx, writes, shape.conflict).await
@@ -260,15 +267,20 @@ fn fast_file_path_write_shape(
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return None;
     };
-    if values.rows.is_empty() || values.columns.len() != 2 {
+    if values.rows.is_empty() || !matches!(values.columns.len(), 2 | 3) {
         return None;
     }
     let path_index = values.column_index("path")?;
     let data_index = values.column_index("data")?;
+    let metadata_index = values.column_index("lixcol_metadata");
+    if values.columns.len() == 3 && metadata_index.is_none() {
+        return None;
+    }
     if values.rows.iter().any(|row| {
         row.len() != values.columns.len()
-            || !fast_file_value_expr_supported(&row[path_index])
-            || !fast_file_value_expr_supported(&row[data_index])
+            || !fast_file_text_expr_supported(&row[path_index])
+            || !fast_file_blob_expr_supported(&row[data_index])
+            || metadata_index.is_some_and(|index| !fast_file_metadata_expr_supported(&row[index]))
     }) {
         return None;
     }
@@ -276,9 +288,28 @@ fn fast_file_path_write_shape(
         None => crate::sql2::providers::FastLixFilePathWriteConflict::None,
         Some(conflict) => fast_file_path_conflict_shape(conflict)?,
     };
+    if conflict == crate::sql2::providers::FastLixFilePathWriteConflict::UpdateDataAndMetadata
+        && metadata_index.is_none()
+    {
+        return None;
+    }
+    if conflict == crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData
+        && metadata_index.is_some()
+    {
+        return None;
+    }
+    // DataFusion ignores insert values for rows skipped by DO NOTHING. Keep
+    // metadata-bearing variants there so invalid metadata on an existing row
+    // retains that behavior without complicating the hot upsert path.
+    if conflict == crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing
+        && metadata_index.is_some()
+    {
+        return None;
+    }
     Some(FastFilePathWriteShape {
         path_index,
         data_index,
+        metadata_index,
         conflict,
     })
 }
@@ -294,28 +325,40 @@ fn fast_file_path_conflict_shape(
             Some(crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing)
         }
         BoundConflictAction::DoUpdate { assignments } => {
-            if assignments.len() != 1 {
-                return None;
-            }
-            let assignment = &assignments[0];
-            if assignment.column.name != "data" {
-                return None;
-            }
-            let BoundExpr::ExcludedColumn(column) = &assignment.value else {
-                return None;
+            let assigns_excluded_column = |assignment: &BoundAssignment, name: &str| {
+                assignment.column.name == name
+                    && matches!(
+                        &assignment.value,
+                        BoundExpr::ExcludedColumn(column) if column.name == name
+                    )
             };
-            if column.name != "data" {
-                return None;
+            if assignments.len() == 1 && assigns_excluded_column(&assignments[0], "data") {
+                return Some(crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData);
             }
-            Some(crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData)
+            if assignments.len() == 2
+                && assignments
+                    .iter()
+                    .any(|assignment| assigns_excluded_column(assignment, "data"))
+                && assignments
+                    .iter()
+                    .any(|assignment| assigns_excluded_column(assignment, "lixcol_metadata"))
+            {
+                return Some(
+                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+                );
+            }
+            None
         }
     }
 }
 
-fn fast_file_value_expr_supported(expr: &BoundExpr) -> bool {
+fn fast_file_metadata_expr_supported(expr: &BoundExpr) -> bool {
     matches!(
         expr,
-        BoundExpr::Param(_) | BoundExpr::Literal(BoundLiteral::Text(_) | BoundLiteral::Blob(_))
+        BoundExpr::Param(_)
+            | BoundExpr::Literal(
+                BoundLiteral::Null | BoundLiteral::Text(_) | BoundLiteral::Json(_)
+            )
     )
 }
 
@@ -380,6 +423,49 @@ fn eval_fast_file_blob(
             format!("lix_file fast write column '{column}' supports params and blob literals only"),
         )),
     }
+}
+
+fn eval_fast_file_metadata(
+    expr: &BoundExpr,
+    params: &[Value],
+) -> Result<Option<TransactionJson>, LixError> {
+    let value = match expr {
+        BoundExpr::Literal(BoundLiteral::Null) => return Ok(None),
+        BoundExpr::Literal(BoundLiteral::Text(value)) => {
+            parse_row_metadata_value(value, "lix_file")?
+        }
+        BoundExpr::Literal(BoundLiteral::Json(value)) => {
+            validate_row_metadata(value, "lix_file")?;
+            value.clone()
+        }
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Null) => return Ok(None),
+            Some(Value::Text(value)) => parse_row_metadata_value(value, "lix_file")?,
+            Some(Value::Json(value)) => {
+                validate_row_metadata(value, "lix_file")?;
+                value.clone()
+            }
+            Some(_) => {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "lix_file fast write column 'lixcol_metadata' expects a JSON object",
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("missing SQL parameter ${}", param.index),
+                ));
+            }
+        },
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "lix_file fast write column 'lixcol_metadata' supports params and literals only",
+            ));
+        }
+    };
+    TransactionJson::from_value(value, "lix_file metadata").map(Some)
 }
 
 async fn entity_insert(
