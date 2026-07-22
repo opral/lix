@@ -430,6 +430,7 @@ class RemoteObservationHub {
 	): Promise<void> {
 		let reconnect = false;
 		let streamOpened = false;
+		const transportBases = new Map<string, BindingObserveEvent>();
 		try {
 			const response = await this.#openStream(
 				[...this.#observations.values()].map((observation) =>
@@ -478,8 +479,19 @@ class RemoteObservationHub {
 							JSON.parse(frame.data),
 							"remote multiplex observe next event",
 						);
-						const observation = this.#observation(payload.subscriptionId);
-						observation.accept(decodeObserveEvent(payload));
+						const subscriptionId = payload.subscriptionId;
+						if (typeof subscriptionId !== "string") {
+							throw protocolError(
+								"remote observe event requires subscriptionId",
+							);
+						}
+						const observation = this.#observation(subscriptionId);
+						const event = decodeObserveEvent(
+							payload,
+							transportBases.get(subscriptionId),
+						);
+						transportBases.set(subscriptionId, event);
+						observation.accept(event);
 						this.#retryAttempt = 0;
 					} catch (error) {
 						this.#failStream(

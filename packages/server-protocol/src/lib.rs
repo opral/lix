@@ -794,18 +794,28 @@ where
         let parent = tracing::Span::current();
         tasks.push(tokio::spawn(
             async move {
+                let mut blob_base = None;
                 loop {
                     let message = match events.next().await {
-                        Ok(Some(event)) => match ObserveEventResponse::try_from(event) {
-                            Ok(payload) => MultiplexObserveMessage::Next {
-                                subscription_id: subscription_id.clone(),
-                                payload,
-                            },
-                            Err(error) => MultiplexObserveMessage::Error {
-                                subscription_id: subscription_id.clone(),
-                                error: ErrorEnvelope::from_lix_error(&error),
-                            },
-                        },
+                        Ok(Some(event)) => {
+                            match multiplex_observe_payload(event, blob_base.as_ref()) {
+                                Ok((payload, next_blob_base)) => {
+                                    let message = MultiplexObserveMessage::Next {
+                                        subscription_id: subscription_id.clone(),
+                                        payload,
+                                    };
+                                    if sender.send(message).await.is_err() {
+                                        break;
+                                    }
+                                    blob_base = next_blob_base;
+                                    continue;
+                                }
+                                Err(error) => MultiplexObserveMessage::Error {
+                                    subscription_id: subscription_id.clone(),
+                                    error: ErrorEnvelope::from_lix_error(&error),
+                                },
+                            }
+                        }
                         Ok(None) => break,
                         Err(error) => MultiplexObserveMessage::Error {
                             subscription_id: subscription_id.clone(),
@@ -834,6 +844,7 @@ where
                         sequence: payload.sequence,
                         mutation_sequence: payload.mutation_sequence,
                         result: payload.result,
+                        delta: payload.delta,
                     }));
                 }
                 MultiplexObserveMessage::Error { subscription_id, error } => {
@@ -1207,12 +1218,38 @@ impl TryFrom<ObserveEvent> for ObserveEventResponse {
 enum MultiplexObserveMessage {
     Next {
         subscription_id: String,
-        payload: ObserveEventResponse,
+        payload: MultiplexObservePayload,
     },
     Error {
         subscription_id: String,
         error: ErrorEnvelope,
     },
+}
+
+struct BlobDeltaBase {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MultiplexObservePayload {
+    sequence: u64,
+    mutation_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ExecuteResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<SingleBlobSplice>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SingleBlobSplice {
+    kind: &'static str,
+    base_sequence: u64,
+    prefix_bytes: u64,
+    suffix_bytes: u64,
+    insert_base64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1221,7 +1258,133 @@ struct MultiplexObserveEventResponse {
     subscription_id: String,
     sequence: u64,
     mutation_sequence: u64,
-    result: ExecuteResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ExecuteResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<SingleBlobSplice>,
+}
+
+const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
+// Compared with only the full blob's Base64 length, this deliberately
+// overestimates every delta-only JSON/SSE field. The shared event envelope is
+// omitted from both sides, so passing the 90% test guarantees >10% savings.
+const BLOB_DELTA_ENVELOPE_BUDGET_BYTES: usize = 512;
+
+fn multiplex_observe_payload(
+    event: ObserveEvent,
+    base: Option<&BlobDeltaBase>,
+) -> Result<(MultiplexObservePayload, Option<BlobDeltaBase>), LixError> {
+    let next_base = point_blob_bytes(&event.rows).map(|bytes| BlobDeltaBase {
+        sequence: event.sequence,
+        bytes: bytes.to_vec(),
+    });
+    let delta = match base.zip(next_base.as_ref()) {
+        Some((base, next)) if base.sequence.checked_add(1) == Some(event.sequence) => {
+            single_blob_splice(base, next)?
+        }
+        _ => None,
+    };
+
+    let payload = if let Some(delta) = delta {
+        MultiplexObservePayload {
+            sequence: event.sequence,
+            mutation_sequence: event.mutation_sequence,
+            result: None,
+            delta: Some(delta),
+        }
+    } else {
+        MultiplexObservePayload {
+            sequence: event.sequence,
+            mutation_sequence: event.mutation_sequence,
+            result: Some(ExecuteResponse::try_from(event.rows)?),
+            delta: None,
+        }
+    };
+    Ok((payload, next_base))
+}
+
+fn point_blob_bytes(result: &ExecuteResult) -> Option<&[u8]> {
+    if result.columns() != ["data"]
+        || result.rows().len() != 1
+        || result.rows_affected() != 0
+        || !result.notices().is_empty()
+    {
+        return None;
+    }
+    match result.rows()[0].values() {
+        [Value::Blob(bytes)] => Some(bytes),
+        _ => None,
+    }
+}
+
+fn single_blob_splice(
+    base: &BlobDeltaBase,
+    next: &BlobDeltaBase,
+) -> Result<Option<SingleBlobSplice>, LixError> {
+    if next.bytes.len() < MIN_BLOB_DELTA_BYTES {
+        return Ok(None);
+    }
+    let prefix_bytes = base
+        .bytes
+        .iter()
+        .zip(&next.bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let max_suffix = base
+        .bytes
+        .len()
+        .saturating_sub(prefix_bytes)
+        .min(next.bytes.len().saturating_sub(prefix_bytes));
+    let suffix_bytes = base
+        .bytes
+        .iter()
+        .rev()
+        .zip(next.bytes.iter().rev())
+        .take(max_suffix)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let insert_end = next.bytes.len().saturating_sub(suffix_bytes);
+    let insert = &next.bytes[prefix_bytes..insert_end];
+    let Some(full_base64_bytes) = padded_base64_len(next.bytes.len()) else {
+        return Ok(None);
+    };
+    let Some(delta_base64_bytes) = padded_base64_len(insert.len()) else {
+        return Ok(None);
+    };
+    let Some(delta_estimate) = delta_base64_bytes.checked_add(BLOB_DELTA_ENVELOPE_BUDGET_BYTES)
+    else {
+        return Ok(None);
+    };
+    if delta_estimate.saturating_mul(10) >= full_base64_bytes.saturating_mul(9) {
+        return Ok(None);
+    }
+    let WireValue::Blob {
+        base64: insert_base64,
+    } = WireValue::try_from_engine(&Value::Blob(insert.to_vec()))?
+    else {
+        unreachable!("blob wire conversion must return a blob")
+    };
+    Ok(Some(SingleBlobSplice {
+        kind: "single-blob-splice",
+        base_sequence: base.sequence,
+        prefix_bytes: u64::try_from(prefix_bytes).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "blob delta prefix is too large",
+            )
+        })?,
+        suffix_bytes: u64::try_from(suffix_bytes).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "blob delta suffix is too large",
+            )
+        })?,
+        insert_base64,
+    }))
+}
+
+fn padded_base64_len(bytes: usize) -> Option<usize> {
+    bytes.checked_add(2)?.checked_div(3)?.checked_mul(4)
 }
 
 #[derive(Debug, Serialize)]
@@ -1618,6 +1781,123 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn point_blob_event(sequence: u64, bytes: Vec<u8>) -> ObserveEvent {
+        ObserveEvent {
+            sequence,
+            mutation_sequence: sequence,
+            rows: ExecuteResult::from_rows(
+                vec!["data".to_string()],
+                vec![vec![Value::Blob(bytes)]],
+            ),
+        }
+    }
+
+    fn apply_blob_splice(base: &[u8], delta: SingleBlobSplice) -> Vec<u8> {
+        let Value::Blob(insert) = WireValue::Blob {
+            base64: delta.insert_base64,
+        }
+        .try_into_engine()
+        .expect("delta insert should decode") else {
+            panic!("delta insert should be a blob")
+        };
+        let prefix = usize::try_from(delta.prefix_bytes).expect("prefix should fit");
+        let suffix = usize::try_from(delta.suffix_bytes).expect("suffix should fit");
+        let mut next = Vec::with_capacity(prefix + insert.len() + base.len() - suffix);
+        next.extend_from_slice(&base[..prefix]);
+        next.extend_from_slice(&insert);
+        next.extend_from_slice(&base[base.len() - suffix..]);
+        next
+    }
+
+    #[test]
+    fn multiplex_blob_delta_roundtrips_replace_insert_and_delete() {
+        let initial = vec![b'a'; 100 * 1024];
+        let (payload, mut base) =
+            multiplex_observe_payload(point_blob_event(0, initial.clone()), None)
+                .expect("initial payload");
+        assert!(payload.result.is_some());
+        assert!(payload.delta.is_none());
+
+        let mut replaced = initial.clone();
+        replaced[50_000..50_032].fill(b'b');
+        let (payload, next_base) =
+            multiplex_observe_payload(point_blob_event(1, replaced.clone()), base.as_ref())
+                .expect("replacement delta");
+        assert_eq!(
+            apply_blob_splice(&initial, payload.delta.expect("replacement splice")),
+            replaced
+        );
+        base = next_base;
+
+        let mut inserted = replaced.clone();
+        inserted.splice(40_000..40_000, [b'x'; 32]);
+        let (payload, next_base) =
+            multiplex_observe_payload(point_blob_event(2, inserted.clone()), base.as_ref())
+                .expect("insert delta");
+        assert_eq!(
+            apply_blob_splice(&replaced, payload.delta.expect("insert splice")),
+            inserted
+        );
+        base = next_base;
+
+        let mut deleted = inserted.clone();
+        deleted.drain(60_000..60_032);
+        let (payload, _) =
+            multiplex_observe_payload(point_blob_event(3, deleted.clone()), base.as_ref())
+                .expect("delete delta");
+        assert_eq!(
+            apply_blob_splice(&inserted, payload.delta.expect("delete splice")),
+            deleted
+        );
+    }
+
+    #[test]
+    fn multiplex_blob_delta_requires_more_than_ten_percent_wire_saving() {
+        let initial = vec![b'a'; 1024 * 1024];
+        let (_, base) = multiplex_observe_payload(point_blob_event(0, initial.clone()), None)
+            .expect("initial payload");
+
+        let replace_89_percent = initial.len() * 89 / 100;
+        let mut next = initial.clone();
+        let start = (initial.len() - replace_89_percent) / 2;
+        next[start..start + replace_89_percent].fill(b'b');
+        let (payload, _) = multiplex_observe_payload(point_blob_event(1, next), base.as_ref())
+            .expect("89 percent payload");
+        assert!(payload.delta.is_some());
+        assert!(payload.result.is_none());
+
+        let replace_90_percent = initial.len() * 90 / 100;
+        let mut next = initial.clone();
+        let start = (initial.len() - replace_90_percent) / 2;
+        next[start..start + replace_90_percent].fill(b'b');
+        let (payload, _) = multiplex_observe_payload(point_blob_event(1, next), base.as_ref())
+            .expect("90 percent payload");
+        assert!(payload.result.is_some());
+        assert!(payload.delta.is_none());
+    }
+
+    #[test]
+    fn multiplex_blob_full_fallback_becomes_the_next_delta_base() {
+        let initial = vec![b'a'; 100 * 1024];
+        let (_, base) =
+            multiplex_observe_payload(point_blob_event(0, initial), None).expect("initial payload");
+        let replacement = vec![b'b'; 100 * 1024];
+        let (payload, base) =
+            multiplex_observe_payload(point_blob_event(1, replacement.clone()), base.as_ref())
+                .expect("full fallback");
+        assert!(payload.result.is_some());
+
+        let mut localized = replacement.clone();
+        localized[50_000] = b'c';
+        let (payload, _) =
+            multiplex_observe_payload(point_blob_event(2, localized.clone()), base.as_ref())
+                .expect("localized delta");
+        assert_eq!(
+            apply_blob_splice(&replacement, payload.delta.expect("localized splice")),
+            localized
+        );
     }
 
     #[tokio::test]

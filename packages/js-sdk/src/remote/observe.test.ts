@@ -48,6 +48,73 @@ test("remote observe streams native Lix results", async () => {
 	await lix.close();
 });
 
+test("remote observe applies every blob delta before coalescing delivery", async () => {
+	const body = [
+		sseFrame("next", {
+			subscriptionId: "observe-1",
+			sequence: 0,
+			mutationSequence: 10,
+			result: {
+				columns: ["data"],
+				rows: [[{ kind: "blob", base64: "YWJjZGVm" }]],
+				rowsAffected: 0,
+				notices: [],
+			},
+		}),
+		sseFrame("next", {
+			subscriptionId: "observe-1",
+			sequence: 1,
+			mutationSequence: 11,
+			delta: {
+				kind: "single-blob-splice",
+				baseSequence: 0,
+				prefixBytes: 2,
+				suffixBytes: 2,
+				insertBase64: "WFla",
+			},
+		}),
+		sseFrame("next", {
+			subscriptionId: "observe-1",
+			sequence: 2,
+			mutationSequence: 12,
+			delta: {
+				kind: "single-blob-splice",
+				baseSequence: 1,
+				prefixBytes: 3,
+				suffixBytes: 2,
+				insertBase64: "IQ==",
+			},
+		}),
+	].join("");
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "DELETE") return closedSession();
+				return new URL(request.url).pathname.endsWith("/lix/v1/")
+					? handshake()
+					: sseResponse(body);
+			},
+		},
+	});
+
+	const events = lix.observe("SELECT data FROM lix_file WHERE id = $1", [
+		"file-1",
+	]);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	const latest = await events.next();
+	expect(latest?.sequence).toBe(2);
+	expect(latest?.mutationSequence).toBe(12);
+	expect(
+		new TextDecoder().decode(latest?.result.rows[0]?.value("data").asBytes()),
+	).toBe("abX!ef");
+
+	events.close();
+	await lix.close();
+});
+
 test("remote observe multiplexes more than six subscriptions without blocking execute", async () => {
 	const observeRequests: Request[] = [];
 	let liveObserveRequests = 0;

@@ -50,11 +50,24 @@ export type RemoteMultiplexObserveRequest = {
 	subscriptions: RemoteObserveSubscription[];
 };
 
-export type RemoteObserveEvent = {
+type RemoteObserveEventBase = {
 	sequence: number;
 	mutationSequence: number;
-	result: RemoteExecuteResponse;
 };
+
+export type RemoteObserveBlobDelta = {
+	kind: "single-blob-splice";
+	baseSequence: number;
+	prefixBytes: number;
+	suffixBytes: number;
+	insertBase64: string;
+};
+
+export type RemoteObserveEvent = RemoteObserveEventBase &
+	(
+		| { result: RemoteExecuteResponse; delta?: never }
+		| { result?: never; delta: RemoteObserveBlobDelta }
+	);
 
 export type RemoteMultiplexObserveEvent = RemoteObserveEvent & {
 	subscriptionId: string;
@@ -188,7 +201,10 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 	};
 }
 
-export function decodeObserveEvent(value: unknown): BindingObserveEvent {
+export function decodeObserveEvent(
+	value: unknown,
+	base?: BindingObserveEvent,
+): BindingObserveEvent {
 	const event = record(value, "observe event");
 	if (
 		typeof event.sequence !== "number" ||
@@ -208,10 +224,89 @@ export function decodeObserveEvent(value: unknown): BindingObserveEvent {
 			"observe event mutationSequence must be a non-negative safe integer",
 		);
 	}
+	const hasResult = event.result !== undefined;
+	const hasDelta = event.delta !== undefined;
+	if (hasResult === hasDelta) {
+		throw protocolError("observe event requires exactly one of result or delta");
+	}
+	const sequence = event.sequence;
 	return {
-		sequence: event.sequence,
+		sequence,
 		mutationSequence: event.mutationSequence,
-		rows: decodeExecuteResult(event.result),
+		rows: hasResult
+			? decodeExecuteResult(event.result)
+			: applyObserveBlobDelta(event.delta, sequence, base),
+	};
+}
+
+function applyObserveBlobDelta(
+	value: unknown,
+	sequence: number,
+	base: BindingObserveEvent | undefined,
+): BindingExecuteResult {
+	const delta = record(value, "observe event delta");
+	if (delta.kind !== "single-blob-splice") {
+		throw protocolError(`unknown observe delta kind: ${String(delta.kind)}`);
+	}
+	const baseSequence = nonNegativeSafeInteger(
+		delta.baseSequence,
+		"observe delta baseSequence",
+	);
+	const prefixBytes = nonNegativeSafeInteger(
+		delta.prefixBytes,
+		"observe delta prefixBytes",
+	);
+	const suffixBytes = nonNegativeSafeInteger(
+		delta.suffixBytes,
+		"observe delta suffixBytes",
+	);
+	if (typeof delta.insertBase64 !== "string") {
+		throw protocolError("observe delta insertBase64 must be a string");
+	}
+	if (
+		base === undefined ||
+		base.sequence !== baseSequence ||
+		sequence !== baseSequence + 1
+	) {
+		throw protocolError("observe blob delta does not match its transport base");
+	}
+	const baseValue = base.rows.rows[0]?.[0];
+	if (
+		base.rows.columns.length !== 1 ||
+		base.rows.columns[0] !== "data" ||
+		base.rows.rows.length !== 1 ||
+		base.rows.rows[0]?.length !== 1 ||
+		base.rows.rowsAffected !== 0 ||
+		base.rows.notices.length !== 0 ||
+		baseValue?.kind !== "blob"
+	) {
+		throw protocolError("observe blob delta base is not a point blob result");
+	}
+	if (prefixBytes + suffixBytes > baseValue.blob.byteLength) {
+		throw protocolError("observe blob delta prefix and suffix overlap");
+	}
+	const insert = base64ToBytes(delta.insertBase64);
+	const nextLength = prefixBytes + insert.byteLength + suffixBytes;
+	if (!Number.isSafeInteger(nextLength)) {
+		throw protocolError("observe blob delta result is too large");
+	}
+	let blob: Uint8Array;
+	try {
+		blob = new Uint8Array(nextLength);
+	} catch {
+		throw protocolError("observe blob delta result is too large");
+	}
+	blob.set(baseValue.blob.subarray(0, prefixBytes), 0);
+	blob.set(insert, prefixBytes);
+	blob.set(
+		baseValue.blob.subarray(baseValue.blob.byteLength - suffixBytes),
+		prefixBytes + insert.byteLength,
+	);
+	return {
+		columns: ["data"],
+		rows: [[{ kind: "blob", value: null, blob }]],
+		rowsAffected: 0,
+		notices: [],
 	};
 }
 
@@ -320,6 +415,17 @@ function stringArray(value: unknown, description: string): string[] {
 		throw protocolError(`${description} must be an array of strings`);
 	}
 	return [...value];
+}
+
+function nonNegativeSafeInteger(value: unknown, description: string): number {
+	if (
+		typeof value !== "number" ||
+		!Number.isSafeInteger(value) ||
+		value < 0
+	) {
+		throw protocolError(`${description} must be a non-negative safe integer`);
+	}
+	return value;
 }
 
 function assertJsonValue(
