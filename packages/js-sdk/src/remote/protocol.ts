@@ -16,21 +16,35 @@ export type WireValue =
 	| { kind: "json"; value: unknown }
 	| { kind: "blob"; base64: string };
 
+export type WireRequestBlobSplice = {
+	kind: "blob-splice";
+	baseSha256: string;
+	resultSha256: string;
+	prefixBytes: number;
+	suffixBytes: number;
+	insertBase64: string;
+};
+
+export type WireRequestValue = WireValue | WireRequestBlobSplice;
+
 export type RemoteHandshake = {
 	protocolVersion: number;
 	activeBranchId: string;
 	sessionId: string;
+	requestBlobSplice: boolean;
 };
 
 export type RemoteExecuteRequest = {
 	sql: string;
-	params: WireValue[];
+	params: WireRequestValue[];
 	options?: { originKey?: string };
+	cacheBlobs?: true;
 };
 
 export type RemoteExecuteBatchRequest = {
-	statements: Array<{ sql: string; params: WireValue[] }>;
+	statements: Array<{ sql: string; params: WireRequestValue[] }>;
 	options?: { originKey?: string };
+	cacheBlobs?: true;
 };
 
 export type RemoteExecuteResponse = {
@@ -40,7 +54,10 @@ export type RemoteExecuteResponse = {
 	notices: Array<{ code: string; message: string; hint?: string }>;
 };
 
-export type RemoteObserveRequest = Omit<RemoteExecuteRequest, "options">;
+export type RemoteObserveRequest = {
+	sql: string;
+	params: WireValue[];
+};
 
 export type RemoteObserveSubscription = RemoteObserveRequest & {
 	id: string;
@@ -198,6 +215,9 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 		protocolVersion: REMOTE_PROTOCOL_VERSION,
 		activeBranchId: handshake.activeBranchId,
 		sessionId: handshake.sessionId,
+		requestBlobSplice:
+			isRecord(handshake.capabilities) &&
+			handshake.capabilities.requestBlobSplice === true,
 	};
 }
 
@@ -369,6 +389,10 @@ export function record(
 		throw protocolError(`${description} must be an object`);
 	}
 	return value as Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function decodeWireValue(value: unknown): NativeLixValue {
