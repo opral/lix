@@ -328,6 +328,9 @@ fn maybe_print_write_accounting(runtime: &tokio::runtime::Runtime) {
         let started = Instant::now();
         rows_affected += match operation.as_str() {
             "overwrite" => runtime.block_on(fixture.upload_overwrite_file()),
+            "overwrite-static-metadata" => {
+                runtime.block_on(fixture.upload_overwrite_file_static_metadata())
+            }
             "insert" => runtime.block_on(fixture.upload_new_file()),
             other => panic!("unsupported LIX_SLATEDB_WRITE_OPERATION {other:?}"),
         };
@@ -639,6 +642,25 @@ impl UploadBenchFixture {
             )
             .await
             .expect("overwrite benchmark file");
+        result.rows_affected()
+    }
+
+    async fn upload_overwrite_file_static_metadata(&self) -> u64 {
+        let version = self.next_upload_version.fetch_add(1, Ordering::Relaxed);
+        let result = self
+            .session
+            .execute(
+                "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
+                 ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+                 lixcol_metadata = excluded.lixcol_metadata",
+                &[
+                    Value::Text(self.upload_path.clone()),
+                    Value::Blob(upload_file_bytes(version)),
+                    file_metadata(),
+                ],
+            )
+            .await
+            .expect("overwrite benchmark file with unchanged metadata");
         result.rows_affected()
     }
 
