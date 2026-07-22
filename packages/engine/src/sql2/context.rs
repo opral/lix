@@ -25,7 +25,7 @@ use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::wasm::UnsupportedWasmRuntime;
 
-use super::SessionFileViews;
+use super::{PublicCatalog, SessionFileViews};
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
@@ -90,6 +90,11 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     fn active_branch_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+    fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
+        Ok(Arc::new(PublicCatalog::from_visible_schemas(
+            &self.list_visible_schemas()?,
+        )?))
+    }
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
     }
@@ -170,8 +175,8 @@ impl SqlWriteContext {
         Arc::new(WriteContextBlobDataReader::new(self.clone()))
     }
 
-    pub(crate) fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        unsafe { self.ptr.0.as_ref().list_visible_schemas() }
+    pub(crate) fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
+        unsafe { self.ptr.0.as_ref().public_catalog() }
     }
 
     pub(crate) fn active_branch_id(&self) -> String {

@@ -175,8 +175,12 @@ mod tests {
             .as_ref()
             .ok()
             .and_then(|(_result, path)| *path);
-        let staged_rows =
-            probe_transaction_state(&mut transaction, case.probes, &active_branch_id).await;
+        let staged_rows = Box::pin(probe_transaction_state(
+            &mut transaction,
+            case.probes,
+            &active_branch_id,
+        ))
+        .await;
 
         match execution_result {
             Ok(_) => transaction
@@ -247,8 +251,12 @@ mod tests {
             });
         }
 
-        let staged_rows =
-            probe_transaction_state(&mut transaction, case.probes, &active_branch_id).await;
+        let staged_rows = Box::pin(probe_transaction_state(
+            &mut transaction,
+            case.probes,
+            &active_branch_id,
+        ))
+        .await;
         transaction
             .commit()
             .await

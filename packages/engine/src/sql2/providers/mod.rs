@@ -447,7 +447,7 @@ pub(crate) async fn register_write(
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
-    let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
+    let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(
         session,
         write_ctx,
@@ -472,9 +472,9 @@ where
     C: SqlExecutionContext + ?Sized,
 {
     // Both capabilities project the same transaction-scoped schema snapshot.
-    // Build that immutable metadata once, then install read-only providers from
-    // the committed read capability and writable providers from the overlay.
-    let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
+    // Reuse that immutable metadata, then install read-only providers from the
+    // committed read capability and writable providers from the overlay.
+    let catalog = write_ctx.public_catalog()?;
     register_read_from_catalog(
         session,
         read_ctx,

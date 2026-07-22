@@ -202,7 +202,7 @@ where
                 "observe requires a non-empty SQL string",
             ));
         }
-        let statement = sql2::parse_statement(sql)?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,

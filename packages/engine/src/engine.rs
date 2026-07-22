@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
-use crate::catalog::CatalogContext;
+use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
@@ -14,6 +14,7 @@ use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
 use crate::session::SessionContext;
+use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
@@ -31,6 +32,7 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
     branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
+    sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
     observe_coordinator: Arc<ObserveCoordinator>,
@@ -137,6 +139,7 @@ where
             live_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
+            sql_planning_cache: Arc::new(SqlPlanningCache::default()),
             deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
             collaboration_write_gate: Arc::new(tokio::sync::Mutex::new(())),
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
@@ -185,6 +188,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
             Arc::clone(&self.collaboration_write_gate),
             Arc::clone(&self.observe_coordinator),
@@ -203,6 +207,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
             Arc::clone(&self.collaboration_write_gate),
             Arc::clone(&self.observe_coordinator),

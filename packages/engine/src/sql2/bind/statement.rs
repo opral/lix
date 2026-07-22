@@ -28,15 +28,24 @@ use super::write::{
     BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
 };
 
+#[cfg(test)]
 pub(crate) fn bind_statement(
     statement: &DataFusionStatement,
     visible_schemas: &[JsonValue],
     active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
     let catalog = PublicCatalog::from_visible_schemas(visible_schemas)?;
+    bind_statement_with_catalog(statement, &catalog, active_branch_id)
+}
+
+pub(crate) fn bind_statement_with_catalog(
+    statement: &DataFusionStatement,
+    catalog: &PublicCatalog,
+    active_branch_id: &str,
+) -> Result<BoundWrite, LixError> {
     match statement {
         DataFusionStatement::Statement(statement) => {
-            bind_sql_statement(statement, &catalog, active_branch_id)
+            bind_sql_statement(statement, catalog, active_branch_id)
         }
         DataFusionStatement::Explain(_) => Err(super::error::unsupported(
             "EXPLAIN statements are not supported by SQL write binding",

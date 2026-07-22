@@ -43,7 +43,8 @@ pub(crate) async fn create_write_logical_plan(
 }
 
 #[expect(clippy::needless_pass_by_ref_mut)]
-pub(crate) async fn create_write_logical_plan_from_parsed(
+#[cfg(test)]
+async fn create_write_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
@@ -51,9 +52,25 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
     let bound_write =
         crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_branch_id())?;
     let logical_write = crate::sql2::plan_write(bound_write)?;
-    Ok(SqlLogicalPlan::Write(WriteLogicalPlan {
+    Ok(create_write_logical_plan_from_template(logical_write))
+}
+
+pub(crate) fn create_write_plan_template_from_parsed(
+    statement: &DataFusionStatement,
+    catalog: &crate::sql2::PublicCatalog,
+    active_branch_id: &str,
+) -> Result<LogicalWritePlan, LixError> {
+    let bound_write =
+        crate::sql2::bind_statement_with_catalog(statement, catalog, active_branch_id)?;
+    crate::sql2::plan_write(bound_write)
+}
+
+pub(crate) fn create_write_logical_plan_from_template(
+    logical_write: LogicalWritePlan,
+) -> SqlLogicalPlan {
+    SqlLogicalPlan::Write(WriteLogicalPlan {
         plan: logical_write,
-    }))
+    })
 }
 
 #[cfg(test)]

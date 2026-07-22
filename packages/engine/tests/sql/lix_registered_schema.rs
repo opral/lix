@@ -98,6 +98,78 @@ simulation_test!(
 );
 
 simulation_test!(
+    sql_catalog_templates_follow_committed_transaction_snapshots,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        transaction
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema registration should stage");
+
+        let insert_sql = "INSERT INTO sql_template_snapshot_note (id, text) VALUES ($1, $2)";
+        transaction
+            .execute(
+                insert_sql,
+                &[
+                    Value::Text("note-1".to_string()),
+                    Value::Text("after commit".to_string()),
+                ],
+            )
+            .await
+            .expect_err("SQL binding should keep the transaction-opening catalog snapshot");
+
+        transaction
+            .commit()
+            .await
+            .expect("schema transaction should commit");
+
+        let inserted = session
+            .execute(
+                insert_sql,
+                &[
+                    Value::Text("note-1".to_string()),
+                    Value::Text("after commit".to_string()),
+                ],
+            )
+            .await
+            .expect("the next transaction should bind against the committed catalog");
+        assert_eq!(inserted.rows_affected(), 1);
+
+        let selected = session
+            .execute(
+                "SELECT text FROM sql_template_snapshot_note WHERE id = $1",
+                &[Value::Text("note-1".to_string())],
+            )
+            .await
+            .expect("new entity surface should be readable after commit");
+        assert_rows_eq(
+            selected,
+            vec![vec![Value::Text("after commit".to_string())]],
+        );
+    }
+);
+
+simulation_test!(
     untracked_registered_schema_does_not_authorize_tracked_state_write,
     |sim| async move {
         let engine = sim.boot_engine().await;
