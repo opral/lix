@@ -17,7 +17,7 @@ use lix_engine::storage::{
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rocksdb::Snapshot;
-use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
+use rocksdb::{BlockBasedOptions, DB, Direction, IteratorMode, Options, WriteBatch};
 use tempfile::TempDir;
 
 const OWNED_VALUE_MIN_BYTES: usize = 64 * 1024;
@@ -464,6 +464,11 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
     options.create_if_missing(true);
     options.set_use_fsync(false);
     options.set_write_buffer_size(64 * 1024 * 1024);
+    let mut table_options = BlockBasedOptions::default();
+    // Full whole-key filters let missing point reads skip unrelated SST data.
+    table_options.set_bloom_filter(8.0, false);
+    table_options.set_optimize_filters_for_memory(true);
+    options.set_block_based_table_factory(&table_options);
     DB::open(&options, path).map_err(rocksdb_error)
 }
 
