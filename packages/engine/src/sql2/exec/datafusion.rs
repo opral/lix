@@ -4976,10 +4976,9 @@ mod tests {
                 .expect_err("duplicate VALUES paths should fail");
 
             assert_eq!(error.code, LixError::CODE_UNIQUE, "{sql}");
-            // Only DO UPDATE enters the indexed existing-path route before the
-            // generic scan rejects duplicate missing paths.
-            let expected_scans = if sql.contains("DO UPDATE") { 2 } else { 1 };
-            assert_eq!(scans.load(Ordering::SeqCst), expected_scans, "{sql}");
+            // Existing and missing path conflicts are both resolved from the
+            // indexed route without a second generic scan.
+            assert_eq!(scans.load(Ordering::SeqCst), 1, "{sql}");
             assert!(
                 staged_writes
                     .lock()
