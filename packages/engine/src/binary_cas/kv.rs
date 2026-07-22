@@ -176,7 +176,8 @@ async fn get_one(
         .into_iter()
         .next()
         .flatten()
-        .and_then(full_value))
+        .and_then(full_value)
+        .map(|bytes| bytes.to_vec()))
 }
 
 async fn scan_all_values(
@@ -207,7 +208,8 @@ async fn scan_all_values(
             page.value
                 .entries
                 .into_iter()
-                .filter_map(|entry| full_value(entry.value)),
+                .filter_map(|entry| full_value(entry.value))
+                .map(|bytes| bytes.to_vec()),
         );
         if !page.value.has_more || resume_after.is_none() {
             break;
@@ -327,7 +329,7 @@ pub(crate) async fn load_bytes_many(
 async fn load_chunk_rows(
     store: &impl StorageAdapterRead,
     hashes: &[BlobHash],
-) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+) -> Result<Vec<Option<Bytes>>, LixError> {
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
@@ -343,7 +345,7 @@ async fn point_values(
     store: &impl StorageAdapterRead,
     space: StorageSpace,
     keys: Vec<Vec<u8>>,
-) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+) -> Result<Vec<Option<Bytes>>, LixError> {
     let keys = keys
         .into_iter()
         .map(|key| StorageKey(Bytes::from(key)))
@@ -368,16 +370,16 @@ fn value(bytes: Vec<u8>) -> StorageValue {
     }
 }
 
-fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
     match value {
-        StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
+        StorageProjectedValue::FullValue(bytes) => Some(bytes),
         StorageProjectedValue::KeyOnly => None,
     }
 }
 
 fn assemble_blob_bytes(
     metadata: &BlobMetadata,
-    chunk_rows_by_hash: &HashMap<BlobHash, Option<Vec<u8>>>,
+    chunk_rows_by_hash: &HashMap<BlobHash, Option<Bytes>>,
     chunked_manifest: Option<&Vec<KvBlobManifestChunk>>,
 ) -> Result<Vec<u8>, LixError> {
     let expected_blob_size = persisted_size_to_usize(metadata.size_bytes, "binary CAS blob")?;
@@ -403,7 +405,7 @@ fn assemble_blob_bytes(
             )?;
             if cfg!(debug_assertions)
                 && *chunk_hash != metadata.hash
-                && BlobHash::from_content(&chunk) != metadata.hash
+                && BlobHash::from_content(chunk) != metadata.hash
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -413,7 +415,7 @@ fn assemble_blob_bytes(
                     ),
                 ));
             }
-            chunk
+            chunk.to_vec()
         }
         BlobLayout::Chunked { chunk_count } => {
             let Some(manifest_chunks) = chunked_manifest else {
@@ -447,7 +449,7 @@ fn assemble_blob_bytes(
                     chunk_hash,
                     expected_chunk_size,
                 )?;
-                out.extend_from_slice(&chunk);
+                out.extend_from_slice(chunk);
             }
             if out.len() != expected_blob_size {
                 return Err(LixError::new(
@@ -476,11 +478,11 @@ fn assemble_blob_bytes(
 }
 
 fn decode_chunk_from_map(
-    chunk_rows_by_hash: &HashMap<BlobHash, Option<Vec<u8>>>,
+    chunk_rows_by_hash: &HashMap<BlobHash, Option<Bytes>>,
     blob_hash: BlobHash,
     chunk_hash: BlobHash,
     expected_chunk_size: usize,
-) -> Result<Vec<u8>, LixError> {
+) -> Result<&[u8], LixError> {
     let Some(Some(chunk_bytes)) = chunk_rows_by_hash.get(&chunk_hash) else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -499,7 +501,7 @@ fn decode_and_verify_chunk(
     expected_chunk_size: usize,
     blob_hash: BlobHash,
     chunk_hash: BlobHash,
-) -> Result<Vec<u8>, LixError> {
+) -> Result<&[u8], LixError> {
     let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
     if uncompressed_len != expected_chunk_size as u64 {
         return Err(LixError::new(
@@ -536,7 +538,7 @@ fn decode_and_verify_chunk(
             ),
         ));
     }
-    Ok(chunk_payload.to_vec())
+    Ok(chunk_payload)
 }
 
 #[allow(dead_code)]
