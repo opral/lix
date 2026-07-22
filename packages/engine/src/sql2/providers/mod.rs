@@ -24,7 +24,7 @@ mod spec;
 mod upsert;
 mod values;
 
-use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
+use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
@@ -115,10 +115,42 @@ pub(crate) async fn register_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
+    register_read_from_catalog(session, ctx, branch_ref, &catalog, ReadProviderScope::All).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadProviderScope {
+    All,
+    ReadOnly,
+}
+
+impl ReadProviderScope {
+    fn includes(self, surface: &PublicSurfaceContract) -> bool {
+        self == Self::All || !is_write_surface(surface)
+    }
+}
+
+fn is_write_surface(surface: &PublicSurfaceContract) -> bool {
+    surface.capabilities.insert || surface.capabilities.update || surface.capabilities.delete
+}
+
+async fn register_read_from_catalog<C>(
+    session: &SessionContext,
+    ctx: &C,
+    branch_ref: Arc<dyn BranchRefReader>,
+    catalog: &PublicCatalog,
+    scope: ReadProviderScope,
+) -> Result<(), LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let history_query_source = ctx.history_query_source();
     let changelog_query_source = ctx.changelog_query_source();
-    let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
     for surface in catalog.surfaces() {
+        if !scope.includes(surface) {
+            continue;
+        }
         match &surface.kind {
             PublicSurfaceKind::LixState => {
                 lix_state::register_lix_state_active_provider(
@@ -249,7 +281,8 @@ where
         Arc::clone(&branch_ref),
         Arc::new(tokio::sync::Mutex::new(ctx.commit_graph())),
         history_query_source,
-        &catalog,
+        catalog,
+        scope == ReadProviderScope::All,
     )
     .await?;
 
@@ -263,10 +296,45 @@ pub(crate) async fn register_write(
     options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
     let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
+    register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog).await
+}
+
+pub(crate) async fn register_transaction<C>(
+    session: &SessionContext,
+    read_ctx: &C,
+    read_branch_ref: Arc<dyn BranchRefReader>,
+    write_ctx: SqlWriteContext,
+    write_branch_ref: Arc<dyn BranchRefReader>,
+    options: SqlWriteSessionOptions,
+) -> Result<(), LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    // Both capabilities project the same transaction-scoped schema snapshot.
+    // Build that immutable metadata once, then install read-only providers from
+    // the committed read capability and writable providers from the overlay.
+    let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
+    register_read_from_catalog(
+        session,
+        read_ctx,
+        read_branch_ref,
+        &catalog,
+        ReadProviderScope::ReadOnly,
+    )
+    .await?;
+    register_write_from_catalog(session, write_ctx, write_branch_ref, options, &catalog).await
+}
+
+async fn register_write_from_catalog(
+    session: &SessionContext,
+    write_ctx: SqlWriteContext,
+    branch_ref: Arc<dyn BranchRefReader>,
+    options: SqlWriteSessionOptions,
+    catalog: &PublicCatalog,
+) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
         match &surface.kind {
             PublicSurfaceKind::LixState => {
-                replace_registered_table(session, &surface.name)?;
                 lix_state::register_lix_state_active_write_provider(
                     session,
                     &surface.name,
@@ -276,7 +344,6 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::LixStateByBranch => {
-                replace_registered_table(session, &surface.name)?;
                 lix_state::register_lix_state_by_branch_write_provider(
                     session,
                     &surface.name,
@@ -286,7 +353,6 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::Branch => {
-                replace_registered_table(session, &surface.name)?;
                 branch::register_write_provider(
                     session,
                     &surface.name,
@@ -296,7 +362,6 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::File => {
-                replace_registered_table(session, &surface.name)?;
                 file::register_active_write_provider(
                     session,
                     &surface.name,
@@ -307,7 +372,6 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::FileByBranch => {
-                replace_registered_table(session, &surface.name)?;
                 file::register_by_branch_write_provider(
                     session,
                     &surface.name,
@@ -318,7 +382,6 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::Directory => {
-                replace_registered_table(session, &surface.name)?;
                 directory::register_active_write_provider(
                     session,
                     &surface.name,
@@ -328,7 +391,6 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::DirectoryByBranch => {
-                replace_registered_table(session, &surface.name)?;
                 directory::register_by_branch_write_provider(
                     session,
                     &surface.name,
@@ -346,28 +408,8 @@ pub(crate) async fn register_write(
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
-    for surface in catalog.surfaces() {
-        if matches!(
-            surface.kind,
-            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
-        ) {
-            replace_registered_table(session, &surface.name)?;
-        }
-    }
-    entity::register_entity_write_providers(session, write_ctx.clone(), branch_ref, &catalog)
-        .await?;
+    entity::register_entity_write_providers(session, write_ctx, branch_ref, catalog).await?;
     Ok(())
-}
-
-fn replace_registered_table(session: &SessionContext, name: &str) -> Result<(), LixError> {
-    match session.deregister_table(name) {
-        Ok(_) => Ok(()),
-        Err(error) if error.to_string().contains("not found") => Ok(()),
-        Err(error) => Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("sql2 DataFusion error: {error}"),
-        )),
-    }
 }
 
 #[cfg(test)]
@@ -398,9 +440,67 @@ mod tests {
     };
 
     use super::{
-        branch, change, directory, directory_history, entity, file, file_history, history,
-        lix_state,
+        ReadProviderScope, branch, change, directory, directory_history, entity, file,
+        file_history, history, is_write_surface, lix_state,
     };
+
+    #[test]
+    fn transaction_registration_partitions_provider_construction_once() {
+        let schema = json!({
+            "x-lix-key": "phase8_entity",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } }
+        });
+        let catalog = PublicCatalog::from_visible_schemas(&[schema]).expect("catalog should build");
+
+        let read_only = catalog
+            .surfaces()
+            .filter(|surface| ReadProviderScope::ReadOnly.includes(surface))
+            .map(|surface| surface.name.as_str())
+            .collect::<Vec<_>>();
+        let writable = catalog
+            .surfaces()
+            .filter(|surface| is_write_surface(surface))
+            .map(|surface| surface.name.as_str())
+            .collect::<Vec<_>>();
+        let all_read = catalog
+            .surfaces()
+            .filter(|surface| ReadProviderScope::All.includes(surface))
+            .count();
+
+        assert_eq!(
+            read_only,
+            vec![
+                "lix_change",
+                "lix_directory_history",
+                "lix_file_history",
+                "lix_state_history",
+                "phase8_entity_history",
+            ]
+        );
+        assert_eq!(
+            writable,
+            vec![
+                "lix_branch",
+                "lix_directory",
+                "lix_directory_by_branch",
+                "lix_file",
+                "lix_file_by_branch",
+                "lix_state",
+                "lix_state_by_branch",
+                "phase8_entity",
+                "phase8_entity_by_branch",
+            ]
+        );
+        assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
+        assert_eq!(all_read + writable.len(), 23, "previous construction count");
+        assert_eq!(
+            read_only.len() + writable.len(),
+            14,
+            "new construction count"
+        );
+    }
 
     #[test]
     fn provider_history_schemas_match_catalog_contract_order() {
@@ -507,6 +607,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(Box::new(EmptyCommitGraphReader))),
             empty_history_query_source().await,
             &catalog,
+            true,
         )
         .await
         .expect("entity providers should register");
