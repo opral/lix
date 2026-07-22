@@ -67,7 +67,8 @@ use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::WasmComponentInstance;
 use crate::{
-    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, parse_row_metadata_value, serialize_row_metadata,
+    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
+    serialize_row_metadata,
 };
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -573,6 +574,67 @@ pub(crate) async fn execute_exact_lix_file_read(
             .collect::<Vec<_>>(),
         &[batch],
     )
+}
+
+/// Executes Lixray's exact active-branch file batch without constructing a
+/// DataFusion catalog, plan, or Arrow result batch. Keep this separate from
+/// the established point-read path so unrelated file queries remain
+/// byte-for-byte on their existing implementation.
+pub(crate) async fn execute_exact_lix_file_batch_read(
+    active_branch_id: &str,
+    live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    session_file_views: Option<SessionFileViews>,
+    paths: &BTreeSet<String>,
+) -> Result<SqlQueryResult, LixError> {
+    let base_schema = lix_file_schema();
+    let schema = Arc::new(Schema::new(vec![
+        base_schema
+            .field_with_name("path")
+            .expect("lix_file schema should have path")
+            .clone(),
+        base_schema
+            .field_with_name("data")
+            .expect("lix_file schema should have data")
+            .clone(),
+    ]));
+    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
+
+    let index = filesystem_path_index
+        .path_index(&FilesystemPathIndexRequest::new(
+            request.filter.branch_ids.clone(),
+        ))
+        .await?;
+    let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
+    let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let plugin_render = if prepared.needs_plugin_render(true) {
+        plugin_render_context_for_lix_file_scan(live_state, &request, plugin_host, &prepared, false)
+            .await?
+            .map(|context| context.with_session_file_views(session_file_views))
+    } else {
+        None
+    };
+
+    // No relational operators remain after exact path selection. Move owned
+    // blobs into the result instead of packing them into Arrow only for
+    // DataFusion to copy them back into row values.
+    let rows = exact_path_data_rows_from_prepared(&blob_reader, plugin_render, prepared).await?;
+    Ok(SqlQueryResult {
+        columns: vec!["path".to_string(), "data".to_string()],
+        rows,
+        notices: Vec::new(),
+    })
 }
 
 fn lix_file_dml_source_state(
@@ -3855,6 +3917,56 @@ async fn lix_file_record_batch_from_prepared(
     }
 
     columns.into_record_batch(schema)
+}
+
+async fn exact_path_data_rows_from_prepared(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_render: Option<PluginRenderContext>,
+    prepared: PreparedLixFileRows,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let PreparedLixFileRows {
+        mut file_rows,
+        blob_rows,
+        mut file_paths,
+        path_ordered_file_keys,
+    } = prepared;
+    let mut blob_bytes = load_blob_bytes_for_files(blob_reader, &file_rows, &blob_rows).await?;
+    let file_keys =
+        path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect::<Vec<_>>());
+    let mut rows = Vec::with_capacity(file_keys.len());
+    let mut rendered_plugin_bytes = match &plugin_render {
+        Some(plugin_render) => {
+            render_plugin_files_for_sql(
+                plugin_render,
+                blob_reader,
+                &file_keys,
+                &file_rows,
+                &blob_rows,
+                &file_paths,
+            )
+            .await?
+        }
+        None => BTreeMap::new(),
+    };
+    for key in file_keys {
+        let file = file_rows
+            .remove(&key)
+            .expect("prepared lix_file order should reference a descriptor");
+        let path = file_paths
+            .remove(&key)
+            .expect("prepared lix_file descriptor should have a path");
+        let blob_key = file.blob_ref_key();
+        let data = match blob_bytes.take(&blob_key) {
+            Some(data) => data,
+            None => Some(rendered_plugin_bytes.remove(&key).unwrap_or_default()),
+        };
+        rows.push(vec![
+            Value::Text(path),
+            data.map_or(Value::Null, Value::Blob),
+        ]);
+    }
+
+    Ok(rows)
 }
 
 #[derive(Default)]
