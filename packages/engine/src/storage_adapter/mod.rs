@@ -22,11 +22,12 @@ mod write_set;
 mod conformance;
 
 pub use crate::storage::{
-    CoreProjection as StorageCoreProjection, GetOptions as StorageGetOptions, Key as StorageKey,
-    KeyRange as StorageKeyRange, Memory, MemoryRead, MemoryWrite, Prefix as StoragePrefix,
-    ProjectedValue as StorageProjectedValue, ReadEntry as StorageReadEntry,
-    ReadOptions as StorageReadOptions, ScanOptions as StorageScanOptions,
-    SpaceId as StorageSpaceId, Storage, StorageError, StorageRead, StoredValue as StorageValue,
+    CoreProjection as StorageCoreProjection, GetManyResult as StorageGetManyResult,
+    GetOptions as StorageGetOptions, Key as StorageKey, KeyRange as StorageKeyRange, Memory,
+    MemoryRead, MemoryWrite, Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
+    ReadEntry as StorageReadEntry, ReadOptions as StorageReadOptions,
+    ScanChunk as StorageScanChunk, ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId,
+    Storage, StorageError, StorageRead, StoredValue as StorageValue,
     WriteOptions as StorageWriteOptions,
 };
 

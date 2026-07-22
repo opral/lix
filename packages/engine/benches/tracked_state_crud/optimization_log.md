@@ -2030,8 +2030,9 @@ The v3 writer emits one deterministic format:
   beside live leaves.
 
 The first counterfactual used two fixed 8-byte timestamp fields. It looked good
-on the normal 2026 workload, but was rejected before publication: stacked on
-#653 it increased SlateDB singleton update/delete WAL bytes by about 9% because
+on the normal 2026 workload, but was rejected before publication: when stacked
+on PR #653, it increased SlateDB singleton update/delete WAL bytes by about 9%
+because
 that deterministic fixture uses compact epoch-like timestamps. The width-tag
 form used here is never larger than that fixed representation and is smaller for
 both epoch-like and ordinary current timestamps.
