@@ -1,5 +1,30 @@
 import { expect, test, vi } from "vitest";
-import { decodeExecuteResult, encodeWireValue } from "./protocol.js";
+import {
+	decodeExecuteResult,
+	decodeHandshake,
+	decodeObserveEvent,
+	encodeWireValue,
+} from "./protocol.js";
+
+test.each([
+	[undefined, false],
+	[{}, false],
+	[{ requestBlobSplice: false }, false],
+	[{ requestBlobSplice: "true" }, false],
+	[{ requestBlobSplice: true }, true],
+])(
+	"remote handshake negotiates only the exact blob splice capability: %j",
+	(capabilities, expected) => {
+		expect(
+			decodeHandshake({
+				protocolVersion: 1,
+				activeBranchId: "main-id",
+				sessionId: "session-1",
+				...(capabilities === undefined ? {} : { capabilities }),
+			}).requestBlobSplice,
+		).toBe(expected);
+	},
+);
 
 test("remote blobs use native typed-array base64 when available", () => {
 	const prototype = Uint8Array.prototype as Uint8Array & {
@@ -126,3 +151,47 @@ function restoreProperty(
 		Reflect.deleteProperty(target, key);
 	}
 }
+test("observe blob deltas fail closed without an exact non-overlapping base", () => {
+	const full = {
+		sequence: 0,
+		mutationSequence: 0,
+		result: {
+			columns: ["data"],
+			rows: [[{ kind: "blob", base64: "YWJjZGVm" }]],
+			rowsAffected: 0,
+			notices: [],
+		},
+	};
+	const base = decodeObserveEvent(full);
+	const delta = {
+		sequence: 1,
+		mutationSequence: 1,
+		delta: {
+			kind: "single-blob-splice",
+			baseSequence: 0,
+			prefixBytes: 2,
+			suffixBytes: 2,
+			insertBase64: "WA==",
+		},
+	};
+	expect(decodeObserveEvent(delta, base).rows.rows[0]?.[0]).toEqual({
+		kind: "blob",
+		value: null,
+		blob: new TextEncoder().encode("abXef"),
+	});
+	expect(() => decodeObserveEvent(delta)).toThrow(
+		"observe blob delta does not match its transport base",
+	);
+	expect(() =>
+		decodeObserveEvent(
+			{
+				...delta,
+				delta: { ...delta.delta, prefixBytes: 5, suffixBytes: 2 },
+			},
+			base,
+		),
+	).toThrow("observe blob delta prefix and suffix overlap");
+	expect(() => decodeObserveEvent({ ...delta, result: full.result }, base)).toThrow(
+		"observe event requires exactly one of result or delta",
+	);
+});

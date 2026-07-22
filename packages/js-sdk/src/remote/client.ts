@@ -30,12 +30,24 @@ import {
 	REMOTE_PROTOCOL_PATH,
 	remoteError,
 	type RemoteObserveSubscription,
+	type WireRequestBlobSplice,
+	type WireRequestValue,
+	type WireValue,
 } from "./protocol.js";
 import { readSseEvents } from "./sse.js";
 
 const OBSERVE_RETRY_BASE_MS = 100;
 const OBSERVE_RETRY_MAX_MS = 5_000;
 const REMOTE_SESSION_HEADER = "Lix-Session-Id";
+const REQUEST_BLOB_DELTA_MIN_BYTES = 32 * 1024;
+const REQUEST_BLOB_DELTA_MIN_WIRE_RATIO = 0.9;
+const REQUEST_BLOB_BASE_MAX_ENTRIES = 8;
+const REQUEST_BLOB_BASE_MAX_BYTES = 2 * 1024 * 1024;
+const REMOTE_BLOB_BASE_MISSING = "LIX_REMOTE_BLOB_BASE_MISSING";
+const WIRE_BLOB_JSON_ENVELOPE_BYTES = JSON.stringify({
+	kind: "blob",
+	base64: "",
+}).length;
 const MIN_COMPRESSIBLE_JSON_BYTES = 32 * 1024;
 const COMPRESSION_SAMPLE_BYTES = 32 * 1024;
 const MAX_COMPRESSION_SAMPLE_RATIO = 0.7;
@@ -54,7 +66,10 @@ class RemoteLixBinding implements LixBinding {
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #observationHub: RemoteObservationHub;
+	readonly #requestBlobBases = new Map<string, RequestBlobBase>();
 	#sessionId: string | undefined;
+	#supportsRequestBlobSplice = false;
+	#requestBlobBaseBytes = 0;
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
@@ -93,6 +108,7 @@ class RemoteLixBinding implements LixBinding {
 			await this.#requestJson("", { method: "GET" }),
 		);
 		this.#sessionId = handshake.sessionId;
+		this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
 	}
 
 	async execute(
@@ -101,18 +117,30 @@ class RemoteLixBinding implements LixBinding {
 		options?: ExecuteOptions,
 	): Promise<BindingExecuteResult> {
 		this.#assertOpen();
-		return this.#enqueue(async () =>
-			decodeExecuteResult(
-				await this.#requestJson("execute", {
+		const snapshot = snapshotParams(params);
+		return this.#enqueue(async () => {
+			const prepared = await this.#prepareParams(
+				snapshot,
+				(index) => requestBlobSlot("execute", sql, index),
+			);
+			const request = (params: WireRequestValue[]) =>
+				this.#requestJson("execute", {
 					method: "POST",
 					body: JSON.stringify({
 						sql,
-						params: params.map(encodeWireValue),
+						params,
 						...(options === undefined ? {} : { options }),
+						...(prepared.cacheBlobs ? { cacheBlobs: true } : {}),
 					}),
-				}),
-			),
-		);
+				});
+			const value = await requestWithFullBlobFallback(
+				() => request(prepared.params),
+				prepared.hasDelta ? () => request(prepared.fullParams()) : undefined,
+			);
+			const result = decodeExecuteResult(value);
+			this.#commitRequestBlobBases(prepared.cacheUpdates);
+			return result;
+		});
 	}
 
 	async executeBatch(
@@ -120,21 +148,58 @@ class RemoteLixBinding implements LixBinding {
 		options?: LixBatchOptions,
 	): Promise<BindingExecuteResult[]> {
 		this.#assertOpen();
+		const snapshot = statements.map((statement) => ({
+			sql: statement.sql,
+			params: snapshotParams(statement.params),
+		}));
 		return this.#enqueue(async () => {
-			const value = await this.#requestJson("execute-batch", {
-				method: "POST",
-				body: JSON.stringify({
-					statements: statements.map((statement) => ({
-						sql: statement.sql,
-						params: statement.params.map(encodeWireValue),
-					})),
-					...(options === undefined ? {} : { options }),
-				}),
-			});
+			const preparedStatements = await Promise.all(
+				snapshot.map(async (statement, statementIndex) => ({
+					sql: statement.sql,
+					prepared: await this.#prepareParams(statement.params, (paramIndex) =>
+						requestBlobSlot(
+							"batch",
+							statement.sql,
+							paramIndex,
+							statementIndex,
+						),
+					),
+				})),
+			);
+			const cacheBlobs = preparedStatements.some(
+				(statement) => statement.prepared.cacheBlobs,
+			);
+			const hasDelta = preparedStatements.some(
+				(statement) => statement.prepared.hasDelta,
+			);
+			const request = (full: boolean) =>
+				this.#requestJson("execute-batch", {
+					method: "POST",
+					body: JSON.stringify({
+						statements: preparedStatements.map((statement) => ({
+							sql: statement.sql,
+							params: full
+								? statement.prepared.fullParams()
+								: statement.prepared.params,
+						})),
+						...(options === undefined ? {} : { options }),
+						...(cacheBlobs ? { cacheBlobs: true } : {}),
+					}),
+				});
+			const value = await requestWithFullBlobFallback(
+				() => request(false),
+				hasDelta ? () => request(true) : undefined,
+			);
 			if (!Array.isArray(value)) {
 				throw protocolError("execute batch response must be an array");
 			}
-			return value.map(decodeExecuteResult);
+			const results = value.map(decodeExecuteResult);
+			this.#commitRequestBlobBases(
+				preparedStatements.flatMap(
+					(statement) => statement.prepared.cacheUpdates,
+				),
+			);
+			return results;
 		});
 	}
 
@@ -342,6 +407,81 @@ class RemoteLixBinding implements LixBinding {
 		}
 	}
 
+	async #prepareParams(
+		params: NativeLixValue[],
+		slot: (index: number) => string,
+	): Promise<PreparedRequestParams> {
+		const prepared = await Promise.all(
+			params.map(async (param, index): Promise<PreparedRequestParam> => {
+				if (
+					!this.#supportsRequestBlobSplice ||
+					param.kind !== "blob" ||
+					param.blob.byteLength < REQUEST_BLOB_DELTA_MIN_BYTES ||
+					param.blob.byteLength > REQUEST_BLOB_BASE_MAX_BYTES
+				) {
+					return fullRequestParam(param);
+				}
+				const resultSha256 = await sha256Hex(param.blob);
+				if (resultSha256 === undefined) return fullRequestParam(param);
+				const cacheSlot = slot(index);
+				const cacheUpdate = {
+					slot: cacheSlot,
+					base: {
+						sha256: resultSha256,
+						bytes: param.blob,
+					},
+				};
+				const base = this.#requestBlobBases.get(cacheSlot);
+				if (base === undefined) {
+					return { ...fullRequestParam(param), cacheUpdate };
+				}
+				const delta = planBlobSplice(base, param.blob, resultSha256);
+				if (!blobSpliceIsAtLeastTenPercentSmaller(delta, param.blob)) {
+					return { ...fullRequestParam(param), cacheUpdate };
+				}
+				return {
+					value: encodeBlobSplice(delta),
+					full: () => encodeWireValue(param),
+					cacheUpdate,
+				};
+			}),
+		);
+		return {
+			params: prepared.map((param) => param.value),
+			fullParams: () => prepared.map((param) => param.full()),
+			cacheUpdates: prepared.flatMap((param) =>
+				param.cacheUpdate === undefined ? [] : [param.cacheUpdate],
+			),
+			cacheBlobs: prepared.some((param) => param.cacheUpdate !== undefined),
+			hasDelta: prepared.some((param) => param.value.kind === "blob-splice"),
+		};
+	}
+
+	#commitRequestBlobBases(updates: RequestBlobCacheUpdate[]): void {
+		for (const update of updates) {
+			const previous = this.#requestBlobBases.get(update.slot);
+			if (previous !== undefined) {
+				this.#requestBlobBaseBytes -= previous.bytes.byteLength;
+				this.#requestBlobBases.delete(update.slot);
+			}
+			if (update.base.bytes.byteLength > REQUEST_BLOB_BASE_MAX_BYTES) continue;
+			while (
+				this.#requestBlobBases.size >= REQUEST_BLOB_BASE_MAX_ENTRIES ||
+				this.#requestBlobBaseBytes + update.base.bytes.byteLength >
+					REQUEST_BLOB_BASE_MAX_BYTES
+			) {
+				const oldest = this.#requestBlobBases.entries().next().value as
+					| [string, RequestBlobBase]
+					| undefined;
+				if (oldest === undefined) break;
+				this.#requestBlobBases.delete(oldest[0]);
+				this.#requestBlobBaseBytes -= oldest[1].bytes.byteLength;
+			}
+			this.#requestBlobBases.set(update.slot, update.base);
+			this.#requestBlobBaseBytes += update.base.bytes.byteLength;
+		}
+	}
+
 	#assertOpen(): void {
 		if (!this.#acceptingOperations) {
 			throw remoteError("LIX_ERROR_CLOSED", "Lix is closed");
@@ -356,6 +496,189 @@ class RemoteLixBinding implements LixBinding {
 		);
 		return result;
 	}
+}
+
+type RequestBlobBase = {
+	sha256: string;
+	bytes: Uint8Array;
+};
+
+type RequestBlobCacheUpdate = {
+	slot: string;
+	base: RequestBlobBase;
+};
+
+type PreparedRequestParam = {
+	value: WireRequestValue;
+	full: () => WireValue;
+	cacheUpdate?: RequestBlobCacheUpdate;
+};
+
+type PreparedRequestParams = {
+	params: WireRequestValue[];
+	fullParams: () => WireValue[];
+	cacheUpdates: RequestBlobCacheUpdate[];
+	cacheBlobs: boolean;
+	hasDelta: boolean;
+};
+
+type BlobSplicePlan = {
+	baseSha256: string;
+	resultSha256: string;
+	prefixBytes: number;
+	suffixBytes: number;
+	insert: Uint8Array;
+};
+
+function fullRequestParam(param: NativeLixValue): PreparedRequestParam {
+	const full = encodeWireValue(param);
+	return { value: full, full: () => full };
+}
+
+function snapshotParams(params: NativeLixValue[]): NativeLixValue[] {
+	return params.map((param) =>
+		param.kind === "blob"
+			? { kind: "blob", value: null, blob: new Uint8Array(param.blob) }
+			: param,
+	);
+}
+
+function requestBlobSlot(
+	kind: "execute" | "batch",
+	sql: string,
+	paramIndex: number,
+	statementIndex?: number,
+): string {
+	return JSON.stringify([kind, statementIndex, sql, paramIndex]);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string | undefined> {
+	const subtle = globalThis.crypto?.subtle;
+	if (subtle === undefined) return undefined;
+	try {
+		const input =
+			bytes.buffer instanceof ArrayBuffer &&
+			bytes.byteOffset === 0 &&
+			bytes.byteLength === bytes.buffer.byteLength
+				? bytes.buffer
+				: copyArrayBuffer(bytes);
+		const digest = await subtle.digest("SHA-256", input);
+		return Array.from(new Uint8Array(digest), (byte) =>
+			byte.toString(16).padStart(2, "0"),
+		).join("");
+	} catch {
+		return undefined;
+	}
+}
+
+function planBlobSplice(
+	base: RequestBlobBase,
+	result: Uint8Array,
+	resultSha256: string,
+): BlobSplicePlan {
+	let prefixBytes = 0;
+	const prefixLimit = Math.min(base.bytes.byteLength, result.byteLength);
+	while (
+		prefixBytes < prefixLimit &&
+		base.bytes[prefixBytes] === result[prefixBytes]
+	) {
+		prefixBytes += 1;
+	}
+
+	let suffixBytes = 0;
+	const suffixLimit = Math.min(
+		base.bytes.byteLength - prefixBytes,
+		result.byteLength - prefixBytes,
+	);
+	while (
+		suffixBytes < suffixLimit &&
+		base.bytes[base.bytes.byteLength - suffixBytes - 1] ===
+			result[result.byteLength - suffixBytes - 1]
+	) {
+		suffixBytes += 1;
+	}
+
+	const insert = result.subarray(
+		prefixBytes,
+		result.byteLength - suffixBytes,
+	);
+	return {
+		baseSha256: base.sha256,
+		resultSha256,
+		prefixBytes,
+		suffixBytes,
+		insert,
+	};
+}
+
+function encodeBlobSplice(plan: BlobSplicePlan): WireRequestBlobSplice {
+	const encodedInsert = encodeWireValue({
+		kind: "blob",
+		value: null,
+		blob: plan.insert,
+	});
+	if (encodedInsert.kind !== "blob") {
+		throw protocolError("request blob splice insert could not be encoded");
+	}
+	return {
+		kind: "blob-splice",
+		baseSha256: plan.baseSha256,
+		resultSha256: plan.resultSha256,
+		prefixBytes: plan.prefixBytes,
+		suffixBytes: plan.suffixBytes,
+		insertBase64: encodedInsert.base64,
+	};
+}
+
+function blobSpliceIsAtLeastTenPercentSmaller(
+	delta: BlobSplicePlan,
+	full: Uint8Array,
+): boolean {
+	const deltaEnvelopeBytes = JSON.stringify({
+		kind: "blob-splice",
+		baseSha256: delta.baseSha256,
+		resultSha256: delta.resultSha256,
+		prefixBytes: delta.prefixBytes,
+		suffixBytes: delta.suffixBytes,
+		insertBase64: "",
+	}).length;
+	const deltaBytes =
+		deltaEnvelopeBytes + base64EncodedLength(delta.insert.byteLength);
+	const fullBytes =
+		WIRE_BLOB_JSON_ENVELOPE_BYTES + base64EncodedLength(full.byteLength);
+	return (
+		deltaBytes < fullBytes * REQUEST_BLOB_DELTA_MIN_WIRE_RATIO
+	);
+}
+
+function base64EncodedLength(byteLength: number): number {
+	return 4 * Math.ceil(byteLength / 3);
+}
+
+async function requestWithFullBlobFallback<T>(
+	request: () => Promise<T>,
+	fullFallback: (() => Promise<T>) | undefined,
+): Promise<T> {
+	try {
+		return await request();
+	} catch (error) {
+		if (fullFallback !== undefined && errorCode(error) === REMOTE_BLOB_BASE_MISSING) {
+			return await fullFallback();
+		}
+		throw error;
+	}
+}
+
+function errorCode(error: unknown): string | undefined {
+	return error instanceof Error && "code" in error
+		? (error as { code?: string }).code
+		: undefined;
+}
+
+function copyArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	const copy = new Uint8Array(bytes.byteLength);
+	copy.set(bytes);
+	return copy.buffer;
 }
 
 type ObserveWaiter = {
@@ -455,6 +778,7 @@ class RemoteObservationHub {
 	): Promise<void> {
 		let reconnect = false;
 		let streamOpened = false;
+		const transportBases = new Map<string, BindingObserveEvent>();
 		try {
 			const response = await this.#openStream(
 				[...this.#observations.values()].map((observation) =>
@@ -503,8 +827,19 @@ class RemoteObservationHub {
 							JSON.parse(frame.data),
 							"remote multiplex observe next event",
 						);
-						const observation = this.#observation(payload.subscriptionId);
-						observation.accept(decodeObserveEvent(payload));
+						const subscriptionId = payload.subscriptionId;
+						if (typeof subscriptionId !== "string") {
+							throw protocolError(
+								"remote observe event requires subscriptionId",
+							);
+						}
+						const observation = this.#observation(subscriptionId);
+						const event = decodeObserveEvent(
+							payload,
+							transportBases.get(subscriptionId),
+						);
+						transportBases.set(subscriptionId, event);
+						observation.accept(event);
 						this.#retryAttempt = 0;
 					} catch (error) {
 						this.#failStream(

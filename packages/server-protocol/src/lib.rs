@@ -17,8 +17,9 @@ use lix_sdk::{
     ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, WireValue,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     future::Future,
     sync::{
@@ -58,6 +59,14 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MIN_COMPRESSION_BODY_BYTES: u16 = 32 * 1024;
 /// Maximum number of queries multiplexed onto one observation stream.
 pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
+
+/// Maximum number of request blobs retained by one remote session.
+const MAX_REQUEST_BLOB_CACHE_ENTRIES: usize = 8;
+/// Blobs below this size are cheaper to send whole than to retain and hash.
+const MIN_REQUEST_BLOB_CACHE_BYTES: usize = 32 * 1024;
+/// Maximum aggregate bytes retained by one remote session's request blob cache.
+const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
@@ -136,6 +145,49 @@ where
     lix: Arc<Lix<S>>,
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
+    request_blobs: Mutex<RequestBlobCache>,
+}
+
+#[derive(Default)]
+struct RequestBlobCache {
+    entries: HashMap<String, Arc<[u8]>>,
+    insertion_order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+impl RequestBlobCache {
+    fn get(&self, sha256: &str) -> Option<Arc<[u8]>> {
+        self.entries.get(sha256).cloned()
+    }
+
+    fn insert(&mut self, candidate: CachedRequestBlob) {
+        if !is_request_blob_cacheable(candidate.bytes.len())
+            || self.entries.contains_key(&candidate.sha256)
+        {
+            return;
+        }
+        while self.entries.len() >= MAX_REQUEST_BLOB_CACHE_ENTRIES
+            || self
+                .total_bytes
+                .checked_add(candidate.bytes.len())
+                .is_none_or(|total| total > MAX_REQUEST_BLOB_CACHE_BYTES)
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.len());
+            }
+        }
+        self.total_bytes += candidate.bytes.len();
+        self.insertion_order.push_back(candidate.sha256.clone());
+        self.entries.insert(candidate.sha256, candidate.bytes);
+    }
+}
+
+struct CachedRequestBlob {
+    sha256: String,
+    bytes: Arc<[u8]>,
 }
 
 impl<S> SessionRecord<S>
@@ -147,6 +199,7 @@ where
             lix: Arc::new(lix),
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
+            request_blobs: Mutex::new(RequestBlobCache::default()),
         }
     }
 
@@ -180,6 +233,23 @@ where
 
     fn is_idle_expired(&self, now: Instant, timeout: Duration) -> bool {
         self.lease_count() == 0 && now.saturating_duration_since(self.last_used()) >= timeout
+    }
+
+    fn request_blob(&self, sha256: &str) -> Option<Arc<[u8]>> {
+        self.request_blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(sha256)
+    }
+
+    fn cache_request_blobs(&self, candidates: Vec<CachedRequestBlob>) {
+        let mut cache = self
+            .request_blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for candidate in candidates {
+            cache.insert(candidate);
+        }
     }
 }
 
@@ -645,6 +715,9 @@ where
             protocol_version: PROTOCOL_VERSION,
             active_branch_id,
             session_id: lease.session_id.clone(),
+            capabilities: ProtocolCapabilities {
+                request_blob_splice: true,
+            },
         }),
     ))
 }
@@ -669,11 +742,24 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let sql = required_non_empty(request.sql, "sql")?;
-    let params = decode_params(request.params)?;
+    let mut reconstructed_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let mut cache_candidates = Vec::new();
+    let decoded = decode_request_params(
+        request.params,
+        None,
+        request.cache_blobs,
+        &mut reconstructed_bytes_remaining,
+        &mut cache_candidate_bytes_remaining,
+        &mut cache_candidates,
+        |sha256| lease.record.request_blob(sha256),
+    )?;
     let options = request.options.into();
+    let params = decoded.values;
     let result = lease
         .run(move |lix| async move { lix.execute_with_options(&sql, &params, options).await })
         .await?;
+    lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(ExecuteResponse::try_from(result)?))
 }
 
@@ -687,14 +773,26 @@ where
     if request.statements.is_empty() {
         return Err(ApiError::bad_request("statements must not be empty"));
     }
+    let mut cache_candidates = Vec::new();
+    let mut reconstructed_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
     let statements = request
         .statements
         .into_iter()
         .enumerate()
         .map(|(index, statement)| {
+            let decoded = decode_request_params(
+                statement.params,
+                Some(index),
+                request.cache_blobs,
+                &mut reconstructed_bytes_remaining,
+                &mut cache_candidate_bytes_remaining,
+                &mut cache_candidates,
+                |sha256| lease.record.request_blob(sha256),
+            )?;
             Ok(ExecuteBatchStatement {
                 sql: required_non_empty(statement.sql, "statements[].sql")?,
-                params: decode_params_at(statement.params, Some(index))?,
+                params: decoded.values,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
@@ -702,6 +800,7 @@ where
     let results = lease
         .run(move |lix| async move { lix.execute_batch_with_options(&statements, options).await })
         .await?;
+    lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(
         results
             .into_iter()
@@ -813,18 +912,28 @@ where
         let parent = tracing::Span::current();
         tasks.push(tokio::spawn(
             async move {
+                let mut blob_base = None;
                 loop {
                     let message = match events.next().await {
-                        Ok(Some(event)) => match ObserveEventResponse::try_from(event) {
-                            Ok(payload) => MultiplexObserveMessage::Next {
-                                subscription_id: subscription_id.clone(),
-                                payload,
-                            },
-                            Err(error) => MultiplexObserveMessage::Error {
-                                subscription_id: subscription_id.clone(),
-                                error: ErrorEnvelope::from_lix_error(&error),
-                            },
-                        },
+                        Ok(Some(event)) => {
+                            match multiplex_observe_payload(event, blob_base.as_ref()) {
+                                Ok((payload, next_blob_base)) => {
+                                    let message = MultiplexObserveMessage::Next {
+                                        subscription_id: subscription_id.clone(),
+                                        payload,
+                                    };
+                                    if sender.send(message).await.is_err() {
+                                        break;
+                                    }
+                                    blob_base = next_blob_base;
+                                    continue;
+                                }
+                                Err(error) => MultiplexObserveMessage::Error {
+                                    subscription_id: subscription_id.clone(),
+                                    error: ErrorEnvelope::from_lix_error(&error),
+                                },
+                            }
+                        }
                         Ok(None) => break,
                         Err(error) => MultiplexObserveMessage::Error {
                             subscription_id: subscription_id.clone(),
@@ -853,6 +962,7 @@ where
                         sequence: payload.sequence,
                         mutation_sequence: payload.mutation_sequence,
                         result: payload.result,
+                        delta: payload.delta,
                     }));
                 }
                 MultiplexObserveMessage::Error { subscription_id, error } => {
@@ -922,6 +1032,228 @@ fn decode_params_at(
         .collect()
 }
 
+struct DecodedRequestParams {
+    values: Vec<Value>,
+}
+
+fn decode_request_params(
+    params: Vec<RequestWireValue>,
+    statement_index: Option<usize>,
+    cache_full_blobs: bool,
+    reconstructed_bytes_remaining: &mut usize,
+    cache_candidate_bytes_remaining: &mut usize,
+    cache_candidates: &mut Vec<CachedRequestBlob>,
+    lookup_blob: impl Fn(&str) -> Option<Arc<[u8]>>,
+) -> Result<DecodedRequestParams, ApiError> {
+    let mut values = Vec::with_capacity(params.len());
+    for (parameter_index, value) in params.into_iter().enumerate() {
+        match value {
+            RequestWireValue::Value(value) => {
+                let value = value.try_into_engine().map_err(|error| {
+                    invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        error.code,
+                        error.message,
+                    )
+                })?;
+                if cache_full_blobs
+                    && let Value::Blob(bytes) = &value
+                    && is_request_blob_cacheable(bytes.len())
+                    && bytes.len() <= *cache_candidate_bytes_remaining
+                {
+                    prepare_cache_candidate(
+                        sha256_hex(bytes),
+                        bytes,
+                        cache_candidate_bytes_remaining,
+                        cache_candidates,
+                    );
+                }
+                values.push(value);
+            }
+            RequestWireValue::BlobSplice(splice) => {
+                let base_sha256 = splice.base_sha256;
+                let result_sha256 = splice.result_sha256;
+                if !is_lowercase_sha256(&base_sha256) {
+                    return Err(invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        "blob splice baseSha256 must be a lowercase SHA-256 hex digest",
+                    ));
+                }
+                if !is_lowercase_sha256(&result_sha256) {
+                    return Err(invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        "blob splice resultSha256 must be a lowercase SHA-256 hex digest",
+                    ));
+                }
+                let Some(base) = lookup_blob(&base_sha256) else {
+                    return Err(ApiError::blob_base_missing(
+                        base_sha256,
+                        parameter_index,
+                        statement_index,
+                    ));
+                };
+                let prefix = usize::try_from(splice.prefix_bytes).map_err(|_| {
+                    invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        "blob splice prefixBytes is too large",
+                    )
+                })?;
+                let suffix = usize::try_from(splice.suffix_bytes).map_err(|_| {
+                    invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        "blob splice suffixBytes is too large",
+                    )
+                })?;
+                if prefix > base.len()
+                    || suffix > base.len()
+                    || prefix.saturating_add(suffix) > base.len()
+                {
+                    return Err(invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        "blob splice prefix and suffix must not overlap the cached base",
+                    ));
+                }
+                let insert = WireValue::Blob {
+                    base64: splice.insert_base64,
+                }
+                .try_into_engine()
+                .map_err(|error| {
+                    invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        error.code,
+                        format!("invalid blob splice insertBase64: {}", error.message),
+                    )
+                })?;
+                let Value::Blob(insert) = insert else {
+                    unreachable!("WireValue::Blob must decode to Value::Blob")
+                };
+                let reconstructed_len = prefix
+                    .checked_add(insert.len())
+                    .and_then(|length| length.checked_add(suffix))
+                    .ok_or_else(|| {
+                        invalid_parameter_error(
+                            parameter_index,
+                            statement_index,
+                            LixError::CODE_INVALID_PARAM,
+                            "reconstructed blob size overflows the server address space",
+                        )
+                    })?;
+                if reconstructed_len > *reconstructed_bytes_remaining {
+                    return Err(invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "aggregate reconstructed blobs exceed the {MAX_REQUEST_BLOB_CACHE_BYTES}-byte request limit"
+                        ),
+                    ));
+                }
+                *reconstructed_bytes_remaining -= reconstructed_len;
+                let mut reconstructed = Vec::with_capacity(reconstructed_len);
+                reconstructed.extend_from_slice(&base[..prefix]);
+                reconstructed.extend_from_slice(&insert);
+                reconstructed.extend_from_slice(&base[base.len() - suffix..]);
+                let actual_sha256 = sha256_hex(&reconstructed);
+                if actual_sha256 != result_sha256 {
+                    return Err(invalid_parameter_error(
+                        parameter_index,
+                        statement_index,
+                        LixError::CODE_INVALID_PARAM,
+                        "blob splice resultSha256 does not match the reconstructed bytes",
+                    ));
+                }
+                prepare_cache_candidate(
+                    result_sha256,
+                    &reconstructed,
+                    cache_candidate_bytes_remaining,
+                    cache_candidates,
+                );
+                values.push(Value::Blob(reconstructed));
+            }
+        }
+    }
+    Ok(DecodedRequestParams { values })
+}
+
+fn prepare_cache_candidate(
+    sha256: String,
+    bytes: &[u8],
+    bytes_remaining: &mut usize,
+    candidates: &mut Vec<CachedRequestBlob>,
+) {
+    if !is_request_blob_cacheable(bytes.len())
+        || bytes.len() > *bytes_remaining
+        || candidates
+            .iter()
+            .any(|candidate| candidate.sha256 == sha256)
+    {
+        return;
+    }
+    *bytes_remaining -= bytes.len();
+    candidates.push(CachedRequestBlob {
+        sha256,
+        bytes: Arc::from(bytes.to_vec()),
+    });
+}
+
+fn invalid_parameter_error(
+    parameter_index: usize,
+    statement_index: Option<usize>,
+    source_code: impl Into<String>,
+    message: impl Into<String>,
+) -> ApiError {
+    let mut details = serde_json::json!({
+        "parameterIndex": parameter_index,
+        "sourceCode": source_code.into(),
+    });
+    if let Some(statement_index) = statement_index {
+        details["statementIndex"] = statement_index.into();
+    }
+    ApiError::from(
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!(
+                "invalid SQL parameter at index {parameter_index}: {}",
+                message.into()
+            ),
+        )
+        .with_details(details),
+    )
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_request_blob_cacheable(length: usize) -> bool {
+    (MIN_REQUEST_BLOB_CACHE_BYTES..=MAX_REQUEST_BLOB_CACHE_BYTES).contains(&length)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 fn required_non_empty(value: Option<String>, field: &'static str) -> Result<String, ApiError> {
     match value {
         Some(value) if !value.trim().is_empty() => Ok(value),
@@ -963,6 +1295,29 @@ impl ApiError {
                 message,
                 None,
                 None,
+            ),
+        }
+    }
+
+    fn blob_base_missing(
+        base_sha256: String,
+        parameter_index: usize,
+        statement_index: Option<usize>,
+    ) -> Self {
+        let mut details = serde_json::json!({
+            "baseSha256": base_sha256,
+            "parameterIndex": parameter_index,
+        });
+        if let Some(statement_index) = statement_index {
+            details["statementIndex"] = statement_index.into();
+        }
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ErrorEnvelope::from_parts(
+                BLOB_BASE_MISSING_CODE,
+                "the blob splice base is not available in this remote session",
+                Some("retry the request with the complete blob".to_string()),
+                Some(details),
             ),
         }
     }
@@ -1079,6 +1434,13 @@ struct HandshakeResponse {
     protocol_version: u32,
     active_branch_id: String,
     session_id: String,
+    capabilities: ProtocolCapabilities,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtocolCapabilities {
+    request_blob_splice: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1086,9 +1448,11 @@ struct HandshakeResponse {
 struct ExecuteRequest {
     sql: Option<String>,
     #[serde(default)]
-    params: Vec<WireValue>,
+    params: Vec<RequestWireValue>,
     #[serde(default)]
     options: ExecuteOptionsRequest,
+    #[serde(default)]
+    cache_blobs: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1112,13 +1476,40 @@ struct ExecuteBatchRequest {
     statements: Vec<ExecuteBatchStatementRequest>,
     #[serde(default)]
     options: ExecuteOptionsRequest,
+    #[serde(default)]
+    cache_blobs: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExecuteBatchStatementRequest {
     sql: Option<String>,
     #[serde(default)]
-    params: Vec<WireValue>,
+    params: Vec<RequestWireValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RequestWireValue {
+    BlobSplice(RequestBlobSplice),
+    Value(WireValue),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestBlobSplice {
+    #[serde(rename = "kind")]
+    _kind: RequestBlobSpliceKind,
+    base_sha256: String,
+    result_sha256: String,
+    prefix_bytes: u64,
+    suffix_bytes: u64,
+    insert_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum RequestBlobSpliceKind {
+    #[serde(rename = "blob-splice")]
+    BlobSplice,
 }
 
 #[derive(Debug, Serialize)]
@@ -1226,12 +1617,38 @@ impl TryFrom<ObserveEvent> for ObserveEventResponse {
 enum MultiplexObserveMessage {
     Next {
         subscription_id: String,
-        payload: ObserveEventResponse,
+        payload: MultiplexObservePayload,
     },
     Error {
         subscription_id: String,
         error: ErrorEnvelope,
     },
+}
+
+struct BlobDeltaBase {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MultiplexObservePayload {
+    sequence: u64,
+    mutation_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ExecuteResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<SingleBlobSplice>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SingleBlobSplice {
+    kind: &'static str,
+    base_sequence: u64,
+    prefix_bytes: u64,
+    suffix_bytes: u64,
+    insert_base64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1240,7 +1657,133 @@ struct MultiplexObserveEventResponse {
     subscription_id: String,
     sequence: u64,
     mutation_sequence: u64,
-    result: ExecuteResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ExecuteResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<SingleBlobSplice>,
+}
+
+const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
+// Compared with only the full blob's Base64 length, this deliberately
+// overestimates every delta-only JSON/SSE field. The shared event envelope is
+// omitted from both sides, so passing the 90% test guarantees >10% savings.
+const BLOB_DELTA_ENVELOPE_BUDGET_BYTES: usize = 512;
+
+fn multiplex_observe_payload(
+    event: ObserveEvent,
+    base: Option<&BlobDeltaBase>,
+) -> Result<(MultiplexObservePayload, Option<BlobDeltaBase>), LixError> {
+    let next_base = point_blob_bytes(&event.rows).map(|bytes| BlobDeltaBase {
+        sequence: event.sequence,
+        bytes: bytes.to_vec(),
+    });
+    let delta = match base.zip(next_base.as_ref()) {
+        Some((base, next)) if base.sequence.checked_add(1) == Some(event.sequence) => {
+            single_blob_splice(base, next)?
+        }
+        _ => None,
+    };
+
+    let payload = if let Some(delta) = delta {
+        MultiplexObservePayload {
+            sequence: event.sequence,
+            mutation_sequence: event.mutation_sequence,
+            result: None,
+            delta: Some(delta),
+        }
+    } else {
+        MultiplexObservePayload {
+            sequence: event.sequence,
+            mutation_sequence: event.mutation_sequence,
+            result: Some(ExecuteResponse::try_from(event.rows)?),
+            delta: None,
+        }
+    };
+    Ok((payload, next_base))
+}
+
+fn point_blob_bytes(result: &ExecuteResult) -> Option<&[u8]> {
+    if result.columns() != ["data"]
+        || result.rows().len() != 1
+        || result.rows_affected() != 0
+        || !result.notices().is_empty()
+    {
+        return None;
+    }
+    match result.rows()[0].values() {
+        [Value::Blob(bytes)] => Some(bytes),
+        _ => None,
+    }
+}
+
+fn single_blob_splice(
+    base: &BlobDeltaBase,
+    next: &BlobDeltaBase,
+) -> Result<Option<SingleBlobSplice>, LixError> {
+    if next.bytes.len() < MIN_BLOB_DELTA_BYTES {
+        return Ok(None);
+    }
+    let prefix_bytes = base
+        .bytes
+        .iter()
+        .zip(&next.bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let max_suffix = base
+        .bytes
+        .len()
+        .saturating_sub(prefix_bytes)
+        .min(next.bytes.len().saturating_sub(prefix_bytes));
+    let suffix_bytes = base
+        .bytes
+        .iter()
+        .rev()
+        .zip(next.bytes.iter().rev())
+        .take(max_suffix)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let insert_end = next.bytes.len().saturating_sub(suffix_bytes);
+    let insert = &next.bytes[prefix_bytes..insert_end];
+    let Some(full_base64_bytes) = padded_base64_len(next.bytes.len()) else {
+        return Ok(None);
+    };
+    let Some(delta_base64_bytes) = padded_base64_len(insert.len()) else {
+        return Ok(None);
+    };
+    let Some(delta_estimate) = delta_base64_bytes.checked_add(BLOB_DELTA_ENVELOPE_BUDGET_BYTES)
+    else {
+        return Ok(None);
+    };
+    if delta_estimate.saturating_mul(10) >= full_base64_bytes.saturating_mul(9) {
+        return Ok(None);
+    }
+    let WireValue::Blob {
+        base64: insert_base64,
+    } = WireValue::try_from_engine(&Value::Blob(insert.to_vec()))?
+    else {
+        unreachable!("blob wire conversion must return a blob")
+    };
+    Ok(Some(SingleBlobSplice {
+        kind: "single-blob-splice",
+        base_sequence: base.sequence,
+        prefix_bytes: u64::try_from(prefix_bytes).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "blob delta prefix is too large",
+            )
+        })?,
+        suffix_bytes: u64::try_from(suffix_bytes).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "blob delta suffix is too large",
+            )
+        })?,
+        insert_base64,
+    }))
+}
+
+fn padded_base64_len(bytes: usize) -> Option<usize> {
+    bytes.checked_add(2)?.checked_div(3)?.checked_mul(4)
 }
 
 #[derive(Debug, Serialize)]
@@ -1403,6 +1946,33 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    fn wire_blob_json(bytes: &[u8]) -> JsonValue {
+        let value =
+            WireValue::try_from_engine(&Value::Blob(bytes.to_vec())).expect("blob should encode");
+        serde_json::to_value(value).expect("wire blob should serialize")
+    }
+
+    fn blob_splice_json(
+        base: &[u8],
+        result: &[u8],
+        prefix_bytes: usize,
+        suffix_bytes: usize,
+        insert: &[u8],
+    ) -> JsonValue {
+        let insert_base64 = wire_blob_json(insert)["base64"]
+            .as_str()
+            .expect("blob base64")
+            .to_string();
+        json!({
+            "kind": "blob-splice",
+            "baseSha256": sha256_hex(base),
+            "resultSha256": sha256_hex(result),
+            "prefixBytes": prefix_bytes,
+            "suffixBytes": suffix_bytes,
+            "insertBase64": insert_base64,
+        })
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(bytes).expect("gzip input");
@@ -1438,6 +2008,7 @@ mod tests {
         let app = app().await;
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(first["capabilities"]["requestBlobSplice"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -1598,6 +2169,395 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn execute_reconstructs_cached_blob_splices_and_caches_each_result() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let cached = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1 AS data",
+                "params": [wire_blob_json(&base)],
+                "cacheBlobs": true,
+            })),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::OK);
+
+        let first_insert = b"BETA";
+        let replace_at = base.len() / 2;
+        let mut first = base.clone();
+        first[replace_at..replace_at + first_insert.len()].copy_from_slice(first_insert);
+        let first_response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1 AS data",
+                "params": [blob_splice_json(
+                    &base,
+                    &first,
+                    replace_at,
+                    base.len() - replace_at - first_insert.len(),
+                    first_insert,
+                )],
+            })),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(first_response).await["rows"][0][0],
+            wire_blob_json(&first)
+        );
+
+        let second_insert = b"!";
+        let mut second = first.clone();
+        second.extend_from_slice(second_insert);
+        let second_response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1 AS data",
+                "params": [blob_splice_json(
+                    &first,
+                    &second,
+                    first.len(),
+                    0,
+                    second_insert,
+                )],
+            })),
+        )
+        .await;
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(second_response).await["rows"][0][0],
+            wire_blob_json(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_batch_accepts_blob_splices() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let cached = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1",
+                "params": [wire_blob_json(&base)],
+                "cacheBlobs": true,
+            })),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::OK);
+
+        let mut result = base.clone();
+        result[0] = b'b';
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    {
+                        "sql": "SELECT $1 AS data",
+                        "params": [blob_splice_json(
+                            &base,
+                            &result,
+                            0,
+                            base.len() - 1,
+                            b"b",
+                        )],
+                    },
+                    { "sql": "SELECT 2 AS value" },
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["rows"][0][0], wire_blob_json(&result));
+        assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn missing_blob_splice_base_fails_before_sql_mutation() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let absent_base = b"not cached";
+        let result = b"replacement";
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "params": [
+                    { "kind": "text", "value": "/must-not-exist.bin" },
+                    blob_splice_json(absent_base, result, 0, 0, result),
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(response).await, BLOB_BASE_MISSING_CODE);
+
+        let read = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/must-not-exist.bin" }],
+            })),
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(response_json(read).await["rows"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn execute_batch_bounds_aggregate_blob_reconstruction_before_mutation() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let base = vec![b'a'; MAX_REQUEST_BLOB_CACHE_BYTES / 2];
+        let cached = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "params": [
+                    { "kind": "text", "value": "/aggregate-base.bin" },
+                    wire_blob_json(&base),
+                ],
+                "cacheBlobs": true,
+            })),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::OK);
+
+        let mut result = base.clone();
+        result.push(b'b');
+        let splice = blob_splice_json(&base, &result, base.len(), 0, b"b");
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    {
+                        "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                        "params": [
+                            { "kind": "text", "value": "/must-not-execute.bin" },
+                            splice,
+                        ],
+                    },
+                    {
+                        "sql": "SELECT $1",
+                        "params": [blob_splice_json(
+                            &base,
+                            &result,
+                            base.len(),
+                            0,
+                            b"b",
+                        )],
+                    },
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(response).await, LixError::CODE_INVALID_PARAM);
+
+        let read = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/must-not-execute.bin" }],
+            })),
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(response_json(read).await["rows"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn failed_execute_does_not_publish_full_blob_cache_candidates() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let failed = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "NOT VALID SQL",
+                "params": [wire_blob_json(&base)],
+                "cacheBlobs": true,
+            })),
+        )
+        .await;
+        assert_ne!(failed.status(), StatusCode::OK);
+
+        let mut result = base.clone();
+        result[0] = b'b';
+        let missing = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1",
+                "params": [blob_splice_json(
+                    &base,
+                    &result,
+                    0,
+                    base.len() - 1,
+                    b"b",
+                )],
+            })),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(missing).await, BLOB_BASE_MISSING_CODE);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_hash_mismatched_blob_splices_are_rejected() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let cached = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1",
+                "params": [wire_blob_json(&base)],
+                "cacheBlobs": true,
+            })),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::OK);
+
+        let overlap = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1",
+                "params": [blob_splice_json(
+                    &base,
+                    &base,
+                    base.len(),
+                    1,
+                    b"",
+                )],
+            })),
+        )
+        .await;
+        assert_eq!(overlap.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(overlap).await, LixError::CODE_INVALID_PARAM);
+
+        let mismatch = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT $1",
+                "params": [{
+                    "kind": "blob-splice",
+                    "baseSha256": sha256_hex(&base),
+                    "resultSha256": "0".repeat(64),
+                    "prefixBytes": base.len(),
+                    "suffixBytes": 0,
+                    "insertBase64": wire_blob_json(b"")["base64"],
+                }],
+            })),
+        )
+        .await;
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(mismatch).await, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[test]
+    fn request_blob_cache_evicts_by_entry_and_byte_limits() {
+        let mut cache = RequestBlobCache::default();
+        for index in 0..=MAX_REQUEST_BLOB_CACHE_ENTRIES {
+            cache.insert(CachedRequestBlob {
+                sha256: format!("entry-{index}"),
+                bytes: Arc::from(vec![
+                    u8::try_from(index).expect("test index should fit");
+                    MIN_REQUEST_BLOB_CACHE_BYTES
+                ]),
+            });
+        }
+        assert_eq!(cache.entries.len(), MAX_REQUEST_BLOB_CACHE_ENTRIES);
+        assert!(cache.get("entry-0").is_none());
+        assert!(
+            cache
+                .get(&format!("entry-{MAX_REQUEST_BLOB_CACHE_ENTRIES}"))
+                .is_some()
+        );
+
+        cache.insert(CachedRequestBlob {
+            sha256: "too-large".to_string(),
+            bytes: Arc::from(vec![0_u8; MAX_REQUEST_BLOB_CACHE_BYTES + 1]),
+        });
+        assert!(cache.get("too-large").is_none());
+        assert!(cache.total_bytes <= MAX_REQUEST_BLOB_CACHE_BYTES);
+
+        cache.insert(CachedRequestBlob {
+            sha256: "too-small".to_string(),
+            bytes: Arc::from(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1]),
+        });
+        assert!(cache.get("too-small").is_none());
+    }
+
+    #[test]
+    fn request_cache_candidates_share_one_bounded_clone_budget() {
+        let mut remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let mut candidates = Vec::new();
+        let first = vec![b'a'; MAX_REQUEST_BLOB_CACHE_BYTES / 2];
+        prepare_cache_candidate(sha256_hex(&first), &first, &mut remaining, &mut candidates);
+        let after_first = remaining;
+        prepare_cache_candidate(sha256_hex(&first), &first, &mut remaining, &mut candidates);
+        assert_eq!(remaining, after_first, "duplicate should reuse candidate");
+
+        let over_remaining = vec![b'b'; after_first + 1];
+        prepare_cache_candidate(
+            sha256_hex(&over_remaining),
+            &over_remaining,
+            &mut remaining,
+            &mut candidates,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(remaining, after_first);
     }
 
     #[tokio::test]
@@ -1792,6 +2752,123 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn point_blob_event(sequence: u64, bytes: Vec<u8>) -> ObserveEvent {
+        ObserveEvent {
+            sequence,
+            mutation_sequence: sequence,
+            rows: ExecuteResult::from_rows(
+                vec!["data".to_string()],
+                vec![vec![Value::Blob(bytes)]],
+            ),
+        }
+    }
+
+    fn apply_blob_splice(base: &[u8], delta: SingleBlobSplice) -> Vec<u8> {
+        let Value::Blob(insert) = WireValue::Blob {
+            base64: delta.insert_base64,
+        }
+        .try_into_engine()
+        .expect("delta insert should decode") else {
+            panic!("delta insert should be a blob")
+        };
+        let prefix = usize::try_from(delta.prefix_bytes).expect("prefix should fit");
+        let suffix = usize::try_from(delta.suffix_bytes).expect("suffix should fit");
+        let mut next = Vec::with_capacity(prefix + insert.len() + base.len() - suffix);
+        next.extend_from_slice(&base[..prefix]);
+        next.extend_from_slice(&insert);
+        next.extend_from_slice(&base[base.len() - suffix..]);
+        next
+    }
+
+    #[test]
+    fn multiplex_blob_delta_roundtrips_replace_insert_and_delete() {
+        let initial = vec![b'a'; 100 * 1024];
+        let (payload, mut base) =
+            multiplex_observe_payload(point_blob_event(0, initial.clone()), None)
+                .expect("initial payload");
+        assert!(payload.result.is_some());
+        assert!(payload.delta.is_none());
+
+        let mut replaced = initial.clone();
+        replaced[50_000..50_032].fill(b'b');
+        let (payload, next_base) =
+            multiplex_observe_payload(point_blob_event(1, replaced.clone()), base.as_ref())
+                .expect("replacement delta");
+        assert_eq!(
+            apply_blob_splice(&initial, payload.delta.expect("replacement splice")),
+            replaced
+        );
+        base = next_base;
+
+        let mut inserted = replaced.clone();
+        inserted.splice(40_000..40_000, [b'x'; 32]);
+        let (payload, next_base) =
+            multiplex_observe_payload(point_blob_event(2, inserted.clone()), base.as_ref())
+                .expect("insert delta");
+        assert_eq!(
+            apply_blob_splice(&replaced, payload.delta.expect("insert splice")),
+            inserted
+        );
+        base = next_base;
+
+        let mut deleted = inserted.clone();
+        deleted.drain(60_000..60_032);
+        let (payload, _) =
+            multiplex_observe_payload(point_blob_event(3, deleted.clone()), base.as_ref())
+                .expect("delete delta");
+        assert_eq!(
+            apply_blob_splice(&inserted, payload.delta.expect("delete splice")),
+            deleted
+        );
+    }
+
+    #[test]
+    fn multiplex_blob_delta_requires_more_than_ten_percent_wire_saving() {
+        let initial = vec![b'a'; 1024 * 1024];
+        let (_, base) = multiplex_observe_payload(point_blob_event(0, initial.clone()), None)
+            .expect("initial payload");
+
+        let replace_89_percent = initial.len() * 89 / 100;
+        let mut next = initial.clone();
+        let start = (initial.len() - replace_89_percent) / 2;
+        next[start..start + replace_89_percent].fill(b'b');
+        let (payload, _) = multiplex_observe_payload(point_blob_event(1, next), base.as_ref())
+            .expect("89 percent payload");
+        assert!(payload.delta.is_some());
+        assert!(payload.result.is_none());
+
+        let replace_90_percent = initial.len() * 90 / 100;
+        let mut next = initial.clone();
+        let start = (initial.len() - replace_90_percent) / 2;
+        next[start..start + replace_90_percent].fill(b'b');
+        let (payload, _) = multiplex_observe_payload(point_blob_event(1, next), base.as_ref())
+            .expect("90 percent payload");
+        assert!(payload.result.is_some());
+        assert!(payload.delta.is_none());
+    }
+
+    #[test]
+    fn multiplex_blob_full_fallback_becomes_the_next_delta_base() {
+        let initial = vec![b'a'; 100 * 1024];
+        let (_, base) =
+            multiplex_observe_payload(point_blob_event(0, initial), None).expect("initial payload");
+        let replacement = vec![b'b'; 100 * 1024];
+        let (payload, base) =
+            multiplex_observe_payload(point_blob_event(1, replacement.clone()), base.as_ref())
+                .expect("full fallback");
+        assert!(payload.result.is_some());
+
+        let mut localized = replacement.clone();
+        localized[50_000] = b'c';
+        let (payload, _) =
+            multiplex_observe_payload(point_blob_event(2, localized.clone()), base.as_ref())
+                .expect("localized delta");
+        assert_eq!(
+            apply_blob_splice(&replacement, payload.delta.expect("localized splice")),
+            localized
+        );
     }
 
     #[tokio::test]

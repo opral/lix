@@ -2,6 +2,15 @@ import { expect, test, vi } from "vitest";
 import { gunzipSync } from "fflate";
 import { openLix } from "../index.js";
 
+async function requestJson(request: Request): Promise<unknown> {
+	const bytes = new Uint8Array(await request.arrayBuffer());
+	const decoded =
+		request.headers.get("content-encoding") === "gzip"
+			? gunzipSync(bytes)
+			: bytes;
+	return JSON.parse(new TextDecoder().decode(decoded));
+}
+
 test("remote mode uses the workspace protocol without loading a local engine", async () => {
 	const requests: Request[] = [];
 	let headerCalls = 0;
@@ -226,6 +235,244 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	});
 
 	await lix.close();
+});
+
+test("remote execute sends successful large blob updates as exact splices", async () => {
+	const bodies: Array<Record<string, unknown>> = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				bodies.push((await requestJson(request)) as Record<string, unknown>);
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+	const first = new Uint8Array(32 * 1024).fill(97);
+	const second = new Uint8Array(first);
+	second[16 * 1024] = 98;
+	const prototype = Uint8Array.prototype as Uint8Array & {
+		toBase64?: () => string;
+	};
+	const originalToBase64 = Object.getOwnPropertyDescriptor(
+		prototype,
+		"toBase64",
+	);
+	const encodedLengths: number[] = [];
+	Object.defineProperty(prototype, "toBase64", {
+		configurable: true,
+		value: function (this: Uint8Array) {
+			encodedLengths.push(this.byteLength);
+			return btoa(String.fromCharCode(...this));
+		},
+	});
+	let deltaEncodedLengths: number[];
+	try {
+		await lix.execute("UPDATE lix_file SET data = $1", [first]);
+		encodedLengths.length = 0;
+		await lix.execute("UPDATE lix_file SET data = $1", [second]);
+		deltaEncodedLengths = [...encodedLengths];
+	} finally {
+		if (originalToBase64 === undefined) delete prototype.toBase64;
+		else Object.defineProperty(prototype, "toBase64", originalToBase64);
+	}
+	await lix.close();
+
+	expect(deltaEncodedLengths).toEqual([1]);
+	expect(bodies[0]).toMatchObject({
+		cacheBlobs: true,
+		params: [{ kind: "blob" }],
+	});
+	const delta = (bodies[1]?.params as Array<Record<string, unknown>>)[0];
+	expect(bodies[1]?.cacheBlobs).toBe(true);
+	expect(delta).toMatchObject({
+		kind: "blob-splice",
+		prefixBytes: 16 * 1024,
+		suffixBytes: 16 * 1024 - 1,
+		insertBase64: "Yg==",
+	});
+	expect(delta?.baseSha256).toMatch(/^[0-9a-f]{64}$/);
+	expect(delta?.resultSha256).toMatch(/^[0-9a-f]{64}$/);
+	expect(delta?.baseSha256).not.toBe(delta?.resultSha256);
+	expect(JSON.stringify(bodies[1]).length).toBeLessThan(
+		JSON.stringify(bodies[0]).length * 0.1,
+	);
+});
+
+test("remote execute retries a missing blob base once with full bytes", async () => {
+	const bodies: Array<Record<string, unknown>> = [];
+	let rejectedDelta = false;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				const body = (await requestJson(request)) as Record<string, unknown>;
+				bodies.push(body);
+				const param = (body.params as Array<Record<string, unknown>>)[0];
+				if (param?.kind === "blob-splice" && !rejectedDelta) {
+					rejectedDelta = true;
+					return Response.json(
+						{
+							error: {
+								code: "LIX_REMOTE_BLOB_BASE_MISSING",
+								message: "Blob base was evicted",
+							},
+						},
+						{ status: 409 },
+					);
+				}
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+	const first = new Uint8Array(32 * 1024).fill(97);
+	const second = new Uint8Array(first);
+	second[0] = 98;
+
+	await lix.execute("UPDATE lix_file SET data = $1", [first]);
+	await lix.execute("UPDATE lix_file SET data = $1", [second]);
+	await lix.close();
+
+	expect(bodies).toHaveLength(3);
+	expect((bodies[1]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+		"blob-splice",
+	);
+	expect((bodies[2]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+		"blob",
+	);
+	expect(bodies[2]?.cacheBlobs).toBe(true);
+});
+
+test("remote execute keeps small and low-saving blob updates full", async () => {
+	const bodies: Array<Record<string, unknown>> = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				bodies.push((await requestJson(request)) as Record<string, unknown>);
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+	const first = new Uint8Array(32 * 1024).fill(97);
+	const unrelated = new Uint8Array(32 * 1024).fill(98);
+
+	await lix.execute("UPDATE lix_file SET data = $1", [first]);
+	await lix.execute("UPDATE lix_file SET data = $1", [unrelated]);
+	await lix.execute("UPDATE lix_file SET data = $1", [new Uint8Array(1024)]);
+	await lix.close();
+
+	expect((bodies[1]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+		"blob",
+	);
+	expect(bodies[1]?.cacheBlobs).toBe(true);
+	expect((bodies[2]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+		"blob",
+	);
+	expect(bodies[2]).not.toHaveProperty("cacheBlobs");
+});
+
+test("remote execute keeps large writes full without the splice capability", async () => {
+	const bodies: Array<Record<string, unknown>> = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				bodies.push((await requestJson(request)) as Record<string, unknown>);
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+	const first = new Uint8Array(32 * 1024).fill(97);
+	const second = new Uint8Array(first);
+	second[0] = 98;
+
+	await lix.execute("UPDATE lix_file SET data = $1", [first]);
+	await lix.execute("UPDATE lix_file SET data = $1", [second]);
+	await lix.close();
+
+	expect(bodies).toHaveLength(2);
+	for (const body of bodies) {
+		expect((body.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+			"blob",
+		);
+		expect(body).not.toHaveProperty("cacheBlobs");
+	}
+});
+
+test("remote executeBatch uses blob splices for stable statement slots", async () => {
+	const bodies: Array<Record<string, unknown>> = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				bodies.push((await requestJson(request)) as Record<string, unknown>);
+				return Response.json([emptyExecuteResponse()]);
+			},
+		},
+	});
+	const first = new Uint8Array(32 * 1024).fill(97);
+	const second = new Uint8Array(first);
+	second[second.byteLength - 1] = 98;
+	const statement = (blob: Uint8Array) => [
+		{ sql: "UPDATE lix_file SET data = $1", params: [blob] },
+	];
+
+	await lix.executeBatch(statement(first));
+	await lix.executeBatch(statement(second));
+	await lix.close();
+
+	const statements = bodies[1]?.statements as Array<{
+		params: Array<Record<string, unknown>>;
+	}>;
+	expect(bodies[1]?.cacheBlobs).toBe(true);
+	expect(statements[0]?.params[0]).toMatchObject({
+		kind: "blob-splice",
+		prefixBytes: 32 * 1024 - 1,
+		suffixBytes: 0,
+		insertBase64: "Yg==",
+	});
 });
 
 test("remote branches preserve local Lix branch semantics", async () => {
@@ -653,6 +900,24 @@ test("close waits for queued operations before deleting the remote session", asy
 	await Promise.all([executing, closing]);
 	expect(order).toEqual(["execute-start", "execute-finish", "delete"]);
 });
+
+function handshakeResponse() {
+	return Response.json({
+		protocolVersion: 1,
+		activeBranchId: "main-id",
+		sessionId: "session-1",
+		capabilities: { requestBlobSplice: true },
+	});
+}
+
+function emptyExecuteResponse() {
+	return {
+		columns: [],
+		rows: [],
+		rowsAffected: 1,
+		notices: [],
+	};
+}
 
 function deferred<T>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
