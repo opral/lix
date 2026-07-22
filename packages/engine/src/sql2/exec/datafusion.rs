@@ -4801,7 +4801,9 @@ mod tests {
         assert_eq!(fast_path, WriteExecutorPath::Fast);
         assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
         assert_eq!(fast_result.rows, datafusion_result.rows);
-        assert_eq!(fast_scans.load(Ordering::SeqCst), 1);
+        // The indexed existing-path route performs one path-index load and one
+        // exact blob-ref load. The counting test reader models both as scans.
+        assert_eq!(fast_scans.load(Ordering::SeqCst), 2);
         assert_eq!(datafusion_scans.load(Ordering::SeqCst), 3);
 
         let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
@@ -4935,7 +4937,9 @@ mod tests {
 
         assert_eq!(path, WriteExecutorPath::Fast);
         assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        // The indexed route probes the path index before declining to the
+        // generic mixed existing/new batch scan.
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         assert_eq!(staged_writes.deltas.len(), 1);
@@ -4972,7 +4976,10 @@ mod tests {
                 .expect_err("duplicate VALUES paths should fail");
 
             assert_eq!(error.code, LixError::CODE_UNIQUE, "{sql}");
-            assert_eq!(scans.load(Ordering::SeqCst), 1, "{sql}");
+            // Only DO UPDATE enters the indexed existing-path route before the
+            // generic scan rejects duplicate missing paths.
+            let expected_scans = if sql.contains("DO UPDATE") { 2 } else { 1 };
+            assert_eq!(scans.load(Ordering::SeqCst), expected_scans, "{sql}");
             assert!(
                 staged_writes
                     .lock()
