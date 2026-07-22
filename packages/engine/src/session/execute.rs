@@ -483,8 +483,12 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
-        let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params);
-        let exact_lix_file_read = exact_lix_file_read(&statement, params);
+        let exact_lix_file_read = exact_lix_file_read_route(&statement, params);
+        let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params)
+            || matches!(
+                &exact_lix_file_read,
+                Some(ExactLixFileRead::PathDataBatch(_))
+            );
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -976,7 +980,7 @@ where
         statement: datafusion::sql::parser::Statement,
         params: &[Value],
         acknowledge_file_views: bool,
-        exact_lix_file_read: Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)>,
+        exact_lix_file_read: Option<ExactLixFileRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
         (
@@ -987,7 +991,7 @@ where
     > {
         let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
         let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-        if let Some((selector, column)) = exact_lix_file_read {
+        if let Some(exact_lix_file_read) = exact_lix_file_read {
             let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                 Arc::new(self.live_state.reader(read_store.clone()));
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
@@ -996,18 +1000,35 @@ where
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                 Arc::new(self.binary_cas.reader(read_store));
-            let query = sql2::execute_exact_lix_file_read(
-                &active_branch_id,
-                live_state,
-                filesystem_path_index,
-                branch_ref,
-                blob_reader,
-                self.plugin_host.clone(),
-                file_view_collector.clone(),
-                &selector,
-                column,
-            )
-            .await?;
+            let query = match exact_lix_file_read {
+                ExactLixFileRead::Point(selector, column) => {
+                    sql2::execute_exact_lix_file_read(
+                        &active_branch_id,
+                        live_state,
+                        filesystem_path_index,
+                        branch_ref,
+                        blob_reader,
+                        self.plugin_host.clone(),
+                        file_view_collector.clone(),
+                        &selector,
+                        column,
+                    )
+                    .await?
+                }
+                ExactLixFileRead::PathDataBatch(paths) => {
+                    sql2::execute_exact_lix_file_batch_read(
+                        &active_branch_id,
+                        live_state,
+                        filesystem_path_index,
+                        branch_ref,
+                        blob_reader,
+                        self.plugin_host.clone(),
+                        file_view_collector.clone(),
+                        &paths,
+                    )
+                    .await?
+                }
+            };
             let file_view_mutations = file_view_collector
                 .map(|collector| collector.plugin_file_mutations())
                 .unwrap_or_default();
@@ -1397,7 +1418,28 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
     })
 }
 
-fn exact_lix_file_read(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactLixFileRead {
+    Point(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn),
+    PathDataBatch(BTreeSet<String>),
+}
+
+fn exact_lix_file_read_route(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactLixFileRead> {
+    if let Some((selector, column)) = exact_lix_file_point_read(statement, params) {
+        return Some(ExactLixFileRead::Point(selector, column));
+    }
+
+    let point_read = simple_point_read(statement)?;
+    if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
+        return None;
+    }
+    exact_path_data_batch(point_read.select, params).map(ExactLixFileRead::PathDataBatch)
+}
+
+fn exact_lix_file_point_read(
     statement: &DataFusionStatement,
     params: &[Value],
 ) -> Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)> {
@@ -1427,6 +1469,56 @@ fn exact_lix_file_read(
         _ => return None,
     };
     Some((selector, column))
+}
+
+/// Recognizes the exact batch download shape used by Lixray. Keeping the
+/// projection and numbered placeholders strict makes the direct result path
+/// equivalent to the DataFusion query without reimplementing general SQL.
+fn exact_path_data_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<String>> {
+    let [
+        SelectItem::UnnamedExpr(path_projection),
+        SelectItem::UnnamedExpr(data_projection),
+    ] = select.projection.as_slice()
+    else {
+        return None;
+    };
+    if exact_point_column(path_projection).as_deref() != Some("path")
+        || exact_point_column(data_projection).as_deref() != Some("data")
+    {
+        return None;
+    }
+    let Expr::InList {
+        expr,
+        list,
+        negated: false,
+    } = select.selection.as_ref()?
+    else {
+        return None;
+    };
+    if exact_point_column(expr).as_deref() != Some("path")
+        || list.is_empty()
+        || list.len() != params.len()
+    {
+        return None;
+    }
+
+    let mut paths = BTreeSet::new();
+    for (index, (expression, param)) in list.iter().zip(params).enumerate() {
+        let Expr::Value(value) = expression else {
+            return None;
+        };
+        let SqlValue::Placeholder(placeholder) = &value.value else {
+            return None;
+        };
+        if placeholder != &format!("${}", index + 1) {
+            return None;
+        }
+        let Value::Text(path) = param else {
+            return None;
+        };
+        paths.insert(path.clone());
+    }
+    Some(paths)
 }
 
 fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, String)> {
@@ -1779,11 +1871,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_lix_file_read_recognizes_only_the_narrow_point_shapes() {
+    fn exact_lix_file_read_recognizes_only_the_narrow_shapes() {
         let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
         assert_eq!(
-            exact_lix_file_read(&data_by_id, &[Value::Text("file-a".to_string())]),
-            Some((
+            exact_lix_file_read_route(&data_by_id, &[Value::Text("file-a".to_string())]),
+            Some(ExactLixFileRead::Point(
                 sql2::ExactLixFileReadSelector::Id("file-a".to_string()),
                 sql2::ExactLixFileReadColumn::Data,
             ))
@@ -1792,12 +1884,72 @@ mod tests {
         let change_by_path =
             sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = ?").unwrap();
         assert_eq!(
-            exact_lix_file_read(&change_by_path, &[Value::Text("/a.txt".to_string())]),
-            Some((
+            exact_lix_file_read_route(&change_by_path, &[Value::Text("/a.txt".to_string())]),
+            Some(ExactLixFileRead::Point(
                 sql2::ExactLixFileReadSelector::Path("/a.txt".to_string()),
                 sql2::ExactLixFileReadColumn::ChangeId,
             ))
         );
+
+        let data_by_paths =
+            sql2::parse_statement("SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3)")
+                .unwrap();
+        assert_eq!(
+            exact_lix_file_read_route(
+                &data_by_paths,
+                &[
+                    Value::Text("/b.txt".to_string()),
+                    Value::Text("/a.txt".to_string()),
+                    Value::Text("/b.txt".to_string()),
+                ],
+            ),
+            Some(ExactLixFileRead::PathDataBatch(BTreeSet::from([
+                "/a.txt".to_string(),
+                "/b.txt".to_string(),
+            ])))
+        );
+
+        for (sql, params) in [
+            (
+                "SELECT data, path FROM lix_file WHERE path IN ($1, $2)",
+                vec![
+                    Value::Text("/a.txt".to_string()),
+                    Value::Text("/b.txt".to_string()),
+                ],
+            ),
+            (
+                "SELECT path, data FROM lix_file WHERE path IN ($2, $1)",
+                vec![
+                    Value::Text("/a.txt".to_string()),
+                    Value::Text("/b.txt".to_string()),
+                ],
+            ),
+            (
+                "SELECT path, data FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
+                vec![
+                    Value::Text("/a.txt".to_string()),
+                    Value::Text("/b.txt".to_string()),
+                ],
+            ),
+            (
+                "SELECT path, data FROM lix_file WHERE path IN ($1, $2) LIMIT 1",
+                vec![
+                    Value::Text("/a.txt".to_string()),
+                    Value::Text("/b.txt".to_string()),
+                ],
+            ),
+            (
+                "SELECT path, data FROM lix_file WHERE path IN ($1, $2)",
+                vec![Value::Text("/a.txt".to_string()), Value::Null],
+            ),
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                exact_lix_file_read_route(&statement, &params),
+                None,
+                "unexpected batch fast-path match for {sql}"
+            );
+        }
 
         for (sql, params) in [
             (
@@ -1840,7 +1992,7 @@ mod tests {
         ] {
             let statement = sql2::parse_statement(sql).unwrap();
             assert_eq!(
-                exact_lix_file_read(&statement, &params),
+                exact_lix_file_read_route(&statement, &params),
                 None,
                 "unexpected fast-path match for {sql}"
             );
@@ -1914,6 +2066,48 @@ mod tests {
 
         assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 11);
         assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 22);
+    }
+
+    #[tokio::test]
+    async fn exact_batch_file_read_returns_each_matching_file_once() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
+                &[
+                    Value::Text("/b.txt".to_string()),
+                    Value::Blob(b"bravo".to_vec()),
+                    Value::Text("/a.txt".to_string()),
+                    Value::Blob(b"alpha".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let result = session
+            .execute(
+                "SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3)",
+                &[
+                    Value::Text("/b.txt".to_string()),
+                    Value::Text("/a.txt".to_string()),
+                    Value::Text("/b.txt".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns(), &["path", "data"]);
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.rows()[0].get::<String>("path").unwrap(), "/a.txt");
+        assert_eq!(
+            result.rows()[0].value("data").unwrap(),
+            &Value::Blob(b"alpha".to_vec())
+        );
+        assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
+        assert_eq!(
+            result.rows()[1].value("data").unwrap(),
+            &Value::Blob(b"bravo".to_vec())
+        );
     }
 
     #[test]

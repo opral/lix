@@ -61,6 +61,7 @@ pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::SqlPlanningCache;
 pub(crate) use providers::{
-    ExactLixFileReadColumn, ExactLixFileReadSelector, execute_exact_lix_file_read,
+    ExactLixFileReadColumn, ExactLixFileReadSelector, execute_exact_lix_file_batch_read,
+    execute_exact_lix_file_read,
 };
 pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};

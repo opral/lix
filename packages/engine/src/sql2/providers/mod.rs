@@ -33,8 +33,8 @@ use datafusion::catalog::TableProvider;
 
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
-    execute_exact_lix_file_read, execute_fast_lix_file_data_update_by_id,
-    execute_fast_lix_file_path_writes,
+    execute_exact_lix_file_batch_read, execute_exact_lix_file_read,
+    execute_fast_lix_file_data_update_by_id, execute_fast_lix_file_path_writes,
 };
 pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
