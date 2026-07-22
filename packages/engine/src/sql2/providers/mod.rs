@@ -31,7 +31,8 @@ use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 use datafusion::catalog::TableProvider;
 
 pub(crate) use file::{
-    FastLixFilePathWriteConflict, execute_fast_lix_file_data_update_by_id,
+    ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
+    execute_exact_lix_file_read, execute_fast_lix_file_data_update_by_id,
     execute_fast_lix_file_path_writes,
 };
 pub(crate) use spec::DmlReturning;

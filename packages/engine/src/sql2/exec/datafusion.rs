@@ -1467,7 +1467,7 @@ fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> L
     crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
-fn query_result_from_batches(
+pub(crate) fn query_result_from_batches(
     result_fields: &[Field],
     batches: &[RecordBatch],
 ) -> Result<SqlQueryResult, LixError> {
