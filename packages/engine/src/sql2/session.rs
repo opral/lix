@@ -78,13 +78,14 @@ where
         .await?
         .map(|head| head.commit_id.to_string());
     register_sql2_functions(&session, read_ctx.functions(), active_branch_commit_id);
-    providers::register_read(&session, read_ctx, read_branch_ref).await?;
     let write_ctx = SqlWriteContext::new(write_ctx);
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
     ));
-    providers::register_write(
+    providers::register_transaction(
         &session,
+        read_ctx,
+        read_branch_ref,
         write_ctx,
         write_branch_ref,
         SqlWriteSessionOptions::default(),

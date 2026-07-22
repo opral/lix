@@ -58,13 +58,14 @@ pub(crate) async fn register_entity_providers<S>(
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     catalog: &PublicCatalog,
+    include_write_surfaces: bool,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     for surface in catalog.surfaces() {
         match &surface.kind {
-            PublicSurfaceKind::EntityBase { schema_key } => {
+            PublicSurfaceKind::EntityBase { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
@@ -78,7 +79,7 @@ where
                     WriteAccess::read_only(),
                 )?;
             }
-            PublicSurfaceKind::EntityByBranch { schema_key } => {
+            PublicSurfaceKind::EntityByBranch { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
