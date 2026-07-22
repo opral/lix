@@ -1485,7 +1485,7 @@ pub(crate) fn query_result_from_batches(
                 let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
                     .map_err(datafusion_error_to_lix_error)?;
                 let field = result_fields.get(column_index);
-                row.push(scalar_value_to_lix_value(&scalar, field)?);
+                row.push(scalar_value_to_lix_value(scalar, field)?);
             }
             rows.push(row);
         }
@@ -1617,36 +1617,33 @@ fn history_non_identity_filter_notice(view_name: &str) -> LixNotice {
     }
 }
 
-fn scalar_value_to_lix_value(
-    value: &ScalarValue,
-    field: Option<&Field>,
-) -> Result<Value, LixError> {
+fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Result<Value, LixError> {
     match value {
         ScalarValue::Null => Ok(Value::Null),
-        ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(*value)),
+        ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(value)),
         ScalarValue::Boolean(None) => Ok(Value::Null),
-        ScalarValue::Int8(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::Int8(Some(value)) => Ok(Value::Integer(i64::from(value))),
         ScalarValue::Int8(None) => Ok(Value::Null),
-        ScalarValue::Int16(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::Int16(Some(value)) => Ok(Value::Integer(i64::from(value))),
         ScalarValue::Int16(None) => Ok(Value::Null),
-        ScalarValue::Int32(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::Int32(Some(value)) => Ok(Value::Integer(i64::from(value))),
         ScalarValue::Int32(None) => Ok(Value::Null),
-        ScalarValue::Int64(Some(value)) => Ok(Value::Integer(*value)),
+        ScalarValue::Int64(Some(value)) => Ok(Value::Integer(value)),
         ScalarValue::Int64(None) => Ok(Value::Null),
-        ScalarValue::UInt8(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::UInt8(Some(value)) => Ok(Value::Integer(i64::from(value))),
         ScalarValue::UInt8(None) => Ok(Value::Null),
-        ScalarValue::UInt16(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::UInt16(Some(value)) => Ok(Value::Integer(i64::from(value))),
         ScalarValue::UInt16(None) => Ok(Value::Null),
-        ScalarValue::UInt32(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::UInt32(Some(value)) => Ok(Value::Integer(i64::from(value))),
         ScalarValue::UInt32(None) => Ok(Value::Null),
-        ScalarValue::UInt64(Some(value)) => match i64::try_from(*value) {
+        ScalarValue::UInt64(Some(value)) => match i64::try_from(value) {
             Ok(value) => Ok(Value::Integer(value)),
             Err(_) => Ok(Value::Text(value.to_string())),
         },
         ScalarValue::UInt64(None) => Ok(Value::Null),
-        ScalarValue::Float32(Some(value)) => Ok(Value::Real(f64::from(*value))),
+        ScalarValue::Float32(Some(value)) => Ok(Value::Real(f64::from(value))),
         ScalarValue::Float32(None) => Ok(Value::Null),
-        ScalarValue::Float64(Some(value)) => Ok(Value::Real(*value)),
+        ScalarValue::Float64(Some(value)) => Ok(Value::Real(value)),
         ScalarValue::Float64(None) => Ok(Value::Null),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
@@ -1655,16 +1652,16 @@ fn scalar_value_to_lix_value(
             Ok(Value::Null)
         }
         ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => {
-            Ok(Value::Blob(value.clone()))
+            Ok(Value::Blob(value))
         }
         ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
         other => Ok(Value::Text(other.to_string())),
     }
 }
 
-fn string_scalar_to_lix_value(value: &str, field: Option<&Field>) -> Result<Value, LixError> {
+fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
     if field.is_some_and(field_is_json) {
-        return serde_json::from_str::<serde_json::Value>(value)
+        return serde_json::from_str::<serde_json::Value>(&value)
             .map(Value::Json)
             .map_err(|error| {
                 LixError::new(
@@ -1678,7 +1675,7 @@ fn string_scalar_to_lix_value(value: &str, field: Option<&Field>) -> Result<Valu
                 )
             });
     }
-    Ok(Value::Text(value.to_string()))
+    Ok(Value::Text(value))
 }
 
 #[cfg(test)]
@@ -1693,7 +1690,9 @@ mod tests {
     use serde_json::Value as JsonValue;
     use serde_json::json;
 
-    use super::{SqlExecutionContext, SqlWriteExecutionContext, execute_sql};
+    use super::{
+        SqlExecutionContext, SqlWriteExecutionContext, execute_sql, scalar_value_to_lix_value,
+    };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
     use crate::changelog::{ChangeId, CommitId};
@@ -1723,6 +1722,7 @@ mod tests {
     };
     use crate::{Engine, ExecuteResult, SessionContext};
     use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, Value};
+    use datafusion::common::ScalarValue;
 
     struct DummyBlobReader;
     struct StaticBlobReader {
@@ -1752,6 +1752,20 @@ mod tests {
 
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
+    }
+
+    #[test]
+    fn result_scalar_conversion_moves_blob_payload() {
+        let payload = vec![0x41, 0x42, 0x43];
+        let payload_pointer = payload.as_ptr();
+
+        let result = scalar_value_to_lix_value(ScalarValue::LargeBinary(Some(payload)), None)
+            .expect("blob scalar should convert");
+        let Value::Blob(bytes) = result else {
+            panic!("expected blob result");
+        };
+
+        assert_eq!(bytes.as_ptr(), payload_pointer);
     }
 
     #[derive(Default)]
