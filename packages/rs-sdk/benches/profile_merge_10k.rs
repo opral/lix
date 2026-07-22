@@ -33,9 +33,10 @@
 
 use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
-    CommitResult, GetManyResult, GetOptions, Key, KeyRange, LocalFilesystem, OpenLixOptions,
-    PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
-    StorageWrite, Value, WasmComponentInstance, WasmLimits, WasmRuntime, WriteOptions, open_lix,
+    CommitResult, GetManyResult, GetOptions, Key, KeyRange, LocalFilesystem,
+    LocalFilesystemOpenOptions, OpenLixOptions, PutBatch, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, Storage, StorageError, StorageRead, StorageWrite, Value, WasmComponentInstance,
+    WasmLimits, WasmRuntime, WriteOptions, open_lix,
 };
 use lix_slatedb_storage::SlateDB;
 use lix_slatedb_storage::{SlateDBCacheOptions, SlateDBObjectStoreOptions};
@@ -99,9 +100,16 @@ fn main() {
 
     match backend {
         "rocksdb-fs" => {
-            let storage = runtime
-                .block_on(LocalFilesystem::open(&storage_path))
-                .expect("open production RocksDB filesystem profiling storage");
+            let options = LocalFilesystemOpenOptions::new(storage_path.clone(), true);
+            let storage = if let Some(wasm_runtime) = profiling_wasm_runtime() {
+                runtime.block_on(LocalFilesystem::open_with_options_and_wasm_runtime(
+                    options,
+                    wasm_runtime,
+                ))
+            } else {
+                runtime.block_on(LocalFilesystem::open_with_options(options))
+            }
+            .expect("open production RocksDB filesystem profiling storage");
             runtime.block_on(run_with_optional_io_stats(
                 storage,
                 mode,
@@ -153,7 +161,14 @@ fn main() {
         "storage_bytes backend={backend} bytes={}",
         directory_bytes(&storage_path)
     );
-    if backend == "slatedb-cached" {
+    if backend == "rocksdb-fs" {
+        eprintln!(
+            "storage_bytes_detail backend={backend} rocksdb_bytes={} materialized_file_bytes={} plugin_archive_bytes={}",
+            directory_bytes(&storage_path.join(".lix/.internal/rocksdb")),
+            file_bytes(&storage_path.join(CSV_PATH.trim_start_matches('/'))),
+            file_bytes(&storage_path.join(".lix/plugins/plugin_csv.lixplugin")),
+        );
+    } else if backend == "slatedb-cached" {
         eprintln!(
             "storage_bytes_detail backend={backend} object_store_bytes={} cache_bytes={}",
             directory_bytes(&storage_path.join("object-store")),
@@ -178,6 +193,10 @@ fn directory_bytes(path: &Path) -> u64 {
             })
         })
         .sum()
+}
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 fn open_cached_slatedb(storage_path: &Path) -> SlateDB {
@@ -361,8 +380,17 @@ async fn run_mode<S>(
 
 fn open_options<S>(storage: S) -> OpenLixOptions<S> {
     let options = OpenLixOptions::new(storage);
-    let Ok(raw_memory_mib) = std::env::var("LIX_PROFILE_WASM_MEMORY_MIB") else {
+    let Some(wasm_runtime) = profiling_wasm_runtime() else {
         return options;
+    };
+    let memory_mib = profile_wasm_memory_mib().expect("profiling runtime requires memory limit");
+    eprintln!("diagnostic_wasm_memory_mib={memory_mib} production_default_mib=64");
+    options.with_wasm_runtime(wasm_runtime)
+}
+
+fn profile_wasm_memory_mib() -> Option<u64> {
+    let Ok(raw_memory_mib) = std::env::var("LIX_PROFILE_WASM_MEMORY_MIB") else {
+        return None;
     };
     let memory_mib = raw_memory_mib
         .parse::<u64>()
@@ -371,13 +399,17 @@ fn open_options<S>(storage: S) -> OpenLixOptions<S> {
         memory_mib > 0,
         "LIX_PROFILE_WASM_MEMORY_MIB must be nonzero"
     );
+    Some(memory_mib)
+}
+
+fn profiling_wasm_runtime() -> Option<Arc<dyn WasmRuntime>> {
+    let memory_mib = profile_wasm_memory_mib()?;
     let max_memory_bytes = memory_mib
         .checked_mul(1024 * 1024)
         .expect("LIX_PROFILE_WASM_MEMORY_MIB exceeds u64 bytes");
-    eprintln!("diagnostic_wasm_memory_mib={memory_mib} production_default_mib=64");
     let inner = lix_sdk::profiling_default_wasm_runtime()
         .expect("initialize SDK Wasmtime runtime for profiling");
-    options.with_wasm_runtime(Arc::new(MemoryOverrideRuntime {
+    Some(Arc::new(MemoryOverrideRuntime {
         inner,
         max_memory_bytes,
     }))
@@ -459,10 +491,15 @@ fn env_flag(name: &str) -> bool {
 
 fn print_samples(label: &str, samples: &mut [std::time::Duration]) {
     samples.sort_unstable();
+    let sample_ms = samples
+        .iter()
+        .map(|sample| sample.as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
     let percentile = |numerator: usize| {
         let index = samples.len().saturating_mul(numerator).saturating_sub(1) / 100;
         samples[index]
     };
+    eprintln!("{label} sample_ms={sample_ms:?}");
     eprintln!(
         "{label} samples={} p50_ms={:.3} p95_ms={:.3} min_ms={:.3} max_ms={:.3}",
         samples.len(),

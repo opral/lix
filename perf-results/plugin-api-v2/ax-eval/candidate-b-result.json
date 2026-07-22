@@ -1,0 +1,244 @@
+{
+  "schema": 1,
+  "tool": {
+    "slug": "lix-plugin-api-b",
+    "name": "Lix plugin API candidate B: persistent document, splices, and patches",
+    "version": "research-2026-07-22",
+    "install": "included in the isolated Lix research workspace"
+  },
+  "task": "Implement and test the assigned Text, CSV, JSON, Markdown, or Excalidraw plugin task",
+  "round": "candidate-b-finalist",
+  "ts": "2026-07-22T12:01:00Z",
+  "config": {
+    "agent_model": "gpt-5.6-sol",
+    "agent_count": 9,
+    "temperature": 0,
+    "tools": [
+      "Codex functions.exec",
+      "Codex collaboration.send_message"
+    ],
+    "mcp_servers": [],
+    "system_prompt": null,
+    "max_turns": 40,
+    "prompt_template": "Implement and test the {format} plugin task at {task_path} in {isolated_workspace} using {candidate_api_path}",
+    "docs_included": false,
+    "overrides": {
+      "agent_model": "claude-opus-4-7 was unavailable; used gpt-5.6-sol",
+      "reasoning_effort": "low",
+      "temperature": "Codex collaboration agents do not expose temperature; 0 records the requested nominal setting, not a verified provider setting",
+      "tools": "Codex functions.exec and collaboration.send_message replaced the pinned Claude Code tool list; apply_patch and shell execution were nested under functions.exec",
+      "mcp_servers": "Codex does not expose per-agent MCP stripping; no MCP calls were observed in the scored transcripts",
+      "system_prompt": "Codex collaboration agents use the Codex system/developer instructions and cannot run with no system prompt",
+      "mode": "Codex workspace-write sandbox policy replaced bypassPermissions",
+      "max_turns": "Codex collaboration agents do not expose a hard turn cap; 40 records the requested nominal limit",
+      "fork_turns": "none"
+    }
+  },
+  "agents": [
+    {
+      "id": 1,
+      "success": true,
+      "success_reason": "Implemented the Candidate B line-oriented text plugin in the assigned workspace with seven tests covering every required behavior; an independent cargo test rerun passed all 7 tests.",
+      "duration_sec": 124.8,
+      "tool_calls": 9,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 83,
+        "efficiency": 79,
+        "errorRecovery": 100,
+        "final": 92
+      },
+      "first_3_commands": [
+        "pwd && rg --files -g 'AGENTS.md' -g 'text.md' -g 'candidate_b.rs' -g 'Cargo.toml' | head -80",
+        "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/text.md && sed -n '1,280p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && find . -maxdepth 3 -type f -print | sort",
+        "sed -n '1,260p' src/lib.rs && sed -n '1,200p' Cargo.toml && sed -n '1,240p' README.md && sed -n '1,320p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/lib.rs"
+      ]
+    },
+    {
+      "id": 2,
+      "success": true,
+      "success_reason": "Submission implements Candidate B\u2019s FilePlugin/Document facade and includes seven focused tests covering every stated requirement; `cargo fmt --check && cargo test` completed successfully with 7 passed, 0 failed.",
+      "duration_sec": 199.7,
+      "tool_calls": 11,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 70,
+        "efficiency": 74,
+        "errorRecovery": 100,
+        "final": 87
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/text.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && find experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 -maxdepth 3 -type f -print",
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && sed -n '1,180p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,360p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,420p' experiments/plugin-api-v2/api-candidates/src/types.rs && sed -n '1,200p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/README.md"
+      ]
+    },
+    {
+      "id": 3,
+      "success": false,
+      "success_reason": "The tests pass only after weakening the reorder assertion. Reordering produces IDs [b2,a,b1], and file_changed emits no metadata updates for unchanged moved rows, so committed entity state cannot preserve/render the new row order as required.",
+      "duration_sec": 128.9,
+      "tool_calls": 9,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 83,
+        "efficiency": 79,
+        "errorRecovery": 100,
+        "final": 92
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/csv.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && rg --files experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 | head -80",
+        "sed -n '1,260p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && cat experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,320p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,360p' experiments/plugin-api-v2/api-candidates/src/types.rs && rg \"candidate_b\" experiments/plugin-api-v2/ax-eval/runs -g '*.rs'"
+      ]
+    },
+    {
+      "id": 4,
+      "success": true,
+      "success_reason": "Implemented an executable Candidate B CSV plugin with tests covering all eight required behaviors; cargo test passed all 6 tests and cargo clippy passed with warnings denied.",
+      "duration_sec": 144.5,
+      "tool_calls": 10,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 80,
+        "efficiency": 77,
+        "errorRecovery": 100,
+        "final": 90
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/csv.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && find experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 -maxdepth 3 -type f -print | sort",
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,320p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && sed -n '1,240p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/README.md && sed -n '1,320p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,400p' experiments/plugin-api-v2/api-candidates/src/types.rs && rg -n \"candidate_b|FileTransition|EntityUpdate\" experiments/plugin-api-v2/ax-eval/runs experiments/plugin-api-v2 -g '*.rs' | head -120"
+      ]
+    },
+    {
+      "id": 5,
+      "success": true,
+      "success_reason": "Submission implements candidate-B JSON plugin in the assigned workspace, includes tests covering all eight required identity/change/rendering/isolation behaviors, and an independent rerun of cargo test passed (1 test, 0 failures).",
+      "duration_sec": 172.2,
+      "tool_calls": 11,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 75,
+        "efficiency": 74,
+        "errorRecovery": 100,
+        "final": 89
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/json.md && sed -n '1,300p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && find /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 -maxdepth 3 -type f -print",
+        "sed -n '1,260p' Cargo.toml && sed -n '1,360p' src/lib.rs && sed -n '1,200p' README.md && sed -n '1,320p' ../../../../api-candidates/src/lib.rs",
+        "sed -n '1,400p' ../../../../api-candidates/src/types.rs && rg \"candidate_b\" -n ../../final-active ../../pilot-* 2>/dev/null | head -50"
+      ]
+    },
+    {
+      "id": 6,
+      "success": true,
+      "success_reason": "Implemented the JSON plugin in the assigned workspace without modifying the candidate SDK; tests cover all eight required identity, edit, tombstone, escaping, rendering, and failed-transition behaviors, and cargo test passed 2/2 tests.",
+      "duration_sec": 113.4,
+      "tool_calls": 8,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 85,
+        "efficiency": 82,
+        "errorRecovery": 100,
+        "final": 93
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/json.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && rg --files experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 | sort",
+        "sed -n '1,260p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && sed -n '1,200p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,360p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,420p' experiments/plugin-api-v2/api-candidates/src/types.rs && find experiments/plugin-api-v2/ax-eval/runs -path '*/src/lib.rs' -size +2k -print | head -20"
+      ]
+    },
+    {
+      "id": 7,
+      "success": true,
+      "success_reason": "Implemented candidate-B Markdown plugin with tests covering all eight required behaviors; cargo fmt, 6 tests, and clippy with warnings denied all passed.",
+      "duration_sec": 132.4,
+      "tool_calls": 9,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 82,
+        "efficiency": 79,
+        "errorRecovery": 100,
+        "final": 91
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/markdown.md && sed -n '1,280p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && printf '\\n-- files --\\n' && rg --files",
+        "sed -n '1,260p' src/lib.rs; sed -n '1,240p' README.md; cat Cargo.toml; sed -n '1,360p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,420p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/types.rs"
+      ]
+    },
+    {
+      "id": 8,
+      "success": true,
+      "success_reason": "Implemented the Markdown plugin against candidate B in the assigned workspace, with tests covering all eight required behaviors; independent cargo test rerun passes all 6 tests.",
+      "duration_sec": 117.8,
+      "tool_calls": 8,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 85,
+        "efficiency": 82,
+        "errorRecovery": 100,
+        "final": 93
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/markdown.md && sed -n '1,260p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && rg --files /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 | head -80",
+        "sed -n '1,260p' src/lib.rs; sed -n '1,200p' Cargo.toml; sed -n '1,220p' README.md; sed -n '1,300p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,360p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/types.rs; rg -n \"candidate_b|FilePlugin|IdAllocator\" /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/runs -g '*.rs' | head -100"
+      ]
+    },
+    {
+      "id": 9,
+      "success": true,
+      "success_reason": "Implemented an executable candidate B Excalidraw plugin in the assigned workspace; 8 tests cover all nine required behaviors, and the final cargo fmt check and cargo test run passed with 8/8 tests.",
+      "duration_sec": 173.5,
+      "tool_calls": 16,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 75,
+        "efficiency": 62,
+        "errorRecovery": 100,
+        "final": 86
+      },
+      "first_3_commands": [
+        "pwd && rg --files -g 'AGENTS.md' -g 'SKILL.md' -g 'excalidraw.md' -g 'candidate_b.rs' -g 'Cargo.toml' -g 'package.json' | head -200",
+        "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/excalidraw.md && sed -n '1,280p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_b.rs && find . -maxdepth 3 -type f -print | sort && sed -n '1,200p' Cargo.toml",
+        "sed -n '1,300p' src/lib.rs; sed -n '1,220p' README.md; sed -n '1,320p' ../../../../api-candidates/src/lib.rs; rg -n \"candidate_b|ChangeSet|FileEdits|struct Change|enum Change|IdAllocator|EntitySource\" ../../../../api-candidates/src -g '*.rs'"
+      ]
+    }
+  ],
+  "summary": {
+    "success_rate": 0.8888888888888888,
+    "median_final": 91,
+    "p25_final": 89,
+    "p75_final": 92,
+    "common_first_command": "pwd && rg --files -g 'AGENTS.md' -g 'text.md' -g 'candidate_b.rs' -g 'Cargo.toml' | head -80 (1/9)"
+  }
+}

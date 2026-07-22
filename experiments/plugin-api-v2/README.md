@@ -43,6 +43,15 @@ semantic index, application-level packed KV, or retained guest copy of the
 file. Its timed output contains the exact changed entity bytes, not merely a
 hash.
 
+The measured Candidate B facade was later refined after the controlled AX
+cohort and a source-level correctness review. The warm mechanism is unchanged,
+but the final compileable facade adds explicit byte/entity cold constructors,
+minimal merge groups, complete upserts versus keyed deletes, composite retry-
+stable IDs, and no guest `Send`/`Sync` requirement. The refined WIT also names
+large input ranges and guest lazy outputs instead of forcing full `list<u8>`
+payloads. These post-cohort changes are not presented as another benchmark
+lane or retroactively assigned an AX score.
+
 ## Fixtures and correctness
 
 The harness generates approximately 100 KiB, 1 MiB, and 10 MiB fixtures for:
@@ -59,14 +68,19 @@ are valid JSON.
 
 Each timed write changes one value in the middle entity, alternating between
 one byte and 17 bytes. This forces both a 16-byte growth and shrink rather than
-special-casing same-length replacement. After timing, the host obtains a full
-checkpoint and verifies:
+special-casing same-length replacement. After timing, the host validates the
+candidate's measured output:
 
 1. the target entity ID is unchanged;
 2. the plugin reports that exact ID as changed; and
-3. the reconstructed bytes exactly equal the requested file, or, for D's
-   detection-only lane, the reported affected-entity hash exactly equals the
-   requested source view.
+3. v1/A/B/C reconstruct the complete requested file exactly; B2 returns the
+   exact affected-entity bytes from the requested source view; and D's
+   detection-only lane returns the exact affected-entity hash.
+
+B2 deliberately isolates incremental detection and source access; it does not
+exercise a full renderer. A production B2 port must additionally prove that
+applying its semantic delta and cold-rendering all entities reproduces the
+canonical requested file.
 
 ## Run
 

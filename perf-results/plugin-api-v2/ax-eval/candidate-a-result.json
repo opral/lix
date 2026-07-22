@@ -1,0 +1,156 @@
+{
+  "schema": 1,
+  "tool": {
+    "slug": "lix-plugin-api-a",
+    "name": "Lix plugin API candidate A: persistent document plus full blobs",
+    "version": "research-2026-07-22",
+    "install": "included in the isolated Lix research workspace"
+  },
+  "task": "Implement and test the assigned Text, CSV, JSON, Markdown, or Excalidraw plugin task",
+  "round": "candidate-a-format-screen",
+  "ts": "2026-07-22T12:00:00Z",
+  "config": {
+    "agent_model": "gpt-5.6-sol",
+    "agent_count": 5,
+    "temperature": 0,
+    "tools": [
+      "Codex functions.exec",
+      "Codex collaboration.send_message"
+    ],
+    "mcp_servers": [],
+    "system_prompt": null,
+    "max_turns": 40,
+    "prompt_template": "Implement and test the {format} plugin task at {task_path} in {isolated_workspace} using {candidate_api_path}",
+    "docs_included": false,
+    "overrides": {
+      "agent_model": "claude-opus-4-7 was unavailable; used gpt-5.6-sol",
+      "reasoning_effort": "low",
+      "temperature": "Codex collaboration agents do not expose temperature; 0 records the requested nominal setting, not a verified provider setting",
+      "tools": "Codex functions.exec and collaboration.send_message replaced the pinned Claude Code tool list; apply_patch and shell execution were nested under functions.exec",
+      "mcp_servers": "Codex does not expose per-agent MCP stripping; no MCP calls were observed in the scored transcripts",
+      "system_prompt": "Codex collaboration agents use the Codex system/developer instructions and cannot run with no system prompt",
+      "mode": "Codex workspace-write sandbox policy replaced bypassPermissions",
+      "max_turns": "Codex collaboration agents do not expose a hard turn cap; 40 records the requested nominal limit",
+      "fork_turns": "none"
+    }
+  },
+  "agents": [
+    {
+      "id": 1,
+      "success": true,
+      "success_reason": "The agent implemented the candidate A text plugin in the assigned workspace and `cargo test` passed all 6 tests, explicitly covering the seven required behaviors: stable IDs, single-ID edit, duplicate deletion, retry-stable insertion, reorder preservation, exact entity-change bytes, and discarded-transition immutability.",
+      "duration_sec": 110.2,
+      "tool_calls": 8,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 86,
+        "efficiency": 82,
+        "errorRecovery": 100,
+        "final": 93
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/text.md && sed -n '1,280p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_a.rs && printf '\\nFILES\\n' && rg --files /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 | head -80",
+        "sed -n '1,260p' Cargo.toml; sed -n '1,320p' src/lib.rs; sed -n '1,220p' README.md; printf '\\nSDK\\n'; sed -n '1,320p' ../../../api-candidates/src/lib.rs",
+        "sed -n '1,360p' ../../../../api-candidates/src/lib.rs; sed -n '1,320p' ../../../../api-candidates/src/common.rs 2>/dev/null || true; rg -n \"struct (Change|ChangeSet|EntitySource|IdAllocator|Source)|enum Change\" ../../../../api-candidates/src -g '*.rs'"
+      ]
+    },
+    {
+      "id": 2,
+      "success": true,
+      "success_reason": "The session implemented the CSV plugin in the assigned workspace using candidate A, added coverage for all eight required behaviors, fixed the only compile error, and finished with `cargo fmt --check && cargo test` passing (1 test passed, 0 failed).",
+      "duration_sec": 120.4,
+      "tool_calls": 9,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 84,
+        "efficiency": 79,
+        "errorRecovery": 100,
+        "final": 92
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/csv.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_a.rs && find experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 -maxdepth 3 -type f -print",
+        "sed -n '1,260p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && sed -n '1,200p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,300p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,360p' experiments/plugin-api-v2/api-candidates/src/types.rs && find experiments/plugin-api-v2/ax-eval/runs -path '*/src/lib.rs' -size +1c | head -20"
+      ]
+    },
+    {
+      "id": 3,
+      "success": true,
+      "success_reason": "Implemented the candidate A JSON plugin and comprehensive tests covering all eight requirements; cargo test passed 1/1 unit tests and doc tests with no failures.",
+      "duration_sec": 154.3,
+      "tool_calls": 9,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 78,
+        "efficiency": 79,
+        "errorRecovery": 100,
+        "final": 90
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/json.md && printf '\\n--- candidate ---\\n' && sed -n '1,260p' experiments/plugin-api-v2/api-candidates/src/candidate_a.rs && printf '\\n--- run files ---\\n' && find experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 -maxdepth 3 -type f -print | sort",
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && printf '\\n--- lib ---\\n' && sed -n '1,300p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && printf '\\n--- SDK crate ---\\n' && sed -n '1,320p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,400p' experiments/plugin-api-v2/api-candidates/src/types.rs && find experiments/plugin-api-v2/ax-eval/runs -path '*/src/lib.rs' -not -path '*/agent-1/*' | head -15"
+      ]
+    },
+    {
+      "id": 4,
+      "success": true,
+      "success_reason": "Implemented an executable Markdown plugin against candidate_a in the assigned workspace; all eight required behaviors have dedicated tests, and an independent cargo test rerun passed 8/8 tests.",
+      "duration_sec": 130.0,
+      "tool_calls": 10,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 82,
+        "efficiency": 77,
+        "errorRecovery": 100,
+        "final": 91
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/markdown.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_a.rs && find experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 -maxdepth 3 -type f -print",
+        "sed -n '1,260p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && sed -n '1,200p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,320p' experiments/plugin-api-v2/api-candidates/src/lib.rs",
+        "sed -n '1,360p' experiments/plugin-api-v2/api-candidates/src/types.rs && find experiments/plugin-api-v2/ax-eval/runs -path '*/src/lib.rs' | head -20"
+      ]
+    },
+    {
+      "id": 5,
+      "success": true,
+      "success_reason": "Implemented the Excalidraw adapter against candidate A, with five passing tests covering all nine required behaviors; final cargo test completed successfully with 5 passed, 0 failed, and no warnings.",
+      "duration_sec": 119.3,
+      "tool_calls": 8,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 84,
+        "efficiency": 82,
+        "errorRecovery": 100,
+        "final": 92
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' experiments/plugin-api-v2/ax-eval/tasks/excalidraw.md && sed -n '1,280p' experiments/plugin-api-v2/api-candidates/src/candidate_a.rs && rg --files experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 | head -80",
+        "sed -n '1,260p' experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/src/lib.rs && cat experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1/Cargo.toml && sed -n '1,300p' experiments/plugin-api-v2/api-candidates/src/lib.rs && rg -n \"candidate_a|EntitySource|struct Change|enum Change\" experiments/plugin-api-v2 -g '*.rs'",
+        "sed -n '1,260p' experiments/plugin-api-v2/api-candidates/src/types.rs && find experiments/plugin-api-v2/ax-eval/runs -path '*excalidraw*' -o -path '*agent-*' | head"
+      ]
+    }
+  ],
+  "summary": {
+    "success_rate": 1.0,
+    "median_final": 92,
+    "p25_final": 91,
+    "p75_final": 92,
+    "common_first_command": "sed -n '1,240p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/tasks/text.md && sed -n '1,280p' /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/api-candidates/src/candidate_a.rs && printf '\\nFILES\\n' && rg --files /private/tmp/lix-plugin-api-research.idNwOL/lix/experiments/plugin-api-v2/ax-eval/runs/final-active/agent-1 | head -80 (1/5)"
+  }
+}

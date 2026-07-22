@@ -14,7 +14,7 @@ The deterministic fixture contains 220,000 CSV rows and 10,680,000 bytes. A
 timed edit changes one field in the middle row and alternates between the
 original and edited file so every round is a real one-row transition.
 
-Before timing a write, the harness performs exactly:
+Before timing an edit series, the harness performs exactly once:
 
 ```sql
 SELECT data FROM lix_file WHERE path = $1
@@ -22,15 +22,22 @@ SELECT data FROM lix_file WHERE path = $1
 
 That point read grants the session deletion authority for the bytes it actually
 received. Plugin compilation, the point read, and construction of the edited
-blob stay outside the write timer. The timed write is the ordinary SQL upsert
-used by clients.
+blobs stay outside every write timer. Each timed write is the ordinary SQL
+upsert used by clients.
 
-The two reported backends are:
+The two reported production backends are:
 
-- `rocksdb`: the direct RocksDB engine storage adapter.
+- `rocksdb-fs`: `LocalFilesystem`, including its internal RocksDB engine,
+  materialized working files, watcher/synchronization path, and second Wasm
+  engine used by filesystem sync.
 - `slatedb-cached`: SlateDB over a local object store with the Lixray
   per-workspace policy: 64 MiB disk cache, 4 MiB block cache, and 1 MiB metadata
   cache.
+
+The harness also accepts raw `rocksdb` and cacheless `slatedb` as diagnostic
+controls, but they are not headline results. In particular, raw `rocksdb`
+omits production filesystem synchronization and is not a substitute for
+`rocksdb-fs`.
 
 Latency runs do not use the I/O-counting wrapper. Logical I/O is collected in
 separate single-round runs with `LIX_PROFILE_IO_STATS=1`.
@@ -46,7 +53,8 @@ production configuration or recommendation.
 
 Every timing collected with that knob prints both the diagnostic ceiling and
 the 64 MiB production default. Omitting the variable exercises the production
-policy.
+policy. For `rocksdb-fs`, the benchmark-only ceiling is applied to both the
+outer SQL engine and the engine owned by `LocalFilesystem` sync.
 
 ## Build and run
 
@@ -64,32 +72,50 @@ case directory. The commands used for the recorded 220k runs have this shape:
 ```sh
 env LIX_PROFILE_INITIAL_ROWS=220000 \
   LIX_PROFILE_WASM_MEMORY_MIB=256 \
-  <profile-binary> rocksdb setup <rocks-case>
-
-env LIX_PROFILE_INITIAL_ROWS=220000 \
-  LIX_PROFILE_WASM_MEMORY_MIB=256 \
-  LIX_PROFILE_ROUNDS=12 \
-  <profile-binary> rocksdb edit <rocks-case>
+  <profile-binary> rocksdb-fs setup <rocks-case>
 
 env LIX_PROFILE_INITIAL_ROWS=220000 \
   LIX_PROFILE_WASM_MEMORY_MIB=256 \
   LIX_PROFILE_ROUNDS=11 \
-  <profile-binary> rocksdb render <rocks-case>
+  <profile-binary> rocksdb-fs edit <rocks-case>
+
+env LIX_PROFILE_INITIAL_ROWS=220000 \
+  LIX_PROFILE_WASM_MEMORY_MIB=256 \
+  LIX_PROFILE_ROUNDS=11 \
+  <profile-binary> rocksdb-fs render <rocks-case>
 
 env LIX_PROFILE_INITIAL_ROWS=220000 \
   LIX_PROFILE_WASM_MEMORY_MIB=256 \
   LIX_PROFILE_IO_STATS=1 \
-  <profile-binary> rocksdb edit <rocks-case>
+  <profile-binary> rocksdb-fs edit <rocks-case>
 ```
 
-Replace `rocksdb` with `slatedb-cached` and use a separate fresh case for the
+Replace `rocksdb-fs` with `slatedb-cached` and use a separate fresh case for the
 cached SlateDB lane. Wrap a command in `/usr/bin/time -l` on macOS to collect
 maximum resident set size without changing the timed interval printed by the
 harness.
 
-The harness also prints recursive backend bytes. For cached SlateDB it reports
-the object-store and cache directories separately so cache duplication is not
-mistaken for durable storage amplification.
+The harness also prints recursive backend bytes. For `rocksdb-fs` it separates
+the internal database, materialized CSV, and plugin archive. For cached SlateDB
+it reports object-store and cache directories separately so cache duplication
+is not mistaken for durable storage amplification.
 
-See `results-latest-main.md` for the immutable commit, toolchain, raw commands,
-measurements, and interpretation.
+## Recorded latest-main result
+
+See
+[`full-engine-v1-baseline-66ad14da.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-66ad14da.md)
+for the immutable commit, toolchain, raw samples, RSS, storage, logical I/O,
+Samply attribution, reproduction commands, and interpretation. Its profiles
+are stored beside the report and can be opened directly:
+
+```sh
+samply load \
+  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-66ad14da.json.gz
+
+samply load \
+  perf-results/plugin-api-v2/full-engine-v1-slatedb-cached-edit-220k-66ad14da.json.gz
+```
+
+Use `perf-results/plugin-api-v2/analyze_samply.py --binary <profile-binary>
+<profile>` for an idle-filtered native summary. The report explains why the
+async marker is not used as a sample filter in this build.

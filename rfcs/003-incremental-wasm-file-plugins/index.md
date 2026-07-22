@@ -8,12 +8,13 @@ status: research
 ## Decision
 
 Replace the stateless whole-state plugin calls with one SDK-facing immutable
-`Document` abstraction. A document receives either byte splices or committed
+`Document` abstraction. A document receives either byte splices or merge-resolved
 entity changes and returns an immutable successor plus the opposite kind of
 delta. Immutable file versions stay behind a host-owned, range-readable
 `Source`; the Wasm document normally retains only format-specific syntax and
 identity indexes. The engine owns transaction acceptance, rollback, session
-views, deletion authority, revision checks, storage, scheduling, and eviction.
+views, observation handles, deletion authority, revision checks, storage,
+scheduling, and eviction.
 
 The recommended author-facing shape is intentionally small:
 
@@ -21,10 +22,21 @@ The recommended author-facing shape is intentionally small:
 pub trait FilePlugin {
     type Document: Document;
 
-    fn open(&self, input: OpenDocument<'_>) -> Result<Self::Document, Error>;
+    // Initial import: bytes exist, durable semantic entities do not.
+    fn open_file(
+        &self,
+        input: OpenFile<'_>,
+    ) -> Result<FileTransition<Self::Document>, Error>;
+
+    // Cold canonical shared-renderer recovery: durable entities exist,
+    // plugin-backed bytes do not.
+    fn open_entities(
+        &self,
+        input: OpenEntities<'_>,
+    ) -> Result<EntityTransition<Self::Document>, Error>;
 }
 
-pub trait Document: Sized + Send + Sync + 'static {
+pub trait Document: Sized + 'static {
     fn file_changed(
         &self,
         input: FileUpdate<'_>,
@@ -35,33 +47,89 @@ pub trait Document: Sized + Send + Sync + 'static {
         input: EntityUpdate<'_>,
     ) -> Result<EntityTransition<Self>, Error>;
 
-    fn checkpoint(&self) -> Result<Option<Checkpoint>, Error> {
-        Ok(None)
-    }
 }
 ```
 
-`FileUpdate` contains base-relative, sorted, non-overlapping byte splices and a
-retry-stable ID allocator. `FileTransition` contains the successor document and
-one atomic semantic change set. `EntityUpdate` contains only the final committed
-entity deltas. `EntityTransition` contains the successor document and byte
-splices against its previous bytes.
+`FileUpdate` contains before/after descriptors, base-relative sorted
+non-overlapping byte splices, lazy before/after sources, and a retry-stable ID
+allocator whose calls name the schema, composite-PK scope, and deterministic
+ordinal. `FileTransition` contains the successor document and semantic merge
+groups. `EntityUpdate` contains before/after descriptors, the final
+merge-resolved entity deltas, and a bounded paged complete-state fallback.
+`EntityTransition` contains the successor document and inline or paged byte
+splices; large replacement bytes may remain behind a lazy output. The generated
+SDK, not the author type, implements the WIT resource lifecycle; one
+branch/file actor serializes access, so a guest `Document` need not satisfy host
+`Send`/`Sync` constraints.
 
-A basic plugin may ignore locality and use these fallbacks:
+The descriptor contains path, media type, and the host-selected
+content-addressed plugin generation. Descriptor changes are semantic inputs: a
+rename-only transition is delivered even when the byte-splice list is empty.
+Every host source read, entity/change page, ID allocation, edit page, and lazy
+output read shares one aggregate top-level transition budget covering record
+size, page size/count, total bytes, and a non-renewing deadline. Paging is a
+bounded fallback, not a way to reset the five-second deadline per `next` call.
+
+Both cold directions are mandatory because plugin-backed files do not retain a
+durable raw blob. `open_file` parses a newly created raw file and emits its
+first entity groups. `open_entities` streams the canonical durable entities of
+one branch/file incarnation, renders a complete file from an empty base, and
+constructs its shared renderer after restart or eviction. It is not a recovery
+constructor for an arbitrary private session view: that view may contain exact
+noncanonical bytes or proposals that never won the shared merge. A private
+document, its exact byte source, and its exact semantic root therefore share
+one bounded lease. Evicting any non-reconstructible part revokes its observation
+handle and forces a reread. Cold work may be `O(document)`; the warm transition
+methods may not silently fall back to that cost without instrumentation.
+
+The evaluated facade's generic optional `snapshot`/`metadata` fields were too
+permissive: one Candidate B CSV implementation preserved row IDs during a
+reorder but failed to commit the new order, so a later render could not
+reproduce the file. The selected semantic delta is therefore explicit:
 
 ```rust
-fn file_changed(&self, update: FileUpdate<'_>) -> Result<FileTransition<Self>, Error> {
-    let next_bytes = update.apply_and_read_all()?;
-    self.reparse(next_bytes, update.ids())
+pub enum EntityChange {
+    Upsert {
+        entity: Entity,       // complete schema entity, including order_key
+        effect: ChangeEffect, // content or the typed format-only hint
+    },
+    Delete(EntityKey),
 }
 
-fn entities_changed(
-    &self,
-    update: EntityUpdate<'_>,
-) -> Result<EntityTransition<Self>, Error> {
-    let next = self.apply_changes(update.changes())?;
-    Ok(update.replace_all(next.render()?).with_document(next))
-}
+pub struct MergeGroup(pub Vec<EntityChange>);
+pub struct EntityChanges(pub Vec<MergeGroup>);
+```
+
+There is no partial upsert and no generic transport metadata escape hatch.
+Schema-defined order, parentage, native references, and other render-critical
+state live in the complete entity snapshot. Deletion is a separate variant.
+Every entity key may appear at most once in a transition. Most changes are
+singleton merge groups; coupled facts such as the two sides of an Excalidraw
+binding can win or lose a conflict together without coupling unrelated edits
+from the same file write.
+
+A basic plugin may ignore locality. The following is deliberately pseudocode
+for proposed SDK convenience helpers, not compileable methods on the checked
+facade. `read_all_bounded`, `collect_pages_bounded`, `apply_and_read_all`, and
+`replace_all` must remain charged to the same aggregate transition budget:
+
+```text
+open_file(input):
+  bytes = sdk.read_all_bounded(input.file)
+  return parse(input.descriptor, bytes, input.ids)
+
+open_entities(input):
+  entities = sdk.collect_pages_bounded(input.entities)
+  document = from_entities(input.descriptor, entities)
+  return (document, sdk.replace_all(empty_base, document.render()))
+
+file_changed(update):
+  next_bytes = sdk.apply_and_read_all(update.before, update.edits, update.after)
+  return reparse(update.after_descriptor, next_bytes, update.ids)
+
+entities_changed(update):
+  next = apply_complete_changes(update.after_descriptor, update.changes)
+  return (next, sdk.replace_all(update.before.len(), next.render_lazy()))
 ```
 
 An optimized plugin consumes the same methods, but reads only the affected
@@ -128,35 +196,109 @@ materialization and stateless reconstruction.
 
 ### One concept for authors, distinct roles in the engine
 
-Plugin authors implement only `Document`. Internally the engine holds different
-document versions for different authority domains:
+Plugin authors implement one `FilePlugin`/`Document` pair. Internally the engine
+holds different document versions for different authority domains:
 
-- A shared renderer document represents the current merged branch/file state.
-- A session document represents exactly the bytes and entities that session
-  received or subsequently submitted.
+- One shared renderer document represents each current merged
+  `(workspace, branch, path, file incarnation, plugin generation)` state.
+- A bounded set of private documents represents exact byte/entity roots that a
+  session demonstrably received or subsequently submitted on that same path.
 
 Those versions may share immutable guest structures, but they are never one
 mutable object. Applying a stale client's splice directly to the shared
 renderer would reintroduce overwrite bugs.
 
-The engine calls `file_changed` on the exact private session version. It merges
-the returned semantic changes into current shared state, commits them, and only
-then calls `entities_changed` on the shared renderer with the final merged
-changes. The session successor is the client's submitted view, not a merged
-view the client never received.
+Each acknowledgement-safe unique-file response carries an opaque observation
+handle. Aggregates, transformed bytes, ambiguous joins, and broad scans do not.
+The handle is unforgeably bound to the session, workspace, branch, path, file
+incarnation, and plugin generation, and addresses exactly one immutable byte
+source, semantic root, and private guest document. Only the SDK's later echo
+proves that it received the response; creating or attempting to send the
+response is not authority. The SDK does this without exposing commit state to
+the application. Base/result hashes still validate splice reconstruction, but
+a byte hash is not a root identity: byte-identical views can carry different
+stable entity IDs after different histories. A hash alone must never select a
+private root or grant authority. A server-side read attempt whose response may
+have been lost on the network likewise grants no authority; possession and
+validation of the session/path-bound handle is required.
+
+There is no generic “safe upsert” fallback when that exact observation is
+missing. For an ID-less format, parsing an entire submitted blob without its
+identity root cannot distinguish updates from new entities or duplicate an
+existing ID safely. If the path is absent, explicit creation may call
+`open_file`; if the submitted result is byte-identical to the current canonical
+source, the engine may return a no-op. Every other existing-file mutation with
+a missing, expired, wrong-path, wrong-branch, or wrong-generation observation
+fails closed with a retryable reread/`410` response before invoking the plugin.
+An optional format-specific blind-import capability would need separate
+identity proofs and is not part of v2. Ordinary applications still issue SQL
+blob reads and writes; this observation token is hidden SDK/transport
+provenance, not a `baseCommitId` or client-managed merge state.
+
+The engine calls `file_changed` only on the exact private version selected by
+the observation handle. It validates authority for every member of every merge
+group before conflict resolution: a delete or update of an existing key must
+refer to that observed root, while a new key must be a validated native ID or
+come from the operation-scoped allocator and be absent from current shared
+state (except for an idempotent retry of the same operation). Native-ID
+collisions with an unseen concurrent entity are rejected. If one member fails,
+the entire transition is rejected; the engine never filters a group into a
+different semantic operation.
+
+Conflict resolution is group-level and deterministic. Each group receives one
+retry-stable engine LWW rank from the operation order plus group ordinal.
+Overlapping concurrent candidate groups are considered in descending rank; a
+group is selected only when all of its keys are free, otherwise none of it is
+selected.
+The engine retains enough group provenance to recompute that frontier when a
+later higher-ranked group displaces an earlier group, including restoring prior
+values for the displaced group's non-overlapping keys. This makes the result
+independent of arrival order and prevents a coupled Excalidraw binding from
+being half-applied. Per-entity LWW without this group provenance is not a valid
+implementation of `MergeGroup`.
+
+The engine then calls `entities_changed` on the branch's shared renderer with
+only the final merge-resolved groups *before* durable commit. Only after the
+prospective graph and byte patches validate does storage commit and atomically
+publish the shared successor/source. The private successor is the client's
+submitted view, not a merged view the client never received.
+
+Host private semantic roots are structurally shared persistent maps, not full
+row vectors. A received observation stores an `Arc`-like root in `O(1)`; a
+sparse submission path-copies affected keys; authority is membership in the
+handle-selected root. This host structure is required alongside guest
+tree/source sharing or session fan-out would remain
+`O(sessions × entities)`. Private roots are not durable branch state and cannot
+be reconstructed by cold-opening the current shared entities. The bounded
+observation entry therefore retains its exact source/root/document together;
+eviction expires the handle and fails the next stale write closed.
 
 ### Immutable transitions make rollback ordinary
 
 An accepted document is borrowed immutably. A plugin returns a new document.
 The host retains both resources until storage commits:
 
-1. Invoke the accepted document and receive `(successor, output)`.
-2. Validate the output and stage the authoritative engine mutation.
-3. On commit, swap the host cache pointer to the successor.
-4. On abort or failed validation, drop the successor and evict the accepted
-   guest resource; reopen the previous authoritative root when it is needed.
-5. On a trap or uncertain completion, evict the disposable resource and reopen
-   from authoritative engine state.
+1. Resolve and validate the observation handle, then invoke its exact private
+   accepted document and receive `(successor, proposal)`.
+2. Validate every proposal group as a unit and deterministically resolve the
+   group-level LWW frontier into final groups.
+3. Invoke the shared accepted renderer and validate its prospective successor
+   and output patches.
+4. Commit authoritative storage.
+5. Publish the shared cache pointer/source and the next private
+   source/root/document lease with non-failing pointer swaps; only then issue
+   its observation handle.
+6. On abort or failed validation, drop successors. If a guest call may have
+   mutated an accepted private resource, revoke that observation; it cannot be
+   cold-reopened from shared state.
+7. On a shared-renderer trap or uncertain completion, evict that disposable
+   resource and reopen the branch's prior authoritative root from storage.
+
+If cache publication is unexpectedly unavailable after a successful commit,
+the commit remains successful: evict derived resources and cold-open from the
+new durable entity root. Do not issue a private observation unless its exact
+source/root/document lease was installed; the client must reread. Never report
+a durable commit as failed because a disposable cache could not be published.
 
 No plugin-visible `prepare`, `accept`, `abort`, transaction ID, branch ID, or
 commit ID is required. The safe SDK never gives ordinary authors mutable access
@@ -174,8 +316,11 @@ The API standardizes lifecycle and deltas, not matching policy. It supports:
   and Markdown nodes.
 - Structural identities, such as JSON object slots.
 
-New IDs come from a host allocator keyed by operation identity and ordinal.
-Retries therefore allocate the same IDs. The guest may use a native file ID
+The host binds each ID allocator to operation identity, file incarnation, and
+plugin generation. Each call supplies a schema key, composite-PK scope, and
+deterministic ordinal; the result is the scope plus one opaque host component.
+The same tuple returns the same ID on retries, distinct tuples cannot collide,
+and identity never depends on call order. The guest may use a native file ID
 when one exists, but it must not use time or unseeded randomness for retry
 identity.
 
@@ -184,13 +329,15 @@ Two byte-identical duplicate rows swapped in a CSV have no observable identity
 signal. The contract instead requires that IDs never derive from mutable array
 indices or byte offsets, preserves an existing ID whenever the format matcher
 has an unambiguous correspondence, and makes ambiguous matching deterministic.
-Native Excalidraw IDs are exact. JSON object-slot IDs are stable for value edits
-and key reorder but a key rename is intentionally a delete plus insert; opaque
-array-item IDs survive insertion and reorder.
+Native Excalidraw IDs are exact. JSON object slots and array items use opaque
+IDs. Object slots are matched by stable parent ID plus decoded key, so a value
+edit or key reorder preserves identity while a key rename is intentionally a
+delete plus insert. Array-item IDs survive insertion and reorder.
 
-The engine validates every tombstone against the exact private identity root
-acknowledged by that session. A guest resource and checkpoint are acceleration
-only; neither grants delete authority.
+The engine validates every tombstone, existing-key upsert, and newly allocated
+identity as part of its complete merge group against the exact
+observation-selected private identity root. Guest resources, byte hashes, and
+derived caches never grant authority.
 
 ### Coordinate and atomicity rules
 
@@ -199,13 +346,59 @@ only; neither grants delete authority.
   code runs.
 - The engine verifies the before and after content hashes. Remote v3 already
   sends an exact prefix/delete/insert splice with SHA-256 validation; that edit
-  provenance should survive parameter decoding.
-- All entity changes returned by one call are atomic. This supports Markdown
-  table references and Excalidraw binding updates.
-- A renderer receives only final committed entity deltas, never the client's
+  provenance should survive parameter decoding. Hash validation proves bytes,
+  while the separate observation handle selects the semantic root.
+- Each change belongs to an explicit merge group. Singleton groups are the
+  default; authority is validated for the whole group, and all members of a
+  coupled group win or lose deterministic conflict resolution together.
+  Transaction atomicity alone is insufficient under per-entity LWW.
+- One entity key may occur only once across all groups in one transition;
+  empty groups and upsert/delete duplicates are rejected.
+- A renderer receives only final merge-resolved entity deltas, never the client's
   unmerged proposal.
 - Full replacement is represented by one splice and remains a first-class
   fallback.
+
+### File, branch, and plugin-generation lifecycle
+
+The document API models content transitions inside one live file incarnation;
+it does not overload empty bytes as file deletion or silently carry resources
+across lifecycle boundaries:
+
+- A path creation is serialized against path state, allocates a fresh file
+  incarnation, and calls `open_file`. A zero-byte file is still a live file.
+- Explicit whole-file deletion is an engine operation that requires a valid
+  observation for the current incarnation. It competes with concurrent content
+  writes at the file-incarnation boundary under one deterministic LWW rank,
+  rather than asking a plugin to emit an unbounded list of tombstones. If the
+  delete wins, the incarnation and all of its semantic entities are tombstoned
+  atomically; if a content write wins, the file remains live.
+- Recreating the same path after a winning delete allocates a new incarnation
+  and calls `open_file`. Old observation handles, IDs scoped to the old
+  incarnation, guest documents, and byte sources can never authorize or mutate
+  the replacement.
+- A rename requires an observation bound to the old path, serializes both path
+  slots, preserves the file incarnation, and delivers distinct before/after
+  descriptors even when bytes are unchanged. A successful move revokes
+  old-path observations and issues only destination-bound successors;
+  destination collisions are resolved explicitly at the file-lifecycle layer.
+- There is exactly one shared renderer actor per
+  `(workspace, branch, path, incarnation, plugin generation)`. Branch forks
+  may structurally share immutable roots and sources, but their renderer
+  pointers and serialization queues are distinct. Branch deletion drops its
+  actor; branch merge applies the target branch's final resolved groups through
+  its renderer rather than reusing another branch's mutable lifecycle.
+- A plugin-generation upgrade first stops that branch/file actor and revokes
+  every old-generation observation. A schema-compatible generation must
+  `open_entities` from the durable root and validate its complete render before
+  an atomic generation-pointer swap. A schema or identity change requires an
+  explicit migration transaction; reparsing bytes with `open_file` and silently
+  reallocating IDs is forbidden. Failure leaves the old generation
+  authoritative.
+
+These rules make restart, deletion, path reuse, branch isolation, and plugin
+upgrade explicit engine state transitions without expanding the author-facing
+`Document` interface.
 
 ## Candidate APIs tested
 
@@ -239,6 +432,16 @@ locality hints and lazy/full fallbacks in the same types. The B control retained
 a complete file buffer in Wasm. B2 retains only the format index in Wasm and
 reads immutable before/after byte ranges from the host. The author facade is
 identical; B2 is the selected runtime/storage composition.
+
+The post-evaluation refinement keeps this lifecycle and data flow unchanged,
+but replaces v1-shaped optional change fields with
+`Upsert(complete entity, typed effect) | Delete(entity key)`, adds explicit
+`open_file`/`open_entities` cold directions, groups coupled merge facts, and
+drops guest `Send`/`Sync`. These are correctness/operability changes rather
+than a new performance candidate; the refined facade is compile-tested but was
+created after the controlled AX cohort. The AX results therefore cover the
+earlier B lifecycle/splice concept, not the final constructors, group semantics,
+observation behavior, or error ergonomics of this refined surface.
 
 ### Candidate C: pure copied checkpoint reducer
 
@@ -290,9 +493,14 @@ Inserting one value at index zero changes every numeric suffix pointer. The new
 JSON plugin should use:
 
 - a fixed root ID;
-- object-slot identity derived from stable parent ID plus decoded key;
+- opaque object-slot IDs matched by stable parent ID plus decoded key;
 - opaque array-item IDs plus independent order keys; and
 - pointers as derived locators rather than primary keys.
+
+Duplicate object keys are rejected in v2 rather than silently collapsed.
+Unambiguous subtree moves may preserve opaque IDs through format-owned hash
+matching; ambiguous duplicates use a documented deterministic match. Allocator
+output and every emitted schema/snapshot/PK correspondence are host-validated.
 
 This correctness change is required even if the plugin API itself remains
 unchanged.
@@ -312,21 +520,39 @@ locally. Complete immutable bytes remain in the host source:
   asset reachability.
 
 The index is not a duplicate rich snapshot graph. Entity payloads remain
-ordinary engine entities and are delivered only when a local render needs
-them.
+ordinary engine entities and are delivered only for cold `open_entities`, a
+full-state fallback, or when a local render needs them.
 
-Warm operations must not hydrate every active entity. A cold open may rebuild
-from the file and an identity-only projection. An optional, versioned checkpoint
-can avoid that rebuild when it matches the plugin hash, ABI version, file
-incarnation, and immutable semantic root. Checkpoints are disposable derived
-data; missing or corrupt checkpoints fall back to rebuild.
+The measured B2 prototype uses a flat absolute-offset vector. A
+length-changing edit therefore shifts every following offset and is
+`O(entities after the edit)`, even though its source reads and emitted entity
+are local. Production must use a relative-offset/interval tree (or equivalent
+piece-tree annotations) and demonstrate logarithmic lookup plus work
+proportional to the affected grammatical region on start-, middle-, and
+end-of-file length-changing edits. The B2 benchmark proves affected-entity
+exactness for generated fixture scanners; it does not validate a complete cold
+render. Every production format must additionally prove that
+`open_entities(full durable state)` reconstructs exactly the canonical bytes
+produced by the warm renderer, including after eviction and at the 10 MiB
+64 MiB guest-memory gate.
 
-The first production version should keep checkpoints process-local until a
-storage design proves more than 20% end-to-end benefit without more than 20%
-write amplification. Persisting a monolithic 10 MiB checkpoint after every
-one-byte edit is rejected. Packing unrelated entity KVs above RocksDB/SlateDB is
-also rejected: both stores already have block/SST packing, and an extra packing
-layer can hurt point reads.
+Warm operations must not hydrate every active entity. Cold `open_file` streams
+the file, while cold `open_entities` honestly streams the full durable entity
+set: today's engine cannot extract format-specific identity fields from opaque
+snapshots without decoding them. A later plugin-emitted identity projection or
+durable checkpoint is a separate optimization and must clear the greater-than-
+20% end-to-end benefit gate without greater-than-20% write amplification.
+Persisting a monolithic 10 MiB checkpoint after every one-byte edit is rejected.
+Packing unrelated entity KVs above RocksDB/SlateDB is also rejected: both stores
+already have block/SST packing, and an extra packing layer can hurt point reads.
+
+Render-effective formatting must survive eviction of the shared renderer.
+Applying emitted entities to the base semantic root and then cold
+`open_entities` must produce the same canonical bytes as applying the warm
+renderer's patches. Markdown therefore
+stores required format fields; text must either store each line terminator or
+explicitly canonicalize mixed line endings on first ingest rather than relying
+on ephemeral spans.
 
 Host byte sources are also process-local derived views, not a new durable file
 store. A shared renderer source and session sources must use immutable ropes or
@@ -341,25 +567,176 @@ The high-level SDK compiles to Component Model resources. The important wire
 property is ownership, not exposing this WIT to plugin authors:
 
 ```wit
+record transition-limits {
+  max-record-bytes: u32,
+  max-page-bytes: u32,
+  max-pages: u32,
+  max-total-bytes: u64,
+  total-deadline-nanoseconds: u64,
+}
+
+resource transition-budget {
+  limits: func() -> transition-limits;
+  remaining-nanoseconds: func() -> u64;
+}
+
+resource byte-source {
+  len: func() -> u64;
+  read: func(budget: borrow<transition-budget>, offset: u64, length: u32)
+    -> result<bytes, source-error>;
+}
+
+record packet-page {
+  format-version: u16,
+  record-count: u32,
+  payload: bytes,
+  attachments: list<own<byte-source>>,
+}
+
+resource packet-source {
+  next: func(budget: borrow<transition-budget>, max-bytes: u32)
+    -> result<option<packet-page>, source-error>;
+}
+
+resource id-allocator {
+  allocate: func(
+    budget: borrow<transition-budget>,
+    schema-key: string,
+    scope: list<string>,
+    ordinal: u64,
+  ) -> result<list<string>, source-error>;
+}
+
+record plugin-selection {
+  plugin-key: string,
+  generation: string,
+}
+
+record file-descriptor {
+  path: option<string>,
+  media-type: option<string>,
+  plugin: plugin-selection,
+}
+
+resource byte-output {
+  len: func() -> u64;
+  read: func(budget: borrow<transition-budget>, offset: u64, length: u32)
+    -> result<bytes, plugin-error>;
+}
+
+record file-update {
+  before-descriptor: file-descriptor,
+  after-descriptor: file-descriptor,
+  before: own<byte-source>,
+  edits: list<input-splice>,
+  after: own<byte-source>,
+  ids: own<id-allocator>,
+}
+
+record entity-update {
+  before-descriptor: file-descriptor,
+  after-descriptor: file-descriptor,
+  before: own<byte-source>,
+  changes: own<packet-source>,
+  current-entities: own<packet-source>,
+}
+
+variant output-bytes {
+  inline(bytes),
+  output(own<byte-output>),
+}
+
+record output-splice {
+  offset: u64,
+  delete-len: u64,
+  insert: output-bytes,
+}
+
+record edit-page {
+  edits: list<output-splice>,
+}
+
+resource edit-cursor {
+  next: func(
+    budget: borrow<transition-budget>,
+    max-edits: u32,
+    max-inline-bytes: u32,
+  ) -> result<option<edit-page>, plugin-error>;
+}
+
+record change-page {
+  format-version: u16,
+  record-count: u32,
+  payload: bytes,
+  attachments: list<own<byte-output>>,
+}
+
+resource change-cursor {
+  next: func(budget: borrow<transition-budget>, max-bytes: u32)
+    -> result<option<change-page>, plugin-error>;
+}
+
+record file-transition {
+  document: own<document>,
+  changes: own<change-cursor>,
+}
+
+record entity-transition {
+  document: own<document>,
+  edits: own<edit-cursor>,
+}
+
 resource document {
   fork: func() -> own<document>;
-  file-changed: func(update: file-update)
-    -> result<tuple<own<document>, own<change-cursor>>, plugin-error>;
-  entities-changed: func(update: entity-update)
-    -> result<tuple<own<document>, own<edit-cursor>>, plugin-error>;
-  checkpoint: func() -> result<option<own<byte-source>>, plugin-error>;
+  file-changed: func(budget: borrow<transition-budget>, update: file-update)
+    -> result<file-transition, plugin-error>;
+  entities-changed: func(budget: borrow<transition-budget>, update: entity-update)
+    -> result<entity-transition, plugin-error>;
 }
+
+record open-file-input {
+  descriptor: file-descriptor,
+  file: own<byte-source>,
+  ids: own<id-allocator>,
+}
+
+record open-entities-input {
+  descriptor: file-descriptor,
+  entities: own<packet-source>,
+}
+
+open-file: func(budget: borrow<transition-budget>, input: open-file-input)
+  -> result<file-transition, plugin-error>;
+open-entities: func(budget: borrow<transition-budget>, input: open-entities-input)
+  -> result<entity-transition, plugin-error>;
 ```
 
 `fork` is constant-time at the resource layer: it aliases the same immutable
 accepted document. Successors structurally share unchanged rope/tree nodes.
 
-Small splices and change batches use a versioned packed byte arena. Large cold
-hydration, full replacement, and checkpoint traffic use streams. Rich nested
+Small splices and change batches use a versioned packed byte arena. Merge-group
+boundaries and complete upsert records are encoded in that transient packet.
+Large cold hydration and full replacement use lazy sources/outputs, upgraded to
+P3 streams when the toolchain gate clears. Rich nested
 `list<entity-state>` values are not the wire format. Bounds checks and packet
 version checks run on the host before semantic application. Both transition
 directions receive the accepted host byte source; an optimized plugin keeps
 offsets, hashes, parser checkpoints, and IDs rather than a duplicate blob.
+
+Small insertion bytes are inline. A large input splice names a range in the
+immutable `after` source; a large renderer result returns a guest-owned lazy
+byte output. Cursor pages share one global coordinate space, and the host
+validates ordering/non-overlap across all pages. The SDK presents both forms as
+the same `Splice` abstraction.
+
+Packet pages use explicit framing and never split an entity/change record.
+Every non-EOF page is non-empty and advances; EOF is permanent; oversized
+indivisible records fail explicitly. The host passes the same
+`transition-budget` through the top-level call and all later cursor/output
+draining, so repeated reads, page count, aggregate bytes, and elapsed time stay
+bounded across the whole transition rather than restarting on each resource
+method. The author-facing Rust facade hides this plumbing behind bounded
+`EntitySource`, inline/paged `FileEdits`, and lazy `ByteOutput` abstractions.
 
 ### WASI 0.3 / P3
 
@@ -369,23 +746,32 @@ Canonical ABI copies by itself. Inline small deltas should stay inline; streams
 should be used for large or naturally asynchronous transfers. P3 adoption is a
 transport implementation choice under the SDK facade and must not create a
 second author API. WASI 0.3 was ratified on 2026-06-11; the current Wasmtime 45
-line exposes the release-candidate implementation, while Wasmtime 46 enables
-0.3.0 Component Model Async by default. Toolchain readiness should therefore be
-an implementation gate, not a reason to change the document contract.
+line can run the ABI behind flags and the Bytecode Alliance announced that
+Wasmtime 46 will enable final 0.3.0 Component Model Async by default. Guest
+toolchains are still converging on the final WIT pins.
+
+The Bytecode Alliance also reports roughly 3.5x overhead in the current async
+task machinery even for purely synchronous component calls. That reinforces a
+split transport: keep warm splice/change calls synchronous and inline, and use
+P3 streams/futures for cold scans, cache misses, and large fallbacks where
+suspension or bounded buffering is useful. Toolchain and sync-call overhead are
+implementation gates, not reasons to change the `Document` contract.
 
 ## Runtime ownership and concurrency
 
 The current runtime caches one instantiated component/store per plugin key and
 serializes every call through one mutex. The v2 runtime instead caches compiled
-components and creates bounded actors per active plugin-generation/file
-incarnation:
+components and creates bounded actors per active
+branch/path/plugin-generation/file-incarnation tuple:
 
 - one shared renderer and structurally shared private session versions live in
   the same actor when safe;
-- different files can execute in parallel;
-- one file's mutation remains serialized;
+- different branch/files can execute in parallel;
+- one branch/file's mutation remains serialized;
 - per-file and aggregate memory budgets are explicit;
-- LRU eviction drops disposable resources and cold-reopens them;
+- LRU eviction cold-reopens only canonical shared renderers; evicting a private
+  noncanonical source/root/document lease revokes its observation and requires
+  the session to reread;
 - guest CPU runs on bounded workers, not general async executor threads; and
 - a trap/cancellation discards only that actor, not every file using the plugin.
 
@@ -398,8 +784,10 @@ microbenchmark is insufficient.
 The API win depends on not reconstructing the old full row graph before the
 guest call. Production integration should:
 
-1. Pass only committed changed entities to a warm renderer.
-2. Retain exact private view roots rather than rich row vectors per session.
+1. Pass only merge-resolved changed entities to a warm renderer before commit.
+2. Retain observation-addressed exact source/root/document leases and
+   structurally shared semantic roots rather than rich row vectors per session;
+   hashes validate bytes but do not identify those roots.
 3. Use RocksDB native `MultiGet` for unavoidable sparse cold hydration.
 4. Use SlateDB bounded dense-run scans or a real batched lookup, retaining its
    block, metadata, and object-store caches.
@@ -408,7 +796,27 @@ guest call. Production integration should:
 This is not a proposal to pack individual logical KVs into Lix-owned packs.
 RocksDB and SlateDB already group data into physical blocks/SSTs. The remaining
 opportunity is fewer logical reads and less decoding, achieved through deltas,
-storage-native batching, identity-only projection, and warm document state.
+storage-native batching, persistent semantic roots, and warm document state.
+
+## Evidence-ranked implementation targets
+
+The ranks combine measured headroom with architectural dependency. Profile
+percentages below are inclusive whole-process active-sample attribution and
+overlap; they are not isolated phase timings and must not be summed.
+
+| Rank | Target | Exact evidence | Decision gate |
+|---:|---|---|---|
+| 1 | Integrate B2 with observation-selected sparse host roots and a relative-offset document tree | Current one-row 10.68 MiB CSV writes request 226,391 RocksDB-filesystem / 226,360 cached-SlateDB keys and cannot initialize under 64 MiB guest memory. Isolated B2 p50 is 0.0126-0.0710 ms, 264.9-1462.6x over its optimistic v1 control, with 77.99-91.93% lower guest high-water than B. | Must beat current full SQL p50 and p95 by >20% on both backends, pass 64 MiB, and pass observation/lifecycle/full cold-render tests. |
+| 2 | Add adaptive SlateDB batched/dense-run reads after the warm path stops requesting the world | Cached SlateDB current-v1 p50 is 4,092 ms/edit and 4,190 ms/render; 41.86% / 23.60% of whole-process active samples include `get_snapshot_values` / SST iterator initialization. | >20% full-engine improvement with a configured sparse-key over-read budget. |
+| 3 | Reuse the already validated renderer splice/materialization in `LocalFilesystem` | RocksDB-filesystem exact render p50 is 937 ms, and 42.49% of whole-process active samples include `LocalFilesystem::sync_from_lix` on its separate sync thread. | >20% end-to-end RocksDB-filesystem win with identical bytes and acknowledgement/commit ordering. |
+| 4 | Produce a packed transient Component packet directly from sparse state | Rich-record versus arena boundary probes are 6.25-84.0x faster; the two 218,454-entity cases reduce guest peak from 64.88 to 39.32 MB and 63.11 to 28.84 MB. The file-byte control is 0.95x. | >20% after sparse retrieval; constructing rich rows first does not count. |
+| 5 | Use P3 streams only for cold/large transfers | A 10 MiB stream reduced payload high-water 81-90% while p50 stayed 2.686-2.718 ms versus 2.692 ms for `list<u8>`. | Capacity/backpressure win without >5% hot-call regression; not a warm latency claim. |
+
+Persistence with complete blobs (A) is rejected at only 1.00-1.05x. Copied
+checkpoints (C) are rejected despite 10.54-16.69x core-Wasm latency because
+10.05-12.78 MiB crosses each direction per edit. Host KV access (D) remains an
+in-memory access probe, and generic Lix-owned packed storage pages are not a
+ranked target.
 
 ## Hypotheses and acceptance gates
 
@@ -430,6 +838,14 @@ writes, physical SlateDB object/WAL bytes, and RocksDB WAL/database size.
 Fixture construction, plugin compilation, and backend open stay outside warm
 timers. Cold compile/open are reported separately.
 
+The mechanism scanners and AX task adapters do not satisfy H7/H8. Those gates
+require production parser ports plus complete cold render, observation-selected
+out-of-order views, expired private-view failure, actor eviction, abort/trap,
+file deletion/recreation, branch isolation, plugin-generation upgrade, warm
+range/entity-read counters, mixed-line-ending round trips, relative-offset
+length-changing edits, and concurrent group-level coupled-reference tests on
+both backends.
+
 ## AX evaluation protocol
 
 The API candidates are evaluated with the repository's `ax-eval` research
@@ -439,8 +855,10 @@ package and raw transcripts. Each prompt follows the minimal canonical shape:
 Implement and test the assigned <format> plugin using <candidate SDK path>
 ```
 
-The screening round gives A, C, and D one isolated agent per format. Candidate
-B/B2 then receives the ax-eval default of ten agents, two per format. Only one
+The planned screen gave A, C, and D one isolated agent per format, followed by
+the ax-eval default of ten B/B2 agents. Execution completed A=5, B=9, C=4, and
+D=4 before the environment's agent-write capacity was exhausted. Missing cells
+are reported as missing rather than imputed. Only one
 submission workspace is visible at a time; completed workspaces are archived
 outside the repository before the next agent begins. An independent judge
 evaluates every transcript and workspace. Deterministic parsing—not agent
@@ -453,39 +871,62 @@ the result metadata records the model/tool/temperature overrides. Raw rollout
 JSONL, judge output, result JSON, and the per-tool index are retained. Deltas
 under ten score points at N=10 are treated as noise.
 
+After the correctness review froze the refined signatures, a targeted N=3
+follow-up assigned one isolated agent each to lifecycle/cold-open/rename, CSV
+reorder/cold reconstruction, and Excalidraw coupled-group/lazy-large-entity
+work. All three implementations and their seven tests passed independent
+judgment. Scores were 86, 85, and 82 (median 85). This demonstrates that the
+added concepts are usable in focused tasks, but the heterogeneous N=3 result is
+not statistically comparable with the earlier N=9 B cohort. The Excalidraw
+task exercised bounded 64 KiB reads and lazy output for a 4 MiB entity, but its
+test implementation eventually accumulated the payload; it is not peak-memory
+evidence.
+
 The decision order is correctness, then the >20% performance/storage gate,
 then AX usability. A pleasant API cannot rescue an `O(document)` warm path; a
 fast API that agents routinely misuse cannot ship without a safer facade.
+The main comparative cohort evaluates the pre-refinement candidate facades.
+The targeted follow-up covers `open_file`/`open_entities`, descriptors, scoped
+allocation, bounded pages/lazy output, complete order upserts, and merge-group
+construction. Aggregate-budget failures, observation expiry/retry, generated
+bindings, and realistic recovery still require a larger homogeneous controlled
+cohort before the API is frozen.
 
 ## Rollout plan
 
-1. Preserve remote blob-splice metadata through SQL parameter binding and add a
-   local full-blob-to-splice fallback.
-2. Introduce the SDK facade and v2 resources behind a new plugin API version.
-3. Port text first, then CSV, because their grammatical invalidation boundaries
+1. Preserve remote blob-splice/hash metadata through SQL parameter binding,
+   add opaque session/branch/path-bound observation handles, and reject an
+   existing-file mutation whose exact identity root is unavailable.
+2. Introduce structurally shared host byte and semantic roots plus
+   observation-addressed private leases; benchmark 1/8/32 sessions and expiry.
+3. Introduce the refined SDK/WIT facade with both cold constructors, merge
+   groups, packet validation, and precommit renderer validation.
+4. Port text first, then CSV, because their grammatical invalidation boundaries
    are easiest to verify.
-4. Break JSON identity before claiming stable array behavior.
-5. Port Markdown with retained source spans and subtree indexes.
-6. Add the Excalidraw plugin using native IDs and separate streamed assets.
-7. Add per-file actors, memory admission, eviction, rollback, trap, upgrade,
-   and multi-session tests.
-8. Enable v2 by measured format/backend cohort; retain v1 only for migration,
+5. Break JSON identity before claiming stable array behavior.
+6. Port Markdown with retained source spans and subtree indexes.
+7. Add the Excalidraw plugin using native IDs and separate streamed assets.
+8. Add per-branch/file actors, memory admission, private-handle expiry,
+   rollback, trap, whole-file deletion/recreation, plugin upgrade, and
+   multi-session tests.
+9. Enable v2 by measured format/backend cohort; retain v1 only for migration,
    not as an automatic large-file fallback.
 
 ## Open questions
 
-- Whether process-local checkpoints are sufficient for the first release or a
-  compact periodic durable checkpoint clears the storage gate.
+- Whether a compact periodic durable checkpoint clears the cold-open and
+  storage-amplification gates after the first full-entity-streaming release.
 - Whether one Wasm store per file actor provides the best fault isolation, or a
   small actor pool per plugin generation is necessary for tiny files.
-- Whether strict network receipt needs an opaque delivery confirmation token
-  before delete authority is granted.
+- Which persistent semantic-map implementation gives the best root sharing and
+  sparse merge behavior at 1/8/32 retained session views.
 - Which incremental parser implementation each format should use; the API does
   not mandate Tree-sitter or any other parser.
 
 ## References
 
 - [WASI 0.3 launch and async Component Model primitives](https://bytecodealliance.org/articles/WASI-0.3)
+- [Component Model 1.0 roadmap and current synchronous-call overhead](https://bytecodealliance.org/articles/the-road-to-component-model-1-0)
 - [Component Model Canonical ABI](https://component-model.bytecodealliance.org/advanced/canonical-abi.html)
 - [Tree-sitter incremental edits and structurally shared trees](https://tree-sitter.github.io/tree-sitter/using-parsers/3-advanced-parsing.html)
 - [RocksDB MultiGet performance rationale](https://github.com/facebook/rocksdb/wiki/MultiGet-Performance)

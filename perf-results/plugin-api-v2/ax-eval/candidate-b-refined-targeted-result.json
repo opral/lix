@@ -1,0 +1,115 @@
+{
+  "schema": 1,
+  "tool": {
+    "slug": "lix-plugin-api-b-refined",
+    "name": "Lix plugin API candidate B refined lifecycle",
+    "version": "research-2026-07-22-b66a0242",
+    "install": "frozen source snapshot in each isolated evaluation workspace"
+  },
+  "task": "Implement and test the assigned lifecycle/descriptor, CSV reorder, or Excalidraw coupled-change and large-entity task",
+  "round": "candidate-b-refined-targeted",
+  "ts": "2026-07-22T16:16:22Z",
+  "config": {
+    "agent_model": "gpt-5.6-sol",
+    "agent_count": 3,
+    "temperature": 0,
+    "tools": [
+      "Codex functions.exec",
+      "Codex collaboration.send_message"
+    ],
+    "mcp_servers": [],
+    "system_prompt": null,
+    "max_turns": 40,
+    "prompt_template": "Implement and test the task at {task_path} in {isolated_workspace} using the frozen API at {candidate_api_path}",
+    "docs_included": false,
+    "overrides": {
+      "agent_model": "claude-opus-4-7 was unavailable; used gpt-5.6-sol",
+      "reasoning_effort": "low",
+      "temperature": "Codex collaboration agents do not expose temperature; 0 records the requested nominal setting, not a verified provider setting",
+      "tools": "Codex functions.exec and collaboration.send_message replaced the pinned Claude Code tool list; apply_patch and shell execution were nested under functions.exec",
+      "mcp_servers": "Codex does not expose per-agent MCP stripping; no MCP calls were observed in the scored transcripts",
+      "system_prompt": "Codex collaboration agents use the Codex system/developer instructions and cannot run with no system prompt",
+      "mode": "Codex workspace-write sandbox policy replaced bypassPermissions",
+      "max_turns": "Codex collaboration agents do not expose a hard turn cap; 40 records the requested nominal limit",
+      "fork_turns": "none",
+      "cohort_size": "Targeted N=3 follow-up, one agent per high-risk scenario; not a replacement for an N=10+ cohort",
+      "frozen_contract": "candidate_b_refined.rs sha256 b66a0242623d8988ebfd5fa503a818861fd72f738a4663c6b6134184c7784918; lix-plugin-v2.wit sha256 866e6dd59c9c72e153abbd77357fd65ff97c75f52b7c11c2065890459438a4eb",
+      "metric_parser": "Codex rollout JSONL was adapted deterministically: custom_tool_call plus function_call count as tool calls; task_complete timestamps provide duration; tool transport errors and post-end-turn user messages provide errors/interruptions"
+    }
+  },
+  "agents": [
+    {
+      "id": 1,
+      "success": true,
+      "success_reason": "The log shows src/lib.rs was fully implemented and cargo test completed successfully with all 3 lifecycle, pagination/stable-ID, rename, and malformed-input tests passing.",
+      "duration_sec": 210.1,
+      "tool_calls": 13,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 68,
+        "efficiency": 69,
+        "errorRecovery": 100,
+        "final": 86
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' TASK.md && printf '\\n-- files --\\n' && rg --files -g 'AGENTS.md' -g '!target' . .. | head -50 && printf '\\n-- api --\\n' && sed -n '1,260p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs",
+        "sed -n '261,620p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs && printf '\\n-- crate --\\n' && rg --files -g '!target' && printf '\\n-- manifest --\\n' && sed -n '1,200p' Cargo.toml",
+        "sed -n '1,320p' src/lib.rs && sed -n '1,180p' /private/tmp/lix-refined-ax-api/src/lib.rs"
+      ]
+    },
+    {
+      "id": 2,
+      "success": true,
+      "success_reason": "The log shows only isolated-crate files were modified, and cargo fmt --check plus cargo test --offline passed the durability, stable-ID, reconstruction, validation, and zero-page warm-render test.",
+      "duration_sec": 205.1,
+      "tool_calls": 15,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 69,
+        "efficiency": 64,
+        "errorRecovery": 100,
+        "final": 85
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' TASK.md && sed -n '1,280p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs && rg --files -g 'AGENTS.md' -g '!target' .. /private/tmp/lix-refined-ax-csv 2>/dev/null | head -40",
+        "sed -n '281,620p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs; rg --files -g '!target'; sed -n '1,240p' Cargo.toml",
+        "sed -n '1,260p' src/lib.rs; sed -n '1,180p' /private/tmp/lix-refined-ax-api/src/lib.rs"
+      ]
+    },
+    {
+      "id": 3,
+      "success": true,
+      "success_reason": "The log records implementation edits followed by cargo fmt --check and cargo test --quiet succeeding with all 3 tests passed.",
+      "duration_sec": 261.4,
+      "tool_calls": 16,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 59,
+        "efficiency": 62,
+        "errorRecovery": 100,
+        "final": 82
+      },
+      "first_3_commands": [
+        "pwd && rg --files -g 'AGENTS.md' -g 'TASK.md' -g 'Cargo.toml' -g '*.rs' | head -200 && sed -n '1,240p' TASK.md && sed -n '1,260p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs",
+        "sed -n '261,620p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs && sed -n '1,300p' src/lib.rs && cat Cargo.toml && find .. -name AGENTS.md -print",
+        "sed -n '1,220p' /private/tmp/lix-refined-ax-api/src/lib.rs"
+      ]
+    }
+  ],
+  "summary": {
+    "success_rate": 1,
+    "median_final": 85,
+    "p25_final": 83.5,
+    "p75_final": 85.5,
+    "common_first_command": "sed -n '1,240p' TASK.md && printf '\\n-- files --\\n' && rg --files -g 'AGENTS.md' -g '!target' . .. | head -50 && printf '\\n-- api --\\n' && sed -n '1,260p' /private/tmp/lix-refined-ax-api/src/candidate_b_refined.rs (1/3)"
+  }
+}
