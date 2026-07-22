@@ -113,6 +113,7 @@ pub(crate) struct SqlWriteSessionOptions {
 pub(crate) async fn build_write_session_with_options(
     ctx: &mut dyn SqlWriteExecutionContext,
     options: SqlWriteSessionOptions,
+    provider_selection: &providers::ProviderSelection,
 ) -> Result<SessionContext, LixError> {
     let session = new_sql_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
@@ -136,7 +137,7 @@ pub(crate) async fn build_write_session_with_options(
         write_ctx.functions(),
         Some(active_branch_commit_id.commit_id.to_string()),
     );
-    providers::register_write(&session, write_ctx, branch_ref, options).await?;
+    providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
     Ok(session)
 }

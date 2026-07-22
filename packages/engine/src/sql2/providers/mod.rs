@@ -113,7 +113,7 @@ pub(crate) async fn register_read<C>(
     session: &SessionContext,
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
-    selection: &ReadProviderSelection,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
@@ -139,15 +139,16 @@ where
     .await
 }
 
-/// Snapshot-local providers needed to plan a set of already-parsed reads.
+/// Snapshot-local providers needed to plan already-bound SQL.
 ///
-/// DataFusion's resolver is deliberately used here instead of maintaining a
-/// second SQL AST walker. It is the same resolver called by
+/// For reads, DataFusion's resolver is deliberately used instead of maintaining
+/// a second SQL AST walker. It is the same resolver called by
 /// `SessionState::statement_to_plan`, including its CTE scoping and identifier
-/// normalization rules. The selection retains names only; providers and plans
-/// remain scoped to the current storage snapshot.
+/// normalization rules. Bound target-only writes select their known target
+/// directly. The selection retains names only; providers and plans remain
+/// scoped to the current storage snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReadProviderSelection {
+pub(crate) enum ProviderSelection {
     /// Register every surface when catalog-wide visibility is part of the SQL
     /// semantics (notably `information_schema` and rewritten `SHOW` queries),
     /// or when reference resolution cannot prove a narrower set is sufficient.
@@ -156,7 +157,7 @@ pub(crate) enum ReadProviderSelection {
     Only(BTreeSet<String>),
 }
 
-impl ReadProviderSelection {
+impl ProviderSelection {
     fn is_empty(&self) -> bool {
         matches!(self, Self::Only(names) if names.is_empty())
     }
@@ -190,24 +191,24 @@ impl ReadProviderSelection {
 pub(crate) fn read_provider_selection(
     session: &SessionContext,
     statements: &[datafusion::sql::parser::Statement],
-) -> ReadProviderSelection {
+) -> ProviderSelection {
     let mut names = BTreeSet::new();
     let state = session.state();
     for statement in statements {
         if statement_requires_all_providers(statement) {
-            return ReadProviderSelection::All;
+            return ProviderSelection::All;
         }
         let Ok(references) = state.resolve_table_references(statement) else {
-            return ReadProviderSelection::All;
+            return ProviderSelection::All;
         };
         for reference in references {
             if reference.schema() == Some("information_schema") {
-                return ReadProviderSelection::All;
+                return ProviderSelection::All;
             }
             names.insert(reference.table().to_string());
         }
     }
-    ReadProviderSelection::Only(names)
+    ProviderSelection::Only(names)
 }
 
 fn statement_requires_all_providers(statement: &datafusion::sql::parser::Statement) -> bool {
@@ -264,7 +265,7 @@ async fn register_read_from_catalog<C>(
     branch_ref: Arc<dyn BranchRefReader>,
     catalog: &PublicCatalog,
     scope: ReadProviderScope,
-    selection: &ReadProviderSelection,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
@@ -446,17 +447,10 @@ pub(crate) async fn register_write(
     write_ctx: SqlWriteContext,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError> {
     let catalog = write_ctx.public_catalog()?;
-    register_write_from_catalog(
-        session,
-        write_ctx,
-        branch_ref,
-        options,
-        &catalog,
-        &ReadProviderSelection::All,
-    )
-    .await
+    register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection).await
 }
 
 pub(crate) async fn register_transaction<C>(
@@ -466,7 +460,7 @@ pub(crate) async fn register_transaction<C>(
     write_ctx: SqlWriteContext,
     write_branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
-    selection: &ReadProviderSelection,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
@@ -501,7 +495,7 @@ async fn register_write_from_catalog(
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     catalog: &PublicCatalog,
-    selection: &ReadProviderSelection,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
         if !selection.includes(surface) {
@@ -616,11 +610,11 @@ mod tests {
     };
 
     use super::{
-        ReadProviderScope, ReadProviderSelection, branch, change, directory, directory_history,
-        entity, file, file_history, history, is_write_surface, lix_state, read_provider_selection,
+        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
+        file, file_history, history, is_write_surface, lix_state, read_provider_selection,
     };
 
-    fn selection_for_sql(sql: &[&str]) -> ReadProviderSelection {
+    fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
         let statements = sql
             .iter()
             .map(|sql| crate::sql2::parse_statement(sql).expect("SQL should parse"))
@@ -628,8 +622,8 @@ mod tests {
         read_provider_selection(&SessionContext::new(), &statements)
     }
 
-    fn selected_names(names: &[&str]) -> ReadProviderSelection {
-        ReadProviderSelection::Only(names.iter().map(|name| (*name).to_string()).collect())
+    fn selected_names(names: &[&str]) -> ProviderSelection {
+        ProviderSelection::Only(names.iter().map(|name| (*name).to_string()).collect())
     }
 
     #[test]
@@ -689,7 +683,7 @@ mod tests {
     fn referenced_provider_selection_registers_none_for_table_free_queries() {
         assert_eq!(
             selection_for_sql(&["SELECT 1, lix_uuid_v7()"]),
-            ReadProviderSelection::Only(BTreeSet::new())
+            ProviderSelection::Only(BTreeSet::new())
         );
     }
 
@@ -697,12 +691,9 @@ mod tests {
     fn referenced_provider_selection_keeps_catalog_wide_information_schema_semantics() {
         assert_eq!(
             selection_for_sql(&["SELECT * FROM information_schema.tables"]),
-            ReadProviderSelection::All
+            ProviderSelection::All
         );
-        assert_eq!(
-            selection_for_sql(&["SHOW TABLES"]),
-            ReadProviderSelection::All
-        );
+        assert_eq!(selection_for_sql(&["SHOW TABLES"]), ProviderSelection::All);
     }
 
     #[test]
@@ -805,6 +796,24 @@ mod tests {
             14,
             "new construction count"
         );
+    }
+
+    #[test]
+    fn target_write_selection_reduces_provider_construction_count_to_one() {
+        let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
+        let all_writable = catalog
+            .surfaces()
+            .filter(|surface| is_write_surface(surface))
+            .count();
+        let selection = selected_names(&["lix_file"]);
+        let selected_writable = catalog
+            .surfaces()
+            .filter(|surface| is_write_surface(surface) && selection.includes(surface))
+            .map(|surface| surface.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(all_writable, 7, "previous standalone write count");
+        assert_eq!(selected_writable, vec!["lix_file"]);
     }
 
     #[test]
@@ -915,7 +924,7 @@ mod tests {
             Some(empty_history_query_source().await),
             &catalog,
             true,
-            &ReadProviderSelection::All,
+            &ProviderSelection::All,
         )
         .await
         .expect("entity providers should register");
