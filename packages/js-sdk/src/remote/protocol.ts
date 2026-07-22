@@ -350,6 +350,13 @@ function assertJsonValue(
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
+	const nativeToBase64 = (
+		bytes as Uint8Array & { toBase64?: () => string }
+	).toBase64;
+	if (typeof nativeToBase64 === "function") {
+		return nativeToBase64.call(bytes);
+	}
+
 	let binary = "";
 	const chunkSize = 0x8000;
 	for (let offset = 0; offset < bytes.length; offset += chunkSize) {
@@ -359,6 +366,19 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 function base64ToBytes(base64: string): Uint8Array {
+	const nativeFromBase64 = (
+		Uint8Array as Uint8ArrayConstructor & {
+			fromBase64?: (value: string) => Uint8Array;
+		}
+	).fromBase64;
+	if (typeof nativeFromBase64 === "function") {
+		try {
+			return nativeFromBase64(base64);
+		} catch {
+			throw protocolError("blob wire value contains invalid base64");
+		}
+	}
+
 	let binary: string;
 	try {
 		binary = atob(base64);
