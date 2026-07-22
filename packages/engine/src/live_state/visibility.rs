@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::GLOBAL_BRANCH_ID;
@@ -326,6 +327,26 @@ fn resolve_live_state_rows(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<MaterializedLiveStateRow> {
+    if can_resolve_uncontested_single_branch_rows(&base_rows, &staged_rows, requested_branch_ids) {
+        return resolve_uncontested_single_branch_rows(base_rows, include_tombstones, limit);
+    }
+
+    resolve_live_state_rows_via_overlay(
+        base_rows,
+        staged_rows,
+        requested_branch_ids,
+        include_tombstones,
+        limit,
+    )
+}
+
+fn resolve_live_state_rows_via_overlay(
+    base_rows: Vec<MaterializedLiveStateRow>,
+    staged_rows: Vec<MaterializedLiveStateRow>,
+    requested_branch_ids: &[String],
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> Vec<MaterializedLiveStateRow> {
     let base_rows = resolve_scan_rows(base_rows, requested_branch_ids, true);
     let staged_rows = resolve_scan_rows(staged_rows, requested_branch_ids, true);
     let mut rows_by_identity =
@@ -359,6 +380,60 @@ fn resolve_live_state_rows(
         rows.truncate(limit);
     }
     rows
+}
+
+fn can_resolve_uncontested_single_branch_rows(
+    base_rows: &[MaterializedLiveStateRow],
+    staged_rows: &[MaterializedLiveStateRow],
+    requested_branch_ids: &[String],
+) -> bool {
+    let [requested_branch_id] = requested_branch_ids else {
+        return false;
+    };
+    staged_rows.is_empty()
+        && base_rows
+            .iter()
+            .all(|row| !row.global && row.branch_id == *requested_branch_id)
+}
+
+/// Resolves candidates which are already scoped to one nonglobal branch.
+///
+/// The general overlay path builds two `BTreeMap`s and clones every row while
+/// projecting it. With no global or staged candidates, tier arbitration is a
+/// no-op. A stable in-place sort followed by deduplication preserves the
+/// general path's identity order and "last input row wins" behavior without
+/// cloning row payloads. Reversing before the stable sort makes the last input
+/// candidate the first equal-key candidate retained by `dedup_by`.
+fn resolve_uncontested_single_branch_rows(
+    mut rows: Vec<MaterializedLiveStateRow>,
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> Vec<MaterializedLiveStateRow> {
+    rows.reverse();
+    rows.sort_by(compare_row_identity);
+    rows.dedup_by(|later, earlier| same_row_identity(later, earlier));
+    if !include_tombstones {
+        rows.retain(|row| !row.deleted);
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+fn compare_row_identity(
+    left: &MaterializedLiveStateRow,
+    right: &MaterializedLiveStateRow,
+) -> Ordering {
+    left.branch_id
+        .cmp(&right.branch_id)
+        .then_with(|| left.schema_key.cmp(&right.schema_key))
+        .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+        .then_with(|| left.file_id.cmp(&right.file_id))
+}
+
+fn same_row_identity(left: &MaterializedLiveStateRow, right: &MaterializedLiveStateRow) -> bool {
+    compare_row_identity(left, right) == Ordering::Equal
 }
 
 fn requested_branch_ids(branch_scope: &VisibilityBranchScope) -> Vec<String> {
@@ -538,6 +613,94 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"staged\"}")
         );
+    }
+
+    #[test]
+    fn uncontested_single_branch_fast_path_matches_overlay_semantics() {
+        let rows = vec![
+            row_at("branch-a", "b", "B", false, Some("change-b")),
+            row_at(
+                "branch-a",
+                "duplicate",
+                "first",
+                false,
+                Some("change-first"),
+            ),
+            tombstone_at("branch-a", "deleted", false, Some("change-deleted")),
+            row_at("branch-a", "a", "A", false, Some("change-a")),
+            row_at("branch-a", "duplicate", "last", false, Some("change-last")),
+        ];
+        let requested = vec!["branch-a".to_string()];
+
+        let expected =
+            resolve_live_state_rows_via_overlay(rows.clone(), Vec::new(), &requested, false, None);
+        let actual = resolve_live_state_rows(rows, Vec::new(), &requested, false, None);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 3);
+        assert_eq!(
+            actual[2].snapshot_content.as_deref(),
+            Some("{\"value\":\"last\"}")
+        );
+    }
+
+    #[test]
+    fn uncontested_single_branch_fast_path_applies_tombstones_and_limit_after_deduplication() {
+        let rows = vec![
+            row_at("branch-a", "a", "first", false, Some("change-first")),
+            tombstone_at("branch-a", "a", false, Some("change-delete")),
+            row_at("branch-a", "b", "B", false, Some("change-b")),
+            row_at("branch-a", "c", "C", false, Some("change-c")),
+        ];
+
+        let actual = resolve_uncontested_single_branch_rows(rows, false, Some(1));
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].entity_pk, EntityPk::single("b"));
+    }
+
+    #[test]
+    fn uncontested_single_branch_fast_path_keeps_distinct_file_identities() {
+        let rows = vec![
+            file_row_at("branch-a", "same", "file-a", false, "schema", "file-a"),
+            file_row_at("branch-a", "same", "file-b", false, "schema", "file-b"),
+        ];
+        let requested = vec!["branch-a".to_string()];
+
+        let expected =
+            resolve_live_state_rows_via_overlay(rows.clone(), Vec::new(), &requested, true, None);
+        let actual = resolve_live_state_rows(rows, Vec::new(), &requested, true, None);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+    }
+
+    #[test]
+    fn uncontested_single_branch_fast_path_requires_exact_scope() {
+        let branch_row = row_at("branch-a", "a", "A", false, Some("change-a"));
+        let global_row = row_at("global", "a", "global", true, Some("change-global"));
+        let requested = vec!["branch-a".to_string()];
+
+        assert!(can_resolve_uncontested_single_branch_rows(
+            std::slice::from_ref(&branch_row),
+            &[],
+            &requested,
+        ));
+        assert!(!can_resolve_uncontested_single_branch_rows(
+            std::slice::from_ref(&global_row),
+            &[],
+            &requested,
+        ));
+        assert!(!can_resolve_uncontested_single_branch_rows(
+            std::slice::from_ref(&branch_row),
+            std::slice::from_ref(&branch_row),
+            &requested,
+        ));
+        assert!(!can_resolve_uncontested_single_branch_rows(
+            std::slice::from_ref(&branch_row),
+            &[],
+            &["branch-a".to_string(), "branch-b".to_string()],
+        ));
     }
 
     #[test]

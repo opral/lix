@@ -1728,15 +1728,16 @@ pub(crate) enum FastLixFilePathWriteConflict {
     None,
     DoNothing,
     UpdateData,
+    UpdateDataAndMetadata,
 }
 
 pub(crate) async fn execute_fast_lix_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
-    writes: Vec<(String, Vec<u8>)>,
+    writes: Vec<(String, Vec<u8>, Option<TransactionJson>)>,
     conflict: FastLixFilePathWriteConflict,
-) -> Result<u64, LixError> {
+) -> Result<Option<u64>, LixError> {
     if writes.is_empty() {
-        return Ok(0);
+        return Ok(Some(0));
     }
 
     let active_branch_id = ctx.active_branch_id().to_string();
@@ -1753,7 +1754,15 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
             ..LiveStateScanRequest::default()
         })
         .await?;
-    let filesystem = FilesystemIndex::from_live_rows(live_rows.clone())?;
+    let filesystem = match FilesystemIndex::from_live_rows(live_rows.clone()) {
+        Ok(filesystem) => filesystem,
+        // The legacy write index intentionally rejects visible path collisions
+        // across storage scopes, while the general provider can disambiguate
+        // them. No writes have been staged yet, so decline the fast route and
+        // let the caller execute the original DataFusion plan.
+        Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let mut path_resolvers = directory_path_resolvers_from_state_rows(live_rows)?;
     let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, false, None);
     path_resolvers.entry(resolver_key).or_default();
@@ -1774,7 +1783,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                         global: false,
                         untracked: false,
                         file_id: None,
-                        metadata: None,
+                        metadata: write.metadata,
                     };
                     let plan = plan_parsed_file_path_write_with_resolvers(
                         &mut path_resolvers,
@@ -1812,6 +1821,33 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
                     staged.add_count(1)?;
                 }
+                FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
+                    let mut context = existing.scope.context(None);
+                    if context.global {
+                        context.branch_id = GLOBAL_BRANCH_ID.to_string();
+                    }
+                    context.metadata = write.metadata;
+                    staged
+                        .state_rows
+                        .push(file_descriptor_row(FileDescriptorRowInput {
+                            id: existing.id.clone(),
+                            directory_id: existing.directory_id.clone(),
+                            name: existing.name.clone(),
+                            context: context.clone(),
+                        }));
+                    stage_lix_file_data_update_write(
+                        &mut staged,
+                        existing.id.clone(),
+                        Some(write.parsed.path),
+                        Some(existing.name.clone()),
+                        write.data,
+                        context,
+                        existing.blob_hash.is_some(),
+                        None,
+                    )
+                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    staged.add_count(1)?;
+                }
             }
         } else {
             let context = FilesystemRowContext {
@@ -1819,7 +1855,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                 global: false,
                 untracked: false,
                 file_id: None,
-                metadata: None,
+                metadata: write.metadata,
             };
             let file_id = write
                 .parsed
@@ -1842,11 +1878,11 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
 
     let mode = match conflict {
         FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
-        FastLixFilePathWriteConflict::DoNothing | FastLixFilePathWriteConflict::UpdateData => {
-            TransactionWriteMode::Replace
-        }
+        FastLixFilePathWriteConflict::DoNothing
+        | FastLixFilePathWriteConflict::UpdateData
+        | FastLixFilePathWriteConflict::UpdateDataAndMetadata => TransactionWriteMode::Replace,
     };
-    stage_lix_file_fast_batch(ctx, mode, staged).await
+    stage_lix_file_fast_batch(ctx, mode, staged).await.map(Some)
 }
 
 pub(crate) async fn execute_fast_lix_file_data_update_by_id(
@@ -1934,18 +1970,20 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
 struct FastLixFilePathWrite {
     parsed: ParsedFileWritePath,
     data: Vec<u8>,
+    metadata: Option<TransactionJson>,
 }
 
 fn parse_fast_lix_file_path_writes(
-    writes: Vec<(String, Vec<u8>)>,
+    writes: Vec<(String, Vec<u8>, Option<TransactionJson>)>,
 ) -> std::result::Result<Vec<FastLixFilePathWrite>, LixError> {
     writes
         .into_iter()
-        .map(|(path, data)| {
+        .map(|(path, data, metadata)| {
             Ok(FastLixFilePathWrite {
                 parsed: parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?,
                 data,
+                metadata,
             })
         })
         .collect()
@@ -3793,7 +3831,11 @@ async fn render_plugin_files_for_sql(
                         .owner_change_id_for_file(&file_key)
                         .expect("rendered plugin owner should have a change id")
                         .to_string(),
-                    rows: active_state.clone(),
+                    // Rendering only borrows the materialized state and this
+                    // is its final consumer. Move the row graph into the
+                    // session acknowledgement instead of deep-cloning every
+                    // entity on each exact blob read.
+                    rows: active_state.into(),
                 },
             );
         }
@@ -9586,6 +9628,37 @@ mod tests {
         assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
         assert_eq!(file_data[0].data(), b"new");
         assert!(file_data[0].had_blob_ref);
+    }
+
+    #[tokio::test]
+    async fn fast_file_path_write_declines_ambiguous_cross_scope_paths() {
+        let tracked = live_file_row(
+            "file-tracked",
+            "branch-b",
+            r#"{"id":"file-tracked","directory_id":null,"name":"shared.md"}"#,
+        );
+        let mut untracked = live_file_row(
+            "file-untracked",
+            "branch-b",
+            r#"{"id":"file-untracked","directory_id":null,"name":"shared.md"}"#,
+        );
+        untracked.untracked = true;
+        let mut write_context = CapturingWriteContext {
+            rows: vec![tracked, untracked],
+            ..CapturingWriteContext::default()
+        };
+
+        let outcome = super::execute_fast_lix_file_path_writes(
+            &mut write_context,
+            vec![("/shared.md".to_string(), b"new".to_vec(), None)],
+            super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+        )
+        .await
+        .expect("ambiguous legacy topology should decline the fast path");
+
+        assert_eq!(outcome, None);
+        assert_eq!(write_context.scan_count, 1);
+        assert!(write_context.writes.is_empty());
     }
 
     #[tokio::test]

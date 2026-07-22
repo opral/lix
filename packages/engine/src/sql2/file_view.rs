@@ -41,7 +41,9 @@ pub(crate) struct SessionPluginFileView {
     /// prevents an old view from becoming valid again after plugin -> raw ->
     /// the same plugin.
     pub(crate) owner_change_id: String,
-    pub(crate) rows: Vec<MaterializedLiveStateRow>,
+    /// Immutable acknowledged rows are shared between deferred delivery and
+    /// the session cache. Cloning a view must not deep-clone every entity.
+    pub(crate) rows: Arc<[MaterializedLiveStateRow]>,
 }
 
 #[derive(Debug, Clone)]

@@ -151,7 +151,6 @@ function restoreProperty(
 		Reflect.deleteProperty(target, key);
 	}
 }
-
 test("observe blob deltas fail closed without an exact non-overlapping base", () => {
 	const full = {
 		sequence: 0,

@@ -16,11 +16,9 @@ use crate::csv::{
 use crate::diff::{DiffRun, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
-use itertools::Itertools;
 use lix_order_key::OrderKey;
 use serde_json::Value;
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::str;
 use uuid::Uuid;
@@ -38,7 +36,7 @@ export!(CsvPlugin);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Projection {
-    rows_by_id: BTreeMap<String, RowSnapshot>,
+    rows: Vec<Row>,
     dialect: CsvDialect,
     table_present: bool,
 }
@@ -83,9 +81,9 @@ fn detect_changes_for_rows(
     file_rows: &[Vec<String>],
     after_dialect: CsvDialect,
 ) -> Result<Vec<DetectedChange>, PluginError> {
-    let base = before.to_rows();
+    let base = before.rows.as_slice();
     let (old_for_new, new_for_old) = match_diff_rows(
-        &base,
+        base,
         file_rows,
         imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter()),
     );
@@ -106,7 +104,7 @@ fn detect_changes_for_rows(
             metadata: None,
         });
     }
-    detect_row_upsert_changes(&base, file_rows, &old_for_new, &inserted_ids, &mut changes)?;
+    detect_row_upsert_changes(base, file_rows, &old_for_new, &inserted_ids, &mut changes)?;
 
     if before.dialect != after_dialect
         || (!before.table_present
@@ -364,7 +362,8 @@ fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
 
 impl Projection {
     fn from_entity_state(changes: impl Iterator<Item = EntityState>) -> Result<Self, PluginError> {
-        let mut rows_by_id = BTreeMap::new();
+        let mut rows = Vec::new();
+        let mut row_ids = HashSet::new();
         let mut dialect = None;
 
         for change in changes {
@@ -385,42 +384,29 @@ impl Projection {
                 }
                 ROW_SCHEMA_KEY => {
                     let entity_pk = single_entity_pk(change.entity_pk)?;
-                    match rows_by_id.entry(entity_pk) {
-                        Entry::Occupied(entry) => {
-                            return Err(PluginError::InvalidInput(format!(
-                                "duplicate entity_pk '{}' for schema_key '{ROW_SCHEMA_KEY}'",
-                                entry.key()
-                            )));
-                        }
-                        Entry::Vacant(entry) => {
-                            let row = parse_row_snapshot(&change.snapshot_content, entry.key())?;
-                            entry.insert(row);
-                        }
+                    if !row_ids.insert(entity_pk.clone()) {
+                        return Err(PluginError::InvalidInput(format!(
+                            "duplicate entity_pk '{entity_pk}' for schema_key '{ROW_SCHEMA_KEY}'"
+                        )));
                     }
+                    let snapshot = parse_row_snapshot(&change.snapshot_content, &entity_pk)?;
+                    rows.push(Row {
+                        id: entity_pk,
+                        order_key: snapshot.order_key,
+                        cells: snapshot.cells,
+                    });
                 }
                 _ => {}
             }
         }
 
+        rows.sort_by(|a, b| a.order_key.cmp(&b.order_key).then_with(|| a.id.cmp(&b.id)));
+
         Ok(Self {
-            rows_by_id,
+            rows,
             dialect: dialect.unwrap_or_default(),
             table_present: dialect.is_some(),
         })
-    }
-
-    fn to_rows(&self) -> Vec<Row> {
-        let mut rows = self
-            .rows_by_id
-            .iter()
-            .map(|(id, row)| Row {
-                id: id.clone(),
-                order_key: row.order_key.clone(),
-                cells: row.cells.clone(),
-            })
-            .collect_vec();
-        rows.sort_by(|a, b| a.order_key.cmp(&b.order_key).then_with(|| a.id.cmp(&b.id)));
-        rows
     }
 }
 
@@ -534,7 +520,30 @@ mod tests {
     use super::*;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
-    use std::collections::BTreeMap;
+
+    #[test]
+    fn projection_rejects_duplicate_row_ids() {
+        let row = EntityState {
+            entity_pk: vec!["row:duplicate".to_string()],
+            schema_key: ROW_SCHEMA_KEY.to_string(),
+            snapshot_content: serde_json::json!({
+                "id": "row:duplicate",
+                "order_key": "80",
+                "cells": ["value"],
+            })
+            .to_string(),
+            metadata: None,
+        };
+
+        let error = Projection::from_entity_state(vec![row.clone(), row].into_iter())
+            .expect_err("duplicate row ids must be rejected");
+
+        assert!(matches!(
+            error,
+            PluginError::InvalidInput(message)
+                if message == "duplicate entity_pk 'row:duplicate' for schema_key 'csv_row'"
+        ));
+    }
 
     #[test]
     fn fuzz_detect_changes_round_trips_rows() {
@@ -561,7 +570,7 @@ mod tests {
             }
 
             let applied_rows = applied
-                .to_rows()
+                .rows
                 .into_iter()
                 .map(|row| row.cells)
                 .collect::<Vec<_>>();
@@ -590,8 +599,9 @@ mod tests {
 
                 let entity_pk = single_entity_pk(change.entity_pk.clone()).unwrap();
                 let before_row = before
-                    .rows_by_id
-                    .get(&entity_pk)
+                    .rows
+                    .iter()
+                    .find(|row| row.id == entity_pk)
                     .expect("reordering rows should only update existing row ids");
                 let snapshot_content = change
                     .snapshot_content
@@ -615,7 +625,7 @@ mod tests {
             }
 
             let applied_rows = applied
-                .to_rows()
+                .rows
                 .into_iter()
                 .map(|row| row.cells)
                 .collect::<Vec<_>>();
@@ -651,14 +661,18 @@ mod tests {
             .map(|offset| format!("row:{offset}"))
             .collect::<Vec<_>>();
         let order_keys = OrderKey::evenly_between(None, None, ids.len()).unwrap();
-        let rows_by_id = rows
+        let rows = rows
             .into_iter()
             .zip(ids.into_iter().zip(order_keys))
-            .map(|(cells, (id, order_key))| (id, RowSnapshot { order_key, cells }))
-            .collect::<BTreeMap<_, _>>();
+            .map(|(cells, (id, order_key))| Row {
+                id,
+                order_key,
+                cells,
+            })
+            .collect();
 
         Projection {
-            rows_by_id,
+            rows,
             dialect: CsvDialect::default(),
             table_present: true,
         }
@@ -681,10 +695,24 @@ mod tests {
             ROW_SCHEMA_KEY => {
                 let entity_pk = single_entity_pk(change.entity_pk)?;
                 if let Some(raw) = change.snapshot_content {
-                    let row = parse_row_snapshot(&raw, &entity_pk)?;
-                    projection.rows_by_id.insert(entity_pk, row);
+                    let snapshot = parse_row_snapshot(&raw, &entity_pk)?;
+                    let row = Row {
+                        id: entity_pk.clone(),
+                        order_key: snapshot.order_key,
+                        cells: snapshot.cells,
+                    };
+                    if let Some(existing) =
+                        projection.rows.iter_mut().find(|row| row.id == entity_pk)
+                    {
+                        *existing = row;
+                    } else {
+                        projection.rows.push(row);
+                    }
+                    projection.rows.sort_by(|a, b| {
+                        a.order_key.cmp(&b.order_key).then_with(|| a.id.cmp(&b.id))
+                    });
                 } else {
-                    projection.rows_by_id.remove(&entity_pk);
+                    projection.rows.retain(|row| row.id != entity_pk);
                 }
             }
             _ => {}

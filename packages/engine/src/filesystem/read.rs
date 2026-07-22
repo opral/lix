@@ -120,6 +120,7 @@ impl FilesystemIndex {
             };
             let file = FilesystemFileEntry {
                 id: snapshot.id.clone(),
+                directory_id: snapshot.directory_id,
                 name: snapshot.name,
                 blob_hash: blob_hashes_by_key
                     .get(&FilesystemBlobRefKey::from_context(
@@ -173,6 +174,7 @@ enum FilesystemEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct FilesystemFileEntry {
     pub(crate) id: String,
+    pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
     pub(crate) blob_hash: Option<String>,
     pub(crate) scope: RowScope,
@@ -491,6 +493,7 @@ mod tests {
     fn file_entry(id: &str) -> FilesystemFileEntry {
         FilesystemFileEntry {
             id: id.to_string(),
+            directory_id: None,
             name: "foo".to_string(),
             blob_hash: None,
             scope: row_scope(),
