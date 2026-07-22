@@ -2856,7 +2856,7 @@ mod tests {
                 && before.tree_height >= 3
                 && next.tree_height > before.tree_height
             {
-                transition = Some((before.clone(), next.clone(), inserted_key, inserted_value));
+                transition = Some((before.clone(), next, inserted_key, inserted_value));
                 break;
             }
             previous = Some(next);
