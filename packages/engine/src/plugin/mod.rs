@@ -19,33 +19,26 @@ pub(crate) use archive::{
 pub(crate) use component::{
     CachedPluginComponent, PluginComponentHost, PluginRuntimeHost, load_or_init_plugin_component,
 };
-pub(crate) use install::{
-    PluginArchiveInstallPlan, plugin_install_plan_from_archive_path,
-    plugin_schema_rows_from_archive_path,
-};
-#[allow(unused_imports)]
+pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{
-    PluginContentType, PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,
-    glob_matches_path, parse_plugin_manifest_json, select_best_glob_match,
+    PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
+    select_best_glob_match,
 };
-#[allow(unused_imports)]
 pub(crate) use materializer::{
-    PluginDetectedChange, detect_changes_with_component_instance, detect_changes_with_plugin,
-    plugin_state_live_state_projection, render_materialized_plugin_file, render_plugin_state,
+    PluginDetectedChange, detect_changes_with_component_instance,
+    plugin_state_live_state_projection, render_materialized_plugin_file,
     render_plugin_state_with_component_instance, retain_plugin_state_rows,
     retain_plugin_state_rows_for_schema_keys,
 };
-#[allow(unused_imports)]
 pub(crate) use registry::{
-    CompiledPluginCatalog, MAX_PLUGIN_REGISTRY_ENTRIES, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
-    PluginCatalogCache, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
+    PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
 };
-#[allow(unused_imports)]
+#[cfg(test)]
+pub(crate) use storage::plugin_storage_archive_path;
 pub(crate) use storage::{
-    PLUGIN_ARCHIVE_FILE_EXTENSION, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, is_plugin_storage_path,
-    plugin_key_from_archive_file_id, plugin_key_from_archive_path, plugin_storage_archive_file_id,
-    plugin_storage_archive_path, reject_normal_plugin_storage_mutation,
+    is_plugin_storage_path, plugin_key_from_archive_file_id, plugin_key_from_archive_path,
+    plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

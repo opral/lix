@@ -162,48 +162,6 @@ pub(crate) struct LiveStateScanRequest {
     pub(crate) limit: Option<usize>,
 }
 
-/// File-scoped scan request for visible live-state rows.
-///
-/// This is the named form of the common query shape "rows for this branch,
-/// concrete file id, and schema set". It deliberately lowers to
-/// `LiveStateScanRequest` so optimized implementations can preserve the exact
-/// generic scan semantics while specializing the storage path.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct LiveStateFileScanRequest {
-    #[serde(default)]
-    pub(crate) branch_ids: Vec<String>,
-    pub(crate) file_id: String,
-    #[serde(default)]
-    pub(crate) schema_keys: Vec<String>,
-    #[serde(default)]
-    pub(crate) untracked: Option<bool>,
-    #[serde(default)]
-    pub(crate) include_tombstones: bool,
-    #[serde(default)]
-    pub(crate) projection: LiveStateProjection,
-    #[serde(default)]
-    pub(crate) limit: Option<usize>,
-}
-
-impl LiveStateFileScanRequest {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn to_scan_request(&self) -> LiveStateScanRequest {
-        LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: self.schema_keys.clone(),
-                branch_ids: self.branch_ids.clone(),
-                file_ids: vec![NullableKeyFilter::Value(self.file_id.clone())],
-                untracked: self.untracked,
-                include_tombstones: self.include_tombstones,
-                ..LiveStateFilter::default()
-            },
-            projection: self.projection.clone(),
-            limit: self.limit,
-        }
-    }
-}
-
 /// Point lookup request for one visible live-state row.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LiveStateRowRequest {

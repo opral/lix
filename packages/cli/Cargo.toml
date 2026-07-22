@@ -23,11 +23,9 @@ path = "src/main.rs"
 [dependencies]
 lix_sdk = { workspace = true }
 
-async-trait = "0.1"
 clap = { version = "4.5.31", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-pollster = "0.4"
 comfy-table = "7.1"
 base64 = "0.22"
 bytes = "1"

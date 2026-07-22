@@ -32,7 +32,6 @@ pub(crate) mod json_store;
 pub(crate) mod live_state;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
-#[allow(dead_code, unused_imports)]
 pub(crate) mod plugin;
 mod schema;
 pub mod session;
