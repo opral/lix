@@ -17,7 +17,7 @@ use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, LimitClause, SelectFlavor, SelectItem, SetExpr,
+    BinaryOperator, Expr, GroupByExpr, LimitClause, Select, SelectFlavor, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -488,6 +488,7 @@ where
         }
 
         let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params);
+        let exact_lix_file_read = exact_lix_file_read(&statement, params);
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -522,6 +523,7 @@ where
                     statement,
                     params,
                     acknowledge_file_views,
+                    exact_lix_file_read,
                 )
                 .await
             },
@@ -974,6 +976,7 @@ where
         statement: datafusion::sql::parser::Statement,
         params: &[Value],
         acknowledge_file_views: bool,
+        exact_lix_file_read: Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)>,
     ) -> Result<
         (
             sql2::SessionReadSqlResult,
@@ -982,11 +985,43 @@ where
         LixError,
     > {
         let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
+        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        if let Some((selector, column)) = exact_lix_file_read {
+            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let branch_ref: Arc<dyn BranchRefReader> =
+                Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+            let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
+                Arc::new(self.binary_cas.reader(read_store));
+            let query = sql2::execute_exact_lix_file_read(
+                &active_branch_id,
+                live_state,
+                filesystem_path_index,
+                branch_ref,
+                blob_reader,
+                self.plugin_host.clone(),
+                file_view_collector.clone(),
+                &selector,
+                column,
+            )
+            .await?;
+            let file_view_mutations = file_view_collector
+                .map(|collector| collector.plugin_file_mutations())
+                .unwrap_or_default();
+            return Ok((
+                sql2::SessionReadSqlResult {
+                    runtime_functions: FunctionContext::system_for_function_free_read(),
+                    query,
+                },
+                file_view_mutations,
+            ));
+        }
         let live_state: Arc<dyn crate::live_state::LiveStateReader> =
             Arc::new(self.live_state.reader(read_store.clone()));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
-        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
             read_store,
@@ -1196,11 +1231,72 @@ where
 /// This intentionally recognizes a narrow, predictable MVP surface. False
 /// negatives merely preserve an omitted entity; false positives can lose one.
 fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
-    let DataFusionStatement::Statement(statement) = statement else {
+    let Some(point_read) = simple_point_read(statement) else {
         return false;
     };
-    let SqlStatement::Query(query) = statement.as_ref() else {
+
+    if !point_read.select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::UnnamedExpr(expression)
+                | SelectItem::ExprWithAlias {
+                    expr: expression,
+                    ..
+                } if direct_column_name(expression).as_deref() == Some("data")
+        )
+    }) {
         return false;
+    }
+
+    let selection = point_read
+        .select
+        .selection
+        .as_ref()
+        .expect("simple point read requires a predicate");
+    let mut equality_columns = BTreeSet::new();
+    // Anonymous placeholders are bound in textual order. Atelier's point read
+    // projects the active branch as `? AS active_branch_id` before filtering
+    // by `file.id = ?`, so start the WHERE binder after projection params.
+    let mut anonymous_placeholder_index = point_read
+        .select
+        .projection
+        .iter()
+        .map(anonymous_placeholders_in_select_item)
+        .sum();
+    if !collect_literal_equalities(
+        selection,
+        &mut equality_columns,
+        params,
+        &mut anonymous_placeholder_index,
+    ) {
+        return false;
+    }
+    match point_read.table_name.as_str() {
+        "lix_file" => {
+            equality_columns.len() == 1
+                && (equality_columns.contains("id") || equality_columns.contains("path"))
+        }
+        "lix_file_by_branch" => {
+            equality_columns.len() == 2
+                && equality_columns.contains("lixcol_branch_id")
+                && (equality_columns.contains("id") || equality_columns.contains("path"))
+        }
+        _ => false,
+    }
+}
+
+struct SimplePointRead<'a> {
+    select: &'a Select,
+    table_name: String,
+    exact_table_shape: bool,
+}
+
+fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<'_>> {
+    let DataFusionStatement::Statement(statement) = statement else {
+        return None;
+    };
+    let SqlStatement::Query(query) = statement.as_ref() else {
+        return None;
     };
     if query.with.is_some()
         || query.order_by.is_some()
@@ -1212,10 +1308,10 @@ fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[
         || query.format_clause.is_some()
         || !query.pipe_operators.is_empty()
     {
-        return false;
+        return None;
     }
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
+        return None;
     };
     if select.flavor != SelectFlavor::Standard
         || select.optimizer_hint.is_some()
@@ -1236,30 +1332,18 @@ fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
     {
-        return false;
-    }
-
-    if !select.projection.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::UnnamedExpr(expression)
-                | SelectItem::ExprWithAlias {
-                    expr: expression,
-                    ..
-                } if direct_column_name(expression).as_deref() == Some("data")
-        )
-    }) {
-        return false;
+        return None;
     }
 
     let [from] = select.from.as_slice() else {
-        return false;
+        return None;
     };
     if !from.joins.is_empty() {
-        return false;
+        return None;
     }
     let TableFactor::Table {
         name,
+        alias,
         args,
         with_hints,
         version,
@@ -1271,7 +1355,7 @@ fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[
         ..
     } = &from.relation
     else {
-        return false;
+        return None;
     };
     if args.is_some()
         || !with_hints.is_empty()
@@ -1282,44 +1366,95 @@ fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[
         || sample.is_some()
         || !index_hints.is_empty()
     {
-        return false;
+        return None;
     }
-    let Some(table_name) = name.0.last().and_then(|part| part.as_ident()) else {
-        return false;
-    };
+    let table_name = name.0.last().and_then(|part| part.as_ident())?;
+    let unquoted_table = table_name.quote_style.is_none();
     let table_name = table_name.value.to_ascii_lowercase();
 
-    let Some(selection) = select.selection.as_ref() else {
-        return false;
-    };
-    let mut equality_columns = BTreeSet::new();
-    // Anonymous placeholders are bound in textual order. Atelier's point read
-    // projects the active branch as `? AS active_branch_id` before filtering
-    // by `file.id = ?`, so start the WHERE binder after projection params.
-    let mut anonymous_placeholder_index = select
-        .projection
-        .iter()
-        .map(anonymous_placeholders_in_select_item)
-        .sum();
-    if !collect_literal_equalities(
-        selection,
-        &mut equality_columns,
-        params,
-        &mut anonymous_placeholder_index,
-    ) {
-        return false;
+    select.selection.as_ref()?;
+    Some(SimplePointRead {
+        select,
+        table_name,
+        exact_table_shape: name.0.len() == 1
+            && unquoted_table
+            && alias.is_none()
+            && query.limit_clause.is_none(),
+    })
+}
+
+fn exact_lix_file_read(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)> {
+    let point_read = simple_point_read(statement)?;
+    if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
+        return None;
     }
-    match table_name.as_str() {
-        "lix_file" => {
-            equality_columns.len() == 1
-                && (equality_columns.contains("id") || equality_columns.contains("path"))
+    let [SelectItem::UnnamedExpr(projection)] = point_read.select.projection.as_slice() else {
+        return None;
+    };
+    let Expr::Identifier(projection) = projection else {
+        return None;
+    };
+    if projection.quote_style.is_some() {
+        return None;
+    }
+    let column = match projection.value.to_ascii_lowercase().as_str() {
+        "data" => sql2::ExactLixFileReadColumn::Data,
+        "lixcol_change_id" => sql2::ExactLixFileReadColumn::ChangeId,
+        _ => return None,
+    };
+    let selection = point_read.select.selection.as_ref()?;
+    let (identity_column, identity_value) = exact_point_identity(selection, params)?;
+    let selector = match identity_column.as_str() {
+        "id" => sql2::ExactLixFileReadSelector::Id(identity_value),
+        "path" => sql2::ExactLixFileReadSelector::Path(identity_value),
+        _ => return None,
+    };
+    Some((selector, column))
+}
+
+fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, String)> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expression
+    else {
+        return None;
+    };
+    match (exact_point_column(left), exact_point_column(right)) {
+        (Some(column), None) => Some((column, exact_point_text_param(right, params)?)),
+        (None, Some(column)) => Some((column, exact_point_text_param(left, params)?)),
+        _ => None,
+    }
+}
+
+fn exact_point_column(expression: &Expr) -> Option<String> {
+    let Expr::Identifier(identifier) = expression else {
+        return None;
+    };
+    if identifier.quote_style.is_some() {
+        return None;
+    }
+    Some(identifier.value.to_ascii_lowercase())
+}
+
+fn exact_point_text_param(expression: &Expr, params: &[Value]) -> Option<String> {
+    let Expr::Value(value) = expression else {
+        return None;
+    };
+    match &value.value {
+        SqlValue::Placeholder(placeholder)
+            if params.len() == 1 && (placeholder == "?" || placeholder == "$1") =>
+        {
+            let Value::Text(value) = &params[0] else {
+                return None;
+            };
+            Some(value.clone())
         }
-        "lix_file_by_branch" => {
-            equality_columns.len() == 2
-                && equality_columns.contains("lixcol_branch_id")
-                && (equality_columns.contains("id") || equality_columns.contains("path"))
-        }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -1624,6 +1759,75 @@ mod tests {
         ExecuteBatchStatement {
             sql: sql.to_string(),
             params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_lix_file_read_recognizes_only_the_narrow_point_shapes() {
+        let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
+        assert_eq!(
+            exact_lix_file_read(&data_by_id, &[Value::Text("file-a".to_string())]),
+            Some((
+                sql2::ExactLixFileReadSelector::Id("file-a".to_string()),
+                sql2::ExactLixFileReadColumn::Data,
+            ))
+        );
+
+        let change_by_path =
+            sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = ?").unwrap();
+        assert_eq!(
+            exact_lix_file_read(&change_by_path, &[Value::Text("/a.txt".to_string())]),
+            Some((
+                sql2::ExactLixFileReadSelector::Path("/a.txt".to_string()),
+                sql2::ExactLixFileReadColumn::ChangeId,
+            ))
+        );
+
+        for (sql, params) in [
+            (
+                "SELECT id FROM lix_file WHERE id = $1",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            (
+                "SELECT data AS bytes FROM lix_file WHERE id = $1",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            (
+                "SELECT data FROM lix_file AS file WHERE id = $1",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            ("SELECT data FROM lix_file WHERE id = 'file-a'", vec![]),
+            (
+                "SELECT data FROM lix_file WHERE id = $1 LIMIT 1",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            (
+                "SELECT \"DATA\" FROM lix_file WHERE id = $1",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            (
+                "SELECT data FROM \"LIX_FILE\" WHERE id = $1",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            (
+                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                vec![Value::Text("file-a".to_string())],
+            ),
+            ("SELECT data FROM lix_file WHERE id = $1", vec![Value::Null]),
+            (
+                "SELECT data FROM lix_file WHERE id = $1",
+                vec![
+                    Value::Text("file-a".to_string()),
+                    Value::Text("extra".to_string()),
+                ],
+            ),
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                exact_lix_file_read(&statement, &params),
+                None,
+                "unexpected fast-path match for {sql}"
+            );
         }
     }
 

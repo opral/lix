@@ -106,6 +106,64 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    exact_lix_file_point_reads_match_generic_sql_across_visible_lanes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_global) VALUES \
+                 ('shared-point-file', '/shared-point.bin', X'61', false), \
+                 ('shared-point-file', '/shared-point.bin', X'62', true)",
+                &[],
+            )
+            .await
+            .expect("branch and global point-read fixtures should insert");
+
+        for (fast_sql, generic_sql, parameter) in [
+            (
+                "SELECT data FROM lix_file WHERE id = $1",
+                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "shared-point-file",
+            ),
+            (
+                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT data FROM lix_file WHERE path = $1 AND true",
+                "/shared-point.bin",
+            ),
+            (
+                "SELECT lixcol_change_id FROM lix_file WHERE id = $1",
+                "SELECT lixcol_change_id FROM lix_file WHERE id = $1 AND true",
+                "shared-point-file",
+            ),
+            (
+                "SELECT data FROM lix_file WHERE id = $1",
+                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "missing-point-file",
+            ),
+        ] {
+            let params = [Value::Text(parameter.to_string())];
+            let fast = session
+                .execute(fast_sql, &params)
+                .await
+                .expect("exact point read should execute");
+            let generic = session
+                .execute(generic_sql, &params)
+                .await
+                .expect("generic comparison read should execute");
+            assert_eq!(fast, generic, "point read differed for {fast_sql}");
+        }
+    }
+);
+
 #[tokio::test]
 async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
     let storage = Memory::new();
