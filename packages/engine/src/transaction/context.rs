@@ -621,7 +621,7 @@ where
                         && view.plugin_generation == plugin.archive_blob_hash()
                         && view.owner_change_id == owner_change_id =>
                 {
-                    Some(view.rows.clone())
+                    Some(view.rows.to_vec())
                 }
                 SessionFileViewMutation::Set { .. } | SessionFileViewMutation::Remove { .. } => {
                     None
@@ -635,7 +635,7 @@ where
                 plugin.archive_blob_hash(),
                 owner_change_id,
             )
-            .map(|view| view.rows)
+            .map(|view| view.rows.to_vec())
     }
 
     /// Reconciles plugin lifecycle, ownership, and state for one logical write
@@ -1437,7 +1437,7 @@ where
                         plugin_key: selected.key().to_string(),
                         plugin_generation: selected.archive_blob_hash().to_string(),
                         owner_change_id,
-                        rows: submitted_state,
+                        rows: submitted_state.into(),
                     },
                 },
             );
