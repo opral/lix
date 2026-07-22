@@ -37,7 +37,7 @@ use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
 
-use super::ReadProviderSelection;
+use super::ProviderSelection;
 use super::entity_history::register_entity_history_surface;
 use datafusion::physical_plan::ExecutionPlan;
 
@@ -60,7 +60,7 @@ pub(crate) async fn register_entity_providers<S>(
     query_source: Option<SqlHistoryQuerySource<S>>,
     catalog: &PublicCatalog,
     include_write_surfaces: bool,
-    selection: &ReadProviderSelection,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -127,7 +127,7 @@ pub(crate) async fn register_entity_write_providers(
     write_ctx: SqlWriteContext,
     branch_ref: Arc<dyn BranchRefReader>,
     catalog: &PublicCatalog,
-    selection: &ReadProviderSelection,
+    selection: &ProviderSelection,
 ) -> Result<(), LixError> {
     for surface in catalog.surfaces() {
         if !selection.includes(surface) {
