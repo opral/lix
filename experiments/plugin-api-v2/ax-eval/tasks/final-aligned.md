@@ -29,13 +29,17 @@ Acceptance requirements:
    not accepted-before, bytes.
 6. Drain paged renderer edits through one `EditDrainValidator`. Prove two pages
    that are individually valid but overlap in accepted-base coordinates are
-   rejected, and prove progress after accepted EOF is rejected.
+   rejected. Also prove a zero-width insertion followed on another page by an
+   edit at the same base offset is rejected, and prove progress after accepted
+   EOF is rejected.
 7. Build a small host pre-call wrapper for warm `file_changed`. It must call
    `validate_warm_plugin_selection` and `validate_input_splices` before invoking
    plugin logic. Instrument the document so tests prove all of these are
    rejected while the plugin call count stays zero: excessive splice count,
    excessive aggregate inline bytes, overlapping/unsorted edits, before-source
-   out-of-range deletion, and after-source out-of-range `AfterRange`.
+   out-of-range deletion, after-source out-of-range `AfterRange`, duplicate
+   start coordinates, reconstructed-length mismatch, and checked-length
+   overflow.
 8. A rename-only update with the same plugin key and generation must reach the
    plugin. Changing either the plugin key or generation must be rejected before
    plugin logic. Include both reselection cases.

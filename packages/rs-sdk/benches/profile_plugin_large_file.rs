@@ -1,4 +1,4 @@
-//! Two-phase profiling harness for large plugin-backed CSV operations.
+//! Large-file profiling harness for plugin-backed CSV operations.
 //!
 //! `<backend> setup <dir>` builds the fixture, installs the CSV plugin, writes
 //! the initial CSV, and closes. The other modes reopen the
@@ -79,7 +79,7 @@ fn main() {
             // called explicitly, so a plain usage note and success exit
             // keeps bench sweeps green.
             eprintln!(
-                "usage: profile_merge_10k <rocksdb-fs|rocksdb|slatedb|slatedb-cached> \
+                "usage: profile_plugin_large_file <rocksdb-fs|rocksdb|slatedb|slatedb-cached> \
                  <setup|merge|noop|edit|render|render-noack> <dir>"
             );
             return;
@@ -866,8 +866,8 @@ fn build_csv_plugin() -> Vec<u8> {
     let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv") else {
         eprintln!(
             "CSV plugin wasm path unavailable; build via `cargo build --bench \
-             profile_merge_10k --features \
-             default_wasm_runtime,local_filesystem,profile_wasm_memory` so cargo provides the \
+             profile_plugin_large_file --features \
+             default_wasm_runtime,local_filesystem,__profile_wasm_memory` so cargo provides the \
              bindep artifact"
         );
         std::process::exit(2);

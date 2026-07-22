@@ -65,6 +65,9 @@ pub enum ChangeEffect {
     #[default]
     Content,
     /// Typed replacement for v1's `{"impact":"format"}` metadata convention.
+    /// The upsert still carries a changed complete durable snapshot; this flag
+    /// only classifies conflict/notification/incremental-render behavior. An
+    /// effect-only upsert with an unchanged snapshot is invalid.
     FormatOnly,
 }
 
@@ -255,10 +258,12 @@ impl<'a> EntitySource<'a> {
     }
 }
 
-/// The host binds this capability to an operation identity, file incarnation,
-/// and plugin generation. The same `(schema_key, scope, ordinal)` request must
-/// return the same non-empty component on retries; distinct requests must not
-/// collide.
+/// The host binds this capability to a hidden mutation operation key, file
+/// incarnation, and plugin generation. The operation key combines the session,
+/// accepted observation, SDK mutation ID, and normalized request digest. The
+/// same `(schema_key, scope, ordinal)` request must return the same non-empty
+/// component when that exact transport operation is retried; distinct requests
+/// must not collide.
 pub trait StableIdAllocation {
     fn allocate_component(
         &self,
@@ -344,22 +349,30 @@ pub fn validate_input_splices(
     }
 
     let mut previous_end = 0u64;
+    let mut previous_start = None;
     let mut inline_bytes = 0u64;
+    let mut deleted_bytes = 0u64;
+    let mut inserted_bytes = 0u64;
     for edit in edits {
         let end = edit
             .offset
             .checked_add(edit.delete_len)
             .ok_or_else(|| Error("input splice deletion range overflowed".to_owned()))?;
-        if edit.offset < previous_end || end > before_len {
+        if previous_start == Some(edit.offset) || edit.offset < previous_end || end > before_len {
             return Err(Error(
-                "input splices must be sorted, non-overlapping, and in bounds".to_owned(),
+                "input splices must have strictly increasing starts, be non-overlapping, and be in bounds"
+                    .to_owned(),
             ));
         }
-        match edit.insert {
+        deleted_bytes = deleted_bytes
+            .checked_add(edit.delete_len)
+            .ok_or_else(|| Error("input splice deleted-byte count overflowed".to_owned()))?;
+        let insert_len = match edit.insert {
             InputBytes::Inline(bytes) => {
                 inline_bytes = inline_bytes
                     .checked_add(bytes.len() as u64)
                     .ok_or_else(|| Error("inline input byte count overflowed".to_owned()))?;
+                bytes.len() as u64
             }
             InputBytes::AfterRange(range) => {
                 let range_end = range
@@ -369,14 +382,28 @@ pub fn validate_input_splices(
                 if range_end > after_len {
                     return Err(Error("after-source range is out of bounds".to_owned()));
                 }
+                range.length
             }
-        }
+        };
+        inserted_bytes = inserted_bytes
+            .checked_add(insert_len)
+            .ok_or_else(|| Error("input splice inserted-byte count overflowed".to_owned()))?;
+        previous_start = Some(edit.offset);
         previous_end = end;
     }
 
     if inline_bytes > limits.max_inline_bytes {
         return Err(Error(
             "inline input bytes exceed the pre-call limit".to_owned(),
+        ));
+    }
+    let reconstructed_len = before_len
+        .checked_sub(deleted_bytes)
+        .and_then(|len| len.checked_add(inserted_bytes))
+        .ok_or_else(|| Error("input splice reconstructed length overflowed".to_owned()))?;
+    if reconstructed_len != after_len {
+        return Err(Error(
+            "input splices do not reconstruct the declared after-source length".to_owned(),
         ));
     }
     Ok(())
@@ -446,6 +473,7 @@ impl FileEdits {
 pub struct EditDrainValidator {
     base_len: u64,
     previous_end: u64,
+    previous_start: Option<u64>,
     reached_eof: bool,
 }
 
@@ -454,6 +482,7 @@ impl EditDrainValidator {
         Self {
             base_len,
             previous_end: 0,
+            previous_start: None,
             reached_eof: false,
         }
     }
@@ -470,12 +499,16 @@ impl EditDrainValidator {
                 .offset
                 .checked_add(edit.delete_len)
                 .ok_or_else(|| Error("output splice deletion range overflowed".to_owned()))?;
-            if edit.offset < self.previous_end || end > self.base_len {
+            if self.previous_start == Some(edit.offset)
+                || edit.offset < self.previous_end
+                || end > self.base_len
+            {
                 return Err(Error(
-                    "output splices must be globally sorted, non-overlapping, and in bounds"
+                    "output splices must have globally strictly increasing starts, be non-overlapping, and be in bounds"
                         .to_owned(),
                 ));
             }
+            self.previous_start = Some(edit.offset);
             self.previous_end = end;
         }
         Ok(())
@@ -668,6 +701,74 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_input_splices(
+                &edits,
+                3,
+                4,
+                InlineInputLimits {
+                    max_edits: 2,
+                    max_inline_bytes: 2,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_same_offset_input_splices_and_length_overflow() {
+        let byte = [1u8];
+        let duplicate_insertions = [
+            InputSplice {
+                offset: 1,
+                delete_len: 0,
+                insert: InputBytes::Inline(&byte),
+            },
+            InputSplice {
+                offset: 1,
+                delete_len: 0,
+                insert: InputBytes::Inline(&byte),
+            },
+        ];
+        let insertion_then_deletion = [
+            InputSplice {
+                offset: 1,
+                delete_len: 0,
+                insert: InputBytes::Inline(&byte),
+            },
+            InputSplice {
+                offset: 1,
+                delete_len: 1,
+                insert: InputBytes::Inline(&[]),
+            },
+        ];
+        let limits = InlineInputLimits {
+            max_edits: 2,
+            max_inline_bytes: 2,
+        };
+
+        assert!(validate_input_splices(&duplicate_insertions, 2, 4, limits).is_err());
+        assert!(validate_input_splices(&insertion_then_deletion, 2, 2, limits).is_err());
+
+        let overflowing_inserted_length = [
+            InputSplice {
+                offset: 0,
+                delete_len: 0,
+                insert: InputBytes::AfterRange(SourceRange {
+                    offset: 0,
+                    length: u64::MAX,
+                }),
+            },
+            InputSplice {
+                offset: 1,
+                delete_len: 0,
+                insert: InputBytes::AfterRange(SourceRange {
+                    offset: 0,
+                    length: u64::MAX,
+                }),
+            },
+        ];
+        assert!(validate_input_splices(&overflowing_inserted_length, 1, u64::MAX, limits).is_err());
     }
 
     #[test]
@@ -693,6 +794,24 @@ mod tests {
         assert!(validator.accept_page(&overlapping).is_err());
         validator.accept_eof();
         assert!(validator.accept_page(&later).is_err());
+    }
+
+    #[test]
+    fn rejects_same_offset_output_splices_across_pages() {
+        let first = [OutputSplice {
+            offset: 2,
+            delete_len: 0,
+            insert: OutputBytes::Inline(vec![1]),
+        }];
+        let same_offset = [OutputSplice {
+            offset: 2,
+            delete_len: 1,
+            insert: OutputBytes::Inline(vec![2]),
+        }];
+        let mut validator = EditDrainValidator::new(4);
+
+        validator.accept_page(&first).unwrap();
+        assert!(validator.accept_page(&same_offset).is_err());
     }
 
     struct DeterministicIds;

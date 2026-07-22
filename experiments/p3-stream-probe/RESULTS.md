@@ -47,8 +47,9 @@ more relevant proxy for parsing.
 | `stream<u8>`, `Bytes`, 64 KiB | 0.019 / 0.049 ms | 0.276 / 0.281 ms | 1.125 MiB |
 | `stream<u8>`, `Bytes`, 1 MiB | 0.013 / 0.014 ms | 0.266 / 0.272 ms | 2.062 MiB |
 
-The list checksum p95 had OS-noise outliers in this retained run; repeat runs
-put its p95 near 0.27-0.29 ms. P50 and the 10 MiB matrix were stable.
+The 1 MiB list checksum p95 has OS-noise outliers in the retained run. No claim
+uses an unretained repeat; the interpretation below relies on the retained p50
+and 10 MiB capacity/memory matrix.
 
 ## Interpretation for Lix
 

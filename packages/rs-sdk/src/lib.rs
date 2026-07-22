@@ -45,10 +45,11 @@ pub use lix_engine::{
 
 /// Returns the SDK's Wasmtime runtime for the large-file profiling harness.
 ///
-/// This deliberately exists only behind the non-default `profile_wasm_memory`
+/// This deliberately exists only behind the non-default internal
+/// `__profile_wasm_memory`
 /// feature. The harness wraps it to sweep diagnostic memory ceilings without
 /// changing the production 64 MiB policy.
-#[cfg(all(feature = "default_wasm_runtime", feature = "profile_wasm_memory"))]
+#[cfg(all(feature = "default_wasm_runtime", feature = "__profile_wasm_memory"))]
 #[doc(hidden)]
 pub fn profiling_default_wasm_runtime() -> Result<std::sync::Arc<dyn WasmRuntime>, LixError> {
     default_wasm_runtime::runtime()

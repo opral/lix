@@ -46,9 +46,11 @@ interface host {
 
   /// Framing is `u32 little-endian payload length || payload`, repeated exactly
   /// `record-count` times. A record is never split across pages. Payload
-  /// encoding is selected by `format-version` for this ABI generation. A
-  /// snapshot field is either inline or a `(attachment index, offset, length)`
-  /// reference. This keeps one huge JSON value/CSV row out of linear memory.
+  /// encoding is selected by `format-version`; version 1 is normatively defined
+  /// in `wit/packet-v1.md`. The call site fixes whether records are complete
+  /// entities or merge groups. A snapshot field is either inline or an
+  /// attachment reference. This keeps one huge JSON value/CSV row out of linear
+  /// memory.
   record packet-page {
     format-version: u16,
     record-count: u32,
@@ -69,11 +71,14 @@ interface host {
     ) -> result<option<packet-page>, source-error>;
   }
 
-  /// The host also scopes allocation by operation identity, file incarnation,
-  /// and plugin generation. The same `(schema-key, scope, ordinal)` returns the
-  /// same PK on retries. The result is exactly `scope` plus one opaque component;
-  /// distinct requests cannot collide. Ordinals are deterministic within a
-  /// schema/scope and do not depend on call order.
+  /// The host also scopes allocation by a hidden mutation operation key, file
+  /// incarnation, and plugin generation. That key binds the session,
+  /// observation, SDK mutation ID, and normalized request digest; exact
+  /// transport retries coalesce to one result. The same
+  /// `(schema-key, scope, ordinal)` returns the same PK on those retries. The
+  /// result is exactly `scope` plus one opaque component; distinct requests
+  /// cannot collide. Ordinals are deterministic within a schema/scope and do
+  /// not depend on call order.
   resource id-allocator {
     allocate: func(
       budget: borrow<transition-budget>,
@@ -125,6 +130,8 @@ interface api {
 
   record input-splice {
     /// Offset in the accepted document's previous byte string.
+    /// Starts are strictly increasing across the list: two operations at the
+    /// same base coordinate must be coalesced into one replacement.
     offset: u64,
     delete-len: u64,
     insert: input-bytes,
@@ -182,7 +189,11 @@ interface api {
 
   resource edit-cursor {
     /// All cursor pages use coordinates in one accepted base. The host checks
-    /// global ordering/non-overlap rather than validating pages independently.
+    /// globally strictly increasing start offsets and non-overlap rather than
+    /// validating pages independently. Equal-start insert/delete operations are
+    /// invalid and must be coalesced. After validation, the host applies edits
+    /// from greatest base offset to smallest (or an equivalent single pass over
+    /// the immutable base), so every coordinate retains base semantics.
     /// `some(page)` is non-empty and advances; `none` is permanent. The page is
     /// bounded by both arguments and the budget. An edit whose metadata cannot
     /// fit under the record cap returns `record-too-large`; large insert bytes
@@ -202,9 +213,11 @@ interface api {
     after-descriptor: file-descriptor,
     /// Lazy immutable bytes of the accepted document version.
     before: own<byte-source>,
-    /// Sorted, non-overlapping splices, all relative to the accepted base. The
-    /// host rejects excessive count or aggregate inline bytes against the
-    /// transition limits before Canonical-ABI lowering. Large replacements use
+    /// Splices with strictly increasing starts, no overlap, and coordinates in
+    /// the accepted base. Equal-start operations must be coalesced. Before
+    /// Canonical-ABI lowering, the host rejects excessive count/inline bytes,
+    /// checked-length overflow, or a reconstructed length unequal to `after`;
+    /// it also validates the reconstructed bytes/hashes. Large replacements use
     /// `after-range`, normally leaving this as one small splice.
     edits: list<input-splice>,
     /// Lazy complete-result fallback. Optimized plugins need not read it.

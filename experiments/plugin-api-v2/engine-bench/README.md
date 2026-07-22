@@ -62,8 +62,8 @@ From the repository root:
 
 ```sh
 cargo build --release -p lix_sdk \
-  --bench profile_merge_10k \
-  --features default_wasm_runtime,local_filesystem,profile_wasm_memory
+  --bench profile_plugin_large_file \
+  --features default_wasm_runtime,local_filesystem,__profile_wasm_memory
 ```
 
 Resolve the executable printed under `target/release/deps`, then create a fresh
@@ -103,22 +103,22 @@ is not mistaken for durable storage amplification.
 ## Recorded latest-main result
 
 See
-[`full-engine-v1-baseline-c789a2b1.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-c789a2b1.md)
+[`full-engine-v1-baseline-5ffab346.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-5ffab346.md)
 for the immutable commit, toolchain, raw samples, RSS, storage, logical I/O,
-Samply attribution, reproduction commands, and interpretation. Its profiles
-are stored beside the report and can be opened directly:
+Samply attribution, reproduction commands, and interpretation. The clean
+latest-main RocksDB profile is stored beside the report and can be opened
+directly:
 
 ```sh
 samply load \
-  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-c789a2b1.json.gz
-
-samply load \
-  perf-results/plugin-api-v2/full-engine-v1-slatedb-cached-edit-220k-c789a2b1.json.gz
+  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-5ffab346.json.gz
 ```
 
 Use `perf-results/plugin-api-v2/analyze_samply.py --binary <profile-binary>
 <profile>` for an idle-filtered native summary. The report explains why the
 async marker is not used as a sample filter in this build.
 
-The `66ad14da` report and profiles remain beside the latest artifacts as the
-historical pre-fast-path comparison; they are not overwritten.
+The matching clean SlateDB profile is explicitly pending in the report; do not
+substitute the older profile as current evidence. The `c789a2b1` and
+`66ad14da` reports/profiles remain beside the latest artifacts as historical
+comparisons and are not overwritten.

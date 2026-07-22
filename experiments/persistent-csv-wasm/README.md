@@ -39,7 +39,7 @@ exactly one changed decoded cell.
 
 ## Reproduce
 
-Run from the `vendor/lix` directory at commit `115350f9` or later:
+Run from the repository root at commit `115350f9` or later:
 
 ```sh
 cargo build \
@@ -66,7 +66,7 @@ target/release/persistent-csv-wasm-bench \
 ```
 
 The repository's `.cargo/config.toml` places experiment artifacts in the shared
-`vendor/lix/target` directory. The source tree remains isolated under this
+`<repo-root>/target` directory. The source tree remains isolated under this
 directory.
 
 ## Results

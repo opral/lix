@@ -111,7 +111,10 @@ The measured interval includes guest allocation, the direct host-to-guest copy,
 all Wasm execution and host imports, the guest-to-host result copy, and guest
 deallocation. Fixture generation, request assembly in host memory,
 initialization/hydration, and final correctness checks are reported or
-performed separately.
+performed separately. In B2 specifically, the immutable `before`/`after`
+`Arc` sources and import context are constructed and installed before the
+timer. The 4.50-9.81x B2-over-B result therefore excludes host successor-source
+construction, rope/path copying, and root publication.
 
 ## Interpretation limits
 
@@ -127,7 +130,9 @@ performed separately.
 - Candidate B2 mutates one thread-local index in the same way. Its streamed
   hydration cost is reported separately from warm edits. The measurements are
   a localized detection/source-access lower bound, not a measured immutable
-  resource lifecycle.
+  resource lifecycle. The host `after` source is also prebuilt outside the
+  timer; production measurements must include immutable successor-source
+  construction and publication.
 - Candidate D models a warm host-owned source and private index. Its point
   lookup and range reads are in memory; storage-engine latency and cache misses
   belong in the separate RocksDB/SlateDB engine benchmark.
@@ -143,7 +148,10 @@ performed separately.
   a call may be higher.
 - The raw core-Wasm ABI is deliberately packed. A WIT resource API should hide
   an equivalently packed transport behind an ergonomic SDK; these numbers do
-  not measure Canonical ABI lifting/lowering of rich record lists.
+  not measure Canonical ABI lifting/lowering of rich record lists. The proposed
+  interoperable transient encoding is specified in
+  [`wit/packet-v1.md`](./wit/packet-v1.md); this mechanism harness uses its own
+  smaller core-Wasm control layout and is not evidence for that codec's cost.
 
 Do not infer that a persistent resource alone is sufficient. Candidate A still
 receives and scans the full blob; Candidate B tests the combination of retained
@@ -168,8 +176,16 @@ At the approximately 10 MiB scale, the cross-format ranges were:
 | D fine host context | 0.000375–0.000959 ms | 0.000375–0.003375 ms | access-only probe | 1.13 MiB |
 | D batched host context | 0.000333–0.000625 ms | 0.000375–0.000666 ms | access-only probe | 1.13 MiB |
 
-Candidate A does not clear the project's 20% performance threshold. Candidate
-B clears it in every format. Candidate C clears it in every format but still
+The B2 ratio is only for the timed guest detection/source-access mechanism. It
+must not be reported as a 265–1463x end-to-end Lix speedup: immutable source
+construction, storage reads, reconciliation, rendering, and commit are outside
+this timer. The separate latest-main engine baseline still measures about
+2.50 seconds per edit on RocksDB and 4.12 seconds on cached SlateDB.
+
+Candidate A does not clear the isolated mechanism's 20% screening threshold.
+Candidate B clears that mechanism screen in every format, but only the
+full-engine RocksDB/SlateDB A/B can clear the project's adoption gate. Candidate
+C clears the mechanism screen in every format but still
 copies 10.05–12.78 MiB in each direction per edit, so its latency result does
 not solve boundary bandwidth, checkpoint storage, or Canonical ABI pressure.
 

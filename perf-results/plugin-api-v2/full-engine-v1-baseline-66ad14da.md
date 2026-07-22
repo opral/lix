@@ -226,11 +226,13 @@ Build:
 
 ```sh
 cargo build --release -p lix_sdk \
-  --bench profile_merge_10k \
-  --features default_wasm_runtime,local_filesystem,profile_wasm_memory
+  --bench profile_plugin_large_file \
+  --features default_wasm_runtime,local_filesystem,__profile_wasm_memory
 ```
 
-Set `BIN` to the emitted `target/release/deps/profile_merge_10k-*` executable.
+Set `BIN` to the emitted `target/release/deps/profile_plugin_large_file-*`
+executable. The retained profile predates the harness rename, so its symbols
+still use `profile_merge_10k`.
 Use a fresh case directory per backend:
 
 ```sh

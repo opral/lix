@@ -98,10 +98,26 @@ The manifest has this shape:
 }
 ```
 
-The example is a schema-valid one-agent smoke round. The adaptive tournament in
-this research uses five-agent format-complete screens, then the ax-eval default
-of ten independent agents for the selected candidate. Screening results are
-not used to claim sub-ten-point score differences.
+The example is a schema-valid one-agent smoke round. The planned adaptive
+protocol is five format-complete screens followed by ten independent agents for
+the selected candidate. The completed main cohort was A=5, B=9, C=4, D=4, plus
+a separate targeted N=3 refined-facade follow-up; it did not reach the planned
+ten B agents. A later final-aligned N=1 signature check scored 87 and passed
+5/5 acceptance tests, including a 200,000-row paged initial stream. That single
+run is not statistically comparable to the main or targeted cohorts. These
+unequal exploratory cohorts are not used to claim sub-ten-point score
+differences. Exact inclusion rules and limitations are in the
+[`research report`](../../../perf-results/plugin-api-v2/plugin-api-v2-research-2026-07-22.md#controlled-agent-experience-evaluation).
+
+Compact results live under
+`perf-results/plugin-api-v2/ax-eval/`, including the final-aligned result
+whose frozen facade/WIT hashes are
+`132b4d483c538834112f21878c7fdbbfd18e0584ee36ddb508ebbfd0ca8af0ea` and
+`685dcdf248b83ae21d5c937b43dfeb84d0f76427ed8a67a084911890179ada33`.
+The checked-in facade was subsequently `rustfmt`-wrapped on one assertion and
+has SHA-256
+`23aa66d71c4d2626d8ee9798771488a3c3124fd24a62d996afd28cc725ea9783`;
+there is no token or behavior change, and the WIT is byte-identical.
 
 The harness creates the required `~/.ax-eval/{tool-slug}/` layout, archives raw
 tested-agent transcripts, writes `result.json`, and atomically updates

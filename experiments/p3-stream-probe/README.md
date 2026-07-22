@@ -15,10 +15,12 @@ producer support. Host input preparation is outside the timer.
 Build and run:
 
 ```sh
-cd vendor/lix/experiments/p3-stream-probe
-cargo build -p p3-stream-probe-guest --target wasm32-wasip2 --release
-cargo run -p p3-stream-probe-host --release -- \
-  ../../target/wasm32-wasip2/release/p3_stream_probe_guest.wasm
+# From <repo-root>:
+cargo build --manifest-path experiments/p3-stream-probe/Cargo.toml \
+  -p p3-stream-probe-guest --target wasm32-wasip2 --release
+cargo run --manifest-path experiments/p3-stream-probe/Cargo.toml \
+  -p p3-stream-probe-host --release -- \
+  target/wasm32-wasip2/release/p3_stream_probe_guest.wasm
 ```
 
 The Rust toolchains installed for this repository recognize the Tier-3

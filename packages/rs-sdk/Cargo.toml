@@ -49,7 +49,7 @@ zip = { version = "8", default-features = false }
 default = ["default_wasm_runtime"]
 default_wasm_runtime = ["dep:blake3", "dep:lru", "dep:wasmtime", "dep:wasmtime-wasi"]
 local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
-profile_wasm_memory = []
+__profile_wasm_memory = []
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
 
 [[example]]
@@ -68,10 +68,10 @@ path = "tests/fixtures/verify_sqlite_key_value.rs"
 required-features = ["sqlite"]
 
 [[bench]]
-name = "profile_merge_10k"
-path = "benches/profile_merge_10k.rs"
+name = "profile_plugin_large_file"
+path = "benches/profile_plugin_large_file.rs"
 harness = false
-required-features = ["default_wasm_runtime", "local_filesystem", "profile_wasm_memory"]
+required-features = ["default_wasm_runtime", "local_filesystem", "__profile_wasm_memory"]
 
 [[example]]
 name = "profile_fs_open"

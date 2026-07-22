@@ -1,4 +1,4 @@
-# Current v1 full-engine baseline on `c789a2b1`
+# Historical v1 full-engine baseline on `c789a2b1`
 
 This artifact reruns the real current CSV Wasm plugin through the ordinary Lix
 SQL file API after the final rebase. It is a baseline, not evidence that the
@@ -164,7 +164,12 @@ on that phase snapshot.
 Logical I/O was collected in separate fresh cases: initial bytes were present,
 the exact acknowledgement ran outside the counters, and the first measured
 payload was the edited blob. A same-payload diagnostic was discarded. The
-wrapper perturbs timing, so these are counts only.
+wrapper perturbs timing, so these are counts only. It wraps the outer
+semantic-state `Storage` passed to the Lix engine. In the RocksDB-filesystem
+lane it does **not** instrument the second/internal RocksDB engine used by
+`LocalFilesystem` synchronization. The counts below are therefore outer Lix
+requests, not total filesystem RocksDB I/O; whole-process profiles and disk
+snapshots still include both engines.
 
 | Counter | RocksDB filesystem | Cached SlateDB |
 |---|---:|---:|
@@ -275,11 +280,13 @@ Build:
 
 ```sh
 cargo build --release -p lix_sdk \
-  --bench profile_merge_10k \
-  --features default_wasm_runtime,local_filesystem,profile_wasm_memory
+  --bench profile_plugin_large_file \
+  --features default_wasm_runtime,local_filesystem,__profile_wasm_memory
 ```
 
-Set `BIN` to the emitted `target/release/deps/profile_merge_10k-*` executable.
+Set `BIN` to the emitted `target/release/deps/profile_plugin_large_file-*`
+executable. The retained profile predates the harness rename, so its symbols
+still use `profile_merge_10k`.
 Use a fresh case directory for each backend and capacity/profile lane:
 
 ```sh

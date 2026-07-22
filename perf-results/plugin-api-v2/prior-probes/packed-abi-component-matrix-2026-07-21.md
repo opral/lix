@@ -21,7 +21,7 @@ no CSV parsing, diffing, storage, or SQLite work in the timed region.
 Build and run commands:
 
 ```sh
-cd /Users/samuel/git-repos/lixray/vendor/lix
+# From <repo-root>:
 cargo build --release -p lix_plugin_abi_bench
 target/release/lix_plugin_abi_bench
 ```
@@ -123,8 +123,9 @@ destination. The packed-full controls use the exact full-arena lengths.
 
 1. Per-entity canonical lowering/lifting and allocation dominate. Packed input
    is 6.25-75.33x faster and packed rich-output replacement is 7.60-86.12x
-   faster across the tested matrix. This clears a 10% adoption threshold by
-   orders of magnitude.
+   faster across the tested matrix. This clears the isolated 20% mechanism
+   screen by orders of magnitude, but it is not an adoption result; a packed
+   production path must still clear the full-engine RocksDB/SlateDB >20% gate.
 2. The gain scales with entity count, not just bytes. At 10 MiB, moving from
    10,240 1-KiB entities to 218,454 48-byte entities changes rich detect from
    2.402 ms to 46.090 ms, while packed changes from 0.384 ms to 0.676 ms.
