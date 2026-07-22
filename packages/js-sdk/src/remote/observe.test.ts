@@ -117,12 +117,17 @@ test("remote observe applies every blob delta before coalescing delivery", async
 
 test("remote observe multiplexes more than six subscriptions without blocking execute", async () => {
 	const observeRequests: Request[] = [];
+	let headerResolutions = 0;
 	let liveObserveRequests = 0;
 	let maximumLiveObserveRequests = 0;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
 			url: "https://lixray.test/@acme/workspace",
+			headers: () => {
+				headerResolutions += 1;
+				return {};
+			},
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
@@ -177,6 +182,7 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 			},
 		},
 	});
+	headerResolutions = 0;
 
 	const observations = Array.from({ length: 8 }, (_, index) =>
 		lix.observe(`SELECT ${index} AS value`),
@@ -189,6 +195,14 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 	);
 	expect(liveObserveRequests).toBe(1);
 	expect(maximumLiveObserveRequests).toBe(1);
+	expect(observeRequests).toHaveLength(1);
+	expect(headerResolutions).toBe(1);
+	let submittedSubscriptions = 0;
+	for (const request of observeRequests) {
+		const body = (await request.clone().json()) as { subscriptions: unknown[] };
+		submittedSubscriptions += body.subscriptions.length;
+	}
+	expect(submittedSubscriptions).toBe(8);
 	expect(
 		observeRequests.every((request) =>
 			new URL(request.url).pathname.endsWith("/observe/multiplex"),

@@ -127,6 +127,7 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
     cached_cold_lifecycle_benches(c, &runtime);
     cached_preloaded_request_benches(c, &runtime);
     fresh_engine_select_benches(c, &runtime);
+    storage_direct_benches(c, &runtime);
     storage_concurrency_benches(c);
 }
 
@@ -469,6 +470,55 @@ fn storage_concurrency_benches(c: &mut Criterion) {
     });
 
     group.finish();
+}
+
+fn storage_direct_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) {
+    let mut group = c.benchmark_group("slatedb_storage_direct");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    group.bench_function("accept_put_u1_v4096", |b| {
+        b.iter_custom(|iterations| {
+            let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
+            let storage = SlateDB::open_object_store(
+                format!("slatedb-direct-bench-{}-{db_id}", std::process::id()),
+                Arc::new(InMemory::new()),
+            )
+            .expect("open direct SlateDB benchmark storage");
+            let key = Key(Bytes::from_static(b"direct-key"));
+            let value = Bytes::from(vec![0x5a; FILE_SIZE_BYTES]);
+            runtime.block_on(write_direct_storage_value(&storage, &key, &value));
+            measure_iterations(iterations, || {
+                runtime.block_on(write_direct_storage_value(&storage, &key, &value))
+            })
+        });
+    });
+
+    group.finish();
+}
+
+async fn write_direct_storage_value(storage: &SlateDB, key: &Key, value: &Bytes) -> u64 {
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("begin direct SlateDB write");
+    write
+        .put_many(
+            CONCURRENCY_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        )
+        .await
+        .expect("stage direct SlateDB value");
+    let commit = write.commit().await.expect("commit direct SlateDB value");
+    commit.stats.put_entries
 }
 
 fn measure_iterations<T>(iterations: u64, mut operation: impl FnMut() -> T) -> Duration {
