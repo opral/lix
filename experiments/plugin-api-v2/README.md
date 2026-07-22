@@ -44,8 +44,8 @@ file. Its timed output contains the exact changed entity bytes, not merely a
 hash.
 
 The measured Candidate B facade was later refined after the controlled AX
-cohort and a source-level correctness review. The warm mechanism is unchanged,
-but the final compileable facade adds explicit byte/entity cold constructors,
+cohort and a source-level correctness review. The sparse edit/source data flow
+is unchanged, but the final compileable facade adds explicit byte/entity cold constructors,
 minimal merge groups, complete upserts versus keyed deletes, composite retry-
 stable IDs, and no guest `Send`/`Sync` requirement. The refined WIT also names
 large input ranges and guest lazy outputs instead of forcing full `list<u8>`
@@ -58,8 +58,15 @@ The harness generates approximately 100 KiB, 1 MiB, and 10 MiB fixtures for:
 
 - CSV rows, Markdown paragraphs, and text lines, with generated semantic IDs
   reconciled across a localized edit.
-- JSON object properties, whose JSON-pointer-like key is the intrinsic identity.
+- Top-level JSON object properties, whose decoded property key is treated as
+  identity only inside this generated mechanism fixture. This is not the
+  production identity design: nested object slots need stable parent identity,
+  and array items need opaque IDs plus independent order keys rather than JSON
+  Pointer/index primary keys.
 - Excalidraw elements, whose native `id` is the intrinsic identity.
+
+Nested JSON and JSON arrays are not mechanism-tested by this generated fixture;
+their required identity break is specified and correctness-gated separately.
 
 The large CSV/text cases contain 200,000 entities. Large Markdown, JSON, and
 Excalidraw cases contain 50,000 entities. JSON and Excalidraw fixtures are
@@ -114,10 +121,13 @@ performed separately.
   replacements for the production CSV, Markdown, JSON, text, or future
   Excalidraw plugins. Their purpose is to make entity count, identity, and
   bytes processed comparable across API shapes.
-- Candidate B models a warm per-document resource. It does not yet model
-  eviction, transaction rollback, or recovery after process restart.
-- Candidate B2 models the same resource lifecycle for an index-only guest. Its
-  streamed hydration cost is reported separately from warm edits.
+- Candidate B mutates one thread-local document in place. It does not allocate
+  an immutable successor, retain accepted/successor versions through commit,
+  or model eviction, abort, multi-session structural sharing, or restart.
+- Candidate B2 mutates one thread-local index in the same way. Its streamed
+  hydration cost is reported separately from warm edits. The measurements are
+  a localized detection/source-access lower bound, not a measured immutable
+  resource lifecycle.
 - Candidate D models a warm host-owned source and private index. Its point
   lookup and range reads are in memory; storage-engine latency and cache misses
   belong in the separate RocksDB/SlateDB engine benchmark.
@@ -163,7 +173,8 @@ B clears it in every format. Candidate C clears it in every format but still
 copies 10.05–12.78 MiB in each direction per edit, so its latency result does
 not solve boundary bandwidth, checkpoint storage, or Canonical ABI pressure.
 
-Candidate B2 is the strongest complete warm-edit mechanism in this experiment.
+Candidate B2 is the strongest localized detection/source-access mechanism in
+this experiment.
 It is 4.50–9.81x faster than B while reducing guest linear-memory high-water by
 77.99–91.93%. At 10 MiB it retained a 1.14 MiB index for 50,000 entities or a
 4.58 MiB index for 200,000 entities, used exactly two source imports carrying

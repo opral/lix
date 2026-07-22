@@ -1,0 +1,20 @@
+package lix:abi-bench-packed@1.0.0;
+
+interface api {
+  type arena = list<u8>;
+
+  /// The arena starts with a fixed, versioned header and contains all entity
+  /// field spans plus file bytes. The guest only validates the header.
+  detect-empty: func(input: arena) -> result<arena, string>;
+
+  /// Returns the state-only arena by moving the input allocation.
+  entity-round-trip: func(input: arena) -> result<arena, string>;
+
+  /// Returns a file-only arena by moving the input allocation. The 32-byte
+  /// header remains part of the result so no guest-side copy is introduced.
+  file-round-trip: func(input: arena) -> result<arena, string>;
+}
+
+world plugin {
+  export api;
+}

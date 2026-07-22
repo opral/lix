@@ -1,0 +1,50 @@
+package lix:abi-bench-rich@1.0.0;
+
+interface api {
+  type json-text = string;
+  type bytes = list<u8>;
+
+  record file {
+    filename: option<string>,
+    data: bytes,
+  }
+
+  record detected-change {
+    entity-pk: list<string>,
+    schema-key: string,
+    snapshot-content: option<json-text>,
+    metadata: option<json-text>,
+  }
+
+  record entity-state {
+    entity-pk: list<string>,
+    schema-key: string,
+    snapshot-content: json-text,
+    metadata: option<json-text>,
+  }
+
+  /// Current detect-changes input and output shapes with intentionally empty
+  /// guest work/output. This isolates canonical lowering and guest allocation.
+  detect-empty: func(
+    state: list<entity-state>,
+    file: file,
+  ) -> result<list<detected-change>, string>;
+
+  /// Returns every input entity as a change. Fields are moved rather than
+  /// cloned in the guest, so this isolates lowering plus lifting a rich result.
+  entity-round-trip: func(
+    state: list<entity-state>,
+    file: file,
+  ) -> result<list<detected-change>, string>;
+
+  /// Returns the input file bytes without transforming them. State is empty in
+  /// this case; this measures the canonical list<u8> round-trip floor.
+  file-round-trip: func(
+    state: list<entity-state>,
+    file: file,
+  ) -> result<bytes, string>;
+}
+
+world plugin {
+  export api;
+}

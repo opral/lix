@@ -1,0 +1,10 @@
+package lix:p3-stream-probe@0.1.0;
+
+interface transfer {
+    consume-list: func(data: list<u8>, checksum: bool) -> tuple<u64, u64>;
+    consume-stream: async func(data: stream<u8>, checksum: bool, chunk-bytes: u32) -> tuple<u64, u64>;
+}
+
+world guest {
+    export transfer;
+}

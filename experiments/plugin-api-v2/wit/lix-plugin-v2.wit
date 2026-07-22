@@ -19,6 +19,9 @@ interface host {
     max-page-bytes: u32,
     max-pages: u32,
     max-total-bytes: u64,
+    /// Checked by the host before lowering `file-update.edits` into the guest.
+    max-inline-edits: u32,
+    max-inline-input-bytes: u64,
     total-deadline-nanoseconds: u64,
   }
 
@@ -192,11 +195,17 @@ interface api {
   }
 
   record file-update {
+    /// Warm transitions require identical plugin key/generation in these two
+    /// descriptors. Reselection is an engine migration/handoff and never enters
+    /// this guest call.
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
     /// Lazy immutable bytes of the accepted document version.
     before: own<byte-source>,
-    /// Sorted, non-overlapping splices, all relative to the accepted base.
+    /// Sorted, non-overlapping splices, all relative to the accepted base. The
+    /// host rejects excessive count or aggregate inline bytes against the
+    /// transition limits before Canonical-ABI lowering. Large replacements use
+    /// `after-range`, normally leaving this as one small splice.
     edits: list<input-splice>,
     /// Lazy complete-result fallback. Optimized plugins need not read it.
     after: own<byte-source>,
@@ -204,6 +213,7 @@ interface api {
   }
 
   record entity-update {
+    /// These descriptors likewise select the same plugin key/generation.
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
     /// Lazy immutable bytes of the accepted rendered version.
@@ -211,7 +221,9 @@ interface api {
     /// Final merge-resolved semantic changes. Rendering and validation happen
     /// before the engine commits them.
     changes: own<packet-source>,
-    /// Lazy complete-state fallback. Incremental renderers do not consume it.
+    /// Transaction-local complete prospective state after applying `changes`
+    /// and resolving the merge, but before commit. Incremental renderers do not
+    /// consume it.
     current-entities: own<packet-source>,
   }
 

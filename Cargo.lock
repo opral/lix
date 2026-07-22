@@ -3397,6 +3397,30 @@ name = "lix_order_key"
 version = "0.8.4"
 
 [[package]]
+name = "lix_plugin_abi_bench"
+version = "0.8.4"
+dependencies = [
+ "lix_plugin_abi_bench_packed_guest",
+ "lix_plugin_abi_bench_rich_guest",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
+name = "lix_plugin_abi_bench_packed_guest"
+version = "0.8.4"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "lix_plugin_abi_bench_rich_guest"
+version = "0.8.4"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "lix_rocksdb_storage"
 version = "0.8.4"
 dependencies = [

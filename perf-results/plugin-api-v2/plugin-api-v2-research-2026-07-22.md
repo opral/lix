@@ -1,9 +1,9 @@
 # Incremental Wasm plugin API research
 
-Date: 2026-07-22  
-Base commit: `66ad14da` (`origin/main`)
-Branch: `codex/wasm-plugin-api-research`  
-Host: Apple M5 Pro, 18 cores, 64 GiB RAM, macOS 26.3.1 arm64  
+Date: 2026-07-22
+Base commit: `c789a2b1` (`origin/main`)
+Branch: `codex/wasm-plugin-api-research`
+Host: Apple M5 Pro, 18 cores, 64 GiB RAM, macOS 26.3.1 arm64
 Toolchain: Rust nightly 1.97, Wasmtime 45, `wasm32-unknown-unknown` and
 `wasm32-wasip2`
 
@@ -26,12 +26,13 @@ the format's syntax/identity index:
 
 ```rust
 open_file(descriptor, file_source, scoped_ids)
-  -> (document, initial_entity_groups)
+  -> (document, initial_entity_group_pages)
 open_entities(descriptor, bounded_entity_pages)
   -> (document, complete_file_edits)
 file_changed(before_descriptor, after_descriptor, before_source, after_source, byte_splices)
-  -> (successor_document, entity_merge_groups)
-entities_changed(before_descriptor, after_descriptor, before_source, resolved_entity_groups)
+  -> (successor_document, entity_merge_group_pages)
+entities_changed(before_descriptor, after_descriptor, before_source,
+                 resolved_entity_group_pages, prospective_entity_pages)
   -> (successor_document, byte_splices)
 ```
 
@@ -40,6 +41,18 @@ such as both sides of an Excalidraw binding, may share a group. Authority is
 validated for the complete group and deterministic group-level LWW selects all
 of it or none of it. Order, parentage, and references live in complete schema
 snapshots rather than optional transport metadata.
+
+Sparse semantic output is inline; initial import and other broad transitions
+use bounded lazy pages. A 200,000-row `open_file` therefore need not collect
+200,000 complete upserts in guest memory before the host can drain them. The
+host validates duplicate keys and group/page bounds across the whole cursor,
+not just within one page.
+
+Both renderer inputs are stateful bounded sources. The change source carries
+the final merge-resolved groups; the complete fallback carries the prospective
+after-state obtained by applying those groups, transaction-local and before
+commit. A simple renderer consumes the latter, while an incremental renderer
+normally consumes only the small change source.
 
 Descriptors contain path, media type, and the host-selected content-addressed
 plugin generation; a rename-only transition is delivered even with zero byte
@@ -59,13 +72,21 @@ successor resources. A shared renderer can reopen from its durable branch root;
 a noncanonical private view cannot, so its observation expires and the session
 must reread.
 
-The refined facade shown here was produced after the main controlled AX cohort.
-A targeted N=3 follow-up on its frozen signatures independently passed
+An earlier refined facade snapshot was produced after the main controlled AX
+cohort. A targeted N=3 follow-up on those frozen signatures independently passed
 lifecycle/cold-open/rename, CSV reorder/cold reconstruction, and Excalidraw
 coupled-group/lazy-large-entity tasks. Its median score was 85, versus 91 for
 the earlier B cohort, but the tasks and sample sizes differ and cannot support
-a comparative ergonomics claim. Observation expiry, aggregate-budget failure,
-and production generated bindings still need a larger final cohort.
+a comparative ergonomics claim. A final evidence audit then aligned the Rust
+sketch with WIT by making broad semantic output and resolved input lazy,
+statefully consuming entity/change sources, validating keys and edits across
+pages, capping splices before lowering, defining the prospective-state fallback,
+forbidding warm plugin reselection, and removing a facade-only exact lookup.
+Those changes were not part of the N=3 score. Observation expiry,
+aggregate-budget failure, production generated bindings, and the final aligned
+facade still need a larger cohort. One fresh final-aligned implementer was
+attempted but blocked by the environment approval reviewer before any file
+change; it is excluded and has no score.
 
 This report compares four breaking alternatives plus current v1:
 
@@ -92,6 +113,15 @@ investigation:
 - uncontested visibility fast path (`9600c9ca`);
 - remote request/observation blob splices (`26a38c67`); and
 - SlateDB background WAL flush batching (`66ad14da`).
+
+The final rebase to `c789a2b1` additionally includes the exact `lix_file`
+point-read fast path, coalesced/shared observation results, chunked remote blob
+comparisons, one DataFusion write session and one provider set per transaction,
+SQL-provider pruning, fixed-schema read elision, large RocksDB read-buffer
+reuse, lazy SlateDB range-delete snapshots, and CAS dedupe presence markers
+that avoid reading payloads merely to prove existence. The full-engine baseline
+below was rerun after those changes; the immutable `66ad14da` result remains as
+the historical comparison.
 
 This matters because old flamegraphs identified visibility maps and repeated
 acknowledgement clones as large costs; those low-risk fixes are no longer
@@ -133,17 +163,19 @@ exact received source/root/document lease.
 
 ### Statistical gate
 
-Primary latency cells use deterministic fixtures, at least five warmups, 31
-samples, and counterbalanced fresh-process A/B ordering where practical. A
-candidate is accepted when the paired candidate/baseline ratio's 95% interval
-is below `0.80` for the large-file aggregate, at least four of five formats
-improve by more than 20% per backend, and no primary cell regresses more than 5%
-p50 or 10% p95.
+The eventual production integration A/B will use deterministic fixtures, at
+least five warmups, at least 31 samples, and counterbalanced fresh-process
+ordering. A candidate is accepted when the paired candidate/baseline ratio's
+95% interval is below `0.80` for the large-file aggregate, at least four of
+five formats improve by more than 20% per backend, and no primary cell
+regresses more than 5% p50 or 10% p95.
 
-Very slow Slate diagnostics may use 11 samples across three fresh processes,
-reported explicitly. Fixture generation, backend open, and cold plugin compile
-stay outside warm timers. Cold compile, cold hydrate, and first edit are
-reported separately.
+The mechanism matrix below uses 30 warm samples per cell, while the expensive
+latest-main discovery baseline uses one serial N=11 run per backend. They are
+diagnostic and cannot accept a production architecture. Fixture generation,
+backend open, and cold plugin compile stay outside warm timers. A final slow
+Slate A/B may divide its samples across at least three counterbalanced fresh
+processes; cold compile, cold hydrate, and first edit are reported separately.
 
 Storage and memory have independent gates. Reject a monolithic checkpoint or
 other design that adds more than 20% WAL/live-byte amplification unless it
@@ -231,10 +263,13 @@ stateless full-file round trip with a persistent guest document:
 | Persistent splice, guest apply only | 0.065 / 0.081 ms | 38.88 MiB |
 | Persistent splice plus host materialization | 3.080 / 3.548 ms | 38.88 MiB |
 
-The mechanism was 7.0x p50 end to end and 333x at the guest apply boundary.
-Cold hydration was 15.5 ms. That prototype supported one contained, same-length
-CSV cell edit; it did not prove format correctness, storage composition, or
-session lifecycle.
+The isolated persistent-CSV prototype was 7.0x p50 across its host scan, guest
+call, and host materialization interval, and 333x at the guest apply boundary.
+Cold hydration was 15.5 ms. It supported one contained, same-length CSV cell
+edit; it did not prove full-engine behavior, format correctness, storage
+composition, or session lifecycle. The complete standalone harness, controls, commands, and
+limitations are checked in at
+[`experiments/persistent-csv-wasm`](../../experiments/persistent-csv-wasm/README.md).
 
 ### Nested rich ABI versus packed transient arena
 
@@ -253,6 +288,10 @@ The byte-only control rejects “Wasm itself is slow.” Per-entity lowering,
 allocation, and repeated representation building are the problem. A packed
 arena here is only a Component ABI encoding. It is not a proposal to pack
 durable semantic KVs above RocksDB/SlateDB.
+
+The real Component guests, WIT, host harness, and full retained matrix are
+checked in under [`packages/plugin-abi-bench`](../../packages/plugin-abi-bench/README.md)
+and [`prior-probes/packed-abi-component-matrix-2026-07-21.md`](./prior-probes/packed-abi-component-matrix-2026-07-21.md).
 
 ### P3 streams
 
@@ -279,6 +318,9 @@ output behind a bounded lazy source. P3 streams/futures replace those cold/large
 adapters when toolchain and sync-overhead gates clear; they do not create a
 second author API.
 
+The async Component ABI guest/host source, raw TSV, and retained result are in
+[`experiments/p3-stream-probe`](../../experiments/p3-stream-probe/RESULTS.md).
+
 ## Latest-main full-engine v1 baseline
 
 The production-path baseline uses the real CSV Wasm plugin through an ordinary
@@ -296,29 +338,39 @@ a proposal to raise the limit.
 
 | Production backend | Cold write | One-row write p50 / p95 | Exact render p50 / p95 | Write-process max RSS |
 |---|---:|---:|---:|---:|
-| RocksDB filesystem | 5,451 ms | 2,696 / 2,924 ms | 937 / 1,027 ms | 2.05 GiB |
-| Cached SlateDB | 4,345 ms | 4,092 / 4,241 ms | 4,190 / 4,918 ms | 1.97 GiB |
+| RocksDB filesystem | 4,878 ms | 2,646 / 4,597 ms | 926 / 1,090 ms | 1.96 GiB |
+| Cached SlateDB | 7,692 ms | 3,971 / 6,855 ms | 4,204 / 4,495 ms | 1.88 GiB |
 
-A separately instrumented single-row write requested 226,391 keys through
-RocksDB filesystem and 226,360 through cached SlateDB. Of the RocksDB requests,
-220,131 were change-payload keys; another 6,118 calls individually loaded
-tracked-state tree chunks. Storage after initial import was 75.43 MB for the
-complete RocksDB filesystem (7.06x the source) and 193.07 MB for cached SlateDB
-including its cache (18.08x); the SlateDB durable object store alone was
-128.90 MB (12.07x).
+A separately instrumented fresh-state single-row write requested 226,349 keys
+through RocksDB filesystem and 226,350 through cached SlateDB. Of the RocksDB
+requests, 220,131 were change-payload keys; another 6,076 calls individually
+loaded tracked-state tree chunks. Storage after initial import was 75.41 MB for
+the complete RocksDB filesystem (7.06x the source) and 193.11 MB for cached
+SlateDB including its cache (18.08x); the SlateDB durable object store alone
+was 128.92 MB (12.07x).
+
+Against the immutable `66ad14da` baseline, the four warm medians move by only
+-2.97% to +0.34%: RocksDB filesystem edit/render improve 1.88%/1.19%, cached
+SlateDB edit improves 2.97%, and cached SlateDB render regresses 0.34%. None is
+near the greater-than-20% gate. With N=11 the nearest-rank p95 is the maximum;
+each new edit lane has one conspicuous high outlier, so its +57-62% max change
+is not treated as a causal mainline regression. Cold setup is one variable
+sample and is not used to rank the architecture.
 
 The Samply phase marker was optimized out, so these profiles are
 **whole-process active-sample attribution**, including reopen, plugin prewarm,
 the acknowledged render, the timed write, and close/flush. Inclusive shares
 overlap and cannot be summed or read as isolated write-phase wall time. Within
-that scope, Wasmtime `detect_changes` appears in 1.00% of active RocksDB samples
-and 0.72% of cached-SlateDB samples. RocksDB stacks include row materialization
-in 41.31%, change-record loading in 27.77%, and the separate filesystem-sync
-thread in 42.49%. Cached-SlateDB stacks include snapshot-value fetching in
-41.86% and SST-iterator initialization in 23.60%. Together with the independent
-226k-key counters, these profiles are consistent with whole-state host/storage
-work dominating the current path; they do not isolate a causal percentage for
-the timed edit alone.
+that scope, RocksDB stacks include row materialization in 41.91%, change-record
+loading in 28.78%, the separate filesystem-sync thread in 41.92%, and Wasmtime
+`detect_changes` in 1.27%. Cached-SlateDB stacks include snapshot-value
+fetching in 39.60%, SST-iterator initialization in 22.40%, and Wasmtime
+`detect_changes` in 5.28%. The Slate guest share differs materially from the
+old whole-process profile, but the denominator also includes compile, warmup,
+render, cache, and shutdown differences, so this is not an isolated guest
+regression. Together with the independent 226k-key counters, the profiles are
+consistent with whole-state host/storage work dominating the current path;
+they do not isolate a causal percentage for the timed edit alone.
 
 This produces the following evidence-ranked implementation targets. The
 mechanism ratios and whole-process profile shares are diagnostic headroom, not
@@ -326,9 +378,9 @@ additive end-to-end forecasts.
 
 | Rank | Target | Exact evidence | Required acceptance evidence |
 |---:|---|---|---|
-| 1 | Integrate B2 with observation-selected sparse host roots and a relative-offset document tree | Current one-row write requests 226,391 RocksDB-filesystem / 226,360 cached-SlateDB keys and current v1 cannot initialize under 64 MiB. Isolated B2 p50 is 0.0126-0.0710 ms, 264.9-1462.6x over its optimistic v1 control, with 77.99-91.93% lower guest high-water than B. | >20% p50 and p95 full SQL win on both backends, 64 MiB pass, stable identities, lifecycle, and complete cold-render validation. |
-| 2 | Add adaptive SlateDB batched/dense-run reads after the warm path stops requesting all state | Current p50 is 4,092 ms/edit and 4,190 ms/render; whole-process active samples include `get_snapshot_values` in 41.86% and SST initialization in 23.60%. | >20% full-engine win with a bounded sparse-key over-read budget. |
-| 3 | Reuse the precommit-validated renderer splice/materialization in `LocalFilesystem` | Exact render p50 is 937 ms; the separate sync thread accounts for 42.49% of whole-process RocksDB active samples. | >20% RocksDB-filesystem end-to-end win with byte equality and unchanged commit/acknowledgement ordering. |
+| 1 | Integrate B2 with observation-selected sparse host roots and a relative-offset document tree | Current one-row write requests 226,349 RocksDB-filesystem / 226,350 cached-SlateDB keys and current v1 cannot initialize under 64 MiB. Isolated B2 p50 is 0.0126-0.0710 ms, 264.9-1462.6x over its optimistic v1 control, with 77.99-91.93% lower guest high-water than B. | >20% p50 and p95 full SQL win on both backends, 64 MiB pass, stable identities, lifecycle, and complete cold-render validation. |
+| 2 | Add adaptive SlateDB batched/dense-run reads after the warm path stops requesting all state | Current p50 is 3,971 ms/edit and 4,204 ms/render; whole-process active samples include `get_snapshot_values` in 39.60% and SST initialization in 22.40%. | >20% full-engine win with a bounded sparse-key over-read budget. |
+| 3 | Reuse the precommit-validated renderer splice/materialization in `LocalFilesystem` | Exact render p50 is 926 ms; the separate sync thread accounts for 41.92% of whole-process RocksDB active samples. | >20% RocksDB-filesystem end-to-end win with byte equality and unchanged commit/acknowledgement ordering. |
 | 4 | Produce the packed transient Component packet directly from sparse state | Rich-record versus arena probes are 6.25-84.0x faster. The 218,454-entity cases reduce guest peak from 64.88 to 39.32 MB and 63.11 to 28.84 MB; file bytes alone are 0.95x. | >20% after sparse retrieval. Building today's rich rows and then packing them fails the intent. |
 | 5 | Adopt P3 streams for cold and large transfers only | 10 MiB streams reduce payload high-water 81-90%, while p50 remains 2.686-2.718 ms versus 2.692 ms for `list<u8>`. | Capacity/backpressure benefit with no >5% warm-call regression; no localized-edit latency claim. |
 
@@ -341,7 +393,9 @@ the measured problem is logical whole-state retrieval/materialization.
 
 The complete raw samples, RSS, on-disk decomposition, logical counters,
 profiles, and reproduction commands are in
-[`full-engine-v1-baseline-66ad14da.md`](./full-engine-v1-baseline-66ad14da.md).
+[`full-engine-v1-baseline-c789a2b1.md`](./full-engine-v1-baseline-c789a2b1.md).
+The [`66ad14da` baseline](./full-engine-v1-baseline-66ad14da.md) and profiles
+remain as the immutable historical comparison.
 This PR does not claim the full-engine greater-than-20% gate for v2: that gate
 requires a production integration A/B against this baseline.
 
@@ -384,6 +438,16 @@ local. The 0.070 ms CSV/text cells already include this 200,000-entity suffix
 shift; they are not proof of asymptotically local indexing. Production needs a
 relative-offset/interval tree (or equivalent piece-tree annotations) and tests
 length-changing edits at the beginning, middle, and end of a 10 MiB file.
+
+B and B2 also mutate one thread-local guest document/index in place. The timed
+call does not allocate an immutable successor, retain accepted and successor
+versions through commit, exercise abort, or measure structural sharing across
+1/8/32 sessions. The result proves the sparse byte/source/scanner mechanism,
+not the complete immutable lifecycle cost. Production acceptance therefore
+requires an immutable relative-offset tree with path-copy accounting, abort
+tests, and retained-session RSS/storage measurements; “the warm mechanism is
+unchanged” means its data flow, not that the benchmark already implements the
+proposed ownership model.
 
 B2 does not authorize one full host `Vec` per client. The source implementation
 must be an immutable rope/piece tree: a session acknowledgement forks the
@@ -497,7 +561,10 @@ but their primary keys are opaque rather than derived path strings. A value
 edit or property reorder preserves identity while a key rename is a
 delete/insert. JSON array items use opaque IDs and independent order keys.
 Duplicate object keys are rejected in v2; subtree moves preserve IDs only when
-the format matcher has an unambiguous correspondence.
+the format matcher has an unambiguous correspondence **and the owning identity
+semantics permit it**. Moving an object property to another parent, or changing
+its key, creates a new object-slot identity; moving an unambiguous array item
+may preserve that item's opaque ID and the identities inside its value.
 
 ## API hypothesis tournament
 
@@ -585,8 +652,8 @@ earlier persistent-document/splice facade remained about as straightforward to
 implement as the full-blob and checkpoint controls. It does not measure the
 final refined facade.
 
-The post-review facade was then frozen and tested with three deliberately
-harder, heterogeneous tasks:
+The first post-review facade snapshot (SHA-256 `b66a024...`) was frozen and
+tested with three deliberately harder, heterogeneous tasks:
 
 | Refined task | Score | Duration / tool calls | Independent result |
 |---|---:|---:|---:|
@@ -601,6 +668,18 @@ the 4 MiB payload, so it is API-usage evidence rather than guest peak-memory
 evidence. N=3 is exploratory and not statistically comparable with the earlier
 N=9 B cohort.
 
+A final-aligned task covering 200,000 paged initial upserts, stateful
+entity/change sources, prospective-state rendering, cross-page change/edit
+validation, pre-call splice caps, and plugin reselection is checked in at
+[`final-aligned.md`](../../experiments/plugin-api-v2/ax-eval/tasks/final-aligned.md).
+Its fresh implementer was blocked by the automatic approval reviewer before any
+file change. No retry/workaround was attempted; no result was generated or
+scored. The final facade (`candidate_b_refined.rs` SHA-256
+`9ec4a63c8b09fa729f99d9a9c20b49620caf2770d701299f4c6a00a61e61f38b`;
+WIT SHA-256
+`d28796b343a5cf1ebafb3c103d7da3433963feb7b99de278c4c7eea8be695ccf`)
+is therefore compile/test/WIT-audit evidence, not AX evidence.
+
 The one valid correctness failure is important. B's first CSV agent preserved
 row IDs during a reorder but emitted no committed order updates for unchanged
 moved rows; it then weakened the reorder assertion until tests passed. The
@@ -611,15 +690,19 @@ carry the complete schema entity, including its order key, and represent delete
 as a separate keyed variant. The optimized source/splice mechanism can remain
 unchanged.
 
-The post-cohort correctness review further added explicit byte/entity cold
+The post-cohort correctness review added explicit byte/entity cold
 constructors, per-change merge groups, precommit renderer validation, and
 observation-selected private roots, and removed guest `Send`/`Sync`. The
-refined facade and WIT compile/validate, and the targeted follow-up covers its
-descriptors, scoped allocation, bounded pages/lazy output, complete upserts,
-groups, and both cold constructors. It was not retroactively mixed into the
-main cohort. A larger homogeneous follow-up still must cover aggregate-budget
-errors, observation expiry/retry, generated bindings, and realistic error
-recovery before the final API can be called frozen.
+targeted follow-up covers that snapshot's descriptors, scoped allocation, lazy
+bytes, complete upserts, groups, and both cold constructors. A final audit then
+made broad semantic output paged, aligned entity input with WIT's stateful
+cursor, streamed resolved-change input, added transition-wide key/edit
+validation and pre-call splice caps, defined the prospective-state fallback,
+and forbade warm plugin reselection. Those later signatures are not credited
+with the N=3 score; the attempted final-aligned run was blocked before work. A
+larger homogeneous follow-up still must cover aggregate-budget errors,
+observation expiry/retry, generated bindings, and realistic error recovery
+before the API can be called frozen.
 
 Excluded data was never scored: the initial A and B text tasks had a
 contradictory terminal-newline fixture; early workspaces could see sibling
@@ -642,8 +725,12 @@ Schema-valid compact results are checked in for [A](ax-eval/candidate-a-result.j
 [D](ax-eval/candidate-d-result.json), and the
 [targeted refined facade](ax-eval/candidate-b-refined-targeted-result.json).
 Raw main-cohort tested/judge transcripts are archived under
-`~/.ax-eval/lix-plugin-api-{a,b,c,d}/`; the targeted result records its frozen
-source hashes and raw Codex rollout locations.
+`~/.ax-eval/lix-plugin-api-{a,b,c,d}/`, not in this Git branch. The targeted
+result records its frozen source hashes, but its raw Codex rollouts are also
+local-only. GitHub reviewers can audit the compact per-agent metrics, prompts,
+verdicts, and declared substitutions, but cannot replay the complete
+transcripts from this PR. That is an evidence-retention limitation, not a
+hidden success claim.
 
 ## Post-tournament API correctness review
 
@@ -666,14 +753,26 @@ freeze. The refined compileable facade/WIT addresses these design requirements:
 | 8 | Empty files, path deletion/recreation, branches, and plugin upgrades cross document authority domains | Make whole-file deletion an explicit file-incarnation operation, allocate a fresh incarnation on recreation, keep one shared renderer per branch tuple, and revoke observations on generation migration |
 | 9 | B2's generated-fixture flat offset vector shifts an entire suffix and never exercises `open_entities` | Require a relative-offset tree plus start/middle/end length-changing tests and complete cold-render validation with production parsers |
 | 10 | Path/media-type/plugin selection can affect semantics without changing bytes | Supply before/after file descriptors and invoke rename-only transitions with zero splices |
-| 11 | Unbounded entity/output cursors can evade per-call memory and deadline limits | Bound entity/change/edit pages and lazy byte output under one non-renewing aggregate transition budget |
+| 11 | Unbounded entity/output cursors can evade per-call memory and deadline limits | Bound entity/change/edit pages and lazy byte output under one non-renewing aggregate transition budget; validate edit ordering/bounds across pages |
+| 12 | Initial import could still accumulate every upsert, and page-local validation misses duplicate keys across pages | Make semantic output inline-or-paged, never split groups, and host-validate key uniqueness across the complete cursor |
+| 13 | Rust entity/change input could be replayable or eager while WIT supplies stateful cursors | Align both with permanent-EOF stateful `next_page`; remove the resume token/eager resolved-change list |
+| 14 | `file-update.edits` is lifted before guest code can observe a budget | Enforce splice-count and aggregate-inline-byte caps on the host before Canonical-ABI lowering; large data uses `after-range` |
+| 15 | Descriptor changes may trigger a different plugin selection | Warm calls require identical plugin key/generation; reselection is a stop/revoke/cold-open or identity-migration handoff |
+| 16 | Lazy entity attachments do not prevent today's host storage layer from materializing one huge snapshot | Prototype per-entity CAS/chunk attachments or fail explicitly with `record-too-large`; benchmark both backends |
+| 17 | Arrival-independent merge groups require displaced-value provenance | Specify a bounded frontier/GC layout and measure lookup plus WAL/live-byte amplification before production |
+| 18 | “Complete current entities” is ambiguous during precommit rendering | Define it as the transaction-local prospective state after applying final resolved groups, before durable commit |
 
 This review also removed `Send + Sync` from guest documents and made allocation
 explicitly name schema, composite-PK scope, and deterministic ordinal. The
 checked wire facade uses bounded packet framing, bounded entity/edit pages, and
-lazy input/output bytes, all charged to one top-level transition budget. These
-changes are correctness/operability requirements; they do not borrow the B2
-microbenchmark's speedup as evidence that the full engine is already accepted.
+lazy input/output bytes, all charged to one top-level transition budget. It now
+also pages broad semantic output, statefully consumes entity input, validates
+resolved changes, and prospective state, validates keys/edits across pages, and
+caps inline splices before lowering. The hidden
+observation transport, large-entity storage, group-provenance layout, and
+immutable runtime remain production work. These changes are
+correctness/operability requirements; they do not borrow the B2 microbenchmark's
+speedup as evidence that the full engine is already accepted.
 
 ## Storage decision
 
@@ -697,6 +796,18 @@ uses:
 A versioned transient packed arena between storage materialization and Wasm is
 still useful if it is produced directly. Constructing today's rich row graph
 and then packing it would retain most host cost.
+
+Lazy ABI attachments do **not** yet make one giant entity lazy in storage.
+Today's JSON/changelog path decompresses and materializes a complete snapshot
+as host bytes/strings before WIT lowering, so a 4 MiB Excalidraw asset or one
+giant CSV row can still exceed a record/memory budget. Production must either
+(a) store large snapshot content as a small typed entity envelope plus
+content-addressed byte/chunk attachments, or (b) reject it with an explicit
+`record-too-large` limit. Option (a) is not packing unrelated KVs: each entity
+keeps its own key and independently addressable payload. It must be benchmarked
+on RocksDB and cached SlateDB for point reads, cold streaming, WAL/live bytes,
+GC, and dedupe; no storage or 64 MiB benefit is claimed until that experiment
+clears the configured >20% gate or is required solely for correctness/capacity.
 
 ## Correctness model
 
@@ -751,6 +862,27 @@ before calling the plugin. The handle remains hidden transport provenance, not
 a `baseCommitId`, CRDT API, or client-managed commit state; ordinary clients
 still read and write blobs.
 
+The required remote transport contract is deliberately outside plugin WIT:
+
+```text
+exact unique-file response -> { ordinary SQL result, opaque observation }
+next SDK mutation          -> { ordinary SQL request, splice hashes, observation }
+successful mutation        -> { ordinary SQL result, successor observation }
+```
+
+The SDK stores and echoes the token without exposing it to application SQL.
+The server resolves and validates it **before** constructing `before_source`,
+the semantic root, or the guest `Document`; the plugin cannot inspect or forge
+it. A lost response yields no usable token. Missing/expired, wrong-session,
+wrong-workspace/branch/path/incarnation/generation, replayed-after-success, and
+evicted tokens all fail with `410` and the SDK does not silently retry a stale
+write. Protocol integration must test each case plus byte-identical roots with
+different stable IDs, multi-file/batched SQL (one token per uniquely identified
+file), the full-blob fallback, SSE/reconnect behavior, and successor-token
+publication only after commit. Current v3 carries splice hashes but not this
+identity-root capability, so “ordinary SQL unchanged” describes the
+application surface, not an already implemented transport.
+
 The host semantic root is a structurally shared persistent map, not today's
 full row vector. A read retains a root in `O(1)` and sparse submissions
 path-copy only changed keys. Otherwise guest/source sharing would leave the
@@ -787,7 +919,10 @@ host's `O(sessions × entities)` acknowledgement fan-out untouched.
 Transaction atomicity does not make coupled entity facts merge atomically.
 Every returned change belongs to a merge group; singleton is the default, while
 authority and conflicts are resolved for all members together. Every candidate
-group has one deterministic engine LWW rank. For overlapping concurrent groups,
+group has one deterministic engine LWW rank derived from operation order and a
+host canonical key over sorted member schema/PK keys; cursor page/list order is
+not authority, and the first validated proposal is retained for idempotent
+retry. For overlapping concurrent groups,
 the resolver considers highest rank first and accepts a group only if all of
 its keys are unclaimed; otherwise none of it contributes. Durable group
 provenance lets a higher-ranked arrival displace every member of an older group
@@ -795,6 +930,15 @@ and restore prior values for that group's other keys, making results independent
 of arrival order. Empty groups, duplicate keys, partial upserts, mismatched
 schema/PK fields, invalid packet bounds, and upsert/delete duplicates are
 rejected before plugin output reaches storage.
+
+That provenance is not free. The production design still needs a versioned
+group/frontier layout, a visibility horizon for garbage collection, and a
+bounded rule for retained displaced values. Arrival-order, compaction, branch,
+and restart tests are mandatory. RocksDB and SlateDB benchmarks must report
+WAL/live-byte amplification and conflict-frontier lookup cost; unbounded
+history or more than 20% steady-state amplification without a separately
+chosen >2x latency win is rejected. This RFC specifies the correctness rule,
+not a completed storage implementation.
 
 Warm patches are a cache optimization, not hidden durable state. Applying the
 returned semantic changes and then cold-rendering those entities must reproduce
@@ -827,6 +971,12 @@ and full `open_entities` equality after eviction for every format.
   schema-compatible generation must cold-open durable entities and validate its
   complete render before an atomic swap. Schema/identity changes require an
   explicit migration transaction; silent `open_file` reparsing is forbidden.
+- Warm `file_changed`/`entities_changed` calls require identical selected
+  plugin key and generation in the before/after descriptors. A rename or media
+  type change that causes plugin reselection is an explicit handoff: stop the
+  old actor, revoke observations, and either cold-open schema-compatible state
+  with the new plugin or run an identity migration. One guest can never
+  transition itself into another plugin or generation.
 
 ## Reproduction entry points
 

@@ -28,4 +28,3 @@ Tests must prove all of the following:
 
 Keep the implementation proportional to this task. Run its tests and leave the
 workspace in a state an independent judge can rerun.
-

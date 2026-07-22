@@ -27,4 +27,3 @@ Tests must prove all of the following:
 Do not use an array index or full JSON Pointer as an array element's primary
 key. Keep the implementation proportional to this task. Run its tests and
 leave the workspace in a state an independent judge can rerun.
-

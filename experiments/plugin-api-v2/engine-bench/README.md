@@ -103,19 +103,22 @@ is not mistaken for durable storage amplification.
 ## Recorded latest-main result
 
 See
-[`full-engine-v1-baseline-66ad14da.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-66ad14da.md)
+[`full-engine-v1-baseline-c789a2b1.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-c789a2b1.md)
 for the immutable commit, toolchain, raw samples, RSS, storage, logical I/O,
 Samply attribution, reproduction commands, and interpretation. Its profiles
 are stored beside the report and can be opened directly:
 
 ```sh
 samply load \
-  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-66ad14da.json.gz
+  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-c789a2b1.json.gz
 
 samply load \
-  perf-results/plugin-api-v2/full-engine-v1-slatedb-cached-edit-220k-66ad14da.json.gz
+  perf-results/plugin-api-v2/full-engine-v1-slatedb-cached-edit-220k-c789a2b1.json.gz
 ```
 
 Use `perf-results/plugin-api-v2/analyze_samply.py --binary <profile-binary>
 <profile>` for an idle-filtered native summary. The report explains why the
 async marker is not used as a sample filter in this build.
+
+The `66ad14da` report and profiles remain beside the latest artifacts as the
+historical pre-fast-path comparison; they are not overwritten.

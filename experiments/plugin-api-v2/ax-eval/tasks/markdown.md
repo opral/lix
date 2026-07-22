@@ -26,4 +26,3 @@ Tests must prove all of the following:
 Keep the implementation proportional to this task; a full CommonMark parser is
 not required. Run its tests and leave the workspace in a state an independent
 judge can rerun.
-

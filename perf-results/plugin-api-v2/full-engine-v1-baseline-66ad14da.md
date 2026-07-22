@@ -1,8 +1,9 @@
-# Current v1 full-engine baseline on latest `main`
+# Historical v1 full-engine baseline on `66ad14da`
 
-This artifact records the real, current Wasm CSV plugin through the ordinary
-Lix SQL file API. It is a baseline, not a claim that the experimental v2 API
-has already improved full-engine performance.
+This artifact records the real Wasm CSV plugin through the ordinary Lix SQL
+file API before the later `c789a2b1` rerun. It is retained as a historical
+comparison, not a claim about the current baseline or that the experimental v2
+API has already improved full-engine performance.
 
 ## Scope and controls
 

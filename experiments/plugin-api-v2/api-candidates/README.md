@@ -14,7 +14,15 @@ evaluation. It is not a production SDK and has no runtime implementation.
   are exposed through bounded host-backed pages, while input and output byte
   ranges and oversized entity snapshots can stay lazy. The allocator takes an
   explicit schema, composite-PK scope, and deterministic ordinal, so retry
-  behavior does not depend on call order.
+  behavior does not depend on call order. Semantic change output is inline for
+  ordinary sparse edits and bounded/paged for broad edits or initial import, so
+  a large file never has to accumulate every complete upsert in guest memory.
+  Entity input is one stateful permanent-EOF cursor; the host validates change
+  keys across every output page, caps inline edits before guest lowering, and
+  permits warm descriptor changes only when plugin key/generation are unchanged.
+  Renderer deltas use a separate stateful `EntityChangeSource`; its complete
+  fallback is the transaction-local prospective after-state. Paged renderer
+  edits are validated across page boundaries against one accepted base.
 - `candidate_c`: pure reducer with a copied opaque checkpoint.
 - `candidate_d`: host-owned transactional private KV context.
 

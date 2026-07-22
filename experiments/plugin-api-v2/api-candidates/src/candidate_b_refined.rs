@@ -24,6 +24,21 @@ pub struct FileDescriptor {
     pub plugin: PluginSelection,
 }
 
+/// Warm calls may observe path/media-type changes only while the host-selected
+/// plugin remains identical. Reselection is an engine migration/handoff, never
+/// a call that asks one guest to turn into another plugin generation.
+pub fn validate_warm_plugin_selection(
+    before: &FileDescriptor,
+    after: &FileDescriptor,
+) -> Result<()> {
+    if before.plugin != after.plugin {
+        return Err(Error(
+            "warm transitions require the same selected plugin and generation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityKey {
     pub schema_key: String,
@@ -113,39 +128,119 @@ impl EntityChanges {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityCursor(pub Vec<u8>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangePageLimits {
+    pub max_groups: u32,
+    pub max_encoded_bytes: u32,
+}
+
+/// Stateful bounded merge-group pages. Guest output uses this for initial or
+/// broad detected changes; host input uses the same shape for broad
+/// merge-resolved renderer changes. Every page is non-empty and contains only
+/// complete groups; `None` is permanent EOF. The host uses
+/// `ChangeDrainValidator` to enforce key uniqueness across guest-output pages.
+pub trait ChangePageReader {
+    fn limits(&self) -> ChangePageLimits;
+    fn next_page(&mut self) -> Result<Option<EntityChanges>>;
+}
+
+pub enum EntityChangeOutput {
+    Inline(EntityChanges),
+    Paged(Box<dyn ChangePageReader>),
+}
+
+impl EntityChangeOutput {
+    pub fn inline(changes: EntityChanges) -> Result<Self> {
+        changes.validate()?;
+        Ok(Self::Inline(changes))
+    }
+
+    pub fn paged(reader: Box<dyn ChangePageReader>) -> Self {
+        Self::Paged(reader)
+    }
+}
+
+/// Merge-resolved semantic input to `entities_changed`, backed by WIT's
+/// stateful `packet-source`. A normal sparse render consumes one small page;
+/// broad merges remain bounded instead of first becoming one guest `Vec`.
+pub struct EntityChangeSource<'a> {
+    reader: &'a mut dyn ChangePageReader,
+}
+
+impl<'a> EntityChangeSource<'a> {
+    pub fn new(reader: &'a mut dyn ChangePageReader) -> Self {
+        Self { reader }
+    }
+
+    pub fn limits(&self) -> ChangePageLimits {
+        self.reader.limits()
+    }
+
+    pub fn next_page(&mut self) -> Result<Option<EntityChanges>> {
+        self.reader.next_page()
+    }
+}
+
+/// Host-side transition-wide validation state used while draining a guest
+/// change cursor. Page-local validation is insufficient because the same key
+/// must not appear in two different pages.
+#[derive(Default)]
+pub struct ChangeDrainValidator {
+    seen: BTreeSet<EntityKey>,
+    reached_eof: bool,
+}
+
+impl ChangeDrainValidator {
+    pub fn accept_page(&mut self, page: &EntityChanges) -> Result<()> {
+        if self.reached_eof {
+            return Err(Error("a change cursor cannot advance after EOF".to_owned()));
+        }
+        if page.0.is_empty() {
+            return Err(Error("a change cursor page must not be empty".to_owned()));
+        }
+        page.validate()?;
+        for group in &page.0 {
+            for change in &group.0 {
+                if !self.seen.insert(change.key().clone()) {
+                    return Err(Error(
+                        "an entity key may occur only once across all change pages".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn accept_eof(&mut self) {
+        self.reached_eof = true;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntityPageLimits {
-    pub max_entities: u32,
     pub max_encoded_bytes: u32,
 }
 
 pub struct EntityPage {
     /// A non-empty page bounded by `EntityPageReader::limits`.
     pub entities: Vec<Entity>,
-    /// Opaque resume token. It must differ from the token used for this page.
-    pub resume_after: EntityCursor,
 }
 
-/// Host-backed entity access. `next_page` returns `None` at EOF, and every
-/// successful page is non-empty and advances its opaque cursor.
+/// Stateful host-backed entity access, matching WIT `packet-source.next`.
+/// `next_page` returns `None` permanently at EOF; every successful page is
+/// non-empty and advances. The generated SDK supplies the aggregate budget and
+/// configured maximum encoded page size.
 pub trait EntityPageReader {
     fn limits(&self) -> EntityPageLimits;
-
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>>;
-
-    fn next_page(&self, after: Option<&EntityCursor>) -> Result<Option<EntityPage>>;
+    fn next_page(&mut self) -> Result<Option<EntityPage>>;
 }
 
-#[derive(Clone, Copy)]
 pub struct EntitySource<'a> {
-    reader: &'a dyn EntityPageReader,
+    reader: &'a mut dyn EntityPageReader,
 }
 
 impl<'a> EntitySource<'a> {
-    pub fn new(reader: &'a dyn EntityPageReader) -> Self {
+    pub fn new(reader: &'a mut dyn EntityPageReader) -> Self {
         Self { reader }
     }
 
@@ -153,14 +248,10 @@ impl<'a> EntitySource<'a> {
         self.reader.limits()
     }
 
-    pub fn get(&self, key: &EntityKey) -> Result<Option<Entity>> {
-        self.reader.get(key)
-    }
-
     /// Full-state cold/fallback path. Warm renderers receive complete changed
     /// entities directly and normally never page through this source.
-    pub fn next_page(&self, after: Option<&EntityCursor>) -> Result<Option<EntityPage>> {
-        self.reader.next_page(after)
+    pub fn next_page(&mut self) -> Result<Option<EntityPage>> {
+        self.reader.next_page()
     }
 }
 
@@ -230,6 +321,67 @@ pub struct InputSplice<'a> {
     pub insert: InputBytes<'a>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineInputLimits {
+    pub max_edits: u32,
+    pub max_inline_bytes: u64,
+}
+
+/// Host pre-call validation. It runs before Canonical-ABI lowering, so an
+/// attacker cannot make an unbounded `list<input-splice>` consume guest memory
+/// before the transition budget is observed. Large replacement bytes use an
+/// `AfterRange` and therefore do not count as inline bytes.
+pub fn validate_input_splices(
+    edits: &[InputSplice<'_>],
+    before_len: u64,
+    after_len: u64,
+    limits: InlineInputLimits,
+) -> Result<()> {
+    if edits.len() > limits.max_edits as usize {
+        return Err(Error(
+            "input splice count exceeds the pre-call limit".to_owned(),
+        ));
+    }
+
+    let mut previous_end = 0u64;
+    let mut inline_bytes = 0u64;
+    for edit in edits {
+        let end = edit
+            .offset
+            .checked_add(edit.delete_len)
+            .ok_or_else(|| Error("input splice deletion range overflowed".to_owned()))?;
+        if edit.offset < previous_end || end > before_len {
+            return Err(Error(
+                "input splices must be sorted, non-overlapping, and in bounds".to_owned(),
+            ));
+        }
+        match edit.insert {
+            InputBytes::Inline(bytes) => {
+                inline_bytes = inline_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| Error("inline input byte count overflowed".to_owned()))?;
+            }
+            InputBytes::AfterRange(range) => {
+                let range_end = range
+                    .offset
+                    .checked_add(range.length)
+                    .ok_or_else(|| Error("after-source range overflowed".to_owned()))?;
+                if range_end > after_len {
+                    return Err(Error("after-source range is out of bounds".to_owned()));
+                }
+            }
+        }
+        previous_end = end;
+    }
+
+    if inline_bytes > limits.max_inline_bytes {
+        return Err(Error(
+            "inline input bytes exceed the pre-call limit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Lazy random-access bytes. Reads are bounded by the transition's page/byte
 /// budget and must make progress before EOF.
 pub trait LazyBytes: 'static {
@@ -289,6 +441,51 @@ impl FileEdits {
     }
 }
 
+/// Host-side validation across all renderer edit pages. Coordinates in every
+/// page refer to the same accepted base, so page-local checks are insufficient.
+pub struct EditDrainValidator {
+    base_len: u64,
+    previous_end: u64,
+    reached_eof: bool,
+}
+
+impl EditDrainValidator {
+    pub fn new(base_len: u64) -> Self {
+        Self {
+            base_len,
+            previous_end: 0,
+            reached_eof: false,
+        }
+    }
+
+    pub fn accept_page(&mut self, edits: &[OutputSplice]) -> Result<()> {
+        if self.reached_eof {
+            return Err(Error("an edit cursor cannot advance after EOF".to_owned()));
+        }
+        if edits.is_empty() {
+            return Err(Error("an edit cursor page must not be empty".to_owned()));
+        }
+        for edit in edits {
+            let end = edit
+                .offset
+                .checked_add(edit.delete_len)
+                .ok_or_else(|| Error("output splice deletion range overflowed".to_owned()))?;
+            if edit.offset < self.previous_end || end > self.base_len {
+                return Err(Error(
+                    "output splices must be globally sorted, non-overlapping, and in bounds"
+                        .to_owned(),
+                ));
+            }
+            self.previous_end = end;
+        }
+        Ok(())
+    }
+
+    pub fn accept_eof(&mut self) {
+        self.reached_eof = true;
+    }
+}
+
 /// Initial import when bytes exist but durable semantic entities do not.
 pub struct OpenFile<'a> {
     pub descriptor: &'a FileDescriptor,
@@ -305,7 +502,8 @@ pub struct OpenEntities<'a> {
 
 pub struct FileUpdate<'a> {
     /// Descriptor paired with `before`. A rename-only update still invokes the
-    /// plugin with different before/after descriptors and zero byte edits.
+    /// plugin with different before/after descriptors and zero byte edits, but
+    /// both descriptors must select the same plugin key/generation.
     pub before_descriptor: &'a FileDescriptor,
     pub after_descriptor: &'a FileDescriptor,
     /// Exact accepted bytes selected by the session/path-bound observation
@@ -320,19 +518,25 @@ pub struct FileUpdate<'a> {
 }
 
 pub struct EntityUpdate<'a> {
+    /// Both descriptors select the same plugin key/generation. Reselection is
+    /// handled as a cold migration outside this warm call.
     pub before_descriptor: &'a FileDescriptor,
     pub after_descriptor: &'a FileDescriptor,
     pub before: Source<'a>,
-    /// Final merge-resolved changes. The engine invokes this transition and
+    /// Final merge-resolved changes as bounded stateful pages. The engine
     /// validates the prospective file before committing durable state.
-    pub changes: &'a EntityChanges,
-    /// Lazy complete-state fallback for a simple renderer or cold recovery.
+    pub changes: EntityChangeSource<'a>,
+    /// Transaction-local complete prospective state after applying `changes`
+    /// and resolving the merge, but before commit. A simple renderer may use
+    /// this instead of incrementally applying the change pages.
     pub current_entities: EntitySource<'a>,
 }
 
 pub struct FileTransition<D> {
     pub document: D,
-    pub changes: EntityChanges,
+    /// Usually inline for a warm localized edit. Initial import and other
+    /// broad transitions can stream bounded merge-group pages.
+    pub changes: EntityChangeOutput,
 }
 
 pub struct EntityTransition<D> {
@@ -399,6 +603,98 @@ mod tests {
         assert!(changes.validate().is_err());
     }
 
+    #[test]
+    fn rejects_duplicate_keys_across_change_pages_and_progress_after_eof() {
+        let first = EntityChanges::singleton(EntityChange::delete(key("row-1")));
+        let duplicate = EntityChanges::singleton(EntityChange::delete(key("row-1")));
+        let next = EntityChanges::singleton(EntityChange::delete(key("row-2")));
+        let mut validator = ChangeDrainValidator::default();
+
+        validator.accept_page(&first).unwrap();
+        assert!(validator.accept_page(&duplicate).is_err());
+        validator.accept_eof();
+        assert!(validator.accept_page(&next).is_err());
+    }
+
+    #[test]
+    fn bounds_input_splices_before_guest_lowering() {
+        let inserts = [1u8, 2u8];
+        let edits = [
+            InputSplice {
+                offset: 0,
+                delete_len: 1,
+                insert: InputBytes::Inline(&inserts[..1]),
+            },
+            InputSplice {
+                offset: 2,
+                delete_len: 1,
+                insert: InputBytes::Inline(&inserts[1..]),
+            },
+        ];
+
+        assert!(
+            validate_input_splices(
+                &edits,
+                3,
+                3,
+                InlineInputLimits {
+                    max_edits: 2,
+                    max_inline_bytes: 2,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_input_splices(
+                &edits,
+                3,
+                3,
+                InlineInputLimits {
+                    max_edits: 1,
+                    max_inline_bytes: 2,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_input_splices(
+                &edits,
+                3,
+                3,
+                InlineInputLimits {
+                    max_edits: 2,
+                    max_inline_bytes: 1,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_output_overlap_across_edit_pages_and_progress_after_eof() {
+        let first = [OutputSplice {
+            offset: 1,
+            delete_len: 3,
+            insert: OutputBytes::Inline(vec![1]),
+        }];
+        let overlapping = [OutputSplice {
+            offset: 3,
+            delete_len: 1,
+            insert: OutputBytes::Inline(vec![2]),
+        }];
+        let later = [OutputSplice {
+            offset: 5,
+            delete_len: 1,
+            insert: OutputBytes::Inline(vec![3]),
+        }];
+        let mut validator = EditDrainValidator::new(8);
+
+        validator.accept_page(&first).unwrap();
+        assert!(validator.accept_page(&overlapping).is_err());
+        validator.accept_eof();
+        assert!(validator.accept_page(&later).is_err());
+    }
+
     struct DeterministicIds;
 
     impl StableIdAllocation for DeterministicIds {
@@ -442,6 +738,18 @@ mod tests {
         };
 
         assert_ne!(before, after);
+        validate_warm_plugin_selection(&before, &after).unwrap();
+
+        let reselected = FileDescriptor {
+            path: after.path.clone(),
+            media_type: after.media_type.clone(),
+            plugin: PluginSelection {
+                plugin_key: "csv".to_owned(),
+                generation: "sha256:def".to_owned(),
+            },
+        };
+        assert!(validate_warm_plugin_selection(&after, &reselected).is_err());
+
         let edits: [InputSplice<'_>; 0] = [];
         assert!(edits.is_empty());
     }

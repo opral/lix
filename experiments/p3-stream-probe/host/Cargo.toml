@@ -1,0 +1,12 @@
+[package]
+name = "p3-stream-probe-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wasmtime = { version = "45.0.3", default-features = false, features = ["anyhow", "component-model-async", "component-model-async-bytes", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "45.0.3", default-features = false, features = ["p2", "p3"] }
