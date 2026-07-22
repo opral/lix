@@ -114,10 +114,18 @@ Compact results live under
 whose frozen facade/WIT hashes are
 `132b4d483c538834112f21878c7fdbbfd18e0584ee36ddb508ebbfd0ca8af0ea` and
 `685dcdf248b83ae21d5c937b43dfeb84d0f76427ed8a67a084911890179ada33`.
-The checked-in facade was subsequently `rustfmt`-wrapped on one assertion and
-has SHA-256
-`23aa66d71c4d2626d8ee9798771488a3c3124fd24a62d996afd28cc725ea9783`;
-there is no token or behavior change, and the WIT is byte-identical.
+The immediate post-run `rustfmt` snapshot (`23aa66d7...`) was token-equivalent
+to the evaluated facade, but it is historical. Subsequent correctness review
+changed author and wire semantics: activated-entity hydration, a compact inline
+allocation namespace with zero allocator imports, one multiplex attachment
+table, exact packet/group ordering, and cold-constructor clarifications. The
+current facade/WIT/packet SHA-256 values are
+`319ede7ce4035c1df6145f6f43ad63e4ca0e69330811df0bd754430d69fffca1`,
+`cbf722584936d08f93e912525941caaecfb389625ceb77625a171c3f6acb4d89`,
+and `d64ba556916c8cafb6f77b09b7edbacde87db6b7fc4ec62ec437d65fa97ef89e`.
+The AX run did not test those revisions, generated bindings, the semantic-
+schema descriptor, normalized-decimal durable codec, or legacy-ID migration;
+all remain explicit pre-freeze follow-up work.
 
 The harness creates the required `~/.ax-eval/{tool-slug}/` layout, archives raw
 tested-agent transcripts, writes `result.json`, and atomically updates

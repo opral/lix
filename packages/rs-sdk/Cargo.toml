@@ -68,6 +68,12 @@ path = "tests/fixtures/verify_sqlite_key_value.rs"
 required-features = ["sqlite"]
 
 [[bench]]
+name = "profile_merge_10k"
+path = "benches/profile_merge_10k.rs"
+harness = false
+required-features = ["sqlite"]
+
+[[bench]]
 name = "profile_plugin_large_file"
 path = "benches/profile_plugin_large_file.rs"
 harness = false

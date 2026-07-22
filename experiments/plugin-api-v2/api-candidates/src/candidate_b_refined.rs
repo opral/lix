@@ -251,58 +251,51 @@ impl<'a> EntitySource<'a> {
         self.reader.limits()
     }
 
-    /// Full-state cold/fallback path. Warm renderers receive complete changed
-    /// entities directly and normally never page through this source.
+    /// Bounded complete-entity input. It backs cold/full fallback state and the
+    /// sparse newly-activated hydration source used by hierarchical renderers.
     pub fn next_page(&mut self) -> Result<Option<EntityPage>> {
         self.reader.next_page()
     }
 }
 
-/// The host binds this capability to a hidden mutation operation key, file
-/// incarnation, and plugin generation. The operation key combines the session,
-/// accepted observation, SDK mutation ID, and normalized request digest. The
-/// same `(schema_key, scope, ordinal)` request must return the same non-empty
-/// component when that exact transport operation is retried; distinct requests
-/// must not collide.
-pub trait StableIdAllocation {
-    fn allocate_component(
-        &self,
-        schema_key: &str,
-        scope: &[String],
-        ordinal: u64,
-    ) -> Result<String>;
+/// Retry-stable generated IDs for one top-level file transition. The host binds
+/// the 128-bit namespace to a hidden mutation operation key, file incarnation,
+/// and plugin generation, and passes it inline with the transition. The SDK
+/// appends a big-endian `u64` ordinal and base64url-encodes the 24 bytes without
+/// padding into one 32-character PK component. Generated IDs are file/schema
+/// global; parentage and order belong in the snapshot. Authors choose
+/// deterministic ordinals, not call order, and no host import is required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdAllocator {
+    namespace_id: [u8; 16],
 }
 
-/// Retry-stable composite primary keys. `scope` is copied verbatim into the
-/// primary-key prefix and one host-generated component is appended. Therefore
-/// every result has exactly `scope.len() + 1` components. Authors choose a
-/// deterministic ordinal within each schema/scope, not call order.
-pub struct IdAllocator<'a> {
-    inner: &'a dyn StableIdAllocation,
+impl IdAllocator {
+    pub fn new(namespace_id: [u8; 16]) -> Self {
+        Self { namespace_id }
+    }
+
+    pub fn allocate(&self, ordinal: u64) -> Vec<String> {
+        vec![encode_allocated_component(self.namespace_id, ordinal)]
+    }
 }
 
-impl<'a> IdAllocator<'a> {
-    pub fn new(inner: &'a dyn StableIdAllocation) -> Self {
-        Self { inner }
-    }
+fn encode_allocated_component(namespace_id: [u8; 16], ordinal: u64) -> String {
+    const BASE64URL: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut input = [0u8; 24];
+    input[..16].copy_from_slice(&namespace_id);
+    input[16..].copy_from_slice(&ordinal.to_be_bytes());
 
-    pub fn allocate(
-        &self,
-        schema_key: &str,
-        scope: &[String],
-        ordinal: u64,
-    ) -> Result<Vec<String>> {
-        if schema_key.is_empty() {
-            return Err(Error("schema_key must not be empty".to_owned()));
-        }
-        let component = self.inner.allocate_component(schema_key, scope, ordinal)?;
-        if component.is_empty() {
-            return Err(Error("allocated ID component must not be empty".to_owned()));
-        }
-        let mut entity_pk = scope.to_vec();
-        entity_pk.push(component);
-        Ok(entity_pk)
+    let mut output = String::with_capacity(32);
+    for chunk in input.chunks_exact(3) {
+        let value = u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]);
+        output.push(BASE64URL[((value >> 18) & 0x3f) as usize] as char);
+        output.push(BASE64URL[((value >> 12) & 0x3f) as usize] as char);
+        output.push(BASE64URL[((value >> 6) & 0x3f) as usize] as char);
+        output.push(BASE64URL[(value & 0x3f) as usize] as char);
     }
+    output
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,7 +516,7 @@ impl EditDrainValidator {
 pub struct OpenFile<'a> {
     pub descriptor: &'a FileDescriptor,
     pub file: Source<'a>,
-    pub ids: IdAllocator<'a>,
+    pub ids: IdAllocator,
 }
 
 /// Cold restart/eviction when durable entities exist but plugin-backed file
@@ -547,7 +540,7 @@ pub struct FileUpdate<'a> {
     pub edits: &'a [InputSplice<'a>],
     /// Lazy complete-result fallback for a simple plugin.
     pub after: Source<'a>,
-    pub ids: IdAllocator<'a>,
+    pub ids: IdAllocator,
 }
 
 pub struct EntityUpdate<'a> {
@@ -559,6 +552,12 @@ pub struct EntityUpdate<'a> {
     /// Final merge-resolved changes as bounded stateful pages. The engine
     /// validates the prospective file before committing durable state.
     pub changes: EntityChangeSource<'a>,
+    /// Complete prospective entities that were durable-but-inactive before and
+    /// become active after `changes`, excluding keys already carried as complete
+    /// upserts in `changes`. The source is sorted/unique, empty for flat schemas
+    /// and ordinary local edits, and hydrates a restored subtree in O(activated
+    /// output) after eviction without scanning unrelated active state.
+    pub activated_entities: EntitySource<'a>,
     /// Transaction-local complete prospective state after applying `changes`
     /// and resolving the merge, but before commit. A simple renderer may use
     /// this instead of incrementally applying the change pages.
@@ -814,29 +813,43 @@ mod tests {
         assert!(validator.accept_page(&same_offset).is_err());
     }
 
-    struct DeterministicIds;
+    #[test]
+    fn allocation_namespace_is_inline_compact_and_retry_stable() {
+        let first_ids = IdAllocator::new([0x0e; 16]);
+        let retry_ids = IdAllocator::new([0x0e; 16]);
+        let first = first_ids.allocate(7);
+        let retry = retry_ids.allocate(7);
 
-    impl StableIdAllocation for DeterministicIds {
-        fn allocate_component(
-            &self,
-            schema_key: &str,
-            scope: &[String],
-            ordinal: u64,
-        ) -> Result<String> {
-            Ok(format!("{schema_key}:{}:{ordinal}", scope.join("/")))
+        assert_eq!(first, retry);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first.last().unwrap().len(), 32);
+        assert_eq!(
+            first.last().unwrap(),
+            &encode_allocated_component([0x0e; 16], 7)
+        );
+    }
+
+    #[test]
+    fn two_hundred_thousand_ids_need_no_host_calls_or_extra_pk_components() {
+        let ids = IdAllocator::new([0xbb; 16]);
+
+        for ordinal in 0..200_000 {
+            let entity_pk = ids.allocate(ordinal);
+            assert_eq!(entity_pk.len(), 1);
+            assert_eq!(
+                entity_pk.last().unwrap(),
+                &encode_allocated_component([0xbb; 16], ordinal)
+            );
         }
     }
 
     #[test]
-    fn allocation_is_explicitly_scoped_and_retry_stable() {
-        let ids = IdAllocator::new(&DeterministicIds);
-        let scope = vec!["table-1".to_owned()];
-        let first = ids.allocate("csv_row", &scope, 7).unwrap();
-        let retry = ids.allocate("csv_row", &scope, 7).unwrap();
-
-        assert_eq!(first, retry);
-        assert_eq!(first.len(), scope.len() + 1);
-        assert_eq!(&first[..scope.len()], scope.as_slice());
+    fn allocated_component_has_fixed_base64url_golden_vectors() {
+        assert_eq!(encode_allocated_component([0; 16], 0), "A".repeat(32));
+        assert_eq!(
+            encode_allocated_component([0xff; 16], u64::MAX),
+            "_".repeat(32)
+        );
     }
 
     #[test]

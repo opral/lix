@@ -25,14 +25,16 @@ received. Plugin compilation, the point read, and construction of the edited
 blobs stay outside every write timer. Each timed write is the ordinary SQL
 upsert used by clients.
 
-The two reported production backends are:
+The two reported storage lanes are:
 
 - `rocksdb-fs`: `LocalFilesystem`, including its internal RocksDB engine,
   materialized working files, watcher/synchronization path, and second Wasm
   engine used by filesystem sync.
 - `slatedb-cached`: SlateDB over a local object store with the Lixray
   per-workspace policy: 64 MiB disk cache, 4 MiB block cache, and 1 MiB metadata
-  cache.
+  cache. This controls SlateDB algorithms/cache budgets but does not reproduce
+  remote object-store latency, misses, retries, or tails; production Lixray
+  claims require a separate remote-store run.
 
 The harness also accepts raw `rocksdb` and cacheless `slatedb` as diagnostic
 controls, but they are not headline results. In particular, raw `rocksdb`
@@ -100,25 +102,24 @@ the internal database, materialized CSV, and plugin archive. For cached SlateDB
 it reports object-store and cache directories separately so cache duplication
 is not mistaken for durable storage amplification.
 
-## Recorded latest-main result
+## Recorded exact-e1 result
 
 See
-[`full-engine-v1-baseline-5ffab346.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-5ffab346.md)
+[`full-engine-v1-baseline-e1a57ec3.md`](../../../perf-results/plugin-api-v2/full-engine-v1-baseline-e1a57ec3.md)
 for the immutable commit, toolchain, raw samples, RSS, storage, logical I/O,
-Samply attribution, reproduction commands, and interpretation. The clean
-latest-main RocksDB profile is stored beside the report and can be opened
-directly:
+Samply attribution, reproduction commands, and interpretation. Both clean
+exact-main profiles are stored beside the report and can be opened directly:
 
 ```sh
 samply load \
-  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-5ffab346.json.gz
+  perf-results/plugin-api-v2/full-engine-v1-rocksdb-fs-edit-220k-e1a57ec3.json.gz
+samply load \
+  perf-results/plugin-api-v2/full-engine-v1-slatedb-cached-edit-220k-e1a57ec3.json.gz
 ```
 
 Use `perf-results/plugin-api-v2/analyze_samply.py --binary <profile-binary>
 <profile>` for an idle-filtered native summary. The report explains why the
 async marker is not used as a sample filter in this build.
 
-The matching clean SlateDB profile is explicitly pending in the report; do not
-substitute the older profile as current evidence. The `c789a2b1` and
-`66ad14da` reports/profiles remain beside the latest artifacts as historical
-comparisons and are not overwritten.
+The `5ffab346`, `c789a2b1`, and `66ad14da` reports/profiles remain beside the
+exact-main artifacts as historical comparisons and are not overwritten.

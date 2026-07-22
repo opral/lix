@@ -13,21 +13,23 @@ from collections import Counter
 from pathlib import Path
 
 
-IDLE_NAMES = (
-    "__psynch_",
-    "kevent",
-    "mach_msg",
-    "park",
-    "poll",
-    "select",
-    "semaphore_wait",
-    "sleep",
-    "ulock_wait",
-)
-
-IDLE_LEAF_RESOURCES = (
-    "libsystem_kernel",
-    "libsystem_pthread",
+IDLE_NAMES = frozenset(
+    {
+        "__psynch_cvwait",
+        "__psynch_mutexwait",
+        "__semwait_signal",
+        "__ulock_wait",
+        "_pthread_cond_wait",
+        "_pthread_join",
+        "kevent",
+        "mach_msg2_trap",
+        "mach_msg_trap",
+        "poll",
+        "select",
+        "semaphore_wait_trap",
+        "sleep",
+        "ulock_wait",
+    }
 )
 
 
@@ -38,10 +40,30 @@ def load_profile(path: Path) -> dict:
 
 
 class NativeSymbols:
-    def __init__(self, binary: Path | None):
+    def __init__(self, profile: Path, binary: Path | None):
         self.binary_name = binary.name if binary else ""
         self.addresses: list[int] = []
         self.names: list[str] = []
+        self.sidecar_ranges: dict[str, list[tuple[int, int, str]]] = {}
+        self.sidecar_starts: dict[str, list[int]] = {}
+        sidecar_path = Path(f"{profile.with_suffix('')}.syms.json")
+        if sidecar_path.exists():
+            with sidecar_path.open("r", encoding="utf-8") as sidecar_file:
+                sidecar = json.load(sidecar_file)
+            strings = sidecar["string_table"]
+            for library in sidecar["data"]:
+                ranges = sorted(
+                    (
+                        symbol["rva"],
+                        symbol["rva"] + max(symbol["size"], 1),
+                        strings[symbol["symbol"]],
+                    )
+                    for symbol in library["symbol_table"]
+                )
+                self.sidecar_ranges[library["debug_name"]] = ranges
+                self.sidecar_starts[library["debug_name"]] = [
+                    start for start, _, _ in ranges
+                ]
         if binary is None:
             return
         output = subprocess.check_output(["nm", "-nm", str(binary)], text=True)
@@ -52,13 +74,25 @@ class NativeSymbols:
                 self.names.append(match.group(2))
 
     def resolve(self, resource: str, name: str) -> str | None:
-        if resource != self.binary_name or not name.startswith("0x") or not self.addresses:
+        if not name.startswith("0x"):
+            return None
+        address = int(name, 16)
+        sidecar_ranges = self.sidecar_ranges.get(resource, [])
+        if sidecar_ranges:
+            index = bisect.bisect_right(self.sidecar_starts[resource], address) - 1
+            if index >= 0:
+                start, end, symbol = sidecar_ranges[index]
+                if start <= address < end:
+                    return symbol
+        if resource != self.binary_name or not self.addresses:
             return None
         # Samply stores image-relative addresses while `nm` reports the normal
         # macOS Mach-O image base plus that offset.
-        address = 0x1_0000_0000 + int(name, 16)
-        index = bisect.bisect_right(self.addresses, address) - 1
+        image_address = 0x1_0000_0000 + address
+        index = bisect.bisect_right(self.addresses, image_address) - 1
         if index < 0:
+            return None
+        if index + 1 < len(self.addresses) and image_address >= self.addresses[index + 1]:
             return None
         return self.names[index]
 
@@ -92,10 +126,8 @@ def stack_frames(thread: dict, stack_index: int | None) -> list[int]:
 
 
 def is_idle(name: str, resource: str) -> bool:
-    lowered = name.lower()
-    return any(fragment in lowered for fragment in IDLE_NAMES) or any(
-        fragment in resource.lower() for fragment in IDLE_LEAF_RESOURCES
-    )
+    del resource
+    return name.lower() in IDLE_NAMES
 
 
 def main() -> None:
@@ -110,7 +142,7 @@ def main() -> None:
     args = parser.parse_args()
 
     profile = load_profile(args.profile)
-    symbols = NativeSymbols(args.binary)
+    symbols = NativeSymbols(args.profile, args.binary)
     leaves: Counter[str] = Counter()
     inclusive: Counter[str] = Counter()
     active_leaves: Counter[str] = Counter()
@@ -152,6 +184,7 @@ def main() -> None:
     show("active leaf frames", active_leaves, active)
     show("active inclusive frames", active_inclusive, active)
     show("all leaf frames", leaves, total)
+    show("all inclusive frames", inclusive, total)
 
 
 if __name__ == "__main__":

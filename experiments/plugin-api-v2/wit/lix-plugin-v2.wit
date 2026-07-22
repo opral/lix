@@ -22,6 +22,12 @@ interface host {
     /// Checked by the host before lowering `file-update.edits` into the guest.
     max-inline-edits: u32,
     max-inline-input-bytes: u64,
+    /// Maximum aggregate attachment-tagged `blob-ref` and `output-range`
+    /// occurrences across the transition. Inline blob values do not count;
+    /// repeated attachment references count repeatedly. A receiver validates
+    /// bounded inline framing and counts references before invoking an
+    /// attachment-table method.
+    max-attachment-refs: u32,
     total-deadline-nanoseconds: u64,
   }
 
@@ -44,6 +50,21 @@ interface host {
     ) -> result<bytes, source-error>;
   }
 
+  /// One page-local table multiplexes every immutable attachment used by that
+  /// page. An index is meaningful only in the page that owns this resource.
+  /// Receivers first parse the bounded inline payload and enforce
+  /// `max-attachment-refs`; only then may they call `len` or `read`. This keeps
+  /// an untrusted page from creating one Component resource handle per record.
+  resource byte-sources {
+    len: func(index: u32) -> result<u64, source-error>;
+    read: func(
+      budget: borrow<transition-budget>,
+      index: u32,
+      offset: u64,
+      length: u32,
+    ) -> result<bytes, source-error>;
+  }
+
   /// Framing is `u32 little-endian payload length || payload`, repeated exactly
   /// `record-count` times. A record is never split across pages. Payload
   /// encoding is selected by `format-version`; version 1 is normatively defined
@@ -55,7 +76,7 @@ interface host {
     format-version: u16,
     record-count: u32,
     payload: bytes,
-    attachments: list<own<byte-source>>,
+    attachments: option<own<byte-sources>>,
   }
 
   /// Versioned packed entity or change packets. Upserts contain the complete
@@ -71,26 +92,22 @@ interface host {
     ) -> result<option<packet-page>, source-error>;
   }
 
-  /// The host also scopes allocation by a hidden mutation operation key, file
-  /// incarnation, and plugin generation. That key binds the session,
-  /// observation, SDK mutation ID, and normalized request digest; exact
-  /// transport retries coalesce to one result. The same
-  /// `(schema-key, scope, ordinal)` returns the same PK on those retries. The
-  /// result is exactly `scope` plus one opaque component; distinct requests
-  /// cannot collide. Ordinals are deterministic within a schema/scope and do
-  /// not depend on call order.
-  resource id-allocator {
-    allocate: func(
-      budget: borrow<transition-budget>,
-      schema-key: string,
-      scope: list<string>,
-      ordinal: u64,
-    ) -> result<list<string>, source-error>;
+  /// Retry-stable generated-ID namespace for one top-level file transition.
+  /// The host binds it to the hidden mutation operation key, file incarnation,
+  /// and plugin generation. Exact transport retries receive the same value;
+  /// distinct operations receive collision-checked values. The SDK serializes
+  /// `high` and `low` as big-endian bytes, appends a deterministic big-endian
+  /// `u64` ordinal, and base64url-encodes the 24 bytes without padding into one
+  /// 32-character PK component. Parentage and order remain snapshot fields.
+  /// Generated IDs therefore require no host import and stay file/schema-global.
+  record id-namespace {
+    high: u64,
+    low: u64,
   }
 }
 
 interface api {
-  use host.{byte-source, packet-source, id-allocator, transition-budget};
+  use host.{byte-source, packet-source, id-namespace, transition-budget};
 
   type bytes = list<u8>;
 
@@ -137,22 +154,32 @@ interface api {
     insert: input-bytes,
   }
 
-  /// Guest-owned lazy output for a large render/full replacement. A P3
-  /// binding can expose the same SDK value as `stream<u8>` plus completion.
-  /// Positive reads before EOF make progress and charge the originating
-  /// transition's aggregate page/byte/deadline budget.
-  resource byte-output {
-    len: func() -> u64;
+  /// One page-local guest table multiplexes lazy output attachments. A P3
+  /// binding can expose each indexed SDK value as `stream<u8>` plus
+  /// completion. Positive reads before EOF make progress and charge the
+  /// originating transition's aggregate page/byte/deadline budget. The host
+  /// validates bounded page metadata and counts every reference before calling
+  /// either method.
+  resource byte-outputs {
+    len: func(index: u32) -> result<u64, plugin-error>;
     read: func(
       budget: borrow<transition-budget>,
+      index: u32,
       offset: u64,
       length: u32,
     ) -> result<bytes, plugin-error>;
   }
 
+  /// Range in the `byte-outputs` table owned by the surrounding page.
+  record output-range {
+    index: u32,
+    offset: u64,
+    length: u64,
+  }
+
   variant output-bytes {
     inline(bytes),
-    output(own<byte-output>),
+    output(output-range),
   }
 
   record output-splice {
@@ -162,13 +189,13 @@ interface api {
   }
 
   /// Guest-output equivalent of the host packet page. Framed records can name
-  /// page-local `byte-output` attachments for arbitrarily large complete
-  /// snapshots. Attachments share the originating transition budget.
+  /// page-local indices in one `byte-outputs` table for arbitrarily large
+  /// complete snapshots. References share the originating transition budget.
   record change-page {
     format-version: u16,
     record-count: u32,
     payload: bytes,
-    attachments: list<own<byte-output>>,
+    attachments: option<own<byte-outputs>>,
   }
 
   resource change-cursor {
@@ -185,6 +212,9 @@ interface api {
 
   record edit-page {
     edits: list<output-splice>,
+    /// Exactly one page-local table supplies every `output-range` in `edits`.
+    /// It is `none` iff the page contains no output references.
+    outputs: option<own<byte-outputs>>,
   }
 
   resource edit-cursor {
@@ -197,7 +227,10 @@ interface api {
     /// `some(page)` is non-empty and advances; `none` is permanent. The page is
     /// bounded by both arguments and the budget. An edit whose metadata cannot
     /// fit under the record cap returns `record-too-large`; large insert bytes
-    /// must use `byte-output` rather than an oversized inline value.
+    /// must use an `output-range` in the page's single `byte-outputs` table
+    /// rather than an oversized inline value. Before invoking that table, the
+    /// host validates the bounded edit list and charges all output-reference
+    /// occurrences against `max-attachment-refs`.
     next: func(
       budget: borrow<transition-budget>,
       max-edits: u32,
@@ -222,7 +255,7 @@ interface api {
     edits: list<input-splice>,
     /// Lazy complete-result fallback. Optimized plugins need not read it.
     after: own<byte-source>,
-    ids: own<id-allocator>,
+    ids: id-namespace,
   }
 
   record entity-update {
@@ -234,6 +267,13 @@ interface api {
     /// Final merge-resolved semantic changes. Rendering and validation happen
     /// before the engine commits them.
     changes: own<packet-source>,
+    /// Complete prospective entities that were durable-but-inactive before and
+    /// become active after `changes`, excluding keys already carried as complete
+    /// upserts in `changes`. The stream is sorted/unique under entity-record
+    /// rules. Flat schemas and ordinary local edits provide an empty source.
+    /// This hydration delta may scale with the activated output subtree, but
+    /// never with unrelated active document state.
+    activated-entities: own<packet-source>,
     /// Transaction-local complete prospective state after applying `changes`
     /// and resolving the merge, but before commit. Incremental renderers do not
     /// consume it.
@@ -263,11 +303,14 @@ interface api {
   record open-file-input {
     descriptor: file-descriptor,
     file: own<byte-source>,
-    ids: own<id-allocator>,
+    ids: id-namespace,
   }
 
   /// Cold restart/eviction: durable entities exist and plugin-backed bytes do
-  /// not. Implementations may consume this packet source as a P3 stream.
+  /// not. Implementations may consume this packet source as a P3 stream. The
+  /// returned `entity-transition.edits` use the empty byte string as their
+  /// accepted base: an empty result has no edits, while a non-empty complete
+  /// file is one coalesced splice at offset 0 with delete length 0.
   record open-entities-input {
     descriptor: file-descriptor,
     entities: own<packet-source>,
@@ -278,6 +321,8 @@ interface api {
   /// to a nested call is invalid; no resource call extends the deadline.
   open-file: func(budget: borrow<transition-budget>, input: open-file-input)
     -> result<file-transition, plugin-error>;
+  /// `entity-transition.edits` obey the empty-base rule documented on
+  /// `open-entities-input`.
   open-entities: func(budget: borrow<transition-budget>, input: open-entities-input)
     -> result<entity-transition, plugin-error>;
 }

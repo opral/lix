@@ -45,12 +45,19 @@ hash.
 
 The measured Candidate B facade was later refined after the controlled AX
 cohort and a source-level correctness review. The sparse edit/source data flow
-is unchanged, but the final compileable facade adds explicit byte/entity cold constructors,
-minimal merge groups, complete upserts versus keyed deletes, composite retry-
-stable IDs, and no guest `Send`/`Sync` requirement. The refined WIT also names
+is unchanged, but the refined compileable facade adds explicit byte/entity cold
+constructors, minimal merge groups, complete upserts versus keyed deletes, and
+no guest `Send`/`Sync` requirement. The current post-evaluation contract also
+passes one compact retry-stable ID namespace inline, derives one-component IDs
+without host imports, and supplies bounded newly activated entity hydration.
+The refined WIT names
 large input ranges and guest lazy outputs instead of forcing full `list<u8>`
 payloads. These post-cohort changes are not presented as another benchmark
-lane or retroactively assigned an AX score.
+lane or retroactively assigned a main-cohort AX score. A separate final-aligned
+N=1 signature check scored 87 and passed 5/5 tests; it is usability smoke
+evidence, not a comparative cohort. The subsequent attachment-table,
+activation, and inline-ID revisions were not exercised by that check or through
+generated Component bindings.
 
 ## Fixtures and correctness
 

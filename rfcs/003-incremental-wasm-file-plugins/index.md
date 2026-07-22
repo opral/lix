@@ -51,14 +51,16 @@ pub trait Document: Sized + 'static {
 ```
 
 `FileUpdate` contains before/after descriptors, base-relative sorted
-non-overlapping byte splices, lazy before/after sources, and a retry-stable ID
-allocator whose calls name the schema, composite-PK scope, and deterministic
-ordinal. `FileTransition` contains the successor document and inline or bounded
+non-overlapping byte splices, lazy before/after sources, and one compact
+retry-stable allocation namespace passed inline by the host. The SDK derives
+one-component generated IDs from deterministic ordinals with no allocator
+imports. `FileTransition` contains the successor document and inline or bounded
 paged semantic merge groups, so an initial import need not collect every
 upsert in guest memory. `EntityUpdate` contains before/after descriptors, the
-final merge-resolved entity deltas as one bounded stateful source, and a second
-bounded stateful fallback containing the transaction-local prospective state
-after those deltas, before commit.
+final merge-resolved entity deltas as one bounded stateful source, complete
+newly activated entities as another bounded source, and a complete stateful
+fallback containing the transaction-local prospective state after those deltas,
+before commit.
 `EntityTransition` contains the successor document and inline or paged byte
 splices; large replacement bytes may remain behind a lazy output. The generated
 SDK, not the author type, implements the WIT resource lifecycle; one
@@ -68,8 +70,8 @@ branch/file actor serializes access, so a guest `Document` need not satisfy host
 The descriptor contains path, media type, and the host-selected
 content-addressed plugin generation. Descriptor changes are semantic inputs: a
 rename-only transition is delivered even when the byte-splice list is empty.
-Every host source read, entity/change page, ID allocation, edit page, and lazy
-output read shares one aggregate top-level transition budget covering record
+Every host source read, entity/change page, edit page, and lazy output read
+shares one aggregate top-level transition budget covering record
 size, page size/count, total bytes, and a non-renewing deadline. Paging is a
 bounded fallback, not a way to reset the five-second deadline per `next` call.
 
@@ -85,14 +87,15 @@ one bounded lease. Evicting any non-reconstructible part revokes its observation
 handle and forces a reread. Cold work may be `O(document)`; the warm transition
 methods may not silently fall back to that cost without instrumentation.
 
-`open_file` is the first half of import, not permission to commit its groups
-and keep the uploaded bytes. The host drains and validates those groups,
-resolves them against the empty incarnation, and unconditionally calls the
-returned document's `entities_changed` with the uploaded source, final
-resolved groups, and complete prospective state. This call also occurs when
-the resolved group source is empty. Its successor plus validated edits define
-the canonical shared bytes and shared renderer. The provisional raw
-document/source stays alive through commit. If the response actually delivers
+`open_file` starts a **provisional-document bootstrap phase**; it is not
+permission to commit its groups and keep the uploaded bytes. The host drains
+and validates those groups, resolves them against the empty incarnation, and
+unconditionally calls the returned provisional document's `entities_changed`
+with the uploaded source, final resolved groups, and complete prospective
+state. This call also occurs when the resolved group source is empty. Its
+successor plus validated edits define the canonical shared bytes and shared
+renderer. The provisional raw document/source stays alive through commit. If
+the response actually delivers
 the canonical bytes, the session may receive their observation; otherwise it
 may retain only a bounded private continuation for its exact submitted
 bytes/document and existing-or-newly-authored authority, or be forced to
@@ -165,13 +168,24 @@ entities_changed(update):
 An optimized plugin consumes the same methods, but reads only the affected
 ranges from `update.before`/`update.after`, reparses the grammatical closure of
 each splice, consumes `update.changes` instead of the complete prospective
-entity source on a warm render, and emits local byte patches. There is no
+entity source on a warm render, hydrates `update.activated_entities` when it is
+nonempty, and emits local byte patches. There is no
 separate “fast plugin API.” Keeping complete bytes on the host is an
 implementation property of the `Source` capability, not a second author model.
 
-This is an RFC and executable research package, not a production API merge. The
-production implementation is gated on the full-engine RocksDB and cached
-SlateDB results defined below.
+This first pull request is an RFC and executable research package, not a
+production API merge: it records the proposed contract, evidence, and
+measurement gates without changing live file behavior. Its hidden SDK profiling
+feature, large-file benchmark, and ABI-probe workspace are opt-in build/CI
+surface, not default runtime semantics. A second pull request
+is stacked on it and owns the production CSV vertical slice: observation-
+selected sparse roots, the persistent Wasm document, one-row semantic deltas,
+and patch-maintained bytes must eliminate 220,092 change-payload requests and
+220,089 returned-payload materializations on the measured warm path. The
+full-state convenience fallback remains available, but
+using it on that measured warm path fails the gate. The second pull request is
+accepted only by the full-engine RocksDB and cached SlateDB results defined
+below; neither pull request introduces generic Lix-owned packed KV pages.
 
 ## Why change the API
 
@@ -287,10 +301,16 @@ or a duplicate whose bounded replay record has expired, returns `410` and
 requires a reread rather than re-executing an uncertain write.
 
 After validating all observations, the serialized workspace writer assigns the
-operation one monotonic branch write rank and retains it in the in-flight/replay
-record; gaps from failed operations are harmless. Exact retries reuse that
-rank, and committed merge-group provenance persists it. Only committed ranks
-participate in LWW; the mutation ID is a deterministic tie-breaker, not a clock.
+operation one monotonic `branch_write_sequence` and retains it in the in-flight
+and replay record; gaps from failed operations are harmless. This sequence
+intentionally represents accepted writer order--the meaning of "last write"--
+and is not a promise that different network arrival orders produce the same
+winner. Exact retries reuse it. Every group has the one exact lexicographic
+total rank
+`(branch_write_sequence, mutation_id, canonical_group_key)`, where the
+mutation ID is compared as opaque bytes and `canonical_group_key` is the host's
+deterministic encoding of the group's sorted schema/PK keys. Cursor order is
+never rank authority. Only committed ranks participate in LWW.
 
 The server validates the token and operation key before constructing any guest
 source/document. Lost read responses yield no authority. Missing/expired,
@@ -308,35 +328,47 @@ SDK/protocol changes.
 The engine calls `file_changed` only on the exact private version selected by
 the observation handle. It validates authority for every member of every merge
 group before conflict resolution: a delete or update of an existing key must
-refer to that observed root, while a new key must be a validated native ID or
-come from the hidden-operation-scoped allocator and be absent from current
-shared state (except for an exact coalesced/cached retry of the same operation). Native-ID
-collisions with an unseen concurrent entity are rejected. If one member fails,
-the entire transition is rejected; the engine never filters a group into a
-different semantic operation.
+refer to that observed root, while a new identity-less sequence key must come
+from the transition's inline allocation namespace and be absent from current shared
+state (except for an exact coalesced/cached retry of the same operation).
+Validated native IDs follow their format's collision rule. Schema-natural
+slots are different: two concurrent creations of the same slot intentionally
+name the same key and compete through ordinary same-entity LWW rather than
+being rejected as an allocator collision. If one member fails, the entire
+transition is rejected; the engine never filters a group into a different
+semantic operation.
 
-Conflict resolution is group-level and deterministic. Each group receives one
-retry-stable engine LWW rank from that assigned branch write rank plus a host canonical
-group key derived from its sorted member schema/PK keys; cursor page/list order
-is never rank authority. The first validated proposal is retained for an
-idempotent retry of the same operation.
-Overlapping concurrent candidate groups are considered in descending rank; a
-group is selected only when all of its keys are free, otherwise none of it is
-selected.
-The engine retains enough group provenance to recompute that frontier when a
-later higher-ranked group displaces an earlier group, including restoring prior
-values for the displaced group's non-overlapping keys. This makes the result
-independent of arrival order and prevents a coupled Excalidraw binding from
-being half-applied. Per-entity LWW without this group provenance is not a valid
-implementation of `MergeGroup`.
+Conflict resolution is group-level and deterministic after rank assignment.
+Every proposal persists the exact observation/semantic-root version from which
+it was authored. Groups whose effects are visible in that proposal base are
+its causal baseline; they do not re-enter the frontier as unordered
+competitors. Only groups causally unordered with the proposal compete. Thus a
+client that observes committed group `{A, B}` and later proposes `{A}` changes
+`A` without accidentally displacing baseline member `B`.
+
+Overlapping causally unordered candidate groups are considered in descending
+total rank. A group is selected only when all of its keys are free, otherwise
+none of it is selected. The first validated proposal is retained for an
+idempotent retry of the same operation. The engine retains enough base-version
+and group provenance to recompute that frontier when a later higher-ranked
+concurrent group displaces an earlier group, including restoring prior values
+for the displaced group's non-overlapping keys. Once ranks and causal bases are
+assigned, replay, restart, and application order do not change the result. This
+is deliberately narrower than network-arrival independence. It prevents a
+coupled Excalidraw binding from being half-applied; per-entity LWW without this
+causal group provenance is not a valid implementation of `MergeGroup`.
 
 The storage representation is unresolved production work, not a free metadata
-field. It needs a versioned conflict frontier, a visibility/branch horizon for
-GC, and a bounded policy for displaced values. Arrival-order, restart, branch,
-and compaction suites are required. RocksDB and cached SlateDB acceptance runs
+field. It needs a versioned conflict frontier, persisted proposal-base
+versions, a visibility/branch horizon for GC, and a bounded policy for
+displaced values. Fixed-rank replay/application-order permutations, accepted-
+writer-order, restart, branch, and compaction suites are required. RocksDB and
+cached SlateDB acceptance runs
 must include lookup cost plus WAL/live-byte amplification; unbounded retention
 or more than 20% steady-state amplification without a separately selected >2x
-latency win is rejected.
+latency win is rejected. The checked Slate lane uses a local object store with
+production cache budgets; a remote-object-store run is an additional Lixray
+production gate, not something inferred from the local lane.
 
 The engine then calls `entities_changed` on the branch's shared renderer with
 only the final merge-resolved groups *before* durable commit. Only after the
@@ -356,14 +388,22 @@ eviction expires the handle and fails the next stale write closed.
 
 ### Immutable transitions make rollback ordinary
 
-An accepted document is borrowed immutably. A plugin returns a new document.
-WIT resource types do not enforce guest immutability: a hostile component can
-alias internal nodes or mutate globals. The minimum safe runtime therefore
-treats the complete branch/file/plugin-generation actor and its Wasmtime
-store/instance as one taint domain. Independently valid private documents and
-the shared renderer may coexist in that actor, but failure cannot be contained
-to one resource handle. Pooling multiple file actors in one instance is
-permitted only after an adapter proves resource/global isolation; ordinary WIT
+An accepted document is borrowed immutably and a plugin returns a new document.
+That is a trusted plugin semantic contract for the files the plugin owns, not a
+property enforced by the Wasm sandbox. Wasm isolates host memory, capabilities,
+and resource limits; WIT resource types do not make co-resident guest aliases
+or globals logically immutable. The engine validates file scope, entity keys,
+framing, authority, and budgets, but it cannot prove that a plugin detected the
+right semantic change or preserved its accepted resource internally.
+
+The branch/file/plugin-generation actor and its Wasmtime store/instance are
+therefore one trap/uncertainty containment domain. Independently valid private
+documents and the shared renderer may coexist in that actor, so an uncertain
+guest failure cannot be contained to one resource handle. The initial v2
+runtime requires one Store/instance per file actor and shares only compiled
+component code across actors. Pooling multiple file actors is forbidden unless
+an adapter proves resource/global isolation; otherwise the entire pool is one
+failure domain and every actor in it must be retired together. Ordinary WIT
 resources are not that proof. The host retains accepted and successor resources
 until storage commits:
 
@@ -377,11 +417,15 @@ until storage commits:
 5. Publish the shared cache pointer/source and the next private
    source/root/document lease with non-failing pointer swaps; only then issue
    its observation handle.
-6. On abort, failed validation, trap, commit failure, or uncertain completion,
-   retire the entire file-actor/store trust domain and revoke every observation
-   backed by it; a private noncanonical view cannot be cold-reopened.
-7. Reopen the branch's prior authoritative root and shared renderer in a fresh
-   actor instance. Narrower eviction requires proven adapter isolation.
+6. On a deterministic validation rejection or known storage abort, discard the
+   unaccepted successor and keep the accepted resources under the trusted
+   immutability contract.
+7. On a trap, cancellation/unwind that makes guest completion uncertain, or any
+   other uncertain guest-state failure, retire the complete actor/store domain
+   and revoke every observation backed by it; a private noncanonical view
+   cannot be cold-reopened.
+8. Reopen the branch's prior authoritative root and shared renderer in a fresh
+   actor instance.
 
 If cache publication is unexpectedly unavailable after a successful commit,
 the commit remains successful: evict derived resources and cold-open from the
@@ -391,12 +435,13 @@ a durable commit as failed because a disposable cache could not be published.
 
 No plugin-visible `prepare`, `accept`, `abort`, transaction ID, branch ID, or
 commit ID is required. The safe SDK never gives ordinary authors mutable access
-to the accepted document. A malicious Wasm guest can ignore that facade and
-mutate its resource, aliases, or globals internally, so the host must not trust
-any resource in that file-actor trust domain after a call whose engine
-transaction did not commit. Guest state is always a disposable cache, never
-rollback or commit authority. One-/eight-/32-session fan-out, actor RSS, and
-reinstantiation cost are part of the production acceptance gate.
+to the accepted document. Guest state is always a disposable cache, never
+rollback or commit authority. Strong isolation against a plugin that
+deliberately violates the immutability contract requires one store per
+authority root or host-checked checkpoints around calls; either design must be
+benchmarked before it replaces the trusted-plugin boundary. One-/eight-/32-
+session fan-out, actor RSS, trap reinstantiation, and any stronger-isolation
+cost are part of the production acceptance gate.
 
 ### Stable identity remains format-owned
 
@@ -404,32 +449,73 @@ The API standardizes lifecycle and deltas, not matching policy. It supports:
 
 - Native IDs already encoded in a file, such as Excalidraw element IDs.
 - Plugin-generated IDs reconciled against syntax, such as CSV rows, text lines,
-  and Markdown nodes.
-- Structural identities, such as JSON object slots.
+  Markdown nodes, and identity-less ordered JSON array items.
+- Schema-natural identities, such as a JSON object slot keyed by its stable
+  parent and decoded property key.
 
-The host binds each ID allocator to the hidden operation key, file incarnation,
-and plugin generation. Each call supplies a schema key, composite-PK scope, and
-deterministic ordinal; the result is the scope plus one opaque host component.
-The same tuple returns the same ID on exact coalesced/cached retries, distinct
-tuples cannot collide, and identity never depends on allocation call order. The
-guest may use a native file ID when one exists, but it must not use time or
-unseeded randomness for retry identity.
+Those rules are not inferred from opaque `schema_key` strings at runtime. A v2
+plugin archive must carry one content-addressed, versioned semantic-schema
+descriptor bound to the plugin generation. For each entity schema it declares
+the exact primary-key rule (one-component `host-allocated`, `native snapshot
+field`, or a natural composite over named snapshot fields), any independent semantic-order field,
+and typed reference fields. Hierarchical formats additionally declare the one
+fixed root schema/key and which reference fields are owning edges; all other
+references are non-owning. File-incarnation scoping is added by the host and is
+not guest-controlled. The archive installer validates descriptor structure,
+generated SDK types compile against it, and the engine uses it to validate
+natural keys, roots, owning-edge targets, cycles, multiple parents, and
+prospective reachability. Changing these rules is a plugin-generation schema
+migration, never a warm call.
+
+The exact descriptor encoding and migration tooling are production work and an
+API freeze gate. Until they land, natural-key and reachability claims in this
+RFC are a required host contract, not functionality supplied by the WIT alone.
+Keeping this static metadata out of every transition preserves the simple
+four-call author API and prevents the guest from redefining authority while a
+mutation is running.
+
+For truly identity-less syntax, the host derives one 128-bit allocation
+namespace from the hidden operation key, file incarnation, and plugin
+generation and passes its two `u64` halves inline. Exact coalesced/cached retries
+receive the same namespace. The SDK appends each deterministic big-endian `u64`
+ordinal, base64url-encodes the 24 bytes without padding, and returns one fixed
+32-character PK component. Generated IDs are file/schema-global: parentage and
+order live in complete snapshots, so an unambiguous JSON array move can preserve
+identity. CSV, text, Markdown, and JSON array items need no author-supplied
+scope, and 200,000 initial entities require zero Component imports.
+
+The host validates existing IDs against the observation-selected root and new
+generated IDs against the transition namespace and the descriptor's exact
+one-component `host-allocated` rule. Namespace reservations are collision-
+checked and become durable only if at least one new generated ID commits; retry
+mapping and reservation provenance are retained only while referenced by live
+entities or conflict/visibility history, then garbage-collected. Their rows,
+lookups, WAL bytes, and live bytes are part of the storage gate. The guest may
+instead use a native file ID or descriptor-declared schema-natural composite key
+when one exists, but it must not use time or unseeded randomness for retry
+identity.
 
 For ID-less formats, “stable” cannot mean recovering unknowable user intent.
 Two byte-identical duplicate rows swapped in a CSV have no observable identity
 signal. The contract instead requires that IDs never derive from mutable array
 indices or byte offsets, preserves an existing ID whenever the format matcher
 has an unambiguous correspondence, and makes ambiguous matching deterministic.
-Native Excalidraw IDs are exact. JSON object slots and array items use opaque
-IDs. Object slots are matched by stable parent ID plus decoded key, so a value
-edit or key reorder preserves identity while a key rename is intentionally a
-delete plus insert. An array-item ID survives insertion or reorder only when
-the matcher has an unambiguous correspondence; duplicate ambiguity is resolved
-deterministically but cannot promise the user's unknowable identity intent.
+Native Excalidraw IDs are exact. A JSON object slot has the deterministic
+schema-natural primary key `(parent_node_id, decoded_property_key)`, scoped by
+the file incarnation. A value edit or key reorder therefore preserves identity,
+two concurrent additions of the same property converge on the same entity key,
+property reorder updates an independent durable order key, and a key rename is
+intentionally a delete plus insert. Object-slot creation does not consume the
+transition's generated-ID namespace. Ordered JSON array items remain opaque
+identity-less sequence nodes and use deterministic inline-namespace allocation when
+matching cannot reuse an observed ID. An array-item ID survives insertion or
+reorder only when the matcher has an unambiguous correspondence; duplicate
+ambiguity is resolved deterministically but cannot promise the user's
+unknowable identity intent.
 
 JSON's normalized semantic graph must also stay nonrecursive: object/array
 container snapshots contain only structural kind, object-slot entities contain
-parent/key/child, array-item entities contain parent/order/child, and scalar
+parent/key/order/child, array-item entities contain parent/order/child, and scalar
 nodes contain only their payload. A localized scalar edit in a 50,000-property
 object may load/upsert its node and bounded syntax path/slot, but must not load,
 lower, or rewrite a recursively embedded root snapshot. The production suite
@@ -439,6 +525,40 @@ The engine validates every tombstone, existing-key upsert, and newly allocated
 identity as part of its complete merge group against the exact
 observation-selected private identity root. Guest resources, byte hashes, and
 derived caches never grant authority.
+
+### Bounded hierarchical deletion uses reachability
+
+A subtree delete must not require one unbounded merge group containing every
+descendant. Hierarchical schemas instead declare ownership/reachability edges.
+Each file incarnation has one fixed root; an owning parent-to-child edge is an
+ordinary bounded entity with a stable key (for JSON, the object-slot entity is
+such an edge). The active shared state is the reachable closure from that root.
+Deleting or replacing one owning edge can therefore hide a 50,000-node subtree
+without loading or emitting 50,000 tombstones, while the edge's own merge group
+stays bounded and indivisible.
+
+Descendants detached by a winning edge change are excluded from active
+`current_entities`, `open_entities`, and render input. They remain only as long
+as needed for bounded observation/conflict provenance, then are reclaimed once
+the visibility horizon proves that no live observation or branch can refer to
+them. A non-owning reference, such as an Excalidraw binding, never makes its
+target reachable. The host validates schema-declared edge kinds, rejects
+owning cycles and multiple owning parents, and applies reachability against the
+prospective root before commit. This is a semantic index over ordinary entity
+keys, not a generic packed-storage layer.
+
+Reattachment and conflict-frontier restoration are allowed. `EntityUpdate`
+therefore has an `activated_entities` source containing sorted/unique complete
+prospective entities that were durable-but-inactive before and become active in
+that transition, excluding keys already carried as complete upserts in
+`changes`. It is a hydration-only delta with no duplicate-application
+precedence. The host derives this set from the before/prospective reachability
+indexes and loads only that closure. A warm renderer consumes it alongside the
+owning-edge change; an evicted renderer can first cold-open the previously
+active state and then hydrate the restored subtree without scanning unrelated
+entities. Work may be
+`O(activated subtree/output)`, which is unavoidable, but not `O(all active
+document state)`. The source is empty for flat formats and ordinary local edits.
 
 ### Coordinate and atomicity rules
 
@@ -622,17 +742,20 @@ Inserting one value at index zero changes every numeric suffix pointer. The new
 JSON plugin should use:
 
 - a fixed root ID;
-- opaque object-slot IDs matched by stable parent ID plus decoded key;
+- deterministic object-slot keys `(parent_node_id, decoded_property_key)`,
+  scoped by the file incarnation and acting as owning edges, with child ID and
+  independent semantic order key in the complete slot snapshot;
 - opaque array-item IDs plus independent order keys; and
 - pointers as derived locators rather than primary keys.
 
 Duplicate object keys are rejected in v2 rather than silently collapsed.
-Unambiguous subtree moves may preserve opaque IDs through format-owned hash
-matching only where the owning identity semantics permit it; ambiguous
+Unambiguous subtree moves may preserve opaque node IDs through format-owned
+hash matching only where the owning identity semantics permit it; ambiguous
 duplicates use a documented deterministic match. Moving or renaming an object
-slot changes its parent/key identity, while an unambiguous array item move may
-preserve that item's opaque ID and its nested value identities. Allocator output
-and every emitted schema/snapshot/PK correspondence are host-validated.
+slot changes its schema-natural parent/key identity, while an unambiguous array
+item move may preserve that item's opaque operation-allocated ID and its nested
+value identities. Inline-namespace generated IDs and every emitted schema/snapshot/PK
+correspondence are host-validated.
 
 This correctness change is required even if the plugin API itself remains
 unchanged.
@@ -715,6 +838,7 @@ record transition-limits {
   max-total-bytes: u64,
   max-inline-edits: u32,
   max-inline-input-bytes: u64,
+  max-attachment-refs: u32,
   total-deadline-nanoseconds: u64,
 }
 
@@ -729,11 +853,21 @@ resource byte-source {
     -> result<bytes, source-error>;
 }
 
+resource byte-sources {
+  len: func(index: u32) -> result<u64, source-error>;
+  read: func(
+    budget: borrow<transition-budget>,
+    index: u32,
+    offset: u64,
+    length: u32,
+  ) -> result<bytes, source-error>;
+}
+
 record packet-page {
   format-version: u16,
   record-count: u32,
   payload: bytes,
-  attachments: list<own<byte-source>>,
+  attachments: option<own<byte-sources>>,
 }
 
 resource packet-source {
@@ -741,13 +875,9 @@ resource packet-source {
     -> result<option<packet-page>, source-error>;
 }
 
-resource id-allocator {
-  allocate: func(
-    budget: borrow<transition-budget>,
-    schema-key: string,
-    scope: list<string>,
-    ordinal: u64,
-  ) -> result<list<string>, source-error>;
+record id-namespace {
+  high: u64,
+  low: u64,
 }
 
 record plugin-selection {
@@ -761,9 +891,14 @@ record file-descriptor {
   plugin: plugin-selection,
 }
 
-resource byte-output {
-  len: func() -> u64;
-  read: func(budget: borrow<transition-budget>, offset: u64, length: u32)
+resource byte-outputs {
+  len: func(index: u32) -> result<u64, plugin-error>;
+  read: func(
+    budget: borrow<transition-budget>,
+    index: u32,
+    offset: u64,
+    length: u32,
+  )
     -> result<bytes, plugin-error>;
 }
 
@@ -773,7 +908,7 @@ record file-update {
   before: own<byte-source>,
   edits: list<input-splice>,
   after: own<byte-source>,
-  ids: own<id-allocator>,
+  ids: id-namespace,
 }
 
 record entity-update {
@@ -781,12 +916,20 @@ record entity-update {
   after-descriptor: file-descriptor,
   before: own<byte-source>,
   changes: own<packet-source>,
+  /// Complete entities transitioning from unreachable to reachable.
+  activated-entities: own<packet-source>,
   current-entities: own<packet-source>,
+}
+
+record output-range {
+  index: u32,
+  offset: u64,
+  length: u64,
 }
 
 variant output-bytes {
   inline(bytes),
-  output(own<byte-output>),
+  output(output-range),
 }
 
 record output-splice {
@@ -797,6 +940,7 @@ record output-splice {
 
 record edit-page {
   edits: list<output-splice>,
+  outputs: option<own<byte-outputs>>,
 }
 
 resource edit-cursor {
@@ -811,7 +955,7 @@ record change-page {
   format-version: u16,
   record-count: u32,
   payload: bytes,
-  attachments: list<own<byte-output>>,
+  attachments: option<own<byte-outputs>>,
 }
 
 resource change-cursor {
@@ -840,7 +984,7 @@ resource document {
 record open-file-input {
   descriptor: file-descriptor,
   file: own<byte-source>,
-  ids: own<id-allocator>,
+  ids: id-namespace,
 }
 
 record open-entities-input {
@@ -862,7 +1006,22 @@ boundaries and complete upsert records are encoded in that transient packet.
 Version 1's little-endian framing, entity/group records, attachment references,
 canonical validation, and limits are normative in
 [`packet-v1.md`](../../experiments/plugin-api-v2/wit/packet-v1.md); SDKs expose
-typed values rather than this binary layout.
+typed values rather than this binary layout. The packet specification also
+defines the one normative Snapshot JSON semantic model and canonical encoding,
+including duplicate-key rejection, Unicode-scalar strings, object-key order,
+and mathematical arbitrary-precision number equality. Hosts and SDKs must use
+that model rather than whichever JSON number/string behavior their platform
+parser happens to provide.
+
+Current Lix durable snapshots use `serde_json::Value` without arbitrary-
+precision numbers and cannot represent that v1 model losslessly. Production v2
+is therefore gated on a breaking versioned durable snapshot codec whose number
+node stores the normalized decimal sign/coefficient/exponent, plus migration,
+hash/equality, storage round-trip, and cross-SDK golden tests. No implementation
+may silently round or range-reject valid packet-v1 numbers. Choosing bounded
+legacy numbers instead would require a separately reviewed packet version with
+explicit ranges and equality; the present WIT is research-only until one of
+those durable decisions lands.
 Large cold hydration and full replacement use lazy sources/outputs, upgraded to
 P3 streams when the toolchain gate clears. Rich nested
 `list<entity-state>` values are not the wire format. Bounds checks and packet
@@ -897,6 +1056,16 @@ method. The author-facing Rust facade hides this plumbing behind bounded
 cursors are stateful like WIT `packet-source.next`; change-key uniqueness and
 edit ordering/non-overlap/base bounds are validated across complete drained
 cursors, including page boundaries and permanent EOF.
+
+Attachments are multiplexed through at most one optional table resource per
+page, never a guest-selected `list<own<resource>>`. Packet and edit records name
+bounded table indices and ranges. Before calling `len` or `read` on that table,
+the host parses the bounded payload/edit list, validates every range, counts
+all references against `max-attachment-refs`, and rejects missing or unreferenced
+tables. The same rule applies in both host-to-guest packet pages and guest-to-
+host change/edit pages. This leaves only one returned resource handle per page
+while aggregate bytes, reads, pages, and time remain charged to the top-level
+transition budget.
 
 ### WASI 0.3 / P3
 
@@ -964,30 +1133,28 @@ The ranks combine measured headroom with architectural dependency. Profile
 percentages below are inclusive whole-process active-sample attribution and
 overlap; they are not isolated phase timings and must not be summed.
 
-The full-engine baseline was rerun on `origin/main` at `5ffab346`, including the
-new RocksDB missing-point filter, reduced CAS read copying, and write-target-
-only provider registration. Against the coherent `c789a2b1` run, recurring
-medians move by -5.39% to +3.73%; scans fall from 11 to 3, but requested keys
-fall by less than 0.02%. These mainline improvements do not remove the plugin-
-backed whole-state path. See
-[`full-engine-v1-baseline-5ffab346.md`](../../perf-results/plugin-api-v2/full-engine-v1-baseline-5ffab346.md)
-for raw samples, RSS, storage, logical I/O, the clean Rocks profile, and the
-explicitly pending Slate profile. The
-[`c789a2b1`](../../perf-results/plugin-api-v2/full-engine-v1-baseline-c789a2b1.md)
-and [`66ad14da`](../../perf-results/plugin-api-v2/full-engine-v1-baseline-66ad14da.md)
-artifacts are retained as historical comparisons.
+The full-engine baseline was rerun at exact `origin/main` commit `e1a57ec3`,
+after unused durable-function state was skipped and `LocalFilesystem` adopted
+the shared RocksDB adapter. Relative to the clean `5ffab346` run, recurring
+medians move by only -6.87% to +2.59%. One-row writes still request exactly
+220,092 change-payload keys; only 21 RocksDB and 31 SlateDB tree-history keys
+disappear, while every non-tree semantic space is unchanged. These mainline
+changes do not remove the plugin-backed whole-state path. See
+[`full-engine-v1-baseline-e1a57ec3.md`](../../perf-results/plugin-api-v2/full-engine-v1-baseline-e1a57ec3.md)
+for raw samples, RSS, gross directory snapshots, logical I/O, and matching clean
+RocksDB and SlateDB profiles. Older reports are historical comparisons only.
 
 | Rank | Target | Exact evidence | Decision gate |
 |---:|---|---|---|
-| 1 | Integrate B2 with observation-selected sparse host roots and a relative-offset document tree | Current one-row 10.68 MiB CSV writes request 226,339 RocksDB-filesystem / 226,314 cached-SlateDB keys and cannot initialize under 64 MiB guest memory. Isolated B2 p50 is 0.0126-0.0710 ms, 264.9-1462.6x over its optimistic v1 control, with 77.99-91.93% lower guest high-water than B, but its host successor source was prebuilt outside the timer. | Clear the defined localized-SQL-update p50 and p95 >20% aggregate gate on both backends, pass 64 MiB, and pass observation/actor-lifecycle/full cold-render tests. |
-| 2 | Add adaptive SlateDB batched/dense-run reads after the warm path stops requesting the world | Cached SlateDB p50 is 4,119 ms/edit and 4,162 ms/render; one row still requests 220,092 change-payload keys. The latest Slate profile is pending, so no historical profile share is promoted to current evidence. | Clear the defined >20% update gate with a configured sparse-key over-read budget. |
-| 3 | Reuse the already validated renderer splice/materialization in `LocalFilesystem` | RocksDB-filesystem exact render p50 is 900 ms, and 37.25% of latest whole-process active samples include `LocalFilesystem::sync_from_lix` on its separate sync thread. | Clear the defined >20% render-specific RocksDB-filesystem gate with identical bytes and acknowledgement/commit ordering. |
+| 1 | Integrate B2 with observation-selected sparse host roots and a relative-offset document tree | Current one-row 10.68 MB / 10.19 MiB CSV writes request 226,318 RocksDB-filesystem / 226,283 cached-SlateDB keys. The prior 5ff run failed at 64 MiB; exact e1 used 256 MiB and did not repeat that capacity cell. Isolated B2 p50 is 0.0126-0.0710 ms, an observed 264.9-1462.6x over its deliberately optimistic v1 mechanism control, with 77.99-91.93% lower guest high-water than B, but its host successor source was prebuilt outside the timer. | Clear the defined localized-SQL-update p50 and p95 >20% aggregate gate on both backends, pass 64 MiB, and pass observation/actor-lifecycle/full cold-render tests. |
+| 2 | Add adaptive SlateDB batched/dense-run reads after the warm path stops requesting the world | Cached SlateDB p50 is 3,836 ms/edit and 4,080 ms/render; one row still requests 220,092 change-payload keys, and `get_snapshot_values` appears in 34.94% of exact-e1 whole-process active samples. | Clear the defined >20% update gate with a configured sparse-key over-read budget and separate remote-object-store validation. |
+| 3 | Reuse the already validated renderer splice/materialization in `LocalFilesystem` | RocksDB-filesystem exact-render p50 is 855 ms, and 36.45% of exact-e1 whole-process active samples include `LocalFilesystem::sync_from_lix` on its separate sync thread. | Clear the defined >20% render-specific RocksDB-filesystem gate with identical bytes and acknowledgement/commit ordering. |
 | 4 | Produce a packed transient Component packet directly from sparse state | Rich-record versus arena boundary probes are 6.25-84.0x faster; the two 218,454-entity cases reduce guest peak from 64.88 to 39.32 MB and 63.11 to 28.84 MB. The file-byte control is 0.95x. | >20% after sparse retrieval; constructing rich rows first does not count. |
-| 5 | Use P3 streams only for cold/large transfers | A 10 MiB stream reduced payload high-water 81-90% while p50 stayed 2.686-2.718 ms versus 2.692 ms for `list<u8>`. | Capacity/backpressure win without >5% hot-call regression; not a warm latency claim. |
+| 5 | Use P3 streams only for cold/large transfers | A 10 MiB stream reduced the largest single guest linear-memory size 81-90% while p50 stayed 2.686-2.718 ms versus 2.692 ms for `list<u8>`. | Capacity/backpressure win without >5% hot-call regression; not a warm latency claim. |
 
 Persistence with complete blobs (A) is rejected at only 1.00-1.05x. Copied
 checkpoints (C) are rejected despite 10.54-16.69x core-Wasm latency because
-10.05-12.78 MiB crosses each direction per edit. Host KV access (D) remains an
+10.04-12.78 MiB crosses each direction per edit. Host KV access (D) remains an
 in-memory access probe, and generic Lix-owned packed storage pages are not a
 ranked target.
 
@@ -1014,25 +1181,60 @@ timers. Cold compile/open are reported separately.
 The checked mechanism matrix (30 warm calls per cell in one process) and the
 latest-main discovery baseline (one serial N=11 run per backend) are diagnostic,
 not an acceptance A/B. Production H8's primary operation is one localized
-ordinary-SQL blob update. It requires at least 31 warm observations per arm in
-at least five paired, counterbalanced fresh-process blocks. For p50 and p95
-separately, the upper 95% interval of the geometric mean of the five format
-candidate/baseline ratios must be below 0.80 on each backend, at least four of
-five format point ratios must be below 0.80, and no guarded cell may regress
-more than 5% p50 or 10% p95. Exact render is guarded; a render-specific change
-must clear the same >20% aggregate rule. Use a fixed-seed (`0x4c495832`),
-10,000-draw hierarchical cluster bootstrap of log ratios, resampling paired
-process blocks and then warm observations within each selected arm/block. The
-process block is the independent unit. No v2 integration is claimed to pass H8
-here.
+ordinary-SQL blob update. Its sample count is chosen from a separate pilot and
+pre-registered before the acceptance run; adaptive stopping is forbidden. The
+minimum design in each backend-by-format stratum is 12 paired fresh-process
+blocks, exactly six run in baseline-then-candidate (`AB`) order and six in
+candidate-then-baseline (`BA`) order, with 20 measured warm observations per
+arm/block after a fixed warmup. If the separate pilot selects more blocks, the
+extension is pre-registered and exactly counterbalanced. Both latency arms run
+under the same diagnostic memory cap. Separately, the candidate must initialize
+and complete the defined warm workload under the production 64 MiB aggregate
+guest linear-memory limit.
+
+Preserve backend-by-format strata. For p50 and p95 separately, report a one-
+sided 95% upper percentile bound from a fixed-seed (`0x4c495832`), 10,000-draw
+hierarchical cluster bootstrap of log candidate/baseline ratios, resampling
+paired process blocks and then observations within each selected arm/block.
+The fresh process block is the independent unit. On each backend, the upper
+bound for the geometric mean of the format ratios must be strictly below
+`0.80`, and at least four of five format point ratios must be strictly below
+`0.80`. Each guarded
+backend-by-format cell's upper bound must also be at most `1.05` for p50 and
+`1.10` for p95; these are uncertainty-aware regression guards, not point-
+estimate exceptions. Exact render is guarded, and a render-specific change
+must clear the same greater-than-20% aggregate rule. Excalidraw enters the
+latency aggregate only after an algorithm-identical stateless control exists;
+the current contract fixture is not a valid performance control. No v2
+integration is claimed to pass H8 here.
+
+The stacked CSV vertical-slice pull request uses this same preregistered paired
+design before the other four production ports exist. For that pull request,
+the CSV candidate/baseline one-sided upper bound must be strictly below `0.80` for both
+p50 and p95 independently on RocksDB filesystem and cached SlateDB, with the
+same render/regression, correctness, and 64 MiB guards. Passing admits the CSV
+slice for review; it is not the five-format aggregate needed to freeze or roll
+out v2 generally.
 
 The mechanism scanners and AX task adapters do not satisfy H7/H8. Those gates
 require production parser ports plus complete cold render, observation-selected
 out-of-order views, expired private-view failure, actor eviction, abort/trap,
 file deletion/recreation, branch isolation, plugin-generation upgrade, warm
 range/entity-read counters, mixed-line-ending round trips, relative-offset
-length-changing edits, and concurrent group-level coupled-reference tests on
-both backends.
+length-changing edits, concurrent group-level coupled-reference tests,
+fixed-ranked replay/application permutations, the sequential `{A, B}` then
+`{A}` causal-baseline case, concurrent creation of one schema-natural JSON
+property, JSON property reorder with byte-identical warm/cold rendering, and a
+50,000-node owning-edge detach whose active-state work remains bounded on both
+backends. The same hierarchical fixture must reattach/restore that subtree after
+shared-renderer eviction: `activated_entities` is exactly the newly reachable
+closure, excludes changed upserts, and causes zero unrelated active-row reads.
+A 200,000-entity initial import must use one inline namespace and zero allocator
+imports, preserve one-component 32-character PK arity, pass retry/distinct-
+operation/collision-reservation and cross-SDK golden-vector tests, and include
+namespace provenance in live/WAL storage measurements. V2 migration preserves
+existing UUID PKs; only newly created identities use the compact encoding, and
+legacy edit/reorder/delete plus new insertion must survive restart.
 
 ## AX evaluation protocol
 
@@ -1084,11 +1286,19 @@ Clippy with warnings denied. The test set included a 200,000-row paged initial
 stream, stateful resolved changes, prospective-state rendering, cross-page
 validation, pre-call caps, rename, and reselection rejection. The frozen
 signatures were facade SHA-256 `132b4d48...` and WIT SHA-256 `685dcdf2...`.
-The checked-in facade was subsequently `rustfmt`-wrapped on one assertion
-(SHA-256 `23aa66d7...`); it is token-equivalent to the evaluated snapshot, and
-the WIT is byte-identical.
+The immediate post-run `rustfmt` snapshot (`23aa66d7...`) was token-equivalent
+to the evaluated facade, but it is historical. Later correctness review made
+substantive semantic changes: one multiplex attachment table, prospective
+`activated_entities` hydration, a compact inline operation namespace with zero
+allocator imports, exact packet/group ordering, and cold-constructor
+clarifications. The current facade/WIT/packet SHA-256 values are
+`319ede7ce4035c1df6145f6f43ad63e4ca0e69330811df0bd754430d69fffca1`,
+`cbf722584936d08f93e912525941caaecfb389625ceb77625a171c3f6acb4d89`,
+and `d64ba556916c8cafb6f77b09b7edbacde87db6b7fc4ec62ec437d65fa97ef89e`.
+Those revisions were not AX-evaluated, and the N=1 task used an isolated Rust
+facade rather than generated Component bindings.
 
-That N=1 result proves a fresh agent could use the final signatures, including
+That N=1 result proves a fresh agent could use the evaluated signatures, including
 the simple renderer's prospective-`current_entities` fallback. It is a
 signature-alignment check, not statistically meaningful ergonomics evidence,
 and is not silently combined with the N=3 or N=9 scores. It also used the
@@ -1106,28 +1316,46 @@ descriptors, scoped allocation, lazy bytes, complete order upserts, and
 merge-group construction. The final N=1 check covers cross-page validation and
 the prospective-state fallback. Aggregate-budget failures, observation
 expiry/retry, generated bindings, and realistic recovery still require a
-larger controlled follow-up before the API is frozen.
+larger controlled follow-up before the API is frozen. That follow-up must also
+cover the current activation source, inline compact namespace and legacy-ID
+migration, semantic-schema descriptor, normalized-decimal durable codec, and
+generated Component bindings; none was present in the final N=1 run.
 
 ## Rollout plan
+
+Pull request 1 ends at the research/RFC boundary: contract, executable facade,
+wire sketch, AX evidence, mechanism probes, and reproducible acceptance design.
+Pull request 2 is stacked on it and is the first production decision point. It
+implements CSV end to end and must show, with explicit semantic-row and storage-
+read counters, that one row edit no longer requests 220,092 change-payload keys
+or materializes the 220,089 returned payloads.
+It is not accepted on isolated guest speed alone.
 
 1. Preserve remote blob-splice/hash metadata through SQL parameter binding,
    add opaque session/branch/path-bound observation handles, and reject an
    existing-file mutation whose exact identity root is unavailable.
-2. Introduce structurally shared host byte and semantic roots plus
-   observation-addressed private leases; benchmark 1/8/32 sessions and expiry.
-3. Introduce the refined SDK/WIT facade with both cold constructors, merge
-   groups, transition-wide cursor validation, pre-call splice caps, and
-   precommit renderer validation.
-4. Port text first, then CSV, because their grammatical invalidation boundaries
-   are easiest to verify.
-5. Break JSON identity before claiming stable array behavior.
-6. Port Markdown with retained source spans and subtree indexes.
-7. Add the Excalidraw plugin using native IDs and separate streamed assets.
-8. Add per-branch/file actors, memory admission, private-handle expiry,
-   rollback, trap, whole-file deletion/recreation, plugin upgrade, and
-   multi-session tests.
-9. Prototype bounded group-provenance GC and large-entity CAS attachments (or
-   explicit record limits), measuring RocksDB and cached SlateDB amplification.
+2. Introduce per-branch/file actors with one Wasmtime Store/instance per actor,
+   structurally shared host byte/semantic roots, observation-addressed private
+   leases, memory admission, expiry, rollback, trap retirement, deletion/
+   recreation, plugin upgrade, and multi-session tests; benchmark 1/8/32 views.
+3. Land the content-addressed semantic-schema descriptor and migration tooling,
+   the versioned normalized-decimal durable snapshot codec, compact generated-ID
+   reservation/migration rules, and cross-SDK golden vectors.
+4. Introduce the refined SDK/WIT runtime with both cold constructors, merge
+   groups, one-table attachment limits, transition-wide cursor validation,
+   pre-call splice caps, and precommit renderer validation; run the post-review
+   AX follow-up against generated bindings.
+5. Port CSV as the stacked production vertical slice, including persistent
+   record/identity indexes, sparse semantic roots, and patch-maintained bytes;
+   port text next.
+6. Break JSON identity before claiming stable array behavior: deterministic
+   parent/key object slots, operation-allocated array items, fixed-root
+   reachability, and owning-edge validation ship together.
+7. Port Markdown with retained source spans and subtree indexes.
+8. Add the Excalidraw plugin using native IDs and separate streamed assets.
+9. Prototype bounded group/base-version and detached-reachability provenance
+   GC plus large-entity CAS attachments (or explicit record limits), measuring
+   RocksDB and cached SlateDB amplification.
 10. Enable v2 by measured format/backend cohort; retain v1 only for migration,
    not as an automatic large-file fallback.
 
@@ -1141,8 +1369,9 @@ larger controlled follow-up before the API is frozen.
   sparse merge behavior at 1/8/32 retained session views.
 - Which incremental parser implementation each format should use; the API does
   not mandate Tree-sitter or any other parser.
-- Which bounded group-conflict frontier and visibility horizon preserve
-  arrival-order independence without unbounded durable provenance.
+- Which bounded group-conflict frontier and visibility horizon preserve fixed-
+  rank replay/application-order independence without unbounded durable
+  provenance while retaining the specified accepted-writer-order LWW meaning.
 - Whether per-entity content-addressed attachments beat an explicit maximum
   entity record size for huge assets/rows on both storage backends.
 

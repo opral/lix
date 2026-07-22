@@ -56,8 +56,9 @@ and 10 MiB capacity/memory matrix.
 - Do not adopt P3 streams as a latency optimization by themselves. On a
   CPU-bound byte scan they were neutral within measurement noise.
 - Adopt a streaming boundary if large-file capacity and bounded memory matter.
-  At 10 MiB it removed 9-10 MiB of guest payload high-water. That directly
-  addresses the current 64 MiB guest ceiling, but only if parsing is incremental.
+  At 10 MiB it reduced the largest single guest linear-memory size by 9-10 MiB.
+  That directly addresses the current 64 MiB guest ceiling, but only if parsing
+  is incremental; it is not a measurement of aggregate component memory or RSS.
 - Start chunk tuning around 256 KiB-1 MiB. An 8 KiB default is visibly too small
   for in-process CPU parsing. A 64 KiB chunk is a reasonable memory-first point,
   but 1 MiB removed almost all transfer overhead while remaining bounded.

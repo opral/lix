@@ -223,8 +223,8 @@ be made from this artifact until a fresh clean window produces the matching
 ## What this baseline establishes
 
 1. The newest direct SQL/write optimizations are real but target secondary
-   work for a 10.68 MiB plugin-backed edit: scans drop from 11 to 3, while total
-   requested keys and recurring medians barely move.
+   work for a 10.68 MB / 10.19 MiB plugin-backed edit: scans drop from 11 to 3,
+   while total requested keys and recurring medians barely move.
 2. The architectural bottleneck remains whole-state work. One changed CSV row
    still requests roughly 226k keys, including 220,092 change payloads, and
    materializes/renders state proportional to the complete file.
