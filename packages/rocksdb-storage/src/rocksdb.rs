@@ -3,11 +3,12 @@
     reason = "explicit future signatures mirror Storage traits and keep Send guarantees visible"
 )]
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
 use lix_engine::storage::{
@@ -19,8 +20,12 @@ use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rocksdb::Snapshot;
 use rocksdb::{BlockBasedOptions, DB, Direction, IteratorMode, Options, WriteBatch};
 use tempfile::TempDir;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const OWNED_VALUE_MIN_BYTES: usize = 64 * 1024;
+const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
+const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
+const DEFAULT_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
 
 #[derive(Debug)]
 pub struct RocksDBFactory {
@@ -37,7 +42,13 @@ pub struct RocksDBFixture {
 #[allow(missing_debug_implementations)]
 pub struct RocksDB {
     path: PathBuf,
-    db: Arc<DB>,
+    inner: Arc<RocksDBInner>,
+}
+
+#[allow(missing_debug_implementations)]
+struct RocksDBInner {
+    db: DB,
+    write_gate: WriteGate,
 }
 
 #[allow(missing_debug_implementations)]
@@ -47,11 +58,14 @@ pub struct RocksDBRead<'a> {
 
 #[allow(missing_debug_implementations)]
 pub struct RocksDBWrite {
-    db: Arc<DB>,
+    inner: Arc<RocksDBInner>,
+    _writer_permit: OwnedMutexGuard<()>,
     batch: WriteBatch,
     staged_put_keys: Vec<Key>,
     stats: WriteStats,
 }
+
+static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<RocksDBInner>>>> = OnceLock::new();
 
 impl Default for RocksDBFactory {
     fn default() -> Self {
@@ -101,8 +115,10 @@ impl StorageFixture for RocksDBFixture {
 impl RocksDB {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
-        let db = Arc::new(open_rocksdb(&path)?);
-        Ok(Self { path, db })
+        Ok(Self {
+            inner: open_shared_rocksdb(path.clone())?,
+            path,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -110,7 +126,7 @@ impl RocksDB {
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush().map_err(rocksdb_error)
+        self.inner.db.flush().map_err(rocksdb_error)
     }
 }
 
@@ -130,7 +146,7 @@ impl Storage for RocksDB {
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
             Ok(RocksDBRead {
-                snapshot: self.db.snapshot(),
+                snapshot: self.inner.db.snapshot(),
             })
         }
     }
@@ -140,8 +156,10 @@ impl Storage for RocksDB {
         _opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
+            let writer_permit = self.inner.write_gate.acquire().await;
             Ok(RocksDBWrite {
-                db: Arc::clone(&self.db),
+                inner: Arc::clone(&self.inner),
+                _writer_permit: writer_permit,
                 batch: WriteBatch::default(),
                 staged_put_keys: Vec::new(),
                 stats: WriteStats::default(),
@@ -300,6 +318,7 @@ impl StorageWrite for RocksDBWrite {
             } else {
                 let bounds = EncodedBounds::new(range, None);
                 for item in self
+                    .inner
                     .db
                     .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
                 {
@@ -328,7 +347,7 @@ impl StorageWrite for RocksDBWrite {
 
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
-            self.db.write(self.batch).map_err(rocksdb_error)?;
+            self.inner.db.write(self.batch).map_err(rocksdb_error)?;
             Ok(CommitResult {
                 commit_id: None,
                 stats: self.stats,
@@ -459,6 +478,67 @@ fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError> {
+    let path = registry_key(&path)?;
+    let registry = OPEN_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut open_databases = registry
+        .lock()
+        .map_err(|error| StorageError::Io(format!("rocksdb registry lock poisoned: {error}")))?;
+
+    if let Some(existing) = open_databases.get(&path) {
+        if let Some(inner) = existing.upgrade() {
+            return Ok(inner);
+        }
+    }
+
+    let db = open_rocksdb(&path)?;
+    let inner = Arc::new(RocksDBInner {
+        db,
+        write_gate: WriteGate::new(),
+    });
+    open_databases.insert(path, Arc::downgrade(&inner));
+    Ok(inner)
+}
+
+fn registry_key(path: &Path) -> Result<PathBuf, StorageError> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| StorageError::Io(format!("read current directory: {error}")))?
+            .join(path)
+    };
+
+    if absolute_path.exists() {
+        return std::fs::canonicalize(&absolute_path).map_err(|error| {
+            StorageError::Io(format!(
+                "canonicalize rocksdb storage path {}: {error}",
+                absolute_path.display()
+            ))
+        });
+    }
+
+    let parent = absolute_path.parent().ok_or_else(|| {
+        StorageError::Io(format!(
+            "rocksdb storage path has no parent: {}",
+            absolute_path.display()
+        ))
+    })?;
+    let file_name = absolute_path.file_name().ok_or_else(|| {
+        StorageError::Io(format!(
+            "rocksdb storage path has no final component: {}",
+            absolute_path.display()
+        ))
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        StorageError::Io(format!(
+            "canonicalize rocksdb storage parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(canonical_parent.join(file_name))
+}
+
 fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
     let mut options = Options::default();
     options.create_if_missing(true);
@@ -469,7 +549,12 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
     table_options.set_bloom_filter(8.0, false);
     table_options.set_optimize_filters_for_memory(true);
     options.set_block_based_table_factory(&table_options);
-    DB::open(&options, path).map_err(rocksdb_error)
+    options.set_enable_blob_files(true);
+    options.set_min_blob_size(DEFAULT_BLOB_MIN_SIZE);
+    options.set_blob_file_size(DEFAULT_BLOB_FILE_SIZE);
+    options.set_enable_blob_gc(true);
+    options.set_blob_gc_age_cutoff(DEFAULT_BLOB_GC_AGE_CUTOFF);
+    DB::open(&options, path).map_err(|error| rocksdb_open_error(error, path))
 }
 
 fn stored_value_bytes(value: StoredValue) -> Bytes {
@@ -494,4 +579,35 @@ where
 
 fn rocksdb_error(error: rocksdb::Error) -> StorageError {
     StorageError::Io(format!("rocksdb storage: {error}"))
+}
+
+fn rocksdb_open_error(error: rocksdb::Error, path: &Path) -> StorageError {
+    let message = error.to_string();
+    if message.to_ascii_lowercase().contains("lock") {
+        StorageError::Io(format!(
+            "rocksdb storage at {} is already open by another process: {message}",
+            path.display()
+        ))
+    } else {
+        StorageError::Io(format!(
+            "rocksdb storage failed to open {}: {message}",
+            path.display()
+        ))
+    }
+}
+
+#[derive(Default)]
+#[allow(missing_debug_implementations)]
+struct WriteGate {
+    state: Arc<AsyncMutex<()>>,
+}
+
+impl WriteGate {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn acquire(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.state).lock_owned().await
+    }
 }

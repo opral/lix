@@ -3389,11 +3389,7 @@ dependencies = [
 name = "lix_local_filesystem"
 version = "0.8.4"
 dependencies = [
- "bytes",
- "lix_engine",
- "rocksdb",
- "tempfile",
- "tokio",
+ "lix_rocksdb_storage",
 ]
 
 [[package]]
@@ -3408,6 +3404,7 @@ dependencies = [
  "lix_engine",
  "rocksdb",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
