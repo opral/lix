@@ -92,8 +92,6 @@ jiff = { version = "0.2.27", default-features = false, features = ["std"] }
 lru = "0.18"
 memchr = "2"
 uuid = { version = "1", features = ["v7", "std", "js", "fast-rng"] }
-unicode-normalization = "0.1"
-precis-profiles = "0.1.13"
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt"] }
@@ -107,7 +105,6 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2-zli
 
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "*" }
-iref = "4.0.0"
 lix_rocksdb_storage = { workspace = true }
 lix_slatedb_storage = { workspace = true }
 lix_sqlite_storage = { workspace = true }

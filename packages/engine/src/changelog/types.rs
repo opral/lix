@@ -430,22 +430,6 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) origin_key: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct ChangeRecordViewV1<'a> {
-    pub(crate) format_version: u32,
-    pub(crate) schema_key: &'a str,
-    #[musli(with = crate::storage_codec::id_string_seq)]
-    pub(crate) entity_pk: Vec<String>,
-    #[musli(with = crate::storage_codec::option_id_string)]
-    pub(crate) file_id: Option<String>,
-    #[musli(with = crate::json_store::json_slot_storage)]
-    pub(crate) snapshot: JsonSlot,
-    #[musli(with = crate::json_store::json_slot_storage)]
-    pub(crate) metadata: JsonSlot,
-    pub(crate) created_at: LixTimestamp,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ChangeLoadRequest<'a> {
     pub(crate) change_ids: &'a [ChangeId],

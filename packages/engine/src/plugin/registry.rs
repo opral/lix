@@ -117,40 +117,12 @@ impl PluginRegistryEntry {
         &self.key
     }
 
-    pub(crate) fn runtime(&self) -> PluginRuntime {
-        self.runtime
-    }
-
-    pub(crate) fn api_version(&self) -> &str {
-        &self.api_version
-    }
-
-    pub(crate) fn path_glob(&self) -> &str {
-        &self.path_glob
-    }
-
     pub(crate) fn content_type(&self) -> Option<PluginContentType> {
         self.content_type
     }
 
-    pub(crate) fn entry(&self) -> &str {
-        &self.entry
-    }
-
     pub(crate) fn schema_keys(&self) -> &[String] {
         &self.schema_keys
-    }
-
-    pub(crate) fn manifest_json(&self) -> &str {
-        &self.manifest_json
-    }
-
-    pub(crate) fn archive_file_id(&self) -> &str {
-        &self.archive_file_id
-    }
-
-    pub(crate) fn archive_path(&self) -> &str {
-        &self.archive_path
     }
 
     pub(crate) fn archive_blob_hash(&self) -> &str {
@@ -237,10 +209,6 @@ impl PluginRegistry {
         })
     }
 
-    pub(crate) fn plugin_count(&self) -> u32 {
-        self.plugin_count
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.plugins.is_empty()
     }
@@ -317,23 +285,6 @@ impl PluginRegistry {
         Ok(())
     }
 
-    pub(crate) fn with_upserted(&self, plugin: PluginRegistryEntry) -> Result<Self, LixError> {
-        let mut plugins = self.plugins.clone();
-        match plugins.binary_search_by(|entry| entry.key.cmp(&plugin.key)) {
-            Ok(index) => plugins[index] = plugin,
-            Err(index) => plugins.insert(index, plugin),
-        }
-        Self::new(plugins)
-    }
-
-    pub(crate) fn without(&self, plugin_key: &str) -> Result<Self, LixError> {
-        let mut plugins = self.plugins.clone();
-        if let Ok(index) = plugins.binary_search_by(|entry| entry.key.as_str().cmp(plugin_key)) {
-            plugins.remove(index);
-        }
-        Self::new(plugins)
-    }
-
     /// Decode the JSON held in the `value` field. A missing entity is the
     /// canonical empty registry and requires no filesystem discovery.
     pub(crate) fn from_optional_value(value: Option<&JsonValue>) -> Result<Self, LixError> {
@@ -393,10 +344,6 @@ impl PluginRegistry {
         }))
     }
 
-    pub(crate) fn to_canonical_json(&self) -> Result<String, LixError> {
-        Ok(canonical_json(&self.to_value()?))
-    }
-
     pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {
         tracked_key_value_write_row(
             PLUGIN_REGISTRY_KEY,
@@ -404,10 +351,6 @@ impl PluginRegistry {
             Some(self.to_snapshot()?),
             branch_id,
         )
-    }
-
-    pub(crate) fn delete_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
-        tracked_key_value_write_row(PLUGIN_REGISTRY_KEY, None, None, branch_id)
     }
 
     fn from_wire(wire: PluginRegistryWire) -> Result<Self, LixError> {
@@ -608,7 +551,6 @@ impl PluginFileOwner {
 /// One compiled multi-pattern matcher for a registry generation.
 #[derive(Debug)]
 pub(crate) struct CompiledPluginCatalog {
-    generation: String,
     plugins: Arc<[PluginRegistryEntry]>,
     globs: GlobSet,
     specificity: Vec<(u8, i32)>,
@@ -636,19 +578,10 @@ impl CompiledPluginCatalog {
             invalid_registry(format!("failed to compile plugin matcher catalog: {error}"))
         })?;
         Ok(Self {
-            generation: registry.generation.clone(),
             plugins: registry.plugins.clone().into(),
             globs,
             specificity,
         })
-    }
-
-    pub(crate) fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    pub(crate) fn plugin_count(&self) -> usize {
-        self.plugins.len()
     }
 
     /// Returns whether the named plugin's already-compiled glob matches the
@@ -670,21 +603,6 @@ impl CompiledPluginCatalog {
             return false;
         };
         self.globs.matches(path).contains(&plugin_index)
-    }
-
-    /// Select the most specific compatible matcher. When callers already have
-    /// file bytes they pass the classified content type and both predicates
-    /// must match. `None` deliberately keeps the prior path-only behavior for
-    /// owner validation and other flows where bytes are not available.
-    /// Equal-specificity matches resolve by lexicographically smallest plugin
-    /// key because registry entries are canonicalized by key and matching
-    /// indices are ascending.
-    pub(crate) fn select(
-        &self,
-        path: &str,
-        file_content_type: Option<PluginContentType>,
-    ) -> Option<&PluginRegistryEntry> {
-        self.select_with_content_type(path, || file_content_type)
     }
 
     /// Selects for a known payload without scanning its bytes unless at least
@@ -1122,7 +1040,7 @@ mod tests {
     fn missing_registry_is_empty_without_discovery() {
         let registry = PluginRegistry::from_optional_value(None).expect("missing row is valid");
         assert!(registry.is_empty());
-        assert_eq!(registry.plugin_count(), 0);
+        assert!(registry.plugins().is_empty());
         assert_eq!(registry.generation().len(), 64);
     }
 
@@ -1141,8 +1059,8 @@ mod tests {
 
         assert_eq!(first.generation(), second.generation());
         assert_eq!(
-            first.to_canonical_json().unwrap(),
-            second.to_canonical_json().unwrap()
+            canonical_json(&first.to_value().unwrap()),
+            canonical_json(&second.to_value().unwrap())
         );
         assert_eq!(first.plugins()[0].key(), "plugin_a");
 
@@ -1154,15 +1072,16 @@ mod tests {
     #[test]
     fn upsert_and_remove_change_generation_deterministically() {
         let empty = PluginRegistry::empty();
-        let installed = empty
-            .with_upserted(entry("plugin_a", "*.json", 'a'))
+        let mut installed = empty.clone();
+        installed
+            .upsert(entry("plugin_a", "*.json", 'a'))
             .expect("install should be valid");
         assert_ne!(installed.generation(), empty.generation());
-        assert_eq!(installed.plugin("plugin_a").unwrap().path_glob(), "*.json");
-        let removed = installed
-            .without("plugin_a")
+        assert_eq!(installed.plugin("plugin_a").unwrap().path_glob, "*.json");
+        installed
+            .remove("plugin_a")
             .expect("remove should be valid");
-        assert_eq!(removed, empty);
+        assert_eq!(installed, empty);
     }
 
     #[test]
@@ -1308,15 +1227,21 @@ mod tests {
         .unwrap();
         let catalog = CompiledPluginCatalog::compile(&registry).unwrap();
         assert_eq!(
-            catalog.select("src/data.json", None).unwrap().key(),
+            catalog
+                .select_for_bytes("src/data.json", b"")
+                .unwrap()
+                .key(),
             "plugin_specific"
         );
-        assert_eq!(catalog.select("data.json", None).unwrap().key(), "plugin_a");
         assert_eq!(
-            catalog.select("data.txt", None).unwrap().key(),
+            catalog.select_for_bytes("data.json", b"").unwrap().key(),
+            "plugin_a"
+        );
+        assert_eq!(
+            catalog.select_for_bytes("data.txt", b"").unwrap().key(),
             "plugin_all"
         );
-        assert!(catalog.select("", None).is_none());
+        assert!(catalog.select_for_bytes("", b"").is_none());
         assert!(catalog.matches_plugin("plugin_specific", "src/data.json"));
         assert!(catalog.matches_plugin("plugin_a", "src/data.json"));
         assert!(catalog.matches_plugin("plugin_z", "src/data.json"));
@@ -1376,13 +1301,13 @@ mod tests {
         assert_eq!(classification_calls.get(), 0);
         assert_eq!(
             text_only
-                .select("document.data", Some(PluginContentType::Text))
+                .select_with_content_type("document.data", || Some(PluginContentType::Text))
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert!(
             text_only
-                .select("document.data", Some(PluginContentType::Binary))
+                .select_with_content_type("document.data", || Some(PluginContentType::Binary))
                 .is_none()
         );
 
@@ -1391,13 +1316,13 @@ mod tests {
                 .unwrap();
         assert_eq!(
             catalog
-                .select("document.data", Some(PluginContentType::Text))
+                .select_with_content_type("document.data", || Some(PluginContentType::Text))
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert_eq!(
             catalog
-                .select("document.data", Some(PluginContentType::Binary))
+                .select_with_content_type("document.data", || Some(PluginContentType::Binary))
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
         );
@@ -1410,12 +1335,6 @@ mod tests {
         assert_eq!(
             catalog
                 .select_for_bytes("document.data", &[0xff, 0xfe])
-                .map(PluginRegistryEntry::key),
-            Some("plugin_binary")
-        );
-        assert_eq!(
-            catalog
-                .select("document.data", None)
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
         );

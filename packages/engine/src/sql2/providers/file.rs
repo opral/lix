@@ -8368,20 +8368,20 @@ mod tests {
         assert_eq!(
             context
                 .branch("branch-a")
-                .and_then(|branch| branch.catalog.select("/note.branch-a", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-a", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
         assert!(
             context
                 .branch("branch-a")
-                .and_then(|branch| branch.catalog.select("/note.branch-b", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-b", b""))
                 .is_none()
         );
         assert_eq!(
             context
                 .branch("branch-b")
-                .and_then(|branch| branch.catalog.select("/note.branch-b", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-b", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
@@ -8744,7 +8744,7 @@ mod tests {
         assert_eq!(
             context
                 .branch("branch-b")
-                .and_then(|branch| branch.catalog.select("/note.active", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.active", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_active")
         );

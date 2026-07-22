@@ -32,10 +32,10 @@ use crate::filesystem::{
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateExactBatchRequest, LiveStateFileScanRequest, LiveStateFilter,
-    LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateContext, LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::live_state::{overlay_load_exact_rows, overlay_scan_file_rows, overlay_scan_rows};
+use crate::live_state::{overlay_load_exact_rows, overlay_scan_rows};
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginArchiveInstallPlan,
     PluginDetectedChange, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
@@ -1961,13 +1961,6 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         overlay_scan_rows(&self.base, &self.staged, request).await
-    }
-
-    async fn scan_file_rows(
-        &self,
-        request: &LiveStateFileScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        overlay_scan_file_rows(&self.base, &self.staged, request).await
     }
 
     async fn load_row(

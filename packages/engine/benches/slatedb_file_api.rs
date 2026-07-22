@@ -304,8 +304,12 @@ impl SingletonWriteFixture {
             Arc::new(InMemory::new()),
             Duration::ZERO,
         ));
-        let storage = SlateDB::open_object_store(db_path, object_store_handle(&object_store))
-            .expect("open SlateDB singleton accounting storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store_handle(&object_store),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open SlateDB singleton accounting storage");
         let rows = (0..SINGLETON_ACCOUNTING_ROWS)
             .map(|index| {
                 let path = format!("/singleton/{index:04}");
@@ -535,9 +539,10 @@ fn storage_direct_benches(c: &mut Criterion, runtime: &tokio::runtime::Runtime) 
     group.bench_function("accept_put_u1_v4096", |b| {
         b.iter_custom(|iterations| {
             let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
-            let storage = SlateDB::open_object_store(
+            let storage = SlateDB::open_object_store_with_options(
                 format!("slatedb-direct-bench-{}-{db_id}", std::process::id()),
                 Arc::new(InMemory::new()),
+                SlateDBObjectStoreOptions::default(),
             )
             .expect("open direct SlateDB benchmark storage");
             let key = Key(Bytes::from_static(b"direct-key"));
@@ -615,8 +620,12 @@ impl SeededStore {
         let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
         let db_path = format!("slatedb-file-api-bench-{}-{db_id}", std::process::id());
         let seed_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let storage = SlateDB::open_object_store(db_path.clone(), Arc::clone(&seed_object_store))
-            .expect("open SlateDB seed storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path.clone(),
+            Arc::clone(&seed_object_store),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open SlateDB seed storage");
         let init_receipt = Engine::initialize(storage.clone())
             .await
             .expect("initialize SlateDB file benchmark engine");
@@ -1065,9 +1074,10 @@ impl CachedRequestBenchFixture {
 impl FreshEngineSelectBenchFixture {
     async fn seeded(delay: Duration) -> Self {
         let seeded = SeededStore::create().await;
-        let storage = SlateDB::open_object_store(
+        let storage = SlateDB::open_object_store_with_options(
             seeded.db_path.clone(),
             object_store_handle(&seeded.object_store),
+            SlateDBObjectStoreOptions::default(),
         )
         .expect("reopen uncached SlateDB file benchmark storage");
         seeded.object_store.set_delay(delay);
@@ -1151,9 +1161,12 @@ impl StorageConcurrencyFixture {
             .collect::<Vec<_>>();
 
         {
-            let storage =
-                SlateDB::open_object_store(db_path.clone(), Arc::clone(&seed_object_store))
-                    .expect("open SlateDB concurrency seed storage");
+            let storage = SlateDB::open_object_store_with_options(
+                db_path.clone(),
+                Arc::clone(&seed_object_store),
+                SlateDBObjectStoreOptions::default(),
+            )
+            .expect("open SlateDB concurrency seed storage");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1189,8 +1202,12 @@ impl StorageConcurrencyFixture {
         }
 
         let object_store = Arc::new(DelayedObjectStore::new(seed_object_store, Duration::ZERO));
-        let storage = SlateDB::open_object_store(db_path, object_store_handle(&object_store))
-            .expect("reopen SlateDB concurrency benchmark storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store_handle(&object_store),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen SlateDB concurrency benchmark storage");
         let readers = StorageReadWorkers::new(&storage, &keys);
         object_store.set_delay(delay);
 
