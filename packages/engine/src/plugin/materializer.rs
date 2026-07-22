@@ -7,10 +7,7 @@ use crate::live_state::{LiveStateProjection, MaterializedLiveStateRow};
 use crate::wasm::{WasmComponentInstance, WasmPluginEntityState, WasmPluginFile};
 
 use super::InstalledPlugin;
-use super::component::{
-    PluginComponentHost, detect_changes_with_plugin as detect_changes_with_component,
-    render_with_plugin as render_with_component,
-};
+use super::component::{PluginComponentHost, render_with_plugin as render_with_component};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PluginDetectedChange {
@@ -18,22 +15,6 @@ pub(crate) struct PluginDetectedChange {
     pub(crate) schema_key: String,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-}
-
-pub(crate) async fn detect_changes_with_plugin(
-    host: &impl PluginComponentHost,
-    plugin: &InstalledPlugin,
-    active_state: &[MaterializedLiveStateRow],
-    file: WasmPluginFile,
-) -> Result<Vec<PluginDetectedChange>, LixError> {
-    let changes = detect_changes_with_component(
-        host,
-        plugin,
-        plugin_entity_state_from_live_rows(active_state)?,
-        file,
-    )
-    .await?;
-    normalize_detected_changes(changes)
 }
 
 /// Executes a component that was resolved from the warm hash cache before any

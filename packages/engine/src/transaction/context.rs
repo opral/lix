@@ -19,7 +19,10 @@ use serde_json::Value as JsonValue;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader, branch_ref_stage_row};
-use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot};
+use crate::catalog::{
+    CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision,
+    stage_catalog_revision,
+};
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::LixTimestamp;
@@ -32,10 +35,10 @@ use crate::filesystem::{
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateExactBatchRequest, LiveStateFileScanRequest, LiveStateFilter,
-    LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateContext, LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::live_state::{overlay_load_exact_rows, overlay_scan_file_rows, overlay_scan_rows};
+use crate::live_state::{overlay_load_exact_rows, overlay_scan_rows};
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginArchiveInstallPlan,
     PluginDetectedChange, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
@@ -300,11 +303,13 @@ where
             };
             let functions = runtime_functions.provider();
             let schema_catalog = {
+                let catalog_revision = load_catalog_revision(&read).await?;
                 let visible_live_state = live_state.reader(&read);
                 catalog_context
-                    .compiled_catalog_for_domain(
+                    .compiled_catalog_for_transaction_open(
                         &visible_live_state,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
+                        catalog_revision.as_ref(),
                     )
                     .await?
             };
@@ -371,6 +376,7 @@ where
                 return Err(error);
             }
         };
+        let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         check_commit_boundary(commit_boundary.as_ref())?;
         transaction
@@ -407,7 +413,7 @@ where
         } else {
             load_path_index_revision(&read).await.ok().flatten()
         };
-        let writes = match commit::commit_prepared_writes(
+        let mut writes = match commit::commit_prepared_writes(
             &transaction.binary_cas,
             transaction.branch_ctx.as_ref(),
             transaction.live_state.index(),
@@ -420,6 +426,9 @@ where
             Ok(writes) => writes,
             Err(error) => return Err(error),
         };
+        if catalog_revision_changed {
+            stage_catalog_revision(&mut writes);
+        }
         let prepared_commit = transaction
             .storage
             .prepare_write_set(writes, StorageWriteOptions::default())
@@ -1963,13 +1972,6 @@ where
         overlay_scan_rows(&self.base, &self.staged, request).await
     }
 
-    async fn scan_file_rows(
-        &self,
-        request: &LiveStateFileScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        overlay_scan_file_rows(&self.base, &self.staged, request).await
-    }
-
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
@@ -2155,6 +2157,19 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
             "invalid {column} timestamp for prepared state row: {error}"
         ))
     })
+}
+
+fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
+    prepared_writes.state_rows.iter().any(|row| {
+        matches!(
+            row.schema_key.as_str(),
+            REGISTERED_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
+        )
+    }) || prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .flat_map(|change_refs| change_refs.selected_change_refs.iter())
+        .any(|change_ref| change_ref.schema_key == REGISTERED_SCHEMA_KEY)
 }
 
 pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {

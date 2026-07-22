@@ -3,10 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobHash;
 use crate::common::LixError;
-use crate::wasm::{
-    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
-    WasmPluginFile, WasmRuntime,
-};
+use crate::wasm::{WasmComponentInstance, WasmLimits, WasmPluginEntityState, WasmRuntime};
 
 use super::{CompiledPluginCatalog, InstalledPlugin, PluginCatalogCache, PluginRegistry};
 
@@ -156,21 +153,11 @@ pub(crate) async fn render_with_plugin(
     instance.render(state).await
 }
 
-pub(crate) async fn detect_changes_with_plugin(
-    host: &impl PluginComponentHost,
-    plugin: &InstalledPlugin,
-    state: Vec<WasmPluginEntityState>,
-    file: WasmPluginFile,
-) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
-    let instance = load_or_init_plugin_component(host, plugin).await?;
-    instance.detect_changes(state, file).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugin::{InstalledPlugin, PluginRuntime};
-    use crate::wasm::WasmRuntime;
+    use crate::wasm::{WasmPluginDetectedChange, WasmPluginFile, WasmRuntime};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::Mutex;

@@ -62,11 +62,6 @@ pub struct SlateDB {
     write_gate: WriteGate,
 }
 
-#[derive(Clone, Debug)]
-pub struct SlateDBOptions {
-    pub path: PathBuf,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SlateDBObjectStoreOptions {
     pub cache: Option<SlateDBCacheOptions>,
@@ -141,10 +136,6 @@ impl StorageFixture for SlateDBFixture {
 }
 
 impl SlateDB {
-    pub fn new(options: SlateDBOptions) -> Result<Self, StorageError> {
-        Self::open(options.path)
-    }
-
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
         std::fs::create_dir_all(&path).map_err(|error| {
@@ -155,21 +146,15 @@ impl SlateDB {
         })?;
         let object_store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?);
-        Self::open_object_store(DB_PATH, object_store).map(|mut storage| {
-            storage.path = path;
-            storage
-        })
-    }
-
-    pub fn open_object_store(
-        db_path: impl Into<String>,
-        object_store: Arc<dyn ObjectStore>,
-    ) -> Result<Self, StorageError> {
         Self::open_object_store_with_options(
-            db_path,
+            DB_PATH,
             object_store,
             SlateDBObjectStoreOptions::default(),
         )
+        .map(|mut storage| {
+            storage.path = path;
+            storage
+        })
     }
 
     pub fn open_object_store_with_options(
@@ -711,7 +696,7 @@ fn open_slatedb(
                 .with_db_cache(Arc::new(db_cache));
         } else {
             // The SlateDB dependency is compiled with Moka support so cached
-            // callers can choose bounded capacities. Keep the legacy constructor
+            // callers can choose bounded capacities. Keep default construction
             // cacheless instead of accepting SlateDB's much larger defaults.
             builder = builder.with_db_cache_disabled();
         }
@@ -1030,8 +1015,12 @@ mod tests {
 
     #[test]
     fn open_object_store_round_trips_with_memory_store() {
-        let storage = SlateDB::open_object_store("test-db", Arc::new(InMemory::new()))
-            .expect("open memory object-store slatedb storage");
+        let storage = SlateDB::open_object_store_with_options(
+            "test-db",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open memory object-store slatedb storage");
 
         let space = SpaceId(7);
         let key = Key(Bytes::from_static(b"hello"));
@@ -1063,8 +1052,12 @@ mod tests {
     #[test]
     fn commit_is_visible_while_background_wal_flush_is_blocked() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
-        let storage = SlateDB::open_object_store("test-commit-visibility", store.clone())
-            .expect("open commit visibility storage");
+        let storage = SlateDB::open_object_store_with_options(
+            "test-commit-visibility",
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open commit visibility storage");
         let space = SpaceId(8);
         let key = Key(Bytes::from_static(b"visible-before-durable"));
 
@@ -1108,8 +1101,12 @@ mod tests {
     #[test]
     fn explicit_flush_reports_background_durability_failure() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
-        let storage = SlateDB::open_object_store("test-failed-commit", store.clone())
-            .expect("open failed commit storage");
+        let storage = SlateDB::open_object_store_with_options(
+            "test-failed-commit",
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open failed commit storage");
         let space = SpaceId(9);
         let key = Key(Bytes::from_static(b"rejected"));
 
@@ -1147,8 +1144,12 @@ mod tests {
         let space = SpaceId(8);
         let key = Key(Bytes::from_static(b"background-commit"));
         let value = Bytes::from_static(b"durable");
-        let storage =
-            SlateDB::open_object_store(db_path, store.clone()).expect("open close-test storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open close-test storage");
         let mut write =
             block_on(storage.begin_write(WriteOptions::default())).expect("begin close-test write");
         block_on(write.put_many(
@@ -1186,8 +1187,12 @@ mod tests {
             .expect("close should finish after WAL durability");
         closer.join().expect("join close-test closer");
 
-        let reopened =
-            SlateDB::open_object_store(db_path, store).expect("reopen close-test storage");
+        let reopened = SlateDB::open_object_store_with_options(
+            db_path,
+            store,
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen close-test storage");
         let read =
             block_on(reopened.begin_read(ReadOptions::default())).expect("begin close-test read");
         let result = block_on(read.get_many(space, &[key], GetOptions::default()))
@@ -1205,8 +1210,12 @@ mod tests {
         let value = Bytes::from(vec![b'x'; 128 * 1024]);
 
         {
-            let storage = SlateDB::open_object_store(db_path, inner.clone())
-                .expect("open concurrent-read seed storage");
+            let storage = SlateDB::open_object_store_with_options(
+                db_path,
+                inner.clone(),
+                SlateDBObjectStoreOptions::default(),
+            )
+            .expect("open concurrent-read seed storage");
             let mut write = block_on(storage.begin_write(WriteOptions::default()))
                 .expect("begin concurrent-read seed write");
             block_on(write.put_many(
@@ -1233,8 +1242,12 @@ mod tests {
         }
 
         let store = Arc::new(BlockingStore::new(inner));
-        let storage = SlateDB::open_object_store(db_path, store.clone())
-            .expect("reopen concurrent-read storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen concurrent-read storage");
         let read = Arc::new(
             block_on(storage.begin_read(ReadOptions::default()))
                 .expect("begin shared snapshot read"),
@@ -1279,8 +1292,12 @@ mod tests {
         let value = Bytes::from(vec![b'x'; 128 * 1024]);
 
         {
-            let storage = SlateDB::open_object_store(db_path, inner.clone())
-                .expect("open async-read seed storage");
+            let storage = SlateDB::open_object_store_with_options(
+                db_path,
+                inner.clone(),
+                SlateDBObjectStoreOptions::default(),
+            )
+            .expect("open async-read seed storage");
             let mut write = storage
                 .begin_write(WriteOptions::default())
                 .await
@@ -1303,8 +1320,12 @@ mod tests {
         }
 
         let store = Arc::new(BlockingStore::new(inner));
-        let storage =
-            SlateDB::open_object_store(db_path, store.clone()).expect("reopen async-read storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen async-read storage");
         let read = storage
             .begin_read(ReadOptions::default())
             .await

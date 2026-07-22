@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value as JsonValue;
 
+use crate::catalog::revision::CatalogRevision;
 use crate::catalog::snapshot::{
     CatalogFingerprint, fingerprint_schema_facts, hash_fingerprint_part,
 };
@@ -28,10 +29,13 @@ const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
 /// schemas are also seeded as ordinary `lix_registered_schema` rows for
 /// validation and introspection, while fixed-surface reads may use their
 /// compile-time definitions without loading those rows. The context also owns
-/// the engine-wide cache of compiled catalog snapshots, keyed by fact content.
+/// engine-wide caches of compiled snapshots, keyed by either fact content or
+/// the atomic storage revision captured when a transaction opens.
 pub(crate) struct CatalogContext {
     compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
     compiled_catalogs_by_rows: Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>>,
+    transaction_opening_catalogs:
+        Mutex<HashMap<TransactionOpeningCatalogKey, Arc<CatalogSnapshot>>>,
     #[cfg(test)]
     sql_read_schema_loads: AtomicUsize,
 }
@@ -44,21 +48,74 @@ pub(crate) struct CatalogContext {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CatalogRowsFingerprint(String);
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TransactionOpeningCatalogKey {
+    domain: Domain,
+    revision: CatalogRevision,
+}
+
 impl CatalogContext {
     pub(crate) fn new() -> Self {
         Self {
             compiled_catalogs: Mutex::new(HashMap::new()),
             compiled_catalogs_by_rows: Mutex::new(HashMap::new()),
+            transaction_opening_catalogs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             sql_read_schema_loads: AtomicUsize::new(0),
         }
     }
 
+    /// Returns the catalog captured by a transaction-opening storage snapshot.
+    ///
+    /// The revision is loaded from the same pinned read as `live_state`. A
+    /// matching `(domain, revision)` therefore proves that registered-schema
+    /// visibility is identical without rescanning its tracked and untracked
+    /// rows. Missing revisions conservatively retain the scan path for stores
+    /// initialized by older engines.
+    pub(crate) async fn compiled_catalog_for_transaction_open<R>(
+        &self,
+        live_state: &R,
+        domain: &Domain,
+        revision: Option<&CatalogRevision>,
+    ) -> Result<Arc<CatalogSnapshot>, LixError>
+    where
+        R: LiveStateReader + ?Sized,
+    {
+        let Some(revision) = revision else {
+            return self.compiled_catalog_for_domain(live_state, domain).await;
+        };
+        let key = TransactionOpeningCatalogKey {
+            domain: domain.clone(),
+            revision: revision.clone(),
+        };
+        if let Some(snapshot) = self
+            .transaction_opening_catalogs
+            .lock()
+            .expect("transaction opening catalog cache lock should not be poisoned")
+            .get(&key)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+
+        let snapshot = self.compiled_catalog_for_domain(live_state, domain).await?;
+        let mut cache = self
+            .transaction_opening_catalogs
+            .lock()
+            .expect("transaction opening catalog cache lock should not be poisoned");
+        if cache.len() >= COMPILED_CATALOG_CACHE_LIMIT {
+            if let Some(evicted) = cache.keys().find(|entry| **entry != key).cloned() {
+                cache.remove(&evicted);
+            }
+        }
+        cache.insert(key, Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
     /// Returns the compiled snapshot for the catalog rows visible to `domain`.
     ///
-    /// This is the transaction hot path. On a hit it costs one live-state scan
-    /// plus a hash of the raw row contents; schema rows are only JSON-decoded
-    /// and canonicalized when the raw fingerprint has not been seen before.
+    /// This is the transaction-opening cache-miss path and the authoritative
+    /// path for validation overlays. Identical raw rows avoid JSON decoding and
+    /// canonicalization, but still require the live-state scans.
     pub(crate) async fn compiled_catalog_for_domain<R>(
         &self,
         live_state: &R,
@@ -337,6 +394,65 @@ mod tests {
         assert!(!first.contains("gamma_schema"));
     }
 
+    #[tokio::test]
+    async fn transaction_opening_revision_skips_catalog_row_scans_until_it_changes() {
+        let context = CatalogContext::new();
+        let domain = Domain::schema_catalog("global", true);
+        let revision = CatalogRevision::for_test(b"revision-one");
+        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+
+        let first = context
+            .compiled_catalog_for_transaction_open(&reader, &domain, Some(&revision))
+            .await
+            .expect("opening catalog should compile");
+        assert_eq!(
+            reader.scan_count(),
+            2,
+            "cold open scans both durability scopes"
+        );
+        let second = context
+            .compiled_catalog_for_transaction_open(&reader, &domain, Some(&revision))
+            .await
+            .expect("opening catalog should hit by revision");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            reader.scan_count(),
+            2,
+            "hot open must not rescan registered-schema rows"
+        );
+
+        let changed_reader = RowsLiveStateReader::new(vec![registered_schema_row("beta_schema")]);
+        let changed = context
+            .compiled_catalog_for_transaction_open(
+                &changed_reader,
+                &domain,
+                Some(&CatalogRevision::for_test(b"revision-two")),
+            )
+            .await
+            .expect("changed revision should reload the catalog");
+        assert_eq!(changed_reader.scan_count(), 2);
+        assert!(changed.contains("beta_schema"));
+        assert!(!changed.contains("alpha_schema"));
+    }
+
+    #[tokio::test]
+    async fn missing_transaction_opening_revision_conservatively_rescans() {
+        let context = CatalogContext::new();
+        let domain = Domain::schema_catalog("global", true);
+        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+
+        context
+            .compiled_catalog_for_transaction_open(&reader, &domain, None)
+            .await
+            .expect("first opening catalog should compile");
+        context
+            .compiled_catalog_for_transaction_open(&reader, &domain, None)
+            .await
+            .expect("second opening catalog should compile");
+
+        assert_eq!(reader.scan_count(), 4);
+    }
+
     #[test]
     fn compiled_catalog_cache_shares_snapshots_for_equal_facts() {
         let context = CatalogContext::new();
@@ -572,11 +688,19 @@ mod tests {
 
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
+        scan_count: AtomicUsize,
     }
 
     impl RowsLiveStateReader {
         fn new(rows: Vec<MaterializedLiveStateRow>) -> Self {
-            Self { rows }
+            Self {
+                rows,
+                scan_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn scan_count(&self) -> usize {
+            self.scan_count.load(Ordering::Relaxed)
         }
     }
 
@@ -593,6 +717,7 @@ mod tests {
             &self,
             request: &LiveStateScanRequest,
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_count.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .rows
                 .iter()

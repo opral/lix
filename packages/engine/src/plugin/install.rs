@@ -68,23 +68,6 @@ pub(crate) fn plugin_install_plan_from_archive_path(
     })
 }
 
-pub(crate) fn plugin_schema_rows_from_archive_path(
-    archive_path: &str,
-    archive_bytes: &[u8],
-    branch_id: &str,
-    global: bool,
-    untracked: bool,
-) -> Result<Vec<TransactionWriteRow>, LixError> {
-    Ok(plugin_install_plan_from_archive_path(
-        archive_path,
-        archive_bytes,
-        branch_id,
-        global,
-        untracked,
-    )?
-    .schema_rows)
-}
-
 fn plugin_schema_rows(
     parsed: &ParsedPluginArchive,
     branch_id: &str,

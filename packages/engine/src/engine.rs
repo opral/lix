@@ -247,6 +247,11 @@ where
             .rebuild_commit_root_at(&head_commit_id)
             .await;
         rebuild_result?;
+        // A healthy rebuild is content-equivalent, but this API also repairs a
+        // stale or damaged serving root. Conservatively invalidate transaction
+        // opening catalogs so repaired registered-schema facts are never hidden
+        // behind a pre-rebuild cache entry.
+        crate::catalog::stage_catalog_revision(&mut writes);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
