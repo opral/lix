@@ -2869,7 +2869,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
         relative,
         write_registration,
         &[
-            "PublicCatalog::from_visible_schemas",
+            "write_ctx.public_catalog()",
             "catalog.surfaces()",
             "PublicSurfaceKind::LixState",
             "PublicSurfaceKind::LixStateByBranch",
@@ -2894,6 +2894,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
         &[
             "ctx.live_state()",
             "ctx.branch_ref()",
+            "PublicCatalog::from_visible_schemas",
             "register_lix_state_providers",
             "register_lix_branch_provider",
             "register_lix_change_provider",

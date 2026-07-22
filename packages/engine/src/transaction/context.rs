@@ -19,7 +19,7 @@ use serde_json::Value as JsonValue;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader, branch_ref_stage_row};
-use crate::catalog::CatalogContext;
+use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot};
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::LixTimestamp;
@@ -44,12 +44,12 @@ use crate::plugin::{
     plugin_state_live_state_projection, retain_plugin_state_rows_for_schema_keys,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
-use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViewKey, SessionFileViewMutation,
     SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
+use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     Memory, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
@@ -135,42 +135,21 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
-    catalog_context: Arc<CatalogContext>,
     schema_resolver: TransactionSchemaResolver,
+    /// SQL binding is snapshot-isolated at transaction open. Schema writes
+    /// staged later in this transaction affect validation but become visible
+    /// to SQL planning only after commit opens a new transaction snapshot.
+    sql_schema_snapshot: Arc<CatalogSnapshot>,
+    sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
     storage: StorageAdapter<StorageImpl>,
-    sql_schema_cache: SqlSchemaCache,
     functions: FunctionProviderHandle,
     commit_boundary: Option<TransactionCommitBoundary>,
     origin_key: Option<String>,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
-}
-
-#[derive(Default)]
-struct SqlSchemaCache {
-    visible_schemas: Option<Vec<JsonValue>>,
-}
-
-impl SqlSchemaCache {
-    fn is_prepared(&self) -> bool {
-        self.visible_schemas.is_some()
-    }
-
-    fn prepare(&mut self, visible_schemas: Vec<JsonValue>) {
-        self.visible_schemas = Some(visible_schemas);
-    }
-
-    fn visible_schemas(&self) -> Result<&[JsonValue], LixError> {
-        self.visible_schemas.as_deref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "SQL visible schemas were requested before SQL transaction context preparation",
-            )
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -306,6 +285,7 @@ where
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         session_file_views: SessionFileViews,
     ) -> Result<OpenTransaction<StorageImpl>, LixError> {
         let read =
@@ -346,7 +326,7 @@ where
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_compiled_catalog(
             &Domain::schema_catalog(active_branch_id.clone(), true),
-            schema_catalog,
+            Arc::clone(&schema_catalog),
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         Ok(OpenTransaction {
@@ -357,13 +337,13 @@ where
                 binary_cas,
                 plugin_host,
                 branch_ctx,
-                catalog_context,
                 schema_resolver,
+                sql_schema_snapshot: schema_catalog,
+                sql_planning_cache,
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
                 storage,
-                sql_schema_cache: SqlSchemaCache::default(),
                 functions,
                 commit_boundary: None,
                 origin_key: None,
@@ -1652,6 +1632,47 @@ where
         &self.active_branch_id
     }
 
+    /// Returns the content identity of the SQL schema catalog captured when
+    /// this transaction opened.
+    pub(crate) fn sql_catalog_fingerprint(&self) -> &CatalogFingerprint {
+        self.sql_schema_snapshot.fingerprint()
+    }
+
+    pub(crate) fn sql_public_catalog(&self) -> Result<Arc<crate::sql2::PublicCatalog>, LixError> {
+        self.sql_planning_cache
+            .public_catalog(self.sql_catalog_fingerprint(), || {
+                Ok(self.sql_schema_snapshot.schema_jsons())
+            })
+    }
+
+    pub(crate) fn prepare_sql_write_logical_plan(
+        &self,
+        sql: &str,
+        statement: &DataFusionStatement,
+    ) -> Result<crate::sql2::SqlLogicalPlan, LixError> {
+        let fingerprint = self.sql_catalog_fingerprint();
+        if let Some(plan) =
+            self.sql_planning_cache
+                .write_plan(sql, fingerprint, &self.active_branch_id)
+        {
+            return Ok(crate::sql2::create_write_logical_plan_from_template(plan));
+        }
+
+        let catalog = self.sql_public_catalog()?;
+        let plan = crate::sql2::create_write_plan_template_from_parsed(
+            statement,
+            catalog.as_ref(),
+            &self.active_branch_id,
+        )?;
+        self.sql_planning_cache.remember_write_plan(
+            sql,
+            fingerprint.clone(),
+            &self.active_branch_id,
+            &plan,
+        );
+        Ok(crate::sql2::create_write_logical_plan_from_template(plan))
+    }
+
     /// Returns this transaction's prepared runtime functions.
     pub(crate) fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
@@ -1667,14 +1688,13 @@ where
         statement: DataFusionStatement,
         params: &[Value],
     ) -> Result<SqlQueryResult, LixError> {
-        self.prepare_sql_visible_schemas().await?;
         let storage = self.storage.clone();
         let read = storage.begin_read(StorageReadOptions::default()).await?;
         let active_branch_id = self.active_branch_id.clone();
         let live_state = Arc::clone(&self.live_state);
         let binary_cas = Arc::clone(&self.binary_cas);
         let branch_ctx = Arc::clone(&self.branch_ctx);
-        let visible_schemas = self.cached_visible_schemas()?.to_vec();
+        let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
         let staged_writes = Arc::clone(&self.staged_writes);
@@ -1707,26 +1727,8 @@ where
         .await
     }
 
-    pub(crate) async fn prepare_sql_visible_schemas(&mut self) -> Result<(), LixError> {
-        if self.sql_schema_cache.is_prepared() {
-            return Ok(());
-        }
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let live_state = self.live_state.reader(&read);
-        let visible_schemas = self
-            .catalog_context
-            .schema_jsons_for_sql_read_planning(&live_state, &self.active_branch_id)
-            .await?;
-        self.sql_schema_cache.prepare(visible_schemas);
-        Ok(())
-    }
-
-    fn cached_visible_schemas(&self) -> Result<&[JsonValue], LixError> {
-        self.sql_schema_cache.visible_schemas()
+    fn sql_visible_schemas(&self) -> Vec<JsonValue> {
+        self.sql_schema_snapshot.schema_jsons()
     }
 
     /// Advances a branch ref without staging tracked rows.
@@ -2168,6 +2170,7 @@ pub(crate) async fn open_transaction<StorageImpl>(
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
+    sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     session_file_views: SessionFileViews,
 ) -> Result<OpenTransaction<StorageImpl>, LixError>
 where
@@ -2182,6 +2185,7 @@ where
         plugin_host,
         branch_ctx,
         catalog_context,
+        sql_planning_cache,
         session_file_views,
     )
     .await
@@ -2201,7 +2205,11 @@ where
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        Ok(self.cached_visible_schemas()?.to_vec())
+        Ok(self.sql_visible_schemas())
+    }
+
+    fn public_catalog(&self) -> Result<Arc<crate::sql2::PublicCatalog>, LixError> {
+        self.sql_public_catalog()
     }
 
     fn plugin_host(&self) -> PluginRuntimeHost {
@@ -2997,6 +3005,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
+            Arc::new(SqlPlanningCache::default()),
             SessionFileViews::default(),
         )
         .await
@@ -3219,6 +3228,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
+            Arc::new(SqlPlanningCache::default()),
             SessionFileViews::default(),
         )
         .await
@@ -3502,6 +3512,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             catalog_context,
+            Arc::new(SqlPlanningCache::default()),
             SessionFileViews::default(),
         )
         .await

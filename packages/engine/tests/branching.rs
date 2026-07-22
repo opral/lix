@@ -371,6 +371,48 @@ simulation_test!(
 );
 
 simulation_test!(
+    cached_write_templates_are_isolated_across_branch_switches,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+        let insert_sql = "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)";
+
+        main.execute(
+            insert_sql,
+            &[
+                Value::Text("template-main-only".to_string()),
+                Value::Text("main".to_string()),
+            ],
+        )
+        .await
+        .expect("main write should warm the exact SQL template");
+
+        let (switched, _) = main
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "draft-branch".to_string(),
+            })
+            .await
+            .expect("switch should succeed");
+        switched
+            .execute(
+                insert_sql,
+                &[
+                    Value::Text("template-draft-only".to_string()),
+                    Value::Text("draft".to_string()),
+                ],
+            )
+            .await
+            .expect("the same SQL should bind to the switched branch");
+
+        assert_key_value(&switched, "template-draft-only", Some("\"draft\"")).await;
+        assert_key_value(&main, "template-draft-only", None).await;
+        assert_key_value(&main, "template-main-only", Some("\"main\"")).await;
+        assert_key_value(&switched, "template-main-only", None).await;
+
+        drop(engine);
+    }
+);
+
+simulation_test!(
     pinned_switch_branch_is_ephemeral_and_does_not_advance_refs,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;

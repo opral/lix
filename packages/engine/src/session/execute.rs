@@ -452,24 +452,20 @@ where
         defer_file_view_acknowledgement: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
-        let statement = sql2::parse_statement(sql)?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             let write_access = self.begin_session_write_access().await?;
             let sql_for_error = sql.to_string();
+            let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
                 .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
                         let previous_origin_key =
                             transaction.replace_origin_key(options.origin_key);
-                        // Re-plan against the transaction-backed write
-                        // session so provider hooks read and stage through the
-                        // transaction-owned SQL write context.
                         let result = async {
-                            transaction.prepare_sql_visible_schemas().await?;
-                            let tx_plan =
-                                sql2::create_write_logical_plan_from_parsed(transaction, statement)
-                                    .await?;
+                            let tx_plan = transaction
+                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
                             let result = sql2::execute_write_logical_plan_result(
                                 transaction,
                                 tx_plan,
@@ -605,7 +601,7 @@ where
         }
 
         let statements = statements.to_vec();
-        match classify_execute_batch(&statements)? {
+        match classify_execute_batch(&statements, &self.sql_planning_cache)? {
             ExecuteBatchExecution::ReadOnly(parsed) => {
                 self.execute_read_only_batch(&statements, parsed).await
             }
@@ -771,7 +767,7 @@ where
         let parsed = statements
             .iter()
             .map(|(sql, _)| {
-                let statement = sql2::parse_statement(sql)?;
+                let statement = self.sql_planning_cache.parse_statement(sql)?;
                 if sql2::statement_has_durable_runtime_function(&statement) {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
@@ -910,18 +906,17 @@ where
         mode: sql2::WriteExecutorMode,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
-        let statement = sql2::parse_statement(sql)?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             let write_access = self.begin_session_write_access().await?;
             let sql_for_error = sql.to_string();
+            let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
                 .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
-                        transaction.prepare_sql_visible_schemas().await?;
-                        let tx_plan =
-                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
-                                .await?;
+                        let tx_plan = transaction
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
                         let result = sql2::execute_write_logical_plan_with_mode_result(
                             transaction,
                             tx_plan,
@@ -1112,7 +1107,7 @@ where
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
         let operation = async {
             let _operation_guard = self.begin_session_operation()?;
-            let statement = sql2::parse_statement(sql)?;
+            let statement = self.sql_planning_cache.parse_statement(sql)?;
             let transaction = self.transaction_mut()?;
             execute_transaction_statement(transaction, sql, statement, params, options)
                 .await
@@ -1136,11 +1131,11 @@ where
         mode: sql2::WriteExecutorMode,
     ) -> Result<ExecuteResult, LixError> {
         let _operation_guard = self.begin_session_operation()?;
-        let statement = sql2::parse_statement(sql)?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
             sql2::BoundStatementRoute::Write => {
-                execute_transaction_write_with_mode(transaction, statement, params, mode)
+                execute_transaction_write_with_mode(transaction, sql, statement, params, mode)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
@@ -1156,14 +1151,18 @@ where
         mode: sql2::WriteExecutorMode,
     ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
         let _operation_guard = self.begin_session_operation()?;
-        let statement = sql2::parse_statement(sql)?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
-            sql2::BoundStatementRoute::Write => {
-                execute_transaction_write_with_mode_and_trace(transaction, statement, params, mode)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))
-            }
+            sql2::BoundStatementRoute::Write => execute_transaction_write_with_mode_and_trace(
+                transaction,
+                sql,
+                statement,
+                params,
+                mode,
+            )
+            .await
+            .map_err(|error| normalize_sql_surface_error(error, sql)),
             sql2::BoundStatementRoute::Read => {
                 self.execute(sql, params).await.map(|result| (result, None))
             }
@@ -1187,6 +1186,7 @@ where
 
 async fn execute_transaction_write_auto<StorageImpl>(
     transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    sql: &str,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     options: ExecuteOptions,
@@ -1196,8 +1196,7 @@ where
 {
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
-        transaction.prepare_sql_visible_schemas().await?;
-        let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+        let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
         let result = sql2::execute_write_logical_plan_result(transaction, tx_plan, params).await?;
         Ok(ExecuteResult::from_sql_write_result(result))
     }
@@ -1485,6 +1484,7 @@ fn point_identity_value_is_text(
 
 fn classify_execute_batch(
     statements: &[ExecuteBatchStatement],
+    planning_cache: &sql2::SqlPlanningCache<crate::catalog::CatalogFingerprint>,
 ) -> Result<ExecuteBatchExecution, LixError> {
     // Classify the complete batch before choosing a snapshot or transaction;
     // switching execution modes between statements would break atomicity, and
@@ -1493,7 +1493,8 @@ fn classify_execute_batch(
     let mut parsed = Vec::with_capacity(statements.len());
     let mut is_read_only = true;
     for (statement_index, statement) in statements.iter().enumerate() {
-        let parsed_statement = sql2::parse_statement(&statement.sql)
+        let parsed_statement = planning_cache
+            .parse_statement(&statement.sql)
             .map_err(|error| with_batch_statement_index(error, statement_index))?;
         let route = sql2::bind_statement_route(&parsed_statement)
             .map_err(|error| with_batch_statement_index(error, statement_index))?;
@@ -1523,7 +1524,7 @@ where
 {
     match sql2::bind_statement_route(&statement)? {
         sql2::BoundStatementRoute::Write => {
-            execute_transaction_write_auto(transaction, statement, params, options).await
+            execute_transaction_write_auto(transaction, sql, statement, params, options).await
         }
         sql2::BoundStatementRoute::Read => transaction
             .execute_read_sql_statement(sql, statement, params)
@@ -1553,6 +1554,7 @@ fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> Li
 #[cfg(test)]
 async fn execute_transaction_write_with_mode<StorageImpl>(
     transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    sql: &str,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     mode: sql2::WriteExecutorMode,
@@ -1560,8 +1562,7 @@ async fn execute_transaction_write_with_mode<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    transaction.prepare_sql_visible_schemas().await?;
-    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
     let result =
         sql2::execute_write_logical_plan_with_mode_result(transaction, tx_plan, params, mode)
             .await?;
@@ -1571,6 +1572,7 @@ where
 #[cfg(test)]
 async fn execute_transaction_write_with_mode_and_trace<StorageImpl>(
     transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    sql: &str,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     mode: sql2::WriteExecutorMode,
@@ -1578,8 +1580,7 @@ async fn execute_transaction_write_with_mode_and_trace<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    transaction.prepare_sql_visible_schemas().await?;
-    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
     let (result, path) = sql2::execute_write_logical_plan_with_mode_and_trace_result(
         transaction,
         tx_plan,
@@ -1644,34 +1645,45 @@ mod tests {
 
     #[test]
     fn execute_batch_classifies_only_pure_reads_for_the_fast_path() {
+        let cache = sql2::SqlPlanningCache::default();
         assert!(matches!(
-            classify_execute_batch(&[
-                batch_statement("SELECT 1"),
-                batch_statement("SELECT * FROM lix_file"),
-            ])
+            classify_execute_batch(
+                &[
+                    batch_statement("SELECT 1"),
+                    batch_statement("SELECT * FROM lix_file"),
+                ],
+                &cache
+            )
             .unwrap(),
             ExecuteBatchExecution::ReadOnly(_)
         ));
         assert!(matches!(
-            classify_execute_batch(&[
-                batch_statement("SELECT 1"),
-                batch_statement("DELETE FROM lix_file WHERE id = 'missing'"),
-            ])
+            classify_execute_batch(
+                &[
+                    batch_statement("SELECT 1"),
+                    batch_statement("DELETE FROM lix_file WHERE id = 'missing'"),
+                ],
+                &cache
+            )
             .unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
         assert!(matches!(
-            classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")]).unwrap(),
+            classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")], &cache).unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
     }
 
     #[test]
     fn execute_batch_classification_preserves_the_invalid_statement_index() {
-        let result = classify_execute_batch(&[
-            batch_statement("SELECT 1"),
-            batch_statement("this is not SQL"),
-        ]);
+        let cache = sql2::SqlPlanningCache::default();
+        let result = classify_execute_batch(
+            &[
+                batch_statement("SELECT 1"),
+                batch_statement("this is not SQL"),
+            ],
+            &cache,
+        );
         let Err(error) = result else {
             panic!("invalid SQL should fail classification");
         };

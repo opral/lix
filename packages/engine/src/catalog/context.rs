@@ -390,6 +390,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compiled_catalog_projects_the_same_sql_visible_schemas() {
+        let context = CatalogContext::new();
+        let mut tracked = registered_schema_row("zeta_tracked_schema");
+        tracked.untracked = false;
+        let reader = RowsLiveStateReader::new(vec![
+            registered_schema_row("alpha_untracked_schema"),
+            tracked,
+        ]);
+        let domain = Domain::schema_catalog("global", true);
+
+        let durable_projection = context
+            .schema_jsons_for_sql_read_planning(&reader, "global")
+            .await
+            .expect("SQL schema visibility should load");
+        let compiled_projection = context
+            .compiled_catalog_for_domain(&reader, &domain)
+            .await
+            .expect("catalog should compile")
+            .schema_jsons();
+
+        assert_eq!(compiled_projection, durable_projection);
+    }
+
+    #[tokio::test]
     async fn visible_schemas_include_registered_schema_rows() {
         let context = CatalogContext::new();
 

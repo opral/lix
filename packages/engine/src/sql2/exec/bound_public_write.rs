@@ -11,9 +11,7 @@ use crate::sql2::bind::write::{
     BoundWriteOp, BoundWriteTarget, EntityWriteSurface, FileWriteSurface,
 };
 use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
-use crate::sql2::catalog::{
-    EntityColumnType, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
-};
+use crate::sql2::catalog::{EntityColumnType, EntitySurfaceSpec};
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
@@ -1310,10 +1308,9 @@ fn entity_spec(
     ctx: &dyn SqlWriteExecutionContext,
     schema_key: &str,
 ) -> Result<EntitySurfaceSpec, LixError> {
-    ctx.list_visible_schemas()?
-        .into_iter()
-        .filter_map(|schema| derive_entity_surface_spec_from_schema(&schema).ok())
-        .find(|spec| spec.schema_key == schema_key)
+    ctx.public_catalog()?
+        .entity_spec(schema_key)
+        .cloned()
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,

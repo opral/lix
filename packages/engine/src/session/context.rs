@@ -11,7 +11,7 @@ use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
 };
-use crate::catalog::CatalogContext;
+use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
@@ -23,7 +23,7 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
@@ -60,6 +60,7 @@ pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) file_views: SessionFileViews,
@@ -81,6 +82,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -96,6 +98,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             observe_coordinator,
@@ -115,6 +118,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -132,6 +136,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             observe_coordinator,
@@ -149,6 +154,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -164,6 +170,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             observe_coordinator,
@@ -183,6 +190,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_coordinator: Arc<ObserveCoordinator>,
@@ -200,6 +208,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
             file_views,
@@ -464,6 +473,7 @@ where
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
         )
         .await?;

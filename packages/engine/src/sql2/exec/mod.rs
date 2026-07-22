@@ -44,8 +44,8 @@ pub(crate) use write::{
     execute_write_logical_plan_with_mode_result,
 };
 pub(crate) use write::{
-    WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_parsed,
-    execute_write_logical_plan_result,
+    WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
+    create_write_plan_template_from_parsed, execute_write_logical_plan_result,
 };
 
 pub(crate) enum SqlLogicalPlan {
