@@ -22,8 +22,8 @@ use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use slatedb::config::{
-    CompressionCodec, ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDBScanOptions,
-    Settings, WriteOptions as SlateDBWriteOptions,
+    CompressionCodec, ObjectStoreCacheOptions, ScanOptions as SlateDBScanOptions, Settings,
+    WriteOptions as SlateDBWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
@@ -683,7 +683,7 @@ fn open_slatedb(
                 max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
                 part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
                 cache_puts: true,
-                preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+                preload_disk_cache_on_startup: None,
                 scan_interval: None,
                 ..ObjectStoreCacheOptions::default()
             };
@@ -1043,6 +1043,73 @@ mod tests {
         let directory = tempfile::tempdir().expect("create fresh local storage directory");
         let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
         assert_eq!(storage.path(), directory.path());
+    }
+
+    #[test]
+    fn cached_open_does_not_preload_ssts() {
+        let inner = Arc::new(InMemory::new());
+        let db_path = "test-on-demand-disk-cache";
+        let physical_db_path = join_db_path(db_path, LZ4_FORMAT_PATH);
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build raw SlateDB test runtime")
+            .block_on(async {
+                let db = Db::builder(physical_db_path, inner.clone())
+                    .with_settings(slatedb_settings())
+                    .with_db_cache_disabled()
+                    .build()
+                    .await
+                    .expect("open raw SlateDB");
+                let mut batch = WriteBatch::new();
+                batch.put(b"key", b"value");
+                db.write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: false,
+                        ..SlateDBWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("write raw SlateDB row");
+                db.flush().await.expect("flush raw SlateDB WAL");
+                db.flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .expect("flush raw SlateDB memtable");
+                db.close().await.expect("close raw SlateDB");
+            });
+
+        let store = Arc::new(BlockingStore::new(inner));
+        let blocked_reads = store.block_compacted_reads();
+        let cache_dir = tempfile::tempdir().expect("create disk cache directory");
+        let cache_root = cache_dir.path().to_path_buf();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            opened_tx
+                .send(SlateDB::open_object_store_with_options(
+                    db_path,
+                    store,
+                    SlateDBObjectStoreOptions {
+                        cache: Some(SlateDBCacheOptions {
+                            root_folder: cache_root,
+                            max_disk_cache_bytes: 16 * 1024 * 1024,
+                            block_cache_bytes: 0,
+                            metadata_cache_bytes: 0,
+                        }),
+                    },
+                ))
+                .expect("send cached open result");
+        });
+
+        let opened = opened_rx.recv_timeout(Duration::from_secs(5));
+        drop(blocked_reads);
+        opener.join().expect("join cached opener");
+        let storage = opened
+            .expect("cached open must not wait for SST reads")
+            .expect("open cached SlateDB");
+        drop(storage);
     }
 
     #[test]
@@ -1478,6 +1545,7 @@ mod tests {
         fail_writes: Arc<AtomicBool>,
         writes: Arc<OperationBlock>,
         block_reads: Arc<AtomicBool>,
+        block_compacted_reads: Arc<AtomicBool>,
         reads: Arc<OperationBlock>,
     }
 
@@ -1489,6 +1557,7 @@ mod tests {
                 fail_writes: Arc::new(AtomicBool::new(false)),
                 writes: Arc::new(OperationBlock::default()),
                 block_reads: Arc::new(AtomicBool::new(false)),
+                block_compacted_reads: Arc::new(AtomicBool::new(false)),
                 reads: Arc::new(OperationBlock::default()),
             }
         }
@@ -1503,6 +1572,13 @@ mod tests {
 
         fn block_sst_reads(&self) -> OperationBlockGuard {
             OperationBlockGuard::arm(Arc::clone(&self.block_reads), Arc::clone(&self.reads))
+        }
+
+        fn block_compacted_reads(&self) -> OperationBlockGuard {
+            OperationBlockGuard::arm(
+                Arc::clone(&self.block_compacted_reads),
+                Arc::clone(&self.reads),
+            )
         }
 
         fn maybe_block_write(&self) {
@@ -1522,11 +1598,13 @@ mod tests {
         }
 
         fn maybe_block_read(&self, location: &ObjectPath) {
-            if self.block_reads.load(Ordering::Acquire)
-                && location
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"))
-            {
+            let is_sst = location
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"));
+            let block_all_ssts = self.block_reads.load(Ordering::Acquire);
+            let block_compacted = self.block_compacted_reads.load(Ordering::Acquire)
+                && location.as_ref().contains("/compacted/");
+            if is_sst && (block_all_ssts || block_compacted) {
                 self.reads.enter();
             }
         }
