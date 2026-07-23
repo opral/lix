@@ -4,7 +4,7 @@ use crate::LixError;
 use crate::binary_cas::{BlobHash, BlobPayload};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::LixTimestamp;
+use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance};
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
@@ -188,6 +188,15 @@ pub(crate) struct TransactionFileData {
     /// scanning the filesystem during plugin reconciliation. Inserts and
     /// callers without a prior row leave this false.
     pub(crate) had_blob_ref: bool,
+    /// Validated transport splice that produced `payload`, when the ordinary
+    /// SQL blob parameter arrived through the remote splice optimization.
+    /// This is transient execution provenance and is never persisted as file
+    /// or plugin state.
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    /// Retry-stable mutation identity supplied by transport execution
+    /// metadata. It is transient; only a bounded reservation proof derived
+    /// from it can become durable plugin state.
+    mutation_identity: Option<MutationIdentity>,
     payload: BlobPayload,
     /// Content-addressed payloads produced while validating this file write.
     /// Plugin installation uses this for the extracted WASM component so
@@ -213,6 +222,8 @@ impl TransactionFileData {
             global,
             untracked,
             had_blob_ref: false,
+            splice_provenance: None,
+            mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
             auxiliary_payloads: Vec::new(),
         }
@@ -223,12 +234,38 @@ impl TransactionFileData {
         self
     }
 
+    pub(crate) fn set_splice_provenance(
+        &mut self,
+        splice_provenance: Option<RequestBlobSpliceProvenance>,
+    ) {
+        self.splice_provenance = splice_provenance;
+    }
+
+    pub(crate) fn splice_provenance(&self) -> Option<&RequestBlobSpliceProvenance> {
+        self.splice_provenance.as_ref()
+    }
+
+    pub(crate) fn set_mutation_identity(&mut self, mutation_identity: Option<MutationIdentity>) {
+        self.mutation_identity = mutation_identity;
+    }
+
+    pub(crate) fn mutation_identity(&self) -> Option<MutationIdentity> {
+        self.mutation_identity
+    }
+
     pub(crate) fn add_auxiliary_payload(&mut self, data: Vec<u8>) {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
     }
 
     pub(crate) fn data(&self) -> &[u8] {
         self.payload.bytes()
+    }
+
+    pub(crate) fn replace_data(&mut self, data: Vec<u8>) {
+        self.payload = BlobPayload::from_bytes(data);
+        // Transport provenance describes the replaced request payload. Once a
+        // plugin renderer materializes merged bytes, it no longer applies.
+        self.splice_provenance = None;
     }
 
     pub(crate) fn blob_hash(&self) -> Option<BlobHash> {

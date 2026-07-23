@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFileScanRequest,
-    LiveStateReader, LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateReader, LiveStateRowIdentity,
+    LiveStateScanRequest, MaterializedLiveStateRow,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,14 +25,6 @@ pub(crate) trait StagedLiveStateRows {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn staged_file_rows(
-        &self,
-        request: &LiveStateFileScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.staged_rows(&request.to_scan_request())
-    }
 
     /// Loads exact staged storage identities in request order.
     ///
@@ -153,34 +145,6 @@ where
                 branch_ids: request.filter.branch_ids.clone(),
             },
             include_tombstones: request.filter.include_tombstones,
-            limit: request.limit,
-        },
-    ))
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn overlay_scan_file_rows<S>(
-    base: &dyn LiveStateReader,
-    staged: &S,
-    request: &LiveStateFileScanRequest,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError>
-where
-    S: StagedLiveStateRows + ?Sized,
-{
-    let mut candidate_request = request.clone();
-    candidate_request.limit = None;
-    candidate_request.include_tombstones = true;
-    candidate_request.branch_ids = expanded_branch_ids(&request.branch_ids);
-    let staged_rows = staged.staged_file_rows(&candidate_request)?;
-    let rows = base.scan_file_rows(&candidate_request).await?;
-    Ok(resolve_visible_rows(
-        rows,
-        staged_rows,
-        &VisibilityRequest {
-            branch_scope: VisibilityBranchScope::BranchIds {
-                branch_ids: request.branch_ids.clone(),
-            },
-            include_tombstones: request.include_tombstones,
             limit: request.limit,
         },
     ))
@@ -501,7 +465,7 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
-    use crate::live_state::{LiveStateFileScanRequest, LiveStateProjection, LiveStateRowRequest};
+    use crate::live_state::LiveStateRowRequest;
     use async_trait::async_trait;
 
     #[test]
@@ -925,40 +889,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
-    #[test]
-    fn file_scan_request_lowers_to_equivalent_generic_scan_request() {
-        let request = LiveStateFileScanRequest {
-            branch_ids: vec!["branch-a".to_string()],
-            file_id: "file-a".to_string(),
-            schema_keys: vec!["schema-a".to_string(), "schema-b".to_string()],
-            untracked: Some(false),
-            include_tombstones: true,
-            projection: LiveStateProjection {
-                columns: vec!["snapshot_content".to_string(), "metadata".to_string()],
-            },
-            limit: Some(3),
-        };
-
-        let scan = request.to_scan_request();
-
-        assert_eq!(scan.filter.branch_ids, vec!["branch-a"]);
-        assert_eq!(
-            scan.filter.file_ids,
-            vec![NullableKeyFilter::Value("file-a".to_string())]
-        );
-        assert_eq!(
-            scan.filter.schema_keys,
-            vec!["schema-a".to_string(), "schema-b".to_string()]
-        );
-        assert_eq!(scan.filter.untracked, Some(false));
-        assert!(scan.filter.include_tombstones);
-        assert_eq!(
-            scan.projection.columns,
-            vec!["snapshot_content".to_string(), "metadata".to_string()]
-        );
-        assert_eq!(scan.limit, Some(3));
-    }
-
     #[tokio::test]
     async fn overlay_scan_fetches_base_global_candidates_for_staged_only_branch_scope() {
         let base = ExistingGlobalOnlyReader {
@@ -992,68 +922,6 @@ mod tests {
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"global-value\"}")
-        );
-    }
-
-    #[tokio::test]
-    async fn overlay_scan_file_rows_matches_equivalent_generic_overlay_scan() {
-        let base = FilteringReader {
-            rows: vec![
-                file_row_at("global", "shared", "global", true, "schema-a", "file-a"),
-                file_row_at(
-                    "branch-a",
-                    "shared",
-                    "branch-base",
-                    false,
-                    "schema-a",
-                    "file-a",
-                ),
-                file_row_at(
-                    "branch-a",
-                    "other-file",
-                    "ignored",
-                    false,
-                    "schema-a",
-                    "file-b",
-                ),
-                file_row_at(
-                    "branch-a",
-                    "other-schema",
-                    "ignored",
-                    false,
-                    "schema-b",
-                    "file-a",
-                ),
-            ],
-        };
-        let staged = FilteringStagedRows {
-            rows: vec![file_row_at(
-                "branch-a", "shared", "staged", false, "schema-a", "file-a",
-            )],
-        };
-        let file_request = LiveStateFileScanRequest {
-            branch_ids: vec!["branch-a".to_string()],
-            file_id: "file-a".to_string(),
-            schema_keys: vec!["schema-a".to_string()],
-            projection: LiveStateProjection {
-                columns: vec!["snapshot_content".to_string()],
-            },
-            ..Default::default()
-        };
-        let generic_request = file_request.to_scan_request();
-
-        let file_rows = overlay_scan_file_rows(&base, &staged, &file_request)
-            .await
-            .expect("file overlay scan should succeed");
-        let generic_rows = overlay_scan_rows(&base, &staged, &generic_request)
-            .await
-            .expect("generic overlay scan should succeed");
-
-        assert_eq!(file_rows, generic_rows);
-        assert_eq!(file_rows.len(), 1);
-        assert_eq!(
-            file_rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"staged\"}")
         );
     }
 

@@ -873,9 +873,11 @@ enum ProfileSession {
 
 async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSession {
     match profile {
-        LixStorageProfile::SQLite => ProfileSession::SQLite(prepare_session_empty(sqlite()).await),
+        LixStorageProfile::SQLite => {
+            ProfileSession::SQLite(Box::pin(prepare_session_empty(sqlite())).await)
+        }
         LixStorageProfile::RocksDB => {
-            ProfileSession::RocksDB(prepare_session_empty(rocksdb()).await)
+            ProfileSession::RocksDB(Box::pin(prepare_session_empty(rocksdb())).await)
         }
     }
 }

@@ -151,8 +151,12 @@ async fn cached_slatedb_rebuilds_after_local_cache_is_deleted() {
     let space = SpaceId(11);
 
     {
-        let storage = SlateDB::open_object_store(db_path, object_store.clone())
-            .expect("open uncached seed storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open uncached seed storage");
         let mut write = storage
             .begin_write(WriteOptions::default())
             .await
@@ -194,8 +198,12 @@ async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
     let rejected_key = Key(Bytes::from_static(b"rejected"));
 
     {
-        let storage = SlateDB::open_object_store(db_path, object_store.clone())
-            .expect("open failure-test seed storage");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open failure-test seed storage");
         write_one(&storage, space, durable_key.clone(), b"persisted")
             .await
             .expect("persist seed value");
@@ -226,8 +234,12 @@ async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
     }
 
     std::fs::remove_dir_all(&cache_path).expect("delete failure-test cache");
-    let reopened = SlateDB::open_object_store(db_path, object_store)
-        .expect("reopen failure-test storage from durable store");
+    let reopened = SlateDB::open_object_store_with_options(
+        db_path,
+        object_store,
+        SlateDBObjectStoreOptions::default(),
+    )
+    .expect("reopen failure-test storage from durable store");
     let read = reopened
         .begin_read(ReadOptions::default())
         .await
@@ -250,8 +262,12 @@ async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
 async fn slatedb_explicit_flush_makes_visible_commit_durable() {
     let object_store = Arc::new(InMemory::new());
     let counting_store = Arc::new(FaultStore::new(object_store));
-    let storage = SlateDB::open_object_store("slatedb-explicit-wal-flush", counting_store.clone())
-        .expect("open explicit WAL flush storage");
+    let storage = SlateDB::open_object_store_with_options(
+        "slatedb-explicit-wal-flush",
+        counting_store.clone(),
+        SlateDBObjectStoreOptions::default(),
+    )
+    .expect("open explicit WAL flush storage");
     counting_store.reset_write_count();
 
     write_one(

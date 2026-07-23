@@ -20,6 +20,7 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, Stora
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
+use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
@@ -218,6 +219,20 @@ where
         .await
     }
 
+    /// Returns process-local work accumulated by completed v2 transitions on
+    /// this engine. The snapshot is shared by every session cloned from it.
+    #[doc(hidden)]
+    pub fn plugin_v2_transition_counters(&self) -> WasmTransitionCounters {
+        self.plugin_host.v2_transition_counters()
+    }
+
+    /// Resets the process-local v2 transition aggregate used by profiling and
+    /// invariant tests. This does not mutate durable workspace state.
+    #[doc(hidden)]
+    pub fn reset_plugin_v2_transition_counters(&self) {
+        self.plugin_host.reset_v2_transition_counters();
+    }
+
     /// Rebuilds the tracked serving commit root for one branch from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need
@@ -247,6 +262,11 @@ where
             .rebuild_commit_root_at(&head_commit_id)
             .await;
         rebuild_result?;
+        // A healthy rebuild is content-equivalent, but this API also repairs a
+        // stale or damaged serving root. Conservatively invalidate transaction
+        // opening catalogs so repaired registered-schema facts are never hidden
+        // behind a pre-rebuild cache entry.
+        crate::catalog::stage_catalog_revision(&mut writes);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

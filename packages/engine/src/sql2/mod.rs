@@ -44,7 +44,8 @@ pub(crate) use exec::{
     SqlLogicalPlan, create_write_logical_plan_from_template,
     create_write_plan_template_from_parsed, execute_read_statement_from_parsed,
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
-    execute_write_logical_plan_result, prepare_read_session, prepare_read_session_at_head,
+    execute_write_logical_plan_result_with_metadata, prepare_read_session,
+    prepare_read_session_at_head,
 };
 #[cfg(test)]
 pub(crate) use exec::{
@@ -61,6 +62,7 @@ pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::SqlPlanningCache;
 pub(crate) use providers::{
-    ExactLixFileReadColumn, ExactLixFileReadSelector, execute_exact_lix_file_read,
+    ExactLixFileReadColumn, ExactLixFileReadSelector, execute_exact_lix_file_batch_read,
+    execute_exact_lix_file_read,
 };
 pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};

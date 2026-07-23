@@ -2941,7 +2941,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_lix_state_history_from_history_context() {
-        let (session, head_commit_id) = setup_engine_history_fixture()
+        let (session, head_commit_id) = Box::pin(setup_engine_history_fixture())
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -2980,7 +2980,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_entity_history_view_from_history_context() {
-        let (session, head_commit_id) = setup_engine_history_fixture()
+        let (session, head_commit_id) = Box::pin(setup_engine_history_fixture())
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -3017,7 +3017,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_directory_history_view_from_history_context() {
-        let (session, head_commit_id) = setup_engine_history_fixture()
+        let (session, head_commit_id) = Box::pin(setup_engine_history_fixture())
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -3077,7 +3077,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_file_history_view_from_history_context() {
-        let (session, head_commit_id) = setup_engine_history_fixture()
+        let (session, head_commit_id) = Box::pin(setup_engine_history_fixture())
             .await
             .expect("history fixture should initialize");
         let result = session

@@ -18,14 +18,12 @@ pub(crate) use reader::LiveStateReader;
 pub(crate) use reader::load_exact_rows_via_scan_for_test;
 #[allow(unused_imports)]
 pub(crate) use types::{
-    Bound, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFileScanRequest,
-    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentity,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, ScanConstraint, ScanField,
-    ScanOperator,
+    Bound, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
+    LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentity, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow, ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{
     StagedLiveStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    overlay_load_exact_rows, overlay_scan_file_rows, overlay_scan_rows, overlay_scan_tracked_rows,
-    resolve_visible_rows,
+    overlay_load_exact_rows, overlay_scan_rows, overlay_scan_tracked_rows, resolve_visible_rows,
 };

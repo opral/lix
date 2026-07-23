@@ -43,7 +43,10 @@ const REQUEST_BLOB_DELTA_MIN_BYTES = 32 * 1024;
 const REQUEST_BLOB_DELTA_MIN_WIRE_RATIO = 0.9;
 const REQUEST_BLOB_COMPARE_WORD_BYTES = 8;
 const REQUEST_BLOB_BASE_MAX_ENTRIES = 8;
-const REQUEST_BLOB_BASE_MAX_BYTES = 2 * 1024 * 1024;
+// Match the server's per-session aggregate base budget. One 10.68 MB CSV base
+// fits; committing its successor removes the same-slot predecessor before the
+// new base is retained, so repeated large-file edits stay bounded.
+const REQUEST_BLOB_BASE_MAX_BYTES = 16 * 1024 * 1024;
 const REMOTE_BLOB_BASE_MISSING = "LIX_REMOTE_BLOB_BASE_MISSING";
 const WIRE_BLOB_JSON_ENVELOPE_BYTES = JSON.stringify({
 	kind: "blob",

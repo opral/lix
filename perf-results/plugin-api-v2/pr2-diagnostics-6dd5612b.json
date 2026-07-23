@@ -1,0 +1,511 @@
+{
+  "candidate_commit": "6dd5612b",
+  "classification": "separate diagnostic evidence; paired latency acceptance is in pr2-paired-{raw,gate}-6dd5612b.json",
+  "fallback_without_splice_provenance": {
+    "rocksdb-fs": {
+      "edit_samples_ms": [
+        69.759782,
+        74.851968
+      ],
+      "measured_counters": [
+        {
+          "attachment_bytes_read": 0,
+          "attachment_reads": 0,
+          "change_payload_requests": 0,
+          "component_boundary_bytes": 479,
+          "component_import_calls": 1,
+          "durable_semantic_changes": 1,
+          "filesystem_sync_full_renders": 0,
+          "full_document_reparses": 0,
+          "full_renderer_invocations": 0,
+          "full_state_semantic_rows_materialized": 0,
+          "guest_linear_memory_high_water_bytes": 61145088,
+          "host_full_content_classification_bytes": 10680000,
+          "host_full_diff_bytes_compared": 21360002,
+          "label": "edit",
+          "packet_pages": 2,
+          "packet_records": 2,
+          "private_document_cache_hits": 1,
+          "returned_change_payloads": 0,
+          "round": 0,
+          "shared_renderer_cache_hits": 1,
+          "source_bytes_read": 0,
+          "source_read_calls": 0
+        },
+        {
+          "attachment_bytes_read": 0,
+          "attachment_reads": 0,
+          "change_payload_requests": 0,
+          "component_boundary_bytes": 500,
+          "component_import_calls": 1,
+          "durable_semantic_changes": 1,
+          "filesystem_sync_full_renders": 0,
+          "full_document_reparses": 0,
+          "full_renderer_invocations": 0,
+          "full_state_semantic_rows_materialized": 0,
+          "guest_linear_memory_high_water_bytes": 61145088,
+          "host_full_content_classification_bytes": 10680007,
+          "host_full_diff_bytes_compared": 21360002,
+          "label": "edit",
+          "packet_pages": 2,
+          "packet_records": 2,
+          "private_document_cache_hits": 1,
+          "returned_change_payloads": 0,
+          "round": 1,
+          "shared_renderer_cache_hits": 1,
+          "source_bytes_read": 0,
+          "source_read_calls": 0
+        }
+      ],
+      "production_wasm_memory_mib": 64,
+      "storage_bytes": {
+        "backend": "rocksdb-fs",
+        "bytes": 87947100
+      },
+      "storage_bytes_detail": {
+        "backend": "rocksdb-fs",
+        "materialized_file_bytes": 10680007,
+        "plugin_archive_bytes": 408975,
+        "rocksdb_bytes": 76858116
+      }
+    },
+    "slatedb-cached": {
+      "edit_samples_ms": [
+        100.647008,
+        109.967862
+      ],
+      "measured_counters": [
+        {
+          "attachment_bytes_read": 0,
+          "attachment_reads": 0,
+          "change_payload_requests": 0,
+          "component_boundary_bytes": 479,
+          "component_import_calls": 1,
+          "durable_semantic_changes": 1,
+          "filesystem_sync_full_renders": 0,
+          "full_document_reparses": 0,
+          "full_renderer_invocations": 0,
+          "full_state_semantic_rows_materialized": 0,
+          "guest_linear_memory_high_water_bytes": 61145088,
+          "host_full_content_classification_bytes": 10680000,
+          "host_full_diff_bytes_compared": 21360002,
+          "label": "edit",
+          "packet_pages": 2,
+          "packet_records": 2,
+          "private_document_cache_hits": 1,
+          "returned_change_payloads": 0,
+          "round": 0,
+          "shared_renderer_cache_hits": 1,
+          "source_bytes_read": 0,
+          "source_read_calls": 0
+        },
+        {
+          "attachment_bytes_read": 0,
+          "attachment_reads": 0,
+          "change_payload_requests": 0,
+          "component_boundary_bytes": 500,
+          "component_import_calls": 1,
+          "durable_semantic_changes": 1,
+          "filesystem_sync_full_renders": 0,
+          "full_document_reparses": 0,
+          "full_renderer_invocations": 0,
+          "full_state_semantic_rows_materialized": 0,
+          "guest_linear_memory_high_water_bytes": 61145088,
+          "host_full_content_classification_bytes": 10680007,
+          "host_full_diff_bytes_compared": 21360002,
+          "label": "edit",
+          "packet_pages": 2,
+          "packet_records": 2,
+          "private_document_cache_hits": 1,
+          "returned_change_payloads": 0,
+          "round": 1,
+          "shared_renderer_cache_hits": 1,
+          "source_bytes_read": 0,
+          "source_read_calls": 0
+        }
+      ],
+      "production_wasm_memory_mib": 64,
+      "storage_bytes": {
+        "backend": "slatedb-cached",
+        "bytes": 219927765
+      },
+      "storage_bytes_detail": {
+        "backend": "slatedb-cached",
+        "cache_bytes": 63253820,
+        "object_store_bytes": 156673945
+      }
+    }
+  },
+  "instrumented_provenance_lane": {
+    "rocksdb-fs": {
+      "edit_process": {
+        "elapsed": "0:03.97",
+        "file_system_inputs": 0,
+        "file_system_outputs": 282624,
+        "max_rss_bytes": 627707904,
+        "max_rss_kib": 612996
+      },
+      "edit_samples_ms": [
+        74.77052400000001
+      ],
+      "gross_retained_delta_bytes": 3157201,
+      "logical_io": {
+        "begin_read": 12,
+        "begin_write": 1,
+        "delete_calls": 1,
+        "delete_range_calls": 0,
+        "delete_rows": 1,
+        "get_many_calls": 720,
+        "get_many_keys": 805,
+        "get_many_values": 795,
+        "label": "edit",
+        "put_calls": 11,
+        "put_rows": 354,
+        "scan_calls": 1,
+        "scan_entries": 6
+      },
+      "logical_io_by_space": [
+        {
+          "get_many_calls": 3,
+          "get_many_keys": 31,
+          "get_many_values": 31,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 131073
+        },
+        {
+          "get_many_calls": 648,
+          "get_many_keys": 648,
+          "get_many_values": 648,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 262145
+        },
+        {
+          "get_many_calls": 20,
+          "get_many_keys": 20,
+          "get_many_values": 20,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 262148
+        },
+        {
+          "get_many_calls": 19,
+          "get_many_keys": 28,
+          "get_many_values": 24,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 262150
+        },
+        {
+          "get_many_calls": 1,
+          "get_many_keys": 9,
+          "get_many_values": 8,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 327684
+        },
+        {
+          "get_many_calls": 2,
+          "get_many_keys": 2,
+          "get_many_values": 1,
+          "label": "edit",
+          "scan_calls": 1,
+          "scan_entries": 6,
+          "space_id": 393217
+        },
+        {
+          "get_many_calls": 25,
+          "get_many_keys": 65,
+          "get_many_values": 61,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 393218
+        },
+        {
+          "get_many_calls": 1,
+          "get_many_keys": 1,
+          "get_many_values": 1,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 458754
+        },
+        {
+          "get_many_calls": 1,
+          "get_many_keys": 1,
+          "get_many_values": 1,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 458755
+        }
+      ],
+      "measured_counters": {
+        "attachment_bytes_read": 0,
+        "attachment_reads": 0,
+        "change_payload_requests": 0,
+        "component_boundary_bytes": 500,
+        "component_import_calls": 1,
+        "durable_semantic_changes": 1,
+        "filesystem_sync_full_renders": 0,
+        "full_document_reparses": 0,
+        "full_renderer_invocations": 0,
+        "full_state_semantic_rows_materialized": 0,
+        "guest_linear_memory_high_water_bytes": 61145088,
+        "host_full_content_classification_bytes": 0,
+        "host_full_diff_bytes_compared": 0,
+        "label": "edit",
+        "packet_pages": 2,
+        "packet_records": 2,
+        "private_document_cache_hits": 1,
+        "returned_change_payloads": 0,
+        "round": 0,
+        "shared_renderer_cache_hits": 1,
+        "source_bytes_read": 0,
+        "source_read_calls": 0
+      },
+      "production_wasm_memory_mib": 64,
+      "setup_process": {
+        "elapsed": "0:08.17",
+        "file_system_inputs": 0,
+        "file_system_outputs": 164512,
+        "max_rss_bytes": 1134358528,
+        "max_rss_kib": 1107772
+      },
+      "setup_storage_bytes": {
+        "backend": "rocksdb-fs",
+        "bytes": 84183394
+      },
+      "setup_storage_bytes_detail": {
+        "backend": "rocksdb-fs",
+        "materialized_file_bytes": 10680000,
+        "plugin_archive_bytes": 408975,
+        "rocksdb_bytes": 73094417
+      },
+      "storage_bytes": {
+        "backend": "rocksdb-fs",
+        "bytes": 87340595
+      },
+      "storage_bytes_detail": {
+        "backend": "rocksdb-fs",
+        "materialized_file_bytes": 10680007,
+        "plugin_archive_bytes": 408975,
+        "rocksdb_bytes": 76251611
+      }
+    },
+    "slatedb-cached": {
+      "edit_process": {
+        "elapsed": "0:10.71",
+        "file_system_inputs": 0,
+        "file_system_outputs": 405008,
+        "max_rss_bytes": 713404416,
+        "max_rss_kib": 696684
+      },
+      "edit_samples_ms": [
+        179.554679
+      ],
+      "gross_retained_delta_bytes": 4594126,
+      "logical_io": {
+        "begin_read": 12,
+        "begin_write": 1,
+        "delete_calls": 1,
+        "delete_range_calls": 0,
+        "delete_rows": 1,
+        "get_many_calls": 713,
+        "get_many_keys": 798,
+        "get_many_values": 788,
+        "label": "edit",
+        "put_calls": 11,
+        "put_rows": 349,
+        "scan_calls": 1,
+        "scan_entries": 5
+      },
+      "logical_io_by_space": [
+        {
+          "get_many_calls": 3,
+          "get_many_keys": 31,
+          "get_many_values": 31,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 131073
+        },
+        {
+          "get_many_calls": 641,
+          "get_many_keys": 641,
+          "get_many_values": 641,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 262145
+        },
+        {
+          "get_many_calls": 20,
+          "get_many_keys": 20,
+          "get_many_values": 20,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 262148
+        },
+        {
+          "get_many_calls": 19,
+          "get_many_keys": 28,
+          "get_many_values": 24,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 262150
+        },
+        {
+          "get_many_calls": 1,
+          "get_many_keys": 9,
+          "get_many_values": 8,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 327684
+        },
+        {
+          "get_many_calls": 2,
+          "get_many_keys": 2,
+          "get_many_values": 1,
+          "label": "edit",
+          "scan_calls": 1,
+          "scan_entries": 5,
+          "space_id": 393217
+        },
+        {
+          "get_many_calls": 25,
+          "get_many_keys": 65,
+          "get_many_values": 61,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 393218
+        },
+        {
+          "get_many_calls": 1,
+          "get_many_keys": 1,
+          "get_many_values": 1,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 458754
+        },
+        {
+          "get_many_calls": 1,
+          "get_many_keys": 1,
+          "get_many_values": 1,
+          "label": "edit",
+          "scan_calls": 0,
+          "scan_entries": 0,
+          "space_id": 458755
+        }
+      ],
+      "measured_counters": {
+        "attachment_bytes_read": 0,
+        "attachment_reads": 0,
+        "change_payload_requests": 0,
+        "component_boundary_bytes": 500,
+        "component_import_calls": 1,
+        "durable_semantic_changes": 1,
+        "filesystem_sync_full_renders": 0,
+        "full_document_reparses": 0,
+        "full_renderer_invocations": 0,
+        "full_state_semantic_rows_materialized": 0,
+        "guest_linear_memory_high_water_bytes": 61145088,
+        "host_full_content_classification_bytes": 0,
+        "host_full_diff_bytes_compared": 0,
+        "label": "edit",
+        "packet_pages": 2,
+        "packet_records": 2,
+        "private_document_cache_hits": 1,
+        "returned_change_payloads": 0,
+        "round": 0,
+        "shared_renderer_cache_hits": 1,
+        "source_bytes_read": 0,
+        "source_read_calls": 0
+      },
+      "production_wasm_memory_mib": 64,
+      "setup_process": {
+        "elapsed": "0:09.37",
+        "file_system_inputs": 0,
+        "file_system_outputs": 438584,
+        "max_rss_bytes": 1396776960,
+        "max_rss_kib": 1364040
+      },
+      "setup_storage_bytes": {
+        "backend": "slatedb-cached",
+        "bytes": 216114962
+      },
+      "setup_storage_bytes_detail": {
+        "backend": "slatedb-cached",
+        "cache_bytes": 66257123,
+        "object_store_bytes": 149857839
+      },
+      "storage_bytes": {
+        "backend": "slatedb-cached",
+        "bytes": 220709088
+      },
+      "storage_bytes_detail": {
+        "backend": "slatedb-cached",
+        "cache_bytes": 64641652,
+        "object_store_bytes": 156067436
+      }
+    }
+  },
+  "measurement_limits": [
+    "storage_io counts logical outer-storage calls and rows, not physical disk or object-store bytes",
+    "GNU time file-system counters are OS accounting units, not WAL bytes",
+    "the harness does not expose physical WAL bytes/calls or quiesced-live bytes",
+    "cached SlateDB flushes but does not establish compaction/GC quiescence; rocksdb-fs has no explicit physical backend flush here",
+    "directory bytes are gross retained footprint, not live-byte or write amplification",
+    "perf runs are whole-process qualitative CPU profiles and are not latency evidence"
+  ],
+  "profiles": {
+    "rocksdb-fs-candidate": {
+      "call_graph": "dwarf,16384",
+      "diagnostic_wasm_memory_mib": 256,
+      "frequency_hz": 99,
+      "perf_record_size_mb": 11.501,
+      "perf_samples": 717,
+      "svg": "perf-results/plugin-api-v2/profiles/pr2-rocksdb-fs-candidate-6dd5612b.svg",
+      "svg_sha256": "4244b413034ab3e6cea28808ad00fcaaa61aead6ee828c35ae20977bab810e58"
+    },
+    "rocksdb-fs-control": {
+      "call_graph": "dwarf,16384",
+      "diagnostic_wasm_memory_mib": 256,
+      "frequency_hz": 99,
+      "perf_record_size_mb": 293.829,
+      "perf_samples": 18320,
+      "svg": "perf-results/plugin-api-v2/profiles/pr2-rocksdb-fs-control-6dd5612b.svg",
+      "svg_sha256": "e3a7a548d45957aa809e38c4fae6144fbdf71132376d6b78e10b911570c7b51f"
+    },
+    "slatedb-cached-candidate": {
+      "call_graph": "dwarf,16384",
+      "diagnostic_wasm_memory_mib": 256,
+      "frequency_hz": 99,
+      "perf_record_size_mb": 58.151,
+      "perf_samples": 3342,
+      "svg": "perf-results/plugin-api-v2/profiles/pr2-slatedb-cached-candidate-6dd5612b.svg",
+      "svg_sha256": "931a8281219676596a1db8e16d56a7553a32e77ca8498c2acd002cd8a39be337"
+    },
+    "slatedb-cached-control": {
+      "call_graph": "dwarf,16384",
+      "diagnostic_wasm_memory_mib": 256,
+      "frequency_hz": 99,
+      "perf_record_size_mb": 983.031,
+      "perf_samples": 61343,
+      "svg": "perf-results/plugin-api-v2/profiles/pr2-slatedb-cached-control-6dd5612b.svg",
+      "svg_sha256": "dfa678489c94ff132234e5ece755bb5755f52842867970863ae7321b48586e8c"
+    }
+  }
+}

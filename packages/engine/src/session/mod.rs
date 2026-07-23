@@ -18,6 +18,7 @@ pub(crate) mod observe;
 mod switch_branch;
 mod transaction;
 
+pub use crate::common::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
 pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};

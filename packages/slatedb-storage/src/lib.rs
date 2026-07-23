@@ -4,5 +4,5 @@ mod slatedb;
 
 pub use slatedb::{
     SlateDB, SlateDBCacheOptions, SlateDBFactory, SlateDBFixture, SlateDBObjectStoreOptions,
-    SlateDBOptions, SlateDBRead, SlateDBWrite,
+    SlateDBRead, SlateDBWrite,
 };

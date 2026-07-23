@@ -14,8 +14,10 @@ lix_sdk = { path = "../rs-sdk", version = "0.8.4", default-features = false, fea
 
 [dev-dependencies]
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 
 async-trait = "0.1"
+base64 = "0.22"
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 rand = { version = "0.9", features = ["small_rng"] }
 serde_json = "1"

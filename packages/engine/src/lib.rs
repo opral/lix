@@ -32,7 +32,6 @@ pub(crate) mod json_store;
 pub(crate) mod live_state;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
-#[allow(dead_code, unused_imports)]
 pub(crate) mod plugin;
 mod schema;
 pub mod session;
@@ -70,8 +69,9 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::{Engine, EngineOptions};
 pub use init::InitReceipt;
 pub use session::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ObserveEvent,
-    ObserveEvents, Row, RowRef, TryFromValue,
+    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
+    ExecuteStatementMetadata, MutationIdentity, ObserveEvent, ObserveEvents,
+    RequestBlobSpliceProvenance, Row, RowRef, TryFromValue,
 };
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,

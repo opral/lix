@@ -1317,6 +1317,103 @@ async fn atelier_markdown_point_read_acknowledges_only_delivered_plugin_state() 
 }
 
 #[tokio::test]
+async fn lixray_batch_read_acknowledges_only_delivered_plugin_state() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\nseen=S\n".to_vec())
+        .await
+        .expect("seed file should write");
+
+    let delivered = session_b
+        .execute(
+            "SELECT path, data FROM lix_file WHERE path IN ($1, $2)",
+            &[
+                Value::Text("/missing.keyed".to_string()),
+                Value::Text("/shared.keyed".to_string()),
+            ],
+        )
+        .await
+        .expect("Lixray-shaped batch read should execute");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered.rows()[0].values(),
+        &[
+            Value::Text("/shared.keyed".to_string()),
+            Value::Blob(b"root=0\nseen=S\n".to_vec()),
+        ]
+    );
+
+    write_file(
+        &session_a,
+        "/shared.keyed",
+        b"remote=R\nroot=0\nseen=S\n".to_vec(),
+    )
+    .await
+    .expect("remote entity should write");
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("stale Lixray edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=B\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("remote".to_string(), "R".to_string()),
+            ("root".to_string(), "B".to_string()),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn late_file_data_read_acknowledges_only_delivered_plugin_state() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\nseen=S\n".to_vec())
+        .await
+        .expect("seed file should write");
+
+    let delivered = session_b
+        .execute(
+            "SELECT path, data FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 1",
+            &[Value::Text("/shared.%".to_string())],
+        )
+        .await
+        .expect("late-materialized file read should execute");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered.rows()[0].values(),
+        &[
+            Value::Text("/shared.keyed".to_string()),
+            Value::Blob(b"root=0\nseen=S\n".to_vec()),
+        ]
+    );
+
+    write_file(
+        &session_a,
+        "/shared.keyed",
+        b"remote=R\nroot=0\nseen=S\n".to_vec(),
+    )
+    .await
+    .expect("remote entity should write");
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("stale late-materialized edit should write");
+
+    assert_eq!(
+        read_file(&session_a, "/shared.keyed").await.unwrap(),
+        Some(b"remote=R\nroot=B\n".to_vec())
+    );
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([
+            ("remote".to_string(), "R".to_string()),
+            ("root".to_string(), "B".to_string()),
+        ])
+    );
+}
+
+#[tokio::test]
 async fn observe_point_read_acknowledges_delivered_plugin_state_per_session() {
     let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
     write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())

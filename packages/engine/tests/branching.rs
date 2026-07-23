@@ -1480,49 +1480,57 @@ async fn delete_key_value(session: &support::simulation_test::engine::SimSession
         .expect("key-value delete should succeed");
 }
 
-async fn create_draft_after_shared_write(
+fn create_draft_after_shared_write(
     sim: &support::simulation_test::engine::Simulation,
-) -> (
-    Engine,
-    support::simulation_test::engine::SimSession,
-    support::simulation_test::engine::SimSession,
-) {
-    let engine = sim.boot_engine().await;
-    let main = sim.wrap_session(
-        engine
-            .open_session(sim.main_branch_id())
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
-    main.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('shared-before-branch', 'shared')",
-        &[],
-    )
-    .await
-    .expect("source write should succeed");
+) -> impl Future<
+    Output = (
+        Engine,
+        support::simulation_test::engine::SimSession,
+        support::simulation_test::engine::SimSession,
+    ),
+> + '_ {
+    Box::pin(async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('shared-before-branch', 'shared')",
+            &[],
+        )
+        .await
+        .expect("source write should succeed");
 
-    let draft = create_draft(&engine, &main).await;
-    (engine, main, draft)
+        let draft = create_draft(&engine, &main).await;
+        (engine, main, draft)
+    })
 }
 
-async fn create_draft_from_main(
+fn create_draft_from_main(
     sim: &support::simulation_test::engine::Simulation,
-) -> (
-    Engine,
-    support::simulation_test::engine::SimSession,
-    support::simulation_test::engine::SimSession,
-) {
-    let engine = sim.boot_engine().await;
-    let main = sim.wrap_session(
-        engine
-            .open_session(sim.main_branch_id())
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
-    let draft = create_draft(&engine, &main).await;
-    (engine, main, draft)
+) -> impl Future<
+    Output = (
+        Engine,
+        support::simulation_test::engine::SimSession,
+        support::simulation_test::engine::SimSession,
+    ),
+> + '_ {
+    Box::pin(async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let draft = create_draft(&engine, &main).await;
+        (engine, main, draft)
+    })
 }
 
 async fn create_draft(
@@ -1739,43 +1747,45 @@ async fn commit_parent_edges(
         .collect()
 }
 
-async fn assert_empty_merge_commit(
-    engine: &Engine,
-    session: &support::simulation_test::engine::SimSession,
-    merge_commit_id: &str,
-    target_head_before: &str,
-    source_head: &str,
-) {
-    let active_branch_id = session
-        .active_branch_id()
-        .await
-        .expect("active branch should load");
-    assert_eq!(
-        engine
-            .load_branch_head_commit_id(&active_branch_id)
+fn assert_empty_merge_commit<'a>(
+    engine: &'a Engine,
+    session: &'a support::simulation_test::engine::SimSession,
+    merge_commit_id: &'a str,
+    target_head_before: &'a str,
+    source_head: &'a str,
+) -> impl Future<Output = ()> + 'a {
+    Box::pin(async move {
+        let active_branch_id = session
+            .active_branch_id()
             .await
-            .expect("target branch head should load")
-            .as_deref(),
-        Some(merge_commit_id),
-        "empty merge should advance the target branch ref"
-    );
+            .expect("active branch should load");
+        assert_eq!(
+            engine
+                .load_branch_head_commit_id(&active_branch_id)
+                .await
+                .expect("target branch head should load")
+                .as_deref(),
+            Some(merge_commit_id),
+            "empty merge should advance the target branch ref"
+        );
 
-    let global = session.wrap_session(
-        engine
-            .open_session("global")
-            .await
-            .expect("global session should open"),
-        engine,
-    );
-    assert_eq!(
-        commit_parent_edges(&global, merge_commit_id)
-            .await
-            .into_iter()
-            .map(|(parent_id, _)| parent_id)
-            .collect::<std::collections::BTreeSet<_>>(),
-        [target_head_before.to_string(), source_head.to_string()]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
-        "empty merge commit should preserve target/source ancestry"
-    );
+        let global = session.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            engine,
+        );
+        assert_eq!(
+            commit_parent_edges(&global, merge_commit_id)
+                .await
+                .into_iter()
+                .map(|(parent_id, _)| parent_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [target_head_before.to_string(), source_head.to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "empty merge commit should preserve target/source ancestry"
+        );
+    })
 }

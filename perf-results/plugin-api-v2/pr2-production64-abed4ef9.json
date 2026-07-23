@@ -1,0 +1,74 @@
+{
+  "backends": {
+    "rocksdb-fs": {
+      "edit": {
+        "component_boundary_bytes": 479,
+        "durable_semantic_changes": 1,
+        "filesystem_sync_full_renders": 0,
+        "full_document_reparses": 0,
+        "full_renderer_invocations": 0,
+        "full_state_semantic_rows_materialized": 0,
+        "guest_linear_memory_high_water_bytes": 61145088,
+        "host_full_content_classification_bytes": 0,
+        "host_full_diff_bytes_compared": 0,
+        "private_document_cache_hits": 1,
+        "sample_ms": 60.142275000000005,
+        "shared_renderer_cache_hits": 1,
+        "source_bytes_read": 0,
+        "source_read_calls": 0
+      },
+      "fresh_process_exact_render_ms": 2411.5628899999997,
+      "setup_insert_ms": 8125.778554,
+      "status": "complete"
+    },
+    "slatedb-cached": {
+      "edit": {
+        "component_boundary_bytes": 479,
+        "durable_semantic_changes": 1,
+        "filesystem_sync_full_renders": 0,
+        "full_document_reparses": 0,
+        "full_renderer_invocations": 0,
+        "full_state_semantic_rows_materialized": 0,
+        "guest_linear_memory_high_water_bytes": 61145088,
+        "host_full_content_classification_bytes": 0,
+        "host_full_diff_bytes_compared": 0,
+        "private_document_cache_hits": 1,
+        "sample_ms": 166.02614,
+        "shared_renderer_cache_hits": 1,
+        "source_bytes_read": 0,
+        "source_read_calls": 0
+      },
+      "fresh_process_exact_render_ms": 10278.109864,
+      "setup_insert_ms": 9115.32505,
+      "status": "complete"
+    }
+  },
+  "candidate": {
+    "commit": "abed4ef9b97905649a04b15df52c944bced19b88",
+    "path": "/root/projects/lixray/.artifacts/pr2/profile_plugin_large_file-candidate-abed4ef9",
+    "sha256": "21131d39faeb2776da9eb654dcd39ee564b448820f166fad153d36d9eb61bd1c"
+  },
+  "classification": "final-candidate production-default 64 MiB full-engine smoke",
+  "design": {
+    "aggregate_guest_linear_memory_cap_bytes": 67108864,
+    "backends": [
+      "rocksdb-fs",
+      "slatedb-cached"
+    ],
+    "edit": "one warmup followed by one measured provenance-backed middle-row transition",
+    "fixture_bytes": 10680000,
+    "format": "csv",
+    "fresh_process_exact_render_samples": 1,
+    "memory_override": "LIX_PROFILE_WASM_MEMORY_MIB omitted",
+    "measured_edit_samples": 1,
+    "rows": 220000,
+    "runtime": "wasm-component-v2",
+    "warmup_edits": 1
+  },
+  "result": {
+    "correctness": "setup, localized edit, and fresh-process exact render completed on both backends",
+    "max_observed_guest_linear_memory_bytes": 61145088,
+    "memory_cap_pass": true,
+    "status": "pass"
+  }
+}

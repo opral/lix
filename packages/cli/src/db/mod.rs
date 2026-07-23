@@ -475,13 +475,14 @@ impl Drop for FileStorageWrite {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileSnapshot {
     entries: Vec<FileEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileEntry {
-    namespace: String,
     key: String,
     value: String,
 }
@@ -498,13 +499,6 @@ fn read_kv_file(path: &Path) -> Result<KvMap, CliError> {
         .map_err(|error| CliError::msg(format!("failed to decode lix file: {error}")))?;
     let mut kv = KvMap::new();
     for entry in snapshot.entries {
-        if !entry.namespace.is_empty() {
-            return Err(CliError::msg(format!(
-                "unsupported legacy lix namespace '{}' in {}",
-                entry.namespace,
-                path.display()
-            )));
-        }
         kv.insert(decode_bytes(&entry.key)?, decode_bytes(&entry.value)?);
     }
     Ok(kv)
@@ -515,7 +509,6 @@ fn write_kv_file(path: &Path, kv: &KvMap) -> Result<(), LixError> {
         entries: kv
             .iter()
             .map(|(key, value)| FileEntry {
-                namespace: String::new(),
                 key: encode_bytes(key),
                 value: encode_bytes(value),
             })
@@ -586,7 +579,7 @@ fn lix_to_storage_error(error: LixError) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use super::{init_lix_at, prepare_lix_output_path, resolve_db_path};
+    use super::{init_lix_at, prepare_lix_output_path, read_kv_file, resolve_db_path};
     use crate::app::AppContext;
     use std::fs;
     use std::path::PathBuf;
@@ -644,6 +637,23 @@ mod tests {
             !temp_dir.exists(),
             "validator should reject before creating parent directories"
         );
+    }
+
+    #[test]
+    fn file_storage_rejects_removed_namespace_field() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let path = temp_dir.join("legacy.lix");
+        fs::write(
+            &path,
+            r#"{"entries":[{"namespace":"legacy","key":"a2V5","value":"dmFsdWU="}]}"#,
+        )
+        .expect("legacy snapshot should be written");
+
+        let error = read_kv_file(&path).expect_err("removed namespace field should be rejected");
+        assert!(error.to_string().contains("unknown field `namespace`"));
+
+        fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
     }
 
     fn unique_temp_dir() -> PathBuf {

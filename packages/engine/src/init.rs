@@ -260,6 +260,7 @@ where
             )
             .await?;
     }
+    crate::catalog::stage_catalog_revision(&mut writes);
 
     storage
         .commit_write_set(

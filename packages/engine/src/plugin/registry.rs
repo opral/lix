@@ -45,6 +45,7 @@ pub(crate) struct PluginRegistryEntryInput {
     pub(crate) content_type: Option<PluginContentType>,
     pub(crate) entry: String,
     pub(crate) schema_keys: Vec<String>,
+    pub(crate) host_allocated_schema_keys: Vec<String>,
     pub(crate) manifest_json: String,
     pub(crate) archive_file_id: String,
     pub(crate) archive_path: String,
@@ -68,6 +69,7 @@ pub(crate) struct PluginRegistryEntry {
     content_type: Option<PluginContentType>,
     entry: String,
     schema_keys: Vec<String>,
+    host_allocated_schema_keys: Vec<String>,
     manifest_json: String,
     archive_file_id: String,
     archive_path: String,
@@ -94,6 +96,7 @@ impl PluginRegistryEntry {
             content_type: input.content_type,
             entry: input.entry,
             schema_keys: input.schema_keys,
+            host_allocated_schema_keys: input.host_allocated_schema_keys,
             manifest_json: canonicalize_json_text(
                 &input.manifest_json,
                 "plugin registry manifest_json",
@@ -104,6 +107,7 @@ impl PluginRegistryEntry {
             wasm_blob_hash: input.wasm_blob_hash,
         };
         entry.schema_keys.sort();
+        entry.host_allocated_schema_keys.sort();
         // Install-time validation pays the complete JSON-Schema and glob
         // checks once. Durable reads below use the already-validated compact
         // fields and generation integrity, so warm transactions do not
@@ -121,36 +125,16 @@ impl PluginRegistryEntry {
         self.runtime
     }
 
-    pub(crate) fn api_version(&self) -> &str {
-        &self.api_version
-    }
-
-    pub(crate) fn path_glob(&self) -> &str {
-        &self.path_glob
-    }
-
     pub(crate) fn content_type(&self) -> Option<PluginContentType> {
         self.content_type
-    }
-
-    pub(crate) fn entry(&self) -> &str {
-        &self.entry
     }
 
     pub(crate) fn schema_keys(&self) -> &[String] {
         &self.schema_keys
     }
 
-    pub(crate) fn manifest_json(&self) -> &str {
-        &self.manifest_json
-    }
-
-    pub(crate) fn archive_file_id(&self) -> &str {
-        &self.archive_file_id
-    }
-
-    pub(crate) fn archive_path(&self) -> &str {
-        &self.archive_path
+    pub(crate) fn host_allocated_schema_keys(&self) -> &[String] {
+        &self.host_allocated_schema_keys
     }
 
     pub(crate) fn archive_blob_hash(&self) -> &str {
@@ -159,6 +143,39 @@ impl PluginRegistryEntry {
 
     pub(crate) fn wasm_blob_hash(&self) -> &str {
         &self.wasm_blob_hash
+    }
+
+    /// Verifies the durable contract that every existing owner relies on
+    /// before a content-addressed v2 component generation is replaced.
+    ///
+    /// Schema definitions themselves live in `lix_registered_schema` and are
+    /// compared by the lifecycle reconciler. This check covers the registry
+    /// half of that contract, including the exact schema-key set.
+    pub(crate) fn validate_owned_v2_upgrade_contract(
+        &self,
+        replacement: &Self,
+    ) -> Result<(), LixError> {
+        let incompatible = self.key != replacement.key
+            || self.runtime != PluginRuntime::WasmComponentV2
+            || replacement.runtime != PluginRuntime::WasmComponentV2
+            || self.api_version != replacement.api_version
+            || self.path_glob != replacement.path_glob
+            || self.content_type != replacement.content_type
+            || self.schema_keys != replacement.schema_keys
+            || self.host_allocated_schema_keys != replacement.host_allocated_schema_keys;
+        if incompatible {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, content type, schema keys, and ID-allocation contract",
+                    self.key
+                ),
+            )
+            .with_hint(
+                "Move or delete every owned file before changing the plugin contract, then install the replacement archive.",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn to_installed_plugin(&self, wasm: Vec<u8>) -> Result<InstalledPlugin, LixError> {
@@ -237,10 +254,6 @@ impl PluginRegistry {
         })
     }
 
-    pub(crate) fn plugin_count(&self) -> u32 {
-        self.plugin_count
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.plugins.is_empty()
     }
@@ -317,23 +330,6 @@ impl PluginRegistry {
         Ok(())
     }
 
-    pub(crate) fn with_upserted(&self, plugin: PluginRegistryEntry) -> Result<Self, LixError> {
-        let mut plugins = self.plugins.clone();
-        match plugins.binary_search_by(|entry| entry.key.cmp(&plugin.key)) {
-            Ok(index) => plugins[index] = plugin,
-            Err(index) => plugins.insert(index, plugin),
-        }
-        Self::new(plugins)
-    }
-
-    pub(crate) fn without(&self, plugin_key: &str) -> Result<Self, LixError> {
-        let mut plugins = self.plugins.clone();
-        if let Ok(index) = plugins.binary_search_by(|entry| entry.key.as_str().cmp(plugin_key)) {
-            plugins.remove(index);
-        }
-        Self::new(plugins)
-    }
-
     /// Decode the JSON held in the `value` field. A missing entity is the
     /// canonical empty registry and requires no filesystem discovery.
     pub(crate) fn from_optional_value(value: Option<&JsonValue>) -> Result<Self, LixError> {
@@ -393,10 +389,6 @@ impl PluginRegistry {
         }))
     }
 
-    pub(crate) fn to_canonical_json(&self) -> Result<String, LixError> {
-        Ok(canonical_json(&self.to_value()?))
-    }
-
     pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {
         tracked_key_value_write_row(
             PLUGIN_REGISTRY_KEY,
@@ -404,10 +396,6 @@ impl PluginRegistry {
             Some(self.to_snapshot()?),
             branch_id,
         )
-    }
-
-    pub(crate) fn delete_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
-        tracked_key_value_write_row(PLUGIN_REGISTRY_KEY, None, None, branch_id)
     }
 
     fn from_wire(wire: PluginRegistryWire) -> Result<Self, LixError> {
@@ -608,7 +596,6 @@ impl PluginFileOwner {
 /// One compiled multi-pattern matcher for a registry generation.
 #[derive(Debug)]
 pub(crate) struct CompiledPluginCatalog {
-    generation: String,
     plugins: Arc<[PluginRegistryEntry]>,
     globs: GlobSet,
     specificity: Vec<(u8, i32)>,
@@ -636,19 +623,10 @@ impl CompiledPluginCatalog {
             invalid_registry(format!("failed to compile plugin matcher catalog: {error}"))
         })?;
         Ok(Self {
-            generation: registry.generation.clone(),
             plugins: registry.plugins.clone().into(),
             globs,
             specificity,
         })
-    }
-
-    pub(crate) fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    pub(crate) fn plugin_count(&self) -> usize {
-        self.plugins.len()
     }
 
     /// Returns whether the named plugin's already-compiled glob matches the
@@ -672,21 +650,6 @@ impl CompiledPluginCatalog {
         self.globs.matches(path).contains(&plugin_index)
     }
 
-    /// Select the most specific compatible matcher. When callers already have
-    /// file bytes they pass the classified content type and both predicates
-    /// must match. `None` deliberately keeps the prior path-only behavior for
-    /// owner validation and other flows where bytes are not available.
-    /// Equal-specificity matches resolve by lexicographically smallest plugin
-    /// key because registry entries are canonicalized by key and matching
-    /// indices are ascending.
-    pub(crate) fn select(
-        &self,
-        path: &str,
-        file_content_type: Option<PluginContentType>,
-    ) -> Option<&PluginRegistryEntry> {
-        self.select_with_content_type(path, || file_content_type)
-    }
-
     /// Selects for a known payload without scanning its bytes unless at least
     /// one path-matching plugin actually declares a content-type constraint.
     pub(crate) fn select_for_bytes(
@@ -694,10 +657,24 @@ impl CompiledPluginCatalog {
         path: &str,
         bytes: &[u8],
     ) -> Option<&PluginRegistryEntry> {
+        self.select_for_bytes_with_classification_work(path, bytes)
+            .0
+    }
+
+    /// Selects a plugin and reports bytes examined by the lazy full-payload
+    /// content classifier. Path-only catalogs therefore report zero even for
+    /// large payloads.
+    pub(crate) fn select_for_bytes_with_classification_work(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> (Option<&PluginRegistryEntry>, u64) {
         let mut classified = None;
-        self.select_with_content_type(path, || {
+        let selected = self.select_with_content_type(path, || {
             Some(*classified.get_or_insert_with(|| PluginContentType::from_bytes(bytes)))
-        })
+        });
+        let classified_bytes = classified.map_or(0, |_| bytes.len() as u64);
+        (selected, classified_bytes)
     }
 
     fn select_with_content_type(
@@ -806,6 +783,28 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
     if entry.schema_keys.iter().any(String::is_empty) {
         return Err(invalid_registry(format!(
             "plugin '{}' has an empty schema key",
+            entry.key
+        )));
+    }
+    if entry
+        .host_allocated_schema_keys
+        .windows(2)
+        .any(|keys| keys[0] >= keys[1])
+        || entry
+            .host_allocated_schema_keys
+            .iter()
+            .any(|key| entry.schema_keys.binary_search(key).is_err())
+    {
+        return Err(invalid_registry(format!(
+            "plugin '{}' host_allocated_schema_keys must be unique, sorted, and owned by the plugin",
+            entry.key
+        )));
+    }
+    if !entry.host_allocated_schema_keys.is_empty()
+        && entry.runtime != PluginRuntime::WasmComponentV2
+    {
+        return Err(invalid_registry(format!(
+            "plugin '{}' may declare host-allocated IDs only for wasm-component-v2",
             entry.key
         )));
     }
@@ -1109,6 +1108,7 @@ mod tests {
             content_type,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![format!("{key}_schema")],
+            host_allocated_schema_keys: Vec::new(),
             manifest_json: manifest_with_content_type(key, path_glob, content_type),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1118,11 +1118,67 @@ mod tests {
         .expect("test registry entry should be valid")
     }
 
+    fn v2_entry(hash_byte: char) -> PluginRegistryEntry {
+        let key = "plugin_csv_v2";
+        let path_glob = "*.csv";
+        PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: key.to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
+            path_glob: path_glob.to_string(),
+            content_type: Some(PluginContentType::Text),
+            entry: "plugin.wasm".to_string(),
+            schema_keys: vec!["csv_row".to_string()],
+            host_allocated_schema_keys: vec!["csv_row".to_string()],
+            manifest_json: format!(
+                r#"{{"api_version":"2.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
+            ),
+            archive_file_id: plugin_storage_archive_file_id(key),
+            archive_path: plugin_storage_archive_path(key),
+            archive_blob_hash: hash(hash_byte),
+            wasm_blob_hash: hash(hash_byte),
+        })
+        .expect("test v2 registry entry should be valid")
+    }
+
+    #[test]
+    fn owned_v2_upgrade_contract_allows_only_generation_packaging_changes() {
+        let previous = v2_entry('a');
+        let replacement = v2_entry('b');
+        previous
+            .validate_owned_v2_upgrade_contract(&replacement)
+            .expect("content-addressed component replacement should preserve the contract");
+
+        let mut incompatible = Vec::new();
+        let mut value = replacement.clone();
+        value.api_version = "2.1.0".to_string();
+        incompatible.push(value);
+        let mut value = replacement.clone();
+        value.path_glob = "*.tsv".to_string();
+        incompatible.push(value);
+        let mut value = replacement.clone();
+        value.content_type = Some(PluginContentType::Binary);
+        incompatible.push(value);
+        let mut value = replacement.clone();
+        value.schema_keys = vec!["csv_table".to_string()];
+        incompatible.push(value);
+        let mut value = replacement;
+        value.host_allocated_schema_keys.clear();
+        incompatible.push(value);
+
+        for replacement in incompatible {
+            let error = previous
+                .validate_owned_v2_upgrade_contract(&replacement)
+                .expect_err("owned plugin contract mutation must fail closed");
+            assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        }
+    }
+
     #[test]
     fn missing_registry_is_empty_without_discovery() {
         let registry = PluginRegistry::from_optional_value(None).expect("missing row is valid");
         assert!(registry.is_empty());
-        assert_eq!(registry.plugin_count(), 0);
+        assert!(registry.plugins().is_empty());
         assert_eq!(registry.generation().len(), 64);
     }
 
@@ -1141,8 +1197,8 @@ mod tests {
 
         assert_eq!(first.generation(), second.generation());
         assert_eq!(
-            first.to_canonical_json().unwrap(),
-            second.to_canonical_json().unwrap()
+            canonical_json(&first.to_value().unwrap()),
+            canonical_json(&second.to_value().unwrap())
         );
         assert_eq!(first.plugins()[0].key(), "plugin_a");
 
@@ -1154,15 +1210,16 @@ mod tests {
     #[test]
     fn upsert_and_remove_change_generation_deterministically() {
         let empty = PluginRegistry::empty();
-        let installed = empty
-            .with_upserted(entry("plugin_a", "*.json", 'a'))
+        let mut installed = empty.clone();
+        installed
+            .upsert(entry("plugin_a", "*.json", 'a'))
             .expect("install should be valid");
         assert_ne!(installed.generation(), empty.generation());
-        assert_eq!(installed.plugin("plugin_a").unwrap().path_glob(), "*.json");
-        let removed = installed
-            .without("plugin_a")
+        assert_eq!(installed.plugin("plugin_a").unwrap().path_glob, "*.json");
+        installed
+            .remove("plugin_a")
             .expect("remove should be valid");
-        assert_eq!(removed, empty);
+        assert_eq!(installed, empty);
     }
 
     #[test]
@@ -1270,6 +1327,7 @@ mod tests {
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["plugin_a_schema".to_string()],
+            host_allocated_schema_keys: Vec::new(),
             manifest_json: manifest_with_content_type(
                 "plugin_a",
                 "*.json",
@@ -1308,15 +1366,21 @@ mod tests {
         .unwrap();
         let catalog = CompiledPluginCatalog::compile(&registry).unwrap();
         assert_eq!(
-            catalog.select("src/data.json", None).unwrap().key(),
+            catalog
+                .select_for_bytes("src/data.json", b"")
+                .unwrap()
+                .key(),
             "plugin_specific"
         );
-        assert_eq!(catalog.select("data.json", None).unwrap().key(), "plugin_a");
         assert_eq!(
-            catalog.select("data.txt", None).unwrap().key(),
+            catalog.select_for_bytes("data.json", b"").unwrap().key(),
+            "plugin_a"
+        );
+        assert_eq!(
+            catalog.select_for_bytes("data.txt", b"").unwrap().key(),
             "plugin_all"
         );
-        assert!(catalog.select("", None).is_none());
+        assert!(catalog.select_for_bytes("", b"").is_none());
         assert!(catalog.matches_plugin("plugin_specific", "src/data.json"));
         assert!(catalog.matches_plugin("plugin_a", "src/data.json"));
         assert!(catalog.matches_plugin("plugin_z", "src/data.json"));
@@ -1376,13 +1440,13 @@ mod tests {
         assert_eq!(classification_calls.get(), 0);
         assert_eq!(
             text_only
-                .select("document.data", Some(PluginContentType::Text))
+                .select_with_content_type("document.data", || Some(PluginContentType::Text))
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert!(
             text_only
-                .select("document.data", Some(PluginContentType::Binary))
+                .select_with_content_type("document.data", || Some(PluginContentType::Binary))
                 .is_none()
         );
 
@@ -1391,13 +1455,13 @@ mod tests {
                 .unwrap();
         assert_eq!(
             catalog
-                .select("document.data", Some(PluginContentType::Text))
+                .select_with_content_type("document.data", || Some(PluginContentType::Text))
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert_eq!(
             catalog
-                .select("document.data", Some(PluginContentType::Binary))
+                .select_with_content_type("document.data", || Some(PluginContentType::Binary))
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
         );
@@ -1413,12 +1477,14 @@ mod tests {
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
         );
-        assert_eq!(
-            catalog
-                .select("document.data", None)
-                .map(PluginRegistryEntry::key),
-            Some("plugin_binary")
-        );
+        let (selected, classified_bytes) =
+            catalog.select_for_bytes_with_classification_work("document.data", b"hello");
+        assert_eq!(selected.map(PluginRegistryEntry::key), Some("plugin_text"));
+        assert_eq!(classified_bytes, 5);
+        let (selected, classified_bytes) =
+            catalog.select_for_bytes_with_classification_work("document.other", b"hello");
+        assert!(selected.is_none());
+        assert_eq!(classified_bytes, 0);
         assert!(catalog.matches_plugin("plugin_text", "document.data"));
         assert!(catalog.matches_plugin("plugin_binary", "document.data"));
     }

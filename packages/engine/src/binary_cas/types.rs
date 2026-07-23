@@ -33,18 +33,25 @@ impl BlobHash {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobPayload {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     hash: Option<BlobHash>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
         let hash = (!bytes.is_empty()).then(|| BlobHash::from_content(&bytes));
-        Self { bytes, hash }
+        Self {
+            bytes: bytes.into(),
+            hash,
+        }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn shared_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
     }
 
     pub(crate) fn hash(&self) -> Option<BlobHash> {
@@ -119,3 +126,4 @@ pub(crate) struct BinaryCasChunkView<'a> {
     #[musli(bytes)]
     pub(crate) payload: &'a [u8],
 }
+use std::sync::Arc;

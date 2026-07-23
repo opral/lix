@@ -78,13 +78,13 @@ async fn run_single_simulation_test_with_case<F, Fut>(
         .expect("simulation bootstrap should initialize");
     let expect_same = SharedExpectSameRun::with_case(case_id, mode, shared_case);
     let _guard = SharedExpectSameRunGuard::new(expect_same.clone());
-    let sim = Simulation::from_bootstrap(
+    let sim = Box::pin(Simulation::from_bootstrap(
         mode,
         options,
         bootstrap.storage,
         bootstrap.receipt,
         SimulationAssertions::shared(expect_same),
-    )
+    ))
     .await
     .expect("simulation mode should boot");
     test_fn(sim.clone()).await;

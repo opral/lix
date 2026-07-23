@@ -541,25 +541,6 @@ fn decode_and_verify_chunk(
     Ok(chunk_payload)
 }
 
-#[allow(dead_code)]
-pub(in crate::binary_cas) fn stage_blob_write(
-    chunking: BinaryCasChunking,
-    writes: &mut StorageWriteSet,
-    blob_hashes: &mut HashSet<[u8; 32]>,
-    chunk_keys: &mut HashSet<Vec<u8>>,
-    bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
-) -> Result<BlobWriteReceipt, LixError> {
-    stage_blob_write_with_chunk_filter(
-        chunking,
-        writes,
-        blob_hashes,
-        bytes,
-        precomputed_hash,
-        |chunk_hash| Ok(chunk_keys.insert(chunk_key(chunk_hash))),
-    )
-}
-
 pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
     chunking: BinaryCasChunking,
     store: &S,
@@ -581,26 +562,6 @@ where
     let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, bytes, &plan).await?;
     stage_prepared_blob_write(writes, bytes, &plan, |chunk_hash| {
         Ok(chunk_hashes_to_stage.remove(&chunk_hash))
-    })?;
-    Ok(receipt)
-}
-
-fn stage_blob_write_with_chunk_filter(
-    chunking: BinaryCasChunking,
-    writes: &mut StorageWriteSet,
-    blob_hashes: &mut HashSet<[u8; 32]>,
-    bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
-    mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
-) -> Result<BlobWriteReceipt, LixError> {
-    let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
-    let receipt = plan.receipt.clone();
-    if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
-        return Ok(receipt);
-    }
-
-    stage_prepared_blob_write(writes, bytes, &plan, |chunk_hash| {
-        should_stage_chunk(chunk_hash)
     })?;
     Ok(receipt)
 }
@@ -876,6 +837,30 @@ mod tests {
         Memory, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
     };
 
+    async fn stage_test_payload(
+        storage: &StorageAdapter<Memory>,
+        writes: &mut StorageWriteSet,
+        payload: &BlobPayload,
+    ) -> BlobWriteReceipt {
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test blob read should open");
+        BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&store, writes)
+            .stage_payload(payload)
+            .await
+            .expect("test blob write should stage")
+    }
+
+    async fn stage_test_bytes(
+        storage: &StorageAdapter<Memory>,
+        writes: &mut StorageWriteSet,
+        bytes: &[u8],
+    ) -> BlobWriteReceipt {
+        stage_test_payload(storage, writes, &BlobPayload::from_bytes(bytes.to_vec())).await
+    }
+
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
         let storage = StorageAdapter::new(Memory::new());
@@ -1012,8 +997,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer.stage_bytes(data).expect("blob write should stage");
+            stage_test_bytes(&storage, &mut writes, data).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1065,10 +1049,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer
-                .stage_payload(&payload)
-                .expect("initial blob write should stage");
+            stage_test_payload(&storage, &mut writes, &payload).await;
             assert_eq!(writes.stats().staged_puts, 3);
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -1136,10 +1117,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer
-                .stage_payload(&payload)
-                .expect("initial blob write should stage");
+            stage_test_payload(&storage, &mut writes, &payload).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1232,10 +1210,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer
-                .stage_payload(&payload)
-                .expect("blob write should stage with payload hash");
+            stage_test_payload(&storage, &mut writes, &payload).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1273,8 +1248,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer.stage_bytes(data).expect("blob write should stage");
+            stage_test_bytes(&storage, &mut writes, data).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1375,8 +1349,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer.stage_bytes(data).expect("blob write should stage");
+            stage_test_bytes(&storage, &mut writes, data).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1414,8 +1387,7 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            let mut writer = BinaryCasContext::new().writer(&mut writes);
-            writer.stage_bytes(&data).expect("blob write should stage");
+            stage_test_bytes(&storage, &mut writes, &data).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await

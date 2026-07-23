@@ -13,8 +13,9 @@ use axum::{
     routing::{delete, get, post},
 };
 use lix_sdk::{
-    CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Lix, LixError,
-    ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, WireValue,
+    CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
+    ExecuteStatementMetadata, Lix, LixError, MutationIdentity, ObserveEvent, ObserveEvents,
+    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, Value, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -64,9 +65,14 @@ pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
 const MAX_REQUEST_BLOB_CACHE_ENTRIES: usize = 8;
 /// Blobs below this size are cheaper to send whole than to retain and hash.
 const MIN_REQUEST_BLOB_CACHE_BYTES: usize = 32 * 1024;
-/// Maximum aggregate bytes retained by one remote session's request blob cache.
-const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum aggregate bytes retained by one remote session's request blob
+/// cache. This holds one exact 10.68 MB production CSV (or 10 MB JSON) base,
+/// while inserting its similarly sized successor evicts the predecessor.
+const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
+const MUTATION_ID_CONFLICT_CODE: &str = "LIX_ERROR_PROTOCOL_MUTATION_ID_CONFLICT";
+const MAX_MUTATION_ID_BYTES: usize = 128;
+const MAX_MUTATION_REPLAY_ENTRIES: usize = 64;
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
@@ -146,6 +152,56 @@ where
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
     request_blobs: Mutex<RequestBlobCache>,
+    mutation_replays: AsyncMutex<MutationReplayCache>,
+    max_reconstructed_request_blob_bytes: usize,
+}
+
+#[derive(Clone)]
+enum MutationReplayResult {
+    Execute(ExecuteResult),
+    Batch(Vec<ExecuteResult>),
+}
+
+struct MutationReplayEntry {
+    digest: [u8; 32],
+    result: MutationReplayResult,
+}
+
+#[derive(Default)]
+struct MutationReplayCache {
+    entries: HashMap<String, MutationReplayEntry>,
+    insertion_order: VecDeque<String>,
+}
+
+impl MutationReplayCache {
+    fn get(
+        &self,
+        mutation_id: &str,
+        digest: &[u8; 32],
+    ) -> Result<Option<MutationReplayResult>, LixError> {
+        let Some(entry) = self.entries.get(mutation_id) else {
+            return Ok(None);
+        };
+        if &entry.digest != digest {
+            return Err(mutation_id_conflict(mutation_id));
+        }
+        Ok(Some(entry.result.clone()))
+    }
+
+    fn insert(&mut self, mutation_id: String, digest: [u8; 32], result: MutationReplayResult) {
+        if self.entries.contains_key(&mutation_id) {
+            return;
+        }
+        while self.entries.len() >= MAX_MUTATION_REPLAY_ENTRIES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.insertion_order.push_back(mutation_id.clone());
+        self.entries
+            .insert(mutation_id, MutationReplayEntry { digest, result });
+    }
 }
 
 #[derive(Default)]
@@ -194,12 +250,14 @@ impl<S> SessionRecord<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fn new(lix: Lix<S>, now: Instant) -> Self {
+    fn new(lix: Lix<S>, now: Instant, max_reconstructed_request_blob_bytes: usize) -> Self {
         Self {
             lix: Arc::new(lix),
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
             request_blobs: Mutex::new(RequestBlobCache::default()),
+            mutation_replays: AsyncMutex::new(MutationReplayCache::default()),
+            max_reconstructed_request_blob_bytes,
         }
     }
 
@@ -567,7 +625,11 @@ where
                 break candidate;
             }
         };
-        let record = Arc::new(SessionRecord::new(child, now));
+        let record = Arc::new(SessionRecord::new(
+            child,
+            now,
+            self.inner.options.max_request_body_bytes,
+        ));
         registry
             .sessions
             .insert(session_id.clone(), Arc::clone(&record));
@@ -717,6 +779,7 @@ where
             session_id: lease.session_id.clone(),
             capabilities: ProtocolCapabilities {
                 request_blob_splice: true,
+                mutation_replay: true,
             },
         }),
     ))
@@ -741,14 +804,17 @@ async fn execute<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let mutation_id = validate_mutation_id(request.mutation_id)?;
     let sql = required_non_empty(request.sql, "sql")?;
-    let mut reconstructed_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
     let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
     let mut cache_candidates = Vec::new();
     let decoded = decode_request_params(
         request.params,
         None,
         request.cache_blobs,
+        reconstructed_bytes_limit,
         &mut reconstructed_bytes_remaining,
         &mut cache_candidate_bytes_remaining,
         &mut cache_candidates,
@@ -756,10 +822,59 @@ where
     )?;
     let options = request.options.into();
     let params = decoded.values;
-    let result = lease
-        .run(move |lix| async move { lix.execute_with_options(&sql, &params, options).await })
-        .await?;
-    lease.record.cache_request_blobs(cache_candidates);
+    let mut metadata = decoded.metadata;
+    let digest = mutation_id
+        .as_deref()
+        .map(|_| execute_request_digest(&sql, &params, &options))
+        .transpose()?;
+    if let (Some(mutation_id), Some(digest)) = (mutation_id.as_deref(), digest.as_ref()) {
+        metadata.mutation_identity =
+            Some(mutation_identity(&lease.session_id, mutation_id, digest, 0));
+        // Cache reconstructed request bases before dispatch. The replay task
+        // continues after HTTP cancellation, so a lost response cannot also
+        // lose the bytes needed by the retry.
+        lease
+            .record
+            .cache_request_blobs(std::mem::take(&mut cache_candidates));
+    }
+    let result = if let (Some(mutation_id), Some(digest)) = (mutation_id, digest) {
+        let record = Arc::clone(&lease.record);
+        lease
+            .run(move |lix| async move {
+                // Deliberately hold this small per-session gate through the
+                // engine call. It makes duplicates single-flight, and because
+                // it lives inside SessionLease::run's detached blocking task,
+                // cancellation of the HTTP waiter cannot open a replay race.
+                let mut replays = record.mutation_replays.lock().await;
+                if let Some(result) = replays.get(&mutation_id, &digest)? {
+                    return match result {
+                        MutationReplayResult::Execute(result) => Ok(result),
+                        MutationReplayResult::Batch(_) => Err(mutation_id_conflict(&mutation_id)),
+                    };
+                }
+                let result = lix
+                    .execute_with_options_and_metadata(&sql, &params, options, metadata)
+                    .await?;
+                replays.insert(
+                    mutation_id,
+                    digest,
+                    MutationReplayResult::Execute(result.clone()),
+                );
+                Ok(result)
+            })
+            .await?
+    } else {
+        let result = lease
+            .run(move |lix| async move {
+                lix.execute_with_options_and_metadata(&sql, &params, options, metadata)
+                    .await
+            })
+            .await?;
+        lease
+            .record
+            .cache_request_blobs(std::mem::take(&mut cache_candidates));
+        result
+    };
     Ok(Json(ExecuteResponse::try_from(result)?))
 }
 
@@ -770,13 +885,15 @@ async fn execute_batch<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let mutation_id = validate_mutation_id(request.mutation_id)?;
     if request.statements.is_empty() {
         return Err(ApiError::bad_request("statements must not be empty"));
     }
     let mut cache_candidates = Vec::new();
-    let mut reconstructed_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
     let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
-    let statements = request
+    let decoded_statements = request
         .statements
         .into_iter()
         .enumerate()
@@ -785,22 +902,83 @@ where
                 statement.params,
                 Some(index),
                 request.cache_blobs,
+                reconstructed_bytes_limit,
                 &mut reconstructed_bytes_remaining,
                 &mut cache_candidate_bytes_remaining,
                 &mut cache_candidates,
                 |sha256| lease.record.request_blob(sha256),
             )?;
-            Ok(ExecuteBatchStatement {
-                sql: required_non_empty(statement.sql, "statements[].sql")?,
-                params: decoded.values,
-            })
+            Ok((
+                ExecuteBatchStatement {
+                    sql: required_non_empty(statement.sql, "statements[].sql")?,
+                    params: decoded.values,
+                },
+                decoded.metadata,
+            ))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
+    let (statements, mut statement_metadata): (Vec<_>, Vec<_>) =
+        decoded_statements.into_iter().unzip();
     let options = request.options.into();
-    let results = lease
-        .run(move |lix| async move { lix.execute_batch_with_options(&statements, options).await })
-        .await?;
-    lease.record.cache_request_blobs(cache_candidates);
+    let digest = mutation_id
+        .as_deref()
+        .map(|_| execute_batch_request_digest(&statements, &options))
+        .transpose()?;
+    if let (Some(mutation_id), Some(digest)) = (mutation_id.as_deref(), digest.as_ref()) {
+        for (statement_index, metadata) in statement_metadata.iter_mut().enumerate() {
+            metadata.mutation_identity = Some(mutation_identity(
+                &lease.session_id,
+                mutation_id,
+                digest,
+                statement_index,
+            ));
+        }
+        lease
+            .record
+            .cache_request_blobs(std::mem::take(&mut cache_candidates));
+    }
+    let results = if let (Some(mutation_id), Some(digest)) = (mutation_id, digest) {
+        let record = Arc::clone(&lease.record);
+        lease
+            .run(move |lix| async move {
+                let mut replays = record.mutation_replays.lock().await;
+                if let Some(result) = replays.get(&mutation_id, &digest)? {
+                    return match result {
+                        MutationReplayResult::Batch(results) => Ok(results),
+                        MutationReplayResult::Execute(_) => Err(mutation_id_conflict(&mutation_id)),
+                    };
+                }
+                let results = lix
+                    .execute_batch_with_options_and_metadata(
+                        &statements,
+                        options,
+                        statement_metadata,
+                    )
+                    .await?;
+                replays.insert(
+                    mutation_id,
+                    digest,
+                    MutationReplayResult::Batch(results.clone()),
+                );
+                Ok(results)
+            })
+            .await?
+    } else {
+        let results = lease
+            .run(move |lix| async move {
+                lix.execute_batch_with_options_and_metadata(
+                    &statements,
+                    options,
+                    statement_metadata,
+                )
+                .await
+            })
+            .await?;
+        lease
+            .record
+            .cache_request_blobs(std::mem::take(&mut cache_candidates));
+        results
+    };
     Ok(Json(
         results
             .into_iter()
@@ -1034,18 +1212,21 @@ fn decode_params_at(
 
 struct DecodedRequestParams {
     values: Vec<Value>,
+    metadata: ExecuteStatementMetadata,
 }
 
 fn decode_request_params(
     params: Vec<RequestWireValue>,
     statement_index: Option<usize>,
     cache_full_blobs: bool,
+    reconstructed_bytes_limit: usize,
     reconstructed_bytes_remaining: &mut usize,
     cache_candidate_bytes_remaining: &mut usize,
     cache_candidates: &mut Vec<CachedRequestBlob>,
     lookup_blob: impl Fn(&str) -> Option<Arc<[u8]>>,
 ) -> Result<DecodedRequestParams, ApiError> {
     let mut values = Vec::with_capacity(params.len());
+    let mut parameter_blob_splices = Vec::with_capacity(params.len());
     for (parameter_index, value) in params.into_iter().enumerate() {
         match value {
             RequestWireValue::Value(value) => {
@@ -1070,6 +1251,7 @@ fn decode_request_params(
                     );
                 }
                 values.push(value);
+                parameter_blob_splices.push(None);
             }
             RequestWireValue::BlobSplice(splice) => {
                 let base_sha256 = splice.base_sha256;
@@ -1156,7 +1338,7 @@ fn decode_request_params(
                         statement_index,
                         LixError::CODE_INVALID_PARAM,
                         format!(
-                            "aggregate reconstructed blobs exceed the {MAX_REQUEST_BLOB_CACHE_BYTES}-byte request limit"
+                            "aggregate reconstructed blobs exceed the {reconstructed_bytes_limit}-byte request limit"
                         ),
                     ));
                 }
@@ -1175,16 +1357,29 @@ fn decode_request_params(
                     ));
                 }
                 prepare_cache_candidate(
-                    result_sha256,
+                    result_sha256.clone(),
                     &reconstructed,
                     cache_candidate_bytes_remaining,
                     cache_candidates,
                 );
                 values.push(Value::Blob(reconstructed));
+                parameter_blob_splices.push(Some(RequestBlobSpliceProvenance {
+                    base_sha256,
+                    result_sha256,
+                    prefix_bytes: prefix,
+                    suffix_bytes: suffix,
+                    insert,
+                }));
             }
         }
     }
-    Ok(DecodedRequestParams { values })
+    Ok(DecodedRequestParams {
+        values,
+        metadata: ExecuteStatementMetadata {
+            parameter_blob_splices,
+            ..ExecuteStatementMetadata::default()
+        },
+    })
 }
 
 fn prepare_cache_candidate(
@@ -1252,6 +1447,122 @@ fn sha256_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn validate_mutation_id(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty()
+        || value.len() > MAX_MUTATION_ID_BYTES
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(ApiError::bad_request(format!(
+            "mutationId must contain 1 to {MAX_MUTATION_ID_BYTES} visible ASCII bytes"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn digest_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn digest_options(hasher: &mut Sha256, options: &ExecuteOptions) {
+    match options.origin_key.as_deref() {
+        Some(origin_key) => {
+            hasher.update([1]);
+            digest_field(hasher, origin_key.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn digest_params(hasher: &mut Sha256, params: &[Value]) -> Result<(), LixError> {
+    hasher.update(
+        u64::try_from(params.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for value in params {
+        // Normalize full-blob and splice transports to the same engine value.
+        // This lets a retry switch wire encodings without changing identity.
+        let wire = WireValue::try_from_engine(value)?;
+        let encoded = serde_json::to_vec(&wire).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("encode mutation request digest: {error}"),
+            )
+        })?;
+        digest_field(hasher, &encoded);
+    }
+    Ok(())
+}
+
+fn execute_request_digest(
+    sql: &str,
+    params: &[Value],
+    options: &ExecuteOptions,
+) -> Result<[u8; 32], LixError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lix.execute.mutation.v1\0");
+    digest_field(&mut hasher, sql.as_bytes());
+    digest_params(&mut hasher, params)?;
+    digest_options(&mut hasher, options);
+    Ok(hasher.finalize().into())
+}
+
+fn execute_batch_request_digest(
+    statements: &[ExecuteBatchStatement],
+    options: &ExecuteOptions,
+) -> Result<[u8; 32], LixError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lix.execute-batch.mutation.v1\0");
+    hasher.update(
+        u64::try_from(statements.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for statement in statements {
+        digest_field(&mut hasher, statement.sql.as_bytes());
+        digest_params(&mut hasher, &statement.params)?;
+    }
+    digest_options(&mut hasher, options);
+    Ok(hasher.finalize().into())
+}
+
+fn mutation_identity(
+    operation_scope: &str,
+    mutation_id: &str,
+    request_digest: &[u8; 32],
+    statement_index: usize,
+) -> MutationIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lix.plugin-v2.namespace-seed.v1\0");
+    digest_field(&mut hasher, operation_scope.as_bytes());
+    digest_field(&mut hasher, mutation_id.as_bytes());
+    hasher.update(request_digest);
+    hasher.update(
+        u64::try_from(statement_index)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    let operation_proof: [u8; 32] = hasher.finalize().into();
+    MutationIdentity {
+        namespace_seed: operation_proof[..16]
+            .try_into()
+            .expect("SHA-256 digest has a 16-byte prefix"),
+        operation_proof,
+    }
+}
+
+fn mutation_id_conflict(mutation_id: &str) -> LixError {
+    LixError::new(
+        MUTATION_ID_CONFLICT_CODE,
+        "mutationId was already used for a different request",
+    )
+    .with_details(serde_json::json!({ "mutationId": mutation_id }))
 }
 
 fn required_non_empty(value: Option<String>, field: &'static str) -> Result<String, ApiError> {
@@ -1422,7 +1733,8 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         | LixError::CODE_COMMIT_NOT_FOUND
         | LixError::CODE_TABLE_NOT_FOUND
         | LixError::CODE_COLUMN_NOT_FOUND => StatusCode::NOT_FOUND,
-        LixError::CODE_CLOSED => StatusCode::CONFLICT,
+        LixError::CODE_CLOSED | MUTATION_ID_CONFLICT_CODE => StatusCode::CONFLICT,
+        LixError::CODE_PLUGIN_OBSERVATION_STALE => StatusCode::GONE,
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -1441,6 +1753,7 @@ struct HandshakeResponse {
 #[serde(rename_all = "camelCase")]
 struct ProtocolCapabilities {
     request_blob_splice: bool,
+    mutation_replay: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1453,6 +1766,7 @@ struct ExecuteRequest {
     options: ExecuteOptionsRequest,
     #[serde(default)]
     cache_blobs: bool,
+    mutation_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1478,6 +1792,7 @@ struct ExecuteBatchRequest {
     options: ExecuteOptionsRequest,
     #[serde(default)]
     cache_blobs: bool,
+    mutation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2019,6 +2334,164 @@ mod tests {
         })
     }
 
+    #[test]
+    fn request_blob_splice_metadata_stays_aligned_with_its_sql_parameter() {
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let mut result = base.clone();
+        result[8..12].copy_from_slice(b"BETA");
+        let base_sha256 = sha256_hex(&base);
+        let params = vec![
+            json!({ "kind": "text", "value": "file-a" }),
+            blob_splice_json(&base, &result, 8, base.len() - 12, b"BETA"),
+            wire_blob_json(b"full"),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).expect("request parameter should decode"))
+        .collect();
+        let mut reconstructed_bytes_remaining = DEFAULT_MAX_REQUEST_BODY_BYTES;
+        let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let mut cache_candidates = Vec::new();
+
+        let decoded = decode_request_params(
+            params,
+            None,
+            false,
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+            &mut reconstructed_bytes_remaining,
+            &mut cache_candidate_bytes_remaining,
+            &mut cache_candidates,
+            |sha256| (sha256 == base_sha256).then(|| Arc::<[u8]>::from(base.clone())),
+        )
+        .expect("splice parameters should decode");
+
+        assert_eq!(decoded.values[1], Value::Blob(result));
+        assert_eq!(decoded.metadata.parameter_blob_splices.len(), 3);
+        assert!(decoded.metadata.parameter_blob_splices[0].is_none());
+        let provenance = decoded.metadata.parameter_blob_splices[1]
+            .as_ref()
+            .expect("splice metadata should remain at parameter two");
+        assert_eq!(provenance.base_sha256, base_sha256);
+        assert_eq!(provenance.prefix_bytes, 8);
+        assert_eq!(provenance.suffix_bytes, base.len() - 12);
+        assert_eq!(provenance.insert, b"BETA");
+        assert!(decoded.metadata.parameter_blob_splices[2].is_none());
+    }
+
+    #[test]
+    fn request_blob_splice_reconstructs_the_exact_large_csv_fixture() {
+        const EXACT_CSV_BYTES: usize = 10_680_000;
+        const _: () = {
+            assert!(EXACT_CSV_BYTES > 10 * 1024 * 1024);
+            assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+        };
+
+        let base: Arc<[u8]> = Arc::from(vec![b'a'; EXACT_CSV_BYTES]);
+        let mut result = base.to_vec();
+        let edit_offset = result.len() / 2;
+        result[edit_offset] = b'b';
+        let base_sha256 = sha256_hex(&base);
+        let params = vec![
+            serde_json::from_value(blob_splice_json(
+                &base,
+                &result,
+                edit_offset,
+                base.len() - edit_offset - 1,
+                b"b",
+            ))
+            .expect("large splice request parameter should decode"),
+        ];
+        let mut reconstructed_bytes_remaining = DEFAULT_MAX_REQUEST_BODY_BYTES;
+        let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let mut cache_candidates = Vec::new();
+
+        let decoded = decode_request_params(
+            params,
+            None,
+            false,
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+            &mut reconstructed_bytes_remaining,
+            &mut cache_candidate_bytes_remaining,
+            &mut cache_candidates,
+            |sha256| (sha256 == base_sha256).then(|| Arc::clone(&base)),
+        )
+        .expect("the exact 10.68 MB CSV splice should reconstruct");
+
+        let Value::Blob(reconstructed) = &decoded.values[0] else {
+            panic!("large splice should decode to a blob parameter");
+        };
+        assert_eq!(reconstructed, &result);
+        let provenance = decoded.metadata.parameter_blob_splices[0]
+            .as_ref()
+            .expect("large splice provenance should survive decoding");
+        assert_eq!(provenance.prefix_bytes, edit_offset);
+        assert_eq!(provenance.suffix_bytes, base.len() - edit_offset - 1);
+        assert_eq!(provenance.insert, b"b");
+        assert_eq!(
+            reconstructed_bytes_remaining,
+            DEFAULT_MAX_REQUEST_BODY_BYTES - EXACT_CSV_BYTES
+        );
+        assert_eq!(cache_candidates.len(), 1);
+        assert_eq!(cache_candidates[0].bytes.as_ref(), result.as_slice());
+    }
+
+    #[test]
+    fn batch_blob_splice_metadata_stays_aligned_by_statement() {
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let base_sha256 = sha256_hex(&base);
+        let decode = |parameter_index: usize, insert: u8| {
+            let mut result = base.clone();
+            result[parameter_index] = insert;
+            let splice = blob_splice_json(
+                &base,
+                &result,
+                parameter_index,
+                base.len() - parameter_index - 1,
+                &[insert],
+            );
+            let mut wire = vec![json!({ "kind": "text", "value": "unrelated" })];
+            wire.resize_with(parameter_index, || json!({ "kind": "null", "value": null }));
+            wire.push(splice);
+            let params = wire
+                .into_iter()
+                .map(|value| {
+                    serde_json::from_value(value).expect("batch request parameter should decode")
+                })
+                .collect();
+            let mut reconstructed_bytes_remaining = DEFAULT_MAX_REQUEST_BODY_BYTES;
+            let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+            let mut cache_candidates = Vec::new();
+            decode_request_params(
+                params,
+                Some(parameter_index),
+                false,
+                DEFAULT_MAX_REQUEST_BODY_BYTES,
+                &mut reconstructed_bytes_remaining,
+                &mut cache_candidate_bytes_remaining,
+                &mut cache_candidates,
+                |sha256| (sha256 == base_sha256).then(|| Arc::<[u8]>::from(base.clone())),
+            )
+            .expect("batch splice should decode")
+        };
+
+        let first = decode(1, b'1');
+        let second = decode(3, b'2');
+        assert!(first.metadata.parameter_blob_splices[0].is_none());
+        assert_eq!(
+            first.metadata.parameter_blob_splices[1]
+                .as_ref()
+                .map(|splice| splice.insert.as_slice()),
+            Some(&b"1"[..])
+        );
+        assert!(second.metadata.parameter_blob_splices[1].is_none());
+        assert!(second.metadata.parameter_blob_splices[2].is_none());
+        assert_eq!(
+            second.metadata.parameter_blob_splices[3]
+                .as_ref()
+                .map(|splice| splice.insert.as_slice()),
+            Some(&b"2"[..])
+        );
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(bytes).expect("gzip input");
@@ -2055,6 +2528,7 @@ mod tests {
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(first["capabilities"]["requestBlobSplice"], true);
+        assert_eq!(first["capabilities"]["mutationReplay"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -2215,6 +2689,130 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn mutation_id_singleflights_exact_retries_and_rejects_digest_reuse() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let body = json!({
+            "sql": "INSERT INTO lix_key_value (key, value) VALUES ('replay-key', 'one')",
+            "mutationId": "client-operation-1",
+        });
+
+        let (first, retry) = tokio::join!(
+            request(
+                &app.router,
+                "POST",
+                "/lix/v1/execute",
+                Some(&session_id),
+                Some(body.clone()),
+            ),
+            request(
+                &app.router,
+                "POST",
+                "/lix/v1/execute",
+                Some(&session_id),
+                Some(body),
+            ),
+        );
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(response_json(first).await, response_json(retry).await);
+
+        let conflict = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('replay-key-2', 'two')",
+                "mutationId": "client-operation-1",
+            })),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(conflict).await, MUTATION_ID_CONFLICT_CODE);
+
+        let rows = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT key FROM lix_key_value WHERE key = 'replay-key'",
+            })),
+        )
+        .await;
+        assert_eq!(rows.status(), StatusCode::OK);
+        let rows = response_json(rows).await;
+        assert_eq!(rows["rows"].as_array().map(Vec::len), Some(1));
+
+        let rejected_rows = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT key FROM lix_key_value WHERE key = 'replay-key-2'",
+            })),
+        )
+        .await;
+        assert_eq!(rejected_rows.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(rejected_rows).await["rows"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn mutation_identities_are_session_retry_stable_and_statement_scoped() {
+        let digest = execute_request_digest(
+            "UPDATE lix_file SET data = $1 WHERE id = $2",
+            &[Value::Blob(b"new".to_vec()), Value::Text("file".into())],
+            &ExecuteOptions::default(),
+        )
+        .expect("digest");
+        let first = mutation_identity("session-a", "retry-stable", &digest, 0);
+        assert_eq!(
+            first,
+            mutation_identity("session-a", "retry-stable", &digest, 0)
+        );
+        assert_ne!(
+            first,
+            mutation_identity("session-a", "retry-stable", &digest, 1)
+        );
+        assert_ne!(
+            first,
+            mutation_identity("session-a", "different-operation", &digest, 0)
+        );
+        assert_ne!(
+            first,
+            mutation_identity("session-b", "retry-stable", &digest, 0),
+            "the same client mutation ID and request in another protocol session must have distinct hidden operation authority",
+        );
+        assert_eq!(first.namespace_seed, first.operation_proof[..16]);
+    }
+
+    #[test]
+    fn mutation_replay_cache_is_entry_bounded() {
+        let mut cache = MutationReplayCache::default();
+        for index in 0..=MAX_MUTATION_REPLAY_ENTRIES {
+            cache.insert(
+                format!("mutation-{index}"),
+                [u8::try_from(index).unwrap_or(u8::MAX); 32],
+                MutationReplayResult::Execute(ExecuteResult::from_rows_affected(index as u64)),
+            );
+        }
+        assert_eq!(cache.entries.len(), MAX_MUTATION_REPLAY_ENTRIES);
+        assert!(!cache.entries.contains_key("mutation-0"));
+        assert!(
+            cache
+                .entries
+                .contains_key(&format!("mutation-{MAX_MUTATION_REPLAY_ENTRIES}"))
+        );
     }
 
     #[tokio::test]
@@ -2379,9 +2977,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_batch_bounds_aggregate_blob_reconstruction_before_mutation() {
-        let app = app().await;
+        const TEST_RECONSTRUCTION_LIMIT: usize = 128 * 1024;
+        let app = app_with_options(ProtocolServerOptions {
+            max_request_body_bytes: TEST_RECONSTRUCTION_LIMIT,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
         let (session_id, _) = new_session(&app.router).await;
-        let base = vec![b'a'; MAX_REQUEST_BLOB_CACHE_BYTES / 2];
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
         let cached = request(
             &app.router,
             "POST",
@@ -2402,31 +3005,29 @@ mod tests {
         let mut result = base.clone();
         result.push(b'b');
         let splice = blob_splice_json(&base, &result, base.len(), 0, b"b");
+        let statements = (0..4)
+            .map(|index| {
+                if index == 0 {
+                    json!({
+                        "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                        "params": [
+                            { "kind": "text", "value": "/must-not-execute.bin" },
+                            splice.clone(),
+                        ],
+                    })
+                } else {
+                    json!({ "sql": "SELECT $1", "params": [splice.clone()] })
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(result.len() * statements.len() > TEST_RECONSTRUCTION_LIMIT);
         let response = request(
             &app.router,
             "POST",
             "/lix/v1/execute-batch",
             Some(&session_id),
             Some(json!({
-                "statements": [
-                    {
-                        "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-                        "params": [
-                            { "kind": "text", "value": "/must-not-execute.bin" },
-                            splice,
-                        ],
-                    },
-                    {
-                        "sql": "SELECT $1",
-                        "params": [blob_splice_json(
-                            &base,
-                            &result,
-                            base.len(),
-                            0,
-                            b"b",
-                        )],
-                    },
-                ],
+                "statements": statements,
             })),
         )
         .await;
@@ -2583,6 +3184,36 @@ mod tests {
             bytes: Arc::from(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1]),
         });
         assert!(cache.get("too-small").is_none());
+    }
+
+    #[test]
+    fn request_blob_cache_retains_and_rotates_exact_large_file_bases() {
+        const EXACT_CSV_BYTES: usize = 10_680_000;
+        const _: () = {
+            assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+            assert!(EXACT_CSV_BYTES * 2 > MAX_REQUEST_BLOB_CACHE_BYTES);
+        };
+        let mut cache = RequestBlobCache::default();
+
+        cache.insert(CachedRequestBlob {
+            sha256: "large-base".to_string(),
+            bytes: Arc::from(vec![b'a'; EXACT_CSV_BYTES]),
+        });
+        assert_eq!(
+            cache.get("large-base").as_deref().map(<[u8]>::len),
+            Some(EXACT_CSV_BYTES)
+        );
+
+        cache.insert(CachedRequestBlob {
+            sha256: "large-successor".to_string(),
+            bytes: Arc::from(vec![b'b'; EXACT_CSV_BYTES]),
+        });
+        assert!(cache.get("large-base").is_none());
+        assert_eq!(
+            cache.get("large-successor").as_deref().map(<[u8]>::len),
+            Some(EXACT_CSV_BYTES)
+        );
+        assert_eq!(cache.total_bytes, EXACT_CSV_BYTES);
     }
 
     #[test]

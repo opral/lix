@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
-use crate::common::{LixPath, compose_file_path};
+use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
@@ -45,11 +45,12 @@ use crate::live_state::{
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
-    PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
-    plugin_key_from_archive_file_id, plugin_key_from_archive_path,
-    plugin_state_live_state_projection, plugin_storage_archive_file_id,
-    render_plugin_state_with_component_instance,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
+    PluginActorColdOpen, PluginActorKey, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+    PluginRuntime, PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
+    inferred_media_type_for_path, is_plugin_storage_path, plugin_key_from_archive_file_id,
+    plugin_key_from_archive_path, plugin_state_live_state_projection,
+    plugin_storage_archive_file_id, render_plugin_state_with_component_instance,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -66,8 +67,13 @@ use crate::sql2::write_normalization::{
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::WasmComponentInstance;
+use crate::wasm::{
+    WasmComponentV2Factory, WasmFileDescriptor, WasmHostBytes, WasmHostEntity,
+    WasmOpenEntitiesInput, WasmPluginSelection, WasmTransitionLimits,
+};
 use crate::{
-    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, parse_row_metadata_value, serialize_row_metadata,
+    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
+    serialize_row_metadata,
 };
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -306,6 +312,7 @@ impl LixFileSpec {
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
+        let session_file_views = write_ctx.session_file_views();
         Self {
             schema: lix_file_schema(),
             live_state,
@@ -316,7 +323,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             options,
-            session_file_views: None,
+            session_file_views,
         }
     }
 
@@ -352,6 +359,7 @@ impl LixFileSpec {
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
+        let session_file_views = write_ctx.session_file_views();
         Self {
             schema: lix_file_by_branch_schema(),
             live_state,
@@ -362,7 +370,7 @@ impl LixFileSpec {
             functions,
             branch_binding: BranchBinding::explicit(),
             options,
-            session_file_views: None,
+            session_file_views,
         }
     }
 
@@ -397,6 +405,7 @@ impl LixFileSpec {
                 needs_data,
                 needs_plugin_ownership,
                 capture_path_resolver_rows,
+                self.session_file_views.clone(),
                 captured,
             ),
             |(
@@ -410,6 +419,7 @@ impl LixFileSpec {
                 needs_data,
                 needs_plugin_ownership,
                 capture_path_resolver_rows,
+                session_file_views,
                 captured,
             )| async move {
                 *captured.lock().expect("lix_file DML source mutex poisoned") = None;
@@ -468,6 +478,7 @@ impl LixFileSpec {
                             "sql2 lix_file plugin discovery failed: {error}"
                         ))
                     })?
+                    .map(|context| context.with_session_file_views(session_file_views))
                 } else {
                     None
                 };
@@ -550,10 +561,17 @@ pub(crate) async fn execute_exact_lix_file_read(
     let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
     let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let load_data = column == ExactLixFileReadColumn::Data;
-    let plugin_render = if prepared.needs_plugin_render(load_data) {
-        plugin_render_context_for_lix_file_scan(live_state, &request, plugin_host, &prepared, false)
-            .await?
-            .map(|context| context.with_session_file_views(session_file_views))
+    let acknowledge_plugin_data = load_data && session_file_views.is_some();
+    let plugin_render = if prepared.needs_plugin_render(load_data) || acknowledge_plugin_data {
+        plugin_render_context_for_lix_file_scan(
+            live_state,
+            &request,
+            plugin_host,
+            &prepared,
+            acknowledge_plugin_data,
+        )
+        .await?
+        .map(|context| context.with_session_file_views(session_file_views))
     } else {
         None
     };
@@ -573,6 +591,74 @@ pub(crate) async fn execute_exact_lix_file_read(
             .collect::<Vec<_>>(),
         &[batch],
     )
+}
+
+/// Executes Lixray's exact active-branch file batch without constructing a
+/// DataFusion catalog, plan, or Arrow result batch. Keep this separate from
+/// the established point-read path so unrelated file queries remain
+/// byte-for-byte on their existing implementation.
+pub(crate) async fn execute_exact_lix_file_batch_read(
+    active_branch_id: &str,
+    live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    session_file_views: Option<SessionFileViews>,
+    paths: &BTreeSet<String>,
+) -> Result<SqlQueryResult, LixError> {
+    let base_schema = lix_file_schema();
+    let schema = Arc::new(Schema::new(vec![
+        base_schema
+            .field_with_name("path")
+            .expect("lix_file schema should have path")
+            .clone(),
+        base_schema
+            .field_with_name("data")
+            .expect("lix_file schema should have data")
+            .clone(),
+    ]));
+    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
+
+    let index = filesystem_path_index
+        .path_index(&FilesystemPathIndexRequest::new(
+            request.filter.branch_ids.clone(),
+        ))
+        .await?;
+    let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
+    let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let acknowledge_plugin_data = session_file_views.is_some();
+    let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
+        plugin_render_context_for_lix_file_scan(
+            live_state,
+            &request,
+            plugin_host,
+            &prepared,
+            acknowledge_plugin_data,
+        )
+        .await?
+        .map(|context| context.with_session_file_views(session_file_views))
+    } else {
+        None
+    };
+
+    // No relational operators remain after exact path selection. Move owned
+    // blobs into the result instead of packing them into Arrow only for
+    // DataFusion to copy them back into row values.
+    let rows = exact_path_data_rows_from_prepared(&blob_reader, plugin_render, prepared).await?;
+    Ok(SqlQueryResult {
+        columns: vec!["path".to_string(), "data".to_string()],
+        rows,
+        notices: Vec::new(),
+    })
 }
 
 fn lix_file_dml_source_state(
@@ -1837,8 +1923,14 @@ pub(crate) enum FastLixFilePathWriteConflict {
 
 pub(crate) async fn execute_fast_lix_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
-    writes: Vec<(String, Vec<u8>, Option<TransactionJson>)>,
+    writes: Vec<(
+        String,
+        Vec<u8>,
+        Option<TransactionJson>,
+        Option<RequestBlobSpliceProvenance>,
+    )>,
     conflict: FastLixFilePathWriteConflict,
+    mutation_identity: Option<MutationIdentity>,
 ) -> Result<Option<u64>, LixError> {
     if writes.is_empty() {
         return Ok(Some(0));
@@ -1860,6 +1952,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
             parsed_writes,
             indexed,
             conflict,
+            mutation_identity,
         )
         .await
         .map(Some);
@@ -1930,6 +2023,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                     if context.global {
                         context.branch_id = GLOBAL_BRANCH_ID.to_string();
                     }
+                    let file_data_start = staged.file_data_writes.len();
                     stage_lix_file_data_update_write(
                         &mut staged,
                         existing.id.clone(),
@@ -1941,6 +2035,11 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    attach_fast_file_write_metadata(
+                        &mut staged.file_data_writes[file_data_start..],
+                        write.splice_provenance,
+                        mutation_identity,
+                    );
                     staged.add_count(1)?;
                 }
                 FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
@@ -1957,6 +2056,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                             name: existing.name.clone(),
                             context: context.clone(),
                         }));
+                    let file_data_start = staged.file_data_writes.len();
                     stage_lix_file_data_update_write(
                         &mut staged,
                         existing.id.clone(),
@@ -1968,6 +2068,11 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    attach_fast_file_write_metadata(
+                        &mut staged.file_data_writes[file_data_start..],
+                        write.splice_provenance,
+                        mutation_identity,
+                    );
                     staged.add_count(1)?;
                 }
             }
@@ -1993,6 +2098,11 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                 context,
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
+            attach_fast_file_write_metadata(
+                &mut plan.file_data,
+                write.splice_provenance,
+                mutation_identity,
+            );
             attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
             staged.extend_filesystem_plan(plan)?;
         }
@@ -2073,6 +2183,7 @@ async fn stage_indexed_file_path_writes(
     writes: Vec<FastLixFilePathWrite>,
     mut indexed: IndexedFilePathWrites,
     conflict: FastLixFilePathWriteConflict,
+    mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
     debug_assert_eq!(writes.len(), indexed.existing.len());
     debug_assert!(matches!(
@@ -2132,6 +2243,7 @@ async fn stage_indexed_file_path_writes(
                     unreachable!("indexed path route only handles conflict updates")
                 }
             }
+            let file_data_start = staged.file_data_writes.len();
             stage_lix_file_data_update_write(
                 &mut staged,
                 entry.id().to_string(),
@@ -2143,6 +2255,11 @@ async fn stage_indexed_file_path_writes(
                 None,
             )
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+            attach_fast_file_write_metadata(
+                &mut staged.file_data_writes[file_data_start..],
+                write.splice_provenance,
+                mutation_identity,
+            );
             staged.add_count(1)?;
         } else {
             let context = FilesystemRowContext {
@@ -2169,6 +2286,11 @@ async fn stage_indexed_file_path_writes(
                 context,
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
+            attach_fast_file_write_metadata(
+                &mut plan.file_data,
+                write.splice_provenance,
+                mutation_identity,
+            );
             attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
             staged.extend_filesystem_plan(plan)?;
         }
@@ -2221,6 +2343,8 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
     data: Vec<u8>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
@@ -2294,6 +2418,10 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
             None,
         )
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        if let Some(file_data) = staged.file_data_writes.last_mut() {
+            file_data.set_splice_provenance(splice_provenance.clone());
+            file_data.set_mutation_identity(mutation_identity);
+        }
         staged.add_count(1)?;
     }
     stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
@@ -2303,22 +2431,40 @@ struct FastLixFilePathWrite {
     parsed: ParsedFileWritePath,
     data: Vec<u8>,
     metadata: Option<TransactionJson>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
 }
 
 fn parse_fast_lix_file_path_writes(
-    writes: Vec<(String, Vec<u8>, Option<TransactionJson>)>,
+    writes: Vec<(
+        String,
+        Vec<u8>,
+        Option<TransactionJson>,
+        Option<RequestBlobSpliceProvenance>,
+    )>,
 ) -> std::result::Result<Vec<FastLixFilePathWrite>, LixError> {
     writes
         .into_iter()
-        .map(|(path, data, metadata)| {
+        .map(|(path, data, metadata, splice_provenance)| {
             Ok(FastLixFilePathWrite {
                 parsed: parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?,
                 data,
                 metadata,
+                splice_provenance,
             })
         })
         .collect()
+}
+
+fn attach_fast_file_write_metadata(
+    file_data: &mut [TransactionFileData],
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
+) {
+    for file_data in file_data {
+        file_data.set_splice_provenance(splice_provenance.clone());
+        file_data.set_mutation_identity(mutation_identity);
+    }
 }
 
 fn validate_fast_lix_file_path_conflict_pair(
@@ -2878,11 +3024,15 @@ fn path_update_plugin_rewrite_file_ids(
         let existing_plugin_key = plugin_render
             .owner_for_file(&file_key)
             .map(PluginFileOwner::plugin_key);
-        let assigned_plugin_key = plugin_render
+        let assigned_plugin = plugin_render
             .branch(&context.branch_id)
-            .and_then(|branch| branch.catalog.select_for_bytes(&assigned_path, &data))
-            .map(PluginRegistryEntry::key);
-        if existing_plugin_key != assigned_plugin_key {
+            .and_then(|branch| branch.catalog.select_for_bytes(&assigned_path, &data));
+        let assigned_plugin_key = assigned_plugin.map(PluginRegistryEntry::key);
+        let same_v2_owner = assigned_plugin.is_some_and(|plugin| {
+            plugin.runtime() == PluginRuntime::WasmComponentV2
+                && existing_plugin_key == Some(plugin.key())
+        });
+        if existing_plugin_key != assigned_plugin_key || same_v2_owner {
             file_ids.insert(file_id);
         }
     }
@@ -3857,6 +4007,56 @@ async fn lix_file_record_batch_from_prepared(
     columns.into_record_batch(schema)
 }
 
+async fn exact_path_data_rows_from_prepared(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_render: Option<PluginRenderContext>,
+    prepared: PreparedLixFileRows,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let PreparedLixFileRows {
+        mut file_rows,
+        blob_rows,
+        mut file_paths,
+        path_ordered_file_keys,
+    } = prepared;
+    let mut blob_bytes = load_blob_bytes_for_files(blob_reader, &file_rows, &blob_rows).await?;
+    let file_keys =
+        path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect::<Vec<_>>());
+    let mut rows = Vec::with_capacity(file_keys.len());
+    let mut rendered_plugin_bytes = match &plugin_render {
+        Some(plugin_render) => {
+            render_plugin_files_for_sql(
+                plugin_render,
+                blob_reader,
+                &file_keys,
+                &file_rows,
+                &blob_rows,
+                &file_paths,
+            )
+            .await?
+        }
+        None => BTreeMap::new(),
+    };
+    for key in file_keys {
+        let file = file_rows
+            .remove(&key)
+            .expect("prepared lix_file order should reference a descriptor");
+        let path = file_paths
+            .remove(&key)
+            .expect("prepared lix_file descriptor should have a path");
+        let blob_key = file.blob_ref_key();
+        let data = match blob_bytes.take(&blob_key) {
+            Some(data) => data,
+            None => Some(rendered_plugin_bytes.remove(&key).unwrap_or_default()),
+        };
+        rows.push(vec![
+            Value::Text(path),
+            data.map_or(Value::Null, Value::Blob),
+        ]);
+    }
+
+    Ok(rows)
+}
+
 #[derive(Default)]
 struct LoadedBlobBytes {
     bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<Vec<u8>>>,
@@ -3930,13 +4130,11 @@ async fn render_plugin_files_for_sql(
     file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
 ) -> Result<BTreeMap<FilesystemDescriptorKey, Vec<u8>>, LixError> {
     let mut owned_file_keys = Vec::new();
+    let mut materialized_v2_file_keys = Vec::new();
     for key in file_keys {
         let file = file_rows
             .get(key)
             .expect("prepared lix_file order should reference a descriptor");
-        if blob_rows.contains_key(&file.blob_ref_key()) {
-            continue;
-        }
         let Some(owner) = plugin_render.owner_for_file(key) else {
             continue;
         };
@@ -3946,12 +4144,41 @@ async fn render_plugin_files_for_sql(
         let Some(branch) = plugin_render.branch(key.branch_id()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
-        if branch.registry.get(owner.plugin_key()).is_none() {
+        let Some(plugin) = branch.registry.get(owner.plugin_key()) else {
             return Err(plugin_unavailable_error(file, path, owner));
-        }
+        };
         if branch.catalog.matches_plugin(owner.plugin_key(), path) {
-            owned_file_keys.push(key.clone());
+            match (
+                plugin.runtime(),
+                blob_rows.contains_key(&file.blob_ref_key()),
+            ) {
+                (PluginRuntime::WasmComponentV2, true)
+                    if plugin_render.session_file_views.is_some() =>
+                {
+                    materialized_v2_file_keys.push(key.clone());
+                }
+                (PluginRuntime::WasmComponentV2, true) => {}
+                (PluginRuntime::WasmComponentV2, false) => {
+                    return Err(invalid_plugin_read_state(format!(
+                        "v2 plugin-owned file '{}' is missing its durable materialized blob",
+                        file.id
+                    )));
+                }
+                (PluginRuntime::WasmComponentV1, false) => owned_file_keys.push(key.clone()),
+                (PluginRuntime::WasmComponentV1, true) => {}
+            }
         }
+    }
+    for file_key in materialized_v2_file_keys {
+        acknowledge_materialized_v2_file(
+            plugin_render,
+            blob_reader,
+            &file_key,
+            file_rows,
+            blob_rows,
+            file_paths,
+        )
+        .await?;
     }
     if owned_file_keys.is_empty() {
         return Ok(BTreeMap::new());
@@ -4163,6 +4390,7 @@ async fn render_plugin_files_for_sql(
                         .owner_change_id_for_file(&file_key)
                         .expect("rendered plugin owner should have a change id")
                         .to_string(),
+                    observation: None,
                     // Rendering only borrows the materialized state and this
                     // is its final consumer. Move the row graph into the
                     // session acknowledgement instead of deep-cloning every
@@ -4174,6 +4402,250 @@ async fn render_plugin_files_for_sql(
         rendered.insert(file_key, bytes);
     }
     Ok(rendered)
+}
+
+async fn acknowledge_materialized_v2_file(
+    plugin_render: &PluginRenderContext,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    file_key: &FilesystemDescriptorKey,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+    file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
+) -> Result<(), LixError> {
+    let file = file_rows
+        .get(file_key)
+        .expect("v2 materialization candidate has a descriptor");
+    let blob = blob_rows
+        .get(&file.blob_ref_key())
+        .expect("v2 materialization candidate has a blob reference");
+    let owner = plugin_render
+        .owner_for_file(file_key)
+        .expect("v2 materialization candidate has an owner");
+    let owner_change_id = plugin_render
+        .owner_change_id_for_file(file_key)
+        .ok_or_else(|| invalid_plugin_read_state("v2 plugin owner is missing change_id"))?;
+    let path = file_paths
+        .get(file_key)
+        .expect("v2 materialization candidate has a path");
+    let plugin = plugin_render
+        .branch(file_key.branch_id())
+        .and_then(|branch| branch.registry.get(owner.plugin_key()))
+        .ok_or_else(|| plugin_unavailable_error(file, path, owner))?;
+    if plugin.runtime() != PluginRuntime::WasmComponentV2 {
+        return Err(invalid_plugin_read_state(
+            "materialized v2 acknowledgement selected a non-v2 plugin",
+        ));
+    }
+    let semantic_root = blob
+        .live
+        .change_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            invalid_plugin_read_state("materialized v2 blob reference is missing its semantic root")
+        })?;
+    let actor_key = PluginActorKey {
+        branch_id: file_key.branch_id().to_string(),
+        file_id: file_key.descriptor_id().to_string(),
+        path: path.clone(),
+        owner_change_id: owner_change_id.to_string(),
+        plugin_key: plugin.key().to_string(),
+        plugin_generation: plugin.archive_blob_hash().to_string(),
+    };
+    let cache = plugin_render.host.actor_cache();
+    let observation = match cache.observe(&actor_key, &semantic_root).await {
+        Ok(observation) => observation,
+        Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
+            cold_open_materialized_v2_actor(
+                plugin_render,
+                blob_reader,
+                plugin,
+                &actor_key,
+                path,
+                blob,
+                &semantic_root,
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(session_file_views) = &plugin_render.session_file_views {
+        session_file_views.remember_plugin_file_view(
+            SessionFileViewKey::new(file_key.branch_id(), file_key.descriptor_id()),
+            SessionPluginFileView {
+                plugin_key: plugin.key().to_string(),
+                plugin_generation: plugin.archive_blob_hash().to_string(),
+                owner_change_id: owner_change_id.to_string(),
+                observation: Some(observation),
+                rows: Arc::from([]),
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn cold_open_materialized_v2_actor(
+    plugin_render: &PluginRenderContext,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin: &PluginRegistryEntry,
+    actor_key: &PluginActorKey,
+    path: &str,
+    blob: &BlobRefRecord,
+    semantic_root: &str,
+) -> Result<crate::plugin::PluginObservation, LixError> {
+    let cache = plugin_render.host.actor_cache();
+    let _cold_open_guard = cache.cold_open_guard().await;
+    // Another reader may have populated this actor while we waited. Recheck
+    // under the shared cold gate before scanning full semantic state or
+    // instantiating another Store.
+    let cold_install: PluginActorColdInstall =
+        match cache.prepare_cold_open(actor_key, semantic_root).await? {
+            PluginActorColdOpen::Ready(observation) => return Ok(observation),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+    let limits = WasmTransitionLimits::default();
+    let factory = resolve_v2_factory(&plugin_render.host, blob_reader, plugin).await?;
+    let mut rows = plugin_render
+        .live_state
+        .scan_tracked_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: plugin.schema_keys().to_vec(),
+                branch_ids: vec![actor_key.branch_id.clone()],
+                file_ids: vec![crate::NullableKeyFilter::Value(actor_key.file_id.clone())],
+                untracked: Some(false),
+                ..LiveStateFilter::default()
+            },
+            projection: plugin_state_live_state_projection(),
+            limit: None,
+        })
+        .await?;
+    rows.retain(|row| {
+        row.branch_id == actor_key.branch_id
+            && row.file_id.as_deref() == Some(actor_key.file_id.as_str())
+            && !row.global
+            && !row.untracked
+            && row.snapshot_content.is_some()
+            && plugin.schema_keys().binary_search(&row.schema_key).is_ok()
+    });
+    let mut entities = rows
+        .into_iter()
+        .map(|row| WasmHostEntity {
+            key: crate::wasm::WasmEntityKey {
+                schema_key: row.schema_key,
+                entity_pk: row.entity_pk.into_parts(),
+            },
+            snapshot_content: WasmHostBytes::Inline(
+                row.snapshot_content
+                    .expect("cold-open v2 rows retained only live snapshots")
+                    .into_bytes(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    entities.sort_by(|left, right| left.key.cmp(&right.key));
+    let entity_count = entities.len();
+    let source = VecEntitySource::new(entities, limits)?;
+    let materialized_hash = BlobHash::from_hex(&blob.blob_hash)?;
+    let values = blob_reader
+        .load_bytes_many(&[materialized_hash])
+        .await?
+        .into_vec();
+    let materialized_bytes: Arc<[u8]> = values
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| {
+            invalid_plugin_read_state(format!(
+                "materialized v2 blob '{}' is missing",
+                blob.blob_hash
+            ))
+        })?
+        .into();
+    let mut actor = factory.instantiate_actor().await?;
+    let transition = match actor
+        .open_entities(
+            limits,
+            WasmOpenEntitiesInput {
+                descriptor: v2_read_descriptor(path, plugin),
+                entities: Box::new(source),
+            },
+        )
+        .await
+    {
+        Ok(transition) => transition,
+        Err(error) => {
+            let _ = actor.retire().await;
+            return Err(error);
+        }
+    };
+    let validated = match drain_entity_transition_edits(
+        actor.as_mut(),
+        transition,
+        &[],
+        Some(Arc::clone(&materialized_bytes)),
+        None,
+        limits,
+    )
+    .await
+    {
+        Ok(validated) => validated,
+        Err(error) => {
+            let _ = actor.retire().await;
+            return Err(error);
+        }
+    };
+    let mut counters = validated.counters;
+    counters.full_state_semantic_rows_materialized =
+        u64::try_from(entity_count).unwrap_or(u64::MAX);
+    counters.full_document_reparses = 1;
+    counters.full_renderer_invocations = 1;
+    plugin_render.host.record_v2_transition_counters(counters);
+    cache
+        .install_cold_if_absent(
+            cold_install,
+            actor_key.clone(),
+            actor,
+            validated.document,
+            Arc::clone(&materialized_bytes),
+            Arc::<str>::from(semantic_root),
+        )
+        .await
+}
+
+async fn resolve_v2_factory(
+    host: &PluginRuntimeHost,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin: &PluginRegistryEntry,
+) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
+    let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+    if let Some(factory) = host.cached_plugin_v2_factory(plugin.key(), wasm_hash)? {
+        return Ok(factory);
+    }
+    let wasm = blob_reader
+        .load_bytes_many(&[wasm_hash])
+        .await?
+        .into_vec()
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| {
+            invalid_plugin_read_state(format!(
+                "plugin registry references missing WASM blob '{}'",
+                plugin.wasm_blob_hash()
+            ))
+        })?;
+    host.load_or_compile_v2_factory(&plugin.to_installed_plugin(wasm)?)
+        .await
+}
+
+fn v2_read_descriptor(path: &str, plugin: &PluginRegistryEntry) -> WasmFileDescriptor {
+    WasmFileDescriptor {
+        path: Some(path.to_string()),
+        media_type: inferred_media_type_for_path(Some(path)).map(str::to_owned),
+        plugin: WasmPluginSelection {
+            plugin_key: plugin.key().to_string(),
+            generation: plugin.archive_blob_hash().to_string(),
+        },
+    }
 }
 
 async fn plugin_render_context_for_lix_file_scan(
@@ -7765,6 +8237,7 @@ mod tests {
             content_type,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![schema_key.to_string()],
+            host_allocated_schema_keys: Vec::new(),
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -7772,6 +8245,39 @@ mod tests {
             wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid")
+    }
+
+    fn test_v2_plugin_registry_entry(
+        key: &str,
+        path_glob: &str,
+        schema_key: &str,
+        wasm: &[u8],
+    ) -> PluginRegistryEntry {
+        let manifest_json = serde_json::json!({
+            "api_version": "2.0.0",
+            "entry": "plugin.wasm",
+            "key": key,
+            "match": { "path_glob": path_glob },
+            "runtime": "wasm-component-v2",
+            "schemas": ["schema/plugin.json"],
+        })
+        .to_string();
+        PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: key.to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
+            path_glob: path_glob.to_string(),
+            content_type: None,
+            entry: "plugin.wasm".to_string(),
+            schema_keys: vec![schema_key.to_string()],
+            host_allocated_schema_keys: Vec::new(),
+            manifest_json,
+            archive_file_id: plugin_storage_archive_file_id(key),
+            archive_path: plugin_storage_archive_path(key),
+            archive_blob_hash: BlobHash::from_content(format!("archive-{key}").as_bytes()).to_hex(),
+            wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
+        })
+        .expect("test v2 plugin registry entry should be valid")
     }
 
     fn live_plugin_registry_row(
@@ -8368,20 +8874,20 @@ mod tests {
         assert_eq!(
             context
                 .branch("branch-a")
-                .and_then(|branch| branch.catalog.select("/note.branch-a", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-a", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
         assert!(
             context
                 .branch("branch-a")
-                .and_then(|branch| branch.catalog.select("/note.branch-b", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-b", b""))
                 .is_none()
         );
         assert_eq!(
             context
                 .branch("branch-b")
-                .and_then(|branch| branch.catalog.select("/note.branch-b", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-b", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
@@ -8744,10 +9250,75 @@ mod tests {
         assert_eq!(
             context
                 .branch("branch-b")
-                .and_then(|branch| branch.catalog.select("/note.active", None))
+                .and_then(|branch| branch.catalog.select_for_bytes("/note.active", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_active")
         );
+    }
+
+    #[tokio::test]
+    async fn path_update_restages_same_owner_v2_for_descriptor_transition() {
+        let wasm = b"test v2 wasm";
+        let prepared = super::prepare_lix_file_rows(
+            vec![live_file_row(
+                "file-readme",
+                "branch-b",
+                r#"{"id":"file-readme","directory_id":null,"name":"before.csv"}"#,
+            )],
+            &super::FilePathPredicate::All,
+        )
+        .expect("blobless file should prepare");
+        let context = super::plugin_render_context_for_lix_file_scan(
+            Arc::new(RowsLiveStateReader {
+                rows: vec![
+                    live_plugin_registry_row(
+                        "branch-b",
+                        vec![test_v2_plugin_registry_entry(
+                            "plugin_csv_v2",
+                            "*.csv",
+                            "csv_row",
+                            wasm,
+                        )],
+                    ),
+                    live_plugin_owner_row(
+                        "branch-b",
+                        "file-readme",
+                        "plugin_csv_v2",
+                        vec!["csv_row".to_string()],
+                    ),
+                ],
+            }) as Arc<dyn LiveStateReader>,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            &prepared,
+            true,
+        )
+        .await
+        .expect("plugin ownership should load")
+        .expect("the active registry should create a context");
+        let batch = path_update_batch_with_path("/before.csv");
+        let assignments = vec![literal_assignment(
+            "path",
+            ScalarValue::Utf8(Some("/after.csv".to_string())),
+        )];
+        let assignment_values = super::UpdateAssignmentValues::evaluate(&batch, &assignments)
+            .expect("path assignment should evaluate");
+
+        let rewritten = super::path_update_plugin_rewrite_file_ids(
+            Some(&context),
+            &batch,
+            &assignment_values,
+            Some("branch-b"),
+        )
+        .expect("v2 descriptor transition should be selected");
+
+        assert_eq!(rewritten, BTreeSet::from(["file-readme".to_string()]));
     }
 
     #[tokio::test]
@@ -9932,23 +10503,26 @@ mod tests {
             &mut write_context,
             Some("file-readme".to_string()),
             b"new".to_vec(),
+            None,
+            None,
         )
         .await
         .expect("fast data update should stage");
 
         assert_eq!(count, 1);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        let requests = scan_requests.lock().expect("scan request mutex");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].filter.schema_keys,
-            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
-        );
-        assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("file-readme")]
-        );
-        drop(requests);
+        {
+            let requests = scan_requests.lock().expect("scan request mutex");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].filter.schema_keys,
+                vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+            );
+            assert_eq!(
+                requests[0].filter.entity_pks,
+                vec![crate::entity_pk::EntityPk::single("file-readme")]
+            );
+        }
 
         let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[0] else {
             panic!("data update should stage file data");
@@ -9957,6 +10531,41 @@ mod tests {
         assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
         assert_eq!(file_data[0].data(), b"new");
         assert!(file_data[0].had_blob_ref);
+        assert!(file_data[0].splice_provenance().is_none());
+
+        let provenance = crate::common::RequestBlobSpliceProvenance {
+            base_sha256: "a".repeat(64),
+            result_sha256: "b".repeat(64),
+            prefix_bytes: 1,
+            suffix_bytes: 1,
+            insert: b"e".to_vec(),
+        };
+        let count = super::execute_fast_lix_file_data_update_by_id(
+            &mut write_context,
+            Some("file-readme".to_string()),
+            b"next".to_vec(),
+            Some(provenance.clone()),
+            Some(crate::common::MutationIdentity {
+                namespace_seed: [7; 16],
+                operation_proof: [17; 32],
+            }),
+        )
+        .await
+        .expect("fast spliced data update should stage");
+        assert_eq!(count, 1);
+        let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[1] else {
+            panic!("spliced data update should stage file data");
+        };
+        assert_eq!(file_data[0].file_id, "file-readme");
+        assert_eq!(file_data[0].data(), b"next");
+        assert_eq!(file_data[0].splice_provenance(), Some(&provenance));
+        assert_eq!(
+            file_data[0].mutation_identity(),
+            Some(crate::common::MutationIdentity {
+                namespace_seed: [7; 16],
+                operation_proof: [17; 32],
+            })
+        );
     }
 
     #[tokio::test]
@@ -9989,8 +10598,10 @@ mod tests {
                 Some(TransactionJson::from_value_for_test(
                     serde_json::json!({"source": "upload"}),
                 )),
+                None,
             )],
             super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+            None,
         )
         .await
         .expect("existing path upsert should stage");
@@ -10025,6 +10636,20 @@ mod tests {
     #[tokio::test]
     async fn fast_file_path_upsert_mixes_existing_and_missing_without_full_scan() {
         let old_data = b"old";
+        let existing_provenance = crate::common::RequestBlobSpliceProvenance {
+            base_sha256: "a".repeat(64),
+            result_sha256: "b".repeat(64),
+            prefix_bytes: 1,
+            suffix_bytes: 1,
+            insert: b"existing".to_vec(),
+        };
+        let missing_provenance = crate::common::RequestBlobSpliceProvenance {
+            base_sha256: "c".repeat(64),
+            result_sha256: "d".repeat(64),
+            prefix_bytes: 2,
+            suffix_bytes: 3,
+            insert: b"missing".to_vec(),
+        };
         let rows = vec![
             live_file_row(
                 "file-readme",
@@ -10047,10 +10672,24 @@ mod tests {
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
-                ("/readme.md".to_string(), b"updated".to_vec(), None),
-                ("/new.md".to_string(), b"new".to_vec(), None),
+                (
+                    "/readme.md".to_string(),
+                    b"updated".to_vec(),
+                    None,
+                    Some(existing_provenance.clone()),
+                ),
+                (
+                    "/new.md".to_string(),
+                    b"new".to_vec(),
+                    None,
+                    Some(missing_provenance.clone()),
+                ),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
+            Some(crate::common::MutationIdentity {
+                namespace_seed: [8; 16],
+                operation_proof: [18; 32],
+            }),
         )
         .await
         .expect("mixed path upsert should stage");
@@ -10069,6 +10708,15 @@ mod tests {
         assert_eq!(file_data.len(), 2);
         assert!(file_data[0].had_blob_ref);
         assert!(!file_data[1].had_blob_ref);
+        assert_eq!(file_data[0].splice_provenance(), Some(&existing_provenance));
+        assert_eq!(file_data[1].splice_provenance(), Some(&missing_provenance));
+        assert!(file_data.iter().all(|file_data| {
+            file_data.mutation_identity()
+                == Some(crate::common::MutationIdentity {
+                    namespace_seed: [8; 16],
+                    operation_proof: [18; 32],
+                })
+        }));
         assert!(rows.iter().any(|row| {
             row.schema_key == super::FILE_DESCRIPTOR_SCHEMA_KEY
                 && row.origin.as_ref().is_some_and(|origin| {
@@ -10083,8 +10731,14 @@ mod tests {
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/new/nested/file.md".to_string(), b"new".to_vec(), None)],
+            vec![(
+                "/new/nested/file.md".to_string(),
+                b"new".to_vec(),
+                None,
+                None,
+            )],
             super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+            None,
         )
         .await
         .expect("nested missing path upsert should stage");
@@ -10121,10 +10775,11 @@ mod tests {
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
-                ("/duplicate.md".to_string(), b"first".to_vec(), None),
-                ("/duplicate.md".to_string(), b"second".to_vec(), None),
+                ("/duplicate.md".to_string(), b"first".to_vec(), None, None),
+                ("/duplicate.md".to_string(), b"second".to_vec(), None, None),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
+            None,
         )
         .await
         .expect_err("duplicate missing path should be rejected");
@@ -10148,8 +10803,9 @@ mod tests {
 
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/docs".to_string(), b"file".to_vec(), None)],
+            vec![("/docs".to_string(), b"file".to_vec(), None, None)],
             super::FastLixFilePathWriteConflict::UpdateData,
+            None,
         )
         .await
         .expect_err("file should not overwrite a same-name root directory");
@@ -10202,10 +10858,11 @@ mod tests {
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
-                ("/local.md".to_string(), b"new-local".to_vec(), None),
-                ("/global.md".to_string(), b"new-global".to_vec(), None),
+                ("/local.md".to_string(), b"new-local".to_vec(), None, None),
+                ("/global.md".to_string(), b"new-global".to_vec(), None, None),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
+            None,
         )
         .await
         .expect("scope-isolated path upsert should stage");
@@ -10250,8 +10907,9 @@ mod tests {
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/readme.md".to_string(), Vec::new(), None)],
+            vec![("/readme.md".to_string(), Vec::new(), None, None)],
             super::FastLixFilePathWriteConflict::UpdateData,
+            None,
         )
         .await
         .expect("empty existing path upsert should stage");
@@ -10296,8 +10954,9 @@ mod tests {
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/shared.md".to_string(), b"new".to_vec(), None)],
+            vec![("/shared.md".to_string(), b"new".to_vec(), None, None)],
             super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+            None,
         )
         .await
         .expect("ambiguous legacy topology should decline the fast path");

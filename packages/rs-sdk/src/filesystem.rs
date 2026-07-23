@@ -338,16 +338,16 @@ impl LocalFilesystem {
     where
         P: AsRef<Path>,
     {
-        Self::open_with_options(LocalFilesystemOpenOptions {
+        Box::pin(Self::open_with_options(LocalFilesystemOpenOptions {
             root: dir.as_ref().to_path_buf(),
             lix_dir: None,
             sync_all_files: true,
-        })
+        }))
         .await
     }
 
     pub async fn open_with_options(options: LocalFilesystemOpenOptions) -> Result<Self, LixError> {
-        Self::open_with_options_and_runtime(options, None).await
+        Box::pin(Self::open_with_options_and_runtime(options, None)).await
     }
 
     /// Opens a filesystem storage whose disk-sync supervisor uses the same
@@ -356,7 +356,11 @@ impl LocalFilesystem {
         options: LocalFilesystemOpenOptions,
         wasm_runtime: Arc<dyn WasmRuntime>,
     ) -> Result<Self, LixError> {
-        Self::open_with_options_and_runtime(options, Some(wasm_runtime)).await
+        Box::pin(Self::open_with_options_and_runtime(
+            options,
+            Some(wasm_runtime),
+        ))
+        .await
     }
 
     async fn open_with_options_and_runtime(
@@ -367,9 +371,13 @@ impl LocalFilesystem {
         let storage = open_filesystem_rocksdb(&layout)?;
         let engine =
             crate::lix::open_or_initialize_engine(storage.clone(), wasm_runtime, None).await?;
-        let inner =
-            FilesystemSync::open_with_engine(storage, engine, layout, options.sync_all_files)
-                .await?;
+        let inner = Box::pin(FilesystemSync::open_with_engine(
+            storage,
+            engine,
+            layout,
+            options.sync_all_files,
+        ))
+        .await?;
         Ok(Self { inner })
     }
 
@@ -2761,7 +2769,7 @@ mod tests {
         let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
-        state.sync_disk_to_lix(false).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(false)).await.unwrap();
 
         let path_filter = state.path_filter();
         let local = collect_local_snapshot(&state.layout, &path_filter).unwrap();
@@ -2781,7 +2789,7 @@ mod tests {
         let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
-        state.sync_disk_to_lix(false).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(false)).await.unwrap();
         lix_write_file(&state.session, "/sql.txt", b"updated".to_vec())
             .await
             .unwrap();
@@ -2799,7 +2807,7 @@ mod tests {
             )
             .await
             .unwrap();
-        state.sync_disk_to_lix(true).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(true)).await.unwrap();
 
         assert!(!tempdir.path().join("sql.txt").exists());
         let rows = state
@@ -2822,7 +2830,7 @@ mod tests {
         let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
-        state.sync_disk_to_lix(false).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(false)).await.unwrap();
         lix_write_file(&state.session, "/sql.txt", b"first".to_vec())
             .await
             .unwrap();
@@ -2835,7 +2843,7 @@ mod tests {
         lix_write_file(&state.session, "/sql.txt", b"second".to_vec())
             .await
             .unwrap();
-        state.sync_disk_to_lix(true).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(true)).await.unwrap();
 
         assert_eq!(
             std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
@@ -2852,7 +2860,7 @@ mod tests {
         let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
-        state.sync_disk_to_lix(false).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(false)).await.unwrap();
         let disk_path = tempdir.path().join("disk.txt");
         std::fs::write(&disk_path, b"disk").unwrap();
         let path_filter = state.path_filter();
@@ -2883,7 +2891,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&disk_path).unwrap(), b"changed");
 
-        state.sync_disk_to_lix(true).await.unwrap();
+        Box::pin(state.sync_disk_to_lix(true)).await.unwrap();
         assert_eq!(
             lix_read_file(&state.session, "/disk.txt")
                 .await
