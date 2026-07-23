@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
 
     println!(
-        "config\twasmtime=45.0.3\twarmups={WARMUPS}\tsamples={SAMPLES}\tguest_component_bytes={}",
+        "config\twasmtime=47.0.2\twarmups={WARMUPS}\tsamples={SAMPLES}\tguest_component_bytes={}",
         std::fs::metadata(&component_path)?.len()
     );
 

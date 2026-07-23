@@ -29,7 +29,7 @@
     },
 
     "rust-analyzer.server.extraEnv": {
-        "RUSTUP_TOOLCHAIN": "nightly-2026-05-21", // Keep in sync with rust-toolchain.toml
+        "RUSTUP_TOOLCHAIN": "nightly-2026-07-23", // Keep in sync with rust-toolchain.toml
     },
     "rust-analyzer.check.command": "clippy",
     "rust-analyzer.cargo.targetDir": true, // https://rust-analyzer.github.io/book/configuration#cargo.targetDir

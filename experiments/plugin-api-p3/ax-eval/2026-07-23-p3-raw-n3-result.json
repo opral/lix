@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "tool": {
+    "slug": "the-preview-3-wit-api-in-wit-plugin-wit-directly",
+    "name": "the Preview 3 WIT API in wit/plugin.wit directly",
+    "version": "0b3f6ceb5d0d50fa061db41b2bde8d380163127c",
+    "install": "detached git worktree at 0b3f6ceb5d0d50fa061db41b2bde8d380163127c"
+  },
+  "task": "Implement a Rust Wasm plugin that treats each top-level JSON object property as one entity, streams cold open, and handles one equal-length property-value edit",
+  "round": "p3-raw-n3",
+  "ts": "2026-07-23T14:47:54.497283Z",
+  "config": {
+    "agent_model": "gpt-5.4",
+    "agent_count": 3,
+    "temperature": 0,
+    "tools": [
+      "shell",
+      "apply_patch"
+    ],
+    "mcp_servers": [],
+    "system_prompt": "Codex built-in system/developer instructions (implicit)",
+    "max_turns": 40,
+    "prompt_template": "{task} using {tool}",
+    "docs_included": false,
+    "overrides": {
+      "model": "claude-opus-4-7 is unavailable in the required Codex CLI; used gpt-5.4",
+      "temperature": "codex exec exposes no temperature control; 0 is the pinned target but is not enforceable",
+      "tools": "Claude allow-list ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'] is unavailable; used Codex built-in shell/apply_patch with web, apps, MCP, and subagents disabled",
+      "system_prompt": "none is unavailable; codex exec uses its built-in system/developer instructions",
+      "mode": "workspace-write plus the shared Cargo target replaced bypassPermissions",
+      "max_turns": "codex exec exposes no max-turn limit; 40 is recorded but the enforced bound is a 900s process timeout",
+      "log_format": "raw codex exec --json JSONL replaced Claude Code session JSONL",
+      "duration_source": "codex exec JSONL has no event timestamps; duration uses retained monotonic process timing metadata",
+      "cargo_target_dir": "all tested and judge processes inherited /tmp/lix-p3-ax-starter.tD7Jpe/target/ax-eval"
+    }
+  },
+  "agents": [
+    {
+      "id": 1,
+      "success": true,
+      "success_reason": "The log shows `guest/src/lib.rs` was replaced with a full JSON top-level-property parser plus `open_list`/`open_stream` and constrained `file_changed`, and both `cargo check -p ax-p3-json-guest` and `cargo build -p ax-p3-json-guest --target wasm32-wasip2` completed successfully.",
+      "duration_sec": 288.6,
+      "tool_calls": 40,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 3,
+      "scores": {
+        "friction": 100,
+        "speed": 55,
+        "efficiency": 0,
+        "errorRecovery": 80,
+        "final": 64
+      },
+      "first_3_commands": [
+        "/bin/bash -lc 'rg --files'",
+        "/bin/bash -lc 'git status --short'",
+        "/bin/bash -lc \"rg -n \\\"plugin\\\\.wit|preview.?3|cold open|entity|json\\\" -S .\""
+      ]
+    },
+    {
+      "id": 2,
+      "success": true,
+      "success_reason": "The log shows `guest/src/lib.rs` was implemented with top-level JSON property entity scanning plus `open_list`/`open_stream` streaming and single equal-length edit handling in `file_changed`, and both `cargo check -p ax-p3-json-guest` and `cargo build --target wasm32-wasip2 --release` completed successfully.",
+      "duration_sec": 282.3,
+      "tool_calls": 41,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 3,
+      "scores": {
+        "friction": 100,
+        "speed": 56,
+        "efficiency": 0,
+        "errorRecovery": 80,
+        "final": 64
+      },
+      "first_3_commands": [
+        "/bin/bash -c pwd",
+        "/bin/bash -c 'rg --files'",
+        "/bin/bash -c 'git status --short'"
+      ]
+    },
+    {
+      "id": 3,
+      "success": true,
+      "success_reason": "The log shows `guest/src/lib.rs` was replaced with a plugin that parses top-level JSON properties into entities, returns them via `EntitySummaryStream`, enforces exactly one equal-length property-value splice in `file_changed`, and it successfully built for `wasm32-wasip2` in item_59.",
+      "duration_sec": 288.0,
+      "tool_calls": 51,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 8,
+      "scores": {
+        "friction": 100,
+        "speed": 55,
+        "efficiency": 0,
+        "errorRecovery": 47,
+        "final": 55
+      },
+      "first_3_commands": [
+        "/bin/bash -lc 'pwd && rg --files'",
+        "/bin/bash -lc 'git status --short'",
+        "/bin/bash -lc \"sed -n '1,220p' wit/plugin.wit\""
+      ]
+    }
+  ],
+  "summary": {
+    "success_rate": 1.0,
+    "median_final": 64,
+    "p25_final": 59.5,
+    "p75_final": 64.0,
+    "common_first_command": "/bin/bash -lc 'rg --files' (1/3)"
+  }
+}

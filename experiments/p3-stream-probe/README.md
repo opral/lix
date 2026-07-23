@@ -27,7 +27,8 @@ The Rust toolchains installed for this repository recognize the Tier-3
 `wasm32-wasip3` target but do not distribute its standard library. The guest is
 therefore built as a WASI P2 reactor while its exported benchmark interface uses
 the same async Canonical ABI and `stream<u8>` machinery used by WASI P3. The
-host enables Wasmtime 45's P3 linker and async component model. This measures
+host enables Wasmtime 47.0.2's experimental P3 linker and async component
+model. This measures
 the proposed Lix API boundary without pretending the installed Rust target is a
 production-ready P3 SDK. See [RESULTS.md](RESULTS.md) for the retained matrix,
 toolchain blocker, and architectural interpretation.

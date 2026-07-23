@@ -5,6 +5,20 @@ was Wasmtime 45.0.3 and the guest was an 84.7 KiB Wasm component. Every cell is
 40 warm samples after eight warmups. Host input preparation and expected-result
 calculation were outside the timer.
 
+## Wasmtime 47 compatibility rerun
+
+The upgraded manifests were rerun July 23, 2026 on a four-core/eight-thread
+AMD EPYC Milan Linux VM with 30 GiB RAM, Wasmtime 47.0.2, `wit-bindgen` 0.60.0,
+and the same eight-warmup/40-sample protocol. The complete retained matrix is
+[`results/2026-07-23-linux-x86_64.tsv`](results/2026-07-23-linux-x86_64.tsv).
+
+For 10 MiB checksum work, `list<u8>` measured 3.866/4.967 ms p50/p95 at
+11.062 MiB guest high-water. The 64 KiB `Bytes` stream measured 3.674/4.138 ms
+at 1.125 MiB, while the 1 MiB stream measured 3.781/4.305 ms at 2.062 MiB.
+This confirms that the current P3 ABI/toolchain still runs and preserves the
+large memory reduction. The modest latency differences are one non-paired VM
+run, not evidence that streaming itself makes parsing faster.
+
 The `list<u8>` guest export itself uses the synchronous Canonical ABI, matching
 the current Lix shape. Because the same Wasmtime store has Component Model async
 enabled for the stream export, the embedder must invoke that synchronous export
@@ -57,8 +71,9 @@ and 10 MiB capacity/memory matrix.
   CPU-bound byte scan they were neutral within measurement noise.
 - Adopt a streaming boundary if large-file capacity and bounded memory matter.
   At 10 MiB it reduced the largest single guest linear-memory size by 9-10 MiB.
-  That directly addresses the current 64 MiB guest ceiling, but only if parsing
-  is incremental; it is not a measurement of aggregate component memory or RSS.
+  That creates substantially more headroom under a 64 MiB guest configuration,
+  but only if parsing is incremental; the limit itself can be raised, and this
+  is not a measurement of aggregate component memory or RSS.
 - Start chunk tuning around 256 KiB-1 MiB. An 8 KiB default is visibly too small
   for in-process CPU parsing. A 64 KiB chunk is a reasonable memory-first point,
   but 1 MiB removed almost all transfer overhead while remaining bounded.

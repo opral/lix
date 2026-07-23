@@ -1,0 +1,11 @@
+[package]
+name = "plugin-api-p3-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen = { version = "=0.60.0", features = ["async-spawn", "futures-stream"] }
