@@ -101,6 +101,15 @@ ORDER BY depth, schema_key, entity_pk;
 
 `depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `schema_key` or `entity_pk` to narrow.
 
+For filesystem history, `lix_file_history` and `lix_directory_history` expose
+logical projection revisions. A directory change is visible in every
+descendant whose composed path depends on that directory, even when the
+descendant's own descriptor did not change. Rows keep immutable file or
+directory identity and list all same-commit causes in
+`lixcol_source_changes`. Deletions use the exact direct-parent roots to retain
+ancestor tombstones in descendant provenance; merge siblings are never inferred
+from depth.
+
 ### Diff one entity between two versions
 
 ```sql

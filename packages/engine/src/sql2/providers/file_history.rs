@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 
 use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobHash};
-use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
 use crate::entity_pk::EntityPk;
@@ -42,7 +41,8 @@ use crate::sql2::history_route::{
     serialize_history_source_changes,
 };
 use crate::sql2::providers::filesystem_history_path::{
-    HistoryDirectoryPathRecord, resolve_history_directory_path,
+    HistoryDirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
+    resolve_history_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
@@ -211,7 +211,7 @@ struct FileHistoryDescriptorRecord {
 struct FileHistoryDirectoryRecord {
     id: String,
     parent_id: Option<String>,
-    name: String,
+    name: Option<String>,
     entry: HistoryEntry,
 }
 
@@ -225,7 +225,7 @@ impl HistoryDirectoryPathRecord for FileHistoryDirectoryRecord {
     }
 
     fn name(&self) -> Option<&str> {
-        Some(&self.name)
+        self.name.as_deref()
     }
 
     fn entry(&self) -> &HistoryEntry {
@@ -470,6 +470,49 @@ struct FileHistoryObservedState {
     plugin_registry: PluginRegistry,
 }
 
+struct FileHistoryDirectoryIndex {
+    tree: HistoryDirectoryTree,
+    file_ids_by_directory: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl FileHistoryDirectoryIndex {
+    fn from_state(state: &FileHistoryObservedState) -> Self {
+        let mut file_ids_by_directory = BTreeMap::<String, BTreeSet<String>>::new();
+        for descriptor in &state.descriptors {
+            if let Some(directory_id) = &descriptor.directory_id {
+                file_ids_by_directory
+                    .entry(directory_id.clone())
+                    .or_default()
+                    .insert(descriptor.id.clone());
+            }
+        }
+        Self {
+            tree: HistoryDirectoryTree::from_records(&state.directories),
+            file_ids_by_directory,
+        }
+    }
+
+    fn affected_file_ids(&self, changed_directory_id: &str) -> BTreeSet<String> {
+        let mut file_ids = BTreeSet::new();
+        self.visit_affected_file_buckets(changed_directory_id, |bucket| {
+            file_ids.extend(bucket.iter().cloned());
+        });
+        file_ids
+    }
+
+    fn visit_affected_file_buckets(
+        &self,
+        changed_directory_id: &str,
+        mut visit: impl FnMut(&BTreeSet<String>),
+    ) {
+        for directory_id in self.tree.descendants_including(changed_directory_id) {
+            if let Some(bucket) = self.file_ids_by_directory.get(&directory_id) {
+                visit(bucket);
+            }
+        }
+    }
+}
+
 struct FileHistoryPluginDiscovery {
     schema_keys: Vec<String>,
     registries_by_commit: BTreeMap<String, PluginRegistry>,
@@ -512,17 +555,13 @@ where
     )
     .await?;
     let mut installed_plugins_cache = BTreeMap::<(String, String), InstalledPlugin>::new();
-    let filesystem_events = file_history_events(
-        &filesystem_context.event_descriptors,
-        &filesystem_context.event_directories,
-        &filesystem_context.event_blobs,
-        &filesystem_context.descriptors,
-    );
+    let parent_commit_ids_by_commit =
+        load_history_commit_parents(&commit_graph, &context_route.start_commit_ids).await?;
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
         &event_route,
-        &context_route,
+        &parent_commit_ids_by_commit,
         metadata_projection,
     )
     .await?;
@@ -554,17 +593,22 @@ where
     // plugin state in the same commit. The exact observed root contains only
     // the new owner (or its tombstone), so retain direct-parent roots as the
     // ownership evidence for those cleanup changes.
-    let owner_change_parent_commit_ids = event_plugin_owners.iter().flat_map(|record| {
-        plugin_discovery
-            .parent_commit_ids_by_commit
-            .get(&record.entry.observed_commit_id)
-            .into_iter()
-            .flatten()
-            .cloned()
-    });
-    let observed_commit_ids = filesystem_events
+    let mut observed_commit_ids = filesystem_context
+        .event_descriptors
         .iter()
-        .map(|event| event.observed_commit_id.clone())
+        .map(|record| record.entry.observed_commit_id.clone())
+        .chain(
+            filesystem_context
+                .event_directories
+                .iter()
+                .map(|record| record.entry.observed_commit_id.clone()),
+        )
+        .chain(
+            filesystem_context
+                .event_blobs
+                .iter()
+                .map(|record| record.entry.observed_commit_id.clone()),
+        )
         .chain(
             event_plugin_state
                 .iter()
@@ -581,8 +625,26 @@ where
                 .iter()
                 .map(|entry| entry.observed_commit_id.clone()),
         )
-        .chain(owner_change_parent_commit_ids)
         .collect::<BTreeSet<_>>();
+    let parent_evidence_commit_ids = filesystem_context
+        .event_directories
+        .iter()
+        .map(|record| record.entry.observed_commit_id.as_str())
+        .chain(
+            event_plugin_owners
+                .iter()
+                .map(|record| record.entry.observed_commit_id.as_str()),
+        );
+    let direct_parent_commit_ids = parent_evidence_commit_ids
+        .flat_map(|observed_commit_id| {
+            parent_commit_ids_by_commit
+                .get(observed_commit_id)
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    observed_commit_ids.extend(direct_parent_commit_ids);
     let observed_states = load_file_history_observed_states(
         query_source,
         observed_commit_ids,
@@ -590,6 +652,14 @@ where
         lookup_ids,
     )
     .await?;
+    let filesystem_events = file_history_events(
+        &filesystem_context.event_descriptors,
+        &filesystem_context.event_directories,
+        &filesystem_context.event_blobs,
+        &filesystem_context.descriptors,
+        &observed_states,
+        &parent_commit_ids_by_commit,
+    );
     let plugin_state_events = file_history_plugin_events(
         &event_plugin_state,
         &event_plugin_owners,
@@ -676,6 +746,15 @@ fn prepare_file_history_rows(
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
 ) -> Result<Vec<PreparedFileHistoryRow>, LixError> {
+    let directory_indexes = observed_states
+        .iter()
+        .map(|(commit_id, state)| {
+            (
+                commit_id.as_str(),
+                FileHistoryDirectoryIndex::from_state(state),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut prepared = Vec::new();
     for event in events {
         let Some(state) = observed_states.get(&event.observed_commit_id) else {
@@ -694,7 +773,10 @@ fn prepare_file_history_rows(
         else {
             continue;
         };
-        if !file_history_event_affects_observed_file(&event, descriptor) {
+        let directory_index = directory_indexes
+            .get(event.observed_commit_id.as_str())
+            .expect("every observed file state should have a directory index");
+        if !file_history_event_affects_observed_file(&event, descriptor, &directory_index.tree) {
             continue;
         }
         let path = resolve_file_history_path(descriptor, &state.directories, 0);
@@ -1301,25 +1383,29 @@ fn file_history_events(
     event_directories: &[FileHistoryDirectoryRecord],
     event_blobs: &[FileHistoryBlobRecord],
     context_descriptors: &[FileHistoryDescriptorRecord],
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
+    parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
 ) -> Vec<FileHistoryEvent> {
     let mut descriptor_ids_by_start = BTreeSet::<(String, String)>::new();
-    let mut directory_ids_by_file_start = BTreeMap::<(String, String), BTreeSet<String>>::new();
 
     for descriptor in context_descriptors {
         let key = (
             descriptor.id.clone(),
             descriptor.entry.start_commit_id.clone(),
         );
-        descriptor_ids_by_start.insert(key.clone());
-        if let Some(directory_id) = &descriptor.directory_id {
-            directory_ids_by_file_start
-                .entry(key)
-                .or_default()
-                .insert(directory_id.clone());
-        }
+        descriptor_ids_by_start.insert(key);
     }
 
     let mut candidates = Vec::new();
+    let directory_indexes = observed_states
+        .iter()
+        .map(|(commit_id, state)| {
+            (
+                commit_id.as_str(),
+                FileHistoryDirectoryIndex::from_state(state),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for descriptor in event_descriptors {
         candidates.push(file_history_event_from_entry(
             descriptor.id.clone(),
@@ -1327,15 +1413,21 @@ fn file_history_events(
         ));
     }
     for directory in event_directories {
-        for ((file_id, start_commit_id), directory_ids) in &directory_ids_by_file_start {
-            if start_commit_id == &directory.entry.start_commit_id
-                && directory_ids.contains(&directory.id)
-            {
-                candidates.push(file_history_event_from_entry(
-                    file_id.clone(),
-                    &directory.entry,
-                ));
+        let state_commit_ids = std::iter::once(directory.entry.observed_commit_id.as_str()).chain(
+            parent_commit_ids_by_commit
+                .get(&directory.entry.observed_commit_id)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        );
+        let mut affected_file_ids = BTreeSet::new();
+        for state_commit_id in state_commit_ids {
+            if let Some(directory_index) = directory_indexes.get(state_commit_id) {
+                affected_file_ids.extend(directory_index.affected_file_ids(&directory.id));
             }
+        }
+        for file_id in affected_file_ids {
+            candidates.push(file_history_event_from_entry(file_id, &directory.entry));
         }
     }
     for blob in event_blobs {
@@ -1401,7 +1493,7 @@ async fn discover_file_history_plugins<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     event_route: &HistoryRoute,
-    context_route: &HistoryRoute,
+    parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryPluginDiscovery, LixError>
 where
@@ -1411,29 +1503,10 @@ where
     // observed commit. Read that exact root identity for every reachable commit
     // instead of inventing a filesystem state from `(start, depth)`, which
     // conflates equal-depth siblings in a DAG.
-    let mut observed_commit_ids = BTreeSet::new();
-    let mut parent_commit_ids_by_commit = BTreeMap::new();
-    for start_commit_id in &context_route.start_commit_ids {
-        let start_commit_id = CommitId::parse_lix(start_commit_id, "history start_commit_id")?;
-        let reachable = commit_graph
-            .lock()
-            .await
-            .reachable_commits(&start_commit_id)
-            .await?;
-        for reachable in reachable {
-            let observed_commit_id = reachable.commit.commit_id.to_string();
-            parent_commit_ids_by_commit.insert(
-                observed_commit_id.clone(),
-                reachable
-                    .commit
-                    .parent_commit_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-            );
-            observed_commit_ids.insert(observed_commit_id);
-        }
-    }
+    let observed_commit_ids = parent_commit_ids_by_commit
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
     let mut schema_keys = BTreeSet::new();
     let mut registries_by_commit = BTreeMap::new();
@@ -1467,7 +1540,7 @@ where
     Ok(FileHistoryPluginDiscovery {
         schema_keys: schema_keys.into_iter().collect(),
         registries_by_commit,
-        parent_commit_ids_by_commit,
+        parent_commit_ids_by_commit: parent_commit_ids_by_commit.clone(),
         registry_events,
     })
 }
@@ -1668,12 +1741,16 @@ fn parse_file_history_directories(
     entries
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
-        .filter_map(|entry| {
-            let snapshot_content = entry.change.snapshot_content.clone()?;
-            Some((entry, snapshot_content))
-        })
-        .map(|(entry, snapshot_content)| {
-            let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(&snapshot_content)
+        .map(|entry| {
+            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+                return Ok(FileHistoryDirectoryRecord {
+                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    parent_id: None,
+                    name: None,
+                    entry: entry.clone(),
+                });
+            };
+            let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -1683,7 +1760,7 @@ fn parse_file_history_directories(
             Ok(FileHistoryDirectoryRecord {
                 id: snapshot.id,
                 parent_id: snapshot.parent_id,
-                name: snapshot.name,
+                name: Some(snapshot.name),
                 entry: entry.clone(),
             })
         })
@@ -1789,6 +1866,7 @@ fn parse_file_history_plugin_owners(
 fn file_history_event_affects_observed_file(
     event: &FileHistoryEvent,
     descriptor: &FileHistoryDescriptorRecord,
+    directory_tree: &HistoryDirectoryTree,
 ) -> bool {
     event
         .source_changes
@@ -1805,15 +1883,13 @@ fn file_history_event_affects_observed_file(
                         .is_ok_and(|entity_id| entity_id == descriptor.id)
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                descriptor
-                    .directory_id
-                    .as_deref()
-                    .is_some_and(|directory_id| {
-                        change
-                            .entity_pk
-                            .as_single_string_owned()
-                            .is_ok_and(|entity_id| entity_id == directory_id)
-                    })
+                let Ok(changed_directory_id) = change.entity_pk.as_single_string_owned() else {
+                    return false;
+                };
+                let Some(directory_id) = descriptor.directory_id.as_deref() else {
+                    return false;
+                };
+                directory_tree.has_ancestor_including(directory_id, &changed_directory_id)
             }
             KEY_VALUE_SCHEMA_KEY
                 if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
@@ -2089,10 +2165,11 @@ mod tests {
     use crate::sql2::history_route::HistoryEntry;
 
     use super::{
-        FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryFilesystemContext,
-        FileHistoryLookupIds, FileHistoryObservedState, FileHistoryPluginOwnerRecord,
-        FileHistoryPluginStateRecord, FileHistoryPublicPredicate, HistoryRoute, PluginRegistry,
-        PreparedFileHistoryRow, file_history_descriptor_blob_route, file_history_event_from_entry,
+        FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryDirectoryIndex,
+        FileHistoryDirectoryRecord, FileHistoryFilesystemContext, FileHistoryLookupIds,
+        FileHistoryObservedState, FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord,
+        FileHistoryPublicPredicate, HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
+        file_history_descriptor_blob_route, file_history_event_from_entry, file_history_events,
         file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
         prepare_file_history_rows, sorted_grouped_file_history_events,
     };
@@ -2130,6 +2207,41 @@ mod tests {
             directory_id: None,
             name: name.map(str::to_string),
             entry: history_entry(file_id, depth, snapshot),
+        }
+    }
+
+    fn descriptor_in_directory(file_id: &str, directory_id: &str) -> FileHistoryDescriptorRecord {
+        let mut descriptor = descriptor(file_id, Some("file.txt"), 0);
+        descriptor.directory_id = Some(directory_id.to_string());
+        descriptor.entry.change.snapshot_content = Some(
+            serde_json::json!({
+                "id": file_id,
+                "directory_id": directory_id,
+                "name": "file.txt",
+            })
+            .to_string(),
+        );
+        descriptor
+    }
+
+    fn directory_record(directory_id: &str) -> FileHistoryDirectoryRecord {
+        let mut entry = history_entry(directory_id, 0, None);
+        entry.change.id = format!("change-{directory_id}");
+        entry.change.schema_key = super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string();
+        entry.change.file_id = None;
+        entry.change.snapshot_content = Some(
+            serde_json::json!({
+                "id": directory_id,
+                "parent_id": null,
+                "name": directory_id,
+            })
+            .to_string(),
+        );
+        FileHistoryDirectoryRecord {
+            id: directory_id.to_string(),
+            parent_id: None,
+            name: Some(directory_id.to_string()),
+            entry,
         }
     }
 
@@ -2431,6 +2543,63 @@ mod tests {
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
             ])
         );
+    }
+
+    #[test]
+    fn unfiltered_sibling_directory_fanout_uses_directory_file_buckets() {
+        const SIBLING_COUNT: usize = 512;
+
+        let directories = (0..SIBLING_COUNT)
+            .map(|index| directory_record(&format!("directory-{index:04}")))
+            .collect::<Vec<_>>();
+        let descriptors = (0..SIBLING_COUNT)
+            .map(|index| {
+                descriptor_in_directory(
+                    &format!("file-{index:04}"),
+                    &format!("directory-{index:04}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let observed_state = FileHistoryObservedState {
+            descriptors: descriptors.clone(),
+            directories: directories.clone(),
+            blobs: Vec::new(),
+            plugin_state: Vec::new(),
+            plugin_owners: Vec::new(),
+            plugin_registry: PluginRegistry::empty(),
+        };
+        let directory_index = FileHistoryDirectoryIndex::from_state(&observed_state);
+        let observed_states = BTreeMap::from([("commit-0".to_string(), observed_state)]);
+
+        let events = file_history_events(
+            &[],
+            &directories,
+            &[],
+            &descriptors,
+            &observed_states,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(events.len(), SIBLING_COUNT);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.file_id, format!("file-{index:04}"));
+            assert_eq!(event.source_changes.len(), 1);
+            assert_eq!(
+                event.source_changes[0].entity_pk,
+                EntityPk::single(format!("directory-{index:04}"))
+            );
+        }
+
+        let mut visited_buckets = 0;
+        let mut visited_file_candidates = 0;
+        for directory in &directories {
+            directory_index.visit_affected_file_buckets(&directory.id, |bucket| {
+                visited_buckets += 1;
+                visited_file_candidates += bucket.len();
+            });
+        }
+        assert_eq!(visited_buckets, SIBLING_COUNT);
+        assert_eq!(visited_file_candidates, SIBLING_COUNT);
     }
 
     #[test]

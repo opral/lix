@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use lix_engine::{CreateBranchOptions, MergeBranchOptions, Value};
 use serde_json::json;
 
@@ -350,15 +352,25 @@ simulation_test!(
             let Value::Json(source_changes) = &row.values()[3] else {
                 panic!("delete source changes should be JSON");
             };
-            assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
-            assert_eq!(
-                source_changes[0]["schema_key"],
-                json!("lix_directory_descriptor")
-            );
-            assert_eq!(
-                source_changes[0]["snapshot_content"],
-                serde_json::Value::Null
-            );
+            let source_changes = source_changes
+                .as_array()
+                .expect("delete source changes should be an array");
+            let expected_source_ids = if expected_id == "history-delete-docs" {
+                BTreeSet::from(["history-delete-docs"])
+            } else {
+                BTreeSet::from(["history-delete-docs", "history-delete-guides"])
+            };
+            let actual_source_ids = source_changes
+                .iter()
+                .map(|source| {
+                    assert_eq!(source["schema_key"], json!("lix_directory_descriptor"));
+                    assert_eq!(source["snapshot_content"], serde_json::Value::Null);
+                    source["entity_pk"][0]
+                        .as_str()
+                        .expect("directory source identity should be text")
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual_source_ids, expected_source_ids);
             assert_eq!(row.values()[4], Value::Text(delete_commit_id.clone()));
             assert_eq!(row.values()[5], Value::Integer(0));
         }

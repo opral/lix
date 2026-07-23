@@ -113,6 +113,13 @@ When you need the typed columns, reach for the per-entity sugar. When you're que
 
 User columns: `id`, `path`, `directory_id`, `name`, `data`. System columns are `lixcol_*` (`lixcol_version_id` on `_by_version`; `lixcol_start_commit_id`, `lixcol_depth`, `lixcol_observed_commit_id` on `_history`).
 
+`lix_file_history` records changes to the composed file projection, not only
+changes to the file descriptor or bytes. Renaming, moving, deleting, or
+restoring any ancestor directory creates a revision for every affected
+descendant file. The file `id` remains stable while `path` reflects the exact
+observed commit. `lixcol_source_changes` contains the descriptor, blob, plugin,
+and ancestor-directory changes combined into that logical revision.
+
 ```sql
 -- Write a file into the active version
 INSERT INTO lix_file (path, data)
@@ -147,6 +154,11 @@ Same shape as files, minus the `data` column.
 | `lix_directory_history` | Directory history walked through commits. |
 
 User columns: `id`, `path`, `parent_id`, `name`. Same `lixcol_*` system columns as files. Directory paths must end with a trailing slash (`/data/`, not `/data`).
+
+Directory history uses the same composed-projection rule: an ancestor rename,
+move, deletion, or restoration creates a revision for each descendant
+directory whose `path` changed. Recursive deletion provenance includes both a
+descendant's own tombstone and the tombstones of deleted ancestors.
 
 Inserting a `lix_file` at `/a/b/c.txt` auto-creates `lix_directory` rows for `/a/` and `/a/b/` if they don't already exist; you only need to insert directories explicitly when you want them to exist before any file does.
 

@@ -13,5 +13,3 @@ Exact public `id` predicates are routed through observed-state descriptor, blob,
 The composed histories now expose `lixcol_source_changes`, a non-null JSON array ordered by change ID. Each element mirrors the stable `lix_change` payload fields: `id`, `entity_pk`, `schema_key`, `file_id`, `snapshot_content`, `metadata`, `created_at`, and `origin_key`. Multiple source changes in one commit produce one logical revision with every source in this array.
 
 This is a breaking SQL catalog change. The misleading singular `lixcol_schema_key`, `lixcol_file_id`, `lixcol_snapshot_content`, `lixcol_change_id`, `lixcol_origin_key`, and `lixcol_metadata` columns were removed from the composed filesystem histories. Inspect the structured `lixcol_source_changes` objects, or join their `id` fields to `lix_change`, when raw provenance is required.
-
-Recursive propagation of an ancestor-directory rename, move, or deletion to every descendant file revision is intentionally not part of this change. This history surface currently emits directory projection events only for a file's directly referenced directory; full ancestor propagation remains follow-up work.

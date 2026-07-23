@@ -31,7 +31,8 @@ use crate::sql2::history_route::{
     serialize_history_source_changes,
 };
 use crate::sql2::providers::filesystem_history_path::{
-    HistoryDirectoryPathRecord, resolve_history_directory_path,
+    HistoryDirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
+    resolve_history_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
@@ -208,7 +209,7 @@ where
             view_name: "lix_directory_history",
             start_commit_column: HISTORY_COL_START_COMMIT_ID,
         },
-        commit_graph,
+        Arc::clone(&commit_graph),
         query_source.json_reader.clone(),
         &event_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
@@ -216,13 +217,30 @@ where
     )
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
-    let events = grouped_directory_history_events(&event_descriptors);
-    let observed_commit_ids = events
+    let parent_commit_ids_by_commit =
+        load_history_commit_parents(&commit_graph, &event_route.start_commit_ids).await?;
+    let mut observed_commit_ids = event_descriptors
         .iter()
-        .map(|event| event.observed_commit_id.clone())
+        .map(|record| record.entry.observed_commit_id.clone())
         .collect::<BTreeSet<_>>();
+    let direct_parent_commit_ids = observed_commit_ids
+        .iter()
+        .flat_map(|observed_commit_id| {
+            parent_commit_ids_by_commit
+                .get(observed_commit_id)
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    observed_commit_ids.extend(direct_parent_commit_ids);
     let observed_states =
         load_directory_history_observed_states(query_source, observed_commit_ids).await?;
+    let events = grouped_directory_history_events(
+        &event_descriptors,
+        &observed_states,
+        &parent_commit_ids_by_commit,
+    );
     let mut output = Vec::new();
 
     for event in events {
@@ -406,28 +424,60 @@ fn parse_directory_history_records(
 
 fn grouped_directory_history_events(
     descriptors: &[DirectoryHistoryRecord],
+    observed_states: &BTreeMap<String, Vec<DirectoryHistoryRecord>>,
+    parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
 ) -> Vec<DirectoryHistoryEvent> {
     let mut grouped = BTreeMap::<(String, String, String), DirectoryHistoryEvent>::new();
+    let directory_trees = observed_states
+        .iter()
+        .map(|(commit_id, state)| {
+            (
+                commit_id.as_str(),
+                HistoryDirectoryTree::from_records(state),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for descriptor in descriptors {
-        let mut event = directory_history_event_from_entry(&descriptor.id, &descriptor.entry);
-        let key = (
-            event.directory_id.clone(),
-            event.start_commit_id.clone(),
-            event.observed_commit_id.clone(),
+        let state_commit_ids = std::iter::once(descriptor.entry.observed_commit_id.as_str()).chain(
+            parent_commit_ids_by_commit
+                .get(&descriptor.entry.observed_commit_id)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
         );
-        match grouped.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(event);
+        let mut affected_directory_ids = BTreeSet::from([descriptor.id.clone()]);
+        for state_commit_id in state_commit_ids {
+            if observed_states.contains_key(state_commit_id) {
+                affected_directory_ids.extend(
+                    directory_trees
+                        .get(state_commit_id)
+                        .expect("every observed directory state should have a directory tree")
+                        .descendants_including(&descriptor.id),
+                );
             }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let grouped_event = entry.get_mut();
-                debug_assert_eq!(grouped_event.depth, event.depth);
-                // When commit metadata is not projected, history loading uses
-                // each source change's timestamp as an intentionally unused
-                // fallback. Those timestamps may differ within one commit.
-                grouped_event
-                    .source_changes
-                    .append(&mut event.source_changes);
+        }
+        for affected_directory_id in affected_directory_ids {
+            let mut event =
+                directory_history_event_from_entry(&affected_directory_id, &descriptor.entry);
+            let key = (
+                event.directory_id.clone(),
+                event.start_commit_id.clone(),
+                event.observed_commit_id.clone(),
+            );
+            match grouped.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(event);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let grouped_event = entry.get_mut();
+                    debug_assert_eq!(grouped_event.depth, event.depth);
+                    // When commit metadata is not projected, history loading uses
+                    // each source change's timestamp as an intentionally unused
+                    // fallback. Those timestamps may differ within one commit.
+                    grouped_event
+                        .source_changes
+                        .append(&mut event.source_changes);
+                }
             }
         }
     }
