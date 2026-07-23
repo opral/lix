@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -43,6 +44,7 @@ const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
 const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
+const COMPACTOR_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct SlateDBFactory {
@@ -714,10 +716,16 @@ fn join_db_path(db_path: &str, child: &str) -> String {
 }
 
 fn slatedb_settings() -> Settings {
-    Settings {
+    let mut settings = Settings {
         compression_codec: Some(CompressionCodec::Lz4),
         ..Settings::default()
-    }
+    };
+    settings
+        .compactor_options
+        .as_mut()
+        .expect("default SlateDB settings enable compaction")
+        .commit_compacted_interval = COMPACTOR_COMMIT_INTERVAL;
+    settings
 }
 
 fn validate_object_store_options(options: &SlateDBObjectStoreOptions) -> Result<(), StorageError> {
@@ -1041,6 +1049,26 @@ mod tests {
     #[test]
     fn disk_cache_parts_match_scan_read_ahead() {
         assert_eq!(OBJECT_STORE_CACHE_PART_SIZE_BYTES, SCAN_READ_AHEAD_BYTES);
+    }
+
+    #[test]
+    fn batches_completed_compactions_on_the_compactor_poll_interval() {
+        let settings = slatedb_settings();
+        let compactor = settings
+            .compactor_options
+            .as_ref()
+            .expect("Lix enables SlateDB compaction");
+        let default_settings = Settings::default();
+        let default_compactor = default_settings
+            .compactor_options
+            .as_ref()
+            .expect("default SlateDB settings enable compaction");
+        assert_eq!(
+            compactor.commit_compacted_interval,
+            COMPACTOR_COMMIT_INTERVAL
+        );
+        assert_eq!(compactor.commit_compacted_interval, compactor.poll_interval);
+        assert_eq!(compactor.poll_interval, default_compactor.poll_interval);
     }
 
     #[test]
