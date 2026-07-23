@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
+use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
@@ -327,6 +328,10 @@ where
             Some(
                 Arc::clone(&self.collaboration_write_gate)
                     .lock_owned()
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.collaboration_gate_wait"
+                    ))
                     .await,
             )
         } else {
@@ -482,13 +487,23 @@ where
             Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
         )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_open"
+        ))
         .await?;
         self.ensure_open()?;
         let mut transaction = opened.transaction;
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
         let runtime_functions = opened.runtime_functions;
 
-        match f(&mut transaction).await {
+        match f(&mut transaction)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_plan_and_stage"
+            ))
+            .await
+        {
             Ok(value) => {
                 self.ensure_open()?;
                 let outcome = transaction.commit(&runtime_functions).await?;

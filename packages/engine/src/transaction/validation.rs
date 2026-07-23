@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
+use tracing::Instrument as _;
 
 use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
@@ -200,7 +201,12 @@ pub(crate) async fn validate_prepared_writes(
     let constraint_rows = input.staged_writes.constraint_rows().collect::<Vec<_>>();
     let pending_file_descriptors = PendingFileDescriptorIndex::from_rows(&constraint_rows);
     let pending_schema_domains = PendingSchemaDomains::from_staged_rows(&staged_rows)?;
-    validate_registered_schema_identity_is_canonical(&input, &staged_rows).await?;
+    validate_registered_schema_identity_is_canonical(&input, &staged_rows)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.registered_schema_identity"
+        ))
+        .await?;
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
@@ -232,6 +238,10 @@ pub(crate) async fn validate_prepared_writes(
         if let Some(snapshot) = snapshot {
             file_owner_validator
                 .validate(&input, &pending_file_descriptors, row)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.validation.file_owner"
+                ))
                 .await?;
             validate_primary_key_identity(row, schema_plan, snapshot)?;
             pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
@@ -245,16 +255,54 @@ pub(crate) async fn validate_prepared_writes(
     validate_pending_delete_restrictions(input.schema_catalog, &pending_constraints)?;
     let unresolved_foreign_keys =
         validate_committed_foreign_keys(&input, &pending_constraints, &unresolved_foreign_keys)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.validation.committed_foreign_keys"
+            ))
             .await?;
     reject_unresolved_foreign_keys(&unresolved_foreign_keys)?;
     validate_committed_delete_restrictions(&input, input.schema_catalog, &pending_constraints)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.delete_restrictions"
+        ))
         .await?;
-    validate_file_descriptor_delete_restrictions(&input, &pending_constraints).await?;
-    validate_branch_ref_delete_restrictions(&input, &pending_constraints).await?;
-    validate_committed_insert_identities(&input, &pending_constraints).await?;
-    validate_committed_unique_constraints(&input, &pending_constraints).await?;
-    validate_directory_descriptor_parent_graph(&input, &staged_rows, &constraint_rows).await?;
-    validate_filesystem_namespace(&input, &staged_rows).await?;
+    validate_file_descriptor_delete_restrictions(&input, &pending_constraints)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.file_delete_restrictions"
+        ))
+        .await?;
+    validate_branch_ref_delete_restrictions(&input, &pending_constraints)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.branch_ref_delete_restrictions"
+        ))
+        .await?;
+    validate_committed_insert_identities(&input, &pending_constraints)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.insert_identities"
+        ))
+        .await?;
+    validate_committed_unique_constraints(&input, &pending_constraints)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.unique_constraints"
+        ))
+        .await?;
+    validate_directory_descriptor_parent_graph(&input, &staged_rows, &constraint_rows)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.directory_parent_graph"
+        ))
+        .await?;
+    validate_filesystem_namespace(&input, &staged_rows)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.filesystem_namespace"
+        ))
+        .await?;
     Ok(())
 }
 

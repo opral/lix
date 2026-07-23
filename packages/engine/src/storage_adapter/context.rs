@@ -1,6 +1,7 @@
 use std::ops::Bound;
 
 use bytes::Bytes;
+use tracing::Instrument as _;
 
 use crate::storage::{
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, Memory, Prefix, ProjectedValue,
@@ -89,21 +90,33 @@ where
         let mut write = self
             .storage
             .begin_write(opts)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.storage_writer_wait"
+            ))
             .await
             .map_err(StorageWriteSetError::Storage)?;
-        let stats = match write_set.lower_into(&mut write).await {
+        let lowered = async {
+            let stats = write_set.lower_into(&mut write).await?;
+            if stats.staged_puts > 0 || stats.staged_deletes > 0 {
+                stage_mutation_revision(&mut write)
+                    .await
+                    .map_err(StorageWriteSetError::Storage)?;
+            }
+            Ok::<_, StorageWriteSetError>(stats)
+        }
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.storage_lowering"
+        ))
+        .await;
+        let stats = match lowered {
             Ok(stats) => stats,
             Err(error) => {
                 let _ = write.rollback().await;
                 return Err(error);
             }
         };
-        if stats.staged_puts > 0 || stats.staged_deletes > 0 {
-            if let Err(error) = stage_mutation_revision(&mut write).await {
-                let _ = write.rollback().await;
-                return Err(StorageWriteSetError::Storage(error));
-            }
-        }
         Ok(PreparedStorageCommit { write, stats })
     }
 
@@ -206,7 +219,14 @@ where
     StorageImpl: Storage + 'a,
 {
     pub async fn commit(self) -> Result<(CommitResult, StorageWriteSetStats), StorageError> {
-        let result = self.write.commit().await?;
+        let result = self
+            .write
+            .commit()
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.storage_commit_accepted_visible"
+            ))
+            .await?;
         Ok((result, self.stats))
     }
 

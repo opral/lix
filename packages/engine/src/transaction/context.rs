@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::Value as JsonValue;
+use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
@@ -381,6 +382,10 @@ where
         check_commit_boundary(commit_boundary.as_ref())?;
         transaction
             .validate_prepared_writes_by_branch(&prepared_writes)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_validation"
+            ))
             .await?;
         let filesystem_delta_rows = if prepared_writes
             .state_rows
@@ -421,6 +426,10 @@ where
             &mut read,
             prepared_writes,
         )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_materialization"
+        ))
         .await
         {
             Ok(writes) => writes,

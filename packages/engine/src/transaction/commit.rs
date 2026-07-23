@@ -25,6 +25,7 @@ use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::staging::{PreparedStateRowIdentity, PreparedWriteSet};
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
 use std::collections::{BTreeMap, BTreeSet};
+use tracing::Instrument as _;
 
 type RowIndex = usize;
 
@@ -82,6 +83,10 @@ pub(crate) async fn commit_prepared_writes(
         branch_ctx,
         &*read,
     )
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.materialization.finalize_commit_rows"
+    ))
     .await?;
     let commit_rows = finalized.commit_rows;
     let branch_heads = finalized.branch_heads;
@@ -119,6 +124,10 @@ pub(crate) async fn commit_prepared_writes(
         &engine_rows,
         &insert_identities,
     )
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.materialization.flat_current_rows"
+    ))
     .await?;
 
     let staged_commits = stage_changelog_commits(
@@ -130,6 +139,10 @@ pub(crate) async fn commit_prepared_writes(
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
     )
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.materialization.changelog"
+    ))
     .await?;
 
     stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
@@ -142,6 +155,10 @@ pub(crate) async fn commit_prepared_writes(
         tracked_roots,
         staged_commits,
     )
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.materialization.tracked_roots"
+    ))
     .await?;
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
