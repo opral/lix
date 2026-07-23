@@ -4257,6 +4257,8 @@ dependencies = [
 name = "plugin_json_incremental_v2"
 version = "0.8.4"
 dependencies = [
+ "base64 0.22.1",
+ "blake3",
  "serde_json",
  "wit-bindgen 0.57.1",
 ]

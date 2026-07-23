@@ -58,9 +58,10 @@ persists exactly one semantic change, hits both the private actor and shared
 renderer documents once, and performs no full document reparse, full renderer
 invocation, or filesystem-sync full render. These are work invariants in
 addition to the latency gate; a faster sample cannot hide a regression to
-document-sized work. CSV additionally stays under its 64 MiB production
-ceiling. The JSON paired diagnostic checks against its explicitly configured
-equal-arm ceiling and reports the observed high-water. For provenance-backed
+document-sized work. CSV additionally retains its stricter 64 MiB efficiency
+invariant inside the production sandbox. The JSON paired diagnostic checks
+against its explicitly configured equal-arm ceiling and reports the observed
+high-water. For provenance-backed
 edits, `host_full_diff_bytes_compared` and
 `host_full_content_classification_bytes` must both be zero: the host validates
 the localized splice and its UTF-8 boundary window instead of rescanning the
@@ -73,16 +74,15 @@ warmup storage I/O and transition counters are reset before measurement.
 
 ## Production cap and diagnostic timing
 
-The production per-component linear-memory ceiling remains 64 MiB. The v2 CSV
-lane must run with the variable omitted to qualify. A v1 plugin may not be able
-to create the large JSON fixture under that ceiling. The benchmark feature
-therefore exposes the SDK runtime only to this profiling target, whose wrapper
-can replace the incoming memory limit when `LIX_PROFILE_WASM_MEMORY_MIB` is set.
-This is a diagnostic capacity knob, not a production configuration or
-recommendation.
+The production per-component linear-memory ceiling is 256 MiB. This remains a
+hard sandbox bound; it is sized from the measured 10 MiB recursive JSON working
+set rather than from a Wasm specification limit. The benchmark feature exposes
+the SDK runtime only to this profiling target, whose wrapper can replace the
+incoming memory limit when `LIX_PROFILE_WASM_MEMORY_MIB` is set. This is a
+diagnostic capacity knob, not a production configuration or recommendation.
 
 Every timing collected with that knob prints both the diagnostic ceiling and
-the 64 MiB production default. Omitting the variable exercises the production
+the 256 MiB production default. Omitting the variable exercises the production
 policy. For `rocksdb-fs`, the benchmark-only ceiling is applied to both the
 outer SQL engine and the engine owned by `LocalFilesystem` sync.
 
@@ -243,8 +243,8 @@ The smoke analyzer still exits nonzero when its latency guardrails or hot-path
 counters fail; a successful smoke only means the reduced checks passed, never
 that the candidate met the acceptance design.
 
-The 256 MiB value is a configurable, equal-arm diagnostic ceiling, not a
-statement that Wasm has a fixed 64 MiB limit.
+The paired runner keeps the ceiling configurable so both arms always receive
+the same bound. Wasm itself does not prescribe a 64 MiB limit.
 
 ## CSV paired acceptance run
 

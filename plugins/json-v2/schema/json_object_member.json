@@ -1,0 +1,54 @@
+{
+  "x-lix-key": "json_object_member",
+  "x-lix-primary-key": [
+    "/parent_id",
+    "/key"
+  ],
+  "description": "One recursively indexed JSON object member. Its stable identity is the stable parent container identity plus the decoded member key.",
+  "type": "object",
+  "properties": {
+    "parent_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identity of the containing object."
+    },
+    "key": {
+      "type": "string",
+      "description": "The decoded JSON object member name; RFC 6901 escaping is not part of identity."
+    },
+    "order_key": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "A stable fractional order key for deterministic object rendering."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "object",
+        "array",
+        "string",
+        "number",
+        "boolean",
+        "null"
+      ],
+      "description": "The JSON value kind represented by this member."
+    },
+    "scalar_json": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The complete raw JSON scalar encoded as text. Omitted when kind is object or array."
+    },
+    "container_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deterministic child-container identity derived from parent_id and decoded key. Present only when kind is object or array."
+    }
+  },
+  "required": [
+    "parent_id",
+    "key",
+    "order_key",
+    "kind"
+  ],
+  "additionalProperties": false
+}

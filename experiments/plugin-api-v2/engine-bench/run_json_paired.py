@@ -27,10 +27,12 @@ from typing import Any
 
 BACKENDS = ("rocksdb-fs", "slatedb-cached")
 APIS = ("v1", "v2")
+JSON_SHAPES = ("flat", "nested")
 RUNTIMES = {"v1": "wasm-component-v1", "v2": "wasm-component-v2"}
 FIXTURE_BYTES = 10_000_000
 PROPERTY_COUNT = 220_000
 EDIT_PROPERTY = "property_110000"
+NESTED_EDIT_PROPERTY = f"/payload/{EDIT_PROPERTY}"
 DEFAULT_BLOCKS = 12
 DEFAULT_WARMUPS = 5
 DEFAULT_SAMPLES = 20
@@ -83,12 +85,14 @@ def environment(
     samples: int,
     memory_mib: int,
     *,
+    json_shape: str = "flat",
     splice_provenance: bool = False,
 ) -> dict[str, str]:
     """Return an exact profiling environment without inherited profile knobs."""
 
     if api not in APIS:
         raise ValueError(f"unsupported JSON API arm: {api}")
+    validate_json_shape(json_shape)
     result = {
         key: value
         for key, value in os.environ.items()
@@ -98,6 +102,7 @@ def environment(
         {
             "LIX_PROFILE_FORMAT": "json",
             "LIX_PROFILE_JSON_API": api,
+            "LIX_PROFILE_JSON_SHAPE": json_shape,
             "LIX_PROFILE_WARMUPS": str(warmups),
             "LIX_PROFILE_ROUNDS": str(samples),
             "LIX_PROFILE_WASM_MEMORY_MIB": str(memory_mib),
@@ -106,6 +111,18 @@ def environment(
     if splice_provenance:
         result["LIX_PROFILE_SPLICE_PROVENANCE"] = "1"
     return result
+
+
+def validate_json_shape(json_shape: str) -> None:
+    if json_shape not in JSON_SHAPES:
+        raise ValueError(
+            f"JSON shape must be one of {', '.join(JSON_SHAPES)}, got {json_shape!r}"
+        )
+
+
+def edit_property_for_shape(json_shape: str) -> str:
+    validate_json_shape(json_shape)
+    return EDIT_PROPERTY if json_shape == "flat" else NESTED_EDIT_PROPERTY
 
 
 def prepare_root(requested_root: Path) -> Path:
@@ -322,14 +339,18 @@ def unique_json_fields_line(output: str, prefix: str) -> dict[str, str]:
     return candidates[0]
 
 
-def validate_setup(output: str, api: str) -> dict[str, Any]:
+def validate_setup(
+    output: str, api: str, *, json_shape: str = "flat"
+) -> dict[str, Any]:
+    validate_json_shape(json_shape)
     fields = unique_json_fields_line(output, "setup")
     expected = {
         "format": "json",
+        "shape": json_shape,
         "runtime": RUNTIMES[api],
         "properties": str(PROPERTY_COUNT),
         "bytes": str(FIXTURE_BYTES),
-        "edit_property": EDIT_PROPERTY,
+        "edit_property": edit_property_for_shape(json_shape),
     }
     mismatches = {
         key: (fields.get(key), value)
@@ -355,13 +376,20 @@ def validate_setup(output: str, api: str) -> dict[str, Any]:
 
 
 def validate_mode(
-    output: str, mode: str, warmups: int, samples: int
+    output: str,
+    mode: str,
+    warmups: int,
+    samples: int,
+    *,
+    json_shape: str = "flat",
 ) -> None:
     if mode not in ("edit", "render"):
         raise ValueError(f"unsupported JSON paired mode: {mode}")
+    validate_json_shape(json_shape)
     fields = unique_json_fields_line(output, mode)
     expected = {
         "format": "json",
+        "shape": json_shape,
         "properties": str(PROPERTY_COUNT),
         "warmups": str(warmups),
         "rounds": str(samples),
@@ -370,7 +398,7 @@ def validate_mode(
         expected.update(
             {
                 "bytes": str(FIXTURE_BYTES),
-                "property": EDIT_PROPERTY,
+                "property": edit_property_for_shape(json_shape),
             }
         )
     mismatches = {
@@ -466,7 +494,9 @@ def validate_configuration(
     memory_mib: int,
     bootstrap_draws: int,
     timeout_seconds: int,
+    json_shape: str = "flat",
 ) -> None:
+    validate_json_shape(json_shape)
     if blocks < 2 or blocks % 2:
         raise ValueError("blocks must be an even integer of at least two")
     if warmups < 0:
@@ -590,6 +620,7 @@ def validate_resume_artifact(
     memory_mib: int,
     bootstrap_draws: int,
     timeout_seconds: int,
+    json_shape: str = "flat",
 ) -> dict[str, Any]:
     """Reject a resume unless executable, plugins, design, and evidence match."""
 
@@ -607,7 +638,8 @@ def validate_resume_artifact(
         "same_benchmark_executable": True,
         "fixture_bytes": FIXTURE_BYTES,
         "properties": PROPERTY_COUNT,
-        "edit_property": EDIT_PROPERTY,
+        "json_shape": json_shape,
+        "edit_property": edit_property_for_shape(json_shape),
         "blocks": blocks,
         "warmups_per_arm_block": warmups,
         "measured_per_arm_block": samples,
@@ -688,11 +720,18 @@ def run_campaign(
     memory_mib: int = DEFAULT_MEMORY_MIB,
     bootstrap_draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     timeout_seconds: int = DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    json_shape: str = "flat",
     resume: bool = False,
     resume_reason: str | None = None,
 ) -> Path:
     validate_configuration(
-        blocks, warmups, samples, memory_mib, bootstrap_draws, timeout_seconds
+        blocks,
+        warmups,
+        samples,
+        memory_mib,
+        bootstrap_draws,
+        timeout_seconds,
+        json_shape,
     )
     benchmark = benchmark.expanduser().resolve()
     if not benchmark.is_file():
@@ -735,6 +774,7 @@ def run_campaign(
             memory_mib=memory_mib,
             bootstrap_draws=bootstrap_draws,
             timeout_seconds=timeout_seconds,
+            json_shape=json_shape,
         )
         templates_root = ensure_directory(root, root / "templates")
         cases_root = ensure_directory(root, root / "cases")
@@ -787,13 +827,14 @@ def run_campaign(
             "same_benchmark_executable": True,
             "fixture_bytes": FIXTURE_BYTES,
             "properties": PROPERTY_COUNT,
-            "edit_property": EDIT_PROPERTY,
+            "json_shape": json_shape,
+            "edit_property": edit_property_for_shape(json_shape),
             "edit": "one byte, alternating original/edited property value",
             "blocks": blocks,
             "warmups_per_arm_block": warmups,
             "measured_per_arm_block": samples,
             "wasm_memory_mib": memory_mib,
-            "production_default_wasm_memory_mib": 64,
+            "production_default_wasm_memory_mib": 256,
             "backends": list(BACKENDS),
             "order": "exactly counterbalanced alternating blocks",
             "isolation": (
@@ -877,11 +918,19 @@ def run_campaign(
                     backend,
                     "setup",
                     template,
-                    environment(api, warmups, samples, memory_mib),
+                    environment(
+                        api,
+                        warmups,
+                        samples,
+                        memory_mib,
+                        json_shape=json_shape,
+                    ),
                     setup_log,
                     timeout_seconds,
                 )
-                archive = validate_setup(setup_output, api)
+                archive = validate_setup(
+                    setup_output, api, json_shape=json_shape
+                )
                 backend_result["setup"][api] = {
                     "runtime": RUNTIMES[api],
                     "plugin_archive": archive,
@@ -921,6 +970,7 @@ def run_campaign(
                         warmups,
                         samples,
                         memory_mib,
+                        json_shape=json_shape,
                         splice_provenance=(mode == "edit" and api == "v2"),
                     )
                     process_output = run_process(
@@ -932,7 +982,13 @@ def run_campaign(
                         log,
                         timeout_seconds,
                     )
-                    validate_mode(process_output, mode, warmups, samples)
+                    validate_mode(
+                        process_output,
+                        mode,
+                        warmups,
+                        samples,
+                        json_shape=json_shape,
+                    )
                     counter_rows = (
                         parse_v2_counters(process_output, samples)
                         if mode == "edit" and api == "v2"
@@ -978,6 +1034,12 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
     parser.add_argument("--memory-mib", type=int, default=DEFAULT_MEMORY_MIB)
     parser.add_argument(
+        "--json-shape",
+        choices=JSON_SHAPES,
+        default="flat",
+        help="use the flat root object or the same object nested below /payload",
+    )
+    parser.add_argument(
         "--bootstrap-draws", type=int, default=DEFAULT_BOOTSTRAP_DRAWS
     )
     parser.add_argument(
@@ -1020,6 +1082,7 @@ def main() -> None:
         memory_mib=args.memory_mib,
         bootstrap_draws=args.bootstrap_draws,
         timeout_seconds=args.process_timeout_seconds,
+        json_shape=args.json_shape,
         resume=args.resume,
         resume_reason=args.resume_reason,
     )

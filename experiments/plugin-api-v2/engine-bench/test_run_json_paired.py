@@ -53,6 +53,7 @@ class JsonPairedRunnerTests(unittest.TestCase):
         self.assertNotIn("LIX_PROFILE_IO_STATS", env)
         self.assertEqual(env["LIX_PROFILE_FORMAT"], "json")
         self.assertEqual(env["LIX_PROFILE_JSON_API"], "v2")
+        self.assertEqual(env["LIX_PROFILE_JSON_SHAPE"], "flat")
         self.assertEqual(env["LIX_PROFILE_WARMUPS"], "3")
         self.assertEqual(env["LIX_PROFILE_ROUNDS"], "7")
         self.assertEqual(env["LIX_PROFILE_WASM_MEMORY_MIB"], "192")
@@ -60,10 +61,14 @@ class JsonPairedRunnerTests(unittest.TestCase):
 
         v1 = runner.environment("v1", 3, 7, 192)
         self.assertNotIn("LIX_PROFILE_SPLICE_PROVENANCE", v1)
+        nested = runner.environment("v2", 3, 7, 192, json_shape="nested")
+        self.assertEqual(nested["LIX_PROFILE_JSON_SHAPE"], "nested")
+        with self.assertRaisesRegex(ValueError, "JSON shape"):
+            runner.environment("v2", 3, 7, 192, json_shape="wide")
 
     def test_structured_cell_line_ignores_human_timing_lines(self) -> None:
         runner.validate_setup(
-            "setup format=json runtime=wasm-component-v2 mechanism_only=false "
+            "setup format=json shape=flat runtime=wasm-component-v2 mechanism_only=false "
             "properties=220000 bytes=10000000 "
             "edit_property=property_110000 plugin_archive_bytes=1234 "
             f"plugin_archive_sha256={'2' * 64}\n"
@@ -71,12 +76,28 @@ class JsonPairedRunnerTests(unittest.TestCase):
             "v2",
         )
         runner.validate_mode(
-            "edit format=json properties=220000 bytes=10000000 "
+            "edit format=json shape=flat properties=220000 bytes=10000000 "
             "property=property_110000 warmups=1 rounds=2\n"
             "edit took 4 ms\n",
             "edit",
             1,
             2,
+        )
+        runner.validate_setup(
+            "setup format=json shape=nested runtime=wasm-component-v2 "
+            "mechanism_only=false properties=220000 bytes=10000000 "
+            "edit_property=/payload/property_110000 plugin_archive_bytes=1234 "
+            f"plugin_archive_sha256={'2' * 64}\n",
+            "v2",
+            json_shape="nested",
+        )
+        runner.validate_mode(
+            "edit format=json shape=nested properties=220000 bytes=10000000 "
+            "property=/payload/property_110000 warmups=1 rounds=2\n",
+            "edit",
+            1,
+            2,
+            json_shape="nested",
         )
 
     def test_sample_and_counter_contracts_are_exact(self) -> None:
@@ -121,23 +142,26 @@ import sys
 backend, mode, raw_case = sys.argv[1:]
 case = Path(raw_case)
 api = os.environ["LIX_PROFILE_JSON_API"]
+shape = os.environ["LIX_PROFILE_JSON_SHAPE"]
 rounds = int(os.environ["LIX_PROFILE_ROUNDS"])
 warmups = int(os.environ["LIX_PROFILE_WARMUPS"])
+edit_property = "property_110000" if shape == "flat" else "/payload/property_110000"
 assert backend in {"rocksdb-fs", "slatedb-cached"}
 assert api in {"v1", "v2"}
+assert shape in {"flat", "nested"}
 assert os.environ["LIX_PROFILE_FORMAT"] == "json"
 assert os.environ["LIX_PROFILE_WASM_MEMORY_MIB"] == "256"
 if mode == "setup":
     assert "LIX_PROFILE_SPLICE_PROVENANCE" not in os.environ
-    (case / "pristine").write_text(api, encoding="utf-8")
+    (case / "pristine").write_text(f"{api}:{shape}", encoding="utf-8")
     runtime = "wasm-component-v1" if api == "v1" else "wasm-component-v2"
     archive_hash = ("1" if api == "v1" else "2") * 64
-    print(f"setup format=json runtime={runtime} mechanism_only=false properties=220000 bytes=10000000 edit_property=property_110000 plugin_archive_bytes=1234 plugin_archive_sha256={archive_hash}")
+    print(f"setup format=json shape={shape} runtime={runtime} mechanism_only=false properties=220000 bytes=10000000 edit_property={edit_property} plugin_archive_bytes=1234 plugin_archive_sha256={archive_hash}")
     print("setup insert took 1 ms")
 elif mode == "edit":
-    assert (case / "pristine").read_text(encoding="utf-8") == api
+    assert (case / "pristine").read_text(encoding="utf-8") == f"{api}:{shape}"
     assert ("LIX_PROFILE_SPLICE_PROVENANCE" in os.environ) == (api == "v2")
-    print(f"edit format=json properties=220000 bytes=10000000 property=property_110000 warmups={warmups} rounds={rounds}")
+    print(f"edit format=json shape={shape} properties=220000 bytes=10000000 property={edit_property} warmups={warmups} rounds={rounds}")
     scale = 50.0 if api == "v2" else 100.0
     print("edit sample_ms=" + repr([scale + index for index in range(rounds)]))
     print("edit took 1 ms")
@@ -158,9 +182,9 @@ elif mode == "edit":
                 "filesystem_sync_full_renders=0"
             )
 elif mode == "render":
-    assert (case / "pristine").read_text(encoding="utf-8") == api
+    assert (case / "pristine").read_text(encoding="utf-8") == f"{api}:{shape}"
     assert "LIX_PROFILE_SPLICE_PROVENANCE" not in os.environ
-    print(f"render format=json properties=220000 warmups={warmups} rounds={rounds}")
+    print(f"render format=json shape={shape} properties=220000 warmups={warmups} rounds={rounds}")
     print("render sample_ms=" + repr([80.0 + index for index in range(rounds)]))
     print("render took 1 ms")
 else:
@@ -195,6 +219,10 @@ else:
             self.assertEqual(artifact["status"], "complete")
             self.assertFalse(artifact["design"]["acceptance_eligible"])
             self.assertTrue(artifact["design"]["same_benchmark_executable"])
+            self.assertEqual(artifact["design"]["json_shape"], "flat")
+            self.assertEqual(
+                artifact["design"]["edit_property"], "property_110000"
+            )
             self.assertEqual(artifact["benchmark"]["sha256"], runner.sha256_file(binary))
             self.assertEqual(
                 artifact["plugins"]["v2"]["sha256"],
@@ -249,7 +277,9 @@ else:
             for api in runner.APIS:
                 template = run_dir / "templates" / "slatedb-cached" / api
                 template.mkdir(parents=True)
-                (template / "pristine").write_text(api, encoding="utf-8")
+                (template / "pristine").write_text(
+                    f"{api}:flat", encoding="utf-8"
+                )
             stale_case = (
                 run_dir
                 / "cases"
@@ -259,6 +289,25 @@ else:
             )
             stale_case.mkdir(parents=True)
             (stale_case / "partial-copy").write_text("stale", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "resume arguments do not match"
+            ):
+                runner.run_campaign(
+                    binary,
+                    run_dir,
+                    v1_manifest=v1_manifest,
+                    v2_manifest=v2_manifest,
+                    blocks=2,
+                    warmups=1,
+                    samples=2,
+                    memory_mib=256,
+                    bootstrap_draws=200,
+                    timeout_seconds=30,
+                    json_shape="nested",
+                    resume=True,
+                    resume_reason="attempted mismatched nested continuation",
+                )
 
             resumed_output = runner.run_campaign(
                 binary,
@@ -300,6 +349,37 @@ else:
             )
             self.assertFalse(stale_case.exists())
             self.assertEqual(list((run_dir / "cases").glob("*/*/*")), [])
+
+            nested_run_dir = parent / "paired-nested"
+            nested_output = runner.run_campaign(
+                binary,
+                nested_run_dir,
+                v1_manifest=v1_manifest,
+                v2_manifest=v2_manifest,
+                blocks=2,
+                warmups=1,
+                samples=2,
+                memory_mib=256,
+                bootstrap_draws=200,
+                timeout_seconds=30,
+                json_shape="nested",
+            )
+            nested_artifact = json.loads(
+                nested_output.read_text(encoding="utf-8")
+            )
+            self.assertEqual(nested_artifact["status"], "complete")
+            self.assertEqual(nested_artifact["design"]["json_shape"], "nested")
+            self.assertEqual(
+                nested_artifact["design"]["edit_property"],
+                "/payload/property_110000",
+            )
+            for backend in runner.BACKENDS:
+                for setup in nested_artifact["backends"][backend]["setup"].values():
+                    setup_log = nested_run_dir / setup["log"]["path"]
+                    self.assertIn(
+                        "shape=nested",
+                        setup_log.read_text(encoding="utf-8"),
+                    )
 
 
 if __name__ == "__main__":

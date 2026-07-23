@@ -17,7 +17,7 @@ use crate::wasm::{WasmComponentV2Actor, WasmDocumentHandle};
 
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_ACTORS: usize = 8;
 // One predecessor is enough for the required two-reader serialization while
-// keeping 10 MiB documents viable under the 64 MiB guest memory ceiling.
+// keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
 
 /// Complete authority identity for one mutable guest instance.

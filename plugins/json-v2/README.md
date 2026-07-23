@@ -1,32 +1,55 @@
 # Incremental JSON plugin (Component API v2)
 
-This crate is the production JSON vertical slice for `wasm-component-v2`. It
-models each top-level member of a JSON object as one `json_property` entity.
-The decoded member name is the natural entity identity, `order_key` preserves
-object-member order, and `value_json` contains the complete JSON value as text.
-Keeping arbitrary JSON inside a string lets values contain numbers while the
-production packet-v1 durable snapshot itself remains number-free.
+This crate is the production-API candidate for a recursive JSON plugin on
+`wasm-component-v2`. It models the document as stable semantic nodes rather
+than using a full RFC 6901 JSON Pointer as entity identity:
 
-The supported document root is a JSON object with unique decoded member names.
-Root arrays and scalars, duplicate object keys, invalid UTF-8, and invalid JSON
-are rejected. The outer object uses the canonical compact envelope emitted by
-the plugin: no whitespace around the braces, keys, separators, or property
-values, and canonical JSON string encoding for property names. Nested arrays,
-objects, strings, numbers, booleans, and null are supported as complete raw
-values of a top-level property, including their internal whitespace and exact
-number spelling. This is an explicit vertical-slice scope, not yet full parity
-with the Component v1 JSON plugin's root and formatting model.
+- `json_root` is the single stable document root.
+- `json_object_member` identifies an object slot by its stable parent
+  container and decoded key.
+- `json_array_item` uses an opaque retry-stable ID plus an independent
+  `order_key`. A numeric array index is only a locator and never identity.
 
-The hot path is a localized edit to one existing top-level property. Immutable
-document versions share their accepted byte backing and retain an index of
-top-level member ranges. A localized edit reparses the affected property and
-emits one complete sparse property upsert. Structural ambiguity, edits spanning
-multiple properties, property insertion or deletion, and uncommon formatting
-or ordering changes within that compact envelope use the exact full-document
-fallback. Cold `open-file` and `open-entities` paths likewise perform complete
-validation and reconstruction. Complete snapshots larger than a packet page
-are exposed through the contract's page-local lazy attachment table rather
-than rejected or copied into oversized packet records.
+An object or array is coalesced with the root, object member, or array item
+that contains it. Its children are separate entities. This avoids redundant
+container entities while allowing recursive leaf edits, array inserts, moves,
+and subtree deletion to stay semantically precise.
+
+Object-member identities are the two primary-key components `parent_id` and
+`key`. When an object member contains another object or array, `container_id`
+is deterministically derived from that identity and becomes the `parent_id` of
+its children. An array item already has a stable opaque `id`, so that ID also
+identifies any container held by the item. Only `json_array_item` declares
+`x-lix-id-allocation: "host-allocated"`: newly inserted items use the
+transition's namespace, while acknowledged IDs survive content edits and
+moves.
+
+Every node records its `kind`. Scalar values use `scalar_json`, which contains
+the complete raw JSON scalar as text. Numbers therefore preserve their exact
+spelling without placing JSON number nodes in the durable packet snapshot.
+Objects and arrays omit `scalar_json` and carry their content in child
+entities. `order_key` preserves deterministic object-member and array-item
+order independently of identity.
+
+The hot path is a localized edit to one existing scalar. Immutable document
+versions share their accepted byte backing and retain a chunked byte-range
+index. A localized scalar edit reparses only the affected value and emits one
+complete sparse upsert. Same-length edits share the span index unchanged;
+length-changing edits copy its compact chunk directory, shift later chunk
+bases, and copy only the chunks containing the scalar or its ancestors. They
+do not parse or materialize the complete document. The 10 MB flat object
+fixture therefore retains the same one-property fast path even though the
+semantic model also supports nested objects and arrays. Structural edits
+reconcile object members by decoded key and array items by stable identity,
+using the exact full-document fallback when a bounded local reconciliation is
+not possible.
+
+File-originated container deletion currently emits explicit descendant
+tombstones. Making this generation the default also requires the RFC's
+schema-declared ownership/reachability support in the host so concurrent
+entity-side detach and reactivation are enforced durably rather than only by a
+warm plugin document. That host capability is a rollout gate, not a WIT API
+change.
 
 The plugin contract and transient packet encoding are defined by:
 
@@ -35,8 +58,8 @@ The plugin contract and transient packet encoding are defined by:
 - [the v2 authoring guide](../../packages/engine/wit/v2/README.md).
 
 The `bindings.rs` and `packet.rs` modules implement the Component boundary.
-Format parsing, indexing, identity, and incremental transition logic stay in
-`core.rs`.
+Format parsing, recursive indexing, identity reconciliation, and incremental
+transition logic stay in `core.rs`.
 
 From the repository root:
 

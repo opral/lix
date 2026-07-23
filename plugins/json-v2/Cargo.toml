@@ -20,5 +20,7 @@ workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+base64 = "0.22"
+blake3 = "1"
 serde_json = { version = "1", features = ["raw_value"] }
 wit-bindgen = "0.57"

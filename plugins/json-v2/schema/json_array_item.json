@@ -1,0 +1,50 @@
+{
+  "x-lix-key": "json_array_item",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-id-allocation": "host-allocated",
+  "description": "One recursively indexed JSON array item. Its opaque host-allocated identity is independent of its numeric JSON Pointer locator and order.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque retry-stable identity allocated from the transition ID namespace."
+    },
+    "parent_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identity of the containing array."
+    },
+    "order_key": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "A stable fractional order key; array position is derived from ordering and is not identity."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "object",
+        "array",
+        "string",
+        "number",
+        "boolean",
+        "null"
+      ],
+      "description": "The JSON value kind represented by this array item."
+    },
+    "scalar_json": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The complete raw JSON scalar encoded as text. Omitted when kind is object or array."
+    }
+  },
+  "required": [
+    "id",
+    "parent_id",
+    "order_key",
+    "kind"
+  ],
+  "additionalProperties": false
+}

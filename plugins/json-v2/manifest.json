@@ -8,6 +8,8 @@
   },
   "entry": "plugin.wasm",
   "schemas": [
-    "schema/json_property.json"
+    "schema/json_root.json",
+    "schema/json_object_member.json",
+    "schema/json_array_item.json"
   ]
 }

@@ -1,0 +1,37 @@
+{
+  "x-lix-key": "json_root",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "description": "The stable root node of one JSON document. Scalar JSON is stored as text so durable snapshots remain number-free.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "const": "root",
+      "description": "The constant identity of the document root."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "object",
+        "array",
+        "string",
+        "number",
+        "boolean",
+        "null"
+      ],
+      "description": "The JSON node kind. Object and array roots carry their content in child entities."
+    },
+    "scalar_json": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The complete raw JSON scalar encoded as text. Omitted for object and array roots."
+    }
+  },
+  "required": [
+    "id",
+    "kind"
+  ],
+  "additionalProperties": false
+}

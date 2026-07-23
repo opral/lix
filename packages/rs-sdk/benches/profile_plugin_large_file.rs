@@ -19,6 +19,8 @@
 //!   whose API is selected separately)
 //! - `LIX_PROFILE_JSON_API` (`v1`, the default current mechanism, or `v2`, the
 //!   incremental Component v2 candidate; ignored for CSV)
+//! - `LIX_PROFILE_JSON_SHAPE` (`flat`, the default 220,000-property root
+//!   object, or `nested`, the same properties below one `payload` member)
 //! - `LIX_PROFILE_INITIAL_ROWS` (CSV only; default 10,000)
 //! - `LIX_PROFILE_NEW_ROWS` (CSV merge only; default 10,000)
 //! - `LIX_PROFILE_WARMUPS` (default 0; unreported no-op/edit/render operations
@@ -31,7 +33,7 @@
 //!   same already-validated splice/hash sidecar produced by the remote protocol)
 //! - `LIX_PROFILE_WASM_MEMORY_MIB` (diagnostic only; wraps the SDK runtime with
 //!   a non-production memory ceiling so an otherwise-OOM 10 MiB v1 operation
-//!   can be timed; omitted means the production 64 MiB policy)
+//!   can be timed; omitted means the production 256 MiB policy)
 //!
 //! Differences from the merge_10k criterion bench (benches/e2e.rs): the bench's
 //! measured region includes `lix.close()`, which this marker frame excludes, and
@@ -73,7 +75,7 @@ const JSON_PROPERTY_COUNT: usize = 220_000;
 // fixture exactly 10,000,000 bytes without a pathological padding property.
 const JSON_LONG_VALUE_COUNT: usize = 99_999;
 const JSON_FIXTURE_SEED: u64 = 0x6a73_6f6e_2d31_306d;
-const PRODUCTION_WASM_MEMORY_MIB: u64 = 64;
+const PRODUCTION_WASM_MEMORY_MIB: u64 = 256;
 const SLATEDB_CACHED_DB_PATH: &str = "workspace";
 const SLATEDB_CACHED_DISK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SLATEDB_CACHED_BLOCK_CACHE_BYTES: u64 = 4 * 1024 * 1024;
@@ -138,13 +140,39 @@ impl JsonApi {
     }
 }
 
-struct FlatJsonFixture {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonShape {
+    Flat,
+    Nested,
+}
+
+impl JsonShape {
+    fn from_env() -> Self {
+        match std::env::var("LIX_PROFILE_JSON_SHAPE") {
+            Ok(raw) if raw.eq_ignore_ascii_case("flat") => Self::Flat,
+            Ok(raw) if raw.eq_ignore_ascii_case("nested") => Self::Nested,
+            Ok(raw) => panic!("LIX_PROFILE_JSON_SHAPE must be 'flat' or 'nested', got '{raw}'"),
+            Err(std::env::VarError::NotPresent) => Self::Flat,
+            Err(error) => panic!("LIX_PROFILE_JSON_SHAPE must be valid Unicode: {error}"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Nested => "nested",
+        }
+    }
+}
+
+struct JsonFixture {
     initial: Vec<u8>,
     edited_value_offset: usize,
     edited_property: String,
+    shape: JsonShape,
 }
 
-impl FlatJsonFixture {
+impl JsonFixture {
     fn edited_bytes(&self) -> Vec<u8> {
         let mut edited = self.initial.clone();
         assert!(
@@ -164,7 +192,7 @@ enum LargeFileFixture {
         new_rows: Vec<String>,
     },
     Json {
-        fixture: FlatJsonFixture,
+        fixture: JsonFixture,
         api: JsonApi,
     },
 }
@@ -186,7 +214,7 @@ impl LargeFileFixture {
                 }
             }
             ProfileFormat::Json => Self::Json {
-                fixture: flat_json_fixture(),
+                fixture: json_fixture(JsonShape::from_env()),
                 api: JsonApi::from_env(),
             },
         }
@@ -238,6 +266,13 @@ impl LargeFileFixture {
                     ..
                 }
         )
+    }
+
+    fn json_shape(&self) -> Option<JsonShape> {
+        match self {
+            Self::Json { fixture, .. } => Some(fixture.shape),
+            Self::Csv { .. } => None,
+        }
     }
 
     fn v2_memory_assertion_bytes(&self) -> Option<u64> {
@@ -454,7 +489,8 @@ where
             }
             LargeFileFixture::Json { fixture: json, api } => {
                 eprintln!(
-                    "setup format=json runtime={} mechanism_only={} properties={} bytes={} edit_property={} plugin_archive_bytes={} plugin_archive_sha256={}",
+                    "setup format=json shape={} runtime={} mechanism_only={} properties={} bytes={} edit_property={} plugin_archive_bytes={} plugin_archive_sha256={}",
+                    json.shape.label(),
                     api.runtime(),
                     api == &JsonApi::V1,
                     JSON_PROPERTY_COUNT,
@@ -538,7 +574,11 @@ where
                     updated_file.len()
                 ),
                 LargeFileFixture::Json { .. } => eprintln!(
-                    "noop format=json properties={} bytes={} warmups={warmups} rounds={rounds}",
+                    "noop format=json shape={} properties={} bytes={} warmups={warmups} rounds={rounds}",
+                    fixture
+                        .json_shape()
+                        .expect("JSON fixture has a JSON shape")
+                        .label(),
                     JSON_PROPERTY_COUNT,
                     updated_file.len()
                 ),
@@ -593,7 +633,8 @@ where
                     updated_file.len()
                 ),
                 LargeFileFixture::Json { fixture: json, .. } => eprintln!(
-                    "edit format=json properties={} bytes={} property={} warmups={warmups} rounds={rounds}",
+                    "edit format=json shape={} properties={} bytes={} property={} warmups={warmups} rounds={rounds}",
+                    json.shape.label(),
                     JSON_PROPERTY_COUNT,
                     updated_file.len(),
                     json.edited_property
@@ -665,7 +706,11 @@ where
                 }
                 LargeFileFixture::Json { .. } => {
                     eprintln!(
-                        "{mode} format=json properties={JSON_PROPERTY_COUNT} warmups={warmups} rounds={rounds}",
+                        "{mode} format=json shape={} properties={JSON_PROPERTY_COUNT} warmups={warmups} rounds={rounds}",
+                        fixture
+                            .json_shape()
+                            .expect("JSON fixture has a JSON shape")
+                            .label(),
                     );
                 }
             }
@@ -714,7 +759,7 @@ fn open_options<S>(storage: S) -> OpenLixOptions<S> {
         return options;
     };
     let memory_mib = profile_wasm_memory_mib().expect("profiling runtime requires memory limit");
-    eprintln!("diagnostic_wasm_memory_mib={memory_mib} production_default_mib=64");
+    eprintln!("diagnostic_wasm_memory_mib={memory_mib} production_default_mib=256");
     options.with_wasm_runtime(wasm_runtime)
 }
 
@@ -1381,47 +1426,75 @@ fn csv_bytes_from_rows(rows: &[String]) -> Vec<u8> {
     csv.into_bytes()
 }
 
-fn flat_json_fixture() -> FlatJsonFixture {
-    let mut initial = Vec::with_capacity(JSON_TARGET_BYTE_COUNT);
+fn json_fixture(shape: JsonShape) -> JsonFixture {
+    let envelope_bytes = match shape {
+        JsonShape::Flat => 0,
+        JsonShape::Nested => br#"{"payload":"#.len() + 1,
+    };
+    let long_value_count = JSON_LONG_VALUE_COUNT
+        .checked_sub(envelope_bytes)
+        .expect("nested JSON envelope fits the deterministic padding");
+    let mut object = Vec::with_capacity(JSON_TARGET_BYTE_COUNT - envelope_bytes);
     let mut rng = SplitMix64(JSON_FIXTURE_SEED);
     let middle = JSON_PROPERTY_COUNT / 2;
-    let edited_property = format!("property_{middle:06}");
+    let edited_property = match shape {
+        JsonShape::Flat => format!("property_{middle:06}"),
+        JsonShape::Nested => format!("/payload/property_{middle:06}"),
+    };
     let mut edited_value_offset = None;
 
-    initial.push(b'{');
+    object.push(b'{');
     for index in 0..JSON_PROPERTY_COUNT {
         if index > 0 {
-            initial.push(b',');
+            object.push(b',');
         }
         let first = rng.next_u64();
         let second = u32::try_from(rng.next_u64() & u64::from(u32::MAX))
             .expect("masked low 32 bits must fit in u32");
         write!(
-            &mut initial,
+            &mut object,
             "\"property_{index:06}\":\"{first:016x}{second:08x}"
         )
         .expect("write deterministic JSON property");
         if index == middle {
-            edited_value_offset = Some(initial.len() - 24);
+            edited_value_offset = Some(object.len() - 24);
         }
-        if index < JSON_LONG_VALUE_COUNT {
-            initial.push(b'f');
+        if index < long_value_count {
+            object.push(b'f');
         }
-        initial.push(b'"');
+        object.push(b'"');
     }
-    initial.push(b'}');
+    object.push(b'}');
+
+    let (initial, edited_value_offset) = match shape {
+        JsonShape::Flat => (
+            object,
+            edited_value_offset.expect("middle JSON property exists"),
+        ),
+        JsonShape::Nested => {
+            let prefix = br#"{"payload":"#;
+            let mut initial = Vec::with_capacity(JSON_TARGET_BYTE_COUNT);
+            initial.extend_from_slice(prefix);
+            initial.extend_from_slice(&object);
+            initial.push(b'}');
+            (
+                initial,
+                prefix.len() + edited_value_offset.expect("middle JSON property exists"),
+            )
+        }
+    };
 
     assert_eq!(
         initial.len(),
         JSON_TARGET_BYTE_COUNT,
-        "flat JSON fixture must remain exactly 10,000,000 bytes"
+        "JSON fixture must remain exactly 10,000,000 bytes"
     );
-    let edited_value_offset = edited_value_offset.expect("middle JSON property exists");
 
-    FlatJsonFixture {
+    JsonFixture {
         initial,
         edited_value_offset,
         edited_property,
+        shape,
     }
 }
 
@@ -1520,8 +1593,16 @@ fn build_json_v2_plugin() -> Vec<u8> {
                 include_str!("../../../plugins/json-v2/manifest.json").as_bytes(),
             ),
             (
-                "schema/json_property.json",
-                include_str!("../../../plugins/json-v2/schema/json_property.json").as_bytes(),
+                "schema/json_root.json",
+                include_str!("../../../plugins/json-v2/schema/json_root.json").as_bytes(),
+            ),
+            (
+                "schema/json_object_member.json",
+                include_str!("../../../plugins/json-v2/schema/json_object_member.json").as_bytes(),
+            ),
+            (
+                "schema/json_array_item.json",
+                include_str!("../../../plugins/json-v2/schema/json_array_item.json").as_bytes(),
             ),
         ],
     )
@@ -1584,7 +1665,7 @@ mod tests {
 
     #[test]
     fn json_fixture_is_exact_and_changes_only_the_middle_property() {
-        let fixture = super::flat_json_fixture();
+        let fixture = super::json_fixture(super::JsonShape::Flat);
         let edited_bytes = fixture.edited_bytes();
         assert_eq!(fixture.initial.len(), super::JSON_TARGET_BYTE_COUNT);
         assert_eq!(edited_bytes.len(), super::JSON_TARGET_BYTE_COUNT);
@@ -1620,6 +1701,46 @@ mod tests {
     }
 
     #[test]
+    fn nested_json_fixture_is_exact_and_changes_only_one_recursive_leaf() {
+        let fixture = super::json_fixture(super::JsonShape::Nested);
+        let edited_bytes = fixture.edited_bytes();
+        assert_eq!(fixture.initial.len(), super::JSON_TARGET_BYTE_COUNT);
+        assert_eq!(edited_bytes.len(), super::JSON_TARGET_BYTE_COUNT);
+        assert_eq!(
+            fixture
+                .initial
+                .iter()
+                .zip(&edited_bytes)
+                .filter(|(before, after)| before != after)
+                .count(),
+            1
+        );
+        let initial: serde_json::Value =
+            serde_json::from_slice(&fixture.initial).expect("initial fixture is valid JSON");
+        let edited: serde_json::Value =
+            serde_json::from_slice(&edited_bytes).expect("edited fixture is valid JSON");
+        let initial = initial["payload"]
+            .as_object()
+            .expect("payload is the nested object");
+        let edited = edited["payload"]
+            .as_object()
+            .expect("payload is the nested object");
+        assert_eq!(initial.len(), super::JSON_PROPERTY_COUNT);
+        assert_eq!(edited.len(), super::JSON_PROPERTY_COUNT);
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|(key, before)| edited.get(*key) != Some(*before))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture.edited_property,
+            format!("/payload/property_{:06}", super::JSON_PROPERTY_COUNT / 2)
+        );
+    }
+
+    #[test]
     fn json_v1_lane_packages_the_real_wasm_plugin() {
         let archive = super::build_json_plugin(super::JsonApi::V1);
         let mut opened =
@@ -1640,7 +1761,13 @@ mod tests {
         let archive = super::build_json_plugin(super::JsonApi::V2);
         let mut opened =
             zip::ZipArchive::new(std::io::Cursor::new(&archive)).expect("open plugin archive");
-        for path in ["manifest.json", "schema/json_property.json", "plugin.wasm"] {
+        for path in [
+            "manifest.json",
+            "schema/json_root.json",
+            "schema/json_object_member.json",
+            "schema/json_array_item.json",
+            "plugin.wasm",
+        ] {
             let entry = opened.by_name(path).expect("required archive entry");
             assert!(entry.size() > 0, "archive entry '{path}' must not be empty");
         }
