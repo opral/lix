@@ -38,7 +38,7 @@ impl<StorageImpl> OpenLixOptions<StorageImpl> {
     }
 }
 
-/// Workspace-session handle for a Lix repository.
+/// Session handle for a Lix repository.
 #[expect(missing_debug_implementations)]
 pub struct Lix<StorageImpl = Memory>
 where
@@ -46,6 +46,7 @@ where
 {
     engine: Engine<StorageImpl>,
     session: SessionContext<StorageImpl>,
+    branch_pinned: bool,
 }
 
 /// Opens a Lix workspace session.
@@ -86,7 +87,11 @@ where
     let engine =
         open_or_initialize_engine(options.storage, options.wasm_runtime, telemetry).await?;
     let session = engine.open_workspace_session().await?;
-    Ok(Lix { engine, session })
+    Ok(Lix {
+        engine,
+        session,
+        branch_pinned: false,
+    })
 }
 
 pub async fn open_lix_with_storage<StorageImpl>(
@@ -102,6 +107,42 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Opens a branch-pinned session on this handle's existing engine.
+    ///
+    /// Unlike a workspace session, the returned handle never consults or
+    /// changes the workspace's shared active-branch selector. Its branch scope
+    /// remains fixed for the lifetime of the handle.
+    pub async fn open_session(
+        &self,
+        active_branch_id: impl Into<String>,
+    ) -> Result<Self, LixError> {
+        if self.session.is_closed() {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot open a branch-pinned session from a closed Lix handle",
+            ));
+        }
+        let active_branch_id = active_branch_id.into();
+        if self
+            .engine
+            .load_branch_head_commit_id(&active_branch_id)
+            .await?
+            .is_none()
+        {
+            return Err(LixError::branch_not_found(
+                active_branch_id,
+                "open_session",
+                "target",
+            ));
+        }
+        let session = self.engine.open_session(active_branch_id).await?;
+        Ok(Self {
+            engine: self.engine.clone(),
+            session,
+            branch_pinned: true,
+        })
+    }
+
     /// Opens another workspace session on this handle's existing engine.
     ///
     /// The returned handle has independent session-local state, including its
@@ -120,6 +161,7 @@ where
         Ok(Self {
             engine: self.engine.clone(),
             session,
+            branch_pinned: false,
         })
     }
 
@@ -196,6 +238,12 @@ where
         &self,
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
+        if self.branch_pinned {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "a branch-pinned session cannot switch branches; open a new session instead",
+            ));
+        }
         let (_session, receipt) = self.session.switch_branch(options).await?;
         Ok(receipt)
     }
@@ -343,5 +391,88 @@ mod tests {
         root.execute("SELECT 3", &[])
             .await
             .expect("root remains open");
+    }
+
+    #[tokio::test]
+    async fn branch_pinned_sessions_do_not_follow_the_workspace_selector() {
+        let root = open_lix(OpenLixOptions::<Memory>::default())
+            .await
+            .expect("open root Lix");
+        let main_branch_id = root.active_branch_id().await.expect("main branch");
+        let draft = root
+            .create_branch(CreateBranchOptions {
+                id: Some("pinned-draft".to_string()),
+                name: "Pinned draft".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create draft");
+        let pinned = root
+            .open_session(draft.id.clone())
+            .await
+            .expect("open branch-pinned session");
+
+        pinned
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/pinned-only.txt".to_string()),
+                    Value::Blob(b"draft".to_vec()),
+                ],
+            )
+            .await
+            .expect("write pinned branch");
+
+        assert_eq!(
+            pinned.active_branch_id().await.expect("pinned branch"),
+            draft.id
+        );
+        assert_eq!(
+            root.active_branch_id().await.expect("workspace branch"),
+            main_branch_id
+        );
+        let root_rows = root
+            .execute(
+                "SELECT path FROM lix_file WHERE path = '/pinned-only.txt'",
+                &[],
+            )
+            .await
+            .expect("read workspace branch");
+        assert!(root_rows.rows().is_empty());
+        let pinned_rows = pinned
+            .execute(
+                "SELECT path FROM lix_file WHERE path = '/pinned-only.txt'",
+                &[],
+            )
+            .await
+            .expect("read pinned branch");
+        assert_eq!(pinned_rows.rows().len(), 1);
+
+        let error = pinned
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id,
+            })
+            .await
+            .expect_err("pinned session must reject branch switches");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert_eq!(
+            pinned.active_branch_id().await.expect("still pinned"),
+            "pinned-draft"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_pinned_sessions_reject_unknown_branches() {
+        let root = open_lix(OpenLixOptions::<Memory>::default())
+            .await
+            .expect("open root Lix");
+        let Err(error) = root.open_session("missing-branch").await else {
+            panic!("unknown branch must not open");
+        };
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+        let details = error.details.expect("structured branch error details");
+        assert_eq!(details["branch_id"], "missing-branch");
+        assert_eq!(details["operation"], "open_session");
+        assert_eq!(details["role"], "target");
     }
 }

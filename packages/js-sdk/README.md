@@ -55,6 +55,25 @@ so it does not take a client `storage`. Dynamic headers are resolved for every
 request and observation reconnect. An injected `fetch` can route requests
 through a service binding or another authorized server-side transport.
 
+Agent-style clients that always operate on one branch can request immutable,
+server-owned branch scope. This avoids reading the workspace's shared branch
+selector on every operation and prevents another client from moving the
+session to a different branch:
+
+```ts
+const lix = await openLix({
+	server: {
+		mode: "remote",
+		url: "https://lixray.com/@namespace/workspace",
+		branchId: "agent-draft-id",
+	},
+});
+```
+
+`switchBranch()` is rejected for a branch-pinned session; open a new remote
+client to work on another branch. The SDK fails closed if the server does not
+confirm the requested immutable scope.
+
 Browser deployments that only use remote mode can import the same API from the
 remote-only entrypoint. This keeps the local worker and engine WASM out of the
 bundle:

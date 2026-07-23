@@ -110,6 +110,164 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	expect(requests[3]?.headers.get("lix-session-id")).toBe("session-1");
 });
 
+test("remote mode requests and verifies an immutable branch-pinned session", async () => {
+	const requests: Request[] = [];
+	const branchId = "draft/agent one";
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			branchId,
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				return Response.json({
+					protocolVersion: 1,
+					activeBranchId: branchId,
+					sessionId: "session-1",
+					sessionScope: { kind: "branch", branchId },
+				});
+			},
+		},
+	});
+
+	expect(await lix.activeBranchId()).toBe(branchId);
+	await lix.close();
+
+	expect(requests).toHaveLength(3);
+	expect(new URL(requests[0]?.url ?? "").searchParams.get("branchId")).toBe(
+		branchId,
+	);
+	expect(new URL(requests[1]?.url ?? "").search).toBe("");
+	expect(new URL(requests[2]?.url ?? "").search).toBe("");
+	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
+	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
+	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
+});
+
+test("remote mode fails closed and releases a session when branch pinning is not honored", async () => {
+	const requests: Request[] = [];
+	await expect(
+		openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/workspace",
+				branchId: "draft-id",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					requests.push(request.clone());
+					if (request.method === "DELETE") {
+						return new Response(null, { status: 204 });
+					}
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "draft-id",
+						sessionId: "session-1",
+					});
+				},
+			},
+		}),
+	).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote server did not open the requested branch-pinned session",
+	});
+
+	expect(requests.map((request) => request.method)).toEqual(["GET", "DELETE"]);
+	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
+});
+
+test("remote mode releases a branch session whose active branch contradicts its scope", async () => {
+	const requests: Request[] = [];
+	await expect(
+		openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/workspace",
+				branchId: "draft-id",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					requests.push(request.clone());
+					if (request.method === "DELETE") {
+						return new Response(null, { status: 204 });
+					}
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+						sessionScope: { kind: "branch", branchId: "draft-id" },
+					});
+				},
+			},
+		}),
+	).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote server did not open the requested branch-pinned session",
+	});
+
+	expect(requests.map((request) => request.method)).toEqual(["GET", "DELETE"]);
+	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
+});
+
+test("remote mode releases a session after malformed scope decoding without masking that error", async () => {
+	const requests: Request[] = [];
+	await expect(
+		openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/workspace",
+				branchId: "draft-id",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					requests.push(request.clone());
+					if (request.method === "DELETE") {
+						return Response.json(
+							{
+								error: {
+									code: "LIX_DELETE_FAILED",
+									message: "cleanup failed",
+								},
+							},
+							{ status: 500 },
+						);
+					}
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "draft-id",
+						sessionId: "session-1",
+						sessionScope: { kind: "branch" },
+					});
+				},
+			},
+		}),
+	).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote handshake sessionScope is invalid",
+	});
+
+	expect(requests.map((request) => request.method)).toEqual(["GET", "DELETE"]);
+	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
+});
+
+test.each(["", "   ", 42])(
+	"remote mode rejects an invalid branchId: %j",
+	async (branchId) => {
+		await expect(
+			openLix({
+				server: {
+					mode: "remote",
+					url: "https://lixray.test/workspace",
+					branchId: branchId as string,
+				},
+			}),
+		).rejects.toThrow(
+			"openLix() remote server branchId must be a non-empty string",
+		);
+	},
+);
+
 test("remote mode compresses only large compressible JSON requests", async () => {
 	const executeRequests: Request[] = [];
 	const lix = await openLix({

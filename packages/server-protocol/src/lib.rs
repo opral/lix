@@ -1,9 +1,9 @@
-//! Canonical HTTP transport for independent sessions on a workspace-mode
-//! [`lix_sdk::Lix`] handle.
+//! Canonical HTTP transport for independent sessions on a [`lix_sdk::Lix`]
+//! workspace handle.
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
     middleware::{self, Next},
     response::{
@@ -93,8 +93,8 @@ impl Default for ProtocolServerOptions {
 /// Persistent canonical protocol server for one Lix workspace.
 ///
 /// A server owns one root [`Lix`] and opens every remote client as an
-/// independent workspace session on that root's existing engine. Clones share
-/// the same bounded in-memory session registry.
+/// independent workspace or branch-pinned session on that root's existing
+/// engine. Clones share the same bounded in-memory session registry.
 #[expect(missing_debug_implementations)]
 pub struct LixProtocolServer<S>
 where
@@ -138,11 +138,30 @@ where
     sessions: HashMap<String, Arc<SessionRecord<S>>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+enum SessionScope {
+    #[serde(rename = "workspace")]
+    Workspace,
+    #[serde(rename = "branch")]
+    Branch {
+        #[serde(rename = "branchId")]
+        branch_id: String,
+    },
+}
+
+impl SessionScope {
+    fn is_branch_pinned(&self) -> bool {
+        matches!(self, Self::Branch { .. })
+    }
+}
+
 struct SessionRecord<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix: Arc<Lix<S>>,
+    scope: SessionScope,
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
     request_blobs: Mutex<RequestBlobCache>,
@@ -194,9 +213,10 @@ impl<S> SessionRecord<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fn new(lix: Lix<S>, now: Instant) -> Self {
+    fn new(lix: Lix<S>, scope: SessionScope, now: Instant) -> Self {
         Self {
             lix: Arc::new(lix),
+            scope,
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
             request_blobs: Mutex::new(RequestBlobCache::default()),
@@ -526,7 +546,7 @@ where
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn create_session(&self) -> Result<SessionLease<S>, ApiError> {
+    async fn create_session(&self, scope: SessionScope) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
         ensure_server_open(registry.lifecycle)?;
 
@@ -545,29 +565,49 @@ where
             }
         }
 
-        if registry.sessions.len() >= self.inner.options.max_sessions {
-            let lru_idle_id = registry
+        let child = match &scope {
+            SessionScope::Workspace => self.inner.root.open_workspace_session().await?,
+            SessionScope::Branch { branch_id } => {
+                self.inner.root.open_session(branch_id.clone()).await?
+            }
+        };
+
+        let lru_idle_id = if registry.sessions.len() >= self.inner.options.max_sessions {
+            let candidate = registry
                 .sessions
                 .iter()
                 .filter(|(_, record)| record.lease_count() == 0)
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
-            let Some(lru_idle_id) = lru_idle_id else {
+            let Some(candidate) = candidate else {
+                close_unregistered_session(&child).await;
                 return Err(ApiError::capacity());
             };
-            if let Some(record) = registry.sessions.remove(&lru_idle_id) {
-                close_removed_session(record).await;
-            }
-        }
+            Some(candidate)
+        } else {
+            None
+        };
 
-        let child = self.inner.root.open_workspace_session().await?;
         let session_id = loop {
-            let candidate = generate_session_id()?;
+            let candidate = match generate_session_id() {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    close_unregistered_session(&child).await;
+                    return Err(error);
+                }
+            };
             if !registry.sessions.contains_key(&candidate) {
                 break candidate;
             }
         };
-        let record = Arc::new(SessionRecord::new(child, now));
+
+        if let Some(lru_idle_id) = lru_idle_id
+            && let Some(record) = registry.sessions.remove(&lru_idle_id)
+        {
+            close_removed_session(record).await;
+        }
+
+        let record = Arc::new(SessionRecord::new(child, scope, Instant::now()));
         registry
             .sessions
             .insert(session_id.clone(), Arc::clone(&record));
@@ -612,6 +652,19 @@ where
             code = %error.code,
             message = %error.message,
             "failed to close an evicted Lix protocol session"
+        );
+    }
+}
+
+async fn close_unregistered_session<S>(candidate: &Lix<S>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    if let Err(error) = candidate.close().await {
+        tracing::warn!(
+            code = %error.code,
+            message = %error.message,
+            "failed to close an unregistered Lix protocol session"
         );
     }
 }
@@ -697,14 +750,30 @@ where
 
 async fn handshake<S>(
     State(state): State<HandlerState<S>>,
+    Query(query): Query<HandshakeQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let lease = match optional_session_id(&headers)? {
-        Some(session_id) => state.lease(&session_id).await?,
-        None => state.server.create_session().await?,
+        Some(session_id) => {
+            if query.branch_id.is_some() {
+                return Err(ApiError::bad_request(
+                    "branchId is only valid when creating a session",
+                ));
+            }
+            state.lease(&session_id).await?
+        }
+        None => {
+            let scope = match query.branch_id {
+                Some(branch_id) => SessionScope::Branch {
+                    branch_id: required_non_empty(Some(branch_id), "branchId")?,
+                },
+                None => SessionScope::Workspace,
+            };
+            state.server.create_session(scope).await?
+        }
     };
     let active_branch_id = lease
         .run(|lix| async move { lix.active_branch_id().await })
@@ -715,6 +784,7 @@ where
             protocol_version: PROTOCOL_VERSION,
             active_branch_id,
             session_id: lease.session_id.clone(),
+            session_scope: lease.record.scope.clone(),
             capabilities: ProtocolCapabilities {
                 request_blob_splice: true,
             },
@@ -839,6 +909,9 @@ async fn switch_branch<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    if lease.record.scope.is_branch_pinned() {
+        return Err(ApiError::branch_pinned_session());
+    }
     let options = SwitchBranchOptions {
         branch_id: required_non_empty(request.branch_id, "branchId")?,
     };
@@ -1299,6 +1372,18 @@ impl ApiError {
         }
     }
 
+    fn branch_pinned_session() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ErrorEnvelope::from_parts(
+                "LIX_ERROR_PROTOCOL_BRANCH_PINNED",
+                "a branch-pinned session cannot switch branches",
+                Some("open a new session pinned to the target branch".to_string()),
+                None,
+            ),
+        }
+    }
+
     fn blob_base_missing(
         base_sha256: String,
         parameter_index: usize,
@@ -1434,7 +1519,14 @@ struct HandshakeResponse {
     protocol_version: u32,
     active_branch_id: String,
     session_id: String,
+    session_scope: SessionScope,
     capabilities: ProtocolCapabilities,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HandshakeQuery {
+    branch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2055,6 +2147,7 @@ mod tests {
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(first["capabilities"]["requestBlobSplice"], true);
+        assert_eq!(first["sessionScope"], json!({ "kind": "workspace" }));
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -2191,6 +2284,134 @@ mod tests {
         assert_eq!(switched.status(), StatusCode::OK);
         let after = request(&app.router, "GET", "/lix/v1/", Some(&second_session), None).await;
         assert_eq!(response_json(after).await["activeBranchId"], draft);
+    }
+
+    #[tokio::test]
+    async fn branch_pinned_handshake_keeps_immutable_server_owned_scope() {
+        let app = app().await;
+        let (workspace_session, workspace) = new_session(&app.router).await;
+        let main_branch_id = workspace["activeBranchId"]
+            .as_str()
+            .expect("main branch id")
+            .to_string();
+        let created = request(
+            &app.router,
+            "POST",
+            "/lix/v1/branch/create",
+            Some(&workspace_session),
+            Some(json!({ "id": "pinned-draft", "name": "Pinned draft" })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let pinned = request(
+            &app.router,
+            "GET",
+            "/lix/v1?branchId=pinned-draft",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(pinned.status(), StatusCode::OK);
+        let pinned = response_json(pinned).await;
+        let pinned_session = pinned["sessionId"]
+            .as_str()
+            .expect("pinned session id")
+            .to_string();
+        assert_eq!(pinned["activeBranchId"], "pinned-draft");
+        assert_eq!(
+            pinned["sessionScope"],
+            json!({ "kind": "branch", "branchId": "pinned-draft" })
+        );
+
+        let write = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&pinned_session),
+            Some(json!({
+                "sql": "INSERT INTO lix_file (path, data) VALUES ('/pinned-only.txt', $1)",
+                "params": [wire_blob_json(b"draft")],
+            })),
+        )
+        .await;
+        assert_eq!(write.status(), StatusCode::OK);
+        let workspace_read = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&workspace_session),
+            Some(json!({
+                "sql": "SELECT path FROM lix_file WHERE path = '/pinned-only.txt'"
+            })),
+        )
+        .await;
+        assert_eq!(workspace_read.status(), StatusCode::OK);
+        assert_eq!(response_json(workspace_read).await["rows"], json!([]));
+
+        let switch = request(
+            &app.router,
+            "POST",
+            "/lix/v1/branch/switch",
+            Some(&pinned_session),
+            Some(json!({ "branchId": main_branch_id })),
+        )
+        .await;
+        assert_eq!(switch.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(switch).await, "LIX_ERROR_PROTOCOL_BRANCH_PINNED");
+
+        let resumed = request(&app.router, "GET", "/lix/v1/", Some(&pinned_session), None).await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        let resumed = response_json(resumed).await;
+        assert_eq!(resumed["sessionId"], pinned_session);
+        assert_eq!(resumed["activeBranchId"], "pinned-draft");
+        assert_eq!(resumed["sessionScope"], pinned["sessionScope"]);
+    }
+
+    #[tokio::test]
+    async fn branch_scope_is_only_accepted_when_creating_a_live_branch_session() {
+        let app = app().await;
+        let (workspace_session, _) = new_session(&app.router).await;
+
+        let missing = request(
+            &app.router,
+            "GET",
+            "/lix/v1?branchId=missing-branch",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(missing).await, LixError::CODE_BRANCH_NOT_FOUND);
+
+        let empty = request(&app.router, "GET", "/lix/v1?branchId=%20%20", None, None).await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(empty).await, "LIX_INVALID_ARGUMENT");
+
+        let rescope = request(
+            &app.router,
+            "GET",
+            "/lix/v1?branchId=global",
+            Some(&workspace_session),
+            None,
+        )
+        .await;
+        assert_eq!(rescope.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(rescope).await, "LIX_INVALID_ARGUMENT");
+
+        let resumed = request(
+            &app.router,
+            "GET",
+            "/lix/v1",
+            Some(&workspace_session),
+            None,
+        )
+        .await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(resumed).await["sessionScope"],
+            json!({ "kind": "workspace" })
+        );
     }
 
     #[tokio::test]
@@ -3124,6 +3345,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_branch_open_at_capacity_preserves_the_existing_session() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_sessions: 1,
+            session_idle_timeout: Duration::from_mins(1),
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (existing, _) = new_session(&app.router).await;
+
+        let missing = request(
+            &app.router,
+            "GET",
+            "/lix/v1?branchId=missing-branch",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(missing).await, LixError::CODE_BRANCH_NOT_FOUND);
+
+        let existing_response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&existing),
+            Some(json!({ "sql": "SELECT 1" })),
+        )
+        .await;
+        assert_eq!(existing_response.status(), StatusCode::OK);
+        assert_eq!(app.server.inner.registry.lock().await.sessions.len(), 1);
+    }
+
+    #[tokio::test]
     async fn active_sse_lease_cannot_be_evicted_for_capacity() {
         let app = app_with_options(ProtocolServerOptions {
             max_sessions: 1,
@@ -3162,7 +3416,11 @@ mod tests {
             ..ProtocolServerOptions::default()
         })
         .await;
-        let lease = app.server.create_session().await.expect("session lease");
+        let lease = app
+            .server
+            .create_session(SessionScope::Workspace)
+            .await
+            .expect("session lease");
         let record = Arc::clone(&lease.record);
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (finish_sender, finish) = tokio::sync::oneshot::channel();

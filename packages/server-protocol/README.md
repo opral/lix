@@ -32,10 +32,14 @@ route to another instance intentionally makes the old session return `410`.
 ## Session lifecycle
 
 An initial `GET /lix/v1` without `Lix-Session-Id` opens an independent
-workspace session on the root handle's existing engine. Its response contains
-`protocolVersion`, `activeBranchId`, and a cryptographically random
-`sessionId`. The client sends that value as `Lix-Session-Id` on every later
-request, including a resumed handshake and observation streams.
+workspace session on the root handle's existing engine. Passing
+`?branchId=<id>` on that initial request instead opens a branch-pinned session.
+Its branch scope is owned by the server and cannot be changed; attempting
+`branch/switch` returns `409`. The response contains `protocolVersion`,
+`activeBranchId`, `sessionScope`, and a cryptographically random `sessionId`.
+The client sends that value as `Lix-Session-Id` on every later request,
+including a resumed handshake and observation streams. A resumed handshake
+must not repeat `branchId`.
 
 Missing or malformed identifiers return `400`. Unknown, expired, evicted, or
 closed identifiers return `410 Gone`; the client must open a new logical

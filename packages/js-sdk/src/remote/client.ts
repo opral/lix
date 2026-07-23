@@ -64,6 +64,7 @@ export async function openRemoteLixBinding(
 
 class RemoteLixBinding implements LixBinding {
 	readonly #baseUrl: URL;
+	readonly #branchId: string | undefined;
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #observationHub: RemoteObservationHub;
@@ -83,6 +84,15 @@ class RemoteLixBinding implements LixBinding {
 			throw new TypeError("openLix() remote server mode must be 'remote'");
 		}
 		this.#baseUrl = protocolBaseUrl(options.url);
+		if (
+			options.branchId !== undefined &&
+			(typeof options.branchId !== "string" || options.branchId.trim().length === 0)
+		) {
+			throw new TypeError(
+				"openLix() remote server branchId must be a non-empty string",
+			);
+		}
+		this.#branchId = options.branchId;
 		const remoteFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
 		if (typeof remoteFetch !== "function") {
 			throw new TypeError("openLix() remote mode requires fetch");
@@ -105,11 +115,46 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async open(): Promise<void> {
-		const handshake = decodeHandshake(
-			await this.#requestJson("", { method: "GET" }),
+		const rawHandshake = await this.#requestJson(
+			initialHandshakePath(this.#branchId),
+			{
+				method: "GET",
+			},
 		);
+		let handshake: ReturnType<typeof decodeHandshake>;
+		try {
+			handshake = decodeHandshake(rawHandshake);
+		} catch (error) {
+			const issuedSessionId = validIssuedSessionId(rawHandshake);
+			if (issuedSessionId !== undefined) {
+				await this.#releaseSessionBestEffort(issuedSessionId);
+			}
+			throw error;
+		}
 		this.#sessionId = handshake.sessionId;
+		if (
+			this.#branchId !== undefined &&
+			(handshake.sessionScope?.kind !== "branch" ||
+				handshake.sessionScope.branchId !== this.#branchId ||
+				handshake.activeBranchId !== this.#branchId)
+		) {
+			await this.#releaseSessionBestEffort(handshake.sessionId);
+			throw protocolError(
+				"remote server did not open the requested branch-pinned session",
+			);
+		}
 		this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
+	}
+
+	async #releaseSessionBestEffort(sessionId: string): Promise<void> {
+		this.#sessionId = sessionId;
+		try {
+			await this.#requestJson("session", { method: "DELETE" }, "empty");
+		} catch {
+			// The handshake error is authoritative; cleanup is best effort.
+		} finally {
+			this.#sessionId = undefined;
+		}
 	}
 
 	async execute(
@@ -1295,6 +1340,22 @@ function protocolBaseUrl(value: string | URL): URL {
 	}
 	workspaceUrl.pathname = `${workspaceUrl.pathname.replace(/\/$/, "")}${REMOTE_PROTOCOL_PATH}`;
 	return workspaceUrl;
+}
+
+function initialHandshakePath(branchId: string | undefined): string {
+	if (branchId === undefined) return "";
+	const search = new URLSearchParams({ branchId });
+	return `?${search.toString()}`;
+}
+
+function validIssuedSessionId(value: unknown): string | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const sessionId = (value as Record<string, unknown>).sessionId;
+	return typeof sessionId === "string" && /^[\x21-\x7e]{1,256}$/.test(sessionId)
+		? sessionId
+		: undefined;
 }
 
 function unsupportedRemoteOperation(operation: string): Error & { code: string } {

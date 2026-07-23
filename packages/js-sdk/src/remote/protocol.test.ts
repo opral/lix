@@ -26,6 +26,46 @@ test.each([
 	},
 );
 
+test.each([
+	[undefined, undefined],
+	[{ kind: "workspace" }, { kind: "workspace" }],
+	[
+		{ kind: "branch", branchId: "draft-id" },
+		{ kind: "branch", branchId: "draft-id" },
+	],
+])("remote handshake decodes an additive session scope: %j", (scope, expected) => {
+	expect(
+		decodeHandshake({
+			protocolVersion: 1,
+			activeBranchId: "main-id",
+			sessionId: "session-1",
+			...(scope === undefined ? {} : { sessionScope: scope }),
+		}).sessionScope,
+	).toEqual(expected);
+});
+
+test.each([
+	null,
+	{},
+	{ kind: "branch" },
+	{ kind: "branch", branchId: "" },
+	{ kind: "unknown" },
+])("remote handshake rejects an invalid session scope: %j", (sessionScope) => {
+	expect(() =>
+		decodeHandshake({
+			protocolVersion: 1,
+			activeBranchId: "main-id",
+			sessionId: "session-1",
+			sessionScope,
+		}),
+	).toThrow(
+		expect.objectContaining({
+			code: "LIX_REMOTE_PROTOCOL_ERROR",
+			message: expect.stringContaining("remote handshake sessionScope"),
+		}),
+	);
+});
+
 test("remote blobs use native typed-array base64 when available", () => {
 	const prototype = Uint8Array.prototype as Uint8Array & {
 		toBase64?: () => string;

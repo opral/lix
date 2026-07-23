@@ -31,8 +31,13 @@ export type RemoteHandshake = {
 	protocolVersion: number;
 	activeBranchId: string;
 	sessionId: string;
+	sessionScope?: RemoteSessionScope;
 	requestBlobSplice: boolean;
 };
+
+export type RemoteSessionScope =
+	| { kind: "workspace" }
+	| { kind: "branch"; branchId: string };
 
 export type RemoteExecuteRequest = {
 	sql: string;
@@ -211,14 +216,30 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 	) {
 		throw protocolError("remote handshake requires a valid sessionId");
 	}
+	const sessionScope = decodeSessionScope(handshake.sessionScope);
 	return {
 		protocolVersion: REMOTE_PROTOCOL_VERSION,
 		activeBranchId: handshake.activeBranchId,
 		sessionId: handshake.sessionId,
+		...(sessionScope === undefined ? {} : { sessionScope }),
 		requestBlobSplice:
 			isRecord(handshake.capabilities) &&
 			handshake.capabilities.requestBlobSplice === true,
 	};
+}
+
+function decodeSessionScope(value: unknown): RemoteSessionScope | undefined {
+	if (value === undefined) return undefined;
+	const scope = record(value, "remote handshake sessionScope");
+	if (scope.kind === "workspace") return { kind: "workspace" };
+	if (
+		scope.kind === "branch" &&
+		typeof scope.branchId === "string" &&
+		scope.branchId.length > 0
+	) {
+		return { kind: "branch", branchId: scope.branchId };
+	}
+	throw protocolError("remote handshake sessionScope is invalid");
 }
 
 export function decodeObserveEvent(

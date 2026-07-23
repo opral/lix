@@ -16,6 +16,8 @@ export type RemoteLixFetch = (
 export type RemoteLixServerOptions = {
 	mode: "remote";
 	url: string | URL;
+	/** Opens an immutable server-owned session scoped to this branch. */
+	branchId?: string;
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
 	fetch?: RemoteLixFetch;
 };

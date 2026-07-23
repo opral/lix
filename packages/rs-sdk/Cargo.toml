@@ -78,3 +78,8 @@ name = "sqlite"
 path = "benches/sqlite.rs"
 harness = false
 required-features = ["sqlite"]
+
+[[bench]]
+name = "branch_session"
+path = "benches/branch_session.rs"
+harness = false
