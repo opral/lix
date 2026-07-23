@@ -644,17 +644,17 @@ simulation_test!(
             session
                 .execute(
                     &format!(
-                        "SELECT metadata \
+                        "SELECT lixcol_metadata \
                          FROM lix_state_history \
-                         WHERE start_commit_id = '{commit_id}' \
-                           AND entity_pk = lix_json('[\"metadata-valid-object\"]') \
-                           AND schema_key = 'lix_key_value'"
+                         WHERE lixcol_as_of_commit_id = '{commit_id}' \
+                           AND lixcol_entity_pk = lix_json('[\"metadata-valid-object\"]') \
+                           AND lixcol_schema_key = 'lix_key_value'"
                     ),
                     &[],
                 )
                 .await
                 .expect("lix_state_history metadata should read"),
-            "metadata",
+            "lixcol_metadata",
             &expected,
         );
     }

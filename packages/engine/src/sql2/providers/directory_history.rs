@@ -24,9 +24,9 @@ use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
-    HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SOURCE_CHANGES, HISTORY_COL_START_COMMIT_ID,
-    HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
+    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
+    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes,
 };
@@ -89,7 +89,7 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
+        if parse_history_filter(filter).is_some() {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Unsupported
@@ -104,9 +104,8 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema, projection);
-        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
-        let metadata_projection =
-            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
+        let route = HistoryRoute::from_filters(filters);
+        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -174,17 +173,18 @@ struct DirectoryHistoryOutputRow {
     path: Option<String>,
     parent_id: Option<String>,
     name: Option<String>,
+    is_deleted: bool,
     event: DirectoryHistoryEvent,
 }
 
 #[derive(Debug, Clone)]
 struct DirectoryHistoryEvent {
     directory_id: String,
-    start_commit_id: String,
+    as_of_commit_id: String,
     depth: u32,
     source_changes: Vec<MaterializedChange>,
     observed_commit_id: String,
-    commit_created_at: String,
+    commit_created_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,7 +207,7 @@ where
     let event_entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_directory_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
         query_source.json_reader.clone(),
@@ -218,7 +218,7 @@ where
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
     let parent_commit_ids_by_commit =
-        load_history_commit_parents(&commit_graph, &event_route.start_commit_ids).await?;
+        load_history_commit_parents(&commit_graph, &event_route.as_of_commit_ids).await?;
     let mut observed_commit_ids = event_descriptors
         .iter()
         .map(|record| record.entry.observed_commit_id.clone())
@@ -284,6 +284,7 @@ where
             path,
             parent_id: visible_descriptor.parent_id.clone(),
             name: visible_descriptor.name.clone(),
+            is_deleted: visible_descriptor.name.is_none(),
             event,
         });
     }
@@ -300,12 +301,19 @@ where
     output.sort_by(|left, right| {
         left.entity_pk
             .cmp(&right.entity_pk)
-            .then(left.event.start_commit_id.cmp(&right.event.start_commit_id))
+            .then(left.event.as_of_commit_id.cmp(&right.event.as_of_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
             .then(
                 left.event
                     .observed_commit_id
                     .cmp(&right.event.observed_commit_id),
+            )
+            .then(
+                left.event
+                    .source_changes
+                    .first()
+                    .map(|change| &change.id)
+                    .cmp(&right.event.source_changes.first().map(|change| &change.id)),
             )
     });
     Ok(output)
@@ -384,8 +392,8 @@ fn directory_history_entry_from_observed_state(
             origin_key: None,
         },
         observed_commit_id: observed_commit_id.to_string(),
-        commit_created_at: row.updated_at,
-        start_commit_id: observed_commit_id.to_string(),
+        commit_created_at: Some(row.updated_at),
+        as_of_commit_id: observed_commit_id.to_string(),
         depth: 0,
     }
 }
@@ -461,7 +469,7 @@ fn grouped_directory_history_events(
                 directory_history_event_from_entry(&affected_directory_id, &descriptor.entry);
             let key = (
                 event.directory_id.clone(),
-                event.start_commit_id.clone(),
+                event.as_of_commit_id.clone(),
                 event.observed_commit_id.clone(),
             );
             match grouped.entry(key) {
@@ -471,9 +479,6 @@ fn grouped_directory_history_events(
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let grouped_event = entry.get_mut();
                     debug_assert_eq!(grouped_event.depth, event.depth);
-                    // When commit metadata is not projected, history loading uses
-                    // each source change's timestamp as an intentionally unused
-                    // fallback. Those timestamps may differ within one commit.
                     grouped_event
                         .source_changes
                         .append(&mut event.source_changes);
@@ -493,7 +498,7 @@ fn grouped_directory_history_events(
     events.sort_by(|left, right| {
         left.directory_id
             .cmp(&right.directory_id)
-            .then(left.start_commit_id.cmp(&right.start_commit_id))
+            .then(left.as_of_commit_id.cmp(&right.as_of_commit_id))
             .then(left.depth.cmp(&right.depth))
             .then(left.observed_commit_id.cmp(&right.observed_commit_id))
     });
@@ -506,7 +511,7 @@ fn directory_history_event_from_entry(
 ) -> DirectoryHistoryEvent {
     DirectoryHistoryEvent {
         directory_id: directory_id.to_string(),
-        start_commit_id: entry.start_commit_id.clone(),
+        as_of_commit_id: entry.as_of_commit_id.clone(),
         depth: entry.depth,
         source_changes: vec![entry.change.clone()],
         observed_commit_id: entry.observed_commit_id.clone(),
@@ -537,15 +542,19 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
         ),
         (
             HISTORY_COL_COMMIT_CREATED_AT,
-            Col::Utf8(|row| Some(row.event.commit_created_at.as_str())),
+            Col::Utf8(|row| row.event.commit_created_at.as_deref()),
         ),
         (
-            HISTORY_COL_START_COMMIT_ID,
-            Col::Utf8(|row| Some(row.event.start_commit_id.as_str())),
+            HISTORY_COL_AS_OF_COMMIT_ID,
+            Col::Utf8(|row| Some(row.event.as_of_commit_id.as_str())),
         ),
         (
             HISTORY_COL_DEPTH,
             Col::I64(|row| Some(i64::from(row.event.depth))),
+        ),
+        (
+            HISTORY_COL_IS_DELETED,
+            Col::Bool(|row| Some(row.is_deleted)),
         ),
     ],
 };
@@ -576,8 +585,9 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-        Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+        Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
     ]))
 }
 
@@ -591,11 +601,11 @@ mod tests {
     #[tokio::test]
     async fn identical_event_and_context_routes_load_history_once() {
         let route = HistoryRoute {
-            start_commit_ids: vec!["cid-start".to_string()],
+            as_of_commit_ids: vec!["cid-start".to_string()],
             ..HistoryRoute::default()
         };
         let event_route = route.traversal_only();
-        let context_route = route.starts_only();
+        let context_route = route.anchors_only();
         assert_eq!(event_route, context_route);
 
         let loads = Arc::new(AtomicUsize::new(0));
@@ -616,12 +626,12 @@ mod tests {
     #[tokio::test]
     async fn differing_depth_routes_load_history_twice() {
         let route = HistoryRoute {
-            start_commit_ids: vec!["cid-start".to_string()],
+            as_of_commit_ids: vec!["cid-start".to_string()],
             max_depth: Some(3),
             ..HistoryRoute::default()
         };
         let event_route = route.traversal_only();
-        let context_route = route.starts_only();
+        let context_route = route.anchors_only();
         assert_ne!(event_route, context_route);
 
         let loads = Arc::new(AtomicUsize::new(0));

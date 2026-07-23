@@ -63,7 +63,7 @@ export function registerMemoryStorageContract({
 					details: { operation: "execute", parameter_index: 1 },
 				});
 				await expect(
-					lix.execute("SELECT entity_pk FROM lix_state_history"),
+					lix.execute("SELECT lixcol_entity_pk FROM lix_state_history"),
 				).rejects.toMatchObject({
 					name: "LixError",
 					code: "LIX_HISTORY_FILTER_REQUIRED",
@@ -174,7 +174,7 @@ export function registerMemoryStorageContract({
 							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 							params: ["batch-rolled-back", "before failure"],
 						},
-						{ sql: "SELECT entity_pk FROM lix_state_history" },
+						{ sql: "SELECT lixcol_entity_pk FROM lix_state_history" },
 						{
 							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 							params: ["batch-not-run", "after failure"],

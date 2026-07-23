@@ -9,7 +9,7 @@ Lix gives you three SQL surfaces for history. Pick the one that matches the ques
 | Surface | What you ask it |
 | --- | --- |
 | `lix_change` | "Which canonical changes exist?" Tracked history plus the latest compactable untracked change for each current identity. |
-| `lix_state_history` | "What did this version see?" State walked back from a commit, with `depth` for time-travel. |
+| `lix_state_history` | "What did this version see?" State walked back from a commit, with `lixcol_depth` for time-travel. |
 | `<schema>_by_version` | "What's in this version right now?" Current rows in each version. Documented in [Versions & Merging](./versions.md). |
 
 Versions don't filter `lix_change` directly; commit membership lives in the commit graph. Tracked changes are retained by commits. Untracked changes are real change rows too, but a later mutation of the same current identity compacts the superseded untracked change. To scope retained history to a version, use `lix_state_history` with the version's `commit_id`.
@@ -41,21 +41,21 @@ ORDER BY created_at;
 
 ## `lix_state_history` columns
 
-| Column               | What it is                                                                              |
-| -------------------- | --------------------------------------------------------------------------------------- |
-| `entity_pk`          | JSON array of the row's primary-key values, in `x-lix-primary-key` order.                |
-| `schema_key`         | Which schema.                                                                           |
-| `file_id`            | The file the row belongs to, or `null`.                                                 |
-| `snapshot_content`   | JSON snapshot at this depth.                                                            |
-| `metadata`           | JSON metadata.                                                                          |
-| `schema_version`     | Schema contract version.                                                                |
-| `change_id`          | The `lix_change.id` that produced this state.                                           |
-| `observed_commit_id` | The commit where this state was recorded.                                               |
-| `commit_created_at`  | When the commit was created.                                                            |
-| `start_commit_id`    | The commit the walk started from (typically the version's tip, `lix_version.commit_id`). |
-| `depth`              | `0` = current state at `start_commit_id`. Higher values walk back through history.       |
-
-`schema_version` here is engine metadata on history/state projections. It is not a schema authoring field; do not put `x-lix-version` in registered schemas.
+| Column                     | What it is                                                                                     |
+| -------------------------- | ---------------------------------------------------------------------------------------------- |
+| `lixcol_entity_pk`         | JSON array of the row's primary-key values, in `x-lix-primary-key` order.                       |
+| `lixcol_schema_key`        | Which schema.                                                                                  |
+| `lixcol_file_id`           | The file the row belongs to, or `null`.                                                        |
+| `lixcol_snapshot_content`  | JSON snapshot at this revision, or `null` for a tombstone.                                     |
+| `lixcol_metadata`          | JSON metadata.                                                                                 |
+| `lixcol_change_id`         | The `lix_change.id` that produced this state.                                                  |
+| `lixcol_change_created_at` | When that source change was created.                                                           |
+| `lixcol_origin_key`        | Optional origin key attached to the source change.                                             |
+| `lixcol_observed_commit_id`| The commit where this state was recorded.                                                      |
+| `lixcol_commit_created_at` | When that commit was created. This never falls back to the change timestamp.                    |
+| `lixcol_as_of_commit_id`   | The commit anchoring the walk (typically the active branch tip).                                |
+| `lixcol_depth`             | `0` = revision at the anchor. Higher values walk back through reachable history.                |
+| `lixcol_is_deleted`        | `true` when this revision is a tombstone.                                                      |
 
 ## Recipes
 
@@ -92,14 +92,15 @@ WHERE lixcol_version_id = $1;
 ### What did this version see, walked back through history
 
 ```sql
-SELECT entity_pk, schema_key, snapshot_content, depth, observed_commit_id
+SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_snapshot_content,
+       lixcol_depth, lixcol_observed_commit_id, lixcol_is_deleted
 FROM lix_state_history
-WHERE start_commit_id = lix_active_version_commit_id()
-  AND depth >= 0
-ORDER BY depth, schema_key, entity_pk;
+WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()
+  AND lixcol_depth >= 0
+ORDER BY lixcol_depth, lixcol_schema_key, lixcol_entity_pk;
 ```
 
-`depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `schema_key` or `entity_pk` to narrow.
+`lixcol_depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `lixcol_schema_key` or `lixcol_entity_pk` to narrow.
 
 For filesystem history, `lix_file_history` and `lix_directory_history` expose
 logical projection revisions. A directory change is visible in every

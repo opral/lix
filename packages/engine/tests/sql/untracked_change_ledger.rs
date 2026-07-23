@@ -420,11 +420,11 @@ simulation_test!(
         let tracked_history = session
             .execute(
                 &format!(
-                    "SELECT change_id FROM lix_state_history \
-                     WHERE start_commit_id = '{mixed_head}' \
-                       AND schema_key = 'lix_key_value' \
-                       AND lix_json_get_text(entity_pk, 0) = 'untracked-ledger-tx-tracked' \
-                       AND depth = 0"
+                    "SELECT lixcol_change_id FROM lix_state_history \
+                     WHERE lixcol_as_of_commit_id = '{mixed_head}' \
+                       AND lixcol_schema_key = 'lix_key_value' \
+                       AND lix_json_get_text(lixcol_entity_pk, 0) = 'untracked-ledger-tx-tracked' \
+                       AND lixcol_depth = 0"
                 ),
                 &[],
             )
@@ -434,10 +434,10 @@ simulation_test!(
         let untracked_history = session
             .execute(
                 &format!(
-                    "SELECT change_id FROM lix_state_history \
-                     WHERE start_commit_id = '{mixed_head}' \
-                       AND schema_key = 'lix_key_value' \
-                       AND lix_json_get_text(entity_pk, 0) = 'untracked-ledger-tx-untracked'"
+                    "SELECT lixcol_change_id FROM lix_state_history \
+                     WHERE lixcol_as_of_commit_id = '{mixed_head}' \
+                       AND lixcol_schema_key = 'lix_key_value' \
+                       AND lix_json_get_text(lixcol_entity_pk, 0) = 'untracked-ledger-tx-untracked'"
                 ),
                 &[],
             )

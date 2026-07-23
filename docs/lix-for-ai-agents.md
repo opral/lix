@@ -44,11 +44,12 @@ if (preview.conflicts.length === 0) {
 The point of routing agent writes through Lix is that you can ask SQL what the agent did:
 
 ```sql
-SELECT entity_pk, schema_key, snapshot_content, depth, observed_commit_id
+SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_snapshot_content,
+       lixcol_depth, lixcol_observed_commit_id, lixcol_is_deleted
 FROM lix_state_history
-WHERE start_commit_id = lix_active_version_commit_id()
-  AND depth >= 0
-ORDER BY depth, schema_key, entity_pk;
+WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()
+  AND lixcol_depth >= 0
+ORDER BY lixcol_depth, lixcol_schema_key, lixcol_entity_pk;
 ```
 
 This is the data your review UI renders. See [Change History](./history.md) for more recipes (per-entity history, who-changed-what, diffs between versions).

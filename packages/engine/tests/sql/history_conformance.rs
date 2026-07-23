@@ -128,7 +128,7 @@ simulation_test!(
              ) \
                AND (\
                  column_name IN ('path', 'directory_id', 'parent_id', 'name', 'data', 'id', 'count', 'active', 'meta') \
-                 OR column_name IN ('lixcol_snapshot_content', 'lixcol_source_changes')\
+                 OR column_name IN ('lixcol_snapshot_content', 'lixcol_is_deleted', 'lixcol_source_changes')\
                ) \
              ORDER BY table_name, column_name",
         )
@@ -140,11 +140,17 @@ simulation_test!(
             ("engine_history_contract_schema_history", "id", "YES"),
             (
                 "engine_history_contract_schema_history",
+                "lixcol_is_deleted",
+                "NO",
+            ),
+            (
+                "engine_history_contract_schema_history",
                 "lixcol_snapshot_content",
                 "YES",
             ),
             ("engine_history_contract_schema_history", "meta", "YES"),
             ("lix_directory_history", "id", "NO"),
+            ("lix_directory_history", "lixcol_is_deleted", "NO"),
             ("lix_directory_history", "lixcol_source_changes", "NO"),
             ("lix_directory_history", "name", "YES"),
             ("lix_directory_history", "parent_id", "YES"),
@@ -152,6 +158,7 @@ simulation_test!(
             ("lix_file_history", "data", "YES"),
             ("lix_file_history", "directory_id", "YES"),
             ("lix_file_history", "id", "NO"),
+            ("lix_file_history", "lixcol_is_deleted", "NO"),
             ("lix_file_history", "lixcol_source_changes", "NO"),
             ("lix_file_history", "name", "YES"),
             ("lix_file_history", "path", "YES"),
@@ -226,7 +233,7 @@ simulation_test!(
             &session,
             "SELECT id, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM engine_history_conformance_history \
-             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
                AND lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
              ORDER BY lixcol_depth",
         )
@@ -245,12 +252,12 @@ simulation_test!(
 
         let state_rows = select_rows(
             &session,
-            "SELECT snapshot_content, depth \
+            "SELECT lixcol_snapshot_content, lixcol_depth \
              FROM lix_state_history \
-             WHERE start_commit_id = lix_active_branch_commit_id() \
-               AND schema_key = 'engine_history_conformance' \
-               AND entity_pk = lix_json('[\"history-conformance-entity\"]') \
-               AND snapshot_content IS NULL",
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+               AND lixcol_schema_key = 'engine_history_conformance' \
+               AND lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
+               AND lixcol_snapshot_content IS NULL",
         )
         .await;
         assert_eq!(state_rows, vec![vec![Value::Null, Value::Integer(0)]]);
@@ -289,7 +296,7 @@ simulation_test!(
             &session,
             "SELECT key, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM lix_key_value_history \
-             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
                AND key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
         )
@@ -367,7 +374,7 @@ simulation_test!(
             &session,
             "SELECT namespace, id, value, lixcol_snapshot_content, lixcol_depth \
              FROM engine_history_composite_pk_history \
-             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
                AND namespace = 'messages' \
                AND id = '7' \
              ORDER BY lixcol_depth",
@@ -437,9 +444,9 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, data, lixcol_entity_pk, lixcol_depth \
+            "SELECT id, path, name, data, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_file_history \
-             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
                AND id = 'history-conformance-file' \
                AND lixcol_depth = 0",
         )
@@ -452,18 +459,19 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Json(serde_json::json!(["history-conformance-file"])),
+                Value::Boolean(true),
                 Value::Integer(0),
             ]]
         );
 
         let state_rows = select_rows(
             &session,
-            "SELECT snapshot_content, depth \
+            "SELECT lixcol_snapshot_content, lixcol_depth \
              FROM lix_state_history \
-             WHERE start_commit_id = lix_active_branch_commit_id() \
-               AND schema_key = 'lix_file_descriptor' \
-               AND entity_pk = lix_json('[\"history-conformance-file\"]') \
-               AND snapshot_content IS NULL",
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+               AND lixcol_schema_key = 'lix_file_descriptor' \
+               AND lixcol_entity_pk = lix_json('[\"history-conformance-file\"]') \
+               AND lixcol_snapshot_content IS NULL",
         )
         .await;
         assert_eq!(state_rows, vec![vec![Value::Null, Value::Integer(0)]]);
@@ -508,9 +516,9 @@ simulation_test!(
 
         let directory_rows = select_rows(
             &session,
-            "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_depth \
+            "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_directory_history \
-             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
                AND id = 'history-conformance-dir' \
                AND lixcol_depth = 0",
         )
@@ -523,18 +531,19 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Json(serde_json::json!(["history-conformance-dir"])),
+                Value::Boolean(true),
                 Value::Integer(0),
             ]]
         );
 
         let state_rows = select_rows(
             &session,
-            "SELECT snapshot_content, depth \
+            "SELECT lixcol_snapshot_content, lixcol_depth \
              FROM lix_state_history \
-             WHERE start_commit_id = lix_active_branch_commit_id() \
-               AND schema_key = 'lix_directory_descriptor' \
-               AND entity_pk = lix_json('[\"history-conformance-dir\"]') \
-               AND snapshot_content IS NULL",
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+               AND lixcol_schema_key = 'lix_directory_descriptor' \
+               AND lixcol_entity_pk = lix_json('[\"history-conformance-dir\"]') \
+               AND lixcol_snapshot_content IS NULL",
         )
         .await;
         assert_eq!(state_rows, vec![vec![Value::Null, Value::Integer(0)]]);

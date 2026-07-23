@@ -949,11 +949,11 @@ simulation_test!(
 
         let history = main
             .execute(
-                "SELECT snapshot_content \
+                "SELECT lixcol_snapshot_content \
 	             FROM lix_state_history \
-	             WHERE start_commit_id = lix_active_branch_commit_id() \
-	               AND entity_pk = lix_json('[\"merge-select-change\"]') \
-	             ORDER BY depth",
+	             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+	               AND lixcol_entity_pk = lix_json('[\"merge-select-change\"]') \
+	             ORDER BY lixcol_depth",
                 &[],
             )
             .await

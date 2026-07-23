@@ -50,9 +50,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, parent_id, name, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, parent_id, name, lixcol_as_of_commit_id, lixcol_depth \
                      FROM lix_directory_history \
-                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
                        AND id IN ('history-dir-docs', 'history-dir-guides') \
                      ORDER BY lixcol_depth, id"
                 ),
@@ -88,7 +88,7 @@ simulation_test!(
                 &format!(
                     "SELECT lixcol_source_changes \
                      FROM lix_directory_history \
-                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
                        AND id = 'history-dir-guides' \
                        AND lixcol_depth = 0"
                 ),
@@ -137,7 +137,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_history_requires_start_commit_id,
+    lix_directory_history_requires_as_of_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -151,18 +151,18 @@ simulation_test!(
         let error = session
             .execute("SELECT id FROM lix_directory_history", &[])
             .await
-            .expect_err("directory history queries must provide start commit");
+            .expect_err("directory history queries must provide an as-of commit");
 
         assert!(
             error
                 .to_string()
-                .contains("requires a lixcol_start_commit_id filter"),
+                .contains("requires a lixcol_as_of_commit_id filter"),
             "unexpected error: {error}"
         );
         assert!(
             error
                 .hint()
-                .is_some_and(|hint| hint.contains("WHERE lixcol_start_commit_id")),
+                .is_some_and(|hint| hint.contains("WHERE lixcol_as_of_commit_id")),
             "unexpected error: {error}"
         );
     }
@@ -238,7 +238,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth \
                      FROM lix_directory_history \
-                     WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
                        AND id = 'diamond-dir' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
@@ -323,9 +323,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-					"SELECT id, path, name, lixcol_source_changes, lixcol_start_commit_id, lixcol_depth \
+					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_as_of_commit_id, lixcol_depth \
 	                 FROM lix_directory_history \
-	                 WHERE lixcol_start_commit_id = '{delete_commit_id}' \
+	                 WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
 	                   AND lixcol_entity_pk IN (lix_json('[\"history-delete-docs\"]'), lix_json('[\"history-delete-guides\"]')) \
 	                   AND lixcol_depth = 0 \
 	                 ORDER BY lixcol_entity_pk"
@@ -342,14 +342,15 @@ simulation_test!(
             .zip(["history-delete-docs", "history-delete-guides"])
         {
             assert_eq!(
-                &row.values()[..3],
+                &row.values()[..4],
                 &[
                     Value::Text(expected_id.to_string()),
                     Value::Null,
                     Value::Null,
+                    Value::Boolean(true),
                 ]
             );
-            let Value::Json(source_changes) = &row.values()[3] else {
+            let Value::Json(source_changes) = &row.values()[4] else {
                 panic!("delete source changes should be JSON");
             };
             let source_changes = source_changes
@@ -371,8 +372,8 @@ simulation_test!(
                 })
                 .collect::<BTreeSet<_>>();
             assert_eq!(actual_source_ids, expected_source_ids);
-            assert_eq!(row.values()[4], Value::Text(delete_commit_id.clone()));
-            assert_eq!(row.values()[5], Value::Integer(0));
+            assert_eq!(row.values()[5], Value::Text(delete_commit_id.clone()));
+            assert_eq!(row.values()[6], Value::Integer(0));
         }
     }
 );

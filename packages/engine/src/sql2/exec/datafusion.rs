@@ -2948,12 +2948,12 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT entity_pk, snapshot_content, metadata, depth, start_commit_id \
+                    "SELECT lixcol_entity_pk, lixcol_snapshot_content, lixcol_metadata, lixcol_depth, lixcol_as_of_commit_id \
 	             FROM lix_state_history \
-	             WHERE schema_key = 'test_state_schema' \
-	               AND entity_pk = lix_json('[\"entity-history\"]') \
-	               AND start_commit_id = '{head_commit_id}' \
-	               AND depth >= 0"
+	             WHERE lixcol_schema_key = 'test_state_schema' \
+	               AND lixcol_entity_pk = lix_json('[\"entity-history\"]') \
+	               AND lixcol_as_of_commit_id = '{head_commit_id}' \
+	               AND lixcol_depth >= 0"
                 ),
                 &[],
             )
@@ -2964,11 +2964,11 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                "entity_pk",
-                "snapshot_content",
-                "metadata",
-                "depth",
-                "start_commit_id"
+                "lixcol_entity_pk",
+                "lixcol_snapshot_content",
+                "lixcol_metadata",
+                "lixcol_depth",
+                "lixcol_as_of_commit_id"
             ]
         );
         assert_eq!(rows.len(), 1);
@@ -2987,9 +2987,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_entity_pk, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT value, count, lixcol_entity_pk, lixcol_as_of_commit_id, lixcol_depth \
 	             FROM test_state_schema_history \
-	             WHERE lixcol_start_commit_id = '{head_commit_id}' \
+	             WHERE lixcol_as_of_commit_id = '{head_commit_id}' \
 	               AND lixcol_entity_pk = lix_json('[\"entity-history\"]')"
                 ),
                 &[],
@@ -3004,7 +3004,7 @@ mod tests {
                 "value",
                 "count",
                 "lixcol_entity_pk",
-                "lixcol_start_commit_id",
+                "lixcol_as_of_commit_id",
                 "lixcol_depth",
             ]
         );
@@ -3024,9 +3024,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, parent_id, name, path, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, parent_id, name, path, lixcol_as_of_commit_id, lixcol_depth \
              FROM lix_directory_history \
-             WHERE id = 'dir-docs' AND lixcol_start_commit_id = '{head_commit_id}'"
+             WHERE id = 'dir-docs' AND lixcol_as_of_commit_id = '{head_commit_id}'"
                 ),
                 &[],
             )
@@ -3045,7 +3045,7 @@ mod tests {
                 "parent_id",
                 "name",
                 "path",
-                "lixcol_start_commit_id",
+                "lixcol_as_of_commit_id",
                 "lixcol_depth",
             ]
         );
@@ -3063,7 +3063,7 @@ mod tests {
                     "SELECT id \
              FROM lix_directory_history \
              WHERE name = 'docs' \
-               AND lixcol_start_commit_id = '{head_commit_id}'"
+               AND lixcol_as_of_commit_id = '{head_commit_id}'"
                 ),
                 &[],
             )
@@ -3084,10 +3084,10 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, data, lixcol_as_of_commit_id, lixcol_depth \
              FROM lix_file_history \
              WHERE id = 'file-a' \
-               AND lixcol_start_commit_id = '{head_commit_id}' \
+               AND lixcol_as_of_commit_id = '{head_commit_id}' \
                AND data IS NOT NULL \
              ORDER BY lixcol_depth",
                 ),
@@ -3107,7 +3107,7 @@ mod tests {
                 "id",
                 "path",
                 "data",
-                "lixcol_start_commit_id",
+                "lixcol_as_of_commit_id",
                 "lixcol_depth",
             ]
         );
@@ -3124,7 +3124,7 @@ mod tests {
                     "SELECT id \
              FROM lix_file_history \
              WHERE path = '/docs/readme.md' \
-               AND lixcol_start_commit_id = '{head_commit_id}'"
+               AND lixcol_as_of_commit_id = '{head_commit_id}'"
                 ),
                 &[],
             )

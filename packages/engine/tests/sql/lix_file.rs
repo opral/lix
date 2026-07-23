@@ -2569,11 +2569,11 @@ async fn file_descriptor_event_count(
     session
         .execute(
             &format!(
-                "SELECT entity_pk FROM lix_state_history \
-                 WHERE start_commit_id = '{commit_id}' \
-                   AND depth = 0 \
-                   AND schema_key = 'lix_file_descriptor' \
-                   AND entity_pk = lix_json('[\"{file_id}\"]')"
+                "SELECT lixcol_entity_pk FROM lix_state_history \
+                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND lixcol_schema_key = 'lix_file_descriptor' \
+                   AND lixcol_entity_pk = lix_json('[\"{file_id}\"]')"
             ),
             &[],
         )
@@ -2619,11 +2619,11 @@ simulation_test!(
         let blob_ref_history = session
             .execute(
                 &format!(
-                    "SELECT entity_pk \
+                    "SELECT lixcol_entity_pk \
                      FROM lix_state_history \
-                     WHERE start_commit_id = '{commit_id}' \
-                       AND schema_key = 'lix_binary_blob_ref' \
-                       AND entity_pk = lix_json('[\"already-empty-file\"]')"
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
+                       AND lixcol_schema_key = 'lix_binary_blob_ref' \
+                       AND lixcol_entity_pk = lix_json('[\"already-empty-file\"]')"
                 ),
                 &[],
             )

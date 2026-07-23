@@ -2,7 +2,7 @@ use lix_engine::Value;
 use serde_json::json;
 
 simulation_test!(
-    lix_state_history_requires_start_commit_id,
+    lix_state_history_requires_as_of_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -22,14 +22,14 @@ simulation_test!(
             .expect("tracked write should succeed");
 
         let error = session
-            .execute("SELECT entity_pk FROM lix_state_history", &[])
+            .execute("SELECT lixcol_entity_pk FROM lix_state_history", &[])
             .await
-            .expect_err("history queries must provide start_commit_id");
+            .expect_err("history queries must provide lixcol_as_of_commit_id");
 
         assert!(
             error
                 .to_string()
-                .contains("requires a start_commit_id filter")
+                .contains("requires a lixcol_as_of_commit_id filter")
         );
         assert_eq!(
             error.code,
@@ -66,7 +66,7 @@ simulation_test!(
 
         let rows = select_history_rows(
             &session,
-            "SELECT entity_pk FROM lix_state_history WHERE start_commit_id = lix_active_branch_commit_id()",
+            "SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()",
         )
         .await;
 
@@ -79,7 +79,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_history_rejects_prefixed_start_commit_id_filter,
+    lix_state_history_rejects_retired_anchor_names,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -98,21 +98,64 @@ simulation_test!(
             .await
             .expect("tracked write should succeed");
 
-        let error = session
-            .execute(
-                "SELECT entity_pk \
-                 FROM lix_state_history \
-                 WHERE lixcol_start_commit_id = lix_active_branch_commit_id()",
-                &[],
-            )
-            .await
-            .expect_err("lix_state_history should only expose bare start_commit_id");
+        for retired in ["start_commit_id", "lixcol_start_commit_id"] {
+            let error = session
+                .execute(
+                    &format!(
+                        "SELECT lixcol_entity_pk \
+                         FROM lix_state_history \
+                         WHERE {retired} = lix_active_branch_commit_id()"
+                    ),
+                    &[],
+                )
+                .await
+                .expect_err("retired history anchor must fail");
 
-        assert_eq!(error.code, lix_engine::LixError::CODE_COLUMN_NOT_FOUND);
-        assert!(
-            error.to_string().contains("lixcol_start_commit_id"),
-            "unexpected error: {error}"
+            assert_eq!(error.code, lix_engine::LixError::CODE_COLUMN_NOT_FOUND);
+            assert!(
+                error.to_string().contains(retired),
+                "unexpected error: {error}"
+            );
+        }
+    }
+);
+
+simulation_test!(
+    lix_state_history_rejects_bare_system_column_names,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
         );
+
+        for retired in [
+            "entity_pk",
+            "schema_key",
+            "observed_commit_id",
+            "commit_created_at",
+            "depth",
+        ] {
+            let error = session
+                .execute(
+                    &format!(
+                        "SELECT {retired} \
+                         FROM lix_state_history \
+                         WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()"
+                    ),
+                    &[],
+                )
+                .await
+                .expect_err("bare history system columns must fail");
+            assert_eq!(error.code, lix_engine::LixError::CODE_COLUMN_NOT_FOUND);
+            assert!(
+                error.to_string().contains(retired),
+                "unexpected error: {error}"
+            );
+        }
     }
 );
 
@@ -173,11 +216,11 @@ simulation_test!(
         let first_history = select_history_rows(
             &session,
             &format!(
-                "SELECT start_commit_id, depth, snapshot_content, change_id, observed_commit_id, commit_created_at \
+                "SELECT lixcol_as_of_commit_id, lixcol_depth, lixcol_snapshot_content, lixcol_change_id, lixcol_observed_commit_id, lixcol_commit_created_at, lixcol_change_created_at, lixcol_is_deleted \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{first_commit_id}' \
-                   AND entity_pk = lix_json('[\"history-explicit\"]') \
-                 ORDER BY depth"
+                 WHERE lixcol_as_of_commit_id = '{first_commit_id}' \
+                   AND lixcol_entity_pk = lix_json('[\"history-explicit\"]') \
+                 ORDER BY lixcol_depth"
             ),
         )
         .await;
@@ -191,29 +234,34 @@ simulation_test!(
             "historical commit should be queryable after later commits"
         );
         let Value::Text(first_change_id) = &first_history[0][3] else {
-            panic!("change_id should be text");
+            panic!("lixcol_change_id should be text");
         };
         let Value::Text(first_row_commit_id) = &first_history[0][4] else {
-            panic!("observed_commit_id should be text");
+            panic!("lixcol_observed_commit_id should be text");
         };
         let Value::Text(first_commit_created_at) = &first_history[0][5] else {
-            panic!("commit_created_at should be text");
+            panic!("lixcol_commit_created_at should be text");
+        };
+        let Value::Text(first_change_created_at) = &first_history[0][6] else {
+            panic!("lixcol_change_created_at should be text");
         };
         assert!(!first_change_id.is_empty());
         assert_eq!(first_row_commit_id, &first_commit_id);
         assert!(
             !first_commit_created_at.is_empty(),
-            "commit_created_at should be populated"
+            "lixcol_commit_created_at should be populated"
         );
+        assert!(!first_change_created_at.is_empty());
+        assert_eq!(first_history[0][7], Value::Boolean(false));
 
         let second_history = select_history_rows(
             &session,
             &format!(
-                "SELECT depth, snapshot_content \
+                "SELECT lixcol_depth, lixcol_snapshot_content, lixcol_is_deleted \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{second_commit_id}' \
-                   AND entity_pk = lix_json('[\"history-explicit\"]') \
-                 ORDER BY depth"
+                 WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
+                   AND lixcol_entity_pk = lix_json('[\"history-explicit\"]') \
+                 ORDER BY lixcol_depth"
             ),
         )
         .await;
@@ -223,31 +271,33 @@ simulation_test!(
                 vec![
                     Value::Integer(0),
                     Value::Json(json!({"key": "history-explicit", "value": "two"})),
+                    Value::Boolean(false),
                 ],
                 vec![
                     Value::Integer(1),
                     Value::Json(json!({"key": "history-explicit", "value": "one"})),
+                    Value::Boolean(false),
                 ],
             ],
-            "depth 0 is the start commit and parent changes appear at depth > 0"
+            "lixcol_depth 0 is the as-of commit and parent changes appear at lixcol_depth > 0"
         );
 
         let tombstone_history = select_history_rows(
             &session,
             &format!(
-                "SELECT depth, snapshot_content \
+                "SELECT lixcol_depth, lixcol_snapshot_content, lixcol_is_deleted \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{third_commit_id}' \
-                   AND entity_pk = lix_json('[\"history-explicit\"]') \
-                   AND depth = 0 \
-                   AND snapshot_content IS NULL"
+                 WHERE lixcol_as_of_commit_id = '{third_commit_id}' \
+                   AND lixcol_entity_pk = lix_json('[\"history-explicit\"]') \
+                   AND lixcol_depth = 0 \
+                   AND lixcol_snapshot_content IS NULL"
             ),
         )
         .await;
         assert_eq!(
             tombstone_history,
-            vec![vec![Value::Integer(0), Value::Null]],
-            "tombstone changes should be visible as NULL snapshot_content"
+            vec![vec![Value::Integer(0), Value::Null, Value::Boolean(true)]],
+            "tombstone changes should be visible as NULL lixcol_snapshot_content"
         );
     }
 );
@@ -294,15 +344,15 @@ simulation_test!(
         let rows = select_history_rows(
             &session,
             &format!(
-                "SELECT entity_pk, schema_key, file_id, depth \
+                "SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_file_id, lixcol_depth \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{second_commit_id}' \
-                   AND schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"history-file-a\"]') \
-                   AND file_id = 'history-file-a' \
-                   AND depth >= 0 \
-                   AND depth <= 1 \
-                 ORDER BY depth"
+                 WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
+                   AND lixcol_schema_key = 'lix_binary_blob_ref' \
+                   AND lixcol_entity_pk = lix_json('[\"history-file-a\"]') \
+                   AND lixcol_file_id = 'history-file-a' \
+                   AND lixcol_depth >= 0 \
+                   AND lixcol_depth <= 1 \
+                 ORDER BY lixcol_depth"
             ),
         )
         .await;
@@ -322,45 +372,45 @@ simulation_test!(
                     Value::Integer(1),
                 ],
             ],
-            "schema_key, entity_pk, file_id, and depth range filters should route through the provider"
+            "lixcol_schema_key, lixcol_entity_pk, lixcol_file_id, and lixcol_depth range filters should route through the provider"
         );
 
         let parent_only_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT start_commit_id, depth \
+                "SELECT lixcol_as_of_commit_id, lixcol_depth \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{second_commit_id}' \
-                   AND schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"history-file-a\"]') \
-                   AND file_id = 'history-file-a' \
-                   AND depth > 0 \
-                   AND depth < 2"
+                 WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
+                   AND lixcol_schema_key = 'lix_binary_blob_ref' \
+                   AND lixcol_entity_pk = lix_json('[\"history-file-a\"]') \
+                   AND lixcol_file_id = 'history-file-a' \
+                   AND lixcol_depth > 0 \
+                   AND lixcol_depth < 2"
             ),
         )
         .await;
         assert_eq!(
             parent_only_rows,
             vec![vec![Value::Text(second_commit_id), Value::Integer(1)]],
-            "strict depth ranges should keep only matching parent rows"
+            "strict lixcol_depth ranges should keep only matching parent rows"
         );
 
         let historical_start_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT start_commit_id, depth \
+                "SELECT lixcol_as_of_commit_id, lixcol_depth \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{first_commit_id}' \
-                   AND schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"history-file-a\"]') \
-                   AND file_id = 'history-file-a'"
+                 WHERE lixcol_as_of_commit_id = '{first_commit_id}' \
+                   AND lixcol_schema_key = 'lix_binary_blob_ref' \
+                   AND lixcol_entity_pk = lix_json('[\"history-file-a\"]') \
+                   AND lixcol_file_id = 'history-file-a'"
             ),
         )
         .await;
         assert_eq!(
             historical_start_rows,
             vec![vec![Value::Text(first_commit_id), Value::Integer(0)]],
-            "file_id filtering should also work for historical non-head starts"
+            "lixcol_file_id filtering should also work for historical non-head starts"
         );
     }
 );
@@ -415,12 +465,12 @@ simulation_test!(
         let tombstone_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT observed_commit_id, depth, snapshot_content \
+                "SELECT lixcol_observed_commit_id, lixcol_depth, lixcol_snapshot_content \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{later_commit_id}' \
-                   AND entity_pk = lix_json('[\"history-ancestor-tombstone\"]') \
-                   AND snapshot_content IS NULL \
-                 ORDER BY depth"
+                 WHERE lixcol_as_of_commit_id = '{later_commit_id}' \
+                   AND lixcol_entity_pk = lix_json('[\"history-ancestor-tombstone\"]') \
+                   AND lixcol_snapshot_content IS NULL \
+                 ORDER BY lixcol_depth"
             ),
         )
         .await;
@@ -431,13 +481,13 @@ simulation_test!(
                 Value::Integer(1),
                 Value::Null,
             ]],
-            "a tombstone from the parent commit should appear at ancestor depth"
+            "a tombstone from the parent commit should appear at ancestor lixcol_depth"
         );
     }
 );
 
 simulation_test!(
-    lix_state_history_supports_multiple_start_commit_filters,
+    lix_state_history_supports_multiple_as_of_commit_filters,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -477,12 +527,12 @@ simulation_test!(
         let in_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT start_commit_id, depth, snapshot_content \
+                "SELECT lixcol_as_of_commit_id, lixcol_depth, lixcol_snapshot_content \
                  FROM lix_state_history \
-                 WHERE start_commit_id IN ('{first_commit_id}', '{second_commit_id}') \
-                   AND entity_pk = lix_json('[\"history-multi-start\"]') \
-                   AND depth = 0 \
-                 ORDER BY start_commit_id"
+                 WHERE lixcol_as_of_commit_id IN ('{first_commit_id}', '{second_commit_id}') \
+                   AND lixcol_entity_pk = lix_json('[\"history-multi-start\"]') \
+                   AND lixcol_depth = 0 \
+                 ORDER BY lixcol_as_of_commit_id"
             ),
         )
         .await;
@@ -500,19 +550,19 @@ simulation_test!(
                     Value::Json(json!({"key": "history-multi-start", "value": "two"})),
                 ],
             ],
-            "IN should allow multiple explicit history starts"
+            "IN should allow multiple explicit history anchors"
         );
 
         let or_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT start_commit_id \
+                "SELECT lixcol_as_of_commit_id \
                  FROM lix_state_history \
-                 WHERE (start_commit_id = '{first_commit_id}' \
-                        OR start_commit_id = '{second_commit_id}') \
-                   AND entity_pk = lix_json('[\"history-multi-start\"]') \
-                   AND depth = 0 \
-                 ORDER BY start_commit_id"
+                 WHERE (lixcol_as_of_commit_id = '{first_commit_id}' \
+                        OR lixcol_as_of_commit_id = '{second_commit_id}') \
+                   AND lixcol_entity_pk = lix_json('[\"history-multi-start\"]') \
+                   AND lixcol_depth = 0 \
+                 ORDER BY lixcol_as_of_commit_id"
             ),
         )
         .await;
@@ -522,7 +572,7 @@ simulation_test!(
                 vec![Value::Text(first_commit_id)],
                 vec![Value::Text(second_commit_id)],
             ],
-            "OR should also allow multiple explicit history starts"
+            "OR should also allow multiple explicit history anchors"
         );
     }
 );
@@ -562,11 +612,11 @@ simulation_test!(
         let narrowed_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT entity_pk \
+                "SELECT lixcol_entity_pk \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{head_commit_id}' \
-                   AND entity_pk IN (lix_json('[\"history-and-a\"]'), lix_json('[\"history-and-b\"]')) \
-                   AND entity_pk = lix_json('[\"history-and-a\"]')"
+                 WHERE lixcol_as_of_commit_id = '{head_commit_id}' \
+                   AND lixcol_entity_pk IN (lix_json('[\"history-and-a\"]'), lix_json('[\"history-and-b\"]')) \
+                   AND lixcol_entity_pk = lix_json('[\"history-and-a\"]')"
             ),
         )
         .await;
@@ -579,11 +629,11 @@ simulation_test!(
         let contradictory_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT entity_pk \
+                "SELECT lixcol_entity_pk \
                  FROM lix_state_history \
-                 WHERE start_commit_id = '{head_commit_id}' \
-                   AND entity_pk = lix_json('[\"history-and-a\"]') \
-                   AND entity_pk = lix_json('[\"history-and-b\"]')"
+                 WHERE lixcol_as_of_commit_id = '{head_commit_id}' \
+                   AND lixcol_entity_pk = lix_json('[\"history-and-a\"]') \
+                   AND lixcol_entity_pk = lix_json('[\"history-and-b\"]')"
             ),
         )
         .await;

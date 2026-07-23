@@ -359,7 +359,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
                 ],
             },
             ExecuteBatchStatement {
-                sql: "SELECT entity_pk FROM lix_state_history".to_string(),
+                sql: "SELECT lixcol_entity_pk FROM lix_state_history".to_string(),
                 params: Vec::new(),
             },
         ])

@@ -16,8 +16,12 @@ use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{
-    HistoryColumnStyle, HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor,
-    load_history_entries, parse_history_filter,
+    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
+    HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
+    parse_history_filter,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
@@ -48,7 +52,7 @@ where
 /// SQL spec for `lix_state_history`.
 ///
 /// The reachability-aware history surface over canonical state changes: rows
-/// are loaded by walking the commit graph from the routed start commits.
+/// are loaded by walking the commit graph from the routed anchor commits.
 struct StateHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
@@ -73,7 +77,7 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter, HistoryColumnStyle::Bare).is_some() {
+        if parse_history_filter(filter).is_some() {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Unsupported
@@ -88,9 +92,8 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&lix_state_history_schema(), projection);
-        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Bare);
-        let metadata_projection =
-            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Bare);
+        let route = HistoryRoute::from_filters(filters);
+        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -131,17 +134,19 @@ where
 
 pub(super) fn lix_state_history_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        json_field("entity_pk", false),
-        Field::new("schema_key", DataType::Utf8, false),
-        Field::new("file_id", DataType::Utf8, true),
-        json_field("snapshot_content", true),
-        json_field("metadata", true),
-        Field::new("change_id", DataType::Utf8, false),
-        Field::new("origin_key", DataType::Utf8, true),
-        Field::new("observed_commit_id", DataType::Utf8, false),
-        Field::new("commit_created_at", DataType::Utf8, false),
-        Field::new("start_commit_id", DataType::Utf8, false),
-        Field::new("depth", DataType::Int64, false),
+        json_field(HISTORY_COL_ENTITY_PK, false),
+        Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
+        Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
+        json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
+        json_field(HISTORY_COL_METADATA, true),
+        Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_CHANGE_CREATED_AT, DataType::Utf8, false),
+        Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
+        Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
+        Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+        Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
     ]))
 }
 
@@ -164,41 +169,63 @@ struct StateHistorySqlRow {
     snapshot_content: Option<String>,
     metadata: Option<String>,
     change_id: String,
+    change_created_at: String,
     origin_key: Option<String>,
     observed_commit_id: String,
-    commit_created_at: String,
-    start_commit_id: String,
+    commit_created_at: Option<String>,
+    as_of_commit_id: String,
     depth: i64,
+    is_deleted: bool,
 }
 
 static LIX_STATE_HISTORY_COLS: ColumnTable<StateHistorySqlRow> = ColumnTable {
     columns: &[
-        ("entity_pk", Col::Utf8(|row| Some(row.entity_pk.as_str()))),
-        ("schema_key", Col::Utf8(|row| Some(row.schema_key.as_str()))),
-        ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
         (
-            "snapshot_content",
+            HISTORY_COL_ENTITY_PK,
+            Col::Utf8(|row| Some(row.entity_pk.as_str())),
+        ),
+        (
+            HISTORY_COL_SCHEMA_KEY,
+            Col::Utf8(|row| Some(row.schema_key.as_str())),
+        ),
+        (HISTORY_COL_FILE_ID, Col::Utf8(|row| row.file_id.as_deref())),
+        (
+            HISTORY_COL_SNAPSHOT_CONTENT,
             Col::Utf8(|row| row.snapshot_content.as_deref()),
         ),
         (
-            "metadata",
+            HISTORY_COL_METADATA,
             Col::Utf8Owned(|row| row.metadata.as_deref().map(serialize_row_metadata)),
         ),
-        ("change_id", Col::Utf8(|row| Some(row.change_id.as_str()))),
-        ("origin_key", Col::Utf8(|row| row.origin_key.as_deref())),
         (
-            "observed_commit_id",
+            HISTORY_COL_CHANGE_ID,
+            Col::Utf8(|row| Some(row.change_id.as_str())),
+        ),
+        (
+            HISTORY_COL_CHANGE_CREATED_AT,
+            Col::Utf8(|row| Some(row.change_created_at.as_str())),
+        ),
+        (
+            HISTORY_COL_ORIGIN_KEY,
+            Col::Utf8(|row| row.origin_key.as_deref()),
+        ),
+        (
+            HISTORY_COL_OBSERVED_COMMIT_ID,
             Col::Utf8(|row| Some(row.observed_commit_id.as_str())),
         ),
         (
-            "commit_created_at",
-            Col::Utf8(|row| Some(row.commit_created_at.as_str())),
+            HISTORY_COL_COMMIT_CREATED_AT,
+            Col::Utf8(|row| row.commit_created_at.as_deref()),
         ),
         (
-            "start_commit_id",
-            Col::Utf8(|row| Some(row.start_commit_id.as_str())),
+            HISTORY_COL_AS_OF_COMMIT_ID,
+            Col::Utf8(|row| Some(row.as_of_commit_id.as_str())),
         ),
-        ("depth", Col::I64(|row| Some(row.depth))),
+        (HISTORY_COL_DEPTH, Col::I64(|row| Some(row.depth))),
+        (
+            HISTORY_COL_IS_DELETED,
+            Col::Bool(|row| Some(row.is_deleted)),
+        ),
     ],
 };
 
@@ -227,7 +254,7 @@ where
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_state_history",
-            start_commit_column: "start_commit_id",
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
         query_source.json_reader,
@@ -243,13 +270,15 @@ where
                 entity_pk: entry.change.entity_pk.as_json_array_text()?,
                 schema_key: entry.change.schema_key,
                 file_id: entry.change.file_id,
+                is_deleted: entry.change.snapshot_content.is_none(),
                 snapshot_content: entry.change.snapshot_content,
                 metadata: entry.change.metadata,
                 change_id: entry.change.id,
+                change_created_at: entry.change.created_at,
                 origin_key: entry.change.origin_key,
                 observed_commit_id: entry.observed_commit_id,
                 commit_created_at: entry.commit_created_at,
-                start_commit_id: entry.start_commit_id,
+                as_of_commit_id: entry.as_of_commit_id,
                 depth: i64::from(entry.depth),
             })
         })

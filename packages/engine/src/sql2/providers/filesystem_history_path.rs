@@ -83,7 +83,7 @@ impl HistoryDirectoryTree {
 }
 
 /// Loads direct-parent edges for every commit reachable from the requested
-/// history starts.
+/// history anchors.
 ///
 /// Ancestor deletion and move-out events need both sides of the revision:
 /// descendants may no longer be linked to the changed directory in the
@@ -91,13 +91,14 @@ impl HistoryDirectoryTree {
 /// isolation; no depth-based predecessor is inferred.
 pub(super) async fn load_history_commit_parents(
     commit_graph: &Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    start_commit_ids: &[String],
+    as_of_commit_ids: &[String],
 ) -> Result<BTreeMap<String, Vec<String>>, LixError> {
     let mut parents_by_commit = BTreeMap::new();
     let mut commit_graph = commit_graph.lock().await;
-    for start_commit_id in start_commit_ids {
-        let start_commit_id = CommitId::parse_lix(start_commit_id, "history start_commit_id")?;
-        for reachable in commit_graph.reachable_commits(&start_commit_id).await? {
+    for as_of_commit_id in as_of_commit_ids {
+        let as_of_commit_id =
+            CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
+        for reachable in commit_graph.reachable_commits(&as_of_commit_id).await? {
             parents_by_commit.insert(
                 reachable.commit.commit_id.to_string(),
                 reachable
@@ -114,7 +115,7 @@ pub(super) async fn load_history_commit_parents(
 
 pub(super) fn resolve_history_directory_path<R: HistoryDirectoryPathRecord>(
     directory_id: &str,
-    start_commit_id: &str,
+    as_of_commit_id: &str,
     target_depth: u32,
     directories: &[R],
     cache: &mut BTreeMap<String, Option<String>>,
@@ -134,7 +135,7 @@ pub(super) fn resolve_history_directory_path<R: HistoryDirectoryPathRecord>(
             let entry = directory.entry();
             directory.name().is_some()
                 && directory.id() == directory_id
-                && entry.start_commit_id == start_commit_id
+                && entry.as_of_commit_id == as_of_commit_id
                 && entry.depth >= target_depth
         })
         .min_by(|left, right| {
@@ -151,7 +152,7 @@ pub(super) fn resolve_history_directory_path<R: HistoryDirectoryPathRecord>(
         Some(parent_id) => {
             let parent_path = resolve_history_directory_path(
                 parent_id,
-                start_commit_id,
+                as_of_commit_id,
                 target_depth,
                 directories,
                 cache,

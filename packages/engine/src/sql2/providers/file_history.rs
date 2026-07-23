@@ -34,9 +34,9 @@ use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
-    HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SOURCE_CHANGES, HISTORY_COL_START_COMMIT_ID,
-    HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
+    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
+    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes,
 };
@@ -83,7 +83,7 @@ where
 /// SQL spec for `lix_file_history`.
 ///
 /// The reachability-aware file history surface: rows are reconstructed by
-/// walking the commit graph from the routed start commits, resolving the
+/// walking the commit graph from the routed anchor commits, resolving the
 /// nearest descriptor/blob/directory events per file.
 struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
@@ -111,7 +111,7 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some()
+        if parse_history_filter(filter).is_some()
             || FileHistoryPublicPredicate::parse_exact(filter).is_some()
         {
             TableProviderFilterPushDown::Exact
@@ -142,9 +142,8 @@ where
                     .eq_ignore_ascii_case("data")
             })
         });
-        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
-        let metadata_projection =
-            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
+        let route = HistoryRoute::from_filters(filters);
+        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         let lookup_ids = FileHistoryLookupIds::from_public_predicate(&public_predicate);
         Ok(PlannedScan {
@@ -256,11 +255,11 @@ struct FileHistoryPluginOwnerRecord {
 #[derive(Debug, Clone)]
 struct FileHistoryEvent {
     file_id: String,
-    start_commit_id: String,
+    as_of_commit_id: String,
     depth: u32,
     source_changes: Vec<MaterializedChange>,
     observed_commit_id: String,
-    commit_created_at: String,
+    commit_created_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +270,7 @@ struct FileHistoryOutputRow {
     directory_id: Option<String>,
     name: Option<String>,
     data: Option<Vec<u8>>,
+    is_deleted: bool,
     event: FileHistoryEvent,
 }
 
@@ -544,7 +544,7 @@ where
     }
 
     let event_route = route.traversal_only();
-    let context_route = route.starts_only();
+    let context_route = route.anchors_only();
     let filesystem_context = load_file_history_filesystem_context(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -556,7 +556,7 @@ where
     .await?;
     let mut installed_plugins_cache = BTreeMap::<(String, String), InstalledPlugin>::new();
     let parent_commit_ids_by_commit =
-        load_history_commit_parents(&commit_graph, &context_route.start_commit_ids).await?;
+        load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -722,6 +722,7 @@ where
             directory_id: prepared_row.descriptor.directory_id.clone(),
             name: prepared_row.descriptor.name.clone(),
             data,
+            is_deleted: prepared_row.descriptor.name.is_none(),
             event: prepared_row.event,
         });
     }
@@ -729,7 +730,7 @@ where
     output.sort_by(|left, right| {
         left.entity_pk
             .cmp(&right.entity_pk)
-            .then(left.event.start_commit_id.cmp(&right.event.start_commit_id))
+            .then(left.event.as_of_commit_id.cmp(&right.event.as_of_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
             .then(
                 left.event
@@ -1192,8 +1193,8 @@ fn history_entry_from_observed_state(
             origin_key: None,
         },
         observed_commit_id: observed_commit_id.to_string(),
-        commit_created_at: row.updated_at,
-        start_commit_id: observed_commit_id.to_string(),
+        commit_created_at: Some(row.updated_at),
+        as_of_commit_id: observed_commit_id.to_string(),
         depth: 0,
     }
 }
@@ -1212,7 +1213,7 @@ where
         return load_history_entries(
             HistoryViewDescriptor {
                 view_name: "lix_file_history",
-                start_commit_column: HISTORY_COL_START_COMMIT_ID,
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             commit_graph,
             query_source.json_reader,
@@ -1227,7 +1228,7 @@ where
     let mut entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
         query_source.json_reader.clone(),
@@ -1245,7 +1246,7 @@ where
     let directories = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
         query_source.json_reader,
@@ -1296,7 +1297,7 @@ where
                 load_history_entries(
                     HistoryViewDescriptor {
                         view_name: "lix_file_history",
-                        start_commit_column: HISTORY_COL_START_COMMIT_ID,
+                        as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
                     },
                     commit_graph,
                     json_reader,
@@ -1329,7 +1330,7 @@ where
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
         query_source.json_reader,
@@ -1386,14 +1387,14 @@ fn file_history_events(
     observed_states: &BTreeMap<String, FileHistoryObservedState>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
 ) -> Vec<FileHistoryEvent> {
-    let mut descriptor_ids_by_start = BTreeSet::<(String, String)>::new();
+    let mut descriptor_ids_by_as_of = BTreeSet::<(String, String)>::new();
 
     for descriptor in context_descriptors {
         let key = (
             descriptor.id.clone(),
-            descriptor.entry.start_commit_id.clone(),
+            descriptor.entry.as_of_commit_id.clone(),
         );
-        descriptor_ids_by_start.insert(key);
+        descriptor_ids_by_as_of.insert(key);
     }
 
     let mut candidates = Vec::new();
@@ -1431,8 +1432,8 @@ fn file_history_events(
         }
     }
     for blob in event_blobs {
-        if descriptor_ids_by_start
-            .contains(&(blob.file_id.clone(), blob.entry.start_commit_id.clone()))
+        if descriptor_ids_by_as_of
+            .contains(&(blob.file_id.clone(), blob.entry.as_of_commit_id.clone()))
         {
             candidates.push(file_history_event_from_entry(
                 blob.file_id.clone(),
@@ -1451,7 +1452,7 @@ where
     for mut event in events {
         let key = (
             event.file_id.clone(),
-            event.start_commit_id.clone(),
+            event.as_of_commit_id.clone(),
             event.observed_commit_id.clone(),
         );
         match grouped.entry(key) {
@@ -1461,9 +1462,6 @@ where
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let grouped_event = entry.get_mut();
                 debug_assert_eq!(grouped_event.depth, event.depth);
-                // When commit metadata is not projected, history loading uses
-                // each source change's timestamp as an intentionally unused
-                // fallback. Those timestamps may differ within one commit.
                 grouped_event
                     .source_changes
                     .append(&mut event.source_changes);
@@ -1482,7 +1480,7 @@ where
     events.sort_by(|left, right| {
         left.file_id
             .cmp(&right.file_id)
-            .then(left.start_commit_id.cmp(&right.start_commit_id))
+            .then(left.as_of_commit_id.cmp(&right.as_of_commit_id))
             .then(left.depth.cmp(&right.depth))
             .then(left.observed_commit_id.cmp(&right.observed_commit_id))
     });
@@ -1501,7 +1499,7 @@ where
 {
     // The durable registry snapshot is already the complete plugin set at its
     // observed commit. Read that exact root identity for every reachable commit
-    // instead of inventing a filesystem state from `(start, depth)`, which
+    // instead of inventing a filesystem state from `(anchor, depth)`, which
     // conflates equal-depth siblings in a DAG.
     let observed_commit_ids = parent_commit_ids_by_commit
         .keys()
@@ -1527,7 +1525,7 @@ where
     let registry_events = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
         query_source.json_reader,
@@ -1695,7 +1693,7 @@ fn file_history_plugin_registry_events(
 fn file_history_event_from_entry(file_id: String, entry: &HistoryEntry) -> FileHistoryEvent {
     FileHistoryEvent {
         file_id,
-        start_commit_id: entry.start_commit_id.clone(),
+        as_of_commit_id: entry.as_of_commit_id.clone(),
         depth: entry.depth,
         source_changes: vec![entry.change.clone()],
         observed_commit_id: entry.observed_commit_id.clone(),
@@ -1914,7 +1912,7 @@ fn resolve_file_history_path(
     };
     let directory_path = resolve_history_directory_path(
         directory_id,
-        &descriptor.entry.start_commit_id,
+        &descriptor.entry.as_of_commit_id,
         target_depth,
         directories,
         &mut BTreeMap::new(),
@@ -2093,15 +2091,19 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
         ),
         (
             HISTORY_COL_COMMIT_CREATED_AT,
-            Col::Utf8(|row| Some(row.event.commit_created_at.as_str())),
+            Col::Utf8(|row| row.event.commit_created_at.as_deref()),
         ),
         (
-            HISTORY_COL_START_COMMIT_ID,
-            Col::Utf8(|row| Some(row.event.start_commit_id.as_str())),
+            HISTORY_COL_AS_OF_COMMIT_ID,
+            Col::Utf8(|row| Some(row.event.as_of_commit_id.as_str())),
         ),
         (
             HISTORY_COL_DEPTH,
             Col::I64(|row| Some(i64::from(row.event.depth))),
+        ),
+        (
+            HISTORY_COL_IS_DELETED,
+            Col::Bool(|row| Some(row.is_deleted)),
         ),
     ],
 };
@@ -2133,8 +2135,9 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-        Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+        Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
     ]))
 }
 
@@ -2187,8 +2190,8 @@ mod tests {
                 origin_key: None,
             },
             observed_commit_id: format!("commit-{depth}"),
-            commit_created_at: "2026-01-01T00:00:00Z".to_string(),
-            start_commit_id: "start".to_string(),
+            commit_created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            as_of_commit_id: "start".to_string(),
             depth,
         }
     }
@@ -2711,7 +2714,7 @@ mod tests {
             .expect("literal public ID IN filter should be routable");
         let route = file_history_descriptor_blob_route(
             &HistoryRoute {
-                start_commit_ids: vec!["commit-start".to_string()],
+                as_of_commit_ids: vec!["commit-start".to_string()],
                 ..HistoryRoute::default()
             },
             &ids,
@@ -2722,7 +2725,7 @@ mod tests {
             route.entity_pks,
             vec![r#"["file-a"]"#.to_string(), r#"["file-b"]"#.to_string()]
         );
-        assert_eq!(route.start_commit_ids, vec!["commit-start".to_string()]);
+        assert_eq!(route.as_of_commit_ids, vec!["commit-start".to_string()]);
     }
 
     #[test]
@@ -2889,12 +2892,12 @@ mod tests {
     #[tokio::test]
     async fn identical_event_and_context_routes_load_history_once() {
         let route = HistoryRoute {
-            start_commit_ids: vec!["cid-start".to_string()],
+            as_of_commit_ids: vec!["cid-start".to_string()],
             file_ids: vec!["file-a".to_string()],
             ..HistoryRoute::default()
         };
         let event_route = route.traversal_only();
-        let context_route = route.starts_only();
+        let context_route = route.anchors_only();
         assert_eq!(event_route, context_route);
 
         let loads = Arc::new(AtomicUsize::new(0));
@@ -2915,12 +2918,12 @@ mod tests {
     #[tokio::test]
     async fn differing_depth_routes_load_history_twice() {
         let route = HistoryRoute {
-            start_commit_ids: vec!["cid-start".to_string()],
+            as_of_commit_ids: vec!["cid-start".to_string()],
             max_depth: Some(3),
             ..HistoryRoute::default()
         };
         let event_route = route.traversal_only();
-        let context_route = route.starts_only();
+        let context_route = route.anchors_only();
         assert_ne!(event_route, context_route);
 
         let loads = Arc::new(AtomicUsize::new(0));
