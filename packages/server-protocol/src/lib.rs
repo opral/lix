@@ -1434,7 +1434,7 @@ fn decode_request_params(
                     cache_candidate_bytes_remaining,
                     cache_candidates,
                 );
-                values.push(Value::Blob(reconstructed));
+                values.push(Value::Blob(reconstructed.into()));
             }
         }
     }
@@ -2017,7 +2017,7 @@ fn single_blob_splice(
     }
     let WireValue::Blob {
         base64: insert_base64,
-    } = WireValue::try_from_engine(&Value::Blob(insert.to_vec()))?
+    } = WireValue::try_from_engine(&Value::Blob(insert.to_vec().into()))?
     else {
         unreachable!("blob wire conversion must return a blob")
     };
@@ -2322,8 +2322,8 @@ mod tests {
     }
 
     fn wire_blob_json(bytes: &[u8]) -> JsonValue {
-        let value =
-            WireValue::try_from_engine(&Value::Blob(bytes.to_vec())).expect("blob should encode");
+        let value = WireValue::try_from_engine(&Value::Blob(bytes.to_vec().into()))
+            .expect("blob should encode");
         serde_json::to_value(value).expect("wire blob should serialize")
     }
 
@@ -3058,7 +3058,7 @@ mod tests {
     async fn default_body_limit_accepts_blobs_larger_than_axums_two_megabyte_default() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let blob = WireValue::try_from_engine(&Value::Blob(vec![0x41; 2 * 1024 * 1024]))
+        let blob = WireValue::try_from_engine(&Value::Blob(vec![0x41; 2 * 1024 * 1024].into()))
             .expect("large blob should encode");
         let response = request(
             &app.router,
@@ -3254,7 +3254,7 @@ mod tests {
             mutation_sequence: sequence,
             rows: ExecuteResult::from_rows(
                 vec!["data".to_string()],
-                vec![vec![Value::Blob(bytes)]],
+                vec![vec![Value::Blob(bytes.into())]],
             ),
         }
     }

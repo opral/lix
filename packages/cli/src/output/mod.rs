@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn value_to_json_uses_blob_tagged_shape() {
-        let value = Value::Blob(vec![0x01, 0x02, 0x03]);
+        let value = Value::Blob(vec![0x01, 0x02, 0x03].into());
         let json = value_to_json(&value);
         assert_eq!(
             json,
@@ -149,7 +149,7 @@ mod tests {
             vec!["n".to_string(), "payload".to_string()],
             vec![
                 vec![Value::Integer(1), Value::Text("a".to_string())],
-                vec![Value::Integer(2), Value::Blob(vec![0x01, 0x02])],
+                vec![Value::Integer(2), Value::Blob(vec![0x01, 0x02].into())],
             ],
         );
 

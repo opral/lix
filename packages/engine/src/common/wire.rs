@@ -80,7 +80,7 @@ impl WireValue {
                         hint: None,
                         details: None,
                     })?;
-                Ok(Value::Blob(decoded))
+                Ok(Value::Blob(decoded.into()))
             }
         }
     }
@@ -135,7 +135,7 @@ mod tests {
             Value::Real(1.5),
             Value::Text("hello".to_string()),
             Value::Json(json!({"hello": "world"})),
-            Value::Blob(vec![1, 2, 3]),
+            Value::Blob(vec![1, 2, 3].into()),
         ];
 
         for value in original {
@@ -154,7 +154,7 @@ mod tests {
                 vec![
                     Value::Integer(1),
                     Value::Text("a".to_string()),
-                    Value::Blob(vec![0x41, 0x42]),
+                    Value::Blob(vec![0x41, 0x42].into()),
                 ],
                 vec![Value::Null, Value::Boolean(false), Value::Real(2.5)],
             ],

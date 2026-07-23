@@ -304,7 +304,10 @@ where
             .session
             .execute(
                 UPSERT_SQL,
-                &[Value::Text(prepared.path), Value::Blob(prepared.data)],
+                &[
+                    Value::Text(prepared.path),
+                    Value::Blob(prepared.data.into()),
+                ],
             )
             .await
             .expect("write large benchmark blob");

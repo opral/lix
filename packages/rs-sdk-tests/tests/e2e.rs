@@ -107,7 +107,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         files.rows()[0].values(),
         &[
             Value::Text("/people.csv".to_string()),
-            Value::Blob(updated_csv.clone())
+            Value::Blob(updated_csv.clone().into())
         ]
     );
 
@@ -121,7 +121,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     assert_eq!(files_by_id.len(), 1);
     assert_eq!(
         files_by_id.rows()[0].values(),
-        &[Value::Blob(updated_csv.clone())]
+        &[Value::Blob(updated_csv.clone().into())]
     );
 
     let file_changes_before_empty = file_changes(&lix, &file_id).await;
@@ -143,7 +143,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     assert_eq!(files_empty_by_id.len(), 1);
     assert_eq!(
         files_empty_by_id.rows()[0].values(),
-        &[Value::Blob(empty_csv)]
+        &[Value::Blob(empty_csv.into())]
     );
     let empty_changes = file_changes(&lix, &file_id)
         .await
@@ -161,7 +161,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/sql-people.csv".to_string()),
-            Value::Blob(sql_csv.clone()),
+            Value::Blob(sql_csv.clone().into()),
         ],
     )
     .await
@@ -202,7 +202,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE path = $2",
         &[
-            Value::Blob(sql_updated_csv.clone()),
+            Value::Blob(sql_updated_csv.clone().into()),
             Value::Text("/sql-people.csv".to_string()),
         ],
     )
@@ -240,9 +240,9 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
         &[
-            Value::Blob(sql_predicate_updated_csv.clone()),
+            Value::Blob(sql_predicate_updated_csv.clone().into()),
             Value::Text("/sql-people.csv".to_string()),
-            Value::Blob(sql_updated_csv.clone()),
+            Value::Blob(sql_updated_csv.clone().into()),
         ],
     )
     .await
@@ -279,7 +279,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/sql-empty.csv".to_string()),
-            Value::Blob(sql_empty_target),
+            Value::Blob(sql_empty_target.into()),
         ],
     )
     .await
@@ -298,7 +298,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE path = $2",
         &[
-            Value::Blob(sql_empty_bytes.clone()),
+            Value::Blob(sql_empty_bytes.clone().into()),
             Value::Text("/sql-empty.csv".to_string()),
         ],
     )
@@ -324,7 +324,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/sql-rename.csv".to_string()),
-            Value::Blob(sql_rename_csv.clone()),
+            Value::Blob(sql_rename_csv.clone().into()),
         ],
     )
     .await
@@ -364,7 +364,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     assert_eq!(renamed_files.len(), 1);
     assert_eq!(
         renamed_files.rows()[0].values(),
-        &[Value::Blob(sql_rename_csv.clone())]
+        &[Value::Blob(sql_rename_csv.clone().into())]
     );
     let active_plugin_rows_after_rename = lix
         .execute(
@@ -391,7 +391,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         "DELETE FROM lix_file WHERE path = $1 AND data = $2",
         &[
             Value::Text("/sql-people.csv".to_string()),
-            Value::Blob(sql_predicate_updated_csv),
+            Value::Blob(sql_predicate_updated_csv.into()),
         ],
     )
     .await
@@ -458,7 +458,7 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
         .unwrap();
 
     assert_eq!(files.len(), 1);
-    assert_eq!(files.rows()[0].values(), &[Value::Blob(csv)]);
+    assert_eq!(files.rows()[0].values(), &[Value::Blob(csv.into())]);
 
     tx.rollback().await.unwrap();
     lix.close().await.unwrap();
@@ -571,7 +571,7 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-        &[Value::Text(path.to_string()), Value::Blob(data)],
+        &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
     .await?;
     Ok(())

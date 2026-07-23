@@ -9,7 +9,10 @@ fn sized_blob_result(size: usize, changed: bool) -> ExecuteResult {
     if changed {
         bytes[size / 2] = 1;
     }
-    ExecuteResult::from_rows(vec!["data".to_string()], vec![vec![Value::Blob(bytes)]])
+    ExecuteResult::from_rows(
+        vec!["data".to_string()],
+        vec![vec![Value::Blob(bytes.into())]],
+    )
 }
 
 #[test]

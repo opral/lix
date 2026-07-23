@@ -350,7 +350,7 @@ mod tests {
                     Value::Json(value)
                 }
                 DifferentialParam::Text(value) => Value::Text((*value).to_string()),
-                DifferentialParam::Blob(value) => Value::Blob((*value).to_vec()),
+                DifferentialParam::Blob(value) => Value::Blob((*value).to_vec().into()),
             })
             .collect()
     }

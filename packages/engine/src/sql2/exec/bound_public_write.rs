@@ -402,9 +402,9 @@ fn eval_fast_file_blob(
     expr: &BoundExpr,
     params: &[Value],
     column: &str,
-) -> Result<Vec<u8>, LixError> {
+) -> Result<crate::Blob, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Blob(value)) => Ok(value.clone()),
+        BoundExpr::Literal(BoundLiteral::Blob(value)) => Ok(value.clone().into()),
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
             Some(Value::Blob(value)) => Ok(value.clone()),
             Some(_) => Err(LixError::new(
@@ -737,7 +737,9 @@ fn entity_returning_value(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Value, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Blob(value)) => return Ok(Value::Blob(value.clone())),
+        BoundExpr::Literal(BoundLiteral::Blob(value)) => {
+            return Ok(Value::Blob(value.clone().into()));
+        }
         BoundExpr::Param(param)
             if params
                 .get(param.index.saturating_sub(1))

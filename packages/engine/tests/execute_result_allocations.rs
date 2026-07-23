@@ -94,7 +94,7 @@ fn execute_result_construction_and_clone_allocations() {
     for size_mib in [1_usize, 10] {
         let size_bytes = size_mib * 1024 * 1024;
         let columns = vec!["data".to_string()];
-        let rows = vec![vec![Value::Blob(vec![b'x'; size_bytes])]];
+        let rows = vec![vec![Value::Blob(vec![b'x'; size_bytes].into())]];
         let (result, construction) =
             measure_allocations(|| ExecuteResult::from_rows(columns, rows));
         let probe = result.clone();

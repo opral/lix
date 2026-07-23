@@ -14,7 +14,7 @@ use crate::storage_adapter::{
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
-use crate::{LixError, LixNotice, SqlQueryResult, Value};
+use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, LimitClause, OrderByKind, Query, Select,
@@ -323,9 +323,24 @@ impl TryFromValue for serde_json::Value {
 impl TryFromValue for Vec<u8> {
     fn try_from_value(value: &Value) -> Result<Self, LixError> {
         match value {
+            Value::Blob(value) => Ok(value.to_vec()),
+            other => Err(value_type_error("blob", other)),
+        }
+    }
+}
+
+impl TryFromValue for Blob {
+    fn try_from_value(value: &Value) -> Result<Self, LixError> {
+        match value {
             Value::Blob(value) => Ok(value.clone()),
             other => Err(value_type_error("blob", other)),
         }
+    }
+}
+
+impl TryFromValue for bytes::Bytes {
+    fn try_from_value(value: &Value) -> Result<Self, LixError> {
+        Blob::try_from_value(value).map(Blob::into_bytes)
     }
 }
 
@@ -2433,9 +2448,9 @@ mod tests {
                 "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
                 &[
                     Value::Text("/b.txt".to_string()),
-                    Value::Blob(b"bravo".to_vec()),
+                    Value::Blob(b"bravo".to_vec().into()),
                     Value::Text("/a.txt".to_string()),
-                    Value::Blob(b"alpha".to_vec()),
+                    Value::Blob(b"alpha".to_vec().into()),
                 ],
             )
             .await
@@ -2458,12 +2473,12 @@ mod tests {
         assert_eq!(result.rows()[0].get::<String>("path").unwrap(), "/a.txt");
         assert_eq!(
             result.rows()[0].value("data").unwrap(),
-            &Value::Blob(b"alpha".to_vec())
+            &Value::Blob(b"alpha".to_vec().into())
         );
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
         assert_eq!(
             result.rows()[1].value("data").unwrap(),
-            &Value::Blob(b"bravo".to_vec())
+            &Value::Blob(b"bravo".to_vec().into())
         );
     }
 
@@ -2475,11 +2490,11 @@ mod tests {
                 "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4), ($5, $6)",
                 &[
                     Value::Text("/a.txt".to_string()),
-                    Value::Blob(b"alpha".to_vec()),
+                    Value::Blob(b"alpha".to_vec().into()),
                     Value::Text("/b.txt".to_string()),
-                    Value::Blob(b"bravo".to_vec()),
+                    Value::Blob(b"bravo".to_vec().into()),
                     Value::Text("/c.txt".to_string()),
-                    Value::Blob(b"charlie".to_vec()),
+                    Value::Blob(b"charlie".to_vec().into()),
                 ],
             )
             .await
@@ -2499,14 +2514,14 @@ mod tests {
             result.rows()[0].values(),
             &[
                 Value::Text("/c.txt".to_string()),
-                Value::Blob(b"charlie".to_vec()),
+                Value::Blob(b"charlie".to_vec().into()),
             ]
         );
         assert_eq!(
             result.rows()[1].values(),
             &[
                 Value::Text("/b.txt".to_string()),
-                Value::Blob(b"bravo".to_vec()),
+                Value::Blob(b"bravo".to_vec().into()),
             ]
         );
     }
@@ -2531,7 +2546,7 @@ mod tests {
     fn execute_result_clone_shares_immutable_backing() {
         let result = ExecuteResult::from_rows(
             vec!["data".to_string()],
-            vec![vec![Value::Blob(vec![b'x'; 1024 * 1024])]],
+            vec![vec![Value::Blob(vec![b'x'; 1024 * 1024].into())]],
         );
         let cloned = result.clone();
 

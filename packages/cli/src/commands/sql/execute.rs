@@ -154,7 +154,7 @@ fn parse_object_param(
                     "invalid --params value at index {index}: $blob is not valid base64: {error}"
                 ))
             })?;
-        return Ok(Value::Blob(bytes));
+        return Ok(Value::Blob(bytes.into()));
     }
 
     Err(CliError::msg(format!(
@@ -189,7 +189,7 @@ mod tests {
                 Value::Integer(7),
                 Value::Real(2.5),
                 Value::Text("hello".to_string()),
-                Value::Blob(vec![0x68, 0x69]),
+                Value::Blob(vec![0x68, 0x69].into()),
             ]
         );
     }

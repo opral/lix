@@ -669,7 +669,7 @@ impl TryFrom<LixValueDto> for Value {
             "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null))),
             "blob" => value
                 .blob
-                .map(|bytes| Self::Blob(bytes.into_vec()))
+                .map(|bytes| Self::Blob(bytes.into_vec().into()))
                 .ok_or_else(|| invalid_param("blob value must include bytes")),
             other => Err(invalid_param(format!("unsupported LixValue kind: {other}"))),
         }
@@ -690,7 +690,7 @@ impl TryFrom<&Value> for LixValueDto {
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
             Value::Json(value) => ("json", Some(value.clone()), None),
-            Value::Blob(value) => ("blob", None, Some(ByteBuf::from(value.clone()))),
+            Value::Blob(value) => ("blob", None, Some(ByteBuf::from(value.to_vec()))),
         };
         Ok(Self {
             kind: kind.to_string(),

@@ -1754,7 +1754,7 @@ impl TryFrom<LixValue> for Value {
                         "blob value must include bytes",
                     )
                 })?;
-                Ok(Self::Blob(bytes.to_vec()))
+                Ok(Self::Blob(bytes.to_vec().into()))
             }
             other => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1810,7 +1810,7 @@ impl TryFrom<&Value> for LixValue {
             Value::Blob(value) => Ok(Self {
                 kind: "blob".to_string(),
                 value: None,
-                blob: Some(Buffer::from(value.clone())),
+                blob: Some(Buffer::from(value.to_vec())),
             }),
         }
     }

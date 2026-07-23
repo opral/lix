@@ -33,12 +33,13 @@ impl BlobHash {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobPayload {
-    bytes: Vec<u8>,
+    bytes: crate::Blob,
     hash: Option<BlobHash>,
 }
 
 impl BlobPayload {
-    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+    pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
+        let bytes = bytes.into();
         let hash = (!bytes.is_empty()).then(|| BlobHash::from_content(&bytes));
         Self { bytes, hash }
     }

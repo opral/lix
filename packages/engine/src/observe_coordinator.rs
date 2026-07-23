@@ -49,7 +49,7 @@ enum ObserveParamKey {
     Real(u64),
     Text(String),
     Json(String),
-    Blob(Vec<u8>),
+    Blob(crate::Blob),
 }
 
 impl ObserveParamKey {
@@ -337,7 +337,7 @@ mod tests {
     fn blob_result(byte: u8) -> ExecuteResult {
         ExecuteResult::from_rows(
             vec!["data".to_string()],
-            vec![vec![Value::Blob(vec![byte; 1024])]],
+            vec![vec![Value::Blob(vec![byte; 1024].into())]],
         )
     }
 

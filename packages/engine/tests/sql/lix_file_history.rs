@@ -79,7 +79,7 @@ simulation_test!(
                     Value::Text("history-file".to_string()),
                     Value::Text("/docs/readme-renamed.md".to_string()),
                     Value::Text("readme-renamed.md".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
@@ -87,7 +87,7 @@ simulation_test!(
                     Value::Text("history-file".to_string()),
                     Value::Text("/docs/guides/readme.md".to_string()),
                     Value::Text("readme.md".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
                 ],
@@ -174,7 +174,7 @@ simulation_test!(
             result,
             vec![vec![
                 Value::Text("/empty-history.txt".to_string()),
-                Value::Blob(Vec::new()),
+                Value::Blob(Vec::new().into()),
             ]],
         );
     }
@@ -227,12 +227,12 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
             vec![
                 Value::Text("history-in-a".to_string()),
                 Value::Text("/history/in-a.txt".to_string()),
-                Value::Blob(b"a".to_vec()),
+                Value::Blob(b"a".to_vec().into()),
             ],
             vec![
                 Value::Text("history-in-b".to_string()),
                 Value::Text("/history/in-b.txt".to_string()),
-                Value::Blob(b"b".to_vec()),
+                Value::Blob(b"b".to_vec().into()),
             ],
         ],
     );
@@ -344,7 +344,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("zzz-history-target".to_string()),
                 Value::Text("/target/three.txt".to_string()),
-                Value::Blob(b"three".to_vec()),
+                Value::Blob(b"three".to_vec().into()),
             ]],
         );
     }
@@ -369,7 +369,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
             &[
                 Value::Text("/.lix/plugins/plugin_history_render.lixplugin".to_string()),
-                Value::Blob(history_render_plugin_archive()),
+                Value::Blob(history_render_plugin_archive().into()),
             ],
         )
         .await
@@ -379,7 +379,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
             &[
                 Value::Text("/note.history-render".to_string()),
-                Value::Blob(b"first".to_vec()),
+                Value::Blob(b"first".to_vec().into()),
             ],
         )
         .await
@@ -388,7 +388,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
         .execute(
             "UPDATE lix_file SET data = $1 WHERE path = $2",
             &[
-                Value::Blob(b"second".to_vec()),
+                Value::Blob(b"second".to_vec().into()),
                 Value::Text("/note.history-render".to_string()),
             ],
         )
@@ -447,12 +447,12 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
         vec![
             vec![
                 Value::Text("/note.history-render".to_string()),
-                Value::Blob(b"rendered:second-a|second-b".to_vec()),
+                Value::Blob(b"rendered:second-a|second-b".to_vec().into()),
                 Value::Integer(1),
             ],
             vec![
                 Value::Text("/note.history-render".to_string()),
-                Value::Blob(b"rendered:first-a|first-b".to_vec()),
+                Value::Blob(b"rendered:first-a|first-b".to_vec().into()),
                 Value::Integer(2),
             ],
         ],
@@ -477,7 +477,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
     assert_rows_eq(
         depth_filtered,
         vec![vec![
-            Value::Blob(b"rendered:second-a|second-b".to_vec()),
+            Value::Blob(b"rendered:second-a|second-b".to_vec().into()),
             Value::Integer(1),
         ]],
     );
@@ -571,7 +571,7 @@ simulation_test!(
             result,
             vec![vec![
                 Value::Text("/ordinary-history.txt".to_string()),
-                Value::Blob(b"hello".to_vec()),
+                Value::Blob(b"hello".to_vec().into()),
                 Value::Integer(1),
             ]],
         );
@@ -725,7 +725,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("history-file-blob-filter".to_string()),
                 Value::Text("/docs/blob-filter.txt".to_string()),
-                Value::Blob(b"blob2".to_vec()),
+                Value::Blob(b"blob2".to_vec().into()),
                 Value::Text("lix_file_descriptor".to_string()),
             ]],
         );

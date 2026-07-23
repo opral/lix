@@ -203,7 +203,7 @@ impl TransactionFileData {
         branch_id: String,
         global: bool,
         untracked: bool,
-        data: Vec<u8>,
+        data: impl Into<crate::Blob>,
     ) -> Self {
         Self {
             file_id,
@@ -223,7 +223,7 @@ impl TransactionFileData {
         self
     }
 
-    pub(crate) fn add_auxiliary_payload(&mut self, data: Vec<u8>) {
+    pub(crate) fn add_auxiliary_payload(&mut self, data: impl Into<crate::Blob>) {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
     }
 

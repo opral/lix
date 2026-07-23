@@ -316,7 +316,7 @@ simulation_test!(
         );
 
         let error = session
-            .execute("SELECT length($1)", &[Value::Blob(vec![0xff])])
+            .execute("SELECT length($1)", &[Value::Blob(vec![0xff].into())])
             .await
             .expect_err("non-UTF-8 blob should fail as text");
 
@@ -349,7 +349,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('blob-value', $1)",
-                &[Value::Blob(vec![1, 2, 3, 255, 0, 128])],
+                &[Value::Blob(vec![1, 2, 3, 255, 0, 128].into())],
             )
             .await
             .expect_err("blob entity insert should fail cleanly");

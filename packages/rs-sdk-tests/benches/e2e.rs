@@ -392,7 +392,7 @@ impl BenchLix {
         self.execute(
             "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-            &[Value::Text(path.to_string()), Value::Blob(data)],
+            &[Value::Text(path.to_string()), Value::Blob(data.into())],
         )
         .await?;
         Ok(())
@@ -533,7 +533,7 @@ where
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",
         &[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
-            Value::Blob(archive.to_vec()),
+            Value::Blob(archive.to_vec().into()),
         ],
     )
     .await?;

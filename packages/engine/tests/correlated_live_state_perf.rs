@@ -554,7 +554,7 @@ async fn measure_update(
     for iteration in 0..warmups {
         let data = update_data(iteration);
         let result = session
-            .execute(update_sql, &[Value::Blob(data.clone())])
+            .execute(update_sql, &[Value::Blob(data.clone().into())])
             .await
             .expect("update warmup should succeed");
         assert_eq!(
@@ -570,7 +570,7 @@ async fn measure_update(
         let before = storage.stats();
         let started = Instant::now();
         let result = session
-            .execute(update_sql, &[Value::Blob(data.clone())])
+            .execute(update_sql, &[Value::Blob(data.clone().into())])
             .await
             .expect("timed update should succeed");
         let duration_ns = elapsed_ns(started);

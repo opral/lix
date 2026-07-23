@@ -61,7 +61,7 @@ where
                 &[
                     Value::Text(file_id.to_string()),
                     Value::Text(path.to_string()),
-                    Value::Blob(bytes),
+                    Value::Blob(bytes.into()),
                 ],
             )
             .await

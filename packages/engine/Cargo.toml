@@ -100,7 +100,7 @@ blake3 = "1"
 fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]

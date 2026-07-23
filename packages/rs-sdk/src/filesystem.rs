@@ -1011,7 +1011,7 @@ where
             let mut params = Vec::with_capacity(chunk.len() * 2);
             for (path, data) in chunk {
                 params.push(Value::Text((*path).to_string()));
-                params.push(Value::Blob((*data).to_vec()));
+                params.push(Value::Blob((*data).to_vec().into()));
             }
             self.session.execute(&sql, &params).await?;
             start = end;
@@ -2551,7 +2551,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-                &[Value::Text(path.to_string()), Value::Blob(data)],
+                &[Value::Text(path.to_string()), Value::Blob(data.into())],
             )
             .await?;
         Ok(())
@@ -3010,7 +3010,7 @@ mod tests {
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
             &[
                 Value::Text("/.lix/app_data/test.bin".to_string()),
-                Value::Blob(b"plugin".to_vec()),
+                Value::Blob(b"plugin".to_vec().into()),
             ],
         )
         .await

@@ -959,7 +959,7 @@ fn build_replay_commit_statements(
             .map(|row| {
                 params.push(Value::Text(row.id.clone()));
                 params.push(Value::Text(row.path.clone()));
-                params.push(Value::Blob(row.data.clone()));
+                params.push(Value::Blob(row.data.clone().into()));
                 "(?, ?, ?)"
             })
             .collect::<Vec<_>>()
@@ -972,14 +972,17 @@ fn build_replay_commit_statements(
         if stable_file_id(&row.path) == row.id {
             statements.push(SqlStatement {
                 sql: "UPDATE lix_file SET data = ? WHERE id = ?".to_string(),
-                params: vec![Value::Blob(row.data.clone()), Value::Text(row.id.clone())],
+                params: vec![
+                    Value::Blob(row.data.clone().into()),
+                    Value::Text(row.id.clone()),
+                ],
             });
         } else {
             statements.push(SqlStatement {
                 sql: "UPDATE lix_file SET path = ?, data = ? WHERE id = ?".to_string(),
                 params: vec![
                     Value::Text(row.path.clone()),
-                    Value::Blob(row.data.clone()),
+                    Value::Blob(row.data.clone().into()),
                     Value::Text(row.id.clone()),
                 ],
             });
@@ -1505,7 +1508,7 @@ mod tests {
             SqlStatement {
                 sql: "UPDATE lix_file SET data = ? WHERE id = ?".to_string(),
                 params: vec![
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                     Value::Text("file-id".to_string()),
                 ],
             },
@@ -1539,7 +1542,7 @@ mod tests {
         assert_eq!(
             statements[0].params,
             vec![
-                Value::Blob(b"hello".to_vec()),
+                Value::Blob(b"hello".to_vec().into()),
                 Value::Text("/src/main.ts".to_string())
             ]
         );
@@ -1568,7 +1571,7 @@ mod tests {
             statements[0].params,
             vec![
                 Value::Text("/src/new.ts".to_string()),
-                Value::Blob(b"hello".to_vec()),
+                Value::Blob(b"hello".to_vec().into()),
                 Value::Text("/src/old.ts".to_string())
             ]
         );
