@@ -360,8 +360,16 @@ mod tests {
 
     #[tokio::test]
     async fn schema_merges_advance_revision_for_fast_forward_and_merge_commit_paths() {
-        run_schema_merge_case(false, MergeBranchOutcome::FastForward).await;
-        run_schema_merge_case(true, MergeBranchOutcome::MergeCommitted).await;
+        Box::pin(run_schema_merge_case(
+            false,
+            MergeBranchOutcome::FastForward,
+        ))
+        .await;
+        Box::pin(run_schema_merge_case(
+            true,
+            MergeBranchOutcome::MergeCommitted,
+        ))
+        .await;
     }
 
     async fn run_schema_merge_case(diverge_target: bool, expected: MergeBranchOutcome) {

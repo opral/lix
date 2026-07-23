@@ -85,6 +85,7 @@ pub(crate) async fn execute_write_logical_plan(
         .map(|result| result.rows_affected)
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_result(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: SqlLogicalPlan,

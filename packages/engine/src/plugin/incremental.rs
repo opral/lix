@@ -46,14 +46,12 @@ impl ArcByteSource {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
         Self::new(bytes.into())
     }
 
-    pub(crate) fn bytes(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
-    }
-
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> WasmTransitionCounters {
         WasmTransitionCounters {
             source_read_calls: self.reads.calls.load(Ordering::Relaxed),
@@ -273,47 +271,6 @@ fn common_suffix_len(left: &[u8], right: &[u8], max: usize) -> (usize, u64) {
         common += 1;
     }
     (common, bytes_compared)
-}
-
-#[cfg(test)]
-fn apply_input_splices(
-    before: &[u8],
-    after: &[u8],
-    edits: &[WasmInputSplice],
-) -> Result<Vec<u8>, LixError> {
-    let mut result = Vec::with_capacity(after.len());
-    let mut cursor = 0usize;
-    for edit in edits {
-        let start = usize::try_from(edit.offset)
-            .map_err(|_| invalid_input("v2 splice offset does not fit this host"))?;
-        let delete_len = usize::try_from(edit.delete_len)
-            .map_err(|_| invalid_input("v2 splice deletion does not fit this host"))?;
-        let end = start
-            .checked_add(delete_len)
-            .ok_or_else(|| invalid_input("v2 splice deletion range overflowed"))?;
-        if start < cursor || end > before.len() {
-            return Err(invalid_input(
-                "v2 input splices are not sorted or in bounds",
-            ));
-        }
-        result.extend_from_slice(&before[cursor..start]);
-        match &edit.insert {
-            WasmInputBytes::Inline(bytes) => result.extend_from_slice(bytes),
-            WasmInputBytes::AfterRange(range) => {
-                let range_start = usize::try_from(range.offset)
-                    .map_err(|_| invalid_input("v2 after-range offset does not fit this host"))?;
-                let range_end = usize::try_from(range.end()?)
-                    .map_err(|_| invalid_input("v2 after-range end does not fit this host"))?;
-                let bytes = after
-                    .get(range_start..range_end)
-                    .ok_or_else(|| invalid_input("v2 after-range is out of bounds"))?;
-                result.extend_from_slice(bytes);
-            }
-        }
-        cursor = end;
-    }
-    result.extend_from_slice(&before[cursor..]);
-    Ok(result)
 }
 
 #[derive(Debug, Clone)]
@@ -625,10 +582,6 @@ impl VecEntityChangeSource {
             state: VecSourceState::new(limits)?,
         })
     }
-
-    pub(crate) fn empty(limits: WasmTransitionLimits) -> Result<Self, LixError> {
-        Self::new(WasmEntityChanges { groups: Vec::new() }, limits)
-    }
 }
 
 impl WasmEntityChangeSource for VecEntityChangeSource {
@@ -874,6 +827,7 @@ pub(crate) struct ResolvedOutputSplice {
 pub(crate) struct ValidatedEntityTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) bytes: Arc<[u8]>,
+    #[cfg(test)]
     pub(crate) edits: Vec<ResolvedOutputSplice>,
     pub(crate) counters: WasmTransitionCounters,
 }
@@ -1069,6 +1023,7 @@ async fn drain_entity_transition_edits_inner(
     Ok(ValidatedEntityTransition {
         document: transition.document,
         bytes,
+        #[cfg(test)]
         edits,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
@@ -1337,11 +1292,15 @@ async fn read_output_range(
     let mut offset = range.offset;
     while bytes.len() < capacity {
         let remaining = capacity - bytes.len();
-        let requested = remaining.min(budget.limits.max_page_bytes as usize) as u32;
+        let page_limit = usize::try_from(budget.limits.max_page_bytes)
+            .map_err(|_| invalid_guest("v2 output page limit does not fit this host"))?;
+        let requested_len = remaining.min(page_limit);
+        let requested = u32::try_from(requested_len)
+            .map_err(|_| invalid_guest("v2 output read length exceeds the component ABI"))?;
         let chunk = actor
             .read_output(transition, outputs, range.index, offset, requested)
             .await?;
-        if chunk.is_empty() || chunk.len() > requested as usize {
+        if chunk.is_empty() || chunk.len() > requested_len {
             return Err(invalid_guest(
                 "v2 output reads must return a non-empty bounded prefix before EOF",
             ));
@@ -1487,8 +1446,13 @@ fn apply_resolved_output_splices(
     let mut bytes = Vec::with_capacity(capacity);
     let mut cursor = 0usize;
     for edit in edits {
-        let start = edit.offset as usize;
-        let end = start + edit.delete_len as usize;
+        let start = usize::try_from(edit.offset)
+            .map_err(|_| invalid_guest("v2 output splice offset does not fit this host"))?;
+        let delete_len = usize::try_from(edit.delete_len)
+            .map_err(|_| invalid_guest("v2 output splice deletion does not fit this host"))?;
+        let end = start
+            .checked_add(delete_len)
+            .ok_or_else(|| invalid_guest("v2 output splice deletion range overflowed"))?;
         bytes.extend_from_slice(&base[cursor..start]);
         bytes.extend_from_slice(&edit.insert);
         cursor = end;
@@ -1714,7 +1678,10 @@ mod tests {
             WasmTransitionLimits::default(),
         )
         .unwrap();
-        let first_page = source.next_page(first_page_bytes as u32).unwrap().unwrap();
+        let first_page = source
+            .next_page(u32::try_from(first_page_bytes).expect("test page size fits u32"))
+            .unwrap()
+            .unwrap();
         assert_eq!(first_page.entities.len(), 1);
         assert_eq!(first_page.entities[0].key.entity_pk, ["a".to_owned()]);
         let second_page = source
@@ -1762,7 +1729,7 @@ mod tests {
             VecEntityChangeSource::new(changes, WasmTransitionLimits::default()).unwrap();
         assert_eq!(
             source
-                .next_page(first_page_bytes as u32)
+                .next_page(u32::try_from(first_page_bytes).expect("test page size fits u32"))
                 .unwrap()
                 .unwrap()
                 .groups
@@ -1902,7 +1869,8 @@ mod tests {
                 .outputs
                 .get(&(outputs, index))
                 .ok_or_else(|| invalid_guest("missing fake output"))?;
-            let start = offset as usize;
+            let start = usize::try_from(offset)
+                .map_err(|_| invalid_guest("fake output offset does not fit usize"))?;
             let end = start
                 .saturating_add(length as usize)
                 .min(start.saturating_add(self.max_read_prefix))

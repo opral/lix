@@ -382,6 +382,7 @@ impl PluginActorCache {
     }
 
     /// Serializes one transition on the observation-selected actor.
+    #[cfg(test)]
     pub(crate) async fn lease(
         &self,
         observation: &PluginObservation,
@@ -451,12 +452,6 @@ impl PluginActorCache {
             uncertain_guest_call: false,
             successor: None,
         })
-    }
-
-    pub(crate) fn retire(&self, key: &PluginActorKey) {
-        if let Some(slot) = self.lock().actors.remove(key) {
-            slot.retire();
-        }
     }
 
     fn rekey_slot(
@@ -686,6 +681,7 @@ impl PluginActorLease {
 
     /// Publishes the successor only after durable commit. A failure here is a
     /// cache failure: the caller must keep the commit successful and cold-open.
+    #[cfg(test)]
     pub(crate) async fn commit_successor(self) -> Result<PluginObservation, LixError> {
         let key = self.key.clone();
         self.commit_successor_as(key).await

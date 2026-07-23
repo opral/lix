@@ -1365,14 +1365,14 @@ where
             let _operation_guard = self.begin_session_operation()?;
             let statement = self.sql_planning_cache.parse_statement(sql)?;
             let transaction = self.transaction_mut()?;
-            execute_transaction_statement(
+            Box::pin(execute_transaction_statement(
                 transaction,
                 sql,
                 statement,
                 params,
                 options,
                 ExecuteStatementMetadata::default(),
-            )
+            ))
             .await
             .map_err(|error| normalize_sql_surface_error(error, sql))
         };

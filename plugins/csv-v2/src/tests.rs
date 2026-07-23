@@ -44,6 +44,15 @@ fn records(document: &Document) -> Vec<EntityRecord> {
         .collect()
 }
 
+fn has_number(value: &Value) -> bool {
+    match value {
+        Value::Number(_) => true,
+        Value::Array(values) => values.iter().any(has_number),
+        Value::Object(values) => values.values().any(has_number),
+        _ => false,
+    }
+}
+
 #[test]
 fn generated_id_is_namespace_plus_big_endian_ordinal() {
     let id = namespace().encode(0x0102_0304_0506_0708);
@@ -67,14 +76,6 @@ fn import_streams_number_free_complete_snapshots() {
     assert_eq!(changes.len(), 3);
     for change in changes {
         let value: Value = serde_json::from_slice(change.snapshot.as_ref().unwrap()).unwrap();
-        fn has_number(value: &Value) -> bool {
-            match value {
-                Value::Number(_) => true,
-                Value::Array(values) => values.iter().any(has_number),
-                Value::Object(values) => values.values().any(has_number),
-                _ => false,
-            }
-        }
         assert!(!has_number(&value));
     }
 }
@@ -710,11 +711,17 @@ fn exact_220k_insert_and_reorder_touch_only_boundary_chunks() {
     }
     let (document, _) = Document::open_file(source, Some("large.csv"), namespace()).unwrap();
     let left_index = 109_999usize;
-    let left = (u128::try_from(left_index + 1).unwrap() * u128::from(u64::MAX)
-        / u128::try_from(ROW_COUNT + 1).unwrap()) as u64
+    let left = u64::try_from(
+        u128::try_from(left_index + 1).unwrap() * u128::from(u64::MAX)
+            / u128::try_from(ROW_COUNT + 1).unwrap(),
+    )
+    .unwrap()
         | 1;
-    let right = (u128::try_from(left_index + 2).unwrap() * u128::from(u64::MAX)
-        / u128::try_from(ROW_COUNT + 1).unwrap()) as u64
+    let right = u64::try_from(
+        u128::try_from(left_index + 2).unwrap() * u128::from(u64::MAX)
+            / u128::try_from(ROW_COUNT + 1).unwrap(),
+    )
+    .unwrap()
         | 1;
     let order = left + (right - left) / 2;
     let id = IdNamespace::from_halves(0xfeed_face_dead_beef, 0x0123_4567_89ab_cdef).encode(0);
@@ -743,7 +750,7 @@ fn exact_220k_insert_and_reorder_touch_only_boundary_chunks() {
     let (reordered, edits) = inserted
         .entities_changed(&[EntityChange {
             schema_key: ROW_SCHEMA_KEY.to_owned(),
-            entity_pk: vec![id.clone()],
+            entity_pk: vec![id],
             snapshot: Some(snapshot),
             effect: ChangeEffect::Content,
         }])

@@ -28,17 +28,19 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
 
 pub(crate) async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
     match profile.storage() {
-        ProfileStorage::SQLite(storage) => {
-            SqlFixture::SQLite(fixture_for_session(prepare_session(storage).await, rows))
-        }
-        ProfileStorage::RocksDB(storage) => {
-            SqlFixture::RocksDB(fixture_for_session(prepare_session(storage).await, rows))
-        }
+        ProfileStorage::SQLite(storage) => SqlFixture::SQLite(fixture_for_session(
+            Box::pin(prepare_session(storage)).await,
+            rows,
+        )),
+        ProfileStorage::RocksDB(storage) => SqlFixture::RocksDB(fixture_for_session(
+            Box::pin(prepare_session(storage)).await,
+            rows,
+        )),
     }
 }
 
 pub(crate) async fn seeded_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
-    let fixture = empty_fixture(profile, rows).await;
+    let fixture = Box::pin(empty_fixture(profile, rows)).await;
     fixture.insert_all().await;
     fixture
 }

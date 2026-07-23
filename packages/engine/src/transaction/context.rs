@@ -1614,11 +1614,10 @@ where
                 content_type_still_matches.then_some(plugin)
             });
 
-            let (plugin, classified_bytes) = if let Some(plugin) = warm_owned_plugin {
-                (Some(plugin), 0)
-            } else {
-                catalog.select_for_bytes_with_classification_work(path, write.data())
-            };
+            let (plugin, classified_bytes) = warm_owned_plugin.map_or_else(
+                || catalog.select_for_bytes_with_classification_work(path, write.data()),
+                |plugin| (Some(plugin), 0),
+            );
             if classified_bytes != 0 {
                 full_content_classification_bytes.insert(file_key.clone(), classified_bytes);
             }
@@ -1720,20 +1719,20 @@ where
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
             match entry.runtime() {
                 crate::plugin::PluginRuntime::WasmComponentV1 => {
-                    if let Some(instance) = self
+                    let cached_instance = self
                         .plugin_host
-                        .cached_plugin_component(entry.key(), hash)?
-                    {
+                        .cached_plugin_component(entry.key(), hash)?;
+                    if let Some(instance) = cached_instance {
                         component_instances.insert(key, instance);
                     } else {
                         cold_entries.insert(key, entry);
                     }
                 }
                 crate::plugin::PluginRuntime::WasmComponentV2 => {
-                    if let Some(factory) = self
+                    let cached_factory = self
                         .plugin_host
-                        .cached_plugin_v2_factory(entry.key(), hash)?
-                    {
+                        .cached_plugin_v2_factory(entry.key(), hash)?;
+                    if let Some(factory) = cached_factory {
                         component_v2_factories.insert(key, factory);
                     } else {
                         cold_v2_entries.insert(key, entry);
@@ -4754,6 +4753,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "release-only transaction path-index benchmark probe"]
+    #[allow(clippy::large_futures)] // Boxing would add allocation to the measured execute path.
     async fn transaction_path_index_benchmark_probe() {
         let file_count = std::env::var("LIX_PATH_INDEX_BENCH_FILES")
             .ok()

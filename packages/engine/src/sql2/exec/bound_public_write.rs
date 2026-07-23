@@ -1994,112 +1994,6 @@ fn value_json(value: &Value) -> JsonValue {
     }
 }
 
-#[cfg(test)]
-mod splice_provenance_tests {
-    use super::{
-        BoundExpr, FastFileDataUpdateShape, fast_file_blob_expr_splice_provenance,
-        fast_file_data_update_splice_provenance,
-    };
-    use crate::common::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
-    use crate::sql2::bind::expr::BoundParamRef;
-
-    fn splice(label: &str) -> RequestBlobSpliceProvenance {
-        RequestBlobSpliceProvenance {
-            base_sha256: format!("base-{label}"),
-            result_sha256: format!("result-{label}"),
-            prefix_bytes: 4,
-            suffix_bytes: 5,
-            insert: label.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    fn fast_file_data_update_uses_the_bound_data_parameter_metadata() {
-        let expected = splice("data");
-        let metadata = ExecuteStatementMetadata {
-            parameter_blob_splices: vec![Some(splice("unrelated")), None, Some(expected.clone())],
-            ..ExecuteStatementMetadata::default()
-        };
-        let shape = FastFileDataUpdateShape {
-            id: BoundExpr::Param(BoundParamRef { index: 2 }),
-            data: BoundExpr::Param(BoundParamRef { index: 3 }),
-            data_parameter_index: Some(3),
-        };
-
-        assert_eq!(
-            fast_file_data_update_splice_provenance(&shape, &metadata),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn fast_file_data_update_has_no_provenance_for_full_blob_or_literal() {
-        let full_blob_metadata = ExecuteStatementMetadata {
-            parameter_blob_splices: vec![Some(splice("id")), None],
-            ..ExecuteStatementMetadata::default()
-        };
-        let parameter_shape = FastFileDataUpdateShape {
-            id: BoundExpr::Param(BoundParamRef { index: 1 }),
-            data: BoundExpr::Param(BoundParamRef { index: 2 }),
-            data_parameter_index: Some(2),
-        };
-        assert_eq!(
-            fast_file_data_update_splice_provenance(&parameter_shape, &full_blob_metadata,),
-            None
-        );
-
-        let literal_shape = FastFileDataUpdateShape {
-            id: BoundExpr::Param(BoundParamRef { index: 1 }),
-            data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
-            data_parameter_index: None,
-        };
-        assert_eq!(
-            fast_file_data_update_splice_provenance(&literal_shape, &full_blob_metadata),
-            None
-        );
-    }
-
-    #[test]
-    fn fast_file_path_write_uses_each_rows_bound_data_parameter_metadata() {
-        let first = splice("first-data");
-        let second = splice("second-data");
-        let metadata = ExecuteStatementMetadata {
-            parameter_blob_splices: vec![
-                Some(splice("first-path")),
-                Some(first.clone()),
-                None,
-                Some(second.clone()),
-            ],
-            mutation_identity: Some(MutationIdentity {
-                namespace_seed: [9; 16],
-                operation_proof: [19; 32],
-            }),
-        };
-
-        assert_eq!(
-            fast_file_blob_expr_splice_provenance(
-                &BoundExpr::Param(BoundParamRef { index: 2 }),
-                &metadata,
-            ),
-            Some(first)
-        );
-        assert_eq!(
-            fast_file_blob_expr_splice_provenance(
-                &BoundExpr::Param(BoundParamRef { index: 4 }),
-                &metadata,
-            ),
-            Some(second)
-        );
-        assert_eq!(
-            fast_file_blob_expr_splice_provenance(
-                &BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
-                &metadata,
-            ),
-            None
-        );
-    }
-}
-
 fn json_path_get(
     value: &JsonValue,
     segment: &JsonValue,
@@ -2479,5 +2373,111 @@ fn entity_action(op: &BoundWriteOp) -> &'static str {
         BoundWriteOp::Insert => "INSERT into entity surface",
         BoundWriteOp::Update => "UPDATE entity surface",
         BoundWriteOp::Delete => "DELETE from entity surface",
+    }
+}
+
+#[cfg(test)]
+mod splice_provenance_tests {
+    use super::{
+        BoundExpr, FastFileDataUpdateShape, fast_file_blob_expr_splice_provenance,
+        fast_file_data_update_splice_provenance,
+    };
+    use crate::common::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
+    use crate::sql2::bind::expr::BoundParamRef;
+
+    fn splice(label: &str) -> RequestBlobSpliceProvenance {
+        RequestBlobSpliceProvenance {
+            base_sha256: format!("base-{label}"),
+            result_sha256: format!("result-{label}"),
+            prefix_bytes: 4,
+            suffix_bytes: 5,
+            insert: label.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn fast_file_data_update_uses_the_bound_data_parameter_metadata() {
+        let expected = splice("data");
+        let metadata = ExecuteStatementMetadata {
+            parameter_blob_splices: vec![Some(splice("unrelated")), None, Some(expected.clone())],
+            ..ExecuteStatementMetadata::default()
+        };
+        let shape = FastFileDataUpdateShape {
+            id: BoundExpr::Param(BoundParamRef { index: 2 }),
+            data: BoundExpr::Param(BoundParamRef { index: 3 }),
+            data_parameter_index: Some(3),
+        };
+
+        assert_eq!(
+            fast_file_data_update_splice_provenance(&shape, &metadata),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn fast_file_data_update_has_no_provenance_for_full_blob_or_literal() {
+        let full_blob_metadata = ExecuteStatementMetadata {
+            parameter_blob_splices: vec![Some(splice("id")), None],
+            ..ExecuteStatementMetadata::default()
+        };
+        let parameter_shape = FastFileDataUpdateShape {
+            id: BoundExpr::Param(BoundParamRef { index: 1 }),
+            data: BoundExpr::Param(BoundParamRef { index: 2 }),
+            data_parameter_index: Some(2),
+        };
+        assert_eq!(
+            fast_file_data_update_splice_provenance(&parameter_shape, &full_blob_metadata,),
+            None
+        );
+
+        let literal_shape = FastFileDataUpdateShape {
+            id: BoundExpr::Param(BoundParamRef { index: 1 }),
+            data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
+            data_parameter_index: None,
+        };
+        assert_eq!(
+            fast_file_data_update_splice_provenance(&literal_shape, &full_blob_metadata),
+            None
+        );
+    }
+
+    #[test]
+    fn fast_file_path_write_uses_each_rows_bound_data_parameter_metadata() {
+        let first = splice("first-data");
+        let second = splice("second-data");
+        let metadata = ExecuteStatementMetadata {
+            parameter_blob_splices: vec![
+                Some(splice("first-path")),
+                Some(first.clone()),
+                None,
+                Some(second.clone()),
+            ],
+            mutation_identity: Some(MutationIdentity {
+                namespace_seed: [9; 16],
+                operation_proof: [19; 32],
+            }),
+        };
+
+        assert_eq!(
+            fast_file_blob_expr_splice_provenance(
+                &BoundExpr::Param(BoundParamRef { index: 2 }),
+                &metadata,
+            ),
+            Some(first)
+        );
+        assert_eq!(
+            fast_file_blob_expr_splice_provenance(
+                &BoundExpr::Param(BoundParamRef { index: 4 }),
+                &metadata,
+            ),
+            Some(second)
+        );
+        assert_eq!(
+            fast_file_blob_expr_splice_provenance(
+                &BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
+                &metadata,
+            ),
+            None
+        );
     }
 }

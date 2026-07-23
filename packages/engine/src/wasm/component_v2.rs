@@ -17,6 +17,7 @@ pub const PACKET_FORMAT_V1: u16 = 1;
 pub const WASM_COMPONENT_V2_API_VERSION: &str = "2.0.0";
 
 const MIB: u64 = 1024 * 1024;
+const MIB_U32: u32 = 1024 * 1024;
 
 /// Aggregate limits for one top-level v2 transition, including cursor and
 /// attachment draining after the exported guest call returns.
@@ -35,8 +36,8 @@ pub struct WasmTransitionLimits {
 impl Default for WasmTransitionLimits {
     fn default() -> Self {
         Self {
-            max_record_bytes: MIB as u32,
-            max_page_bytes: MIB as u32,
+            max_record_bytes: MIB_U32,
+            max_page_bytes: MIB_U32,
             max_pages: 1_024,
             max_total_bytes: 64 * MIB,
             max_inline_edits: 4_096,
@@ -691,7 +692,7 @@ impl WasmChangeDrainValidator {
 
 /// Cross-page validator for renderer splices whose offsets all address the
 /// same accepted base document.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct WasmEditDrainValidator {
     limits: WasmTransitionLimits,
     base_len: u64,

@@ -689,7 +689,7 @@ struct UploadBenchFixture {
 
 impl UploadBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create().await;
+        let seeded = Box::pin(SeededStore::create()).await;
         let cache_dir = tempfile::tempdir().expect("create SlateDB upload cache directory");
         let storage = SlateDB::open_object_store_with_options(
             seeded.db_path.clone(),
@@ -870,7 +870,7 @@ struct ReadBenchFixture {
 
 impl ReadBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create().await;
+        let seeded = Box::pin(SeededStore::create()).await;
         let (session, cache_dir) = seeded.open_session().await;
         seeded.object_store.set_delay(delay);
 
@@ -971,7 +971,7 @@ struct CachedRequestBenchFixture {
 
 impl CachedLifecycleBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create().await;
+        let seeded = Box::pin(SeededStore::create()).await;
         seeded.object_store.set_delay(delay);
         Self { seeded }
     }
@@ -1034,7 +1034,7 @@ struct CachedLifecycleBenchResult {
 
 impl CachedRequestBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create().await;
+        let seeded = Box::pin(SeededStore::create()).await;
         seeded.object_store.set_delay(delay);
         let cache_dir = tempfile::tempdir().expect("create preloaded request cache directory");
         let storage = SlateDB::open_object_store_with_options(
@@ -1073,7 +1073,7 @@ impl CachedRequestBenchFixture {
 
 impl FreshEngineSelectBenchFixture {
     async fn seeded(delay: Duration) -> Self {
-        let seeded = SeededStore::create().await;
+        let seeded = Box::pin(SeededStore::create()).await;
         let storage = SlateDB::open_object_store_with_options(
             seeded.db_path.clone(),
             object_store_handle(&seeded.object_store),

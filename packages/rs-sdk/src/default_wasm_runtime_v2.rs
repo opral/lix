@@ -41,9 +41,11 @@ impl TransitionBudgetState {
     }
 
     fn remaining_nanoseconds(&self) -> u64 {
+        let elapsed_nanoseconds =
+            u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.limits
             .total_deadline_nanoseconds
-            .saturating_sub(self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+            .saturating_sub(elapsed_nanoseconds)
     }
 
     fn check_active(&self) -> Result<(), LixError> {
@@ -1412,7 +1414,6 @@ impl WasmtimeV2Actor {
     }
 
     fn plugin_error(
-        &self,
         context: &str,
         error: bindings::exports::lix::plugin::api::PluginError,
     ) -> LixError {
@@ -1444,7 +1445,7 @@ impl WasmtimeV2Actor {
             &error,
             bindings::exports::lix::plugin::api::PluginError::DeadlineExceeded
         );
-        let plugin_error = self.plugin_error(context, error);
+        let plugin_error = Self::plugin_error(context, error);
         if must_retire {
             self.retire_now();
             return plugin_error;
@@ -1581,6 +1582,10 @@ impl WasmtimeV2Actor {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "the tests exercise private runtime internals defined later in this file"
+)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1724,8 +1729,9 @@ mod tests {
     }
 
     async fn csv_test_actor_with_limits(limits: WasmLimits) -> Box<dyn WasmComponentV2Actor> {
-        let wasm_path = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")
-            .expect("the CSV v2 artifact dependency must be available");
+        let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
+            panic!("the CSV v2 artifact dependency must be available");
+        };
         let wasm = std::fs::read(wasm_path).expect("CSV v2 component should be readable");
         let runtime = WasmtimePluginRuntime::new().expect("test runtime should initialize");
         let factory = runtime
@@ -2185,7 +2191,10 @@ mod tests {
         )
         .unwrap();
         let mut packet = Vec::new();
-        push_u32(&mut packet, record.len() as u32);
+        push_u32(
+            &mut packet,
+            u32::try_from(record.len()).expect("test change record length fits u32"),
+        );
         packet.extend_from_slice(&record);
         let decoded = decode_change_packet(1, &packet, limits).unwrap();
         assert_eq!(decoded.changes.entity_change_count(), 1);
@@ -2210,7 +2219,10 @@ mod tests {
         push_u64(&mut attachment_record, u64::MAX);
         push_u64(&mut attachment_record, 1);
         let mut attachment_packet = Vec::new();
-        push_u32(&mut attachment_packet, attachment_record.len() as u32);
+        push_u32(
+            &mut attachment_packet,
+            u32::try_from(attachment_record.len()).expect("test attachment record length fits u32"),
+        );
         attachment_packet.extend_from_slice(&attachment_record);
         assert!(decode_change_packet(1, &attachment_packet, limits).is_err());
     }
@@ -2239,8 +2251,9 @@ mod tests {
 
     #[tokio::test]
     async fn production_csv_v2_initial_import_stays_under_64_mib() {
-        let wasm_path = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")
-            .expect("the CSV v2 artifact dependency must be available");
+        let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
+            panic!("the CSV v2 artifact dependency must be available");
+        };
         let wasm = std::fs::read(wasm_path).expect("CSV v2 component should be readable");
         let runtime = WasmtimePluginRuntime::new().expect("test runtime should initialize");
         let factory = runtime
@@ -2306,8 +2319,9 @@ mod tests {
 
     #[tokio::test]
     async fn production_csv_v2_cold_open_and_warm_edit_stay_under_64_mib() {
-        let wasm_path = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")
-            .expect("the CSV v2 artifact dependency must be available");
+        let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
+            panic!("the CSV v2 artifact dependency must be available");
+        };
         let wasm = std::fs::read(wasm_path).expect("CSV v2 component should be readable");
         let runtime = WasmtimePluginRuntime::new().expect("test runtime should initialize");
         let factory = runtime
@@ -2718,7 +2732,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         let value = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
-                let error = self.plugin_error("open-file", error);
+                let error = Self::plugin_error("open-file", error);
                 self.retire_now();
                 return Err(error);
             }
@@ -2756,7 +2770,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         let value = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
-                let error = self.plugin_error("open-entities", error);
+                let error = Self::plugin_error("open-entities", error);
                 self.retire_now();
                 return Err(error);
             }
@@ -3177,7 +3191,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         let length = match result {
             Ok(Ok(length)) => length,
             Ok(Err(error)) => {
-                let error = self.plugin_error("byte-outputs.len", error);
+                let error = Self::plugin_error("byte-outputs.len", error);
                 self.retire_now();
                 return Err(error);
             }
@@ -3231,7 +3245,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         let bytes = match result {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                let error = self.plugin_error("byte-outputs.read", error);
+                let error = Self::plugin_error("byte-outputs.read", error);
                 self.retire_now();
                 return Err(error);
             }
@@ -3348,7 +3362,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         &mut self,
         transition: WasmTransitionHandle,
     ) -> Result<(), LixError> {
-        WasmtimeV2Actor::discard_transition(self, transition.0)
+        Self::discard_transition(self, transition.0)
     }
 
     fn is_retired(&self) -> bool {
@@ -3399,7 +3413,7 @@ impl WasmtimeV2Actor {
                         length
                     }
                     Ok(Err(error)) => {
-                        let error = self.plugin_error("byte-outputs.len", error);
+                        let error = Self::plugin_error("byte-outputs.len", error);
                         self.retire_now();
                         return Err(error);
                     }

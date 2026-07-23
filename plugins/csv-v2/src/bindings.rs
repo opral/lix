@@ -1,3 +1,5 @@
+#![allow(clippy::same_length_and_capacity)]
+
 wit_bindgen::generate!({
     path: "../../packages/engine/wit/v2",
     world: "plugin",

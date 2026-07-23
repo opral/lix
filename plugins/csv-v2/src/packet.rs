@@ -87,7 +87,7 @@ impl ChangeStream {
 fn encode_merge_group(change: &EntityChange) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     put_u32(&mut output, 1);
-    output.push(if change.snapshot.is_some() { 0 } else { 1 });
+    output.push(u8::from(change.snapshot.is_none()));
     encode_key(&mut output, &change.schema_key, &change.entity_pk)?;
     if let Some(snapshot) = &change.snapshot {
         output.push(match change.effect {
@@ -211,7 +211,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
-fn framed_records<'a>(payload: &'a [u8], count: u32) -> Result<Vec<&'a [u8]>, String> {
+fn framed_records(payload: &[u8], count: u32) -> Result<Vec<&[u8]>, String> {
     if count == 0 {
         return Err("packet page must contain at least one record".to_owned());
     }

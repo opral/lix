@@ -41,7 +41,7 @@ const DEFAULT_SETUP_CHUNK_SIZE: usize = 500;
 async fn correlated_live_state_sql_perf() {
     let config = Config::from_env();
     let ids = file_ids(config.files);
-    let seed_snapshot = prepare_seed_snapshot(&config, &ids).await;
+    let seed_snapshot = Box::pin(prepare_seed_snapshot(&config, &ids)).await;
     let mut measurements = Vec::with_capacity(config.batch_sizes.len() * config.operations.len());
     let profile_measurement = if let Some(profile) = config.profile.as_ref() {
         let batch_size = config.batch_sizes[0];
@@ -64,26 +64,26 @@ async fn correlated_live_state_sql_perf() {
 
             if config.operations.contains(&Operation::Select) {
                 measurements.push(
-                    measure_select(
+                    Box::pin(measure_select(
                         &seed_snapshot,
                         selected_ids,
                         &select_sql,
                         config.warmups,
                         config.samples,
-                    )
+                    ))
                     .await,
                 );
             }
             if config.operations.contains(&Operation::Update) {
                 measurements.push(
-                    measure_update(
+                    Box::pin(measure_update(
                         &seed_snapshot,
                         selected_ids,
                         &select_sql,
                         &update_sql,
                         config.warmups,
                         config.samples,
-                    )
+                    ))
                     .await,
                 );
             }
@@ -309,7 +309,7 @@ async fn prepare_seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
         validate_seed_snapshot(&snapshot, config.files).await;
         snapshot
     } else {
-        seed_snapshot(config, ids).await
+        Box::pin(seed_snapshot(config, ids)).await
     };
 
     if let Some(output_path) = config.seed_output_path.as_ref() {

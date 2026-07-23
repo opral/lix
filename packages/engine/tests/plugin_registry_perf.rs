@@ -48,7 +48,7 @@ const WASM_BYTES_ENV: &str = "LIX_PLUGIN_REGISTRY_PERF_WASM_BYTES";
 async fn plugin_registry_perf_probe() {
     let config = ProbeConfig::from_env();
     for mode in modes_from_env() {
-        run_mode(config, mode).await;
+        Box::pin(run_mode(config, mode)).await;
     }
 }
 

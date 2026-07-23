@@ -579,8 +579,7 @@ where
                 }
                 LargeFileFixture::Json(_) => {
                     eprintln!(
-                        "{mode} format=json properties={} warmups={warmups} rounds={rounds}",
-                        JSON_PROPERTY_COUNT,
+                        "{mode} format=json properties={JSON_PROPERTY_COUNT} warmups={warmups} rounds={rounds}",
                     );
                 }
             }
@@ -1286,7 +1285,8 @@ fn flat_json_fixture() -> FlatJsonFixture {
             initial.push(b',');
         }
         let first = rng.next_u64();
-        let second = rng.next_u64() as u32;
+        let second = u32::try_from(rng.next_u64() & u64::from(u32::MAX))
+            .expect("masked low 32 bits must fit in u32");
         write!(
             &mut initial,
             "\"property_{index:06}\":\"{first:016x}{second:08x}"
@@ -1397,20 +1397,18 @@ fn build_plugin_archive(wasm: &[u8], metadata: &[(&str, &[u8])]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn csv_exact_fixture_size_is_preserved() {
-        let rows = random_csv_rows("initial", 220_000, 0x8ae7_b4b1_9f4c_d215);
-        assert_eq!(csv_bytes_from_rows(&rows).len(), 10_680_000);
+        let rows = super::random_csv_rows("initial", 220_000, 0x8ae7_b4b1_9f4c_d215);
+        assert_eq!(super::csv_bytes_from_rows(&rows).len(), 10_680_000);
     }
 
     #[test]
     fn json_fixture_is_exact_and_changes_only_the_middle_property() {
-        let fixture = flat_json_fixture();
+        let fixture = super::flat_json_fixture();
         let edited_bytes = fixture.edited_bytes();
-        assert_eq!(fixture.initial.len(), JSON_TARGET_BYTE_COUNT);
-        assert_eq!(edited_bytes.len(), JSON_TARGET_BYTE_COUNT);
+        assert_eq!(fixture.initial.len(), super::JSON_TARGET_BYTE_COUNT);
+        assert_eq!(edited_bytes.len(), super::JSON_TARGET_BYTE_COUNT);
         assert_eq!(
             fixture
                 .initial
@@ -1429,8 +1427,8 @@ mod tests {
             .as_object()
             .expect("initial fixture is a flat object");
         let edited = edited.as_object().expect("edited fixture is a flat object");
-        assert_eq!(initial.len(), JSON_PROPERTY_COUNT);
-        assert_eq!(edited.len(), JSON_PROPERTY_COUNT);
+        assert_eq!(initial.len(), super::JSON_PROPERTY_COUNT);
+        assert_eq!(edited.len(), super::JSON_PROPERTY_COUNT);
 
         let changed = initial
             .iter()
@@ -1444,8 +1442,9 @@ mod tests {
 
     #[test]
     fn json_lane_packages_the_real_wasm_plugin() {
-        let archive = build_json_plugin();
-        let mut archive = zip::ZipArchive::new(Cursor::new(archive)).expect("open plugin archive");
+        let archive = super::build_json_plugin();
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("open plugin archive");
         for path in ["manifest.json", "schema/json_pointer.json", "plugin.wasm"] {
             let entry = archive.by_name(path).expect("required archive entry");
             assert!(entry.size() > 0, "archive entry '{path}' must not be empty");
@@ -1454,8 +1453,11 @@ mod tests {
 
     #[test]
     fn csv_lane_packages_the_v2_component_and_manifest() {
-        let archive = build_csv_plugin();
-        let mut archive = zip::ZipArchive::new(Cursor::new(archive)).expect("open plugin archive");
+        use std::io::Read as _;
+
+        let archive = super::build_csv_plugin();
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("open plugin archive");
         for path in [
             "manifest.json",
             "schema/csv_table.json",
@@ -1466,7 +1468,6 @@ mod tests {
             assert!(entry.size() > 0, "archive entry '{path}' must not be empty");
         }
         let mut manifest = String::new();
-        use std::io::Read as _;
         archive
             .by_name("manifest.json")
             .unwrap()

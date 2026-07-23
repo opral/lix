@@ -55,7 +55,7 @@ fn main() {
             ))
             .await
             .unwrap();
-            install_plugin(&lix, "plugin_csv", &plugin).await;
+            Box::pin(install_plugin(&lix, "plugin_csv", &plugin)).await;
             let initial_csv = csv_bytes_from_rows(&initial_rows);
             let start = Instant::now();
             write_file(&lix, CSV_PATH, initial_csv).await;

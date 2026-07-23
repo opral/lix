@@ -17,20 +17,20 @@ const ROUNDS: usize = 300;
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual performance probe; run with --ignored --nocapture"]
 async fn exact_file_read_benchmark_probe() {
-    run_backend("memory", Memory::new()).await;
+    Box::pin(run_backend("memory", Memory::new())).await;
 
     let rocks_dir = TempDir::new().expect("create RocksDB benchmark directory");
-    run_backend(
+    Box::pin(run_backend(
         "rocksdb",
         RocksDB::open(rocks_dir.path().join("rocksdb")).expect("open RocksDB benchmark storage"),
-    )
+    ))
     .await;
 
     let slate_dir = TempDir::new().expect("create SlateDB benchmark directory");
-    run_backend(
+    Box::pin(run_backend(
         "slatedb",
         SlateDB::open(slate_dir.path().join("slatedb")).expect("open SlateDB benchmark storage"),
-    )
+    ))
     .await;
 }
 

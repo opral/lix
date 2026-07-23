@@ -152,7 +152,7 @@ where
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
     request_blobs: Mutex<RequestBlobCache>,
-    mutation_replays: Mutex<MutationReplayCache>,
+    mutation_replays: AsyncMutex<MutationReplayCache>,
     max_reconstructed_request_blob_bytes: usize,
 }
 
@@ -256,7 +256,7 @@ where
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
             request_blobs: Mutex::new(RequestBlobCache::default()),
-            mutation_replays: Mutex::new(MutationReplayCache::default()),
+            mutation_replays: AsyncMutex::new(MutationReplayCache::default()),
             max_reconstructed_request_blob_bytes,
         }
     }
@@ -845,10 +845,7 @@ where
                 // engine call. It makes duplicates single-flight, and because
                 // it lives inside SessionLease::run's detached blocking task,
                 // cancellation of the HTTP waiter cannot open a replay race.
-                let mut replays = record
-                    .mutation_replays
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut replays = record.mutation_replays.lock().await;
                 if let Some(result) = replays.get(&mutation_id, &digest)? {
                     return match result {
                         MutationReplayResult::Execute(result) => Ok(result),
@@ -944,10 +941,7 @@ where
         let record = Arc::clone(&lease.record);
         lease
             .run(move |lix| async move {
-                let mut replays = record
-                    .mutation_replays
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut replays = record.mutation_replays.lock().await;
                 if let Some(result) = replays.get(&mutation_id, &digest)? {
                     return match result {
                         MutationReplayResult::Batch(results) => Ok(results),
@@ -1739,8 +1733,7 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         | LixError::CODE_COMMIT_NOT_FOUND
         | LixError::CODE_TABLE_NOT_FOUND
         | LixError::CODE_COLUMN_NOT_FOUND => StatusCode::NOT_FOUND,
-        LixError::CODE_CLOSED => StatusCode::CONFLICT,
-        MUTATION_ID_CONFLICT_CODE => StatusCode::CONFLICT,
+        LixError::CODE_CLOSED | MUTATION_ID_CONFLICT_CODE => StatusCode::CONFLICT,
         LixError::CODE_PLUGIN_OBSERVATION_STALE => StatusCode::GONE,
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
@@ -2387,8 +2380,10 @@ mod tests {
     #[test]
     fn request_blob_splice_reconstructs_the_exact_large_csv_fixture() {
         const EXACT_CSV_BYTES: usize = 10_680_000;
-        assert!(EXACT_CSV_BYTES > 10 * 1024 * 1024);
-        assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+        const _: () = {
+            assert!(EXACT_CSV_BYTES > 10 * 1024 * 1024);
+            assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+        };
 
         let base: Arc<[u8]> = Arc::from(vec![b'a'; EXACT_CSV_BYTES]);
         let mut result = base.to_vec();
@@ -3194,8 +3189,10 @@ mod tests {
     #[test]
     fn request_blob_cache_retains_and_rotates_exact_large_file_bases() {
         const EXACT_CSV_BYTES: usize = 10_680_000;
-        assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
-        assert!(EXACT_CSV_BYTES * 2 > MAX_REQUEST_BLOB_CACHE_BYTES);
+        const _: () = {
+            assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+            assert!(EXACT_CSV_BYTES * 2 > MAX_REQUEST_BLOB_CACHE_BYTES);
+        };
         let mut cache = RequestBlobCache::default();
 
         cache.insert(CachedRequestBlob {
@@ -3203,7 +3200,7 @@ mod tests {
             bytes: Arc::from(vec![b'a'; EXACT_CSV_BYTES]),
         });
         assert_eq!(
-            cache.get("large-base").as_deref().map(|bytes| bytes.len()),
+            cache.get("large-base").as_deref().map(<[u8]>::len),
             Some(EXACT_CSV_BYTES)
         );
 
@@ -3213,10 +3210,7 @@ mod tests {
         });
         assert!(cache.get("large-base").is_none());
         assert_eq!(
-            cache
-                .get("large-successor")
-                .as_deref()
-                .map(|bytes| bytes.len()),
+            cache.get("large-successor").as_deref().map(<[u8]>::len),
             Some(EXACT_CSV_BYTES)
         );
         assert_eq!(cache.total_bytes, EXACT_CSV_BYTES);

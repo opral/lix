@@ -115,11 +115,11 @@ async fn sqlite_open_lix_options_supplies_plugin_wasm_runtime() {
     .await
     .expect("lix opens on sqlite storage with wasm runtime");
 
-    install_plugin(
+    Box::pin(install_plugin(
         &lix,
         "plugin_runtime_test",
         &build_runtime_test_plugin_archive(),
-    )
+    ))
     .await
     .expect("plugin archive installs");
     write_file(&lix, "/custom.runtime", b"source bytes".to_vec())

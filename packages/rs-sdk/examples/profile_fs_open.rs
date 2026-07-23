@@ -570,7 +570,7 @@ async fn main() {
         let (storage, open_elapsed) = open_with_timing(src).await;
         eprintln!("in-place open: {open_elapsed:?}");
         let read_bench = if args.read_bench {
-            Some(run_read_benchmark(&storage, src).await)
+            Some(Box::pin(run_read_benchmark(&storage, src)).await)
         } else {
             None
         };
@@ -609,7 +609,7 @@ async fn main() {
     let (storage, warm_elapsed) = open_with_timing(&work).await;
     eprintln!("warm reopen: {warm_elapsed:?}");
     let read_bench = if args.read_bench {
-        Some(run_read_benchmark(&storage, &work).await)
+        Some(Box::pin(run_read_benchmark(&storage, &work)).await)
     } else {
         None
     };

@@ -127,7 +127,7 @@ async fn print_accounting() {
                 if !selected("LIX_LARGE_BLOB_OPERATIONS", &operation.to_string()) {
                     continue;
                 }
-                let mut fixture = Fixture::new(backend, size, operation).await;
+                let mut fixture = Box::pin(Fixture::new(backend, size, operation)).await;
                 fixture.flush().await;
                 let storage_bytes_before = directory_bytes(fixture.root());
                 reset_binary_cas_write_accounting();
@@ -329,11 +329,15 @@ impl Fixture {
         match backend {
             Backend::Rocks => {
                 let storage = RocksDB::open(&database_path).expect("open benchmark RocksDB");
-                Self::Rocks(BackendFixture::create(storage, temp_dir, size, operation).await)
+                Self::Rocks(
+                    Box::pin(BackendFixture::create(storage, temp_dir, size, operation)).await,
+                )
             }
             Backend::Slate => {
                 let storage = SlateDB::open(&database_path).expect("open benchmark SlateDB");
-                Self::Slate(BackendFixture::create(storage, temp_dir, size, operation).await)
+                Self::Slate(
+                    Box::pin(BackendFixture::create(storage, temp_dir, size, operation)).await,
+                )
             }
         }
     }

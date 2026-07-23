@@ -10511,17 +10511,18 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        let requests = scan_requests.lock().expect("scan request mutex");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].filter.schema_keys,
-            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
-        );
-        assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("file-readme")]
-        );
-        drop(requests);
+        {
+            let requests = scan_requests.lock().expect("scan request mutex");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].filter.schema_keys,
+                vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+            );
+            assert_eq!(
+                requests[0].filter.entity_pks,
+                vec![crate::entity_pk::EntityPk::single("file-readme")]
+            );
+        }
 
         let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[0] else {
             panic!("data update should stage file data");

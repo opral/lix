@@ -67,7 +67,7 @@ pub struct Dialect {
 
 impl Dialect {
     pub fn for_path(path: Option<&str>) -> Self {
-        let delimiter = if path.is_some_and(|path| path.ends_with(".tsv")) {
+        let delimiter = if path.is_some_and(|path| path.as_bytes().ends_with(b".tsv")) {
             b'\t'
         } else {
             b','
@@ -235,7 +235,7 @@ impl PersistentBlob {
         }
         self.append_piece_range(cursor, self.len, &mut pieces)?;
         debug_assert_eq!(
-            pieces.iter().map(|piece| piece.len as u64).sum::<u64>(),
+            pieces.iter().map(|piece| u64::from(piece.len)).sum::<u64>(),
             u64::from(result_len)
         );
         Ok(Self {
@@ -393,8 +393,8 @@ struct IdentityLookup {
 
 #[derive(Clone, Debug, Default)]
 struct IdentityLookupNode {
-    zero: Option<Arc<IdentityLookupNode>>,
-    one: Option<Arc<IdentityLookupNode>>,
+    zero: Option<Arc<Self>>,
+    one: Option<Arc<Self>>,
     slots: Box<[u32]>,
 }
 
@@ -407,8 +407,7 @@ struct IdentityRange {
 impl IdentityStore {
     fn initial(namespace: IdNamespace, count: usize) -> Result<Self, String> {
         let count_u32 = u32::try_from(count).map_err(|_| "CSV has too many rows".to_owned())?;
-        let mut namespace_indices = Vec::with_capacity(count);
-        namespace_indices.resize(count, 0);
+        let namespace_indices = vec![0; count];
         let ordinals = (0..u64::from(count_u32)).collect();
         Ok(Self {
             namespaces: Arc::new(vec![namespace.0]),
@@ -518,12 +517,13 @@ impl IdentityStore {
                 .iter()
                 .position(|candidate| candidate == &namespace)
         {
+            let namespace_index_u16 = u16::try_from(namespace_index).ok()?;
             if let Some(base) = self.dense_slot_bases[namespace_index]
                 && let Ok(ordinal) = u32::try_from(ordinal)
                 && let Some(slot) = base.checked_add(ordinal)
             {
                 let index = usize::try_from(slot).ok()?;
-                if self.base_namespace_indices.get(index).copied() == Some(namespace_index as u16)
+                if self.base_namespace_indices.get(index).copied() == Some(namespace_index_u16)
                     && self.base_ordinals.get(index).copied() == Some(u64::from(ordinal))
                 {
                     return Some(slot);
@@ -531,7 +531,7 @@ impl IdentityStore {
             }
         }
         let hash = identity_hash(id.as_bytes());
-        identity_lookup_node(&self.appended_lookup, hash)
+        identity_lookup_node(self.appended_lookup.as_deref(), hash)
             .and_then(|slots| {
                 slots
                     .iter()
@@ -834,8 +834,8 @@ fn identity_hash_for_stored(store: &IdentityStore, identity: &StoredIdentity) ->
     }
 }
 
-fn identity_lookup_node(node: &Option<Arc<IdentityLookupNode>>, hash: u64) -> Option<&[u32]> {
-    let mut node = node.as_deref()?;
+fn identity_lookup_node(node: Option<&IdentityLookupNode>, hash: u64) -> Option<&[u32]> {
+    let mut node = node?;
     for depth in 0..64 {
         node = if hash & (1u64 << (63 - depth)) == 0 {
             node.zero.as_deref()?
@@ -980,7 +980,7 @@ enum SlotLocationOverride {
 
 #[derive(Clone, Debug)]
 struct SlotLocationOverlay {
-    previous: Option<Arc<SlotLocationOverlay>>,
+    previous: Option<Arc<Self>>,
     entries: Box<[(u32, SlotLocationOverride)]>,
 }
 
@@ -1182,12 +1182,12 @@ impl SlotLocationIndex {
             .filter(|location| *location != MISSING_ROW_LOCATION)
     }
 
-    fn with_changes(&self, mut entries: Vec<(u32, SlotLocationOverride)>) -> Self {
+    fn with_changes(&self, entries: Vec<(u32, SlotLocationOverride)>) -> Self {
         let mut latest = HashMap::with_capacity(entries.len());
-        for (slot, value) in entries.drain(..) {
+        for (slot, value) in entries {
             latest.insert(slot, value);
         }
-        entries.extend(latest);
+        let mut entries = latest.into_iter().collect::<Vec<_>>();
         entries.sort_unstable_by_key(|entry| entry.0);
         if entries.is_empty() {
             return self.clone();
@@ -1303,7 +1303,7 @@ struct OrderKeyStore {
 
 #[derive(Clone, Debug)]
 struct OrderKeyOverlay {
-    previous: Option<Arc<OrderKeyOverlay>>,
+    previous: Option<Arc<Self>>,
     slot: u32,
     value: Option<Arc<str>>,
 }
@@ -1363,7 +1363,7 @@ struct ImportRange {
 }
 
 impl ImportRange {
-    fn bytes<'a>(self, arena: &'a [u8]) -> &'a [u8] {
+    fn bytes(self, arena: &[u8]) -> &[u8] {
         let start = usize::try_from(self.start).expect("u32 fits usize");
         let end = start + usize::try_from(self.len).expect("u32 fits usize");
         &arena[start..end]
@@ -1668,8 +1668,11 @@ fn rendered_cell_len(cell: &[u8], dialect: Dialect) -> Result<usize, String> {
         return Ok(cell.len());
     }
     let quote = dialect.quote.expect("quoting was required");
+    let quote_count = cell
+        .iter()
+        .fold(0usize, |count, byte| count + usize::from(*byte == quote));
     cell.len()
-        .checked_add(cell.iter().filter(|byte| **byte == quote).count())
+        .checked_add(quote_count)
         .and_then(|len| len.checked_add(2))
         .ok_or_else(|| "CSV rendered cell length overflowed".to_owned())
 }
@@ -2759,10 +2762,10 @@ fn match_rows(
     }
     let mut old_suffix = old_cells.len();
     let mut new_suffix = new_cells.len();
-    while old_suffix > prefix
-        && new_suffix > prefix
-        && old_cells[old_suffix - 1] == new_cells[new_suffix - 1]
-    {
+    while old_suffix > prefix && new_suffix > prefix {
+        if old_cells[old_suffix - 1] != new_cells[new_suffix - 1] {
+            break;
+        }
         old_suffix -= 1;
         new_suffix -= 1;
         assign_matched_row(
@@ -2957,7 +2960,7 @@ pub(crate) fn ranks_between(
                 .checked_add(1)
                 .ok_or_else(|| "CSV order-key interval exhausted".to_owned())?,
         );
-        if rank & 0xff == 0 {
+        if rank.trailing_zeros() >= 8 {
             rank = rank
                 .checked_add(1)
                 .ok_or_else(|| "CSV order-key interval exhausted".to_owned())?;
