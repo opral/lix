@@ -21,7 +21,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
     HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-    parse_history_filter,
+    parse_history_filter, validate_history_anchor_filter,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
@@ -84,6 +84,10 @@ where
         }
     }
 
+    fn validate_filter_pushdown(&self, filter: &Expr) -> Result<()> {
+        validate_history_anchor_filter(filter).map_err(lix_error_to_datafusion_error)
+    }
+
     async fn plan_scan(
         &self,
         projection: Option<&Vec<usize>>,
@@ -92,7 +96,8 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&lix_state_history_schema(), projection);
-        let route = HistoryRoute::from_filters(filters);
+        let mut route = HistoryRoute::from_filters(filters);
+        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
@@ -257,7 +262,7 @@ where
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
-        query_source.json_reader,
+        query_source,
         route,
         Vec::new(),
         metadata_projection,

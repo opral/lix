@@ -67,10 +67,17 @@ where
         &session,
         ctx.functions(),
         Some(ctx.active_branch_id().to_string()),
-        active_branch_commit_id,
+        active_branch_commit_id.clone(),
     );
     let provider_selection = providers::read_provider_selection(&session, statements);
-    providers::register_read(&session, ctx, branch_ref, &provider_selection).await?;
+    providers::register_read(
+        &session,
+        ctx,
+        branch_ref,
+        active_branch_commit_id,
+        &provider_selection,
+    )
+    .await?;
 
     Ok(session)
 }
@@ -94,7 +101,7 @@ where
         &session,
         read_ctx.functions(),
         Some(read_ctx.active_branch_id().to_string()),
-        active_branch_commit_id,
+        active_branch_commit_id.clone(),
     );
     let write_ctx = SqlWriteContext::new(write_ctx);
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
@@ -106,6 +113,7 @@ where
         &session,
         read_ctx,
         read_branch_ref,
+        active_branch_commit_id,
         write_ctx,
         write_branch_ref,
         SqlWriteSessionOptions::default(),

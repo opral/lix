@@ -29,12 +29,17 @@ use super::{PublicCatalog, SessionFileViews};
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
-pub(crate) type SqlJsonReader<S> = JsonStoreReader<S>;
 
 #[derive(Clone)]
 pub(crate) struct HistoryQuerySource<S> {
     pub(crate) store: S,
     pub(crate) json_reader: JsonStoreReader<S>,
+    /// Active-branch head pinned by the SQL session that owns this provider.
+    ///
+    /// History scans use this commit when the query does not provide an
+    /// explicit time-travel anchor. Keeping it beside the snapshot-scoped JSON
+    /// reader prevents a later branch-head lookup from mixing snapshots.
+    pub(crate) default_as_of_commit_id: String,
 }
 
 #[derive(Clone)]
@@ -62,7 +67,10 @@ pub(crate) trait SqlExecutionContext {
         Arc::new(UncachedFilesystemPathIndexReader::new(self.live_state()))
     }
     fn functions(&self) -> FunctionProviderHandle;
-    fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore>;
+    fn history_query_source(
+        &self,
+        default_as_of_commit_id: String,
+    ) -> SqlHistoryQuerySource<Self::ReadStore>;
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;

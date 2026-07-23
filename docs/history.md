@@ -95,12 +95,17 @@ WHERE lixcol_version_id = $1;
 SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_snapshot_content,
        lixcol_depth, lixcol_observed_commit_id, lixcol_is_deleted
 FROM lix_state_history
-WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()
-  AND lixcol_depth >= 0
+WHERE lixcol_depth >= 0
 ORDER BY lixcol_depth, lixcol_schema_key, lixcol_entity_pk;
 ```
 
 `lixcol_depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `lixcol_schema_key` or `lixcol_entity_pk` to narrow.
+
+History starts at the active branch head pinned for the statement or coherent
+read batch. Use exact equality or a non-empty `IN` predicate on
+`lixcol_as_of_commit_id` for time travel. Ranges, `LIKE`, `NOT IN`, expressions
+around the anchor, and mixed `OR` conditions are rejected instead of silently
+falling back to the pinned head.
 
 For filesystem history, `lix_file_history` and `lix_directory_history` expose
 logical projection revisions. A directory change is visible in every

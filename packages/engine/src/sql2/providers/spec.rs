@@ -214,6 +214,15 @@ pub(super) trait TableSpec: Send + Sync + 'static {
         TableProviderFilterPushDown::Unsupported
     }
 
+    /// Rejects filters that would be unsafe to leave as residual expressions.
+    ///
+    /// Most providers accept every well-typed filter and keep the default.
+    /// History providers use this hook to prevent an unrouteable time-travel
+    /// anchor from being mistaken for an anchor-free active-head query.
+    fn validate_filter_pushdown(&self, _filter: &Expr) -> Result<()> {
+        Ok(())
+    }
+
     /// `props` are the session's execution properties, for specs that compile
     /// pushed-down filters to physical expressions at plan time.
     async fn plan_scan(
@@ -438,10 +447,13 @@ impl TableProvider for SpecTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
+        filters
             .iter()
-            .map(|filter| self.spec.filter_pushdown(filter))
-            .collect())
+            .map(|filter| {
+                self.spec.validate_filter_pushdown(filter)?;
+                Ok(self.spec.filter_pushdown(filter))
+            })
+            .collect()
     }
 
     async fn scan(

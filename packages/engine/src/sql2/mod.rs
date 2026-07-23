@@ -35,7 +35,7 @@ pub(crate) use bind::{
 pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource, SqlJsonReader, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
+    SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};

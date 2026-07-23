@@ -12,7 +12,7 @@ use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 
-use super::SqlJsonReader;
+use super::SqlHistoryQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -29,6 +29,11 @@ pub(crate) struct HistoryRoute {
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<i64>,
     pub(crate) max_depth: Option<i64>,
+    /// An anchor column appeared in a predicate that cannot be routed exactly.
+    ///
+    /// This must be rejected rather than treated as an anchor-free query,
+    /// because anchor-free queries default to the pinned active head.
+    pub(crate) invalid_as_of_commit_filter: bool,
     pub(crate) contradictory: bool,
 }
 
@@ -36,9 +41,22 @@ impl HistoryRoute {
     pub(crate) fn from_filters(filters: &[Expr]) -> Self {
         let mut route = Self::default();
         for filter in filters {
+            route.invalid_as_of_commit_filter |= !history_anchor_filter_is_exact(filter);
             apply_history_filter(filter, &mut route);
         }
         route
+    }
+
+    /// Materializes the session-pinned head when no explicit time-travel
+    /// anchor was routed.
+    ///
+    /// Filesystem history consumers inspect the route before loading rows to
+    /// resolve commit parents and ancestor projection changes, so the default
+    /// must be visible on the route itself rather than only inside the loader.
+    pub(crate) fn default_to_as_of_commit_id(&mut self, commit_id: &str) {
+        if self.as_of_commit_ids.is_empty() && !self.invalid_as_of_commit_filter {
+            self.as_of_commit_ids.push(commit_id.to_string());
+        }
     }
 
     /// Returns the part of the route that is safe to apply before a shaped
@@ -53,6 +71,7 @@ impl HistoryRoute {
             as_of_commit_ids: self.as_of_commit_ids.clone(),
             min_depth: self.min_depth,
             max_depth: self.max_depth,
+            invalid_as_of_commit_filter: self.invalid_as_of_commit_filter,
             contradictory: self.contradictory,
             ..Self::default()
         }
@@ -66,6 +85,7 @@ impl HistoryRoute {
     pub(crate) fn anchors_only(&self) -> Self {
         Self {
             as_of_commit_ids: self.as_of_commit_ids.clone(),
+            invalid_as_of_commit_filter: self.invalid_as_of_commit_filter,
             contradictory: self.contradictory,
             ..Self::default()
         }
@@ -259,6 +279,37 @@ pub(crate) fn parse_history_filter(expr: &Expr) -> Option<()> {
     parse_history_filter_terms(expr).map(|_| ())
 }
 
+/// Rejects an anchor predicate unless every occurrence can be routed exactly.
+///
+/// Without this validation an unsupported predicate could be left for
+/// DataFusion as a residual filter while the provider silently defaulted its
+/// traversal to the active head. That would make a time-travel query inspect
+/// the wrong commit before the residual predicate removed the rows.
+pub(crate) fn validate_history_anchor_filter(expr: &Expr) -> Result<(), LixError> {
+    if history_anchor_filter_is_exact(expr) {
+        return Ok(());
+    }
+    Err(invalid_history_anchor_error(
+        HISTORY_COL_AS_OF_COMMIT_ID,
+        None,
+    ))
+}
+
+/// Planning-time counterpart to [`validate_history_anchor_filter`].
+///
+/// Logical plans still contain bound placeholders before DataFusion prepares
+/// the physical scan, so this validates the exact routing *shape* while the
+/// provider-level validation later verifies the resolved commit-id values.
+pub(crate) fn validate_history_anchor_filter_shape(expr: &Expr) -> Result<(), LixError> {
+    if history_anchor_filter_shape_is_exact(expr) {
+        return Ok(());
+    }
+    Err(invalid_history_anchor_error(
+        HISTORY_COL_AS_OF_COMMIT_ID,
+        None,
+    ))
+}
+
 pub(crate) fn commit_graph_history_request(
     route: &HistoryRoute,
     schema_keys: Vec<String>,
@@ -285,7 +336,7 @@ pub(crate) fn commit_graph_history_request(
 pub(crate) async fn load_history_entries<S>(
     descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    mut json_reader: SqlJsonReader<S>,
+    query_source: SqlHistoryQuerySource<S>,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
     metadata_projection: HistoryMetadataProjection,
@@ -293,28 +344,27 @@ pub(crate) async fn load_history_entries<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    if route.invalid_as_of_commit_filter {
+        return Err(invalid_history_anchor_error(
+            descriptor.as_of_commit_column,
+            Some(descriptor.view_name),
+        ));
+    }
     if route.is_contradictory() {
         return Ok(Vec::new());
-    }
-    if route.as_of_commit_ids.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_HISTORY_FILTER_REQUIRED,
-            format!(
-                "{} requires a {} filter",
-                descriptor.view_name, descriptor.as_of_commit_column
-            ),
-        )
-        .with_hint(format!(
-            "Use WHERE {} = lix_active_branch_commit_id() to inspect {} from the active branch head.",
-            descriptor.as_of_commit_column, descriptor.view_name
-        )));
     }
     let Some(request) = commit_graph_history_request(route, schema_keys) else {
         return Ok(Vec::new());
     };
+    let as_of_commit_ids = if route.as_of_commit_ids.is_empty() {
+        std::slice::from_ref(&query_source.default_as_of_commit_id)
+    } else {
+        route.as_of_commit_ids.as_slice()
+    };
+    let mut json_reader = query_source.json_reader;
 
     let mut rows = Vec::new();
-    for as_of_commit_id in &route.as_of_commit_ids {
+    for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
         let (entries, reachable_commits) = {
@@ -370,6 +420,22 @@ where
     }
 
     Ok(rows)
+}
+
+pub(crate) fn invalid_history_anchor_error(
+    as_of_commit_column: &str,
+    view_name: Option<&str>,
+) -> LixError {
+    let surface = view_name.map_or_else(String::new, |view_name| format!("{view_name}: "));
+    LixError::new(
+        LixError::CODE_UNSUPPORTED_SQL,
+        format!(
+            "{surface}history anchor '{as_of_commit_column}' only supports exact equality or non-empty IN predicates"
+        ),
+    )
+    .with_hint(format!(
+        "Omit {as_of_commit_column} to use the pinned active branch head, or use WHERE {as_of_commit_column} = $1 (or {as_of_commit_column} IN ($1, $2)) for time travel."
+    ))
 }
 
 fn effective_schema_keys(
@@ -490,11 +556,12 @@ fn merge_history_disjunction_terms(
 fn parse_history_binary_filter(
     binary_expr: &datafusion::logical_expr::BinaryExpr,
 ) -> Option<HistoryFilterTerm> {
-    let Expr::Column(column) = &*binary_expr.left else {
-        return None;
+    let (column, right) = match (&*binary_expr.left, &binary_expr.op, &*binary_expr.right) {
+        (Expr::Column(column), _, right) => (column, right),
+        (left, Operator::Eq, Expr::Column(column)) => (column, left),
+        _ => return None,
     };
     let column_name = canonical_history_column_name(column.name.as_str())?;
-    let right = &*binary_expr.right;
     match (column_name, &binary_expr.op, right) {
         (
             "as_of_commit_id" | "schema_key" | "file_id",
@@ -526,6 +593,103 @@ fn parse_history_binary_filter(
         }
         _ => None,
     }
+}
+
+fn history_anchor_filter_is_exact(expr: &Expr) -> bool {
+    if !history_filter_references_anchor(expr) {
+        return true;
+    }
+
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            history_anchor_filter_is_exact(&binary_expr.left)
+                && history_anchor_filter_is_exact(&binary_expr.right)
+        }
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => matches!(
+            parse_history_disjunction(binary_expr).as_deref(),
+            Some([HistoryFilterTerm::AsOfCommitIds(_)])
+        ),
+        Expr::BinaryExpr(binary_expr) => matches!(
+            parse_history_binary_filter(binary_expr),
+            Some(HistoryFilterTerm::AsOfCommitIds(_))
+        ),
+        Expr::InList(in_list) => matches!(
+            parse_history_in_list_filter(in_list),
+            Some(HistoryFilterTerm::AsOfCommitIds(_))
+        ),
+        _ => false,
+    }
+}
+
+fn history_anchor_filter_shape_is_exact(expr: &Expr) -> bool {
+    if !history_filter_references_anchor(expr) {
+        return true;
+    }
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            history_anchor_filter_shape_is_exact(&binary_expr.left)
+                && history_anchor_filter_shape_is_exact(&binary_expr.right)
+        }
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+            exact_anchor_disjunction_shape(expr)
+        }
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
+            exact_anchor_equality_shape(binary_expr)
+        }
+        Expr::InList(in_list) => {
+            !in_list.negated
+                && !in_list.list.is_empty()
+                && matches!(
+                    in_list.expr.as_ref(),
+                    Expr::Column(column)
+                        if canonical_history_column_name(column.name.as_str())
+                            == Some("as_of_commit_id")
+                )
+                && in_list.list.iter().all(routable_anchor_value_shape)
+        }
+        _ => false,
+    }
+}
+
+fn exact_anchor_disjunction_shape(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+            exact_anchor_disjunction_shape(&binary_expr.left)
+                && exact_anchor_disjunction_shape(&binary_expr.right)
+        }
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
+            exact_anchor_equality_shape(binary_expr)
+        }
+        Expr::InList(_) => history_anchor_filter_shape_is_exact(expr),
+        _ => false,
+    }
+}
+
+fn exact_anchor_equality_shape(binary_expr: &datafusion::logical_expr::BinaryExpr) -> bool {
+    match (&*binary_expr.left, &*binary_expr.right) {
+        (Expr::Column(column), value) | (value, Expr::Column(column)) => {
+            canonical_history_column_name(column.name.as_str()) == Some("as_of_commit_id")
+                && routable_anchor_value_shape(value)
+        }
+        _ => false,
+    }
+}
+
+fn routable_anchor_value_shape(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ScalarValue::Utf8(Some(_)), _) | Expr::Placeholder(_)
+    ) || matches!(
+        expr,
+        Expr::ScalarFunction(function)
+            if function.name() == "lix_active_branch_commit_id" && function.args.is_empty()
+    )
+}
+
+fn history_filter_references_anchor(expr: &Expr) -> bool {
+    expr.column_refs().iter().any(|column| {
+        canonical_history_column_name(column.name.as_str()) == Some("as_of_commit_id")
+    })
 }
 
 fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
@@ -678,6 +842,7 @@ mod tests {
     };
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
+    use crate::sql2::HistoryQuerySource;
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
     };
@@ -778,7 +943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_loader_skips_unprojected_commit_metadata_walk() {
+    async fn history_loader_defaults_to_pinned_head_without_metadata_walk() {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
         let start_commit_id = CommitId::for_test_label("start");
         let rows = load_history_entries(
@@ -787,11 +952,8 @@ mod tests {
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
-            empty_json_reader().await,
-            &HistoryRoute {
-                as_of_commit_ids: vec![start_commit_id.to_string()],
-                ..HistoryRoute::default()
-            },
+            empty_history_query_source(start_commit_id).await,
+            &HistoryRoute::default(),
             vec!["message".to_string()],
             HistoryMetadataProjection::default(),
         )
@@ -818,7 +980,7 @@ mod tests {
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
-            empty_json_reader().await,
+            empty_history_query_source(start_commit_id).await,
             &HistoryRoute {
                 as_of_commit_ids: vec![start_commit_id.to_string()],
                 ..HistoryRoute::default()
@@ -857,7 +1019,7 @@ mod tests {
                 start_commit_id: as_of_commit_id,
                 include_reachable_commit: false,
             }))),
-            empty_json_reader().await,
+            empty_history_query_source(as_of_commit_id).await,
             &HistoryRoute {
                 as_of_commit_ids: vec![as_of_commit_id.to_string()],
                 ..HistoryRoute::default()
@@ -955,14 +1117,20 @@ mod tests {
         crate::common::LixTimestamp::expect_parse("commit timestamp", "2026-07-12T00:00:00Z")
     }
 
-    async fn empty_json_reader() -> crate::sql2::SqlJsonReader<SharedStorageAdapterRead<MemoryRead>>
-    {
+    async fn empty_history_query_source(
+        default_as_of_commit_id: CommitId,
+    ) -> HistoryQuerySource<SharedStorageAdapterRead<MemoryRead>> {
         let storage = StorageAdapter::new(Memory::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        JsonStoreContext::new().reader(SharedStorageAdapterRead::new(read_scope))
+        let read_scope = SharedStorageAdapterRead::new(read_scope);
+        HistoryQuerySource {
+            store: read_scope.clone(),
+            json_reader: JsonStoreContext::new().reader(read_scope),
+            default_as_of_commit_id: default_as_of_commit_id.to_string(),
+        }
     }
 
     fn and(left: Expr, right: Expr) -> Expr {

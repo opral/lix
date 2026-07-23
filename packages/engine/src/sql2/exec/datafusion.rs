@@ -29,6 +29,7 @@ use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurfa
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
+use crate::sql2::history_route::validate_history_anchor_filter_shape;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
@@ -138,6 +139,7 @@ async fn create_logical_plan_in_session_from_parsed(
     let plan = create_logical_plan_from_statement(&session.session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
+    validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
@@ -175,6 +177,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
+    validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
@@ -250,6 +253,43 @@ fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> 
         params.extend(json_predicate_params_in_logical_plan(input));
     }
     params
+}
+
+fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    fn visit(plan: &LogicalPlan, inherited_filters: &[Expr]) -> Result<(), LixError> {
+        match plan {
+            LogicalPlan::Filter(filter) => {
+                let mut filters = inherited_filters.to_vec();
+                filters.push(filter.predicate.clone());
+                visit(&filter.input, &filters)
+            }
+            LogicalPlan::TableScan(scan) => {
+                let table_name = table_reference_name(&scan.table_name);
+                if !table_name.ends_with("_history") {
+                    return Ok(());
+                }
+                if scan
+                    .source
+                    .schema()
+                    .field_with_name("lixcol_as_of_commit_id")
+                    .is_ok()
+                {
+                    for filter in inherited_filters.iter().chain(&scan.filters) {
+                        validate_history_anchor_filter_shape(filter)?;
+                    }
+                }
+                Ok(())
+            }
+            other => {
+                for input in other.inputs() {
+                    visit(input, inherited_filters)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    visit(plan, &[])
 }
 
 async fn execute_logical_plan(
@@ -1902,12 +1942,16 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
+        fn history_query_source(
+            &self,
+            default_as_of_commit_id: String,
+        ) -> SqlHistoryQuerySource<Self::ReadStore> {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             HistoryQuerySource {
                 store: read_scope.clone(),
                 json_reader: JsonStoreContext::new().reader(read_scope),
+                default_as_of_commit_id,
             }
         }
 
