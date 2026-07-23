@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobHash;
 use crate::common::LixError;
-use crate::wasm::v2::WasmComponentV2Factory;
-use crate::wasm::v2::WasmTransitionCounters;
+use crate::wasm::WasmComponentV2Factory;
+use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{WasmComponentInstance, WasmLimits, WasmPluginEntityState, WasmRuntime};
 
 use super::{

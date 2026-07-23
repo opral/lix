@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
-use crate::common::{LixPath, compose_file_path};
+use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
@@ -48,9 +48,9 @@ use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
     PluginActorColdOpen, PluginActorKey, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     PluginRuntime, PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
-    is_plugin_storage_path, plugin_key_from_archive_file_id, plugin_key_from_archive_path,
-    plugin_state_live_state_projection, plugin_storage_archive_file_id,
-    render_plugin_state_with_component_instance,
+    inferred_media_type_for_path, is_plugin_storage_path, plugin_key_from_archive_file_id,
+    plugin_key_from_archive_path, plugin_state_live_state_projection,
+    plugin_storage_archive_file_id, render_plugin_state_with_component_instance,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -67,7 +67,7 @@ use crate::sql2::write_normalization::{
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::WasmComponentInstance;
-use crate::wasm::v2::{
+use crate::wasm::{
     WasmComponentV2Factory, WasmFileDescriptor, WasmHostBytes, WasmHostEntity,
     WasmOpenEntitiesInput, WasmPluginSelection, WasmTransitionLimits,
 };
@@ -1927,10 +1927,10 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         String,
         Vec<u8>,
         Option<TransactionJson>,
-        Option<crate::session::RequestBlobSpliceProvenance>,
+        Option<RequestBlobSpliceProvenance>,
     )>,
     conflict: FastLixFilePathWriteConflict,
-    mutation_identity: Option<crate::session::MutationIdentity>,
+    mutation_identity: Option<MutationIdentity>,
 ) -> Result<Option<u64>, LixError> {
     if writes.is_empty() {
         return Ok(Some(0));
@@ -2183,7 +2183,7 @@ async fn stage_indexed_file_path_writes(
     writes: Vec<FastLixFilePathWrite>,
     mut indexed: IndexedFilePathWrites,
     conflict: FastLixFilePathWriteConflict,
-    mutation_identity: Option<crate::session::MutationIdentity>,
+    mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
     debug_assert_eq!(writes.len(), indexed.existing.len());
     debug_assert!(matches!(
@@ -2343,8 +2343,8 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
     data: Vec<u8>,
-    splice_provenance: Option<crate::session::RequestBlobSpliceProvenance>,
-    mutation_identity: Option<crate::session::MutationIdentity>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
@@ -2431,7 +2431,7 @@ struct FastLixFilePathWrite {
     parsed: ParsedFileWritePath,
     data: Vec<u8>,
     metadata: Option<TransactionJson>,
-    splice_provenance: Option<crate::session::RequestBlobSpliceProvenance>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
 }
 
 fn parse_fast_lix_file_path_writes(
@@ -2439,7 +2439,7 @@ fn parse_fast_lix_file_path_writes(
         String,
         Vec<u8>,
         Option<TransactionJson>,
-        Option<crate::session::RequestBlobSpliceProvenance>,
+        Option<RequestBlobSpliceProvenance>,
     )>,
 ) -> std::result::Result<Vec<FastLixFilePathWrite>, LixError> {
     writes
@@ -2458,8 +2458,8 @@ fn parse_fast_lix_file_path_writes(
 
 fn attach_fast_file_write_metadata(
     file_data: &mut [TransactionFileData],
-    splice_provenance: Option<crate::session::RequestBlobSpliceProvenance>,
-    mutation_identity: Option<crate::session::MutationIdentity>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
 ) {
     for file_data in file_data {
         file_data.set_splice_provenance(splice_provenance.clone());
@@ -4530,7 +4530,7 @@ async fn cold_open_materialized_v2_actor(
     let mut entities = rows
         .into_iter()
         .map(|row| WasmHostEntity {
-            key: crate::wasm::v2::WasmEntityKey {
+            key: crate::wasm::WasmEntityKey {
                 schema_key: row.schema_key,
                 entity_pk: row.entity_pk.into_parts(),
             },
@@ -4640,7 +4640,7 @@ async fn resolve_v2_factory(
 fn v2_read_descriptor(path: &str, plugin: &PluginRegistryEntry) -> WasmFileDescriptor {
     WasmFileDescriptor {
         path: Some(path.to_string()),
-        media_type: Some("text/csv".to_string()),
+        media_type: inferred_media_type_for_path(Some(path)).map(str::to_owned),
         plugin: WasmPluginSelection {
             plugin_key: plugin.key().to_string(),
             generation: plugin.archive_blob_hash().to_string(),
@@ -10532,7 +10532,7 @@ mod tests {
         assert!(file_data[0].had_blob_ref);
         assert!(file_data[0].splice_provenance().is_none());
 
-        let provenance = crate::session::RequestBlobSpliceProvenance {
+        let provenance = crate::common::RequestBlobSpliceProvenance {
             base_sha256: "a".repeat(64),
             result_sha256: "b".repeat(64),
             prefix_bytes: 1,
@@ -10544,7 +10544,7 @@ mod tests {
             Some("file-readme".to_string()),
             b"next".to_vec(),
             Some(provenance.clone()),
-            Some(crate::session::MutationIdentity {
+            Some(crate::common::MutationIdentity {
                 namespace_seed: [7; 16],
                 operation_proof: [17; 32],
             }),
@@ -10560,7 +10560,7 @@ mod tests {
         assert_eq!(file_data[0].splice_provenance(), Some(&provenance));
         assert_eq!(
             file_data[0].mutation_identity(),
-            Some(crate::session::MutationIdentity {
+            Some(crate::common::MutationIdentity {
                 namespace_seed: [7; 16],
                 operation_proof: [17; 32],
             })
@@ -10635,14 +10635,14 @@ mod tests {
     #[tokio::test]
     async fn fast_file_path_upsert_mixes_existing_and_missing_without_full_scan() {
         let old_data = b"old";
-        let existing_provenance = crate::session::RequestBlobSpliceProvenance {
+        let existing_provenance = crate::common::RequestBlobSpliceProvenance {
             base_sha256: "a".repeat(64),
             result_sha256: "b".repeat(64),
             prefix_bytes: 1,
             suffix_bytes: 1,
             insert: b"existing".to_vec(),
         };
-        let missing_provenance = crate::session::RequestBlobSpliceProvenance {
+        let missing_provenance = crate::common::RequestBlobSpliceProvenance {
             base_sha256: "c".repeat(64),
             result_sha256: "d".repeat(64),
             prefix_bytes: 2,
@@ -10685,7 +10685,7 @@ mod tests {
                 ),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
-            Some(crate::session::MutationIdentity {
+            Some(crate::common::MutationIdentity {
                 namespace_seed: [8; 16],
                 operation_proof: [18; 32],
             }),
@@ -10711,7 +10711,7 @@ mod tests {
         assert_eq!(file_data[1].splice_provenance(), Some(&missing_provenance));
         assert!(file_data.iter().all(|file_data| {
             file_data.mutation_identity()
-                == Some(crate::session::MutationIdentity {
+                == Some(crate::common::MutationIdentity {
                     namespace_seed: [8; 16],
                     operation_proof: [18; 32],
                 })

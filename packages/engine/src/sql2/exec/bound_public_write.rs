@@ -1,10 +1,9 @@
 use serde_json::Value as JsonValue;
 
 use crate::changelog::CommitId;
-use crate::common::validate_row_metadata;
+use crate::common::{ExecuteStatementMetadata, RequestBlobSpliceProvenance, validate_row_metadata};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
-use crate::session::ExecuteStatementMetadata;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -101,7 +100,7 @@ async fn execute_file_data_update(
 fn fast_file_data_update_splice_provenance(
     shape: &FastFileDataUpdateShape,
     metadata: &ExecuteStatementMetadata,
-) -> Option<crate::session::RequestBlobSpliceProvenance> {
+) -> Option<RequestBlobSpliceProvenance> {
     shape
         .data_parameter_index
         .and_then(|index| metadata.blob_splice_for_parameter(index))
@@ -294,7 +293,7 @@ async fn execute_file_path_write(
 fn fast_file_blob_expr_splice_provenance(
     expr: &BoundExpr,
     metadata: &ExecuteStatementMetadata,
-) -> Option<crate::session::RequestBlobSpliceProvenance> {
+) -> Option<RequestBlobSpliceProvenance> {
     let BoundExpr::Param(param) = expr else {
         return None;
     };
@@ -2001,7 +2000,7 @@ mod splice_provenance_tests {
         BoundExpr, FastFileDataUpdateShape, fast_file_blob_expr_splice_provenance,
         fast_file_data_update_splice_provenance,
     };
-    use crate::session::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
+    use crate::common::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
     use crate::sql2::bind::expr::BoundParamRef;
 
     fn splice(label: &str) -> RequestBlobSpliceProvenance {

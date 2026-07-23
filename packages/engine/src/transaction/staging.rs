@@ -1385,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn staged_writes_drain_preserves_file_data_payloads() {
         let staged_writes = test_staged_writes();
-        let provenance = crate::session::RequestBlobSpliceProvenance {
+        let provenance = crate::common::RequestBlobSpliceProvenance {
             base_sha256: "a".repeat(64),
             result_sha256: "b".repeat(64),
             prefix_bytes: 2,

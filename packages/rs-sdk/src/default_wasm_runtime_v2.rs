@@ -862,6 +862,7 @@ impl WasmComponentV2Factory for WasmtimeV2Factory {
         // `create_store` installs this only for an explicit component timeout;
         // v2's mandatory transition deadline needs the same trapping behavior.
         store.epoch_deadline_trap();
+        reset_standalone_call_limits(&mut store, self.limits)?;
         let bindings = bindings::Plugin::instantiate(&mut store, &self.component, &self.linker)
             .map_err(|error| wasm_runtime_error("failed to instantiate v2 plugin actor", error))?;
         let guest = bindings.lix_plugin_api().clone();
@@ -1322,6 +1323,23 @@ impl WasmtimeV2Actor {
         Ok(budget_rep)
     }
 
+    /// Re-arms Wasmtime's epoch deadline before a guest destructor that is
+    /// owned by an active transition. This deliberately does not reset fuel:
+    /// cleanup remains part of the transition's aggregate execution budget.
+    fn prepare_transition_resource_drop(&mut self, budget: &SharedBudget) -> Result<(), LixError> {
+        let limits = self.limits;
+        let result = self
+            .store
+            .as_mut()
+            .ok_or_else(|| v2_invalid_plugin("v2 plugin actor has been retired"))
+            .and_then(|store| set_transition_deadline(store, budget, limits));
+        if let Err(error) = result {
+            self.retire_now();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn push_byte_source(
         &mut self,
         source: Arc<dyn WasmByteSource>,
@@ -1363,6 +1381,20 @@ impl WasmtimeV2Actor {
             .get(&transition)
             .map(|transition| transition.budget.clone())
             .ok_or_else(|| v2_invalid_plugin("unknown v2 transition handle"))
+    }
+
+    /// Gives a guest call made outside a top-level transition fresh component
+    /// fuel and a bounded epoch deadline. In particular, an accepted document
+    /// may sit idle longer than the preceding transition's deadline before the
+    /// next warm write forks it.
+    fn prepare_standalone_guest_call(&mut self) -> Result<(), LixError> {
+        if !self.transitions.is_empty() {
+            return Err(v2_invalid_plugin(
+                "v2 standalone guest call cannot run during an active transition",
+            ));
+        }
+        let limits = self.limits;
+        reset_standalone_call_limits(self.store_mut()?, limits)
     }
 
     fn retire_with_error(&mut self, context: &str, error: impl fmt::Display) -> LixError {
@@ -1459,6 +1491,7 @@ impl WasmtimeV2Actor {
             }
         }
         for resource in resources {
+            self.prepare_transition_resource_drop(&active.budget)?;
             if let Err(error) = resource.resource_drop(self.store_mut()?) {
                 return Err(
                     self.retire_with_error("failed to discard v2 transition resource", error)
@@ -1550,6 +1583,7 @@ impl WasmtimeV2Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const LARGE_CSV_ROWS: u32 = 220_000;
 
@@ -1576,6 +1610,22 @@ mod tests {
                 .get(start..end)
                 .map(ToOwned::to_owned)
                 .ok_or_else(|| v2_invalid_plugin("test byte-source range is out of bounds"))
+        }
+    }
+
+    struct DelayedLenByteSource {
+        bytes: Arc<Vec<u8>>,
+        delay: Duration,
+    }
+
+    impl WasmByteSource for DelayedLenByteSource {
+        fn len(&self) -> u64 {
+            std::thread::sleep(self.delay);
+            self.bytes.len() as u64
+        }
+
+        fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
+            TestByteSource(self.bytes.clone()).read(offset, length)
         }
     }
 
@@ -1673,19 +1723,23 @@ mod tests {
         bytes
     }
 
-    async fn csv_test_actor() -> Box<dyn WasmComponentV2Actor> {
+    async fn csv_test_actor_with_limits(limits: WasmLimits) -> Box<dyn WasmComponentV2Actor> {
         let wasm_path = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")
             .expect("the CSV v2 artifact dependency must be available");
         let wasm = std::fs::read(wasm_path).expect("CSV v2 component should be readable");
         let runtime = WasmtimePluginRuntime::new().expect("test runtime should initialize");
         let factory = runtime
-            .compile_component_v2(wasm, WasmLimits::default())
+            .compile_component_v2(wasm, limits)
             .await
             .expect("CSV v2 component should compile");
         factory
             .instantiate_actor()
             .await
             .expect("CSV v2 actor should instantiate")
+    }
+
+    async fn csv_test_actor() -> Box<dyn WasmComponentV2Actor> {
+        csv_test_actor_with_limits(WasmLimits::default()).await
     }
 
     async fn open_small_csv(
@@ -1774,6 +1828,125 @@ mod tests {
             .drop_document(retry)
             .await
             .expect("a new transition should start after deterministic cleanup");
+    }
+
+    #[tokio::test]
+    async fn idle_actor_fork_receives_fresh_fuel_and_epoch_deadline() {
+        let mut actor = csv_test_actor_with_limits(WasmLimits {
+            max_fuel: Some(100_000_000),
+            timeout_ms: Some(250),
+            ..WasmLimits::default()
+        })
+        .await;
+        let (accepted, _) = open_small_csv(actor.as_mut()).await;
+
+        // The preceding transition's absolute Wasmtime epoch deadline is now
+        // stale. A persistent actor must refresh limits before invoking the
+        // guest's standalone document.fork export.
+        std::thread::sleep(Duration::from_millis(750));
+        let fork = actor
+            .fork_document(accepted)
+            .await
+            .expect("an idle accepted document should still fork");
+        assert_ne!(fork, accepted);
+
+        // Keep a smoke check for the standalone destructor hardening. The CSV
+        // destructor is trivial, so the fork above is the assertion that
+        // independently demonstrates stale-deadline recovery.
+        std::thread::sleep(Duration::from_millis(750));
+        actor
+            .drop_document(fork)
+            .await
+            .expect("an idle document destructor should still run");
+        actor
+            .retire()
+            .await
+            .expect("idle test actor should retire cleanly");
+    }
+
+    #[test]
+    fn standalone_call_preparation_restores_configured_fuel() {
+        const MAX_FUEL: u64 = 12_345;
+
+        let engine = create_engine(true, true).expect("test engine should initialize");
+        let limits = WasmLimits {
+            max_fuel: Some(MAX_FUEL),
+            timeout_ms: Some(250),
+            ..WasmLimits::default()
+        };
+        let mut store = create_store(&engine, limits).expect("test Store should initialize");
+        store.set_fuel(0).expect("test should exhaust Store fuel");
+
+        reset_standalone_call_limits(&mut store, limits)
+            .expect("standalone preparation should reset Store limits");
+
+        assert_eq!(
+            store.get_fuel().expect("fuel should be configured"),
+            MAX_FUEL
+        );
+    }
+
+    #[tokio::test]
+    async fn top_level_export_rearms_deadline_after_input_construction() {
+        let mut actor = csv_test_actor_with_limits(WasmLimits {
+            timeout_ms: Some(250),
+            ..WasmLimits::default()
+        })
+        .await;
+        let limits = WasmTransitionLimits::default();
+        let transition = actor
+            .open_file(
+                limits,
+                WasmOpenFileInput {
+                    descriptor: memory_probe_descriptor(),
+                    file: Arc::new(DelayedLenByteSource {
+                        bytes: Arc::new(b"a,b\n".to_vec()),
+                        delay: Duration::from_millis(750),
+                    }),
+                    ids: WasmIdNamespace {
+                        high: 0x4c49_5832,
+                        low: 8,
+                    },
+                },
+            )
+            .await
+            .expect("guest export should receive a fresh component deadline");
+        actor
+            .discard_transition(transition.transition)
+            .await
+            .expect("fresh transition should discard cleanly");
+        assert!(!actor.is_retired());
+    }
+
+    #[tokio::test]
+    async fn expired_transition_cleanup_retires_before_guest_destructor() {
+        let mut actor = csv_test_actor().await;
+        let limits = WasmTransitionLimits {
+            total_deadline_nanoseconds: 500_000_000,
+            ..WasmTransitionLimits::default()
+        };
+        let transition = actor
+            .open_file(
+                limits,
+                WasmOpenFileInput {
+                    descriptor: memory_probe_descriptor(),
+                    file: Arc::new(TestByteSource(Arc::new(b"a,b\n".to_vec()))),
+                    ids: WasmIdNamespace {
+                        high: 0x4c49_5832,
+                        low: 9,
+                    },
+                },
+            )
+            .await
+            .expect("small CSV should open before its deadline");
+
+        std::thread::sleep(Duration::from_millis(750));
+        let error = actor
+            .discard_transition(transition.transition)
+            .await
+            .expect_err("expired cleanup must not enter a guest destructor");
+        assert!(error.message.contains("deadline"));
+        assert!(actor.is_retired());
     }
 
     #[tokio::test]
@@ -2461,6 +2634,17 @@ fn set_transition_deadline(
     Ok(())
 }
 
+fn reset_standalone_call_limits(
+    store: &mut Store<WasiHostState>,
+    component_limits: WasmLimits,
+) -> Result<(), LixError> {
+    reset_store_limits(store, component_limits)?;
+    let budget = Arc::new(Mutex::new(TransitionBudgetState::new(
+        WasmTransitionLimits::default(),
+    )?));
+    set_transition_deadline(store, &budget, component_limits)
+}
+
 fn descriptor_to_binding(
     descriptor: &WasmFileDescriptor,
 ) -> bindings::exports::lix::plugin::api::FileDescriptor {
@@ -2491,6 +2675,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .documents
             .get(&document.0)
             .ok_or_else(|| v2_invalid_plugin("unknown v2 document handle"))?;
+        self.prepare_standalone_guest_call()?;
         let guest = self.guest.clone();
         let result = guest.document().call_fork(self.store_mut()?, resource);
         let fork = match result {
@@ -2509,7 +2694,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         limits: WasmTransitionLimits,
         input: WasmOpenFileInput,
     ) -> Result<WasmFileTransition, LixError> {
-        let (transition, budget_resource) = self.begin_transition(limits, None)?;
+        let (transition, _budget_resource) = self.begin_transition(limits, None)?;
         let budget = self.transition_budget(transition)?;
         let file = self.push_byte_source(input.file, &budget)?;
         let binding_input = bindings::exports::lix::plugin::api::OpenFileInput {
@@ -2518,9 +2703,16 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             ids: ids_to_binding(input.ids),
         };
         let guest = self.guest.clone();
+        let budget_rep = match self.prepare_nested_call(transition) {
+            Ok(budget_rep) => budget_rep,
+            Err(error) => {
+                self.retire_now();
+                return Err(error);
+            }
+        };
         let result = guest.call_open_file(
             self.store_mut()?,
-            Resource::new_borrow(budget_resource.rep()),
+            Resource::new_borrow(budget_rep),
             &binding_input,
         );
         let value = match result {
@@ -2540,7 +2732,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         limits: WasmTransitionLimits,
         input: WasmOpenEntitiesInput,
     ) -> Result<WasmEntityTransition, LixError> {
-        let (transition, budget_resource) = self.begin_transition(limits, None)?;
+        let (transition, _budget_resource) = self.begin_transition(limits, None)?;
         let budget = self.transition_budget(transition)?;
         let entities =
             self.push_packet_source(PacketSourceValue::Entities(input.entities), &budget)?;
@@ -2549,9 +2741,16 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             entities,
         };
         let guest = self.guest.clone();
+        let budget_rep = match self.prepare_nested_call(transition) {
+            Ok(budget_rep) => budget_rep,
+            Err(error) => {
+                self.retire_now();
+                return Err(error);
+            }
+        };
         let result = guest.call_open_entities(
             self.store_mut()?,
-            Resource::new_borrow(budget_resource.rep()),
+            Resource::new_borrow(budget_rep),
             &binding_input,
         );
         let value = match result {
@@ -2577,7 +2776,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .documents
             .get(&document.0)
             .ok_or_else(|| v2_invalid_plugin("unknown v2 document handle"))?;
-        let (transition, budget_resource) = self.begin_transition(limits, Some(document.0))?;
+        let (transition, _budget_resource) = self.begin_transition(limits, Some(document.0))?;
         let budget = self.transition_budget(transition)?;
         let before = self.push_byte_source(update.before, &budget)?;
         let after = self.push_byte_source(update.after, &budget)?;
@@ -2611,10 +2810,17 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             ids: ids_to_binding(update.ids),
         };
         let guest = self.guest.clone();
+        let budget_rep = match self.prepare_nested_call(transition) {
+            Ok(budget_rep) => budget_rep,
+            Err(error) => {
+                self.retire_now();
+                return Err(error);
+            }
+        };
         let result = guest.document().call_file_changed(
             self.store_mut()?,
             document_resource,
-            Resource::new_borrow(budget_resource.rep()),
+            Resource::new_borrow(budget_rep),
             &binding_update,
         );
         let value = match result {
@@ -2641,7 +2847,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .get(&document.0)
             .ok_or_else(|| v2_invalid_plugin("unknown v2 document handle"))?;
         let base_len = update.before.len();
-        let (transition, budget_resource) = self.begin_transition(limits, Some(document.0))?;
+        let (transition, _budget_resource) = self.begin_transition(limits, Some(document.0))?;
         let budget = self.transition_budget(transition)?;
         let before = self.push_byte_source(update.before, &budget)?;
         let changes =
@@ -2663,10 +2869,17 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             current_entities,
         };
         let guest = self.guest.clone();
+        let budget_rep = match self.prepare_nested_call(transition) {
+            Ok(budget_rep) => budget_rep,
+            Err(error) => {
+                self.retire_now();
+                return Err(error);
+            }
+        };
         let result = guest.document().call_entities_changed(
             self.store_mut()?,
             document_resource,
-            Resource::new_borrow(budget_resource.rep()),
+            Resource::new_borrow(budget_rep),
             &binding_update,
         );
         let value = match result {
@@ -3089,6 +3302,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .chain(edit_resources)
             .chain(output_resources)
         {
+            self.prepare_transition_resource_drop(&active.budget)?;
             if let Err(error) = resource.resource_drop(self.store_mut()?) {
                 return Err(self.retire_with_error("failed to drop v2 guest resource", error));
             }
@@ -3105,21 +3319,28 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 .budget
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.check_active()?;
-            state.finished = true;
-            state.counters.guest_linear_memory_high_water_bytes = state
-                .counters
-                .guest_linear_memory_high_water_bytes
-                .max(guest_linear_memory_high_water_bytes);
-            state.counters
+            state.check_active().map(|()| {
+                state.finished = true;
+                state.counters.guest_linear_memory_high_water_bytes = state
+                    .counters
+                    .guest_linear_memory_high_water_bytes
+                    .max(guest_linear_memory_high_water_bytes);
+                state.counters
+            })
         };
-        self.store_mut()?
-            .data_mut()
-            .table
-            .delete(Resource::<TransitionBudgetResource>::new_own(
-                active.budget_rep,
-            ))
-            .map_err(|error| wasm_runtime_error("failed to release v2 transition budget", error))?;
+        let counters = match counters {
+            Ok(counters) => counters,
+            Err(error) => {
+                self.retire_now();
+                return Err(error);
+            }
+        };
+        let result = self.store_mut()?.data_mut().table.delete(
+            Resource::<TransitionBudgetResource>::new_own(active.budget_rep),
+        );
+        if let Err(error) = result {
+            return Err(self.retire_with_error("failed to release v2 transition budget", error));
+        }
         Ok(counters)
     }
 
@@ -3135,10 +3356,14 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
     }
 
     async fn drop_document(&mut self, document: WasmDocumentHandle) -> Result<(), LixError> {
+        if !self.documents.contains_key(&document.0) {
+            return Err(v2_invalid_plugin("unknown v2 document handle"));
+        }
+        self.prepare_standalone_guest_call()?;
         let resource = self
             .documents
             .remove(&document.0)
-            .ok_or_else(|| v2_invalid_plugin("unknown v2 document handle"))?;
+            .expect("v2 document handle was checked before standalone preparation");
         if let Err(error) = resource.resource_drop(self.store_mut()?) {
             return Err(self.retire_with_error("failed to drop v2 document", error));
         }

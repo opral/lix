@@ -11,11 +11,11 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
 use crate::binary_cas::BlobHash;
+use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::session::MutationIdentity;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::wasm::v2::{WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmIdNamespace};
+use crate::wasm::{WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmIdNamespace};
 
 use super::{PluginActorKey, PluginRegistryEntry};
 
@@ -474,7 +474,7 @@ fn invalid_id(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::plugin::{PluginRegistryEntryInput, PluginRuntime};
-    use crate::wasm::v2::{WasmChangeEffect, WasmEntity, WasmHostBytes, WasmMergeGroup};
+    use crate::wasm::{WasmChangeEffect, WasmEntity, WasmHostBytes, WasmMergeGroup};
 
     fn actor_key() -> PluginActorKey {
         PluginActorKey {

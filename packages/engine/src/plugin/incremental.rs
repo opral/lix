@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 
 use crate::LixError;
-use crate::session::RequestBlobSpliceProvenance;
-use crate::wasm::v2::{
+use crate::common::RequestBlobSpliceProvenance;
+use crate::wasm::{
     PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource, WasmChangeDrainValidator,
     WasmChangePage, WasmComponentV2Actor, WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage,
     WasmEntity, WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges, WasmEntityPage,
@@ -802,7 +802,7 @@ fn encoded_merge_group_record_bytes(
     Ok(size)
 }
 
-fn encoded_entity_key_bytes(key: &crate::wasm::v2::WasmEntityKey) -> Result<u64, LixError> {
+fn encoded_entity_key_bytes(key: &crate::wasm::WasmEntityKey) -> Result<u64, LixError> {
     if key.entity_pk.is_empty() {
         return Err(invalid_input("v2 entity primary keys must not be empty"));
     }
@@ -1570,13 +1570,13 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::wasm::v2::{
+    use crate::wasm::{
         WasmChangeCursorHandle, WasmChangeEffect, WasmEditCursorHandle, WasmOpenEntitiesInput,
         WasmOpenFileInput, WasmOutputSplice,
     };
 
-    fn key(id: &str) -> crate::wasm::v2::WasmEntityKey {
-        crate::wasm::v2::WasmEntityKey {
+    fn key(id: &str) -> crate::wasm::WasmEntityKey {
+        crate::wasm::WasmEntityKey {
             schema_key: "csv_row".to_owned(),
             entity_pk: vec![id.to_owned()],
         }
@@ -1844,7 +1844,7 @@ mod tests {
             &mut self,
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
-            _update: crate::wasm::v2::WasmFileUpdate,
+            _update: crate::wasm::WasmFileUpdate,
         ) -> Result<WasmFileTransition, LixError> {
             Err(unused())
         }
@@ -1853,7 +1853,7 @@ mod tests {
             &mut self,
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
-            _update: crate::wasm::v2::WasmEntityUpdate,
+            _update: crate::wasm::WasmEntityUpdate,
         ) -> Result<WasmEntityTransition, LixError> {
             Err(unused())
         }
@@ -2012,7 +2012,7 @@ mod tests {
                 groups: vec![WasmMergeGroup {
                     changes: vec![WasmEntityChange::Upsert {
                         entity: WasmEntity {
-                            key: crate::wasm::v2::WasmEntityKey {
+                            key: crate::wasm::WasmEntityKey {
                                 schema_key: "not_allowed".to_owned(),
                                 entity_pk: vec!["row".to_owned()],
                             },
@@ -2085,7 +2085,7 @@ mod tests {
                 format_version: PACKET_FORMAT_V1,
                 changes: WasmEntityChanges {
                     groups: vec![WasmMergeGroup {
-                        changes: vec![WasmEntityChange::Delete(crate::wasm::v2::WasmEntityKey {
+                        changes: vec![WasmEntityChange::Delete(crate::wasm::WasmEntityKey {
                             schema_key: "not_allowed".to_owned(),
                             entity_pk: vec!["row".to_owned()],
                         })],

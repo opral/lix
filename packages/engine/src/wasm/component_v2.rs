@@ -1,4 +1,4 @@
-//! Host-neutral types for the incremental Wasm Component v2 protocol.
+//! Host-neutral contract for the incremental Wasm Component v2 protocol.
 //!
 //! The Component binding lives in `packages/rs-sdk`; this module deliberately
 //! contains no Wasmtime types. A compiled component factory is shared, while

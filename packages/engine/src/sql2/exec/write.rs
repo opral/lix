@@ -7,7 +7,7 @@ use serde_json::json;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
-use crate::session::ExecuteStatementMetadata;
+use crate::common::ExecuteStatementMetadata;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};

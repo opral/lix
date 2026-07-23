@@ -46,8 +46,8 @@ use crate::plugin::{
     PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist,
     VecEntityChangeSource, VecEntitySource, build_file_update_splices,
     detect_changes_with_component_instance, drain_entity_transition_edits,
-    drain_file_transition_changes, is_plugin_storage_path, is_reservation_key,
-    local_mutation_identity, plugin_install_plan_from_archive_path,
+    drain_file_transition_changes, inferred_media_type_for_path, is_plugin_storage_path,
+    is_reservation_key, local_mutation_identity, plugin_install_plan_from_archive_path,
     plugin_key_from_archive_file_id, plugin_state_live_state_projection,
     require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
     retain_plugin_state_rows_for_schema_keys, transport_splice_preserves_utf8,
@@ -81,7 +81,7 @@ use crate::transaction::types::{
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow, stage_json_from_value,
 };
 use crate::transaction::validation::{TransactionValidationInput, validate_prepared_writes};
-use crate::wasm::v2::{
+use crate::wasm::{
     WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmDocumentHandle, WasmEntity,
     WasmEntityChange, WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes,
     WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
@@ -3289,7 +3289,7 @@ fn v2_file_descriptor(
 ) -> WasmFileDescriptor {
     WasmFileDescriptor {
         path: write.path.clone(),
-        media_type: Some("text/csv".to_string()),
+        media_type: inferred_media_type_for_path(write.path.as_deref()).map(str::to_owned),
         plugin: WasmPluginSelection {
             plugin_key: plugin.key().to_string(),
             generation: plugin.archive_blob_hash().to_string(),
@@ -3300,7 +3300,7 @@ fn v2_file_descriptor(
 fn v2_file_descriptor_from_actor_key(key: &PluginActorKey) -> WasmFileDescriptor {
     WasmFileDescriptor {
         path: Some(key.path.clone()),
-        media_type: Some("text/csv".to_string()),
+        media_type: inferred_media_type_for_path(Some(&key.path)).map(str::to_owned),
         plugin: WasmPluginSelection {
             plugin_key: key.plugin_key.clone(),
             generation: key.plugin_generation.clone(),
@@ -3320,7 +3320,7 @@ fn v2_actor_key_is_descriptor_successor(
 }
 
 #[cfg(test)]
-fn v2_id_namespace(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::v2::WasmIdNamespace {
+fn v2_id_namespace(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmIdNamespace {
     BoundIdNamespace::bind(local_mutation_identity(seed), actor_key).ids()
 }
 
@@ -3375,7 +3375,7 @@ fn v2_host_entities_from_live_rows(
         .into_iter()
         .filter_map(|row| {
             row.snapshot_content.map(|snapshot_content| WasmEntity {
-                key: crate::wasm::v2::WasmEntityKey {
+                key: crate::wasm::WasmEntityKey {
                     schema_key: row.schema_key,
                     entity_pk: row.entity_pk.into_parts(),
                 },
@@ -3982,7 +3982,7 @@ async fn preflight_owned_v2_generation_upgrades(
                 actor.as_mut(),
                 WasmFileDescriptor {
                     path: Some(entry.path.clone()),
-                    media_type: Some("text/csv".to_string()),
+                    media_type: inferred_media_type_for_path(Some(&entry.path)).map(str::to_owned),
                     plugin: WasmPluginSelection {
                         plugin_key: upgrade.replacement.key().to_string(),
                         generation: upgrade.replacement.archive_blob_hash().to_string(),
@@ -4518,7 +4518,7 @@ mod tests {
             &mut self,
             _limits: WasmTransitionLimits,
             _input: WasmOpenFileInput,
-        ) -> Result<crate::wasm::v2::WasmFileTransition, LixError> {
+        ) -> Result<crate::wasm::WasmFileTransition, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
@@ -4526,12 +4526,12 @@ mod tests {
             &mut self,
             _limits: WasmTransitionLimits,
             _input: WasmOpenEntitiesInput,
-        ) -> Result<crate::wasm::v2::WasmEntityTransition, LixError> {
+        ) -> Result<crate::wasm::WasmEntityTransition, LixError> {
             match &self.behavior {
-                UpgradePreflightBehavior::Render(_) => Ok(crate::wasm::v2::WasmEntityTransition {
-                    transition: crate::wasm::v2::WasmTransitionHandle(1),
+                UpgradePreflightBehavior::Render(_) => Ok(crate::wasm::WasmEntityTransition {
+                    transition: crate::wasm::WasmTransitionHandle(1),
                     document: WasmDocumentHandle(2),
-                    edits: crate::wasm::v2::WasmEditCursorHandle(3),
+                    edits: crate::wasm::WasmEditCursorHandle(3),
                 }),
                 UpgradePreflightBehavior::Trap => Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
@@ -4545,7 +4545,7 @@ mod tests {
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
             _update: WasmFileUpdate,
-        ) -> Result<crate::wasm::v2::WasmFileTransition, LixError> {
+        ) -> Result<crate::wasm::WasmFileTransition, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
@@ -4554,26 +4554,26 @@ mod tests {
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
             _update: WasmEntityUpdate,
-        ) -> Result<crate::wasm::v2::WasmEntityTransition, LixError> {
+        ) -> Result<crate::wasm::WasmEntityTransition, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
         async fn next_change_page(
             &mut self,
-            _transition: crate::wasm::v2::WasmTransitionHandle,
-            _cursor: crate::wasm::v2::WasmChangeCursorHandle,
+            _transition: crate::wasm::WasmTransitionHandle,
+            _cursor: crate::wasm::WasmChangeCursorHandle,
             _max_bytes: u32,
-        ) -> Result<Option<crate::wasm::v2::WasmChangePage>, LixError> {
+        ) -> Result<Option<crate::wasm::WasmChangePage>, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
         async fn next_edit_page(
             &mut self,
-            _transition: crate::wasm::v2::WasmTransitionHandle,
-            _cursor: crate::wasm::v2::WasmEditCursorHandle,
+            _transition: crate::wasm::WasmTransitionHandle,
+            _cursor: crate::wasm::WasmEditCursorHandle,
             _max_edits: u32,
             _max_inline_bytes: u32,
-        ) -> Result<Option<crate::wasm::v2::WasmEditPage>, LixError> {
+        ) -> Result<Option<crate::wasm::WasmEditPage>, LixError> {
             if self.emitted {
                 return Ok(None);
             }
@@ -4581,11 +4581,11 @@ mod tests {
             let UpgradePreflightBehavior::Render(bytes) = &self.behavior else {
                 return Err(unused_upgrade_actor_method());
             };
-            Ok(Some(crate::wasm::v2::WasmEditPage {
-                edits: vec![crate::wasm::v2::WasmOutputSplice {
+            Ok(Some(crate::wasm::WasmEditPage {
+                edits: vec![crate::wasm::WasmOutputSplice {
                     offset: 0,
                     delete_len: 0,
-                    insert: crate::wasm::v2::WasmGuestBytes::Inline(bytes.clone()),
+                    insert: crate::wasm::WasmGuestBytes::Inline(bytes.clone()),
                 }],
                 outputs: None,
             }))
@@ -4593,8 +4593,8 @@ mod tests {
 
         async fn output_len(
             &mut self,
-            _transition: crate::wasm::v2::WasmTransitionHandle,
-            _outputs: crate::wasm::v2::WasmByteOutputsHandle,
+            _transition: crate::wasm::WasmTransitionHandle,
+            _outputs: crate::wasm::WasmByteOutputsHandle,
             _index: u32,
         ) -> Result<u64, LixError> {
             Err(unused_upgrade_actor_method())
@@ -4602,8 +4602,8 @@ mod tests {
 
         async fn read_output(
             &mut self,
-            _transition: crate::wasm::v2::WasmTransitionHandle,
-            _outputs: crate::wasm::v2::WasmByteOutputsHandle,
+            _transition: crate::wasm::WasmTransitionHandle,
+            _outputs: crate::wasm::WasmByteOutputsHandle,
             _index: u32,
             _offset: u64,
             _length: u32,
@@ -4613,14 +4613,14 @@ mod tests {
 
         async fn finish_transition(
             &mut self,
-            _transition: crate::wasm::v2::WasmTransitionHandle,
-        ) -> Result<crate::wasm::v2::WasmTransitionCounters, LixError> {
-            Ok(crate::wasm::v2::WasmTransitionCounters::default())
+            _transition: crate::wasm::WasmTransitionHandle,
+        ) -> Result<crate::wasm::WasmTransitionCounters, LixError> {
+            Ok(crate::wasm::WasmTransitionCounters::default())
         }
 
         async fn discard_transition(
             &mut self,
-            _transition: crate::wasm::v2::WasmTransitionHandle,
+            _transition: crate::wasm::WasmTransitionHandle,
         ) -> Result<(), LixError> {
             self.discarded = true;
             Ok(())

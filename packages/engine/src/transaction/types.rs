@@ -4,11 +4,10 @@ use crate::LixError;
 use crate::binary_cas::{BlobHash, BlobPayload};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::LixTimestamp;
+use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance};
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::session::{MutationIdentity, RequestBlobSpliceProvenance};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 

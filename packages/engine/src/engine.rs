@@ -20,7 +20,7 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, Stora
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
-use crate::wasm::v2::WasmTransitionCounters;
+use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 

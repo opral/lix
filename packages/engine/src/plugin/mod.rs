@@ -58,6 +58,24 @@ pub(crate) use storage::{
     plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
 };
 
+/// Returns a MIME type only when the file path carries an unambiguous format
+/// extension understood by the engine. Unknown paths remain `None`; a
+/// Component descriptor must not claim CSV merely because the current
+/// production plugin happens to implement CSV.
+pub(crate) fn inferred_media_type_for_path(path: Option<&str>) -> Option<&'static str> {
+    let filename = path?.rsplit('/').next()?;
+    let (_, extension) = filename.rsplit_once('.')?;
+    if extension.eq_ignore_ascii_case("csv") {
+        Some("text/csv")
+    } else if extension.eq_ignore_ascii_case("tsv") {
+        Some("text/tab-separated-values")
+    } else if extension.eq_ignore_ascii_case("json") {
+        Some("application/json")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstalledPlugin {
     pub key: String,
@@ -83,4 +101,28 @@ pub(crate) struct InstalledPluginMetadata {
     pub path_glob: String,
     pub content_type: Option<PluginContentType>,
     pub schema_keys: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inferred_media_type_for_path;
+
+    #[test]
+    fn component_media_type_inference_is_truthful_and_conservative() {
+        assert_eq!(
+            inferred_media_type_for_path(Some("/data/report.CSV")),
+            Some("text/csv")
+        );
+        assert_eq!(
+            inferred_media_type_for_path(Some("/data/report.tsv")),
+            Some("text/tab-separated-values")
+        );
+        assert_eq!(
+            inferred_media_type_for_path(Some("/data/report.json")),
+            Some("application/json")
+        );
+        assert_eq!(inferred_media_type_for_path(Some("/data/report")), None);
+        assert_eq!(inferred_media_type_for_path(Some("/data/report.bin")), None);
+        assert_eq!(inferred_media_type_for_path(None), None);
+    }
 }

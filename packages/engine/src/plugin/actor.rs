@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::LixError;
-use crate::wasm::v2::{WasmComponentV2Actor, WasmDocumentHandle};
+use crate::wasm::{WasmComponentV2Actor, WasmDocumentHandle};
 
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_ACTORS: usize = 8;
 // One predecessor is enough for the required two-reader serialization while
@@ -774,7 +774,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::wasm::v2::{
+    use crate::wasm::{
         WasmChangeCursorHandle, WasmChangePage, WasmComponentV2Actor, WasmEditCursorHandle,
         WasmEditPage, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
         WasmOpenEntitiesInput, WasmOpenFileInput, WasmTransitionCounters, WasmTransitionHandle,
@@ -856,7 +856,7 @@ mod tests {
         async fn output_len(
             &mut self,
             _transition: WasmTransitionHandle,
-            _outputs: crate::wasm::v2::WasmByteOutputsHandle,
+            _outputs: crate::wasm::WasmByteOutputsHandle,
             _index: u32,
         ) -> Result<u64, LixError> {
             Err(unused())
@@ -865,7 +865,7 @@ mod tests {
         async fn read_output(
             &mut self,
             _transition: WasmTransitionHandle,
-            _outputs: crate::wasm::v2::WasmByteOutputsHandle,
+            _outputs: crate::wasm::WasmByteOutputsHandle,
             _index: u32,
             _offset: u64,
             _length: u32,
