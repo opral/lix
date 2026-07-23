@@ -3430,7 +3430,11 @@ dependencies = [
  "notify-debouncer-full",
  "object_store 0.14.0",
  "plugin_csv",
+ "plugin_csv_v2",
+ "plugin_json_v2",
  "rusqlite",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "wasm-encoder 0.248.0",
@@ -3444,9 +3448,11 @@ name = "lix_sdk_tests"
 version = "0.8.4"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "codspeed-criterion-compat",
  "lix_sdk",
  "plugin_csv",
+ "plugin_csv_v2",
  "rand 0.9.2",
  "serde_json",
  "tempfile",
@@ -4234,6 +4240,15 @@ dependencies = [
  "rand 0.9.2",
  "serde_json",
  "uuid",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "plugin_csv_v2"
+version = "0.8.4"
+dependencies = [
+ "base64 0.22.1",
+ "serde_json",
  "wit-bindgen 0.57.1",
 ]
 

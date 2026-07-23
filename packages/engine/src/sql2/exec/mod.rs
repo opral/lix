@@ -46,6 +46,7 @@ pub(crate) use write::{
 pub(crate) use write::{
     WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
     create_write_plan_template_from_parsed, execute_write_logical_plan_result,
+    execute_write_logical_plan_result_with_metadata,
 };
 
 pub(crate) enum SqlLogicalPlan {

@@ -1385,20 +1385,29 @@ mod tests {
     #[tokio::test]
     async fn staged_writes_drain_preserves_file_data_payloads() {
         let staged_writes = test_staged_writes();
+        let provenance = crate::session::RequestBlobSpliceProvenance {
+            base_sha256: "a".repeat(64),
+            result_sha256: "b".repeat(64),
+            prefix_bytes: 2,
+            suffix_bytes: 1,
+            insert: b"ll".to_vec(),
+        };
+        let mut file_data = TransactionFileData::new(
+            "file-readme".to_string(),
+            Some("/readme.md".to_string()),
+            Some("readme.md".to_string()),
+            "global".to_string(),
+            true,
+            true,
+            b"hello".to_vec(),
+        );
+        file_data.set_splice_provenance(Some(provenance.clone()));
 
         staged_writes
             .stage_write(PreparedTransactionWrite::RowsWithFileData {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("file-readme", "descriptor")],
-                file_data: vec![TransactionFileData::new(
-                    "file-readme".to_string(),
-                    Some("/readme.md".to_string()),
-                    Some("readme.md".to_string()),
-                    "global".to_string(),
-                    true,
-                    true,
-                    b"hello".to_vec(),
-                )],
+                file_data: vec![file_data],
                 count: 1,
             })
             .expect("staging rows with file data should succeed");
@@ -1409,6 +1418,10 @@ mod tests {
         assert_eq!(drained.file_data_writes.len(), 1);
         assert_eq!(drained.file_data_writes[0].file_id, "file-readme");
         assert_eq!(drained.file_data_writes[0].data(), b"hello");
+        assert_eq!(
+            drained.file_data_writes[0].splice_provenance(),
+            Some(&provenance)
+        );
     }
 
     #[test]

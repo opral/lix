@@ -65,6 +65,10 @@ impl EntityPk {
         Ok(Self { parts })
     }
 
+    pub(crate) fn into_parts(self) -> Vec<String> {
+        self.parts
+    }
+
     #[cfg(test)]
     pub(crate) fn tuple(parts: Vec<String>) -> Result<Self, EntityPkError> {
         Self::from_parts(parts)

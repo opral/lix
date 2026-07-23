@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +116,59 @@ def synthetic_rollout(with_followup: bool = True) -> list[dict]:
 
 
 class ExtractTests(unittest.TestCase):
+    def test_extracts_codex_exec_jsonl_with_timing_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {"type": "thread.started", "thread_id": "thread-1"},
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "id": "item-1",
+                            "type": "command_execution",
+                            "command": "cargo test",
+                            "status": "in_progress",
+                        },
+                    },
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item-1",
+                            "type": "command_execution",
+                            "command": "cargo test",
+                            "status": "failed",
+                            "exit_code": 101,
+                        },
+                    },
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item-2",
+                            "type": "file_change",
+                            "status": "completed",
+                        },
+                    },
+                    {"type": "turn.completed", "usage": {}},
+                ],
+            )
+            path.with_suffix(".meta.json").write_text(
+                json.dumps({"duration_sec": 42.26}), encoding="utf-8"
+            )
+            metrics = ax.extract(path)
+
+        self.assertEqual(metrics["agent_id"], "thread-1")
+        self.assertEqual(metrics["duration_sec"], 42.3)
+        self.assertEqual(metrics["tool_calls"], 2)
+        self.assertEqual(metrics["errors"], 1)
+        self.assertEqual(metrics["interruptions"], 0)
+        self.assertEqual(metrics["first_3_commands"], ["cargo test"])
+        self.assertEqual(
+            metrics["tool_breakdown"], {"command_execution": 1, "file_change": 1}
+        )
+
     def test_extracts_active_codex_turns_and_scores(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rollout.jsonl"
@@ -165,6 +219,35 @@ class ExtractTests(unittest.TestCase):
             judgment,
             {"success": False, "reason": "tests failed with exit 1"},
         )
+
+    def test_reads_judgment_from_codex_exec_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "judge.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item-1",
+                            "type": "agent_message",
+                            "text": '{"success": true, "reason": "cargo test exited 0"}',
+                        },
+                    }
+                ],
+            )
+            judgment = ax._judge_result(path)
+        self.assertEqual(judgment, {"success": True, "reason": "cargo test exited 0"})
+
+    def test_rejects_nonconforming_judgment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "judge.json"
+            path.write_text(
+                json.dumps({"success": True, "reason": "passed", "extra": "not allowed"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "no valid judge"):
+                ax._judge_result(path)
 
 
 class PersistenceTests(unittest.TestCase):
@@ -243,6 +326,101 @@ class PersistenceTests(unittest.TestCase):
                 {"schema": 1, "tool_slug": "valid", "rounds": [], "extra": True},
                 "index",
             )
+
+    def test_schema_validator_rejects_naive_date_time(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid date-time"):
+            ax.validate_document(
+                {
+                    "schema": 1,
+                    "tool_slug": "valid",
+                    "rounds": [
+                        {
+                            "ts": "2026-07-22T12:00:00",
+                            "name": "baseline",
+                            "dir": "round",
+                            "median_final": 50,
+                            "success_rate": 0.5,
+                        }
+                    ],
+                },
+                "index",
+            )
+
+
+class HarnessConfigTests(unittest.TestCase):
+    def test_canonical_prompt_is_exact_and_one_line(self) -> None:
+        self.assertEqual(
+            ax.canonical_prompt("Implement the plugin", "lix-cli"),
+            "Implement the plugin using lix-cli",
+        )
+        with self.assertRaisesRegex(ValueError, "one line"):
+            ax.canonical_prompt("Implement\nplugin", "lix-cli")
+
+    def test_codex_command_uses_json_and_shared_cargo_target(self) -> None:
+        command = ax._codex_command(
+            codex_bin="codex",
+            cwd=Path("/tmp/worktree"),
+            model="gpt-test",
+            sandbox="workspace-write",
+            final_message=Path("/tmp/output/final.txt"),
+            cargo_target_dir=Path("/repo/target/ax-eval"),
+            output_schema=None,
+            skip_git_repo_check=False,
+            temp_dir=Path("/tmp/agent-temp"),
+        )
+        self.assertEqual(command[:3], ["codex", "exec", "--json"])
+        self.assertEqual(command[-1], "-")
+        self.assertIn("/repo/target/ax-eval", command)
+        self.assertIn(
+            'shell_environment_policy.set.CARGO_TARGET_DIR="/repo/target/ax-eval"',
+            command,
+        )
+
+    def test_creates_detached_owned_worktrees_and_cleans_only_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "ax-eval@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "AX Eval Test"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "fixture"], check=True
+            )
+            resolved_repo, commit = ax.resolve_repo_revision(repo, "HEAD")
+            owned = ax.create_worktrees(resolved_repo, commit, 2, "fixture")
+            owned_root = owned.root
+            try:
+                self.assertEqual(len(owned.paths), 2)
+                for path in owned.paths:
+                    self.assertEqual(
+                        subprocess.run(
+                            ["git", "-C", str(path), "rev-parse", "HEAD"],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip(),
+                        commit,
+                    )
+                    self.assertEqual(
+                        subprocess.run(
+                            ["git", "-C", str(path), "symbolic-ref", "-q", "HEAD"],
+                            check=False,
+                        ).returncode,
+                        1,
+                    )
+            finally:
+                warnings = owned.cleanup()
+            self.assertEqual(warnings, [])
+            self.assertFalse(owned_root.exists())
+            self.assertTrue(repo.is_dir())
 
 
 if __name__ == "__main__":

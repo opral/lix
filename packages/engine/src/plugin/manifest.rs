@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
+use crate::wasm::v2::WASM_COMPONENT_V2_API_VERSION;
 
 static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
@@ -14,6 +15,7 @@ static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceL
 #[serde(rename_all = "kebab-case")]
 pub enum PluginRuntime {
     WasmComponentV1,
+    WasmComponentV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +79,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
                 format!("Plugin manifest does not match expected shape: {error}"),
             )
         })?;
+    validate_runtime_api_version(&manifest)?;
     compile_path_glob(&manifest.file_match.path_glob).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
@@ -97,6 +100,21 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         manifest,
         normalized_json,
     })
+}
+
+fn validate_runtime_api_version(manifest: &PluginManifest) -> Result<(), LixError> {
+    if manifest.runtime == PluginRuntime::WasmComponentV2
+        && manifest.api_version != WASM_COMPONENT_V2_API_VERSION
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "wasm-component-v2 requires api_version '{WASM_COMPONENT_V2_API_VERSION}', got '{}'",
+                manifest.api_version
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
@@ -270,6 +288,56 @@ mod tests {
         assert_eq!(validated.manifest.key, "plugin_json");
         assert_eq!(validated.manifest.runtime, PluginRuntime::WasmComponentV1);
         assert_eq!(validated.manifest.entry, "plugin.wasm");
+    }
+
+    #[test]
+    fn parses_versioned_v2_manifest_without_changing_v1() {
+        let v2 = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_csv_v2",
+                "runtime":"wasm-component-v2",
+                "api_version":"2.0.0",
+                "match":{"path_glob":"*.csv", "content_type":"text"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/csv_row.json"]
+            }"#,
+        )
+        .expect("v2 manifest should parse");
+
+        assert_eq!(v2.manifest.runtime, PluginRuntime::WasmComponentV2);
+        assert_eq!(v2.manifest.api_version, "2.0.0");
+
+        let v1 = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_csv",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "match":{"path_glob":"*.csv"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/csv_row.json"]
+            }"#,
+        )
+        .expect("existing v1 manifest must remain valid");
+        assert_eq!(v1.manifest.runtime, PluginRuntime::WasmComponentV1);
+    }
+
+    #[test]
+    fn rejects_v2_manifest_with_a_different_contract_version() {
+        let error = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_csv_v2",
+                "runtime":"wasm-component-v2",
+                "api_version":"0.1.0",
+                "match":{"path_glob":"*.csv"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/csv_row.json"]
+            }"#,
+        )
+        .expect_err("the runtime must select the exact production WIT version");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("api_version"));
+        assert!(error.message.contains("2.0.0"));
     }
 
     #[test]

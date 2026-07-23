@@ -4,20 +4,34 @@
 //! code under concrete plugin-owned modules instead of legacy ownership-neutral
 //! buckets.
 
+mod actor;
 mod archive;
 mod component;
+mod id_namespace;
+mod incremental;
 mod install;
 mod manifest;
 mod materializer;
 mod registry;
 mod storage;
 
+pub(crate) use actor::{PluginActorCache, PluginActorKey, PluginActorLease, PluginObservation};
 pub(crate) use archive::{
     ParsedPluginArchive, load_installed_plugin_from_archive_bytes,
     load_installed_plugin_metadata_from_archive_bytes, parse_plugin_archive_for_install,
 };
 pub(crate) use component::{
     CachedPluginComponent, PluginComponentHost, PluginRuntimeHost, load_or_init_plugin_component,
+};
+pub(crate) use id_namespace::{
+    BoundIdNamespace, is_reservation_key, local_mutation_identity, require_existing_id_authorities,
+    reservation_tombstone_row, reserve_namespace_row, validate_host_allocated_changes,
+    validate_namespace_reservation,
+};
+pub(crate) use incremental::{
+    ArcByteSource, V2SchemaAllowlist, VecEntityChangeSource, VecEntitySource,
+    build_file_update_splices, drain_entity_transition_edits, drain_file_transition_changes,
+    transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{

@@ -4,6 +4,8 @@ use async_trait::async_trait;
 
 use crate::LixError;
 
+pub mod v2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPluginFile {
     pub filename: Option<String>,
@@ -56,6 +58,21 @@ pub trait WasmRuntime: Send + Sync {
         bytes: Vec<u8>,
         limits: WasmLimits,
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError>;
+
+    /// Compiles a v2 Component once so its immutable machine code can be
+    /// shared by many file actors. Each actor must subsequently call
+    /// [`v2::WasmComponentV2Factory::instantiate_actor`] to obtain an isolated
+    /// Store/instance; v2 document handles must never be shared across actors.
+    async fn compile_component_v2(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn v2::WasmComponentV2Factory>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            "the configured WASM runtime does not support wasm-component-v2",
+        ))
+    }
 }
 
 #[async_trait]

@@ -7,6 +7,7 @@ use serde_json::json;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
+use crate::session::ExecuteStatementMetadata;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
@@ -89,9 +90,30 @@ pub(crate) async fn execute_write_logical_plan_result(
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
-    execute_write_logical_plan_with_mode_inner(ctx, plan, params, WriteExecutorModeInner::Auto)
-        .await
-        .map(|(result, _path)| result)
+    execute_write_logical_plan_result_with_metadata(
+        ctx,
+        plan,
+        params,
+        &ExecuteStatementMetadata::default(),
+    )
+    .await
+}
+
+pub(crate) async fn execute_write_logical_plan_result_with_metadata(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    metadata: &ExecuteStatementMetadata,
+) -> Result<SqlWriteResult, LixError> {
+    execute_write_logical_plan_with_mode_inner(
+        ctx,
+        plan,
+        params,
+        metadata,
+        WriteExecutorModeInner::Auto,
+    )
+    .await
+    .map(|(result, _path)| result)
 }
 
 #[cfg(test)]
@@ -142,7 +164,14 @@ pub(crate) async fn execute_write_logical_plan_with_mode_and_trace_result(
         WriteExecutorMode::ForceDataFusion => WriteExecutorModeInner::ForceDataFusion,
         WriteExecutorMode::ForceFast => WriteExecutorModeInner::ForceFast,
     };
-    execute_write_logical_plan_with_mode_inner(ctx, plan, params, mode).await
+    execute_write_logical_plan_with_mode_inner(
+        ctx,
+        plan,
+        params,
+        &ExecuteStatementMetadata::default(),
+        mode,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +185,7 @@ async fn execute_write_logical_plan_with_mode_inner(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
+    metadata: &ExecuteStatementMetadata,
     mode: WriteExecutorModeInner,
 ) -> Result<(SqlWriteResult, WriteExecutorPath), LixError> {
     let SqlLogicalPlan::Write(write_plan) = plan else {
@@ -168,9 +198,14 @@ async fn execute_write_logical_plan_with_mode_inner(
     validate_write_parameter_count(&write_plan, params.len())?;
 
     if mode != WriteExecutorModeInner::ForceDataFusion {
-        match super::bound_public_write::try_execute_bound_public_write(ctx, &write_plan, params)
-            .await
-            .map_err(normalize_bound_public_write_error)?
+        match super::bound_public_write::try_execute_bound_public_write(
+            ctx,
+            &write_plan,
+            params,
+            metadata,
+        )
+        .await
+        .map_err(normalize_bound_public_write_error)?
         {
             super::bound_public_write::BoundPublicWriteExecution::Executed(result) => {
                 return Ok((result, WriteExecutorPath::Fast));

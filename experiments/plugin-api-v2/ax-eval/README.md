@@ -1,160 +1,90 @@
-# Plugin API ax-eval harness
+# Codex AX-eval harness
 
-This directory adapts the supplied ax-eval v2 rubric to Codex rollout logs. It
-does not ask agents to self-report metrics: tool calls,
-duration, interruptions, command discovery, and tool errors come directly from
-the JSONL transcript. A separate judge rollout supplies only task success.
-Forked Codex rollouts can embed compacted parent history; extraction begins at
-the `task_started` event immediately preceding the subagent's `NEW_TASK`
-envelope, so inherited commands and elapsed time do not pollute the score.
+`codex_ax_eval.py` runs the supplied ax-eval v2 protocol through
+`codex exec --json`; it never requires the Claude CLI. Every tested agent gets
+one detached Git worktree at the exact requested commit and receives exactly
+this one-line prompt:
 
-The vendored schemas are byte-for-byte copies of ax-eval's `result.schema.json`
-and `index.schema.json`. The harness validates both result and index documents
-without requiring a third-party Python package.
-
-## Controlled evaluation procedure
-
-1. Use one isolated starter workspace per tested agent. Only that workspace may
-   be visible under `runs/` while the agent executes; archive it before starting
-   another agent so repository search cannot expose a sibling implementation.
-   `prepare-workspaces` copies the starter tree and refuses to overwrite any
-   existing output.
-
-   ```sh
-   python3 codex_ax_eval.py prepare-workspaces \
-     --template /absolute/path/to/candidate-a-starter \
-     --output /private/tmp/lix-ax-candidate-a \
-     --count 10
-   ```
-2. Spawn each agent with `fork_turns="none"` and the canonical one-line prompt:
-
-   ```text
-   {task} using {tool}
-   ```
-
-3. Do not send hints or follow-ups. Record every unavailable pinned setting in
-   `config.overrides` (Codex model/tool surface, temperature control, maximum
-   turns, and permission mode).
-4. Find the raw rollout by exact collaboration path, then extract metrics:
-
-   ```sh
-   python3 codex_ax_eval.py find --agent-path /root/ax_a_01
-   python3 codex_ax_eval.py extract /absolute/path/to/rollout.jsonl
-   ```
-
-5. Spawn one independent judge per tested agent using the exact text printed by:
-
-   ```sh
-   python3 codex_ax_eval.py judge-prompt \
-     --task 'Implement and test the CSV plugin' \
-     --transcript /absolute/path/to/rollout.jsonl
-   ```
-
-6. Persist a completed round from a manifest:
-
-   ```sh
-   python3 codex_ax_eval.py persist manifest.json
-   ```
-
-The manifest has this shape:
-
-```json
-{
-  "tool": {
-    "slug": "lix-plugin-api-a",
-    "name": "Lix plugin API candidate A",
-    "version": "research-1",
-    "install": "included in isolated workspace"
-  },
-  "task": "Implement and test the assigned file-format plugin",
-  "round": "candidate-a",
-  "ts": "2026-07-22T12:00:00Z",
-  "config": {
-    "agent_model": "gpt-5.6-terra",
-    "agent_count": 1,
-    "temperature": 0,
-    "tools": ["Codex functions.exec", "Read", "apply_patch", "rg"],
-    "mcp_servers": [],
-    "system_prompt": null,
-    "max_turns": 40,
-    "prompt_template": "{task} using {tool}",
-    "docs_included": false,
-    "overrides": {
-      "agent_model": "claude-opus-4-7 unavailable; used gpt-5.6-terra",
-      "temperature": "Codex collaboration agents do not expose temperature",
-      "tools": "Codex tool surface replaces the pinned Claude Code tools",
-      "system_prompt": "Codex collaboration agents use the Codex system prompt",
-      "mode": "Codex sandbox policy replaces bypassPermissions",
-      "max_turns": "Codex collaboration agents do not expose a hard turn cap"
-    }
-  },
-  "agents": [
-    {
-      "id": 1,
-      "transcript": "/absolute/path/to/tested-agent-rollout.jsonl",
-      "judge": "/absolute/path/to/judge-rollout-or-result.jsonl"
-    }
-  ]
-}
+```text
+{task} using {tool}
 ```
 
-The example is a schema-valid one-agent smoke round. The planned adaptive
-protocol is five format-complete screens followed by ten independent agents for
-the selected candidate. The completed main cohort was A=5, B=9, C=4, D=4, plus
-a separate targeted N=3 refined-facade follow-up; it did not reach the planned
-ten B agents. A later final-aligned N=1 signature check scored 87 and passed
-5/5 acceptance tests, including a 200,000-row paged initial stream. That single
-run is not statistically comparable to the main or targeted cohorts. These
-unequal exploratory cohorts are not used to claim sub-ten-point score
-differences. Exact inclusion rules and limitations are in the
-[`research report`](../../../perf-results/plugin-api-v2/plugin-api-v2-research-2026-07-22.md#controlled-agent-experience-evaluation).
+After all tested agents finish, an independent Codex judge reads each retained
+raw transcript using the ax-eval judge prompt. A timeout can leave that log
+partial; its process outcome remains explicit in the adjacent sidecar. Tested
+agents and judges run in separate bounded parallel batches.
 
-Compact results live under
-`perf-results/plugin-api-v2/ax-eval/`, including the final-aligned result
-whose frozen facade/WIT hashes are
-`132b4d483c538834112f21878c7fdbbfd18e0584ee36ddb508ebbfd0ca8af0ea` and
-`685dcdf248b83ae21d5c937b43dfeb84d0f76427ed8a67a084911890179ada33`.
-The immediate post-run `rustfmt` snapshot (`23aa66d7...`) was token-equivalent
-to the evaluated facade, but it is historical. Subsequent correctness review
-changed author and wire semantics: activated-entity hydration, a compact inline
-allocation namespace with zero allocator imports, one multiplex attachment
-table, exact packet/group ordering, and cold-constructor clarifications. The
-current facade/WIT/packet SHA-256 values are
-`319ede7ce4035c1df6145f6f43ad63e4ca0e69330811df0bd754430d69fffca1`,
-`cbf722584936d08f93e912525941caaecfb389625ceb77625a171c3f6acb4d89`,
-and `d64ba556916c8cafb6f77b09b7edbacde87db6b7fc4ec62ec437d65fa97ef89e`.
-The AX run did not test those revisions, generated bindings, the semantic-
-schema descriptor, normalized-decimal durable codec, or legacy-ID migration;
-all remain explicit pre-freeze follow-up work.
-
-The harness creates the required `~/.ax-eval/{tool-slug}/` layout, archives raw
-tested-agent transcripts, writes `result.json`, and atomically updates
-`index.json`. It never overwrites an existing round.
-
-## Compare, list, and validate
+## Run
 
 ```sh
-python3 codex_ax_eval.py list lix-plugin-api-a
-python3 codex_ax_eval.py compare lix-plugin-api-a baseline refined
-python3 codex_ax_eval.py validate ~/.ax-eval/lix-plugin-api-a/index.json
+python3 codex_ax_eval.py \
+  --repo /absolute/path/to/lix \
+  --revision 0123456789abcdef \
+  --model gpt-5.4 \
+  --task 'Implement and test the CSV plugin' \
+  --tool 'the Lix plugin API in this repository' \
+  --round baseline
 ```
 
-Quartiles use linear interpolation at `(N - 1) × q`. Ties for the common first
-command are broken by the lowest agent ID, making repeated persistence fully
-deterministic.
+The cohort defaults to 10 agents with batches of two. Use `--agent-count` and
+`--parallelism` to change those independently. Each Codex process has a
+one-hour default bound; change it with `--timeout-seconds`.
 
-## Codex adapter boundary
+All tested and judge subprocesses inherit one shared `CARGO_TARGET_DIR`,
+defaulting to `<repo>/target/ax-eval`, so worktrees do not produce duplicate
+Cargo target trees. `--cargo-target-dir` may select another Git-ignored,
+untracked location under the main repository's `target/` directory.
 
-One Codex `custom_tool_call` or `function_call` event counts as one tool call,
-matching ax-eval's event-block definition. The `exec` wrapper can hide a nested
-command's exit status when an agent emits only `result.output`; the adapter
-counts a command failure whenever the rollout exposes a nonzero `exit_code`,
-and counts explicit `isError`, `is_error`, failed call status, or `Script failed`
-markers. This limitation applies equally to every candidate and must be listed
-in the research report's evaluation overrides.
+## Safety and artifacts
 
-Run the harness tests with:
+- Worktrees live under a harness-owned `mkdtemp` root, are detached, and are
+  removed with `git worktree remove --force` only after ownership checks.
+- The main worktree is never checked out, reset, cleaned, or used as an agent
+  working directory. Tested agents receive only two additional writable roots:
+  the shared ignored Cargo target and an agent-private temporary directory.
+- Agents use `workspace-write`; judges use `read-only`. Web search, apps, MCP,
+  hooks, goals, remote plugins, and subagents are disabled for each invocation.
+- Raw Codex stdout remains byte-for-byte JSONL in
+  `transcripts/agent-N.jsonl`; stderr, final messages, and monotonic timing
+  sidecars sit next to it. Raw judge JSONL is retained under `judges/`.
+- The round directory is created before work starts. On handled interruption
+  or error, partial transcripts and a `failure.json` remain in place; cleanup
+  never removes the output directory. Cleanup warnings are durable in
+  `invocation.json`.
+
+Completed rounds use the supplied schemas:
+
+```text
+~/.ax-eval/<tool-slug>/
+  index.json
+  <timestamp>_<round>/
+    result.json
+    invocation.json
+    transcripts/agent-1.jsonl
+    judges/agent-1.jsonl
+```
+
+`result.json` contains the deterministic ax-eval formulas and the separate
+judge verdicts. `index.json` is updated under a file lock by writing
+`index.json.tmp` and atomically renaming it. The config block records every
+Codex substitution for the pinned Claude model, tool surface, system prompt,
+permission mode, maximum turns, temperature, and log format.
+
+## Utilities and validation
+
+The retained compatibility utilities support `extract`, `validate`, `list`,
+and `compare`; see `--help` for the full list.
 
 ```sh
+python3 -m py_compile codex_ax_eval.py
+python3 codex_ax_eval.py --help
 python3 -m unittest discover -s tests -v
 ```
+
+## Production v2 authoring task
+
+[`tasks/production-v2-tsv.md`](tasks/production-v2-tsv.md) defines a narrow
+task for measuring whether an agent can discover and use the production v2
+contract without being led to the CSV implementation. Pass its `task` and
+`tool` values verbatim to the harness so the tested-agent prompt remains the
+canonical one-line `{task} using {tool}` form.

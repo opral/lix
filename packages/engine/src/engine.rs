@@ -20,6 +20,7 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, Stora
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
+use crate::wasm::v2::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
@@ -216,6 +217,20 @@ where
             self.telemetry.clone(),
         )
         .await
+    }
+
+    /// Returns process-local work accumulated by completed v2 transitions on
+    /// this engine. The snapshot is shared by every session cloned from it.
+    #[doc(hidden)]
+    pub fn plugin_v2_transition_counters(&self) -> WasmTransitionCounters {
+        self.plugin_host.v2_transition_counters()
+    }
+
+    /// Resets the process-local v2 transition aggregate used by profiling and
+    /// invariant tests. This does not mutate durable workspace state.
+    #[doc(hidden)]
+    pub fn reset_plugin_v2_transition_counters(&self) {
+        self.plugin_host.reset_v2_transition_counters();
     }
 
     /// Rebuilds the tracked serving commit root for one branch from changelog.

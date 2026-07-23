@@ -472,6 +472,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
             key.as_str(),
             "x-lix-key"
                 | "x-lix-primary-key"
+                | "x-lix-id-allocation"
                 | "x-lix-unique"
                 | "x-lix-foreign-keys"
                 | "x-lix-state-foreign-keys"

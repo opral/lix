@@ -1,0 +1,21 @@
+{
+  "x-lix-key": "csv_row",
+  "x-lix-primary-key": ["/id"],
+  "x-lix-id-allocation": "host-allocated",
+  "description": "One decoded CSV record. Row order is controlled by order_key.",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "order_key": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$"
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["id", "order_key", "cells"],
+  "additionalProperties": false
+}

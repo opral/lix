@@ -1,0 +1,26 @@
+{
+  "x-lix-key": "csv_table",
+  "x-lix-primary-key": ["/id"],
+  "description": "CSV dialect metadata.",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "const": "root" },
+    "dialect": {
+      "type": "object",
+      "properties": {
+        "delimiter": { "type": "string", "minLength": 1, "maxLength": 1 },
+        "quote": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 1 },
+            { "type": "null" }
+          ]
+        },
+        "terminator": { "type": "string", "enum": ["\n", "\r\n", "\r"] }
+      },
+      "required": ["delimiter", "quote", "terminator"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["id", "dialect"],
+  "additionalProperties": false
+}
