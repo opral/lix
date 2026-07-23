@@ -1899,7 +1899,7 @@ pub(crate) enum FastLixFilePathWriteConflict {
 
 pub(crate) async fn execute_fast_lix_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
-    writes: Vec<(String, Vec<u8>, Option<TransactionJson>)>,
+    writes: Vec<(String, crate::Blob, Option<TransactionJson>)>,
     conflict: FastLixFilePathWriteConflict,
 ) -> Result<Option<u64>, LixError> {
     if writes.is_empty() {
@@ -2282,7 +2282,7 @@ async fn load_exact_existing_blob_keys(
 pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
-    data: Vec<u8>,
+    data: crate::Blob,
 ) -> Result<u64, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
@@ -2363,12 +2363,12 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
 
 struct FastLixFilePathWrite {
     parsed: ParsedFileWritePath,
-    data: Vec<u8>,
+    data: crate::Blob,
     metadata: Option<TransactionJson>,
 }
 
 fn parse_fast_lix_file_path_writes(
-    writes: Vec<(String, Vec<u8>, Option<TransactionJson>)>,
+    writes: Vec<(String, crate::Blob, Option<TransactionJson>)>,
 ) -> std::result::Result<Vec<FastLixFilePathWrite>, LixError> {
     writes
         .into_iter()
@@ -3038,7 +3038,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 path_resolvers,
                 parsed_path,
                 Some(file_id.clone()),
-                data,
+                data.map(Into::into),
                 context,
                 generate_directory_id,
             )
@@ -3156,7 +3156,7 @@ fn stage_lix_file_data_insert_write(
     file_id: String,
     path: Option<String>,
     filename: Option<String>,
-    data: Vec<u8>,
+    data: impl Into<crate::Blob>,
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
@@ -3181,7 +3181,7 @@ fn stage_lix_file_data_update_write(
     file_id: String,
     path: Option<String>,
     filename: Option<String>,
-    data: Vec<u8>,
+    data: impl Into<crate::Blob>,
     context: FilesystemRowContext,
     has_blob_ref: bool,
     origin: Option<TransactionWriteOrigin>,
@@ -3962,7 +3962,7 @@ async fn exact_path_data_rows_from_prepared(
         };
         rows.push(vec![
             Value::Text(path),
-            data.map_or(Value::Null, Value::Blob),
+            data.map_or(Value::Null, |data| Value::Blob(data.into())),
         ]);
     }
 
@@ -10043,7 +10043,7 @@ mod tests {
         let count = super::execute_fast_lix_file_data_update_by_id(
             &mut write_context,
             Some("file-readme".to_string()),
-            b"new".to_vec(),
+            b"new".to_vec().into(),
         )
         .await
         .expect("fast data update should stage");
@@ -10097,7 +10097,7 @@ mod tests {
             &mut write_context,
             vec![(
                 "/readme.md".to_string(),
-                b"new".to_vec(),
+                b"new".to_vec().into(),
                 Some(TransactionJson::from_value_for_test(
                     serde_json::json!({"source": "upload"}),
                 )),
@@ -10159,8 +10159,8 @@ mod tests {
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
-                ("/readme.md".to_string(), b"updated".to_vec(), None),
-                ("/new.md".to_string(), b"new".to_vec(), None),
+                ("/readme.md".to_string(), b"updated".to_vec().into(), None),
+                ("/new.md".to_string(), b"new".to_vec().into(), None),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
         )
@@ -10195,7 +10195,11 @@ mod tests {
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/new/nested/file.md".to_string(), b"new".to_vec(), None)],
+            vec![(
+                "/new/nested/file.md".to_string(),
+                b"new".to_vec().into(),
+                None,
+            )],
             super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
         )
         .await
@@ -10233,8 +10237,8 @@ mod tests {
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
-                ("/duplicate.md".to_string(), b"first".to_vec(), None),
-                ("/duplicate.md".to_string(), b"second".to_vec(), None),
+                ("/duplicate.md".to_string(), b"first".to_vec().into(), None),
+                ("/duplicate.md".to_string(), b"second".to_vec().into(), None),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
         )
@@ -10260,7 +10264,7 @@ mod tests {
 
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/docs".to_string(), b"file".to_vec(), None)],
+            vec![("/docs".to_string(), b"file".to_vec().into(), None)],
             super::FastLixFilePathWriteConflict::UpdateData,
         )
         .await
@@ -10314,8 +10318,12 @@ mod tests {
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
-                ("/local.md".to_string(), b"new-local".to_vec(), None),
-                ("/global.md".to_string(), b"new-global".to_vec(), None),
+                ("/local.md".to_string(), b"new-local".to_vec().into(), None),
+                (
+                    "/global.md".to_string(),
+                    b"new-global".to_vec().into(),
+                    None,
+                ),
             ],
             super::FastLixFilePathWriteConflict::UpdateData,
         )
@@ -10362,7 +10370,7 @@ mod tests {
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/readme.md".to_string(), Vec::new(), None)],
+            vec![("/readme.md".to_string(), Vec::new().into(), None)],
             super::FastLixFilePathWriteConflict::UpdateData,
         )
         .await
@@ -10408,7 +10416,7 @@ mod tests {
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
-            vec![("/shared.md".to_string(), b"new".to_vec(), None)],
+            vec![("/shared.md".to_string(), b"new".to_vec().into(), None)],
             super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
         )
         .await

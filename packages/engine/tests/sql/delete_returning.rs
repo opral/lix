@@ -64,7 +64,7 @@ simulation_test!(
             deleted_file,
             vec![vec![
                 Value::Text("returning-file".to_string()),
-                Value::Blob(b"before".to_vec()),
+                Value::Blob(b"before".to_vec().into()),
             ]],
         );
 

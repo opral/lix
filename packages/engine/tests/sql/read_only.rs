@@ -213,7 +213,10 @@ simulation_test!(read_only_binary_blob_ref_rejects_writes, |sim| async move {
         .execute("SELECT data FROM lix_file WHERE id = 'file-with-data'", &[])
         .await
         .expect("file data should still be readable");
-    assert_eq!(data.rows()[0].values(), &[Value::Blob(vec![0x41, 0x42])]);
+    assert_eq!(
+        data.rows()[0].values(),
+        &[Value::Blob(vec![0x41, 0x42].into())]
+    );
 });
 
 simulation_test!(
@@ -381,7 +384,7 @@ simulation_test!(
                 &[
                     Value::Text("fresh-snapshot-file".to_string()),
                     Value::Text("/fresh-snapshot.txt".to_string()),
-                    Value::Blob(b"fresh".to_vec()),
+                    Value::Blob(b"fresh".to_vec().into()),
                 ],
             )
             .await
@@ -391,7 +394,10 @@ simulation_test!(
             .execute(select_sql, &params)
             .await
             .expect("repeated syntax should use a fresh provider snapshot");
-        assert_eq!(after.rows()[0].values(), &[Value::Blob(b"fresh".to_vec())]);
+        assert_eq!(
+            after.rows()[0].values(),
+            &[Value::Blob(b"fresh".to_vec().into())]
+        );
     }
 );
 

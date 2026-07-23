@@ -730,7 +730,7 @@ impl UploadBenchFixture {
                  lixcol_metadata = excluded.lixcol_metadata",
                 &[
                     Value::Text(self.upload_path.clone()),
-                    Value::Blob(upload_file_bytes(version)),
+                    Value::Blob(upload_file_bytes(version).into()),
                     upload_file_metadata(version),
                 ],
             )
@@ -749,7 +749,7 @@ impl UploadBenchFixture {
                  lixcol_metadata = excluded.lixcol_metadata",
                 &[
                     Value::Text(self.upload_path.clone()),
-                    Value::Blob(upload_file_bytes(version)),
+                    Value::Blob(upload_file_bytes(version).into()),
                     file_metadata(),
                 ],
             )
@@ -770,9 +770,9 @@ impl UploadBenchFixture {
             .execute(
                 "UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3",
                 &[
-                    Value::Blob(upload_file_bytes(version)),
+                    Value::Blob(upload_file_bytes(version).into()),
                     Value::Text(self.file_id.clone()),
-                    Value::Blob(expected),
+                    Value::Blob(expected.into()),
                 ],
             )
             .await
@@ -792,7 +792,7 @@ impl UploadBenchFixture {
             .execute(
                 "UPDATE lix_file SET data = $1 WHERE id = $2",
                 &[
-                    Value::Blob(upload_file_bytes(version)),
+                    Value::Blob(upload_file_bytes(version).into()),
                     Value::Text(self.file_id.clone()),
                 ],
             )
@@ -811,7 +811,7 @@ impl UploadBenchFixture {
                 .wrapping_mul(self.upload_batch_paths.len() as u64)
                 .wrapping_add(file_index as u64);
             params.push(Value::Text(path.clone()));
-            params.push(Value::Blob(upload_file_bytes(file_version)));
+            params.push(Value::Blob(upload_file_bytes(file_version).into()));
             params.push(upload_file_metadata(file_version));
         }
         let result = self
@@ -833,7 +833,7 @@ impl UploadBenchFixture {
                  lixcol_metadata = excluded.lixcol_metadata",
                 &[
                     Value::Text(path),
-                    Value::Blob(upload_file_bytes(version)),
+                    Value::Blob(upload_file_bytes(version).into()),
                     upload_file_metadata(version),
                 ],
             )
@@ -1334,7 +1334,7 @@ async fn seed_files(session: &SessionContext<SlateDB>) {
                 row_index * 3 + 3
             ));
             params.push(Value::Text(file_path(file_index)));
-            params.push(Value::Blob(file_bytes(file_index)));
+            params.push(Value::Blob(file_bytes(file_index).into()));
             params.push(file_metadata());
         }
 

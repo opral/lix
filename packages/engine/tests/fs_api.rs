@@ -343,7 +343,10 @@ async fn sql_plugin_archive_plain_insert_reuses_deterministic_file_id() {
     let error = session
         .execute(
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[Value::Text(path.to_string()), Value::Blob(archive.clone())],
+            &[
+                Value::Text(path.to_string()),
+                Value::Blob(archive.clone().into()),
+            ],
         )
         .await
         .expect_err("plain plugin archive insert should reject duplicate archive id");
@@ -402,7 +405,7 @@ async fn explicit_transaction_install_is_visible_to_later_plugin_write() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/.lix/plugins/plugin_sentinel.lixplugin".to_string()),
-            Value::Blob(sentinel_plugin_archive()),
+            Value::Blob(sentinel_plugin_archive().into()),
         ],
     )
     .await
@@ -411,7 +414,7 @@ async fn explicit_transaction_install_is_visible_to_later_plugin_write() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/same-transaction.sentinel".to_string()),
-            Value::Blob(b"hello".to_vec()),
+            Value::Blob(b"hello".to_vec().into()),
         ],
     )
     .await
@@ -450,7 +453,7 @@ async fn sql_update_path_to_plugin_storage_rejects_plugin_archive_rename() {
             "UPDATE lix_file SET path = $1, data = $2 WHERE path = $3",
             &[
                 Value::Text("/.lix/plugins/plugin_sentinel.lixplugin".to_string()),
-                Value::Blob(sentinel_plugin_archive()),
+                Value::Blob(sentinel_plugin_archive().into()),
                 Value::Text("/normal.txt".to_string()),
             ],
         )
@@ -825,7 +828,7 @@ async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
         .await
         .expect("lix_file data read should succeed");
     assert_eq!(files.len(), 1);
-    assert_eq!(files.rows()[0].values(), &[Value::Blob(Vec::new())]);
+    assert_eq!(files.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
     assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 0);
 
     session.close().await.expect("session should close");
@@ -1338,7 +1341,7 @@ async fn lixray_batch_read_acknowledges_only_delivered_plugin_state() {
         delivered.rows()[0].values(),
         &[
             Value::Text("/shared.keyed".to_string()),
-            Value::Blob(b"root=0\nseen=S\n".to_vec()),
+            Value::Blob(b"root=0\nseen=S\n".to_vec().into()),
         ]
     );
 
@@ -1385,7 +1388,7 @@ async fn late_file_data_read_acknowledges_only_delivered_plugin_state() {
         delivered.rows()[0].values(),
         &[
             Value::Text("/shared.keyed".to_string()),
-            Value::Blob(b"root=0\nseen=S\n".to_vec()),
+            Value::Blob(b"root=0\nseen=S\n".to_vec().into()),
         ]
     );
 
@@ -1440,7 +1443,7 @@ async fn observe_point_read_acknowledges_delivered_plugin_state_per_session() {
         .expect("initial observation should be delivered");
     assert_eq!(
         initial.rows.rows()[0].values(),
-        &[Value::Blob(b"a=0\nb=0\n".to_vec())]
+        &[Value::Blob(b"a=0\nb=0\n".to_vec().into())]
     );
 
     write_file(&session_a, "/shared.keyed", b"a=A\nb=0\n".to_vec())
@@ -1524,7 +1527,7 @@ async fn observe_late_subscriber_acknowledges_fresh_plugin_incarnation_after_unc
         .expect("late initial snapshot should be delivered");
     assert_eq!(
         late_initial.rows.rows()[0].values(),
-        &[Value::Blob(b"a=0\n".to_vec())]
+        &[Value::Blob(b"a=0\n".to_vec().into())]
     );
 
     write_file(&session_a, "/shared.keyed", b"a=0\nb=remote\n".to_vec())
@@ -1742,10 +1745,10 @@ async fn multi_value_file_upsert_reconciles_each_plugin_file() {
                  data = excluded.data, lixcol_metadata = excluded.lixcol_metadata";
     let params = [
         Value::Text("/nested/first.sentinel".to_string()),
-        Value::Blob(b"first".to_vec()),
+        Value::Blob(b"first".to_vec().into()),
         Value::Json(json!({"size": 5})),
         Value::Text("/nested/second.sentinel".to_string()),
-        Value::Blob(b"second".to_vec()),
+        Value::Blob(b"second".to_vec().into()),
         Value::Json(json!({"size": 6})),
     ];
     session
@@ -2149,7 +2152,7 @@ where
         .execute_sql(
             "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-            &[Value::Text(path.to_string()), Value::Blob(data)],
+            &[Value::Text(path.to_string()), Value::Blob(data.into())],
         )
         .await?;
     Ok(())
@@ -2169,7 +2172,7 @@ where
         return Ok(None);
     };
     match row.values() {
-        [Value::Blob(data)] => Ok(Some(data.clone())),
+        [Value::Blob(data)] => Ok(Some(data.to_vec())),
         [Value::Null] => Ok(Some(Vec::new())),
         other => panic!("expected one blob data column, got {other:?}"),
     }

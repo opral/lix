@@ -62,7 +62,7 @@ simulation_test!(
             .execute("SELECT data FROM lix_file WHERE id = 'guarded-file'", &[])
             .await
             .expect("guarded file read should succeed");
-        assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec())]]);
+        assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec().into())]]);
     }
 );
 
@@ -187,7 +187,7 @@ simulation_test!(
             )
             .await
             .expect("updated file should be readable");
-        assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec())]]);
+        assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec().into())]]);
 
         let unicode_search = session
             .execute(
@@ -664,7 +664,7 @@ simulation_test!(
             &[
                 Value::Text("file-readme".to_string()),
                 Value::Text("/docs/guides/readme.md".to_string()),
-                Value::Blob(b"hello".to_vec()),
+                Value::Blob(b"hello".to_vec().into()),
                 Value::Text("lix_file_descriptor".to_string()),
             ]
         );
@@ -806,7 +806,7 @@ simulation_test!(
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
         assert_eq!(name, "readme.md");
-        assert_eq!(data, b"");
+        assert_eq!(data.as_ref(), b"");
 
         let null_result = session
             .execute(
@@ -857,7 +857,7 @@ simulation_test!(
         };
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
-        assert_eq!(data, b"hello");
+        assert_eq!(data.as_ref(), b"hello");
     }
 );
 
@@ -1102,7 +1102,7 @@ simulation_test!(
             )
             .await
             .expect("cast file read should succeed");
-        assert_rows_eq(result, vec![vec![Value::Blob(b"updated".to_vec())]]);
+        assert_rows_eq(result, vec![vec![Value::Blob(b"updated".to_vec().into())]]);
     }
 );
 
@@ -1124,7 +1124,7 @@ simulation_test!(
                 &[
                     Value::Text("anonymous-param-file".to_string()),
                     Value::Text("/anonymous-param.bin".to_string()),
-                    Value::Blob(b"anonymous".to_vec()),
+                    Value::Blob(b"anonymous".to_vec().into()),
                 ],
             )
             .await
@@ -1142,7 +1142,7 @@ simulation_test!(
             result,
             vec![vec![
                 Value::Text("/anonymous-param.bin".to_string()),
-                Value::Blob(b"anonymous".to_vec()),
+                Value::Blob(b"anonymous".to_vec().into()),
             ]],
         );
     }
@@ -1203,7 +1203,7 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
         .await
         .expect("file read should succeed");
     assert_eq!(result.len(), 1);
-    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
+    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
 
     let blob_ref_result = session
         .execute(
@@ -1233,7 +1233,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (path, data) VALUES ('/x.bin', $1)",
-                &[Value::Blob(vec![1])],
+                &[Value::Blob(vec![1].into())],
             )
             .await
             .expect("first file path insert should succeed");
@@ -1241,7 +1241,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (path, data) VALUES ('/x.bin', $1)",
-                &[Value::Blob(vec![2])],
+                &[Value::Blob(vec![2].into())],
             )
             .await
             .expect_err("duplicate file path insert should be rejected");
@@ -1664,7 +1664,10 @@ simulation_test!(
             let error = session
                 .execute(
                     "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-                    &[Value::Text(path.to_string()), Value::Blob(Vec::new())],
+                    &[
+                        Value::Text(path.to_string()),
+                        Value::Blob(Vec::new().into()),
+                    ],
                 )
                 .await
                 .expect_err("file path insert should reject dot segments");
@@ -1729,7 +1732,7 @@ simulation_test!(
         };
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
-        assert_eq!(data, b"hello");
+        assert_eq!(data.as_ref(), b"hello");
     }
 );
 
@@ -1780,7 +1783,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         &[
             Value::Text("file-readme".to_string()),
             Value::Text("/docs/readme-renamed.md".to_string()),
-            Value::Blob(b"hello".to_vec()),
+            Value::Blob(b"hello".to_vec().into()),
         ]
     );
 
@@ -1888,7 +1891,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("file-target".to_string()),
                 Value::Text("/archive/renamed.md".to_string()),
-                Value::Blob(b"target".to_vec()),
+                Value::Blob(b"target".to_vec().into()),
             ]],
         );
 
@@ -1903,7 +1906,7 @@ simulation_test!(
             unrelated,
             vec![vec![
                 Value::Text("/docs/other.md".to_string()),
-                Value::Blob(b"other".to_vec()),
+                Value::Blob(b"other".to_vec().into()),
             ]],
         );
     }
@@ -2046,11 +2049,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("/.lix/app_data/atelier/extensions/demo/a.js".to_string()),
-                    Value::Blob(b"a".to_vec()),
+                    Value::Blob(b"a".to_vec().into()),
                 ],
                 vec![
                     Value::Text("/.lix/app_data/atelier/extensions/demo/b.js".to_string()),
-                    Value::Blob(b"b".to_vec()),
+                    Value::Blob(b"b".to_vec().into()),
                 ],
             ],
         );
@@ -2159,7 +2162,10 @@ simulation_test!(
             .await
             .expect("file read should succeed");
         assert_eq!(result.len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::Blob(b"hello".to_vec())]);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Blob(b"hello".to_vec().into())]
+        );
     }
 );
 
@@ -2228,23 +2234,23 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("update-bool-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
                     Value::Text("update-float-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
                     Value::Text("update-int-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
                     Value::Text("update-text-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
                     Value::Text("update-text-function-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
             ],
         );
@@ -2302,11 +2308,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("update-int-param-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
                     Value::Text("update-text-param-file".to_string()),
-                    Value::Blob(b"hello".to_vec()),
+                    Value::Blob(b"hello".to_vec().into()),
                 ],
             ],
         );
@@ -2349,7 +2355,7 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
         .await
         .expect("file read should succeed");
     assert_eq!(result.len(), 1);
-    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
+    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
 
     let blob_ref_result = session
         .execute(
@@ -2387,7 +2393,7 @@ simulation_test!(
                 upsert,
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
-                    Value::Blob(b"before".to_vec()),
+                    Value::Blob(b"before".to_vec().into()),
                     Value::Json(metadata.clone()),
                 ],
             )
@@ -2409,7 +2415,7 @@ simulation_test!(
                 upsert,
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
-                    Value::Blob(b"after".to_vec()),
+                    Value::Blob(b"after".to_vec().into()),
                     Value::Json(metadata.clone()),
                 ],
             )
@@ -2431,7 +2437,7 @@ simulation_test!(
             .expect("updated file should load");
         assert_eq!(
             current.rows()[0].values(),
-            &[Value::Blob(b"after".to_vec()), Value::Json(metadata),]
+            &[Value::Blob(b"after".to_vec().into()), Value::Json(metadata),]
         );
         assert_eq!(
             file_descriptor_event_count(&session, &commit_id, file_id).await,
@@ -2461,7 +2467,7 @@ simulation_test!(
                 upsert,
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
-                    Value::Blob(b"one".to_vec()),
+                    Value::Blob(b"one".to_vec().into()),
                     Value::Json(json!({"version": 1})),
                 ],
             )
@@ -2483,7 +2489,7 @@ simulation_test!(
                 upsert,
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
-                    Value::Blob(b"two".to_vec()),
+                    Value::Blob(b"two".to_vec().into()),
                     Value::Json(json!({"version": 2})),
                 ],
             )
@@ -2504,7 +2510,7 @@ simulation_test!(
                 upsert,
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
-                    Value::Blob(b"three".to_vec()),
+                    Value::Blob(b"three".to_vec().into()),
                     Value::Null,
                 ],
             )
@@ -2525,7 +2531,7 @@ simulation_test!(
                 upsert,
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
-                    Value::Blob(b"four".to_vec()),
+                    Value::Blob(b"four".to_vec().into()),
                     Value::Null,
                 ],
             )
@@ -2550,7 +2556,7 @@ simulation_test!(
             .expect("null-metadata file should load");
         assert_eq!(
             current.rows()[0].values(),
-            &[Value::Blob(b"four".to_vec()), Value::Null]
+            &[Value::Blob(b"four".to_vec().into()), Value::Null]
         );
     }
 );
@@ -2781,7 +2787,7 @@ simulation_test!(
                 Value::Text("file-readme".to_string()),
                 Value::Text("/scratch/readme.md".to_string()),
                 Value::Text("dir-scratch".to_string()),
-                Value::Blob(b"hello".to_vec()),
+                Value::Blob(b"hello".to_vec().into()),
             ]],
         );
     }
@@ -2898,7 +2904,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("file-upsert".to_string()),
                 Value::Text("/docs/upsert.md".to_string()),
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
             ]],
         );
     }
@@ -2948,7 +2954,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("file-nothing".to_string()),
                 Value::Text("/docs/nothing.md".to_string()),
-                Value::Blob(b"keep".to_vec()),
+                Value::Blob(b"keep".to_vec().into()),
             ]],
         );
     }
@@ -2989,7 +2995,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("file-fresh".to_string()),
                 Value::Text("/docs/fresh.md".to_string()),
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
             ]],
         );
     }
@@ -3029,7 +3035,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("/docs/path-fresh.md".to_string()),
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
             ]],
         );
     }
@@ -3079,7 +3085,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("file-path-upsert".to_string()),
                 Value::Text("/docs/path-upsert.md".to_string()),
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
             ]],
         );
 
@@ -3156,7 +3162,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("file-branch-path-upsert".to_string()),
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
             ]],
         );
     }
@@ -3300,7 +3306,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("file-global-path-upsert".to_string()),
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
                 Value::Boolean(true),
                 Value::Text("global".to_string()),
             ]],
@@ -3401,7 +3407,7 @@ simulation_test!(
             first_read,
             vec![vec![
                 Value::Text("transaction-target".to_string()),
-                Value::Blob(b"after".to_vec()),
+                Value::Blob(b"after".to_vec().into()),
             ]],
         );
 
@@ -3420,7 +3426,10 @@ simulation_test!(
             )
             .await
             .expect("repeated transaction path lookup should succeed");
-        assert_rows_eq(repeated_read, vec![vec![Value::Blob(b"again".to_vec())]]);
+        assert_rows_eq(
+            repeated_read,
+            vec![vec![Value::Blob(b"again".to_vec().into())]],
+        );
 
         let error = transaction
             .execute(
@@ -3443,7 +3452,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("transaction-target".to_string()),
                 Value::Text("/docs/target.md".to_string()),
-                Value::Blob(b"again".to_vec()),
+                Value::Blob(b"again".to_vec().into()),
             ]],
         );
 
@@ -3463,7 +3472,7 @@ simulation_test!(
             rolled_back,
             vec![vec![
                 Value::Text("transaction-target".to_string()),
-                Value::Blob(b"before".to_vec()),
+                Value::Blob(b"before".to_vec().into()),
             ]],
         );
         let anchor = session

@@ -63,8 +63,8 @@ pub use schema::{
 };
 
 pub use common::LixError;
+pub use common::{Blob, LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
-pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use engine::{Engine, EngineOptions};

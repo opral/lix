@@ -887,7 +887,7 @@ pub(crate) fn plan_parsed_file_path_write_with_resolvers(
     resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     parsed: LixPath,
     id: Option<String>,
-    data: Option<Vec<u8>>,
+    data: Option<crate::Blob>,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -909,7 +909,7 @@ fn plan_parsed_file_path_write_with_fallback(
     fallback: Option<&DirectoryPathResolver>,
     parsed: LixPath,
     id: Option<String>,
-    data: Option<Vec<u8>>,
+    data: Option<crate::Blob>,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -1627,7 +1627,7 @@ mod tests {
                 resolvers,
                 parsed,
                 id,
-                data,
+                data.map(Into::into),
                 context,
                 generate_directory_id,
             )

@@ -400,7 +400,10 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 
     tx.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-        &[Value::Text(path.clone()), Value::Blob(original.clone())],
+        &[
+            Value::Text(path.clone()),
+            Value::Blob(original.clone().into()),
+        ],
     )
     .await
     .unwrap();
@@ -408,14 +411,17 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
     let selected = tx
         .execute(
             "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
-            &[Value::Text(path.clone()), Value::Blob(original.clone())],
+            &[
+                Value::Text(path.clone()),
+                Value::Blob(original.clone().into()),
+            ],
         )
         .await
         .unwrap();
     assert_eq!(selected.len(), 1);
     assert_eq!(
         selected.rows()[0].values(),
-        &[Value::Blob(original.clone())]
+        &[Value::Blob(original.clone().into())]
     );
 
     let updated = b"updated bytes before commit".to_vec();
@@ -423,9 +429,9 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
         .execute(
             "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
             &[
-                Value::Blob(updated.clone()),
+                Value::Blob(updated.clone().into()),
                 Value::Text(path.clone()),
-                Value::Blob(original),
+                Value::Blob(original.into()),
             ],
         )
         .await
@@ -435,20 +441,23 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
     let after_update = tx
         .execute(
             "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
-            &[Value::Text(path.clone()), Value::Blob(updated.clone())],
+            &[
+                Value::Text(path.clone()),
+                Value::Blob(updated.clone().into()),
+            ],
         )
         .await
         .unwrap();
     assert_eq!(after_update.len(), 1);
     assert_eq!(
         after_update.rows()[0].values(),
-        &[Value::Blob(updated.clone())]
+        &[Value::Blob(updated.clone().into())]
     );
 
     let delete = tx
         .execute(
             "DELETE FROM lix_file WHERE path = $1 AND data = $2",
-            &[Value::Text(path.clone()), Value::Blob(updated)],
+            &[Value::Text(path.clone()), Value::Blob(updated.into())],
         )
         .await
         .unwrap();
@@ -747,7 +756,7 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-        &[Value::Text(path.to_string()), Value::Blob(data)],
+        &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
     .await?;
     Ok(())
@@ -949,7 +958,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/sql.txt".to_string()),
-            Value::Blob(b"sql".to_vec()),
+            Value::Blob(b"sql".to_vec().into()),
         ],
     )
     .await
@@ -959,7 +968,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE path = $2",
         &[
-            Value::Blob(b"updated".to_vec()),
+            Value::Blob(b"updated".to_vec().into()),
             Value::Text("/sql.txt".to_string()),
         ],
     )
@@ -972,7 +981,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
         &[
             Value::Text("/tx.txt".to_string()),
-            Value::Blob(b"tx".to_vec()),
+            Value::Blob(b"tx".to_vec().into()),
         ],
     )
     .await
@@ -1095,7 +1104,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
         &[
             Value::Text("file-untracked".to_string()),
             Value::Text("/untracked.txt".to_string()),
-            Value::Blob(b"untracked".to_vec()),
+            Value::Blob(b"untracked".to_vec().into()),
         ],
     )
     .await

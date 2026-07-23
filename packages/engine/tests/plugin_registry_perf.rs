@@ -576,7 +576,7 @@ async fn install_benchmark_plugin(
             "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
             &[
                 Value::Text("/.lix/plugins/plugin_perf.lixplugin".to_string()),
-                Value::Blob(benchmark_plugin_archive(path_glob, wasm_bytes)),
+                Value::Blob(benchmark_plugin_archive(path_glob, wasm_bytes).into()),
             ],
         )
         .await;
@@ -608,7 +608,7 @@ async fn execute_update(
     payload: Vec<u8>,
     expected_rows: usize,
 ) -> Duration {
-    let params = [Value::Blob(payload)];
+    let params = [Value::Blob(payload.into())];
     let started = Instant::now();
     let result = session.execute(sql, &params).await;
     let elapsed = started.elapsed();
@@ -638,7 +638,7 @@ async fn execute_read_render(
     for row in result.rows() {
         assert_eq!(
             row.values(),
-            &[Value::Blob(BENCH_RENDERED_BYTES.to_vec())],
+            &[Value::Blob(BENCH_RENDERED_BYTES.to_vec().into())],
             "timed rendered read must return deterministic component bytes"
         );
     }

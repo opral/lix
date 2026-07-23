@@ -1475,7 +1475,7 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
-        Value::Blob(value) => ScalarValue::LargeBinary(Some(value.clone())).into(),
+        Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
     }
 }
 
@@ -1673,7 +1673,7 @@ fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Resul
             Ok(Value::Null)
         }
         ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => {
-            Ok(Value::Blob(value))
+            Ok(Value::Blob(value.into()))
         }
         ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
         other => Ok(Value::Text(other.to_string())),
@@ -3113,7 +3113,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("file-a".to_string()));
         assert_eq!(rows[0][1], Value::Text("/docs/readme.md".to_string()));
-        assert_eq!(rows[0][2], Value::Blob(b"hello".to_vec()));
+        assert_eq!(rows[0][2], Value::Blob(b"hello".to_vec().into()));
         assert_eq!(rows[0][3], Value::Text(head_commit_id.clone()));
         assert!(matches!(rows[0][4], Value::Integer(_)));
 
@@ -4872,9 +4872,9 @@ mod tests {
             "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
             &[
                 Value::Text("/multi/param-a.md".to_string()),
-                Value::Blob(b"param-a".to_vec()),
+                Value::Blob(b"param-a".to_vec().into()),
                 Value::Text("/multi/param-b.md".to_string()),
-                Value::Blob(b"param-b".to_vec()),
+                Value::Blob(b"param-b".to_vec().into()),
             ],
             WriteExecutorMode::ForceFast,
         )
@@ -4898,10 +4898,10 @@ mod tests {
              VALUES ($1, $2, $3), ($4, $5, $6)",
             &[
                 Value::Text("/multi/param-a.md".to_string()),
-                Value::Blob(b"param-a".to_vec()),
+                Value::Blob(b"param-a".to_vec().into()),
                 Value::Json(json!({"source": "json-param"})),
                 Value::Text("/multi/param-b.md".to_string()),
-                Value::Blob(b"param-b".to_vec()),
+                Value::Blob(b"param-b".to_vec().into()),
                 Value::Text(r#"{"source":"text-param"}"#.to_string()),
             ],
             WriteExecutorMode::ForceFast,
@@ -4957,7 +4957,7 @@ mod tests {
                    lixcol_metadata = excluded.lixcol_metadata";
         let params = [
             Value::Text("/docs/existing.md".to_string()),
-            Value::Blob(b"updated".to_vec()),
+            Value::Blob(b"updated".to_vec().into()),
             Value::Json(json!({"source": "upload"})),
         ];
 
@@ -5023,7 +5023,7 @@ mod tests {
             "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3)",
             &[
                 Value::Text("/invalid.md".to_string()),
-                Value::Blob(b"data".to_vec()),
+                Value::Blob(b"data".to_vec().into()),
                 Value::Json(json!(["not", "an", "object"])),
             ],
             WriteExecutorMode::ForceFast,
@@ -5254,7 +5254,7 @@ mod tests {
             "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
             &[
                 Value::Text("/ok.md".to_string()),
-                Value::Blob(b"ok".to_vec()),
+                Value::Blob(b"ok".to_vec().into()),
                 Value::Text("/bad.md".to_string()),
                 Value::Text("not a blob".to_string()),
             ],
@@ -5448,9 +5448,9 @@ mod tests {
             &mut ctx,
             "UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3",
             &[
-                Value::Blob(b"new".to_vec()),
+                Value::Blob(b"new".to_vec().into()),
                 Value::Text("file-readme".to_string()),
-                Value::Blob(b"old".to_vec()),
+                Value::Blob(b"old".to_vec().into()),
             ],
             WriteExecutorMode::Auto,
         )
@@ -5603,7 +5603,7 @@ mod tests {
             &mut ctx,
             "UPDATE lix_file SET data = $1 WHERE id = $2",
             &[
-                Value::Blob(b"parameterized".to_vec()),
+                Value::Blob(b"parameterized".to_vec().into()),
                 Value::Text("file-readme".to_string()),
             ],
             WriteExecutorMode::ForceFast,
@@ -5635,7 +5635,7 @@ mod tests {
         let rows = vec![live_file_row("file-readme", "branch-a", None, "readme.md")];
         let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows);
         let sql = "UPDATE lix_file SET data = $1 WHERE id = $2";
-        let params = [Value::Blob(b"parameterized".to_vec()), Value::Null];
+        let params = [Value::Blob(b"parameterized".to_vec().into()), Value::Null];
 
         let (fast_result, fast_path) =
             execute_write_sql_trace(&mut fast_ctx, sql, &params, WriteExecutorMode::ForceFast)
@@ -7055,7 +7055,7 @@ mod tests {
                     Value::Text("/docs/readme.md".to_string())
                 );
                 assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
-                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42]));
+                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
                 assert_eq!(result.rows[0][3], Value::Text("branch-a".to_string()));
             })
         });
@@ -7086,7 +7086,7 @@ mod tests {
                     Value::Text("/docs/readme.md".to_string())
                 );
                 assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
-                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42]));
+                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
             })
         });
     }

@@ -111,7 +111,7 @@ async fn write_file(lix: &lix_sdk::Lix<SQLite>, path: &str, data: Vec<u8>) {
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-        &[Value::Text(path.to_string()), Value::Blob(data)],
+        &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
     .await
     .unwrap();
