@@ -2726,7 +2726,7 @@ mod tests {
         session
             .execute(
                 "SELECT COUNT(*) AS rows FROM lix_key_value_history \
-                 WHERE lixcol_start_commit_id = lix_active_branch_commit_id()",
+                 WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()",
                 &[],
             )
             .await

@@ -402,7 +402,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
 	const fileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_start_commit_id = $2",
+			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_as_of_commit_id = $2",
 			[fileId, insertedHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -413,10 +413,10 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(
 		get(
 			await lix.execute(
-				"SELECT origin_key FROM lix_state_history WHERE change_id = $1 AND start_commit_id = $2",
+				"SELECT lixcol_origin_key FROM lix_state_history WHERE lixcol_change_id = $1 AND lixcol_as_of_commit_id = $2",
 				[get(inserted, "lixcol_change_id"), insertedHeadCommitId],
 			),
-			"origin_key",
+			"lixcol_origin_key",
 		),
 	).toBe("test-origin");
 
@@ -441,10 +441,10 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(
 		get(
 			await lix.execute(
-				"SELECT origin_key FROM lix_state_history WHERE change_id = $1 AND start_commit_id = $2",
+				"SELECT lixcol_origin_key FROM lix_state_history WHERE lixcol_change_id = $1 AND lixcol_as_of_commit_id = $2",
 				[get(txStamped, "lixcol_change_id"), txHeadCommitId],
 			),
-			"origin_key",
+			"lixcol_origin_key",
 		),
 	).toBe("tx-origin");
 	expect(get(txStamped, "lixcol_metadata")).toEqual(metadata);
@@ -1222,7 +1222,7 @@ test("beginTransaction preserves handle after failed statement", async () => {
 		["failed-tx-task", "Before failure", false, JSON.stringify({ batch: 1 })],
 	);
 	await expect(
-		tx.execute("SELECT entity_pk FROM lix_state_history"),
+		tx.execute("SELECT lixcol_entity_pk FROM lix_state_history"),
 	).rejects.toMatchObject({
 		code: "LIX_HISTORY_FILTER_REQUIRED",
 	});
@@ -1251,7 +1251,7 @@ test("beginTransaction can continue after failed statement", async () => {
 		],
 	);
 	await expect(
-		tx.execute("SELECT entity_pk FROM lix_state_history"),
+		tx.execute("SELECT lixcol_entity_pk FROM lix_state_history"),
 	).rejects.toMatchObject({
 		code: "LIX_HISTORY_FILTER_REQUIRED",
 	});
@@ -1384,7 +1384,7 @@ test("engine errors cross the native boundary", async () => {
 	const lix = await openLix();
 
 	try {
-		await lix.execute("SELECT entity_pk FROM lix_state_history");
+		await lix.execute("SELECT lixcol_entity_pk FROM lix_state_history");
 		throw new Error("expected history query to fail");
 	} catch (error) {
 		expect(error).toMatchObject({
@@ -1818,14 +1818,14 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	);
 
 	const result = await lix.execute(
-		"SELECT schema_key, snapshot_content \
+		"SELECT lixcol_schema_key, lixcol_snapshot_content \
 		 FROM lix_state_history \
-		 WHERE start_commit_id = lix_active_branch_commit_id()",
+		 WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()",
 	);
 	const directoryRow = result.rows.find(
-		(row) => row.get("schema_key") === "lix_directory_descriptor",
+		(row) => row.get("lixcol_schema_key") === "lix_directory_descriptor",
 	);
-	expect(directoryRow?.get("snapshot_content")).toMatchObject({
+	expect(directoryRow?.get("lixcol_snapshot_content")).toMatchObject({
 		parent_id: null,
 	});
 

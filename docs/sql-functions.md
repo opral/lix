@@ -30,16 +30,16 @@ Returns the active branch id of the current SQL session. Branch-pinned clients t
 
 Returns the commit id at the tip of the **currently active** branch, as resolved when the SQL statement was planned.
 
-History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) require a literal or bound-parameter equality on `start_commit_id` (or `lixcol_start_commit_id`). A correlated subquery against `lix_branch` is rejected by the planner. `lix_active_branch_commit_id()` is the canonical way to scope history to the active branch in a single statement:
+History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) require a literal or bound-parameter equality on `lixcol_as_of_commit_id`. A correlated subquery against `lix_branch` is rejected by the planner. `lix_active_branch_commit_id()` is the canonical way to scope history to the active branch in a single statement:
 
 ```sql
 -- Walk one entity's history from the active branch's tip
-SELECT depth, observed_commit_id, snapshot_content
+SELECT lixcol_depth, lixcol_observed_commit_id, lixcol_snapshot_content
 FROM lix_state_history
-WHERE schema_key = 'task'
-  AND lix_json_get_text(entity_pk, 0) = 't1'
-  AND start_commit_id = lix_active_branch_commit_id()
-ORDER BY depth;
+WHERE lixcol_schema_key = 'task'
+  AND lix_json_get_text(lixcol_entity_pk, 0) = 't1'
+  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
+ORDER BY lixcol_depth;
 ```
 
 For an arbitrary branch, resolve the commit id with one query and pass it as a parameter:
@@ -52,12 +52,12 @@ const { rows } = await lix.execute(
 const commitId = rows[0].value("commit_id").asText();
 
 await lix.execute(
-  `SELECT depth, snapshot_content
+  `SELECT lixcol_depth, lixcol_snapshot_content
      FROM lix_state_history
-    WHERE start_commit_id = $1
-      AND schema_key = $2
-      AND lix_json_get_text(entity_pk, 0) = $3
-    ORDER BY depth`,
+    WHERE lixcol_as_of_commit_id = $1
+      AND lixcol_schema_key = $2
+      AND lix_json_get_text(lixcol_entity_pk, 0) = $3
+    ORDER BY lixcol_depth`,
   [commitId, "task", "t1"],
 );
 ```

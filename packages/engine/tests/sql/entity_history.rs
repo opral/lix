@@ -62,9 +62,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_as_of_commit_id, lixcol_is_deleted, lixcol_depth \
                      FROM engine_history_schema_history \
-                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
                        AND lixcol_entity_pk = lix_json('[\"history-entity\"]') \
                      ORDER BY lixcol_depth"
                 ),
@@ -84,6 +84,7 @@ simulation_test!(
                     Value::Json(json!(["history-entity"])),
                     Value::Text(second_commit_id.clone()),
                     Value::Text(second_commit_id.clone()),
+                    Value::Boolean(false),
                     Value::Integer(0),
                 ],
                 vec![
@@ -94,6 +95,7 @@ simulation_test!(
                     Value::Json(json!(["history-entity"])),
                     Value::Text(first_commit_id),
                     Value::Text(second_commit_id),
+                    Value::Boolean(false),
                     Value::Integer(1),
                 ],
             ],
@@ -102,7 +104,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_history_requires_lixcol_start_commit_id,
+    entity_history_requires_lixcol_as_of_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -129,7 +131,7 @@ simulation_test!(
         let error = session
             .execute("SELECT id FROM engine_history_error_schema_history", &[])
             .await
-            .expect_err("typed history queries must provide start commit");
+            .expect_err("typed history queries must provide an as-of commit");
 
         assert_eq!(
             error.code,
@@ -138,20 +140,20 @@ simulation_test!(
         assert!(
             error
                 .to_string()
-                .contains("requires a lixcol_start_commit_id filter"),
+                .contains("requires a lixcol_as_of_commit_id filter"),
             "unexpected error: {error}"
         );
         assert!(
             error
                 .hint()
-                .is_some_and(|hint| hint.contains("WHERE lixcol_start_commit_id")),
+                .is_some_and(|hint| hint.contains("WHERE lixcol_as_of_commit_id")),
             "unexpected error: {error}"
         );
     }
 );
 
 simulation_test!(
-    entity_history_rejects_bare_start_commit_id_filter,
+    entity_history_rejects_retired_anchor_names,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -175,20 +177,24 @@ simulation_test!(
             .await
             .expect("registered schema insert should succeed");
 
-        let error = session
-            .execute(
-                "SELECT id \
-                 FROM engine_history_bare_error_schema_history \
-                 WHERE start_commit_id = lix_active_branch_commit_id()",
-                &[],
-            )
-            .await
-            .expect_err("typed history should only expose lixcol_start_commit_id");
+        for retired in ["start_commit_id", "lixcol_start_commit_id"] {
+            let error = session
+                .execute(
+                    &format!(
+                        "SELECT id \
+                         FROM engine_history_bare_error_schema_history \
+                         WHERE {retired} = lix_active_branch_commit_id()"
+                    ),
+                    &[],
+                )
+                .await
+                .expect_err("retired history anchor must fail");
 
-        assert_eq!(error.code, lix_engine::LixError::CODE_COLUMN_NOT_FOUND);
-        assert!(
-            error.to_string().contains("start_commit_id"),
-            "unexpected error: {error}"
-        );
+            assert_eq!(error.code, lix_engine::LixError::CODE_COLUMN_NOT_FOUND);
+            assert!(
+                error.to_string().contains(retired),
+                "unexpected error: {error}"
+            );
+        }
     }
 );

@@ -79,7 +79,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
             .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...");
     }
 
-    if lower.contains("requires start_commit_id")
+    if lower.contains("requires a lixcol_as_of_commit_id filter")
         || lower.contains("history filter")
         || lower.contains("history table")
     {

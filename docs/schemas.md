@@ -127,7 +127,7 @@ If a schema author truly needs a breaking change, they mint a new `x-lix-key` (e
 - **Constraints (`x-lix-primary-key`, `x-lix-unique`, `x-lix-foreign-keys`).** Frozen. You can reorder list elements cosmetically (Lix normalizes the comparison), but you can't add, remove, or modify a constraint. Primary-key column order is semantic and cannot be reordered.
 - **Top-level keywords** like `type`, `examples`, `patternProperties`. Frozen.
 - **Nested object schemas.** A property whose `type` is `object` is frozen as a unit: you cannot add subproperties to it. Recursive schema evolution is intentionally a later, explicit feature.
-- **`x-lix-version`.** Rejected if present on either side. The `schema_version` columns you may see on state/history SQL surfaces are engine metadata, not a schema authoring field.
+- **`x-lix-version`.** Rejected if present on either side. The `schema_version` column you may see on current state SQL surfaces is engine metadata, not a schema authoring field.
 
 ### What to do when you really need a breaking change
 

@@ -40,9 +40,9 @@ Common columns (`lix_state` and `lix_state_by_version`): `entity_pk` (JSON array
 
 Every canonical current row has a `change_id`, including rows written with `lixcol_untracked = true`. Untracked current rows have no `commit_id`; tracked rows reference the commit that retained their change. Deleting an untracked row physically removes its flat current-index entry and standalone ChangeRecord; no untracked tombstone is retained. Valid writes reject tracked and untracked rows with the same canonical identity.
 
-`lix_state_history` shares `entity_pk` (JSON array of primary-key values), `schema_key`, `file_id`, `snapshot_content`, `metadata`, `schema_version`, `change_id`, and instead of `commit_id` exposes `start_commit_id`, `observed_commit_id`, `commit_created_at`, and `depth` (commit-graph distance from `start_commit_id`; `0` is the freshest observation, higher values walk back, and intermediate commits that didn't touch the entity are skipped).
+`lix_state_history` uses the same prefixed history vocabulary as every other history surface: `lixcol_entity_pk`, `lixcol_observed_commit_id`, `lixcol_commit_created_at`, `lixcol_as_of_commit_id`, `lixcol_depth`, and `lixcol_is_deleted`. Because it exposes one canonical change per row, it also provides singular provenance through `lixcol_change_id`, `lixcol_change_created_at`, and `lixcol_origin_key`, plus `lixcol_schema_key`, `lixcol_file_id`, `lixcol_snapshot_content`, and `lixcol_metadata`.
 
-> **History queries require a literal filter on `start_commit_id`.** A correlated subquery against `lix_version` is rejected by the planner. Use `lix_active_version_commit_id()` for the active version, or resolve the commit id with one query and pass it as a parameter. See [`lix_active_version_commit_id()`](./sql-functions.md#lix_active_version_commit_id).
+> **History queries require a literal filter on `lixcol_as_of_commit_id`.** A correlated subquery against `lix_branch` is rejected by the planner. Use `lix_active_branch_commit_id()` for the active branch, or resolve the commit id with one query and pass it as a parameter. See [`lix_active_branch_commit_id()`](./sql-functions.md#lix_active_branch_commit_id).
 
 ```sql
 -- Every entity in the active version, raw JSON
@@ -56,12 +56,12 @@ WHERE schema_key = 'task'
   AND version_id IN ($a, $b);
 
 -- Walk history of one entity from a version's tip
-SELECT depth, observed_commit_id, snapshot_content
+SELECT lixcol_depth, lixcol_observed_commit_id, lixcol_snapshot_content
 FROM lix_state_history
-WHERE schema_key = 'task'
-  AND lix_json_get_text(entity_pk, 0) = 't1'
-  AND start_commit_id = lix_active_version_commit_id()
-ORDER BY depth;
+WHERE lixcol_schema_key = 'task'
+  AND lix_json_get_text(lixcol_entity_pk, 0) = 't1'
+  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
+ORDER BY lixcol_depth;
 ```
 
 ## Per-entity sugar
@@ -78,9 +78,9 @@ Per-entity surfaces project user columns directly (`id`, `title`, `done`, …) p
 
 - `<schema>` (active): `lixcol_change_id`, `lixcol_commit_id`, `lixcol_created_at`, `lixcol_updated_at`, plus bookkeeping. **No `lixcol_version_id`**; the active surface is implicitly the active version.
 - `<schema>_by_version`: adds `lixcol_version_id`. INSERT/UPDATE require it.
-- `<schema>_history`: `lixcol_start_commit_id`, `lixcol_observed_commit_id`, `lixcol_depth`, `lixcol_snapshot_content`, `lixcol_change_id` (no `lixcol_commit_id` here; commits in history are addressed via `lixcol_observed_commit_id`).
+- `<schema>_history`: the common history columns plus `lixcol_snapshot_content`, `lixcol_change_id`, `lixcol_change_created_at`, and `lixcol_origin_key` (no `lixcol_commit_id`; revisions are anchored by `lixcol_as_of_commit_id` and observed at `lixcol_observed_commit_id`).
 
-Note the prefix asymmetry between grains: state surfaces use **bare** column names (`start_commit_id`, `depth`, `observed_commit_id`); per-entity, file, and directory surfaces wear `lixcol_` on the same columns.
+There are no bare history aliases. The `lixcol_` prefix and `lixcol_as_of_commit_id` spelling are identical across raw, typed, file, and directory history.
 
 ```sql
 -- Current rows of one schema, typed columns
@@ -95,7 +95,7 @@ WHERE id = 't1' AND lixcol_version_id IN ($a, $b);
 SELECT lixcol_depth, title, done
 FROM task_history
 WHERE id = 't1'
-  AND lixcol_start_commit_id = lix_active_version_commit_id()
+  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
 ORDER BY lixcol_depth;
 ```
 
@@ -111,7 +111,7 @@ When you need the typed columns, reach for the per-entity sugar. When you're que
 | `lix_file_by_version` | Read or write files across versions. |
 | `lix_file_history` | Walk previous versions of a file's bytes through the commit graph. |
 
-User columns: `id`, `path`, `directory_id`, `name`, `data`. System columns are `lixcol_*` (`lixcol_version_id` on `_by_version`; `lixcol_start_commit_id`, `lixcol_depth`, `lixcol_observed_commit_id` on `_history`).
+User columns: `id`, `path`, `directory_id`, `name`, `data`. File history adds the common history columns and `lixcol_source_changes`, a deterministic JSON array of the canonical changes that caused the composed file revision. It deliberately has no singular `lixcol_change_id`, `lixcol_schema_key`, or `lixcol_origin_key`.
 
 `lix_file_history` records changes to the composed file projection, not only
 changes to the file descriptor or bytes. Renaming, moving, deleting, or
@@ -137,7 +137,7 @@ WHERE path = '/orders.xlsx' AND lixcol_version_id IN ($a, $b);
 SELECT lixcol_depth, lixcol_observed_commit_id, data
 FROM lix_file_history
 WHERE path = '/orders.xlsx'
-  AND lixcol_start_commit_id = lix_active_version_commit_id()
+  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
 ORDER BY lixcol_depth;
 ```
 
@@ -153,7 +153,7 @@ Same shape as files, minus the `data` column.
 | `lix_directory_by_version` | Cross-version directory reads/writes. |
 | `lix_directory_history` | Directory history walked through commits. |
 
-User columns: `id`, `path`, `parent_id`, `name`. Same `lixcol_*` system columns as files. Directory paths must end with a trailing slash (`/data/`, not `/data`).
+User columns: `id`, `path`, `parent_id`, `name`. Directory history uses the same common history columns and structured `lixcol_source_changes` provenance as file history. Directory paths must end with a trailing slash (`/data/`, not `/data`).
 
 Directory history uses the same composed-projection rule: an ancestor rename,
 move, deletion, or restoration creates a revision for each descendant
@@ -192,13 +192,17 @@ Per-version history goes through the commit graph, not `lix_change` directly. Se
 
 ## Naming conventions
 
-| Surface family | System column prefix | Version column |
+| Surface family | System column prefix | Branch column |
 | :-- | :-- | :-- |
-| `lix_state*` | bare (no prefix) | `version_id` |
-| `<schema>*`, `lix_file*`, `lix_directory*` | `lixcol_*` | `lixcol_version_id` |
+| `lix_state`, `lix_state_by_branch` | bare (no prefix) | `branch_id` |
+| `lix_state_history` | `lixcol_*` | (none; anchor with `lixcol_as_of_commit_id`) |
+| `<schema>*`, `lix_file*`, `lix_directory*` | `lixcol_*` | `lixcol_branch_id` |
 | `lix_change` | bare | (none, global) |
 
-State surfaces are projection-friendly raw views. Per-entity, file, and directory surfaces wear `lixcol_*` to keep your user columns (`id`, `title`, `path`, …) cleanly separated from Lix bookkeeping.
+Current and cross-branch state surfaces are projection-friendly raw views with
+bare bookkeeping names. History, per-entity, file, and directory surfaces wear
+`lixcol_*` to keep user columns (`id`, `title`, `path`, …) cleanly separated
+from Lix bookkeeping.
 
 ## Composition recap
 

@@ -6,10 +6,10 @@ use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::sql2::history_route::{
-    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
-    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_START_COMMIT_ID,
 };
 use crate::sql2::result_metadata::{json_field, mark_json_field};
 
@@ -150,11 +150,13 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
             json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
             json_field(HISTORY_COL_METADATA, true),
             Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_CHANGE_CREATED_AT, DataType::Utf8, false),
             Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
             Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-            Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+            Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
         ];
     }
 

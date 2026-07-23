@@ -18,8 +18,11 @@ use crate::sql2::catalog::{
     schema_exposed_as_entity_surface,
 };
 use crate::sql2::history_route::{
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
-    HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SOURCE_CHANGES, HISTORY_COL_START_COMMIT_ID,
+    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
+    HISTORY_COL_SOURCE_CHANGES,
 };
 #[cfg(test)]
 use crate::sql2::result_metadata::json_field;
@@ -124,17 +127,19 @@ impl PublicCatalog {
                 json_field("snapshot_content", true),
             ])),
             PublicSurfaceKind::History => Arc::new(Schema::new(vec![
-                json_field("entity_pk", false),
-                Field::new("schema_key", DataType::Utf8, false),
-                Field::new("file_id", DataType::Utf8, true),
-                json_field("snapshot_content", true),
-                json_field("metadata", true),
-                Field::new("change_id", DataType::Utf8, false),
-                Field::new("origin_key", DataType::Utf8, true),
-                Field::new("observed_commit_id", DataType::Utf8, false),
-                Field::new("commit_created_at", DataType::Utf8, false),
-                Field::new("start_commit_id", DataType::Utf8, false),
-                Field::new("depth", DataType::Int64, false),
+                json_field(HISTORY_COL_ENTITY_PK, false),
+                Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
+                Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
+                json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
+                json_field(HISTORY_COL_METADATA, true),
+                Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+                Field::new(HISTORY_COL_CHANGE_CREATED_AT, DataType::Utf8, false),
+                Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
+                Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
+                Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
+                Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
+                Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+                Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
             ])),
             PublicSurfaceKind::FileHistory => history_filesystem_schema(true),
             PublicSurfaceKind::DirectoryHistory => history_filesystem_schema(false),
@@ -382,8 +387,9 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-        Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+        Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
     ]);
     Arc::new(Schema::new(fields))
 }
@@ -526,17 +532,19 @@ fn entity_system_columns(variant: EntitySurfaceShape) -> Vec<PublicColumn> {
 
 fn state_history_columns() -> Vec<PublicColumn> {
     public_columns([
-        "entity_pk",
-        "schema_key",
-        "file_id",
-        "snapshot_content",
-        "metadata",
-        "change_id",
-        "origin_key",
-        "observed_commit_id",
-        "commit_created_at",
-        "start_commit_id",
-        "depth",
+        HISTORY_COL_ENTITY_PK,
+        HISTORY_COL_SCHEMA_KEY,
+        HISTORY_COL_FILE_ID,
+        HISTORY_COL_SNAPSHOT_CONTENT,
+        HISTORY_COL_METADATA,
+        HISTORY_COL_CHANGE_ID,
+        HISTORY_COL_CHANGE_CREATED_AT,
+        HISTORY_COL_ORIGIN_KEY,
+        HISTORY_COL_OBSERVED_COMMIT_ID,
+        HISTORY_COL_COMMIT_CREATED_AT,
+        HISTORY_COL_AS_OF_COMMIT_ID,
+        HISTORY_COL_DEPTH,
+        HISTORY_COL_IS_DELETED,
     ])
 }
 
@@ -551,8 +559,9 @@ fn file_history_columns() -> Vec<PublicColumn> {
         HISTORY_COL_SOURCE_CHANGES,
         HISTORY_COL_OBSERVED_COMMIT_ID,
         HISTORY_COL_COMMIT_CREATED_AT,
-        HISTORY_COL_START_COMMIT_ID,
+        HISTORY_COL_AS_OF_COMMIT_ID,
         HISTORY_COL_DEPTH,
+        HISTORY_COL_IS_DELETED,
     ])
 }
 
@@ -566,7 +575,8 @@ fn directory_history_columns() -> Vec<PublicColumn> {
         HISTORY_COL_SOURCE_CHANGES,
         HISTORY_COL_OBSERVED_COMMIT_ID,
         HISTORY_COL_COMMIT_CREATED_AT,
-        HISTORY_COL_START_COMMIT_ID,
+        HISTORY_COL_AS_OF_COMMIT_ID,
         HISTORY_COL_DEPTH,
+        HISTORY_COL_IS_DELETED,
     ])
 }

@@ -61,11 +61,11 @@ Lix stores changes as data, not snapshots. One immutable journal across every en
 
 ```sql
 -- What does this version see right now?
-SELECT entity_pk, schema_key, snapshot_content
+SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_snapshot_content
 FROM lix_state_history
-WHERE start_commit_id = lix_active_version_commit_id()
-  AND depth = 0
-ORDER BY schema_key, entity_pk;
+WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()
+  AND lixcol_depth = 0
+ORDER BY lixcol_schema_key, lixcol_entity_pk;
 ```
 
 Whether the entity is a spreadsheet cell, a document clause, a CAD part, or an application row, the surface is the same. Diffs, undo, audit, blame, and attribution are all SQL. See [Change History](./history.md).

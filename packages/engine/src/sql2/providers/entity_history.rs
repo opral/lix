@@ -25,8 +25,9 @@ use crate::sql2::catalog::{
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryMetadataProjection, HistoryRoute,
-    HistoryViewDescriptor, load_history_entries, parse_history_filter,
+    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_IS_DELETED,
+    HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
+    parse_history_filter,
 };
 use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot,
@@ -91,7 +92,7 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
+        if parse_history_filter(filter).is_some() {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Unsupported
@@ -105,10 +106,9 @@ where
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
+        let route = HistoryRoute::from_filters(filters);
         let schema = projected_schema(&self.schema, projection);
-        let metadata_projection =
-            HistoryMetadataProjection::from_scan(&schema, filters, HistoryColumnStyle::Prefixed);
+        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -143,8 +143,8 @@ where
 struct EntityHistoryRow {
     change: MaterializedChange,
     observed_commit_id: String,
-    commit_created_at: String,
-    start_commit_id: String,
+    commit_created_at: Option<String>,
+    as_of_commit_id: String,
     depth: u32,
 }
 
@@ -163,7 +163,7 @@ where
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: history_view_name.as_str(),
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
         query_source.json_reader,
@@ -178,7 +178,7 @@ where
             change: entry.change,
             observed_commit_id: entry.observed_commit_id,
             commit_created_at: entry.commit_created_at,
-            start_commit_id: entry.start_commit_id,
+            as_of_commit_id: entry.as_of_commit_id,
             depth: entry.depth,
         })
         .collect::<Vec<_>>();
@@ -226,6 +226,10 @@ static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<EntityHistoryRow> = ColumnTable {
             Col::Utf8(|row| Some(row.change.id.as_str())),
         ),
         (
+            HISTORY_COL_CHANGE_CREATED_AT,
+            Col::Utf8(|row| Some(row.change.created_at.as_str())),
+        ),
+        (
             "lixcol_origin_key",
             Col::Utf8(|row| row.change.origin_key.as_deref()),
         ),
@@ -235,13 +239,17 @@ static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<EntityHistoryRow> = ColumnTable {
         ),
         (
             "lixcol_commit_created_at",
-            Col::Utf8(|row| Some(row.commit_created_at.as_str())),
+            Col::Utf8(|row| row.commit_created_at.as_deref()),
         ),
         (
-            "lixcol_start_commit_id",
-            Col::Utf8(|row| Some(row.start_commit_id.as_str())),
+            HISTORY_COL_AS_OF_COMMIT_ID,
+            Col::Utf8(|row| Some(row.as_of_commit_id.as_str())),
         ),
         ("lixcol_depth", Col::I64(|row| Some(i64::from(row.depth)))),
+        (
+            HISTORY_COL_IS_DELETED,
+            Col::Bool(|row| Some(row.change.snapshot_content.is_none())),
+        ),
     ],
 };
 

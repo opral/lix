@@ -200,7 +200,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
             &format!(
                 "SELECT id, path \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'history-point-target'"
             ),
@@ -300,7 +300,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
             &format!(
                 "SELECT path, lixcol_source_changes \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'bounded-file'"
             ),
@@ -387,7 +387,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{rename_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{rename_commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'projection-file'"
                 ),
@@ -414,7 +414,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_source_changes \
                      FROM lix_directory_history \
-                     WHERE lixcol_start_commit_id = '{rename_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{rename_commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'projection-guides'"
                 ),
@@ -447,7 +447,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{move_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{move_commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'projection-file'"
                 ),
@@ -534,7 +534,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'grouped-file'"
                 ),
@@ -569,7 +569,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_source_changes \
                      FROM lix_directory_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'grouped-child'"
                 ),
@@ -667,7 +667,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
                        AND lixcol_depth = 1 \
                        AND id = 'ancestor-sibling-file' \
                      ORDER BY lixcol_observed_commit_id"
@@ -742,7 +742,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{delete_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'restore-file'"
                 ),
@@ -805,7 +805,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, data, lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{restore_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{restore_commit_id}' \
                        AND lixcol_depth = 0 \
                        AND id = 'restore-file'"
                 ),
@@ -887,9 +887,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, data, lixcol_start_commit_id, lixcol_depth \
+                "SELECT id, path, name, data, lixcol_as_of_commit_id, lixcol_depth \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = $1 \
+                 WHERE lixcol_as_of_commit_id = $1 \
                    AND id = $2 \
                    AND path LIKE $3 \
                  ORDER BY lixcol_depth",
@@ -929,7 +929,7 @@ simulation_test!(
                 &format!(
                     "SELECT lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
                        AND id = 'history-file' \
                        AND lixcol_depth = 0"
                 ),
@@ -958,13 +958,13 @@ simulation_test!(
                 &format!(
                     "SELECT id \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{first_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{first_commit_id}' \
                        AND path LIKE '/missing/%'"
                 ),
                 &[],
             )
             .await
-            .expect("file history should route start commit and leave path LIKE as residual");
+            .expect("file history should route the as-of commit and leave path LIKE as residual");
         assert_rows_eq(result, Vec::<Vec<Value>>::new());
     }
 );
@@ -999,7 +999,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, data \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND path = '/empty-history.txt' \
                        AND lixcol_depth = 0"
                 ),
@@ -1090,7 +1090,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth, lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
                        AND id = 'diamond-file' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
@@ -1170,7 +1170,7 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
         .execute(
             "SELECT id, path, data \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = $1 \
+                 WHERE lixcol_as_of_commit_id = $1 \
                    AND id IN ($2, $3) \
                  ORDER BY id",
             &[
@@ -1238,7 +1238,7 @@ simulation_test!(
                 &format!(
                     "SELECT id, path, lixcol_depth \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                      ORDER BY lixcol_depth \
                      LIMIT 1"
                 ),
@@ -1291,7 +1291,7 @@ simulation_test!(
                 &format!(
                     "SELECT id, path, data \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND path LIKE '/target/%' \
                      LIMIT 1"
                 ),
@@ -1393,7 +1393,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
             &format!(
                 "SELECT path, data, lixcol_depth \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND id = '{file_id}' \
                  ORDER BY lixcol_depth \
                  LIMIT 2"
@@ -1427,7 +1427,7 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
             &format!(
                 "SELECT data, lixcol_depth \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND id = '{file_id}' \
                    AND lixcol_depth = 1"
             ),
@@ -1520,7 +1520,7 @@ async fn lix_file_history_uses_each_siblings_observed_plugin_registry() {
             &format!(
                 "SELECT data, lixcol_observed_commit_id, lixcol_source_changes \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
                    AND path = '/note.history-render' \
                    AND lixcol_depth = 1"
             ),
@@ -1616,7 +1616,7 @@ async fn lix_file_history_projects_owned_file_plugin_lifecycle_without_glob_reas
             &format!(
                 "SELECT data, lixcol_source_changes \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{upgrade_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{upgrade_commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'plugin-lifecycle-note'"
             ),
@@ -1667,7 +1667,7 @@ async fn lix_file_history_projects_owned_file_plugin_lifecycle_without_glob_reas
             &format!(
                 "SELECT id \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{overlap_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{overlap_commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'plugin-lifecycle-note'"
             ),
@@ -1712,7 +1712,7 @@ async fn lix_file_history_projects_owned_file_plugin_lifecycle_without_glob_reas
             &format!(
                 "SELECT id \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{non_owner_state_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{non_owner_state_commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'plugin-lifecycle-note'"
             ),
@@ -1755,7 +1755,7 @@ async fn lix_file_history_projects_owned_file_plugin_lifecycle_without_glob_reas
             &format!(
                 "SELECT id, lixcol_source_changes \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{uninstall_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{uninstall_commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'plugin-lifecycle-note'"
             ),
@@ -1769,7 +1769,7 @@ async fn lix_file_history_projects_owned_file_plugin_lifecycle_without_glob_reas
             &format!(
                 "SELECT data \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{uninstall_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{uninstall_commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'plugin-lifecycle-note'"
             ),
@@ -1842,7 +1842,7 @@ async fn lix_file_history_keeps_plugin_state_tombstones_in_deleted_file_provenan
             &format!(
                 "SELECT path, data, lixcol_source_changes \
                  FROM lix_file_history \
-                 WHERE lixcol_start_commit_id = '{delete_commit_id}' \
+                 WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
                    AND lixcol_depth = 0 \
                    AND id = 'plugin-deleted-note'"
             ),
@@ -1886,7 +1886,7 @@ async fn lix_file_history_keeps_plugin_state_tombstones_in_deleted_file_provenan
 }
 
 simulation_test!(
-    lix_file_history_requires_start_commit_id,
+    lix_file_history_requires_as_of_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1900,18 +1900,18 @@ simulation_test!(
         let error = session
             .execute("SELECT id FROM lix_file_history", &[])
             .await
-            .expect_err("file history queries must provide start commit");
+            .expect_err("file history queries must provide an as-of commit");
 
         assert!(
             error
                 .to_string()
-                .contains("requires a lixcol_start_commit_id filter"),
+                .contains("requires a lixcol_as_of_commit_id filter"),
             "unexpected error: {error}"
         );
         assert!(
             error
                 .hint()
-                .is_some_and(|hint| hint.contains("WHERE lixcol_start_commit_id")),
+                .is_some_and(|hint| hint.contains("WHERE lixcol_as_of_commit_id")),
             "unexpected error: {error}"
         );
     }
@@ -1958,7 +1958,7 @@ simulation_test!(
                 &format!(
                     "SELECT path, data, lixcol_depth \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND id = 'ordinary-history-file' \
                      ORDER BY lixcol_depth"
                 ),
@@ -2153,7 +2153,7 @@ simulation_test!(
                 &format!(
                     "SELECT id, path, data, lixcol_source_changes \
                      FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND id = 'history-file-blob-filter' \
                      ORDER BY lixcol_depth"
                 ),
@@ -2228,6 +2228,27 @@ simulation_test!(
                 ],
                 "source change objects must mirror the stable lix_change field set"
             );
+        }
+
+        for retired in [
+            "lixcol_change_id",
+            "lixcol_schema_key",
+            "lixcol_origin_key",
+            "lixcol_snapshot_content",
+            "lixcol_metadata",
+        ] {
+            let error = session
+                .execute(
+                    &format!(
+                        "SELECT {retired} \
+                         FROM lix_file_history \
+                         WHERE lixcol_as_of_commit_id = '{commit_id}'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect_err("composed history singular provenance must fail");
+            assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
         }
     }
 );

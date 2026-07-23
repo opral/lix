@@ -19,11 +19,11 @@ use crate::storage_adapter::StorageAdapterRead;
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
 /// History providers differ in how they shape rows, but they should not drift
-/// in how they interpret filters such as `start_commit_id IN (...)`, entity
+/// in how they interpret filters such as `lixcol_as_of_commit_id IN (...)`, entity
 /// filters, or depth ranges.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HistoryRoute {
-    pub(crate) start_commit_ids: Vec<String>,
+    pub(crate) as_of_commit_ids: Vec<String>,
     pub(crate) entity_pks: Vec<String>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
@@ -33,10 +33,10 @@ pub(crate) struct HistoryRoute {
 }
 
 impl HistoryRoute {
-    pub(crate) fn from_filters(filters: &[Expr], column_style: HistoryColumnStyle) -> Self {
+    pub(crate) fn from_filters(filters: &[Expr]) -> Self {
         let mut route = Self::default();
         for filter in filters {
-            apply_history_filter(filter, &mut route, column_style);
+            apply_history_filter(filter, &mut route);
         }
         route
     }
@@ -50,7 +50,7 @@ impl HistoryRoute {
     /// not against the canonical event row.
     pub(crate) fn traversal_only(&self) -> Self {
         Self {
-            start_commit_ids: self.start_commit_ids.clone(),
+            as_of_commit_ids: self.as_of_commit_ids.clone(),
             min_depth: self.min_depth,
             max_depth: self.max_depth,
             contradictory: self.contradictory,
@@ -58,14 +58,14 @@ impl HistoryRoute {
         }
     }
 
-    /// Returns only the explicit history starts.
+    /// Returns only the explicit history anchors.
     ///
     /// Shaped history providers use this for context loading: path/data shaping
     /// often needs ancestor descriptor rows even when the event route is
     /// restricted to a specific depth.
-    pub(crate) fn starts_only(&self) -> Self {
+    pub(crate) fn anchors_only(&self) -> Self {
         Self {
-            start_commit_ids: self.start_commit_ids.clone(),
+            as_of_commit_ids: self.as_of_commit_ids.clone(),
             contradictory: self.contradictory,
             ..Self::default()
         }
@@ -138,8 +138,8 @@ impl HistoryRoute {
 pub(crate) struct HistoryEntry {
     pub(crate) change: MaterializedChange,
     pub(crate) observed_commit_id: String,
-    pub(crate) commit_created_at: String,
-    pub(crate) start_commit_id: String,
+    pub(crate) commit_created_at: Option<String>,
+    pub(crate) as_of_commit_id: String,
     pub(crate) depth: u32,
 }
 
@@ -149,18 +149,20 @@ pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
 pub(crate) const HISTORY_COL_CHANGE_ID: &str = "lixcol_change_id";
+pub(crate) const HISTORY_COL_CHANGE_CREATED_AT: &str = "lixcol_change_created_at";
 pub(crate) const HISTORY_COL_SOURCE_CHANGES: &str = "lixcol_source_changes";
 pub(crate) const HISTORY_COL_ORIGIN_KEY: &str = "lixcol_origin_key";
 pub(crate) const HISTORY_COL_OBSERVED_COMMIT_ID: &str = "lixcol_observed_commit_id";
 pub(crate) const HISTORY_COL_COMMIT_CREATED_AT: &str = "lixcol_commit_created_at";
-pub(crate) const HISTORY_COL_START_COMMIT_ID: &str = "lixcol_start_commit_id";
+pub(crate) const HISTORY_COL_AS_OF_COMMIT_ID: &str = "lixcol_as_of_commit_id";
 pub(crate) const HISTORY_COL_DEPTH: &str = "lixcol_depth";
+pub(crate) const HISTORY_COL_IS_DELETED: &str = "lixcol_is_deleted";
 
 /// Serializes the deterministic provenance set for one composed history row.
 ///
-/// The array is sorted by change id by the composed provider. Each object
-/// deliberately mirrors `lix_change` so callers can join or inspect raw
-/// provenance without pretending that one source change owns a composed row.
+/// Each object mirrors the public `lix_change` fields. Composed history uses
+/// an array because one logical revision can be caused by multiple source
+/// changes in the same commit.
 pub(crate) fn serialize_history_source_changes(
     changes: &[MaterializedChange],
     surface_name: &str,
@@ -224,13 +226,7 @@ fn parse_optional_source_json(
 
 pub(crate) struct HistoryViewDescriptor<'a> {
     pub(crate) view_name: &'a str,
-    pub(crate) start_commit_column: &'a str,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum HistoryColumnStyle {
-    Bare,
-    Prefixed,
+    pub(crate) as_of_commit_column: &'a str,
 }
 
 /// Commit metadata that a history scan must materialize for its projected
@@ -241,15 +237,8 @@ pub(crate) struct HistoryMetadataProjection {
 }
 
 impl HistoryMetadataProjection {
-    pub(crate) fn from_scan(
-        projected_schema: &SchemaRef,
-        filters: &[Expr],
-        column_style: HistoryColumnStyle,
-    ) -> Self {
-        let column_name = match column_style {
-            HistoryColumnStyle::Bare => "commit_created_at",
-            HistoryColumnStyle::Prefixed => HISTORY_COL_COMMIT_CREATED_AT,
-        };
+    pub(crate) fn from_scan(projected_schema: &SchemaRef, filters: &[Expr]) -> Self {
+        let column_name = HISTORY_COL_COMMIT_CREATED_AT;
         let commit_created_at = projected_schema.field_with_name(column_name).is_ok()
             || filters.iter().any(|filter| {
                 filter
@@ -266,8 +255,8 @@ impl HistoryMetadataProjection {
     }
 }
 
-pub(crate) fn parse_history_filter(expr: &Expr, column_style: HistoryColumnStyle) -> Option<()> {
-    parse_history_filter_terms(expr, column_style).map(|_| ())
+pub(crate) fn parse_history_filter(expr: &Expr) -> Option<()> {
+    parse_history_filter_terms(expr).map(|_| ())
 }
 
 pub(crate) fn commit_graph_history_request(
@@ -307,17 +296,17 @@ where
     if route.is_contradictory() {
         return Ok(Vec::new());
     }
-    if route.start_commit_ids.is_empty() {
+    if route.as_of_commit_ids.is_empty() {
         return Err(LixError::new(
             LixError::CODE_HISTORY_FILTER_REQUIRED,
             format!(
                 "{} requires a {} filter",
-                descriptor.view_name, descriptor.start_commit_column
+                descriptor.view_name, descriptor.as_of_commit_column
             ),
         )
         .with_hint(format!(
             "Use WHERE {} = lix_active_branch_commit_id() to inspect {} from the active branch head.",
-            descriptor.start_commit_column, descriptor.view_name
+            descriptor.as_of_commit_column, descriptor.view_name
         )));
     }
     let Some(request) = commit_graph_history_request(route, schema_keys) else {
@@ -325,15 +314,16 @@ where
     };
 
     let mut rows = Vec::new();
-    for start_commit_id in &route.start_commit_ids {
-        let start_commit_id = CommitId::parse_lix(start_commit_id, "history start_commit_id")?;
+    for as_of_commit_id in &route.as_of_commit_ids {
+        let as_of_commit_id =
+            CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
         let (entries, reachable_commits) = {
             let mut guard = commit_graph.lock().await;
             let entries = guard
-                .change_history_from_commit(&start_commit_id, &request)
+                .change_history_from_commit(&as_of_commit_id, &request)
                 .await?;
             let reachable_commits = if metadata_projection.commit_created_at {
-                guard.reachable_commits(&start_commit_id).await?
+                guard.reachable_commits(&as_of_commit_id).await?
             } else {
                 Vec::new()
             };
@@ -351,14 +341,29 @@ where
 
         for entry in entries {
             let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
+            let commit_created_at = if metadata_projection.commit_created_at {
+                Some(
+                    commit_created_at_by_id
+                        .get(&entry.observed_commit_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "history commit '{}' is missing its commit timestamp",
+                                    entry.observed_commit_id
+                                ),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             rows.push(HistoryEntry {
-                commit_created_at: commit_created_at_by_id
-                    .get(&entry.observed_commit_id)
-                    .cloned()
-                    .unwrap_or_else(|| change.created_at.clone()),
+                commit_created_at,
                 change,
                 observed_commit_id: entry.observed_commit_id.to_string(),
-                start_commit_id: entry.start_commit_id.to_string(),
+                as_of_commit_id: entry.start_commit_id.to_string(),
                 depth: entry.depth,
             });
         }
@@ -391,55 +396,41 @@ fn effective_schema_keys(
     }
 }
 
-fn parse_history_filter_terms(
-    expr: &Expr,
-    column_style: HistoryColumnStyle,
-) -> Option<Vec<HistoryFilterTerm>> {
+fn parse_history_filter_terms(expr: &Expr) -> Option<Vec<HistoryFilterTerm>> {
     match expr {
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-            let mut terms = parse_history_filter_terms(&binary_expr.left, column_style)?;
-            terms.extend(parse_history_filter_terms(
-                &binary_expr.right,
-                column_style,
-            )?);
+            let mut terms = parse_history_filter_terms(&binary_expr.left)?;
+            terms.extend(parse_history_filter_terms(&binary_expr.right)?);
             Some(terms)
         }
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-            parse_history_disjunction(binary_expr, column_style)
+            parse_history_disjunction(binary_expr)
         }
         Expr::BinaryExpr(binary_expr) => {
-            parse_history_binary_filter(binary_expr, column_style).map(|term| vec![term])
+            parse_history_binary_filter(binary_expr).map(|term| vec![term])
         }
-        Expr::InList(in_list) => {
-            parse_history_in_list_filter(in_list, column_style).map(|term| vec![term])
-        }
+        Expr::InList(in_list) => parse_history_in_list_filter(in_list).map(|term| vec![term]),
         _ => None,
     }
 }
 
-fn collect_history_route_terms(
-    expr: &Expr,
-    column_style: HistoryColumnStyle,
-) -> Vec<HistoryFilterTerm> {
+fn collect_history_route_terms(expr: &Expr) -> Vec<HistoryFilterTerm> {
     match expr {
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-            let mut terms = collect_history_route_terms(&binary_expr.left, column_style);
-            terms.extend(collect_history_route_terms(
-                &binary_expr.right,
-                column_style,
-            ));
+            let mut terms = collect_history_route_terms(&binary_expr.left);
+            terms.extend(collect_history_route_terms(&binary_expr.right));
             terms
         }
         // OR filters are only safe to route when the entire disjunction is a
         // supported history predicate. Partially routing one side would change
         // SQL semantics before DataFusion can apply the residual filter.
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-            parse_history_disjunction(binary_expr, column_style).unwrap_or_default()
+            parse_history_disjunction(binary_expr).unwrap_or_default()
         }
-        Expr::BinaryExpr(binary_expr) => parse_history_binary_filter(binary_expr, column_style)
+        Expr::BinaryExpr(binary_expr) => parse_history_binary_filter(binary_expr)
             .map(|term| vec![term])
             .unwrap_or_default(),
-        Expr::InList(in_list) => parse_history_in_list_filter(in_list, column_style)
+        Expr::InList(in_list) => parse_history_in_list_filter(in_list)
             .map(|term| vec![term])
             .unwrap_or_default(),
         _ => Vec::new(),
@@ -448,10 +439,9 @@ fn collect_history_route_terms(
 
 fn parse_history_disjunction(
     binary_expr: &datafusion::logical_expr::BinaryExpr,
-    column_style: HistoryColumnStyle,
 ) -> Option<Vec<HistoryFilterTerm>> {
-    let left = parse_history_filter_terms(&binary_expr.left, column_style)?;
-    let right = parse_history_filter_terms(&binary_expr.right, column_style)?;
+    let left = parse_history_filter_terms(&binary_expr.left)?;
+    let right = parse_history_filter_terms(&binary_expr.right)?;
     let [left] = left.as_slice() else {
         return None;
     };
@@ -463,7 +453,7 @@ fn parse_history_disjunction(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryFilterTerm {
-    StartCommitIds(Vec<String>),
+    AsOfCommitIds(Vec<String>),
     EntityPks(Vec<String>),
     SchemaKeys(Vec<String>),
     FileIds(Vec<String>),
@@ -477,9 +467,9 @@ fn merge_history_disjunction_terms(
     right: HistoryFilterTerm,
 ) -> Option<HistoryFilterTerm> {
     match (left, right) {
-        (HistoryFilterTerm::StartCommitIds(mut left), HistoryFilterTerm::StartCommitIds(right)) => {
+        (HistoryFilterTerm::AsOfCommitIds(mut left), HistoryFilterTerm::AsOfCommitIds(right)) => {
             extend_unique(&mut left, right);
-            Some(HistoryFilterTerm::StartCommitIds(left))
+            Some(HistoryFilterTerm::AsOfCommitIds(left))
         }
         (HistoryFilterTerm::EntityPks(mut left), HistoryFilterTerm::EntityPks(right)) => {
             extend_unique(&mut left, right);
@@ -499,20 +489,19 @@ fn merge_history_disjunction_terms(
 
 fn parse_history_binary_filter(
     binary_expr: &datafusion::logical_expr::BinaryExpr,
-    column_style: HistoryColumnStyle,
 ) -> Option<HistoryFilterTerm> {
     let Expr::Column(column) = &*binary_expr.left else {
         return None;
     };
-    let column_name = canonical_history_column_name(column.name.as_str(), column_style)?;
+    let column_name = canonical_history_column_name(column.name.as_str())?;
     let right = &*binary_expr.right;
     match (column_name, &binary_expr.op, right) {
         (
-            "start_commit_id" | "schema_key" | "file_id",
+            "as_of_commit_id" | "schema_key" | "file_id",
             Operator::Eq,
             Expr::Literal(ScalarValue::Utf8(Some(value)), _),
         ) => Some(match column_name {
-            "start_commit_id" => HistoryFilterTerm::StartCommitIds(vec![value.clone()]),
+            "as_of_commit_id" => HistoryFilterTerm::AsOfCommitIds(vec![value.clone()]),
             "schema_key" => HistoryFilterTerm::SchemaKeys(vec![value.clone()]),
             "file_id" => HistoryFilterTerm::FileIds(vec![value.clone()]),
             _ => unreachable!(),
@@ -539,10 +528,7 @@ fn parse_history_binary_filter(
     }
 }
 
-fn parse_history_in_list_filter(
-    in_list: &InList,
-    column_style: HistoryColumnStyle,
-) -> Option<HistoryFilterTerm> {
+fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
     if in_list.negated {
         return None;
     }
@@ -550,7 +536,7 @@ fn parse_history_in_list_filter(
     let Expr::Column(column) = in_list.expr.as_ref() else {
         return None;
     };
-    let column_name = canonical_history_column_name(column.name.as_str(), column_style)?;
+    let column_name = canonical_history_column_name(column.name.as_str())?;
     let values = in_list
         .list
         .iter()
@@ -561,7 +547,7 @@ fn parse_history_in_list_filter(
     }
 
     match column_name {
-        "start_commit_id" => Some(HistoryFilterTerm::StartCommitIds(values)),
+        "as_of_commit_id" => Some(HistoryFilterTerm::AsOfCommitIds(values)),
         "entity_pk" => canonical_entity_pk_values(values).map(HistoryFilterTerm::EntityPks),
         "schema_key" => Some(HistoryFilterTerm::SchemaKeys(values)),
         "file_id" => Some(HistoryFilterTerm::FileIds(values)),
@@ -569,12 +555,12 @@ fn parse_history_in_list_filter(
     }
 }
 
-fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute, column_style: HistoryColumnStyle) {
-    for term in collect_history_route_terms(expr, column_style) {
+fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute) {
+    for term in collect_history_route_terms(expr) {
         match term {
-            HistoryFilterTerm::StartCommitIds(values) => {
+            HistoryFilterTerm::AsOfCommitIds(values) => {
                 route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.start_commit_ids, values);
+                    apply_conjunctive_values_filter(&mut route.as_of_commit_ids, values);
             }
             HistoryFilterTerm::EntityPks(values) => {
                 route.contradictory |=
@@ -630,19 +616,13 @@ fn canonical_entity_pk_value(value: &str) -> Option<String> {
         .ok()
 }
 
-fn canonical_history_column_name(name: &str, column_style: HistoryColumnStyle) -> Option<&str> {
-    match (column_style, name) {
-        (HistoryColumnStyle::Bare, "start_commit_id")
-        | (HistoryColumnStyle::Prefixed, "lixcol_start_commit_id") => Some("start_commit_id"),
-        (HistoryColumnStyle::Bare, "entity_pk")
-        | (HistoryColumnStyle::Prefixed, "lixcol_entity_pk") => Some("entity_pk"),
-        (HistoryColumnStyle::Bare, "schema_key")
-        | (HistoryColumnStyle::Prefixed, "lixcol_schema_key") => Some("schema_key"),
-        (HistoryColumnStyle::Bare, "file_id")
-        | (HistoryColumnStyle::Prefixed, "lixcol_file_id") => Some("file_id"),
-        (HistoryColumnStyle::Bare, "depth") | (HistoryColumnStyle::Prefixed, "lixcol_depth") => {
-            Some("depth")
-        }
+fn canonical_history_column_name(name: &str) -> Option<&str> {
+    match name {
+        HISTORY_COL_AS_OF_COMMIT_ID => Some("as_of_commit_id"),
+        HISTORY_COL_ENTITY_PK => Some("entity_pk"),
+        HISTORY_COL_SCHEMA_KEY => Some("schema_key"),
+        HISTORY_COL_FILE_ID => Some("file_id"),
+        HISTORY_COL_DEPTH => Some("depth"),
         _ => None,
     }
 }
@@ -703,14 +683,15 @@ mod tests {
     };
 
     use super::{
-        HistoryColumnStyle, HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor,
-        load_history_entries, parse_history_filter,
+        HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
+        HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
+        parse_history_filter,
     };
 
     #[test]
     fn route_extraction_keeps_supported_terms_from_mixed_and_filter() {
         let filter = and(
-            eq(col("start_commit_id"), str_lit("commit-1")),
+            eq(col(HISTORY_COL_AS_OF_COMMIT_ID), str_lit("commit-1")),
             Expr::Like(Like::new(
                 false,
                 Box::new(col("path")),
@@ -721,18 +702,18 @@ mod tests {
         );
 
         assert!(
-            parse_history_filter(&filter, HistoryColumnStyle::Bare).is_none(),
+            parse_history_filter(&filter).is_none(),
             "mixed filters must not be advertised as exact pushdown"
         );
 
-        let route = HistoryRoute::from_filters(&[filter], HistoryColumnStyle::Bare);
-        assert_eq!(route.start_commit_ids, vec!["commit-1".to_string()]);
+        let route = HistoryRoute::from_filters(&[filter]);
+        assert_eq!(route.as_of_commit_ids, vec!["commit-1".to_string()]);
     }
 
     #[test]
     fn route_extraction_does_not_partially_route_mixed_or_filter() {
         let filter = or(
-            eq(col("start_commit_id"), str_lit("commit-1")),
+            eq(col(HISTORY_COL_AS_OF_COMMIT_ID), str_lit("commit-1")),
             Expr::Like(Like::new(
                 false,
                 Box::new(col("path")),
@@ -742,51 +723,57 @@ mod tests {
             )),
         );
 
-        let route = HistoryRoute::from_filters(&[filter], HistoryColumnStyle::Bare);
+        let route = HistoryRoute::from_filters(&[filter]);
         assert!(
-            route.start_commit_ids.is_empty(),
+            route.as_of_commit_ids.is_empty(),
             "partial OR pushdown would change SQL semantics"
         );
     }
 
     #[test]
+    fn routing_rejects_retired_history_column_names() {
+        for retired in [
+            "start_commit_id",
+            "lixcol_start_commit_id",
+            "entity_pk",
+            "depth",
+        ] {
+            let filter = eq(col(retired), str_lit("value"));
+            assert!(
+                parse_history_filter(&filter).is_none(),
+                "retired column '{retired}' must not route"
+            );
+            assert!(
+                HistoryRoute::from_filters(&[filter])
+                    .as_of_commit_ids
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn commit_metadata_projection_tracks_projection_and_filters() {
         let unrelated_schema = Arc::new(Schema::new(vec![Field::new(
-            "depth",
+            HISTORY_COL_DEPTH,
             DataType::Int64,
             false,
         )]));
-        assert!(
-            !HistoryMetadataProjection::from_scan(
-                &unrelated_schema,
-                &[],
-                HistoryColumnStyle::Bare,
-            )
-            .commit_created_at()
-        );
+        assert!(!HistoryMetadataProjection::from_scan(&unrelated_schema, &[]).commit_created_at());
 
         let projected_schema = Arc::new(Schema::new(vec![Field::new(
-            "lixcol_commit_created_at",
+            HISTORY_COL_COMMIT_CREATED_AT,
             DataType::Utf8,
             false,
         )]));
-        assert!(
-            HistoryMetadataProjection::from_scan(
-                &projected_schema,
-                &[],
-                HistoryColumnStyle::Prefixed,
-            )
-            .commit_created_at()
-        );
+        assert!(HistoryMetadataProjection::from_scan(&projected_schema, &[]).commit_created_at());
 
-        let residual_filter = eq(col("commit_created_at"), str_lit("2026-07-12T00:00:00Z"));
+        let residual_filter = eq(
+            col(HISTORY_COL_COMMIT_CREATED_AT),
+            str_lit("2026-07-12T00:00:00Z"),
+        );
         assert!(
-            HistoryMetadataProjection::from_scan(
-                &unrelated_schema,
-                &[residual_filter],
-                HistoryColumnStyle::Bare,
-            )
-            .commit_created_at()
+            HistoryMetadataProjection::from_scan(&unrelated_schema, &[residual_filter])
+                .commit_created_at()
         );
     }
 
@@ -797,12 +784,12 @@ mod tests {
         let rows = load_history_entries(
             HistoryViewDescriptor {
                 view_name: "test_history",
-                start_commit_column: "start_commit_id",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
             empty_json_reader().await,
             &HistoryRoute {
-                start_commit_ids: vec![start_commit_id.to_string()],
+                as_of_commit_ids: vec![start_commit_id.to_string()],
                 ..HistoryRoute::default()
             },
             vec!["message".to_string()],
@@ -813,6 +800,7 @@ mod tests {
 
         assert_eq!(reachable_calls.load(Ordering::SeqCst), 0);
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_created_at, None);
     }
 
     #[tokio::test]
@@ -820,35 +808,74 @@ mod tests {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
         let start_commit_id = CommitId::for_test_label("start");
         let metadata_schema = Arc::new(Schema::new(vec![Field::new(
-            "commit_created_at",
+            HISTORY_COL_COMMIT_CREATED_AT,
             DataType::Utf8,
             false,
         )]));
         let rows = load_history_entries(
             HistoryViewDescriptor {
                 view_name: "test_history",
-                start_commit_column: "start_commit_id",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
             empty_json_reader().await,
             &HistoryRoute {
-                start_commit_ids: vec![start_commit_id.to_string()],
+                as_of_commit_ids: vec![start_commit_id.to_string()],
                 ..HistoryRoute::default()
             },
             vec!["message".to_string()],
-            HistoryMetadataProjection::from_scan(&metadata_schema, &[], HistoryColumnStyle::Bare),
+            HistoryMetadataProjection::from_scan(&metadata_schema, &[]),
         )
         .await
         .expect("history load should enrich commit metadata");
 
         assert_eq!(reachable_calls.load(Ordering::SeqCst), 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].commit_created_at, commit_timestamp().to_string());
+        assert_eq!(
+            rows[0].commit_created_at,
+            Some(commit_timestamp().to_string())
+        );
+        assert_eq!(rows[0].change.created_at, event_timestamp().to_string());
+    }
+
+    #[tokio::test]
+    async fn history_loader_does_not_substitute_change_time_for_missing_commit_time() {
+        let reachable_calls = Arc::new(AtomicUsize::new(0));
+        let as_of_commit_id = CommitId::for_test_label("start");
+        let metadata_schema = Arc::new(Schema::new(vec![Field::new(
+            HISTORY_COL_COMMIT_CREATED_AT,
+            DataType::Utf8,
+            false,
+        )]));
+        let error = load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "test_history",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+            },
+            Arc::new(Mutex::new(Box::new(CountingCommitGraphReader {
+                reachable_calls,
+                start_commit_id: as_of_commit_id,
+                include_reachable_commit: false,
+            }))),
+            empty_json_reader().await,
+            &HistoryRoute {
+                as_of_commit_ids: vec![as_of_commit_id.to_string()],
+                ..HistoryRoute::default()
+            },
+            vec!["message".to_string()],
+            HistoryMetadataProjection::from_scan(&metadata_schema, &[]),
+        )
+        .await
+        .expect_err("missing commit metadata must be an explicit error");
+
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("missing its commit timestamp"));
     }
 
     struct CountingCommitGraphReader {
         reachable_calls: Arc<AtomicUsize>,
         start_commit_id: CommitId,
+        include_reachable_commit: bool,
     }
 
     #[async_trait::async_trait]
@@ -865,6 +892,9 @@ mod tests {
             _head_commit_id: &CommitId,
         ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
             self.reachable_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.include_reachable_commit {
+                return Ok(Vec::new());
+            }
             let change = test_change("commit-change", commit_timestamp());
             Ok(vec![ReachableCommitGraphCommit {
                 commit: CommitGraphCommit {
@@ -900,6 +930,7 @@ mod tests {
         Arc::new(Mutex::new(Box::new(CountingCommitGraphReader {
             reachable_calls,
             start_commit_id,
+            include_reachable_commit: true,
         })))
     }
 

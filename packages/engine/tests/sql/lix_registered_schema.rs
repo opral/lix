@@ -424,9 +424,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_as_of_commit_id, lixcol_depth \
                      FROM lix_registered_schema_history \
-                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
                        AND lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
                      ORDER BY lixcol_depth"
                 ),
