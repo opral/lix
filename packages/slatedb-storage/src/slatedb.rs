@@ -42,7 +42,7 @@ const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
-const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SlateDBFactory {
@@ -1036,6 +1036,11 @@ mod tests {
             slatedb_settings().compression_codec,
             Some(CompressionCodec::Lz4)
         );
+    }
+
+    #[test]
+    fn disk_cache_parts_match_scan_read_ahead() {
+        assert_eq!(OBJECT_STORE_CACHE_PART_SIZE_BYTES, SCAN_READ_AHEAD_BYTES);
     }
 
     #[test]
