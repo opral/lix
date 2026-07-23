@@ -33,5 +33,5 @@ tracing = "0.1"
 flate2 = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing-subscriber = "0.3"
