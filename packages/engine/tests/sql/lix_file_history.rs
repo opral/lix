@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,6 +231,616 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
 
     session.close().await.expect("session should close");
 }
+
+#[tokio::test]
+async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() {
+    const UNRELATED_DIRECTORY_COUNT: usize = 256;
+    const MAX_REQUESTED_KEYS: u64 = 400;
+    const MAX_SCAN_CALLS: u64 = 48;
+    const MAX_SCANNED_ROWS: u64 = 48;
+
+    let storage = CountingStorage::default();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
+        .map(|index| format!("('ancestor-noise-{index:03}', '/ancestor-noise-{index:03}/')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_directory (id, path) VALUES {unrelated_directories}"),
+            &[],
+        )
+        .await
+        .expect("unrelated directories should insert");
+    session
+        .execute(
+            "INSERT INTO lix_directory (id, path) VALUES \
+             ('bounded-root', '/bounded/'), \
+             ('bounded-child', '/bounded/child/')",
+            &[],
+        )
+        .await
+        .expect("target ancestors should insert");
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('bounded-file', '/bounded/child/target.txt', X'78')",
+            &[],
+        )
+        .await
+        .expect("target file should insert");
+    session
+        .execute(
+            "UPDATE lix_directory SET name = 'renamed' WHERE id = 'bounded-root'",
+            &[],
+        )
+        .await
+        .expect("target ancestor should rename");
+    let commit_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("renamed head should load");
+    let [Value::Text(commit_id)] = commit_rows.rows()[0].values() else {
+        panic!("renamed head should be text");
+    };
+
+    storage.reset_counters();
+    let result = session
+        .execute(
+            &format!(
+                "SELECT path, lixcol_source_changes \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'bounded-file'"
+            ),
+            &[],
+        )
+        .await
+        .expect("ancestor-projected point history should load");
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows()[0].get::<Value>("path").unwrap(),
+        Value::Text("/renamed/child/target.txt".to_string())
+    );
+    let Value::Json(sources) = result.rows()[0]
+        .get::<Value>("lixcol_source_changes")
+        .unwrap()
+    else {
+        panic!("ancestor source changes should be JSON");
+    };
+    assert_eq!(sources[0]["entity_pk"], json!(["bounded-root"]));
+
+    let (requested_keys, scan_calls, scanned_rows) = storage.counters();
+    assert!(
+        requested_keys <= MAX_REQUESTED_KEYS,
+        "ancestor point history requested {requested_keys} keys with \
+         {UNRELATED_DIRECTORY_COUNT} unrelated directories; expected at most {MAX_REQUESTED_KEYS}"
+    );
+    assert!(
+        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
+        "ancestor point history performed {scan_calls} scans returning {scanned_rows} rows; \
+         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+    );
+
+    session.close().await.expect("session should close");
+}
+
+simulation_test!(
+    lix_filesystem_history_propagates_nested_ancestor_rename_and_move,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES \
+                 ('projection-root', '/workspace/'), \
+                 ('projection-docs', '/workspace/docs/'), \
+                 ('projection-guides', '/workspace/docs/guides/'), \
+                 ('projection-destination', '/destination/')",
+                &[],
+            )
+            .await
+            .expect("nested projection directories should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('projection-file', '/workspace/docs/guides/readme.md', X'78')",
+                &[],
+            )
+            .await
+            .expect("nested projection file should insert");
+
+        session
+            .execute(
+                "UPDATE lix_directory SET name = 'archive' WHERE id = 'projection-root'",
+                &[],
+            )
+            .await
+            .expect("ancestor rename should succeed");
+        let rename_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("rename head should load")
+            .expect("rename head should exist");
+
+        let renamed_file = session
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_source_changes \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{rename_commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'projection-file'"
+                ),
+                &[],
+            )
+            .await
+            .expect("renamed descendant file history should load");
+        assert_eq!(renamed_file.len(), 1);
+        assert_eq!(
+            renamed_file.rows()[0].get::<Value>("path").unwrap(),
+            Value::Text("/archive/docs/guides/readme.md".to_string())
+        );
+        let Value::Json(rename_sources) = renamed_file.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .unwrap()
+        else {
+            panic!("rename sources should be JSON");
+        };
+        assert_eq!(rename_sources.as_array().map(Vec::len), Some(1));
+        assert_eq!(rename_sources[0]["entity_pk"], json!(["projection-root"]));
+
+        let renamed_directory = session
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_source_changes \
+                     FROM lix_directory_history \
+                     WHERE lixcol_start_commit_id = '{rename_commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'projection-guides'"
+                ),
+                &[],
+            )
+            .await
+            .expect("renamed descendant directory history should load");
+        assert_eq!(renamed_directory.len(), 1);
+        assert_eq!(
+            renamed_directory.rows()[0].get::<Value>("path").unwrap(),
+            Value::Text("/archive/docs/guides/".to_string())
+        );
+
+        session
+            .execute(
+                "UPDATE lix_directory \
+                 SET path = '/destination/archive/' \
+                 WHERE id = 'projection-root'",
+                &[],
+            )
+            .await
+            .expect("ancestor subtree move should succeed");
+        let move_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("move head should load")
+            .expect("move head should exist");
+
+        let moved = session
+            .execute(
+                &format!(
+                    "SELECT path FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{move_commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'projection-file'"
+                ),
+                &[],
+            )
+            .await
+            .expect("moved descendant file history should load");
+        assert_rows_eq(
+            moved,
+            vec![vec![Value::Text(
+                "/destination/archive/docs/guides/readme.md".to_string(),
+            )]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_filesystem_history_groups_same_commit_ancestor_sources,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES \
+                 ('grouped-root', '/grouped/'), \
+                 ('grouped-child', '/grouped/child/')",
+                &[],
+            )
+            .await
+            .expect("grouped directories should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('grouped-file', '/grouped/child/file.txt', X'78')",
+                &[],
+            )
+            .await
+            .expect("grouped file should insert");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("grouped transaction should begin");
+        transaction
+            .execute(
+                "UPDATE lix_directory SET name = 'renamed-root' WHERE id = 'grouped-root'",
+                &[],
+            )
+            .await
+            .expect("root rename should stage");
+        transaction
+            .execute(
+                "UPDATE lix_directory SET name = 'renamed-child' WHERE id = 'grouped-child'",
+                &[],
+            )
+            .await
+            .expect("child rename should stage");
+        transaction
+            .execute(
+                "UPDATE lix_file SET name = 'renamed.txt' WHERE id = 'grouped-file'",
+                &[],
+            )
+            .await
+            .expect("file rename should stage");
+        transaction
+            .commit()
+            .await
+            .expect("grouped transaction should commit");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("grouped head should load")
+            .expect("grouped head should exist");
+
+        let file_row = session
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_source_changes \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'grouped-file'"
+                ),
+                &[],
+            )
+            .await
+            .expect("grouped file history should load");
+        assert_eq!(file_row.len(), 1);
+        assert_eq!(
+            file_row.rows()[0].get::<Value>("path").unwrap(),
+            Value::Text("/renamed-root/renamed-child/renamed.txt".to_string())
+        );
+        let Value::Json(file_sources) = file_row.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .unwrap()
+        else {
+            panic!("grouped file sources should be JSON");
+        };
+        let source_ids = file_sources
+            .as_array()
+            .expect("grouped file sources should be an array")
+            .iter()
+            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            source_ids,
+            BTreeSet::from(["grouped-root", "grouped-child", "grouped-file"])
+        );
+
+        let directory_row = session
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_source_changes \
+                     FROM lix_directory_history \
+                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'grouped-child'"
+                ),
+                &[],
+            )
+            .await
+            .expect("grouped directory history should load");
+        assert_eq!(directory_row.len(), 1);
+        let Value::Json(directory_sources) = directory_row.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .unwrap()
+        else {
+            panic!("grouped directory sources should be JSON");
+        };
+        assert_eq!(directory_sources.as_array().map(Vec::len), Some(2));
+    }
+);
+
+simulation_test!(
+    lix_filesystem_history_preserves_ancestor_sibling_revisions,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_directory (id, path) VALUES \
+             ('ancestor-sibling-root', '/before/'), \
+             ('ancestor-sibling-child', '/before/child/')",
+            &[],
+        )
+        .await
+        .expect("sibling directories should insert");
+        main.execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('ancestor-sibling-file', '/before/child/file.txt', X'78')",
+            &[],
+        )
+        .await
+        .expect("sibling file should insert");
+        main.create_branch(CreateBranchOptions {
+            id: Some("ancestor-sibling-draft".to_string()),
+            name: "Ancestor sibling draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("sibling branch should create");
+        let draft = sim.wrap_session(
+            engine
+                .open_session("ancestor-sibling-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "UPDATE lix_directory SET name = 'same' WHERE id = 'ancestor-sibling-root'",
+            &[],
+        )
+        .await
+        .expect("main ancestor rename should succeed");
+        let main_sibling = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main sibling should load")
+            .expect("main sibling should exist");
+        draft
+            .execute(
+                "UPDATE lix_directory SET name = 'same' WHERE id = 'ancestor-sibling-root'",
+                &[],
+            )
+            .await
+            .expect("draft ancestor rename should succeed");
+        let draft_sibling = engine
+            .load_branch_head_commit_id("ancestor-sibling-draft")
+            .await
+            .expect("draft sibling should load")
+            .expect("draft sibling should exist");
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "ancestor-sibling-draft".to_string(),
+            })
+            .await
+            .expect("convergent ancestor renames should merge");
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .expect("convergent ancestor renames should create a merge commit");
+
+        let rows = main
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_observed_commit_id \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                       AND lixcol_depth = 1 \
+                       AND id = 'ancestor-sibling-file' \
+                     ORDER BY lixcol_observed_commit_id"
+                ),
+                &[],
+            )
+            .await
+            .expect("sibling descendant history should load");
+        assert_eq!(rows.len(), 2);
+        let mut actual_commits = rows
+            .rows()
+            .iter()
+            .map(|row| {
+                assert_eq!(
+                    row.get::<Value>("path").unwrap(),
+                    Value::Text("/same/child/file.txt".to_string())
+                );
+                match row.get::<Value>("lixcol_observed_commit_id").unwrap() {
+                    Value::Text(commit_id) => commit_id,
+                    value => panic!("observed commit should be text, got {value:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        actual_commits.sort();
+        let mut expected_commits = vec![main_sibling, draft_sibling];
+        expected_commits.sort();
+        assert_eq!(actual_commits, expected_commits);
+    }
+);
+
+simulation_test!(
+    lix_filesystem_history_attributes_recursive_delete_and_restore_to_ancestors,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES \
+                 ('restore-root', '/restore/'), \
+                 ('restore-child', '/restore/child/')",
+                &[],
+            )
+            .await
+            .expect("restore directories should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('restore-file', '/restore/child/file.txt', X'78')",
+                &[],
+            )
+            .await
+            .expect("restore file should insert");
+        session
+            .execute("DELETE FROM lix_directory WHERE id = 'restore-root'", &[])
+            .await
+            .expect("recursive delete should succeed");
+        let delete_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("delete head should load")
+            .expect("delete head should exist");
+
+        let deleted = session
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_source_changes \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{delete_commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'restore-file'"
+                ),
+                &[],
+            )
+            .await
+            .expect("deleted descendant file history should load");
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted.rows()[0].get::<Value>("path").unwrap(), Value::Null);
+        let Value::Json(delete_sources) = deleted.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .unwrap()
+        else {
+            panic!("delete sources should be JSON");
+        };
+        let deleted_directory_ids = delete_sources
+            .as_array()
+            .expect("delete sources should be an array")
+            .iter()
+            .filter(|source| source["schema_key"] == json!("lix_directory_descriptor"))
+            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            deleted_directory_ids,
+            BTreeSet::from(["restore-root", "restore-child"])
+        );
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("restore transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES \
+                 ('restore-root', '/restored/'), \
+                 ('restore-child', '/restored/child/')",
+                &[],
+            )
+            .await
+            .expect("directories should restore");
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('restore-file', '/restored/child/file.txt', X'79')",
+                &[],
+            )
+            .await
+            .expect("file should restore");
+        transaction
+            .commit()
+            .await
+            .expect("restore transaction should commit");
+        let restore_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("restore head should load")
+            .expect("restore head should exist");
+        let restored = session
+            .execute(
+                &format!(
+                    "SELECT path, data, lixcol_source_changes \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{restore_commit_id}' \
+                       AND lixcol_depth = 0 \
+                       AND id = 'restore-file'"
+                ),
+                &[],
+            )
+            .await
+            .expect("restored descendant file history should load");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.rows()[0].get::<Value>("path").unwrap(),
+            Value::Text("/restored/child/file.txt".to_string())
+        );
+        assert_eq!(
+            restored.rows()[0].get::<Value>("data").unwrap(),
+            Value::Blob(b"y".to_vec().into())
+        );
+        let Value::Json(restore_sources) = restored.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .unwrap()
+        else {
+            panic!("restore sources should be JSON");
+        };
+        let restored_directory_ids = restore_sources
+            .as_array()
+            .expect("restore sources should be an array")
+            .iter()
+            .filter(|source| source["schema_key"] == json!("lix_directory_descriptor"))
+            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            restored_directory_ids,
+            BTreeSet::from(["restore-root", "restore-child"])
+        );
+    }
+);
 
 simulation_test!(
     lix_file_history_reads_path_and_data_from_commit_graph,
@@ -1582,10 +2193,10 @@ simulation_test!(
             .unwrap()
             .iter()
             .map(|source| source["schema_key"].as_str().unwrap())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         assert_eq!(
             source_schema_keys,
-            std::collections::BTreeSet::from(["lix_binary_blob_ref", "lix_file_descriptor",])
+            BTreeSet::from(["lix_binary_blob_ref", "lix_file_descriptor",])
         );
         let source_ids = initial_sources
             .as_array()
