@@ -22,8 +22,8 @@ use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use slatedb::config::{
-    ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDBScanOptions, Settings,
-    WriteOptions as SlateDBWriteOptions,
+    CompressionCodec, ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDBScanOptions,
+    Settings, WriteOptions as SlateDBWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
@@ -33,6 +33,7 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, oneshot};
 
 const DB_PATH: &str = "db";
+const LZ4_FORMAT_PATH: &str = "lix-lz4-v1";
 const SPACE_PREFIX_LEN: usize = 4;
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
 const RUNTIME_WORKER_THREADS: usize = 2;
@@ -673,19 +674,18 @@ fn open_slatedb(
     options: SlateDBObjectStoreOptions,
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
-        let mut builder = Db::builder(db_path, object_store);
+        let physical_db_path = join_db_path(&db_path, LZ4_FORMAT_PATH);
+        let mut builder = Db::builder(physical_db_path, object_store);
+        let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
-            let settings = Settings {
-                object_store_cache_options: ObjectStoreCacheOptions {
-                    root_folder: Some(cache.root_folder),
-                    max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
-                    part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
-                    cache_puts: true,
-                    preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
-                    scan_interval: None,
-                    ..ObjectStoreCacheOptions::default()
-                },
-                ..Settings::default()
+            settings.object_store_cache_options = ObjectStoreCacheOptions {
+                root_folder: Some(cache.root_folder),
+                max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
+                part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
+                cache_puts: true,
+                preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+                scan_interval: None,
+                ..ObjectStoreCacheOptions::default()
             };
             let db_cache = SplitCache::new()
                 .with_block_cache(moka_cache(cache.block_cache_bytes))
@@ -698,10 +698,26 @@ fn open_slatedb(
             // The SlateDB dependency is compiled with Moka support so cached
             // callers can choose bounded capacities. Keep default construction
             // cacheless instead of accepting SlateDB's much larger defaults.
-            builder = builder.with_db_cache_disabled();
+            builder = builder.with_settings(settings).with_db_cache_disabled();
         }
         builder.build().await.map_err(slatedb_error)
     })
+}
+
+fn join_db_path(db_path: &str, child: &str) -> String {
+    let db_path = db_path.trim_end_matches('/');
+    if db_path.is_empty() {
+        child.to_string()
+    } else {
+        format!("{db_path}/{child}")
+    }
+}
+
+fn slatedb_settings() -> Settings {
+    Settings {
+        compression_codec: Some(CompressionCodec::Lz4),
+        ..Settings::default()
+    }
 }
 
 fn validate_object_store_options(options: &SlateDBObjectStoreOptions) -> Result<(), StorageError> {
@@ -1009,9 +1025,94 @@ mod tests {
         ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
         PutResult, RenameOptions, Result as ObjectStoreResult,
     };
+    use slatedb::config::{FlushOptions, FlushType};
     use std::ops::Range;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn uses_lz4_compression_by_default() {
+        assert_eq!(
+            slatedb_settings().compression_codec,
+            Some(CompressionCodec::Lz4)
+        );
+    }
+
+    #[test]
+    fn opens_fresh_local_versioned_storage() {
+        let directory = tempfile::tempdir().expect("create fresh local storage directory");
+        let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
+        assert_eq!(storage.path(), directory.path());
+    }
+
+    #[test]
+    fn fresh_storage_uses_versioned_lz4_format() {
+        let store = Arc::new(InMemory::new());
+        let db_path = "test-lz4-physical-format";
+        let space = SpaceId(7);
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open fresh LZ4 storage");
+
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin LZ4 write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: Key(Bytes::from_static(b"lz4-key")),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"lz4-value"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage LZ4 row");
+        block_on(write.commit()).expect("commit LZ4 row");
+        block_on(storage.flush()).expect("flush LZ4 row");
+        block_on(storage.worker.call(|db| async move {
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .map_err(slatedb_error)?;
+            assert!(
+                db.manifest()
+                    .l0()
+                    .iter()
+                    .any(|view| { view.sst.info.compression_codec == Some(CompressionCodec::Lz4) }),
+                "new physical SST must record the LZ4 codec"
+            );
+            Ok(())
+        }))
+        .expect("flush and inspect LZ4 SST");
+        drop(storage);
+
+        let physical_prefix = format!("{db_path}/{LZ4_FORMAT_PATH}/");
+        let object_paths = block_on(async {
+            let mut objects = store.list(None);
+            let mut paths = Vec::new();
+            while let Some(object) = objects.next().await {
+                paths.push(
+                    object
+                        .expect("list fresh LZ4 storage object")
+                        .location
+                        .to_string(),
+                );
+            }
+            paths
+        });
+        assert!(!object_paths.is_empty(), "fresh storage must write objects");
+        assert!(
+            object_paths
+                .iter()
+                .all(|path| path.starts_with(&physical_prefix)),
+            "all objects must use the versioned LZ4 namespace: {object_paths:?}"
+        );
+    }
 
     #[test]
     fn open_object_store_round_trips_with_memory_store() {
