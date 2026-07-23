@@ -400,15 +400,16 @@ test("execute originKey is exposed on change and history surfaces without metada
 	const insertedHeadCommitId = await activeHeadCommitId(lix);
 	expect(get(inserted, "origin_key")).toBe("test-origin");
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
-	expect(
-		get(
-			await lix.execute(
-				"SELECT lixcol_origin_key FROM lix_file_history WHERE id = $1 AND lixcol_start_commit_id = $2",
-				[fileId, insertedHeadCommitId],
-			),
-			"lixcol_origin_key",
+	const fileHistorySources = get(
+		await lix.execute(
+			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_start_commit_id = $2",
+			[fileId, insertedHeadCommitId],
 		),
-	).toBe("test-origin");
+		"lixcol_source_changes",
+	) as Array<{ origin_key: string | null }>;
+	expect(fileHistorySources.map((source) => source.origin_key)).toContain(
+		"test-origin",
+	);
 	expect(
 		get(
 			await lix.execute(

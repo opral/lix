@@ -992,8 +992,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        let read_scope = SharedStorageAdapterRead::new(read_scope);
         HistoryQuerySource {
-            json_reader: JsonStoreContext::new().reader(SharedStorageAdapterRead::new(read_scope)),
+            store: read_scope.clone(),
+            json_reader: JsonStoreContext::new().reader(read_scope),
         }
     }
 

@@ -140,6 +140,7 @@ impl FilesystemIndex {
         Ok(Self { entries_by_path })
     }
 
+    #[cfg(test)]
     pub(crate) fn file_entries(&self) -> impl Iterator<Item = (&str, &FilesystemFileEntry)> {
         self.entries_by_path
             .iter()

@@ -149,11 +149,78 @@ pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
 pub(crate) const HISTORY_COL_CHANGE_ID: &str = "lixcol_change_id";
+pub(crate) const HISTORY_COL_SOURCE_CHANGES: &str = "lixcol_source_changes";
 pub(crate) const HISTORY_COL_ORIGIN_KEY: &str = "lixcol_origin_key";
 pub(crate) const HISTORY_COL_OBSERVED_COMMIT_ID: &str = "lixcol_observed_commit_id";
 pub(crate) const HISTORY_COL_COMMIT_CREATED_AT: &str = "lixcol_commit_created_at";
 pub(crate) const HISTORY_COL_START_COMMIT_ID: &str = "lixcol_start_commit_id";
 pub(crate) const HISTORY_COL_DEPTH: &str = "lixcol_depth";
+
+/// Serializes the deterministic provenance set for one composed history row.
+///
+/// The array is sorted by change id by the composed provider. Each object
+/// deliberately mirrors `lix_change` so callers can join or inspect raw
+/// provenance without pretending that one source change owns a composed row.
+pub(crate) fn serialize_history_source_changes(
+    changes: &[MaterializedChange],
+    surface_name: &str,
+) -> Result<String, LixError> {
+    let mut ordered_changes = changes.iter().collect::<Vec<_>>();
+    ordered_changes.sort_by(|left, right| left.id.cmp(&right.id));
+    let source_changes = ordered_changes
+        .into_iter()
+        .map(|change| {
+            let entity_pk =
+                serde_json::from_str::<serde_json::Value>(&change.entity_pk.as_json_array_text()?)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("{surface_name} source entity_pk is invalid JSON: {error}"),
+                        )
+                    })?;
+            let snapshot_content = parse_optional_source_json(
+                change.snapshot_content.as_deref(),
+                surface_name,
+                "snapshot_content",
+            )?;
+            let metadata =
+                parse_optional_source_json(change.metadata.as_deref(), surface_name, "metadata")?;
+            Ok(serde_json::json!({
+                "id": change.id,
+                "entity_pk": entity_pk,
+                "schema_key": change.schema_key,
+                "file_id": change.file_id,
+                "snapshot_content": snapshot_content,
+                "metadata": metadata,
+                "created_at": change.created_at,
+                "origin_key": change.origin_key,
+            }))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    serde_json::to_string(&source_changes).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to serialize {surface_name} source changes: {error}"),
+        )
+    })
+}
+
+fn parse_optional_source_json(
+    value: Option<&str>,
+    surface_name: &str,
+    field: &str,
+) -> Result<Option<serde_json::Value>, LixError> {
+    value
+        .map(|value| {
+            serde_json::from_str(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("{surface_name} source {field} is invalid JSON: {error}"),
+                )
+            })
+        })
+        .transpose()
+}
 
 pub(crate) struct HistoryViewDescriptor<'a> {
     pub(crate) view_name: &'a str,
@@ -197,21 +264,6 @@ impl HistoryMetadataProjection {
     fn commit_created_at(self) -> bool {
         self.commit_created_at
     }
-}
-
-/// Shaped history views expose delete events as tombstone rows.
-///
-/// If the current event is the descriptor tombstone itself, the provider must
-/// use that tombstone row instead of looking through to an earlier live
-/// descriptor. This keeps one contract across typed entity, file, directory,
-/// and state history: `snapshot_content IS NULL` means projected user/domain
-/// columns are NULL while metadata columns still identify the event.
-pub(crate) fn history_descriptor_event_matches(
-    descriptor_entry: &HistoryEntry,
-    event_depth: u32,
-    event_change_id: &str,
-) -> bool {
-    descriptor_entry.depth == event_depth && descriptor_entry.change.id == event_change_id
 }
 
 pub(crate) fn parse_history_filter(expr: &Expr, column_style: HistoryColumnStyle) -> Option<()> {

@@ -1906,6 +1906,7 @@ mod tests {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             HistoryQuerySource {
+                store: read_scope.clone(),
                 json_reader: JsonStoreContext::new().reader(read_scope),
             }
         }

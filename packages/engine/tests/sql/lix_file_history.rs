@@ -1,5 +1,6 @@
 use std::io::{Cursor, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lix_engine::Value;
@@ -7,10 +8,228 @@ use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
     WasmPluginFile, WasmRuntime,
 };
-use lix_engine::{Engine, LixError, Memory};
+use lix_engine::{
+    CreateBranchOptions, Engine, GetManyResult, GetOptions, Key, KeyRange, LixError, Memory,
+    MemoryRead, MemoryWrite, MergeBranchOptions, ReadOptions, ScanChunk, ScanOptions, SpaceId,
+    Storage, StorageError, StorageRead, WriteOptions,
+};
 use serde_json::json;
 
 use super::assert_rows_eq;
+
+#[derive(Clone, Default)]
+struct CountingStorage {
+    inner: Memory,
+    get_many_requested_keys: Arc<AtomicU64>,
+    scan_calls: Arc<AtomicU64>,
+    scanned_rows: Arc<AtomicU64>,
+}
+
+struct CountingRead {
+    inner: MemoryRead,
+    get_many_requested_keys: Arc<AtomicU64>,
+    scan_calls: Arc<AtomicU64>,
+    scanned_rows: Arc<AtomicU64>,
+}
+
+impl CountingStorage {
+    fn reset_counters(&self) {
+        self.get_many_requested_keys.store(0, Ordering::Relaxed);
+        self.scan_calls.store(0, Ordering::Relaxed);
+        self.scanned_rows.store(0, Ordering::Relaxed);
+    }
+
+    fn counters(&self) -> (u64, u64, u64) {
+        (
+            self.get_many_requested_keys.load(Ordering::Relaxed),
+            self.scan_calls.load(Ordering::Relaxed),
+            self.scanned_rows.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Storage for CountingStorage {
+    type Read<'a>
+        = CountingRead
+    where
+        Self: 'a;
+    type Write<'a>
+        = MemoryWrite
+    where
+        Self: 'a;
+
+    async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        Ok(CountingRead {
+            inner: self.inner.begin_read(options).await?,
+            get_many_requested_keys: Arc::clone(&self.get_many_requested_keys),
+            scan_calls: Arc::clone(&self.scan_calls),
+            scanned_rows: Arc::clone(&self.scanned_rows),
+        })
+    }
+
+    async fn begin_write(&self, options: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        self.inner.begin_write(options).await
+    }
+}
+
+impl StorageRead for CountingRead {
+    async fn get_many(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        options: GetOptions,
+    ) -> Result<GetManyResult, StorageError> {
+        self.get_many_requested_keys
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        self.inner.get_many(space, keys, options).await
+    }
+
+    async fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        options: ScanOptions,
+    ) -> Result<ScanChunk, StorageError> {
+        let chunk = self.inner.scan(space, range, options).await?;
+        self.scan_calls.fetch_add(1, Ordering::Relaxed);
+        self.scanned_rows
+            .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
+        Ok(chunk)
+    }
+}
+
+#[tokio::test]
+async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state() {
+    const UNRELATED_FILE_COUNT: usize = 64;
+    const UNRELATED_DIRECTORY_COUNT: usize = 32;
+    const UNRELATED_PLUGIN_FILE_COUNT: usize = 16;
+    // Event provenance still walks the commit's change refs. The observed-root
+    // reconstruction must not load the unrelated descriptor/blob/directory,
+    // plugin-state, or durable-owner rows a second time.
+    const MAX_REQUESTED_KEYS: u64 = 416;
+    const MAX_SCAN_CALLS: u64 = 128;
+    const MAX_SCANNED_ROWS: u64 = 512;
+
+    let storage = CountingStorage::default();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine =
+        Engine::new_with_wasm_runtime(storage.clone(), Arc::new(HistoryRenderPluginRuntime))
+            .await
+            .expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let unrelated_values = (0..UNRELATED_FILE_COUNT)
+        .map(|index| {
+            format!("('unrelated-history-{index:03}', '/unrelated-history-{index:03}.txt', X'78')")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_file (id, path, data) VALUES {unrelated_values}"),
+            &[],
+        )
+        .await
+        .expect("unrelated files should insert in one commit");
+    let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
+        .map(|index| {
+            format!("('unrelated-directory-{index:03}', '/unrelated-directory-{index:03}/')")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_directory (id, path) VALUES {unrelated_directories}"),
+            &[],
+        )
+        .await
+        .expect("unrelated directories should insert in one commit");
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix/plugins/plugin_history_render.lixplugin".to_string()),
+                Value::Blob(history_render_plugin_archive().into()),
+            ],
+        )
+        .await
+        .expect("performance fixture plugin should install");
+    let unrelated_plugin_files = (0..UNRELATED_PLUGIN_FILE_COUNT)
+        .map(|index| {
+            format!(
+                "('unrelated-plugin-{index:03}', '/unrelated-plugin-{index:03}.history-render', X'78')"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_file (id, path, data) VALUES {unrelated_plugin_files}"),
+            &[],
+        )
+        .await
+        .expect("unrelated plugin-owned files should insert in one commit");
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('history-point-target', '/history-point-target.txt', X'746172676574')",
+            &[],
+        )
+        .await
+        .expect("target file should insert in its own commit");
+    let commit_id_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("target commit head should load");
+    let [Value::Text(commit_id)] = commit_id_rows.rows()[0].values() else {
+        panic!(
+            "expected active branch commit id row, got {:?}",
+            commit_id_rows.rows()[0].values()
+        );
+    };
+
+    storage.reset_counters();
+    let result = session
+        .execute(
+            &format!(
+                "SELECT id, path \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'history-point-target'"
+            ),
+            &[],
+        )
+        .await
+        .expect("point-routed file history should load");
+
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text("history-point-target".to_string()),
+            Value::Text("/history-point-target.txt".to_string()),
+        ]],
+    );
+    let (requested_keys, scan_calls, scanned_rows) = storage.counters();
+    assert!(
+        requested_keys <= MAX_REQUESTED_KEYS,
+        "point-routed history requested {requested_keys} storage keys with \
+         {UNRELATED_FILE_COUNT} unrelated files, {UNRELATED_DIRECTORY_COUNT} directories, and \
+         {UNRELATED_PLUGIN_FILE_COUNT} plugin-owned files; expected at most {MAX_REQUESTED_KEYS}"
+    );
+    assert!(
+        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
+        "point-routed history performed {scan_calls} scans returning {scanned_rows} rows; \
+         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+    );
+
+    session.close().await.expect("session should close");
+}
 
 simulation_test!(
     lix_file_history_reads_path_and_data_from_commit_graph,
@@ -94,10 +313,10 @@ simulation_test!(
             ],
         );
 
-        let snapshot_result = session
+        let source_changes_result = session
             .execute(
                 &format!(
-                    "SELECT lixcol_snapshot_content \
+                    "SELECT lixcol_source_changes \
                      FROM lix_file_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND id = 'history-file' \
@@ -106,14 +325,22 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("file history descriptor snapshot should be selectable");
-        let snapshot = snapshot_result.rows()[0]
-            .get::<Value>("lixcol_snapshot_content")
-            .expect("snapshot_content should be present");
-        let Value::Json(snapshot) = snapshot else {
-            panic!("snapshot_content should be semantic JSON, got {snapshot:?}");
+            .expect("file history source changes should be selectable");
+        let source_changes = source_changes_result.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .expect("source_changes should be present");
+        let Value::Json(source_changes) = source_changes else {
+            panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
-        assert_eq!(snapshot["name"], json!("readme-renamed.md"));
+        assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            source_changes[0]["schema_key"],
+            json!("lix_file_descriptor")
+        );
+        assert_eq!(
+            source_changes[0]["snapshot_content"]["name"],
+            json!("readme-renamed.md")
+        );
 
         let result = session
             .execute(
@@ -177,6 +404,129 @@ simulation_test!(
                 Value::Blob(Vec::new().into()),
             ]],
         );
+    }
+);
+
+simulation_test!(
+    lix_file_history_preserves_equal_depth_siblings_in_a_diamond,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('diamond-file', '/before.md', X'62617365')",
+            &[],
+        )
+        .await
+        .expect("base file should insert");
+        main.create_branch(CreateBranchOptions {
+            id: Some("diamond-draft".to_string()),
+            name: "Diamond draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft branch should be created");
+        let draft = sim.wrap_session(
+            engine
+                .open_session("diamond-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "UPDATE lix_file SET path = '/same.md' WHERE id = 'diamond-file'",
+            &[],
+        )
+        .await
+        .expect("main path update should succeed");
+        let main_sibling = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main sibling should load")
+            .expect("main sibling should exist");
+        draft
+            .execute(
+                "UPDATE lix_file SET path = '/same.md' WHERE id = 'diamond-file'",
+                &[],
+            )
+            .await
+            .expect("draft path update should succeed");
+        let draft_sibling = engine
+            .load_branch_head_commit_id("diamond-draft")
+            .await
+            .expect("draft sibling should load")
+            .expect("draft sibling should exist");
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "diamond-draft".to_string(),
+            })
+            .await
+            .expect("convergent sibling updates should merge");
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .expect("convergent sibling updates should create an empty merge commit");
+
+        let result = main
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_observed_commit_id, lixcol_depth, lixcol_source_changes \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                       AND id = 'diamond-file' \
+                       AND lixcol_depth = 1 \
+                     ORDER BY lixcol_observed_commit_id"
+                ),
+                &[],
+            )
+            .await
+            .expect("diamond history should load");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "both equal-depth sibling revisions survive"
+        );
+        let mut observed = result
+            .rows()
+            .iter()
+            .map(|row| {
+                assert_eq!(
+                    row.get::<Value>("path").expect("path should decode"),
+                    Value::Text("/same.md".to_string())
+                );
+                assert_eq!(
+                    row.get::<Value>("lixcol_depth")
+                        .expect("history depth should decode"),
+                    Value::Integer(1)
+                );
+                let source_changes = row
+                    .get::<Value>("lixcol_source_changes")
+                    .expect("source changes should exist");
+                let Value::Json(source_changes) = source_changes else {
+                    panic!("source changes should be JSON, got {source_changes:?}");
+                };
+                assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
+                match row
+                    .get::<Value>("lixcol_observed_commit_id")
+                    .expect("observed commit should exist")
+                {
+                    Value::Text(commit_id) => commit_id,
+                    value => panic!("observed commit should be text, got {value:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        observed.sort();
+        let mut expected = vec![main_sibling, draft_sibling];
+        expected.sort();
+        assert_eq!(observed, expected);
     }
 );
 
@@ -485,6 +835,445 @@ async fn lix_file_history_renders_plugin_state_at_each_depth() {
     session.close().await.expect("session should close");
 }
 
+#[tokio::test]
+async fn lix_file_history_uses_each_siblings_observed_plugin_registry() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new_with_wasm_runtime(storage, Arc::new(HistoryRenderPluginRuntime))
+        .await
+        .expect("engine should open with plugin runtime");
+    let main = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    main.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/.lix/plugins/plugin_history_render.lixplugin".to_string()),
+            Value::Blob(history_render_plugin_archive().into()),
+        ],
+    )
+    .await
+    .expect("plugin archive write should install plugin");
+    main.create_branch(CreateBranchOptions {
+        id: Some("plugin-history-sibling".to_string()),
+        name: "Plugin history sibling".to_string(),
+        from_commit_id: None,
+    })
+    .await
+    .expect("plugin history sibling should be created");
+    let sibling = engine
+        .open_session("plugin-history-sibling")
+        .await
+        .expect("plugin history sibling should open");
+
+    main.execute(
+        "DELETE FROM lix_file \
+         WHERE path = '/.lix/plugins/plugin_history_render.lixplugin'",
+        &[],
+    )
+    .await
+    .expect("main sibling should uninstall the plugin");
+    sibling
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+            &[
+                Value::Text("plugin-sibling-note".to_string()),
+                Value::Text("/note.history-render".to_string()),
+                Value::Blob(b"sibling".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("other sibling should materialize a plugin file");
+    let sibling_commit_id = engine
+        .load_branch_head_commit_id("plugin-history-sibling")
+        .await
+        .expect("plugin sibling head should load")
+        .expect("plugin sibling head should exist");
+
+    let receipt = main
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: "plugin-history-sibling".to_string(),
+        })
+        .await
+        .expect("independent plugin uninstall and file insert should merge");
+    let merge_commit_id = receipt
+        .created_merge_commit_id
+        .expect("sibling merge should create a merge commit");
+
+    let result = main
+        .execute(
+            &format!(
+                "SELECT data, lixcol_observed_commit_id, lixcol_source_changes \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                   AND path = '/note.history-render' \
+                   AND lixcol_depth = 1"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin-backed sibling history should load from its observed registry");
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows()[0]
+            .get::<Value>("data")
+            .expect("rendered data should decode"),
+        Value::Blob(b"rendered:sibling-a|sibling-b".to_vec().into())
+    );
+    assert_eq!(
+        result.rows()[0]
+            .get::<Value>("lixcol_observed_commit_id")
+            .expect("observed commit should decode"),
+        Value::Text(sibling_commit_id)
+    );
+    let Value::Json(source_changes) = result.rows()[0]
+        .get::<Value>("lixcol_source_changes")
+        .expect("source changes should decode")
+    else {
+        panic!("source changes should be JSON");
+    };
+    assert!(
+        source_changes.as_array().is_some_and(|changes| changes
+            .iter()
+            .any(|change| change["schema_key"] == json!("plugin_history_note"))),
+        "the plugin state changes from the sibling commit must remain provenance"
+    );
+
+    sibling.close().await.expect("sibling should close");
+    main.close().await.expect("main should close");
+}
+
+#[tokio::test]
+async fn lix_file_history_projects_owned_file_plugin_lifecycle_without_glob_reassignment() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new_with_wasm_runtime(storage, Arc::new(HistoryRenderPluginRuntime))
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix/plugins/plugin_history_render.lixplugin".to_string()),
+                Value::Blob(history_render_plugin_archive().into()),
+            ],
+        )
+        .await
+        .expect("initial plugin should install");
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+            &[
+                Value::Text("plugin-lifecycle-note".to_string()),
+                Value::Text("/note.history-render".to_string()),
+                Value::Blob(b"owned".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("plugin-owned file should insert");
+
+    session
+        .execute(
+            "UPDATE lix_file SET data = $1 \
+             WHERE path = '/.lix/plugins/plugin_history_render.lixplugin'",
+            &[Value::Blob(history_render_plugin_upgrade_archive().into())],
+        )
+        .await
+        .expect("plugin should upgrade without rewriting the owned file");
+    let upgrade_commit_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("upgrade commit should load");
+    let [Value::Text(upgrade_commit_id)] = upgrade_commit_rows.rows()[0].values() else {
+        panic!("upgrade commit id should be text");
+    };
+
+    let upgraded = session
+        .execute(
+            &format!(
+                "SELECT data, lixcol_source_changes \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{upgrade_commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'plugin-lifecycle-note'"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin upgrade should project an owned-file revision");
+    assert_eq!(upgraded.len(), 1);
+    assert_eq!(
+        upgraded.rows()[0].get::<Value>("data").unwrap(),
+        Value::Blob(b"upgraded:owned-a|owned-b".to_vec().into())
+    );
+    let Value::Json(upgrade_sources) = upgraded.rows()[0]
+        .get::<Value>("lixcol_source_changes")
+        .unwrap()
+    else {
+        panic!("upgrade source changes should be JSON");
+    };
+    assert!(
+        upgrade_sources.as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["schema_key"] == json!("lix_key_value")
+                    && source["entity_pk"] == json!(["lix_plugin_registry_v1"])
+            })
+        }),
+        "the registry upgrade must be the owned-file projection source"
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix/plugins/plugin_history_overlap.lixplugin".to_string()),
+                Value::Blob(history_overlap_plugin_archive().into()),
+            ],
+        )
+        .await
+        .expect("overlapping plugin should install");
+    let overlap_commit_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("overlap commit should load");
+    let [Value::Text(overlap_commit_id)] = overlap_commit_rows.rows()[0].values() else {
+        panic!("overlap commit id should be text");
+    };
+    let overlap_history = session
+        .execute(
+            &format!(
+                "SELECT id \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{overlap_commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'plugin-lifecycle-note'"
+            ),
+            &[],
+        )
+        .await
+        .expect("unrelated overlapping install should not project an owned-file revision");
+    assert_rows_eq(overlap_history, Vec::<Vec<Value>>::new());
+    let still_owned = session
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'plugin-lifecycle-note'",
+            &[],
+        )
+        .await
+        .expect("overlapping plugin must not steal the durable owner");
+    assert_rows_eq(
+        still_owned,
+        vec![vec![Value::Blob(
+            b"upgraded:owned-a|owned-b".to_vec().into(),
+        )]],
+    );
+
+    session
+        .execute(
+            "INSERT INTO plugin_history_overlap_note \
+             (id, value, lixcol_file_id, lixcol_global, lixcol_untracked) \
+             VALUES ('overlap-sidecar', 'noise', 'plugin-lifecycle-note', false, false)",
+            &[],
+        )
+        .await
+        .expect("non-owner plugin state should remain independently writable");
+    let non_owner_state_commit_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("non-owner plugin state commit should load");
+    let [Value::Text(non_owner_state_commit_id)] = non_owner_state_commit_rows.rows()[0].values()
+    else {
+        panic!("non-owner plugin state commit id should be text");
+    };
+    let non_owner_state_history = session
+        .execute(
+            &format!(
+                "SELECT id \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{non_owner_state_commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'plugin-lifecycle-note'"
+            ),
+            &[],
+        )
+        .await
+        .expect("non-owner plugin state should not revise the owned file projection");
+    assert_rows_eq(non_owner_state_history, Vec::<Vec<Value>>::new());
+    let still_owned_after_non_owner_write = session
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'plugin-lifecycle-note'",
+            &[],
+        )
+        .await
+        .expect("non-owner plugin state must not affect the durable owner's rendering");
+    assert_rows_eq(
+        still_owned_after_non_owner_write,
+        vec![vec![Value::Blob(
+            b"upgraded:owned-a|owned-b".to_vec().into(),
+        )]],
+    );
+
+    session
+        .execute(
+            "DELETE FROM lix_file \
+             WHERE path = '/.lix/plugins/plugin_history_render.lixplugin'",
+            &[],
+        )
+        .await
+        .expect("owning plugin should uninstall");
+    let uninstall_commit_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("uninstall commit should load");
+    let [Value::Text(uninstall_commit_id)] = uninstall_commit_rows.rows()[0].values() else {
+        panic!("uninstall commit id should be text");
+    };
+    let unavailable_projection = session
+        .execute(
+            &format!(
+                "SELECT id, lixcol_source_changes \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{uninstall_commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'plugin-lifecycle-note'"
+            ),
+            &[],
+        )
+        .await
+        .expect("uninstall should remain queryable when data is not projected");
+    assert_eq!(unavailable_projection.len(), 1);
+    let history_error = session
+        .execute(
+            &format!(
+                "SELECT data \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{uninstall_commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'plugin-lifecycle-note'"
+            ),
+            &[],
+        )
+        .await
+        .expect_err("unavailable historical owner must not silently render or reassign");
+    assert_eq!(history_error.code, LixError::CODE_PLUGIN_UNAVAILABLE);
+    let live_error = session
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'plugin-lifecycle-note'",
+            &[],
+        )
+        .await
+        .expect_err("live file should use the same unavailable-owner contract");
+    assert_eq!(live_error.code, LixError::CODE_PLUGIN_UNAVAILABLE);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn lix_file_history_keeps_plugin_state_tombstones_in_deleted_file_provenance() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new_with_wasm_runtime(storage, Arc::new(HistoryRenderPluginRuntime))
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix/plugins/plugin_history_render.lixplugin".to_string()),
+                Value::Blob(history_render_plugin_archive().into()),
+            ],
+        )
+        .await
+        .expect("plugin should install");
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+            &[
+                Value::Text("plugin-deleted-note".to_string()),
+                Value::Text("/deleted.history-render".to_string()),
+                Value::Blob(b"deleted".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("plugin-owned file should insert");
+    session
+        .execute("DELETE FROM lix_file WHERE id = 'plugin-deleted-note'", &[])
+        .await
+        .expect("plugin-owned file should delete");
+    let delete_commit_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("delete commit should load");
+    let [Value::Text(delete_commit_id)] = delete_commit_rows.rows()[0].values() else {
+        panic!("delete commit id should be text");
+    };
+
+    let result = session
+        .execute(
+            &format!(
+                "SELECT path, data, lixcol_source_changes \
+                 FROM lix_file_history \
+                 WHERE lixcol_start_commit_id = '{delete_commit_id}' \
+                   AND lixcol_depth = 0 \
+                   AND id = 'plugin-deleted-note'"
+            ),
+            &[],
+        )
+        .await
+        .expect("deleted plugin-file provenance should remain queryable");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].get::<Value>("path").unwrap(), Value::Null);
+    assert_eq!(result.rows()[0].get::<Value>("data").unwrap(), Value::Null);
+    let Value::Json(sources) = result.rows()[0]
+        .get::<Value>("lixcol_source_changes")
+        .unwrap()
+    else {
+        panic!("delete source changes should be JSON");
+    };
+    let sources = sources
+        .as_array()
+        .expect("delete source changes should be an array");
+    let plugin_tombstones = sources
+        .iter()
+        .filter(|source| source["schema_key"] == json!("plugin_history_note"))
+        .collect::<Vec<_>>();
+    assert_eq!(plugin_tombstones.len(), 2);
+    assert!(
+        plugin_tombstones
+            .iter()
+            .all(|source| source["snapshot_content"].is_null()),
+        "plugin entity tombstones must remain in composed provenance"
+    );
+    assert!(
+        sources.iter().any(|source| {
+            source["schema_key"] == json!("lix_key_value")
+                && source["entity_pk"] == json!(["lix_plugin_owner_v1"])
+                && source["snapshot_content"].is_null()
+        }),
+        "durable owner tombstone must remain in composed provenance"
+    );
+
+    session.close().await.expect("session should close");
+}
+
 simulation_test!(
     lix_file_history_requires_start_commit_id,
     |sim| async move {
@@ -580,16 +1369,25 @@ simulation_test!(
 
 struct HistoryRenderPluginRuntime;
 
-struct HistoryRenderPluginComponent;
+struct HistoryRenderPluginComponent {
+    prefix: &'static str,
+}
 
 #[async_trait]
 impl WasmRuntime for HistoryRenderPluginRuntime {
     async fn init_component(
         &self,
-        _bytes: Vec<u8>,
+        bytes: Vec<u8>,
         _limits: WasmLimits,
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        Ok(Arc::new(HistoryRenderPluginComponent))
+        let prefix = if bytes.ends_with(b"upgrade") {
+            "upgraded"
+        } else if bytes.ends_with(b"overlap") {
+            "overlap"
+        } else {
+            "rendered"
+        };
+        Ok(Arc::new(HistoryRenderPluginComponent { prefix }))
     }
 }
 
@@ -631,48 +1429,82 @@ impl WasmComponentInstance for HistoryRenderPluginComponent {
             })
             .collect::<Vec<_>>();
         values.sort();
-        Ok(format!("rendered:{}", values.join("|")).into_bytes())
+        Ok(format!("{}:{}", self.prefix, values.join("|")).into_bytes())
     }
 }
 
 fn history_render_plugin_archive() -> Vec<u8> {
-    const MANIFEST_JSON: &[u8] = br#"{
-        "key": "plugin_history_render",
+    history_plugin_archive(
+        "plugin_history_render",
+        "*.history-render",
+        "plugin_history_note",
+        b"",
+    )
+}
+
+fn history_render_plugin_upgrade_archive() -> Vec<u8> {
+    history_plugin_archive(
+        "plugin_history_render",
+        "*.history-render",
+        "plugin_history_note",
+        b"upgrade",
+    )
+}
+
+fn history_overlap_plugin_archive() -> Vec<u8> {
+    history_plugin_archive(
+        "plugin_history_overlap",
+        "note.history-render",
+        "plugin_history_overlap_note",
+        b"overlap",
+    )
+}
+
+fn history_plugin_archive(
+    plugin_key: &str,
+    path_glob: &str,
+    schema_key: &str,
+    wasm_marker: &[u8],
+) -> Vec<u8> {
+    let manifest_json = serde_json::to_vec(&json!({
+        "key": plugin_key,
         "runtime": "wasm-component-v1",
         "api_version": "0.1.0",
-        "match": { "path_glob": "*.history-render" },
+        "match": { "path_glob": path_glob },
         "entry": "plugin.wasm",
-        "schemas": ["schema/plugin_history_note.json"]
-    }"#;
-    const SCHEMA_JSON: &[u8] = br#"{
-        "x-lix-key": "plugin_history_note",
+        "schemas": [format!("schema/{schema_key}.json")],
+    }))
+    .expect("plugin manifest fixture should serialize");
+    let schema_json = serde_json::to_vec(&json!({
+        "x-lix-key": schema_key,
         "x-lix-primary-key": ["/id"],
         "type": "object",
         "properties": {
             "id": { "type": "string" },
-            "value": { "type": "string" }
+            "value": { "type": "string" },
         },
         "required": ["id", "value"],
-        "additionalProperties": false
-    }"#;
-    const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
-
+        "additionalProperties": false,
+    }))
+    .expect("plugin schema fixture should serialize");
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend_from_slice(wasm_marker);
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (path, bytes) in [
-        ("manifest.json", MANIFEST_JSON),
-        ("schema/plugin_history_note.json", SCHEMA_JSON),
-        ("plugin.wasm", WASM_HEADER),
+        ("manifest.json".to_string(), manifest_json),
+        (format!("schema/{schema_key}.json"), schema_json),
+        ("plugin.wasm".to_string(), wasm),
     ] {
         writer.start_file(path, options).unwrap();
-        writer.write_all(bytes).unwrap();
+        writer.write_all(&bytes).unwrap();
     }
     writer.finish().unwrap().into_inner()
 }
 
 simulation_test!(
-    lix_file_history_exposes_file_descriptor_schema_key,
+    lix_file_history_aggregates_composed_source_changes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -686,7 +1518,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-file-blob-filter', '/docs/blob-filter.txt', X'626C6F62')",
+                 VALUES ('history-file-blob-filter', '/blob-filter.txt', X'626C6F62')",
                 &[],
             )
             .await
@@ -708,41 +1540,83 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data, lixcol_schema_key \
+                    "SELECT id, path, data, lixcol_source_changes \
                      FROM lix_file_history \
                      WHERE lixcol_start_commit_id = '{commit_id}' \
-                       AND lixcol_schema_key = 'lix_file_descriptor' \
                        AND id = 'history-file-blob-filter' \
-                       AND lixcol_depth = 0"
+                     ORDER BY lixcol_depth"
                 ),
                 &[],
             )
             .await
-            .expect("file-descriptor-filtered file history read should succeed");
+            .expect("file history read should succeed");
 
-        assert_rows_eq(
-            result,
-            vec![vec![
+        assert_eq!(result.len(), 2);
+        let latest = result.rows()[0].values();
+        assert_eq!(
+            &latest[..3],
+            &[
                 Value::Text("history-file-blob-filter".to_string()),
-                Value::Text("/docs/blob-filter.txt".to_string()),
+                Value::Text("/blob-filter.txt".to_string()),
                 Value::Blob(b"blob2".to_vec().into()),
-                Value::Text("lix_file_descriptor".to_string()),
-            ]],
+            ]
+        );
+        let Value::Json(latest_sources) = &latest[3] else {
+            panic!("latest source changes should be JSON, got {:?}", latest[3]);
+        };
+        assert_eq!(latest_sources.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            latest_sources[0]["schema_key"],
+            json!("lix_binary_blob_ref")
         );
 
-        let blob_schema_result = session
-            .execute(
-                &format!(
-                    "SELECT id \
-                     FROM lix_file_history \
-                     WHERE lixcol_start_commit_id = '{commit_id}' \
-                       AND lixcol_schema_key = 'lix_binary_blob_ref' \
-                       AND id = 'history-file-blob-filter'"
-                ),
-                &[],
-            )
-            .await
-            .expect("blob-ref-filtered file history read should succeed");
-        assert_rows_eq(blob_schema_result, Vec::<Vec<Value>>::new());
+        let Value::Json(initial_sources) = &result.rows()[1].values()[3] else {
+            panic!(
+                "initial source changes should be JSON, got {:?}",
+                result.rows()[1].values()[3]
+            );
+        };
+        assert_eq!(initial_sources.as_array().map(Vec::len), Some(2));
+        let source_schema_keys = initial_sources
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["schema_key"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            source_schema_keys,
+            std::collections::BTreeSet::from(["lix_binary_blob_ref", "lix_file_descriptor",])
+        );
+        let source_ids = initial_sources
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            source_ids.windows(2).all(|ids| ids[0] <= ids[1]),
+            "source changes must be ordered by change id: {source_ids:?}"
+        );
+        for source in initial_sources.as_array().unwrap() {
+            assert_eq!(
+                source
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![
+                    "created_at",
+                    "entity_pk",
+                    "file_id",
+                    "id",
+                    "metadata",
+                    "origin_key",
+                    "schema_key",
+                    "snapshot_content",
+                ],
+                "source change objects must mirror the stable lix_change field set"
+            );
+        }
     }
 );

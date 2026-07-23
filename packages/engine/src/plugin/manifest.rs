@@ -99,46 +99,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
     })
 }
 
-pub fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
-    path: &str,
-    file_content_type: Option<C>,
-    candidates: &'a [T],
-    glob: impl Fn(&T) -> &str,
-    required_content_type: impl Fn(&T) -> Option<C>,
-) -> Option<&'a T> {
-    let mut selected: Option<&T> = None;
-    let mut selected_rank: Option<(u8, i32)> = None;
-
-    for candidate in candidates {
-        let pattern = glob(candidate);
-        if !glob_matches_path(pattern, path) {
-            continue;
-        }
-        if let (Some(actual_type), Some(required_type)) =
-            (file_content_type, required_content_type(candidate))
-        {
-            if actual_type != required_type {
-                continue;
-            }
-        }
-
-        let rank = glob_specificity_rank(pattern);
-        match selected_rank {
-            None => {
-                selected = Some(candidate);
-                selected_rank = Some(rank);
-            }
-            Some(existing_rank) if rank > existing_rank => {
-                selected = Some(candidate);
-                selected_rank = Some(rank);
-            }
-            _ => {}
-        }
-    }
-
-    selected
-}
-
+#[cfg(test)]
 pub fn glob_matches_path(glob: &str, path: &str) -> bool {
     if glob.is_empty() || path.is_empty() {
         return false;
@@ -171,25 +132,7 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
     Ok(())
 }
 
-fn glob_specificity_rank(glob: &str) -> (u8, i32) {
-    if is_catch_all_glob(glob) {
-        return (0, i32::MIN);
-    }
-    (1, glob_specificity_score(glob))
-}
-
-fn glob_specificity_score(glob: &str) -> i32 {
-    let mut literal_chars = 0i32;
-    let mut wildcard_chars = 0i32;
-    for ch in glob.chars() {
-        match ch {
-            '*' | '?' | '[' | ']' | '{' | '}' => wildcard_chars += 1,
-            _ => literal_chars += 1,
-        }
-    }
-    literal_chars - wildcard_chars
-}
-
+#[cfg(test)]
 fn is_catch_all_glob(glob: &str) -> bool {
     glob == "*" || glob == "**/*" || glob == "**"
 }

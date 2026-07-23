@@ -33,6 +33,7 @@ pub(crate) type SqlJsonReader<S> = JsonStoreReader<S>;
 
 #[derive(Clone)]
 pub(crate) struct HistoryQuerySource<S> {
+    pub(crate) store: S,
     pub(crate) json_reader: JsonStoreReader<S>,
 }
 

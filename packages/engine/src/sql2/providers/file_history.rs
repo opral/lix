@@ -12,33 +12,34 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::GLOBAL_BRANCH_ID;
-use crate::LixError;
+use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobHash};
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
-use crate::filesystem::FilesystemIndex;
+use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::plugin::{
-    InstalledPlugin, InstalledPluginMetadata, PluginContentType, PluginRuntimeHost,
-    load_installed_plugin_from_archive_bytes, load_installed_plugin_metadata_from_archive_bytes,
-    plugin_key_from_archive_path, render_materialized_plugin_file, retain_plugin_state_rows,
-    select_best_glob_match,
+    InstalledPlugin, InstalledPluginMetadata, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
+    PluginFileOwner, PluginRegistry, PluginRuntimeHost, load_installed_plugin_from_archive_bytes,
+    render_plugin_state, retain_plugin_state_rows,
 };
-use crate::schema::is_seed_schema_key;
-use crate::serialize_row_metadata;
+use crate::tracked_state::{
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
+    TrackedStateScanRequest, TrackedStateStoreReader,
+};
+use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
-    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection,
-    HistoryRoute, HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
-    parse_history_filter,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
+    HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SOURCE_CHANGES, HISTORY_COL_START_COMMIT_ID,
+    HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
+    HistoryViewDescriptor, load_history_entries, parse_history_filter,
+    serialize_history_source_changes,
 };
 use crate::sql2::providers::filesystem_history_path::{
     HistoryDirectoryPathRecord, resolve_history_directory_path,
@@ -53,7 +54,7 @@ use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table,
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
 pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
@@ -246,12 +247,18 @@ struct FileHistoryPluginStateRecord {
 }
 
 #[derive(Debug, Clone)]
+struct FileHistoryPluginOwnerRecord {
+    file_id: String,
+    owner: Option<PluginFileOwner>,
+    entry: HistoryEntry,
+}
+
+#[derive(Debug, Clone)]
 struct FileHistoryEvent {
     file_id: String,
     start_commit_id: String,
     depth: u32,
-    priority: u8,
-    change: MaterializedChange,
+    source_changes: Vec<MaterializedChange>,
     observed_commit_id: String,
     commit_created_at: String,
 }
@@ -264,7 +271,6 @@ struct FileHistoryOutputRow {
     directory_id: Option<String>,
     name: Option<String>,
     data: Option<Vec<u8>>,
-    descriptor_change: MaterializedChange,
     event: FileHistoryEvent,
 }
 
@@ -453,8 +459,22 @@ struct FileHistoryFilesystemContext {
     event_directories: Vec<FileHistoryDirectoryRecord>,
     event_blobs: Vec<FileHistoryBlobRecord>,
     descriptors: Vec<FileHistoryDescriptorRecord>,
+}
+
+struct FileHistoryObservedState {
+    descriptors: Vec<FileHistoryDescriptorRecord>,
     directories: Vec<FileHistoryDirectoryRecord>,
     blobs: Vec<FileHistoryBlobRecord>,
+    plugin_state: Vec<FileHistoryPluginStateRecord>,
+    plugin_owners: Vec<FileHistoryPluginOwnerRecord>,
+    plugin_registry: PluginRegistry,
+}
+
+struct FileHistoryPluginDiscovery {
+    schema_keys: Vec<String>,
+    registries_by_commit: BTreeMap<String, PluginRegistry>,
+    parent_commit_ids_by_commit: BTreeMap<String, Vec<String>>,
+    registry_events: Vec<HistoryEntry>,
 }
 
 async fn load_file_history_rows<S>(
@@ -482,29 +502,6 @@ where
 
     let event_route = route.traversal_only();
     let context_route = route.starts_only();
-    // Plugins can materialize file history from state rather than a blob. A
-    // plugin install always registers at least one non-seed schema, so retain
-    // the complete filesystem traversal whenever reachable history contains
-    // one. The common no-plugin workspace can safely narrow descriptor/blob
-    // history to the exact public file IDs while retaining all directories for
-    // historical path and rename reconstruction.
-    let lookup_ids = if let Some(lookup_ids) = lookup_ids {
-        match history_contains_non_seed_registered_schema(
-            Arc::clone(&commit_graph),
-            query_source.clone(),
-            &context_route,
-        )
-        .await
-        {
-            Ok(false) => Some(lookup_ids),
-            // If this proof cannot be completed, preserve the established
-            // complete traversal rather than introducing a new query error or
-            // risking skipped plugin materialization.
-            Ok(true) | Err(_) => None,
-        }
-    } else {
-        None
-    };
     let filesystem_context = load_file_history_filesystem_context(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -514,61 +511,108 @@ where
         metadata_projection,
     )
     .await?;
-    let mut installed_plugins_cache = BTreeMap::<(String, u32, String), InstalledPlugin>::new();
-    let mut installed_plugin_metadata_cache =
-        BTreeMap::<(String, u32), Vec<InstalledPluginMetadata>>::new();
-    let events = file_history_events(
+    let mut installed_plugins_cache = BTreeMap::<(String, String), InstalledPlugin>::new();
+    let filesystem_events = file_history_events(
         &filesystem_context.event_descriptors,
         &filesystem_context.event_directories,
         &filesystem_context.event_blobs,
         &filesystem_context.descriptors,
     );
-    let (mut event_plugin_state, plugin_state) = if lookup_ids.is_some() {
-        (Vec::new(), Vec::new())
-    } else {
-        let plugin_schema_keys = discover_file_history_plugin_schema_keys(
-            blob_reader,
-            &mut installed_plugin_metadata_cache,
-            &filesystem_context,
-            &events,
-            public_predicate,
-        )
-        .await?;
-        if plugin_schema_keys.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            load_file_history_plugin_state(
-                commit_graph,
-                query_source,
-                &event_route,
-                &context_route,
-                plugin_schema_keys,
-                metadata_projection,
-            )
-            .await?
-        }
-    };
-    retain_matching_plugin_events(
-        &mut event_plugin_state,
-        &filesystem_context.descriptors,
-        &filesystem_context.directories,
-        public_predicate,
-    );
-    cache_installed_plugins_for_plugin_state_depths(
-        blob_reader,
-        &mut installed_plugin_metadata_cache,
-        &filesystem_context,
-        &event_plugin_state,
+    let plugin_discovery = discover_file_history_plugins(
+        Arc::clone(&commit_graph),
+        query_source.clone(),
+        &event_route,
+        &context_route,
+        metadata_projection,
     )
     .await?;
-    let plugin_events = file_history_plugin_events(
-        &installed_plugin_metadata_cache,
+    let plugin_schema_keys = plugin_discovery.schema_keys.clone();
+    let event_plugin_state = if plugin_schema_keys.is_empty() {
+        Vec::new()
+    } else {
+        let (events, _) = load_file_history_plugin_state(
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            &event_route,
+            &context_route,
+            plugin_schema_keys.clone(),
+            lookup_ids,
+            metadata_projection,
+        )
+        .await?;
+        events
+    };
+    let event_plugin_owners = load_file_history_plugin_owner_events(
+        Arc::clone(&commit_graph),
+        query_source.clone(),
+        &event_route,
+        lookup_ids,
+        metadata_projection,
+    )
+    .await?;
+    // Ownership replacement and deletion can tombstone the prior owner's
+    // plugin state in the same commit. The exact observed root contains only
+    // the new owner (or its tombstone), so retain direct-parent roots as the
+    // ownership evidence for those cleanup changes.
+    let owner_change_parent_commit_ids = event_plugin_owners.iter().flat_map(|record| {
+        plugin_discovery
+            .parent_commit_ids_by_commit
+            .get(&record.entry.observed_commit_id)
+            .into_iter()
+            .flatten()
+            .cloned()
+    });
+    let observed_commit_ids = filesystem_events
+        .iter()
+        .map(|event| event.observed_commit_id.clone())
+        .chain(
+            event_plugin_state
+                .iter()
+                .map(|record| record.entry.observed_commit_id.clone()),
+        )
+        .chain(
+            event_plugin_owners
+                .iter()
+                .map(|record| record.entry.observed_commit_id.clone()),
+        )
+        .chain(
+            plugin_discovery
+                .registry_events
+                .iter()
+                .map(|entry| entry.observed_commit_id.clone()),
+        )
+        .chain(owner_change_parent_commit_ids)
+        .collect::<BTreeSet<_>>();
+    let observed_states = load_file_history_observed_states(
+        query_source,
+        observed_commit_ids,
+        plugin_schema_keys,
+        lookup_ids,
+    )
+    .await?;
+    let plugin_state_events = file_history_plugin_events(
         &event_plugin_state,
-        &filesystem_context.descriptors,
-        &filesystem_context.directories,
+        &event_plugin_owners,
+        &observed_states,
+        &plugin_discovery.parent_commit_ids_by_commit,
     );
-    let events = sorted_deduped_file_history_events(events.into_iter().chain(plugin_events));
-    let prepared = prepare_file_history_rows(&filesystem_context, events, route, public_predicate)?;
+    let plugin_owner_events = event_plugin_owners
+        .iter()
+        .map(|record| file_history_event_from_entry(record.file_id.clone(), &record.entry));
+    let plugin_registry_events = file_history_plugin_registry_events(
+        &plugin_discovery.registry_events,
+        &observed_states,
+        &plugin_discovery.registries_by_commit,
+        &plugin_discovery.parent_commit_ids_by_commit,
+    )?;
+    let events = sorted_grouped_file_history_events(
+        filesystem_events
+            .into_iter()
+            .chain(plugin_state_events)
+            .chain(plugin_owner_events)
+            .chain(plugin_registry_events),
+    );
+    let prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
     let blob_bytes = if needs_data {
         load_file_history_blob_bytes(blob_reader, &prepared).await?
     } else {
@@ -586,8 +630,7 @@ where
                             &plugin_host,
                             blob_reader,
                             &mut installed_plugins_cache,
-                            &installed_plugin_metadata_cache,
-                            &plugin_state,
+                            &observed_states,
                             &prepared_row.descriptor,
                             &prepared_row.event,
                             path,
@@ -609,7 +652,6 @@ where
             directory_id: prepared_row.descriptor.directory_id.clone(),
             name: prepared_row.descriptor.name.clone(),
             data,
-            descriptor_change: prepared_row.descriptor.entry.change.clone(),
             event: prepared_row.event,
         });
     }
@@ -624,25 +666,38 @@ where
                     .observed_commit_id
                     .cmp(&right.event.observed_commit_id),
             )
-            .then(left.event.change.id.cmp(&right.event.change.id))
     });
     Ok(output)
 }
 
 fn prepare_file_history_rows(
-    filesystem_context: &FileHistoryFilesystemContext,
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
     events: Vec<FileHistoryEvent>,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
 ) -> Result<Vec<PreparedFileHistoryRow>, LixError> {
     let mut prepared = Vec::new();
     for event in events {
-        let Some(descriptor) = nearest_file_descriptor(&filesystem_context.descriptors, &event)
+        let Some(state) = observed_states.get(&event.observed_commit_id) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "lix_file_history did not load observed commit '{}'",
+                    event.observed_commit_id
+                ),
+            ));
+        };
+        let Some(descriptor) = state
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == event.file_id)
         else {
             continue;
         };
-        let path =
-            resolve_file_history_path(descriptor, &filesystem_context.directories, event.depth);
+        if !file_history_event_affects_observed_file(&event, descriptor) {
+            continue;
+        }
+        let path = resolve_file_history_path(descriptor, &state.directories, 0);
         let id = tombstone_identity_column_value(
             "id",
             &descriptor.id,
@@ -666,7 +721,10 @@ fn prepare_file_history_rows(
             id,
             path,
             descriptor: descriptor.clone(),
-            blob_hash: nearest_blob_ref(&filesystem_context.blobs, &event)
+            blob_hash: state
+                .blobs
+                .iter()
+                .find(|blob| blob.file_id == event.file_id)
                 .and_then(|blob| blob.blob_hash.clone()),
             event,
         });
@@ -748,38 +806,314 @@ where
         event_directories: parse_file_history_directories(&event_entries)?,
         event_blobs: parse_file_history_blobs(&event_entries)?,
         descriptors: parse_file_history_descriptors(&context_entries)?,
-        directories: parse_file_history_directories(&context_entries)?,
-        blobs: parse_file_history_blobs(&context_entries)?,
     })
 }
 
-async fn history_contains_non_seed_registered_schema<S>(
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+async fn load_file_history_observed_states<S>(
     query_source: SqlHistoryQuerySource<S>,
-    route: &HistoryRoute,
-) -> Result<bool, LixError>
+    observed_commit_ids: BTreeSet<String>,
+    plugin_schema_keys: Vec<String>,
+    lookup_ids: Option<&FileHistoryLookupIds>,
+) -> Result<BTreeMap<String, FileHistoryObservedState>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            start_commit_column: HISTORY_COL_START_COMMIT_ID,
-        },
-        commit_graph,
-        query_source.json_reader,
-        route,
-        vec![REGISTERED_SCHEMA_KEY.to_string()],
-        HistoryMetadataProjection::default(),
+    // Traversal depth is only a distance from the requested start commit. In a
+    // DAG, an equal-depth row may belong to a sibling and must not shape this
+    // revision. Commit roots are the canonical state as of each observed
+    // commit, so use them directly instead of inferring ancestry from depth.
+    let mut reader = TrackedStateContext::new().reader(query_source.store);
+    let mut states = BTreeMap::new();
+    for observed_commit_id in observed_commit_ids {
+        let state = load_file_history_observed_state(
+            &mut reader,
+            &observed_commit_id,
+            &plugin_schema_keys,
+            lookup_ids,
+        )
+        .await?;
+        states.insert(observed_commit_id, state);
+    }
+    Ok(states)
+}
+
+async fn load_file_history_observed_state<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    observed_commit_id: &str,
+    plugin_schema_keys: &[String],
+    lookup_ids: Option<&FileHistoryLookupIds>,
+) -> Result<FileHistoryObservedState, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let plugin_registry =
+        load_plugin_registry_at_observed_commit(reader, observed_commit_id).await?;
+    let plugin_owner_entries = load_file_history_plugin_owner_entries_at_observed_commit(
+        reader,
+        observed_commit_id,
+        lookup_ids,
     )
     .await?;
-    Ok(entries.iter().any(|entry| {
-        entry
-            .change
-            .entity_pk
-            .as_single_string_owned()
-            .map_or(true, |schema_key| !is_seed_schema_key(&schema_key))
-    }))
+    let entries = if let Some(lookup_ids) = lookup_ids {
+        load_selected_file_history_observed_entries(
+            reader,
+            observed_commit_id,
+            plugin_schema_keys,
+            lookup_ids,
+        )
+        .await?
+    } else {
+        let mut schema_keys = file_history_filesystem_schema_keys();
+        schema_keys.extend(plugin_schema_keys.iter().cloned());
+        scan_file_history_observed_entries(
+            reader,
+            observed_commit_id,
+            TrackedStateFilter {
+                schema_keys,
+                include_tombstones: true,
+                ..TrackedStateFilter::default()
+            },
+        )
+        .await?
+    };
+    Ok(FileHistoryObservedState {
+        descriptors: parse_file_history_descriptors(&entries)?,
+        directories: parse_file_history_directories(&entries)?,
+        blobs: parse_file_history_blobs(&entries)?,
+        plugin_state: parse_file_history_plugin_state(&entries),
+        plugin_owners: parse_file_history_plugin_owners(&plugin_owner_entries)?,
+        plugin_registry,
+    })
+}
+
+async fn load_file_history_plugin_owner_entries_at_observed_commit<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    observed_commit_id: &str,
+    lookup_ids: Option<&FileHistoryLookupIds>,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    scan_file_history_observed_entries(
+        reader,
+        observed_commit_id,
+        TrackedStateFilter {
+            schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+            file_ids: lookup_ids
+                .map(|lookup_ids| {
+                    lookup_ids
+                        .0
+                        .iter()
+                        .cloned()
+                        .map(NullableKeyFilter::Value)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            include_tombstones: true,
+        },
+    )
+    .await
+}
+
+async fn load_selected_file_history_observed_entries<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    observed_commit_id: &str,
+    plugin_schema_keys: &[String],
+    lookup_ids: &FileHistoryLookupIds,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let entity_pks = lookup_ids
+        .0
+        .iter()
+        .map(EntityPk::single)
+        .collect::<Vec<_>>();
+    let file_ids = selected_file_id_filters(lookup_ids);
+    let mut entries = scan_file_history_observed_entries(
+        reader,
+        observed_commit_id,
+        TrackedStateFilter {
+            schema_keys: vec![
+                FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                BLOB_REF_SCHEMA_KEY.to_string(),
+            ],
+            entity_pks,
+            file_ids: file_ids.clone(),
+            include_tombstones: true,
+        },
+    )
+    .await?;
+    let descriptors = parse_file_history_descriptors(&entries)?;
+    entries.extend(
+        load_file_history_ancestor_directory_entries(
+            reader,
+            observed_commit_id,
+            &descriptors,
+            file_ids.clone(),
+        )
+        .await?,
+    );
+    if !plugin_schema_keys.is_empty() {
+        entries.extend(
+            scan_file_history_observed_entries(
+                reader,
+                observed_commit_id,
+                TrackedStateFilter {
+                    schema_keys: plugin_schema_keys.to_vec(),
+                    file_ids,
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+            )
+            .await?,
+        );
+    }
+    Ok(entries)
+}
+
+fn selected_file_id_filters(lookup_ids: &FileHistoryLookupIds) -> Vec<NullableKeyFilter<String>> {
+    std::iter::once(NullableKeyFilter::Null)
+        .chain(lookup_ids.0.iter().cloned().map(NullableKeyFilter::Value))
+        .collect()
+}
+
+async fn load_file_history_ancestor_directory_entries<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    observed_commit_id: &str,
+    descriptors: &[FileHistoryDescriptorRecord],
+    file_ids: Vec<NullableKeyFilter<String>>,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut pending = descriptors
+        .iter()
+        .filter_map(|descriptor| descriptor.directory_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut requested = BTreeSet::new();
+    let mut entries = Vec::new();
+    while !pending.is_empty() {
+        let ids = std::mem::take(&mut pending)
+            .into_iter()
+            .filter(|id| requested.insert(id.clone()))
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            break;
+        }
+        let loaded = scan_file_history_observed_entries(
+            reader,
+            observed_commit_id,
+            TrackedStateFilter {
+                schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                entity_pks: ids.iter().map(EntityPk::single).collect(),
+                file_ids: file_ids.clone(),
+                include_tombstones: true,
+            },
+        )
+        .await?;
+        let directories = parse_file_history_directories(&loaded)?;
+        pending.extend(
+            directories
+                .iter()
+                .filter_map(|directory| directory.parent_id.clone())
+                .filter(|id| !requested.contains(id)),
+        );
+        entries.extend(loaded);
+    }
+    Ok(entries)
+}
+
+async fn scan_file_history_observed_entries<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    observed_commit_id: &str,
+    filter: TrackedStateFilter,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    Ok(reader
+        .scan_rows_at_commit(
+            observed_commit_id,
+            &TrackedStateScanRequest {
+                filter,
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_string(), "metadata".to_string()],
+                },
+                ..TrackedStateScanRequest::default()
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|row| history_entry_from_observed_state(row, observed_commit_id))
+        .collect())
+}
+
+async fn load_plugin_registry_at_observed_commit<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    observed_commit_id: &str,
+) -> Result<PluginRegistry, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut rows = reader
+        .scan_rows_at_commit(
+            observed_commit_id,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones: true,
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_string()],
+                },
+                ..TrackedStateScanRequest::default()
+            },
+        )
+        .await?;
+    let row = rows.pop();
+    let snapshot = row
+        .and_then(|row| (!row.deleted).then_some(row.snapshot_content))
+        .flatten()
+        .map(|snapshot| {
+            serde_json::from_str::<serde_json::Value>(&snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    PluginRegistry::from_optional_snapshot(snapshot.as_ref())
+}
+
+fn history_entry_from_observed_state(
+    row: MaterializedTrackedStateRow,
+    observed_commit_id: &str,
+) -> HistoryEntry {
+    HistoryEntry {
+        change: MaterializedChange {
+            id: row.change_id.to_string(),
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            snapshot_content: row.snapshot_content,
+            metadata: row.metadata,
+            created_at: row.updated_at.clone(),
+            // Origin is event provenance, not reconstructed state. Source
+            // changes retain it; commit-root rows intentionally do not.
+            origin_key: None,
+        },
+        observed_commit_id: observed_commit_id.to_string(),
+        commit_created_at: row.updated_at,
+        start_commit_id: observed_commit_id.to_string(),
+        depth: 0,
+    }
 }
 
 async fn load_file_history_filesystem_entries<S>(
@@ -857,6 +1191,7 @@ async fn load_file_history_plugin_state<S>(
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
     plugin_schema_keys: Vec<String>,
+    lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<
     (
@@ -868,8 +1203,10 @@ async fn load_file_history_plugin_state<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    let event_route = file_history_plugin_route(event_route, lookup_ids);
+    let context_route = file_history_plugin_route(context_route, lookup_ids);
     let (event_entries, context_entries) =
-        load_file_history_entry_sets(event_route, context_route, move |route| {
+        load_file_history_entry_sets(&event_route, &context_route, move |route| {
             let commit_graph = Arc::clone(&commit_graph);
             let json_reader = query_source.json_reader.clone();
             let schema_keys = plugin_schema_keys.clone();
@@ -893,6 +1230,44 @@ where
         parse_file_history_plugin_state(&event_entries),
         parse_file_history_plugin_state(&context_entries),
     ))
+}
+
+async fn load_file_history_plugin_owner_events<S>(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    event_route: &HistoryRoute,
+    lookup_ids: Option<&FileHistoryLookupIds>,
+    metadata_projection: HistoryMetadataProjection,
+) -> Result<Vec<FileHistoryPluginOwnerRecord>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let mut owner_route = file_history_plugin_route(event_route, lookup_ids);
+    owner_route.entity_pks = vec![EntityPk::single(PLUGIN_OWNER_KEY).as_json_array_text()?];
+    let entries = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+        },
+        commit_graph,
+        query_source.json_reader,
+        &owner_route,
+        vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+        metadata_projection,
+    )
+    .await?;
+    parse_file_history_plugin_owners(&entries)
+}
+
+fn file_history_plugin_route(
+    route: &HistoryRoute,
+    lookup_ids: Option<&FileHistoryLookupIds>,
+) -> HistoryRoute {
+    let mut route = route.clone();
+    if let Some(lookup_ids) = lookup_ids {
+        route.file_ids = lookup_ids.0.iter().cloned().collect();
+    }
+    route
 }
 
 async fn load_file_history_entry_sets<Load, LoadFuture>(
@@ -949,7 +1324,6 @@ fn file_history_events(
         candidates.push(file_history_event_from_entry(
             descriptor.id.clone(),
             &descriptor.entry,
-            1,
         ));
     }
     for directory in event_directories {
@@ -960,7 +1334,6 @@ fn file_history_events(
                 candidates.push(file_history_event_from_entry(
                     file_id.clone(),
                     &directory.entry,
-                    2,
                 ));
             }
         }
@@ -972,209 +1345,286 @@ fn file_history_events(
             candidates.push(file_history_event_from_entry(
                 blob.file_id.clone(),
                 &blob.entry,
-                3,
             ));
         }
     }
-    sorted_deduped_file_history_events(candidates)
+    sorted_grouped_file_history_events(candidates)
 }
 
-fn sorted_deduped_file_history_events<I>(events: I) -> Vec<FileHistoryEvent>
+fn sorted_grouped_file_history_events<I>(events: I) -> Vec<FileHistoryEvent>
 where
     I: IntoIterator<Item = FileHistoryEvent>,
 {
-    let mut candidates = events.into_iter().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
+    let mut grouped = BTreeMap::<(String, String, String), FileHistoryEvent>::new();
+    for mut event in events {
+        let key = (
+            event.file_id.clone(),
+            event.start_commit_id.clone(),
+            event.observed_commit_id.clone(),
+        );
+        match grouped.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(event);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let grouped_event = entry.get_mut();
+                debug_assert_eq!(grouped_event.depth, event.depth);
+                // When commit metadata is not projected, history loading uses
+                // each source change's timestamp as an intentionally unused
+                // fallback. Those timestamps may differ within one commit.
+                grouped_event
+                    .source_changes
+                    .append(&mut event.source_changes);
+            }
+        }
+    }
+    let mut events = grouped.into_values().collect::<Vec<_>>();
+    for event in &mut events {
+        event
+            .source_changes
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        event
+            .source_changes
+            .dedup_by(|left, right| left.id == right.id);
+    }
+    events.sort_by(|left, right| {
         left.file_id
             .cmp(&right.file_id)
             .then(left.start_commit_id.cmp(&right.start_commit_id))
             .then(left.depth.cmp(&right.depth))
-            .then(left.priority.cmp(&right.priority))
-            .then(left.change.id.cmp(&right.change.id))
+            .then(left.observed_commit_id.cmp(&right.observed_commit_id))
     });
-    candidates.dedup_by(|left, right| {
-        left.file_id == right.file_id
-            && left.start_commit_id == right.start_commit_id
-            && left.depth == right.depth
-    });
-    candidates
+    events
 }
 
-async fn discover_file_history_plugin_schema_keys(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugin_metadata_cache: &mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
-    filesystem_context: &FileHistoryFilesystemContext,
-    events: &[FileHistoryEvent],
-    public_predicate: &FileHistoryPublicPredicate,
-) -> Result<Vec<String>, LixError> {
-    let mut depths = BTreeSet::<(String, u32)>::new();
-    for event in events {
-        depths.insert((event.start_commit_id.clone(), event.depth));
+async fn discover_file_history_plugins<S>(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    event_route: &HistoryRoute,
+    context_route: &HistoryRoute,
+    metadata_projection: HistoryMetadataProjection,
+) -> Result<FileHistoryPluginDiscovery, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    // The durable registry snapshot is already the complete plugin set at its
+    // observed commit. Read that exact root identity for every reachable commit
+    // instead of inventing a filesystem state from `(start, depth)`, which
+    // conflates equal-depth siblings in a DAG.
+    let mut observed_commit_ids = BTreeSet::new();
+    let mut parent_commit_ids_by_commit = BTreeMap::new();
+    for start_commit_id in &context_route.start_commit_ids {
+        let start_commit_id = CommitId::parse_lix(start_commit_id, "history start_commit_id")?;
+        let reachable = commit_graph
+            .lock()
+            .await
+            .reachable_commits(&start_commit_id)
+            .await?;
+        for reachable in reachable {
+            let observed_commit_id = reachable.commit.commit_id.to_string();
+            parent_commit_ids_by_commit.insert(
+                observed_commit_id.clone(),
+                reachable
+                    .commit
+                    .parent_commit_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            );
+            observed_commit_ids.insert(observed_commit_id);
+        }
     }
-    collect_record_depths(&filesystem_context.descriptors, &mut depths);
-    collect_record_depths(&filesystem_context.directories, &mut depths);
-    collect_record_depths(&filesystem_context.blobs, &mut depths);
-
+    let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
     let mut schema_keys = BTreeSet::new();
-    for (start_commit_id, depth) in depths {
-        let paths = file_identity_paths_at_history_depth(
-            &filesystem_context.descriptors,
-            &filesystem_context.directories,
-            &start_commit_id,
-            depth,
-        )
-        .into_iter()
-        .filter_map(|(id, path)| public_predicate.matches(&id, Some(&path)).then_some(path))
-        .collect::<Vec<_>>();
-        if paths.is_empty() {
-            continue;
-        }
-        let plugins = installed_plugins_at_history_depth(
-            blob_reader,
-            installed_plugin_metadata_cache,
-            &filesystem_context.descriptors,
-            &filesystem_context.directories,
-            &filesystem_context.blobs,
-            &start_commit_id,
-            depth,
-        )
-        .await?;
-        for plugin in plugins {
-            if paths.iter().any(|path| {
-                select_plugin_metadata_for_path(plugins, path)
-                    .is_some_and(|candidate| candidate.key == plugin.key)
-            }) {
-                schema_keys.extend(plugin.schema_keys.iter().cloned());
-            }
-        }
+    let mut registries_by_commit = BTreeMap::new();
+    for observed_commit_id in observed_commit_ids {
+        let registry =
+            load_plugin_registry_at_observed_commit(&mut reader, &observed_commit_id).await?;
+        schema_keys.extend(
+            registry
+                .plugins()
+                .iter()
+                .flat_map(|plugin| plugin.schema_keys().iter().cloned()),
+        );
+        registries_by_commit.insert(observed_commit_id, registry);
     }
 
-    Ok(schema_keys.into_iter().collect())
+    let mut registry_route = event_route.clone();
+    registry_route.entity_pks = vec![EntityPk::single(PLUGIN_REGISTRY_KEY).as_json_array_text()?];
+    let registry_events = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+        },
+        commit_graph,
+        query_source.json_reader,
+        &registry_route,
+        vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+        metadata_projection,
+    )
+    .await?;
+
+    Ok(FileHistoryPluginDiscovery {
+        schema_keys: schema_keys.into_iter().collect(),
+        registries_by_commit,
+        parent_commit_ids_by_commit,
+        registry_events,
+    })
 }
 
-fn file_identity_paths_at_history_depth(
-    descriptors: &[FileHistoryDescriptorRecord],
-    directories: &[FileHistoryDirectoryRecord],
-    start_commit_id: &str,
-    depth: u32,
-) -> Vec<(String, String)> {
-    let file_ids = descriptors
+fn file_history_plugin_events(
+    event_plugin_state: &[FileHistoryPluginStateRecord],
+    event_plugin_owners: &[FileHistoryPluginOwnerRecord],
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
+    parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
+) -> Vec<FileHistoryEvent> {
+    let owner_changes = event_plugin_owners
         .iter()
-        .filter(|record| record.entry.start_commit_id == start_commit_id)
-        .map(|record| record.id.clone())
+        .map(|record| {
+            (
+                record.entry.observed_commit_id.as_str(),
+                record.file_id.as_str(),
+            )
+        })
         .collect::<BTreeSet<_>>();
-    file_ids
-        .into_iter()
-        .filter_map(|file_id| {
-            let descriptor = nearest_history_record(
-                descriptors.iter().filter(|record| {
-                    record.id == file_id && record.entry.start_commit_id == start_commit_id
-                }),
-                depth,
-            )?;
-            let path = resolve_file_history_path(descriptor, directories, depth)?;
-            Some((file_id, path))
+
+    event_plugin_state
+        .iter()
+        .filter(|plugin_state| {
+            let observed_commit_id = plugin_state.entry.observed_commit_id.as_str();
+            let schema_key = plugin_state.entry.change.schema_key.as_str();
+            let live_owner_matches = observed_states
+                .get(observed_commit_id)
+                .and_then(|state| {
+                    live_file_history_plugin_owner(state, &plugin_state.file_id)
+                        .map(|owner| (state, owner))
+                })
+                .is_some_and(|(state, owner)| {
+                    file_history_owner_schema_keys(state, owner)
+                        .iter()
+                        .any(|owner_schema_key| owner_schema_key == schema_key)
+                });
+            if live_owner_matches {
+                return true;
+            }
+
+            // A non-owner live row cannot change the public file projection.
+            // A tombstone remains relevant only when this commit also changes
+            // the durable owner and a direct parent proves that the schema was
+            // part of the prior owner's rendering contract. This covers owner
+            // deletion, A -> B replacement, and same-key contract updates.
+            if plugin_state.entry.change.snapshot_content.is_some()
+                || !owner_changes.contains(&(observed_commit_id, plugin_state.file_id.as_str()))
+            {
+                return false;
+            }
+            parent_commit_ids_by_commit
+                .get(observed_commit_id)
+                .into_iter()
+                .flatten()
+                .any(|parent_commit_id| {
+                    observed_states
+                        .get(parent_commit_id)
+                        .and_then(|state| {
+                            live_file_history_plugin_owner(state, &plugin_state.file_id)
+                                .map(|owner| (state, owner))
+                        })
+                        .is_some_and(|(_state, owner)| {
+                            owner
+                                .schema_keys()
+                                .iter()
+                                .any(|owner_schema_key| owner_schema_key == schema_key)
+                        })
+                })
+        })
+        .map(|plugin_state| {
+            file_history_event_from_entry(plugin_state.file_id.clone(), &plugin_state.entry)
         })
         .collect()
 }
 
-fn collect_record_depths<T>(records: &[T], depths: &mut BTreeSet<(String, u32)>)
-where
-    T: FileHistoryRecord,
-{
-    depths.extend(
-        records
-            .iter()
-            .map(|record| (record.entry().start_commit_id.clone(), record.entry().depth)),
-    );
+fn live_file_history_plugin_owner<'a>(
+    state: &'a FileHistoryObservedState,
+    file_id: &str,
+) -> Option<&'a PluginFileOwner> {
+    state
+        .plugin_owners
+        .iter()
+        .find(|record| record.file_id == file_id)
+        .and_then(|record| record.owner.as_ref())
 }
 
-async fn cache_installed_plugins_for_plugin_state_depths(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugin_metadata_cache: &mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
-    filesystem_context: &FileHistoryFilesystemContext,
-    event_plugin_state: &[FileHistoryPluginStateRecord],
-) -> Result<(), LixError> {
-    let mut depths = BTreeSet::<(String, u32)>::new();
-    for record in event_plugin_state {
-        depths.insert((record.entry.start_commit_id.clone(), record.entry.depth));
-    }
-    for (start_commit_id, depth) in depths {
-        installed_plugins_at_history_depth(
-            blob_reader,
-            installed_plugin_metadata_cache,
-            &filesystem_context.descriptors,
-            &filesystem_context.directories,
-            &filesystem_context.blobs,
-            &start_commit_id,
-            depth,
-        )
-        .await?;
-    }
-    Ok(())
+fn file_history_owner_schema_keys<'a>(
+    state: &'a FileHistoryObservedState,
+    owner: &'a PluginFileOwner,
+) -> &'a [String] {
+    state
+        .plugin_registry
+        .get(owner.plugin_key())
+        .map(crate::plugin::PluginRegistryEntry::schema_keys)
+        .unwrap_or_else(|| owner.schema_keys())
 }
 
-fn file_history_plugin_events(
-    installed_plugin_metadata_cache: &BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
-    event_plugin_state: &[FileHistoryPluginStateRecord],
-    descriptors: &[FileHistoryDescriptorRecord],
-    directories: &[FileHistoryDirectoryRecord],
-) -> Vec<FileHistoryEvent> {
+fn file_history_plugin_registry_events(
+    registry_events: &[HistoryEntry],
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
+    registries_by_commit: &BTreeMap<String, PluginRegistry>,
+    parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<FileHistoryEvent>, LixError> {
     let mut events = Vec::new();
-    for plugin_state in event_plugin_state {
-        let event =
-            file_history_event_from_entry(plugin_state.file_id.clone(), &plugin_state.entry, 4);
-        let Some(descriptor) = nearest_file_descriptor(descriptors, &event) else {
-            continue;
-        };
-        let Some(path) = resolve_file_history_path(descriptor, directories, event.depth) else {
-            continue;
-        };
-        let plugins = installed_plugin_metadata_cache
-            .get(&(event.start_commit_id.clone(), event.depth))
+    for registry_event in registry_events {
+        let observed_commit_id = &registry_event.observed_commit_id;
+        let state = observed_states.get(observed_commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("lix_file_history did not load observed commit '{observed_commit_id}'"),
+            )
+        })?;
+        let registry = registries_by_commit.get(observed_commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "lix_file_history did not load plugin registry at observed commit '{observed_commit_id}'"
+                ),
+            )
+        })?;
+        let parent_commit_ids = parent_commit_ids_by_commit
+            .get(observed_commit_id)
             .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let Some(plugin) = select_plugin_metadata_for_path(plugins, &path) else {
-            continue;
-        };
-        if plugin
-            .schema_keys
+            .unwrap_or_default();
+        for owner_record in state
+            .plugin_owners
             .iter()
-            .any(|schema_key| schema_key == &plugin_state.entry.change.schema_key)
+            .filter(|record| record.owner.is_some())
         {
-            events.push(event);
+            let owner = owner_record
+                .owner
+                .as_ref()
+                .expect("filtered plugin owner should exist");
+            let current_entry = registry.get(owner.plugin_key());
+            let owner_contract_changed = parent_commit_ids.iter().any(|parent_commit_id| {
+                registries_by_commit
+                    .get(parent_commit_id)
+                    .and_then(|parent| parent.get(owner.plugin_key()))
+                    != current_entry
+            });
+            if owner_contract_changed {
+                events.push(file_history_event_from_entry(
+                    owner_record.file_id.clone(),
+                    registry_event,
+                ));
+            }
         }
     }
-    events
+    Ok(events)
 }
 
-fn retain_matching_plugin_events(
-    plugin_state: &mut Vec<FileHistoryPluginStateRecord>,
-    descriptors: &[FileHistoryDescriptorRecord],
-    directories: &[FileHistoryDirectoryRecord],
-    public_predicate: &FileHistoryPublicPredicate,
-) {
-    plugin_state.retain(|record| {
-        let event = file_history_event_from_entry(record.file_id.clone(), &record.entry, 4);
-        let Some(descriptor) = nearest_file_descriptor(descriptors, &event) else {
-            return false;
-        };
-        let path = resolve_file_history_path(descriptor, directories, event.depth);
-        public_predicate.matches(&descriptor.id, path.as_deref())
-    });
-}
-
-fn file_history_event_from_entry(
-    file_id: String,
-    entry: &HistoryEntry,
-    priority: u8,
-) -> FileHistoryEvent {
+fn file_history_event_from_entry(file_id: String, entry: &HistoryEntry) -> FileHistoryEvent {
     FileHistoryEvent {
         file_id,
         start_commit_id: entry.start_commit_id.clone(),
         depth: entry.depth,
-        priority,
-        change: entry.change.clone(),
+        source_changes: vec![entry.change.clone()],
         observed_commit_id: entry.observed_commit_id.clone(),
         commit_created_at: entry.commit_created_at.clone(),
     }
@@ -1294,44 +1744,86 @@ fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryP
         .collect()
 }
 
-fn nearest_file_descriptor<'a>(
-    descriptors: &'a [FileHistoryDescriptorRecord],
-    event: &FileHistoryEvent,
-) -> Option<&'a FileHistoryDescriptorRecord> {
-    descriptors
+fn parse_file_history_plugin_owners(
+    entries: &[HistoryEntry],
+) -> Result<Vec<FileHistoryPluginOwnerRecord>, LixError> {
+    entries
         .iter()
-        .filter(|descriptor| {
-            let exact_descriptor_event =
-                history_descriptor_event_matches(&descriptor.entry, event.depth, &event.change.id);
-            (exact_descriptor_event || descriptor.name.is_some())
-                && descriptor.id == event.file_id
-                && descriptor.entry.start_commit_id == event.start_commit_id
-                && descriptor.entry.depth >= event.depth
+        .filter(|entry| {
+            entry.change.schema_key == KEY_VALUE_SCHEMA_KEY
+                && entry.change.entity_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
-        .min_by(|left, right| {
-            left.entry
-                .depth
-                .cmp(&right.entry.depth)
-                .then(left.entry.change.id.cmp(&right.entry.change.id))
+        .map(|entry| {
+            let file_id = entry.change.file_id.clone().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "lix_file_history plugin owner row is missing file_id",
+                )
+            })?;
+            let owner = entry
+                .change
+                .snapshot_content
+                .as_deref()
+                .map(|snapshot| {
+                    serde_json::from_str::<serde_json::Value>(snapshot)
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "lix_file_history plugin owner snapshot is invalid JSON for file '{file_id}': {error}"
+                                ),
+                            )
+                        })
+                        .and_then(|snapshot| PluginFileOwner::from_snapshot(&file_id, &snapshot))
+                })
+                .transpose()?;
+            Ok(FileHistoryPluginOwnerRecord {
+                file_id,
+                owner,
+                entry: entry.clone(),
+            })
         })
+        .collect()
 }
 
-fn nearest_blob_ref<'a>(
-    blobs: &'a [FileHistoryBlobRecord],
+fn file_history_event_affects_observed_file(
     event: &FileHistoryEvent,
-) -> Option<&'a FileHistoryBlobRecord> {
-    blobs
+    descriptor: &FileHistoryDescriptorRecord,
+) -> bool {
+    event
+        .source_changes
         .iter()
-        .filter(|blob| {
-            blob.file_id == event.file_id
-                && blob.entry.start_commit_id == event.start_commit_id
-                && blob.entry.depth >= event.depth
-        })
-        .min_by(|left, right| {
-            left.entry
-                .depth
-                .cmp(&right.entry.depth)
-                .then(left.entry.change.id.cmp(&right.entry.change.id))
+        .any(|change| match change.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
+                change
+                    .file_id
+                    .as_deref()
+                    .is_some_and(|file_id| file_id == descriptor.id)
+                    || change
+                        .entity_pk
+                        .as_single_string_owned()
+                        .is_ok_and(|entity_id| entity_id == descriptor.id)
+            }
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                descriptor
+                    .directory_id
+                    .as_deref()
+                    .is_some_and(|directory_id| {
+                        change
+                            .entity_pk
+                            .as_single_string_owned()
+                            .is_ok_and(|entity_id| entity_id == directory_id)
+                    })
+            }
+            KEY_VALUE_SCHEMA_KEY
+                if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
+            {
+                event.file_id == descriptor.id
+            }
+            _ => change
+                .file_id
+                .as_deref()
+                .is_some_and(|file_id| file_id == descriptor.id),
         })
 }
 
@@ -1358,129 +1850,89 @@ fn resolve_file_history_path(
 async fn render_plugin_file_history_data(
     plugin_host: &PluginRuntimeHost,
     blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &mut BTreeMap<(String, u32, String), InstalledPlugin>,
-    installed_plugin_metadata_cache: &BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
-    plugin_state: &[FileHistoryPluginStateRecord],
+    installed_plugins_cache: &mut BTreeMap<(String, String), InstalledPlugin>,
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
     descriptor: &FileHistoryDescriptorRecord,
     event: &FileHistoryEvent,
     path: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let plugins = installed_plugin_metadata_cache
-        .get(&(event.start_commit_id.clone(), event.depth))
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let Some(plugin_metadata) = select_plugin_metadata_for_path(plugins, path) else {
+    let Some(state) = observed_states.get(&event.observed_commit_id) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "lix_file_history did not load observed commit '{}'",
+                event.observed_commit_id
+            ),
+        ));
+    };
+    let Some(owner) = live_file_history_plugin_owner(state, &descriptor.id) else {
         return Ok(None);
     };
-    let plugin = installed_plugin_at_history_depth(
+    let Some(plugin_entry) = state.plugin_registry.get(owner.plugin_key()) else {
+        return Err(plugin_history_unavailable_error(
+            descriptor, event, path, owner,
+        ));
+    };
+    let catalog = plugin_host.compiled_plugin_catalog(&state.plugin_registry)?;
+    if !catalog.matches_plugin(owner.plugin_key(), path) {
+        return Ok(None);
+    }
+    let plugin_metadata = plugin_entry.to_installed_plugin_metadata();
+    let plugin = installed_plugin_at_observed_commit(
         blob_reader,
         installed_plugins_cache,
-        plugin_metadata,
-        &event.start_commit_id,
-        event.depth,
+        &plugin_metadata,
+        &event.observed_commit_id,
     )
     .await?;
-    let rows = plugin_state_live_rows_at_depth(plugin_state, plugin, descriptor, event);
+    let rows = plugin_state_live_rows_at_observed_commit(&state.plugin_state, plugin, descriptor);
     let active_state = retain_plugin_state_rows(plugin, rows);
-    render_materialized_plugin_file(plugin_host, plugin, &active_state).await
+    Ok(Some(
+        render_plugin_state(plugin_host, plugin, &active_state).await?,
+    ))
 }
 
-fn select_plugin_metadata_for_path<'a>(
-    plugins: &'a [InstalledPluginMetadata],
+fn plugin_history_unavailable_error(
+    descriptor: &FileHistoryDescriptorRecord,
+    event: &FileHistoryEvent,
     path: &str,
-) -> Option<&'a InstalledPluginMetadata> {
-    select_best_glob_match(
-        path,
-        None::<PluginContentType>,
-        plugins,
-        |plugin| plugin.path_glob.as_str(),
-        |plugin| plugin.content_type,
+    owner: &PluginFileOwner,
+) -> LixError {
+    LixError::new(
+        LixError::CODE_PLUGIN_UNAVAILABLE,
+        format!(
+            "file '{path}' requires unavailable plugin '{}'",
+            owner.plugin_key()
+        ),
     )
+    .with_hint(format!(
+        "Add a valid .lixplugin archive for '{}' to /.lix/plugins/ to render the file again.",
+        owner.plugin_key()
+    ))
+    .with_details(serde_json::json!({
+        "file_id": descriptor.id,
+        "path": path,
+        "plugin_key": owner.plugin_key(),
+        "observed_commit_id": event.observed_commit_id,
+    }))
 }
 
-async fn installed_plugins_at_history_depth<'a>(
+async fn installed_plugin_at_observed_commit<'a>(
     blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugin_metadata_cache: &'a mut BTreeMap<(String, u32), Vec<InstalledPluginMetadata>>,
-    descriptors: &[FileHistoryDescriptorRecord],
-    directories: &[FileHistoryDirectoryRecord],
-    blobs: &[FileHistoryBlobRecord],
-    start_commit_id: &str,
-    depth: u32,
-) -> Result<&'a [InstalledPluginMetadata], LixError> {
-    let key = (start_commit_id.to_string(), depth);
-    if !installed_plugin_metadata_cache.contains_key(&key) {
-        let rows = filesystem_live_rows_at_history_depth(
-            descriptors,
-            directories,
-            blobs,
-            start_commit_id,
-            depth,
-        );
-        let filesystem = FilesystemIndex::from_live_rows(rows)?;
-        let plugins =
-            load_installed_plugin_metadata_from_filesystem(&filesystem, blob_reader.as_ref())
-                .await?;
-        installed_plugin_metadata_cache.insert(key.clone(), plugins);
-    }
-    Ok(installed_plugin_metadata_cache
-        .get(&key)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]))
-}
-
-async fn load_installed_plugin_metadata_from_filesystem(
-    filesystem: &FilesystemIndex,
-    blob_reader: &dyn BlobDataReader,
-) -> Result<Vec<InstalledPluginMetadata>, LixError> {
-    let mut plugins = Vec::new();
-    for (path, file) in filesystem.file_entries() {
-        let Some(plugin_key) = plugin_key_from_archive_path(path) else {
-            continue;
-        };
-        let Some(blob_hash) = file.blob_hash.as_deref() else {
-            continue;
-        };
-        let Ok(hash) = BlobHash::from_hex(blob_hash) else {
-            continue;
-        };
-        let mut batch = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
-        let Some(archive_bytes) = batch.pop().flatten() else {
-            continue;
-        };
-        let Ok(plugin) = load_installed_plugin_metadata_from_archive_bytes(
-            &plugin_key,
-            path,
-            blob_hash,
-            &archive_bytes,
-        ) else {
-            continue;
-        };
-        plugins.push(plugin);
-    }
-    Ok(plugins)
-}
-
-async fn installed_plugin_at_history_depth<'a>(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &'a mut BTreeMap<(String, u32, String), InstalledPlugin>,
+    installed_plugins_cache: &'a mut BTreeMap<(String, String), InstalledPlugin>,
     plugin_metadata: &InstalledPluginMetadata,
-    start_commit_id: &str,
-    depth: u32,
+    observed_commit_id: &str,
 ) -> Result<&'a InstalledPlugin, LixError> {
-    let cache_key = (
-        start_commit_id.to_string(),
-        depth,
-        plugin_metadata.key.clone(),
-    );
+    let cache_key = (observed_commit_id.to_string(), plugin_metadata.key.clone());
     if !installed_plugins_cache.contains_key(&cache_key) {
         let Some(plugin) =
-            load_installed_plugin_at_history_depth(blob_reader, plugin_metadata).await?
+            load_installed_plugin_for_observed_commit(blob_reader, plugin_metadata).await?
         else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "installed plugin archive '{}' is unavailable at history depth {}",
-                    plugin_metadata.key, depth
+                    "installed plugin archive '{}' is unavailable at observed commit '{}'",
+                    plugin_metadata.key, observed_commit_id
                 ),
             ));
         };
@@ -1491,7 +1943,7 @@ async fn installed_plugin_at_history_depth<'a>(
         .expect("plugin should be cached after load"))
 }
 
-async fn load_installed_plugin_at_history_depth(
+async fn load_installed_plugin_for_observed_commit(
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_metadata: &InstalledPluginMetadata,
 ) -> Result<Option<InstalledPlugin>, LixError> {
@@ -1507,155 +1959,20 @@ async fn load_installed_plugin_at_history_depth(
     )?))
 }
 
-fn filesystem_live_rows_at_history_depth(
-    descriptors: &[FileHistoryDescriptorRecord],
-    directories: &[FileHistoryDirectoryRecord],
-    blobs: &[FileHistoryBlobRecord],
-    start_commit_id: &str,
-    depth: u32,
-) -> Vec<MaterializedLiveStateRow> {
-    let mut rows = Vec::new();
-    let mut descriptor_ids = descriptors
-        .iter()
-        .filter(|record| record.entry.start_commit_id == start_commit_id)
-        .map(|record| record.id.clone())
-        .collect::<BTreeSet<_>>();
-    for descriptor_id in std::mem::take(&mut descriptor_ids) {
-        if let Some(record) = nearest_history_record(
-            descriptors.iter().filter(|record| {
-                record.id == descriptor_id && record.entry.start_commit_id == start_commit_id
-            }),
-            depth,
-        ) {
-            rows.push(history_entry_to_live_row(&record.entry));
-        }
-    }
-
-    let mut directory_ids = directories
-        .iter()
-        .filter(|record| record.entry.start_commit_id == start_commit_id)
-        .map(|record| record.id.clone())
-        .collect::<BTreeSet<_>>();
-    for directory_id in std::mem::take(&mut directory_ids) {
-        if let Some(record) = nearest_history_record(
-            directories.iter().filter(|record| {
-                record.id == directory_id && record.entry.start_commit_id == start_commit_id
-            }),
-            depth,
-        ) {
-            rows.push(history_entry_to_live_row(&record.entry));
-        }
-    }
-
-    let mut blob_file_ids = blobs
-        .iter()
-        .filter(|record| record.entry.start_commit_id == start_commit_id)
-        .map(|record| record.file_id.clone())
-        .collect::<BTreeSet<_>>();
-    for file_id in std::mem::take(&mut blob_file_ids) {
-        if let Some(record) = nearest_history_record(
-            blobs.iter().filter(|record| {
-                record.file_id == file_id && record.entry.start_commit_id == start_commit_id
-            }),
-            depth,
-        ) {
-            rows.push(history_entry_to_live_row(&record.entry));
-        }
-    }
-
-    rows
-}
-
-fn plugin_state_live_rows_at_depth(
+fn plugin_state_live_rows_at_observed_commit(
     plugin_state: &[FileHistoryPluginStateRecord],
     plugin: &InstalledPlugin,
     descriptor: &FileHistoryDescriptorRecord,
-    event: &FileHistoryEvent,
 ) -> Vec<MaterializedLiveStateRow> {
     let plugin_schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
-    let mut identities = plugin_state
+    plugin_state
         .iter()
         .filter(|record| {
             record.file_id == descriptor.id
-                && record.entry.start_commit_id == event.start_commit_id
                 && plugin_schema_keys.contains(&record.entry.change.schema_key)
         })
-        .map(|record| {
-            (
-                record.entry.change.schema_key.clone(),
-                record
-                    .entry
-                    .change
-                    .entity_pk
-                    .as_json_array_text()
-                    .unwrap_or_default(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-
-    let mut rows = Vec::new();
-    for (schema_key, entity_pk) in std::mem::take(&mut identities) {
-        if let Some(record) = nearest_history_record(
-            plugin_state.iter().filter(|record| {
-                record.file_id == descriptor.id
-                    && record.entry.start_commit_id == event.start_commit_id
-                    && record.entry.change.schema_key == schema_key
-                    && record
-                        .entry
-                        .change
-                        .entity_pk
-                        .as_json_array_text()
-                        .is_ok_and(|candidate| candidate == entity_pk)
-            }),
-            event.depth,
-        ) {
-            rows.push(history_entry_to_live_row(&record.entry));
-        }
-    }
-    rows
-}
-
-trait FileHistoryRecord {
-    fn entry(&self) -> &HistoryEntry;
-}
-
-impl FileHistoryRecord for FileHistoryDescriptorRecord {
-    fn entry(&self) -> &HistoryEntry {
-        &self.entry
-    }
-}
-
-impl FileHistoryRecord for FileHistoryDirectoryRecord {
-    fn entry(&self) -> &HistoryEntry {
-        &self.entry
-    }
-}
-
-impl FileHistoryRecord for FileHistoryBlobRecord {
-    fn entry(&self) -> &HistoryEntry {
-        &self.entry
-    }
-}
-
-impl FileHistoryRecord for FileHistoryPluginStateRecord {
-    fn entry(&self) -> &HistoryEntry {
-        &self.entry
-    }
-}
-
-fn nearest_history_record<'a, T, I>(records: I, depth: u32) -> Option<&'a T>
-where
-    T: FileHistoryRecord + 'a,
-    I: Iterator<Item = &'a T>,
-{
-    records
-        .filter(|record| record.entry().depth >= depth)
-        .min_by(|left, right| {
-            left.entry()
-                .depth
-                .cmp(&right.entry().depth)
-                .then(left.entry().change.id.cmp(&right.entry().change.id))
-        })
+        .map(|record| history_entry_to_live_row(&record.entry))
+        .collect()
 }
 
 fn history_entry_to_live_row(entry: &HistoryEntry) -> MaterializedLiveStateRow {
@@ -1688,32 +2005,10 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
             Col::Utf8Fallible(|row| entity_pk_json_array(&row.entity_pk).map(Some)),
         ),
         (
-            HISTORY_COL_SCHEMA_KEY,
-            Col::Utf8(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY)),
-        ),
-        (
-            HISTORY_COL_FILE_ID,
-            Col::Utf8(|row| Some(row.entity_pk.as_str())),
-        ),
-        (
-            HISTORY_COL_CHANGE_ID,
-            Col::Utf8(|row| Some(row.event.change.id.as_str())),
-        ),
-        (
-            HISTORY_COL_ORIGIN_KEY,
-            Col::Utf8(|row| row.event.change.origin_key.as_deref()),
-        ),
-        (
-            HISTORY_COL_SNAPSHOT_CONTENT,
-            Col::Utf8(|row| row.descriptor_change.snapshot_content.as_deref()),
-        ),
-        (
-            HISTORY_COL_METADATA,
-            Col::Utf8Owned(|row| {
-                row.descriptor_change
-                    .metadata
-                    .as_deref()
-                    .map(serialize_row_metadata)
+            HISTORY_COL_SOURCE_CHANGES,
+            Col::Utf8Fallible(|row| {
+                serialize_history_source_changes(&row.event.source_changes, "lix_file_history")
+                    .map(Some)
             }),
         ),
         (
@@ -1759,12 +2054,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, true),
         Field::new("data", DataType::LargeBinary, true),
         json_field(HISTORY_COL_ENTITY_PK, false),
-        Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
-        Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
-        json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
-        Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
-        Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
-        json_field(HISTORY_COL_METADATA, true),
+        json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
         Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
@@ -1791,14 +2081,20 @@ mod tests {
     use crate::LixError;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
     use crate::entity_pk::EntityPk;
+    use crate::plugin::{
+        PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
+        plugin_storage_archive_file_id, plugin_storage_archive_path,
+    };
     use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::history_route::HistoryEntry;
 
     use super::{
         FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryFilesystemContext,
-        FileHistoryLookupIds, FileHistoryPublicPredicate, HistoryRoute, PreparedFileHistoryRow,
-        file_history_descriptor_blob_route, file_history_event_from_entry,
-        load_file_history_blob_bytes, load_file_history_entry_sets, prepare_file_history_rows,
+        FileHistoryLookupIds, FileHistoryObservedState, FileHistoryPluginOwnerRecord,
+        FileHistoryPluginStateRecord, FileHistoryPublicPredicate, HistoryRoute, PluginRegistry,
+        PreparedFileHistoryRow, file_history_descriptor_blob_route, file_history_event_from_entry,
+        file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
+        prepare_file_history_rows, sorted_grouped_file_history_events,
     };
 
     fn history_entry(file_id: &str, depth: u32, snapshot_content: Option<String>) -> HistoryEntry {
@@ -1855,11 +2151,108 @@ mod tests {
         FileHistoryFilesystemContext {
             event_descriptors: descriptors.clone(),
             event_directories: Vec::new(),
-            event_blobs: blobs.clone(),
+            event_blobs: blobs,
             descriptors,
-            directories: Vec::new(),
-            blobs,
         }
+    }
+
+    fn observed_states(
+        context: &FileHistoryFilesystemContext,
+    ) -> BTreeMap<String, FileHistoryObservedState> {
+        BTreeMap::from([(
+            "commit-0".to_string(),
+            FileHistoryObservedState {
+                descriptors: context.descriptors.clone(),
+                directories: context.event_directories.clone(),
+                blobs: context.event_blobs.clone(),
+                plugin_state: Vec::new(),
+                plugin_owners: Vec::new(),
+                plugin_registry: PluginRegistry::empty(),
+            },
+        )])
+    }
+
+    fn plugin_owner_record(
+        file_id: &str,
+        owner: PluginFileOwner,
+        observed_commit_id: &str,
+    ) -> FileHistoryPluginOwnerRecord {
+        let snapshot_content = owner
+            .to_snapshot()
+            .expect("test owner should serialize")
+            .to_string();
+        let mut entry = history_entry(file_id, 0, Some(snapshot_content));
+        entry.observed_commit_id = observed_commit_id.to_string();
+        entry.change.id = format!("owner-{file_id}-{observed_commit_id}");
+        entry.change.entity_pk = EntityPk::single(super::PLUGIN_OWNER_KEY);
+        entry.change.schema_key = super::KEY_VALUE_SCHEMA_KEY.to_string();
+        FileHistoryPluginOwnerRecord {
+            file_id: file_id.to_string(),
+            owner: Some(owner),
+            entry,
+        }
+    }
+
+    fn plugin_state_tombstone(
+        file_id: &str,
+        schema_key: &str,
+        observed_commit_id: &str,
+    ) -> FileHistoryPluginStateRecord {
+        let mut entry = history_entry(file_id, 0, None);
+        entry.observed_commit_id = observed_commit_id.to_string();
+        entry.change.id = format!("plugin-state-{schema_key}-{observed_commit_id}");
+        entry.change.entity_pk = EntityPk::single("plugin-state");
+        entry.change.schema_key = schema_key.to_string();
+        FileHistoryPluginStateRecord {
+            file_id: file_id.to_string(),
+            entry,
+        }
+    }
+
+    fn plugin_observed_state(
+        owner_record: FileHistoryPluginOwnerRecord,
+    ) -> FileHistoryObservedState {
+        FileHistoryObservedState {
+            descriptors: Vec::new(),
+            directories: Vec::new(),
+            blobs: Vec::new(),
+            plugin_state: Vec::new(),
+            plugin_owners: vec![owner_record],
+            plugin_registry: PluginRegistry::empty(),
+        }
+    }
+
+    fn plugin_registry(plugin_key: &str, schema_keys: &[&str]) -> PluginRegistry {
+        let wasm = b"test wasm";
+        let manifest_json = serde_json::json!({
+            "api_version": "0.1.0",
+            "entry": "plugin.wasm",
+            "key": plugin_key,
+            "match": { "path_glob": "*.plugin-test" },
+            "runtime": "wasm-component-v1",
+            "schemas": ["schema/plugin.json"],
+        })
+        .to_string();
+        let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: plugin_key.to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            path_glob: "*.plugin-test".to_string(),
+            content_type: None,
+            entry: "plugin.wasm".to_string(),
+            schema_keys: schema_keys
+                .iter()
+                .map(|schema_key| (*schema_key).to_string())
+                .collect(),
+            manifest_json,
+            archive_file_id: plugin_storage_archive_file_id(plugin_key),
+            archive_path: plugin_storage_archive_path(plugin_key),
+            archive_blob_hash: BlobHash::from_content(format!("archive-{plugin_key}").as_bytes())
+                .to_hex(),
+            wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
+        })
+        .expect("test plugin registry entry should be valid");
+        PluginRegistry::new(vec![entry]).expect("test plugin registry should be valid")
     }
 
     fn eq_filter(column_name: &str, value: &str) -> Expr {
@@ -1921,7 +2314,7 @@ mod tests {
         let events = [&live_a, &live_b, &tombstone]
             .into_iter()
             .map(|descriptor| {
-                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry, 1)
+                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry)
             })
             .collect::<Vec<_>>();
         let context = filesystem_context(
@@ -1934,7 +2327,7 @@ mod tests {
 
         let id_predicate = FileHistoryPublicPredicate::from_filters(&[eq_filter("id", "file-a")]);
         let by_id = prepare_file_history_rows(
-            &context,
+            &observed_states(&context),
             events.clone(),
             &HistoryRoute::default(),
             &id_predicate,
@@ -1946,7 +2339,7 @@ mod tests {
         let path_predicate =
             FileHistoryPublicPredicate::from_filters(&[eq_filter("path", "/b.md")]);
         let by_path = prepare_file_history_rows(
-            &context,
+            &observed_states(&context),
             events.clone(),
             &HistoryRoute::default(),
             &path_predicate,
@@ -1958,7 +2351,7 @@ mod tests {
         let tombstone_predicate =
             FileHistoryPublicPredicate::from_filters(&[eq_filter("id", "file-deleted")]);
         let deleted = prepare_file_history_rows(
-            &context,
+            &observed_states(&context),
             events,
             &HistoryRoute::default(),
             &tombstone_predicate,
@@ -1987,6 +2380,158 @@ mod tests {
                 .matches("file-a", Some("/a.md")),
             "a guaranteed public conjunct remains safe for early pruning"
         );
+    }
+
+    #[test]
+    fn equal_depth_sibling_revisions_are_not_deduplicated() {
+        let mut left = history_entry("file-a", 1, None);
+        left.observed_commit_id = "commit-left".to_string();
+        left.change.id = "change-left".to_string();
+        let mut right = history_entry("file-a", 1, None);
+        right.observed_commit_id = "commit-right".to_string();
+        right.change.id = "change-right".to_string();
+
+        let events = sorted_grouped_file_history_events([
+            file_history_event_from_entry("file-a".to_string(), &left),
+            file_history_event_from_entry("file-a".to_string(), &right),
+        ]);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.observed_commit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-left", "commit-right"]
+        );
+    }
+
+    #[test]
+    fn same_commit_sources_form_one_logical_revision() {
+        let descriptor = history_entry("file-a", 0, None);
+        let mut blob = descriptor.clone();
+        blob.change.id = "change-file-a-blob".to_string();
+        blob.change.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
+
+        let events = sorted_grouped_file_history_events([
+            file_history_event_from_entry("file-a".to_string(), &descriptor),
+            file_history_event_from_entry("file-a".to_string(), &blob),
+        ]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_changes.len(), 2);
+        assert_eq!(
+            events[0]
+                .source_changes
+                .iter()
+                .map(|change| change.schema_key.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                super::BLOB_REF_SCHEMA_KEY,
+                super::FILE_DESCRIPTOR_SCHEMA_KEY,
+            ])
+        );
+    }
+
+    #[test]
+    fn owner_replacement_retains_prior_owner_state_tombstones() {
+        let file_id = "plugin-file";
+        let parent_commit_id = "commit-parent";
+        let replacement_commit_id = "commit-replacement";
+        let parent_owner = plugin_owner_record(
+            file_id,
+            PluginFileOwner::new(file_id, "plugin-a", vec!["plugin_a_state".to_string()]).unwrap(),
+            parent_commit_id,
+        );
+        let replacement_owner = plugin_owner_record(
+            file_id,
+            PluginFileOwner::new(file_id, "plugin-b", vec!["plugin_b_state".to_string()]).unwrap(),
+            replacement_commit_id,
+        );
+        let old_state_tombstone =
+            plugin_state_tombstone(file_id, "plugin_a_state", replacement_commit_id);
+        let observed_states = BTreeMap::from([
+            (
+                parent_commit_id.to_string(),
+                plugin_observed_state(parent_owner),
+            ),
+            (
+                replacement_commit_id.to_string(),
+                plugin_observed_state(replacement_owner.clone()),
+            ),
+        ]);
+        let parents = BTreeMap::from([(
+            replacement_commit_id.to_string(),
+            vec![parent_commit_id.to_string()],
+        )]);
+
+        assert!(
+            file_history_plugin_events(
+                std::slice::from_ref(&old_state_tombstone),
+                &[],
+                &observed_states,
+                &parents,
+            )
+            .is_empty(),
+            "a prior-owner tombstone needs a durable owner change in the same commit"
+        );
+        let events = file_history_plugin_events(
+            &[old_state_tombstone],
+            &[replacement_owner],
+            &observed_states,
+            &parents,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_changes[0].schema_key, "plugin_a_state");
+    }
+
+    #[test]
+    fn owner_contract_update_retains_removed_schema_tombstones() {
+        let file_id = "plugin-file";
+        let parent_commit_id = "commit-parent";
+        let update_commit_id = "commit-contract-update";
+        let parent_owner = plugin_owner_record(
+            file_id,
+            PluginFileOwner::new(
+                file_id,
+                "plugin-a",
+                vec![
+                    "plugin_a_removed".to_string(),
+                    "plugin_a_retained".to_string(),
+                ],
+            )
+            .unwrap(),
+            parent_commit_id,
+        );
+        let updated_owner = plugin_owner_record(
+            file_id,
+            PluginFileOwner::new(file_id, "plugin-a", vec!["plugin_a_retained".to_string()])
+                .unwrap(),
+            update_commit_id,
+        );
+        let removed_schema_tombstone =
+            plugin_state_tombstone(file_id, "plugin_a_removed", update_commit_id);
+        let mut parent_state = plugin_observed_state(parent_owner);
+        parent_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_retained"]);
+        let mut updated_state = plugin_observed_state(updated_owner.clone());
+        updated_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_retained"]);
+        let observed_states = BTreeMap::from([
+            (parent_commit_id.to_string(), parent_state),
+            (update_commit_id.to_string(), updated_state),
+        ]);
+        let parents = BTreeMap::from([(
+            update_commit_id.to_string(),
+            vec![parent_commit_id.to_string()],
+        )]);
+
+        let events = file_history_plugin_events(
+            &[removed_schema_tombstone],
+            &[updated_owner],
+            &observed_states,
+            &parents,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_changes[0].schema_key, "plugin_a_removed");
     }
 
     #[test]
@@ -2058,7 +2603,7 @@ mod tests {
         let present_hash = BlobHash::from_content(b"present");
         let missing_hash = BlobHash::from_content(b"missing");
         let descriptor = descriptor("file-a", Some("a.md"), 0);
-        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry, 1);
+        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
         let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
             id: id.to_string(),
             path: Some(format!("/{id}.md")),
@@ -2097,7 +2642,7 @@ mod tests {
     #[tokio::test]
     async fn blob_hydration_rejects_malformed_batch_lengths() {
         let descriptor = descriptor("file-a", Some("a.md"), 0);
-        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry, 1);
+        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
         let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
             id: id.to_string(),
             path: Some(format!("/{id}.md")),
@@ -2137,7 +2682,7 @@ mod tests {
         let events = descriptors
             .iter()
             .map(|descriptor| {
-                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry, 1)
+                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry)
             })
             .collect::<Vec<_>>();
         let context = filesystem_context(
@@ -2148,7 +2693,7 @@ mod tests {
             ],
         );
         let rows = prepare_file_history_rows(
-            &context,
+            &observed_states(&context),
             events,
             &HistoryRoute::default(),
             &FileHistoryPublicPredicate::All,
