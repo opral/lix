@@ -437,6 +437,57 @@ test("a successful branch switch restarts observations on the pinned session", a
 	await lix.close();
 });
 
+test("a local branch switch setup failure preserves a healthy observation", async () => {
+	let failHeaders = false;
+	let observeRequests = 0;
+	let branchSwitchRequests = 0;
+	let observeSignal: AbortSignal | undefined;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			headers: () => {
+				if (failHeaders) throw new Error("headers unavailable");
+				return {};
+			},
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) return handshake();
+				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/branch/switch")) {
+					branchSwitchRequests += 1;
+					return Response.json({ branchId: "draft-id" });
+				}
+				observeRequests += 1;
+				observeSignal = request.signal;
+				return heldSseResponse(
+					sseFrame(
+						"next",
+						multiplexObservePayload("observe-1", "main-id", 0, 0),
+					),
+					request.signal,
+				);
+			},
+		},
+	});
+
+	const events = lix.observe("SELECT active_branch");
+	expect((await events.next())?.result.rows[0]?.get("value")).toBe("main-id");
+	failHeaders = true;
+	await expect(
+		lix.switchBranch({ branchId: "draft-id" }),
+	).rejects.toThrow("headers unavailable");
+	expect(branchSwitchRequests).toBe(0);
+	expect(observeSignal?.aborted).toBe(false);
+	expect(observeRequests).toBe(1);
+	expect(await lix.activeBranchId()).toBe("main-id");
+
+	failHeaders = false;
+	events.close();
+	await lix.close();
+});
+
 test("remote observe reconnects retryable failures with fresh headers", async () => {
 	vi.useFakeTimers();
 	try {
