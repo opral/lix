@@ -4,8 +4,9 @@ wit_bindgen::generate!({
 });
 
 use exports::lix::plugin_p3_candidate::api::{
-    Document, DocumentStats, EntityChange, EntitySummary, EntitySummaryStream, FileTransition,
-    Guest, GuestDocument, InputSplice, OpenResult, PluginError,
+    Document, DocumentStats, EntityChange, EntityChangeStream, EntitySummary, EntitySummaryStream,
+    FileTransition, Guest, GuestDocument, InputSplice, OpenResult, PluginError,
+    StreamedFileTransition,
 };
 use lix::plugin_p3_candidate::host::{ByteSource, SourceError};
 use std::collections::HashSet;
@@ -26,6 +27,16 @@ struct IndexedEntity {
     hash: u64,
     start: u64,
     end: u64,
+}
+
+#[derive(Debug)]
+struct PreparedChange {
+    index: usize,
+    accepted: IndexedEntity,
+    length: u32,
+    relative_start: usize,
+    relative_end: usize,
+    insert: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -650,6 +661,132 @@ impl CandidateDocument {
             revision: self.revision.wrapping_add(1),
         }
     }
+
+    fn prepare_change(
+        &self,
+        before_length: u64,
+        after_length: u64,
+        edits: Vec<InputSplice>,
+    ) -> Result<PreparedChange, PluginError> {
+        let [edit] = edits.as_slice() else {
+            return Err(PluginError::InvalidInput(
+                "candidate requires exactly one localized splice".to_owned(),
+            ));
+        };
+        if edit.delete_len == 0 {
+            return Err(PluginError::InvalidInput(
+                "candidate requires a non-empty localized splice".to_owned(),
+            ));
+        }
+        if edit.delete_len != u64::try_from(edit.insert.len()).expect("usize fits u64") {
+            return Err(PluginError::InvalidInput(
+                "candidate hot path currently requires an equal-length splice".to_owned(),
+            ));
+        }
+        if before_length != self.byte_length || after_length != self.byte_length {
+            return Err(PluginError::InvalidInput(
+                "source length does not match accepted document".to_owned(),
+            ));
+        }
+        let end = edit
+            .offset
+            .checked_add(edit.delete_len)
+            .ok_or_else(|| PluginError::LimitExceeded("splice end overflow".to_owned()))?;
+        let index = self
+            .entity_index_at(edit.offset)
+            .filter(|index| end <= self.entity(*index).end)
+            .ok_or_else(|| {
+                PluginError::InvalidInput("splice crosses an entity boundary".to_owned())
+            })?;
+        let accepted = self.entity(index).clone();
+        let length = accepted
+            .end
+            .checked_sub(accepted.start)
+            .ok_or_else(|| PluginError::Internal("entity range is inverted".to_owned()))?;
+        let length = u32::try_from(length)
+            .map_err(|_| PluginError::LimitExceeded("entity exceeds u32 reads".to_owned()))?;
+        let relative_start = usize::try_from(edit.offset - accepted.start).map_err(|_| {
+            PluginError::LimitExceeded("relative splice offset overflow".to_owned())
+        })?;
+        let delete_len = usize::try_from(edit.delete_len)
+            .map_err(|_| PluginError::LimitExceeded("splice length exceeds usize".to_owned()))?;
+        let relative_end = relative_start
+            .checked_add(delete_len)
+            .ok_or_else(|| PluginError::LimitExceeded("relative splice end overflow".to_owned()))?;
+        Ok(PreparedChange {
+            index,
+            accepted,
+            length,
+            relative_start,
+            relative_end,
+            insert: edit.insert.clone(),
+        })
+    }
+
+    fn complete_change(
+        &self,
+        prepared: PreparedChange,
+        before_row: Vec<u8>,
+        after_row: Vec<u8>,
+    ) -> Result<FileTransition, PluginError> {
+        let PreparedChange {
+            index,
+            accepted,
+            length,
+            relative_start,
+            relative_end,
+            insert,
+        } = prepared;
+        if before_row.len() != usize::try_from(length).expect("u32-sized member fits usize") {
+            return Err(PluginError::InvalidInput(
+                "accepted source returned a short property member".to_owned(),
+            ));
+        }
+        if fnv1a(&before_row) != accepted.hash {
+            return Err(PluginError::InvalidInput(
+                "accepted source and retained index disagree".to_owned(),
+            ));
+        }
+        if parse_member(&before_row)? != accepted.id {
+            return Err(PluginError::InvalidInput(
+                "accepted source property identity disagrees with retained index".to_owned(),
+            ));
+        }
+        if after_row.len() != before_row.len() {
+            return Err(PluginError::InvalidInput(
+                "successor source returned a short property member".to_owned(),
+            ));
+        }
+        if relative_end > before_row.len()
+            || before_row[..relative_start] != after_row[..relative_start]
+            || after_row[relative_start..relative_end] != *insert
+            || before_row[relative_end..] != after_row[relative_end..]
+        {
+            return Err(PluginError::InvalidInput(
+                "successor source does not match the declared localized splice".to_owned(),
+            ));
+        }
+        let after_id = parse_member(&after_row)?;
+        if after_id != accepted.id {
+            return Err(PluginError::InvalidInput(
+                "localized value edits may not change the JSON property key".to_owned(),
+            ));
+        }
+        let entity = IndexedEntity {
+            id: accepted.id,
+            hash: fnv1a(&after_row),
+            start: accepted.start,
+            end: accepted.end,
+        };
+        let successor = self.successor(index, entity, self.byte_length);
+        Ok(FileTransition {
+            document: Document::new(successor),
+            changes: vec![EntityChange {
+                entity_id: accepted.id,
+                snapshot: after_row,
+            }],
+        })
+    }
 }
 
 impl Guest for Candidate {
@@ -740,106 +877,73 @@ impl GuestDocument for CandidateDocument {
         after: ByteSource,
         edits: Vec<InputSplice>,
     ) -> Result<FileTransition, PluginError> {
-        let [edit] = edits.as_slice() else {
-            return Err(PluginError::InvalidInput(
-                "candidate requires exactly one localized splice".to_owned(),
-            ));
-        };
-        if edit.delete_len == 0 {
-            return Err(PluginError::InvalidInput(
-                "candidate requires a non-empty localized splice".to_owned(),
-            ));
-        }
-        if edit.delete_len != u64::try_from(edit.insert.len()).expect("usize fits u64") {
-            return Err(PluginError::InvalidInput(
-                "candidate hot path currently requires an equal-length splice".to_owned(),
-            ));
-        }
-        if before.len() != self.byte_length || after.len() != self.byte_length {
-            return Err(PluginError::InvalidInput(
-                "source length does not match accepted document".to_owned(),
-            ));
-        }
-        let end = edit
-            .offset
-            .checked_add(edit.delete_len)
-            .ok_or_else(|| PluginError::LimitExceeded("splice end overflow".to_owned()))?;
-        let index = self
-            .entity_index_at(edit.offset)
-            .filter(|index| end <= self.entity(*index).end)
-            .ok_or_else(|| {
-                PluginError::InvalidInput("splice crosses an entity boundary".to_owned())
-            })?;
-        let accepted = self.entity(index);
-        let length = accepted
-            .end
-            .checked_sub(accepted.start)
-            .ok_or_else(|| PluginError::Internal("entity range is inverted".to_owned()))?;
-        let length_u32 = u32::try_from(length)
-            .map_err(|_| PluginError::LimitExceeded("entity exceeds u32 reads".to_owned()))?;
+        let prepared = self.prepare_change(before.len(), after.len(), edits)?;
         let before_row = before
-            .read(accepted.start, length_u32)
+            .read(prepared.accepted.start, prepared.length)
             .map_err(map_source_error)?;
-        if before_row.len() != usize::try_from(length).expect("u32-sized member fits usize") {
-            return Err(PluginError::InvalidInput(
-                "accepted source returned a short property member".to_owned(),
-            ));
-        }
-        if fnv1a(&before_row) != accepted.hash {
-            return Err(PluginError::InvalidInput(
-                "accepted source and retained index disagree".to_owned(),
-            ));
-        }
-        if parse_member(&before_row)? != accepted.id {
-            return Err(PluginError::InvalidInput(
-                "accepted source property identity disagrees with retained index".to_owned(),
-            ));
-        }
         let after_row = after
-            .read(accepted.start, length_u32)
+            .read(prepared.accepted.start, prepared.length)
             .map_err(map_source_error)?;
-        if after_row.len() != before_row.len() {
-            return Err(PluginError::InvalidInput(
-                "successor source returned a short property member".to_owned(),
-            ));
-        }
-        let relative_start = usize::try_from(edit.offset - accepted.start).map_err(|_| {
-            PluginError::LimitExceeded("relative splice offset overflow".to_owned())
-        })?;
-        let delete_len = usize::try_from(edit.delete_len)
-            .map_err(|_| PluginError::LimitExceeded("splice length exceeds usize".to_owned()))?;
-        let relative_end = relative_start
-            .checked_add(delete_len)
-            .ok_or_else(|| PluginError::LimitExceeded("relative splice end overflow".to_owned()))?;
-        if relative_end > before_row.len()
-            || before_row[..relative_start] != after_row[..relative_start]
-            || after_row[relative_start..relative_end] != *edit.insert.as_slice()
-            || before_row[relative_end..] != after_row[relative_end..]
-        {
-            return Err(PluginError::InvalidInput(
-                "successor source does not match the declared localized splice".to_owned(),
-            ));
-        }
-        let after_id = parse_member(&after_row)?;
-        if after_id != accepted.id {
-            return Err(PluginError::InvalidInput(
-                "localized value edits may not change the JSON property key".to_owned(),
-            ));
-        }
-        let entity = IndexedEntity {
-            id: accepted.id,
-            hash: fnv1a(&after_row),
-            start: accepted.start,
-            end: accepted.end,
-        };
-        let successor = self.successor(index, entity, self.byte_length);
-        Ok(FileTransition {
-            document: Document::new(successor),
-            changes: vec![EntityChange {
-                entity_id: accepted.id,
-                snapshot: after_row,
-            }],
+        self.complete_change(prepared, before_row, after_row)
+    }
+
+    async fn file_changed_async_inline(
+        &self,
+        before: ByteSource,
+        after: ByteSource,
+        edits: Vec<InputSplice>,
+    ) -> Result<FileTransition, PluginError> {
+        self.file_changed(before, after, edits)
+    }
+
+    async fn file_changed_async_read_inline(
+        &self,
+        before: ByteSource,
+        after: ByteSource,
+        edits: Vec<InputSplice>,
+    ) -> Result<FileTransition, PluginError> {
+        let prepared = self.prepare_change(before.len(), after.len(), edits)?;
+        let before_row = before
+            .read_async(prepared.accepted.start, prepared.length)
+            .await
+            .map_err(map_source_error)?;
+        let after_row = after
+            .read_async(prepared.accepted.start, prepared.length)
+            .await
+            .map_err(map_source_error)?;
+        self.complete_change(prepared, before_row, after_row)
+    }
+
+    async fn file_changed_async_stream(
+        &self,
+        before: ByteSource,
+        after: ByteSource,
+        edits: Vec<InputSplice>,
+    ) -> Result<StreamedFileTransition, PluginError> {
+        let FileTransition { document, changes } = self.file_changed(before, after, edits)?;
+        Ok(StreamedFileTransition {
+            document,
+            changes: change_stream(changes),
         })
+    }
+}
+
+fn change_stream(changes: Vec<EntityChange>) -> EntityChangeStream {
+    let count = u64::try_from(changes.len()).expect("usize fits u64");
+    let (mut writer, reader) = wit_stream::new::<EntityChange>();
+    let (done_writer, done_reader) = wit_future::new::<Result<(), PluginError>>(cancelled_output);
+    spawn_local(async move {
+        if !writer.write_all(changes).await.is_empty() {
+            let _ = done_writer.write(Err(PluginError::Cancelled)).await;
+            return;
+        }
+        drop(writer);
+        let _ = done_writer.write(Ok(())).await;
+    });
+    EntityChangeStream {
+        count,
+        items: reader,
+        done: done_reader,
     }
 }
 

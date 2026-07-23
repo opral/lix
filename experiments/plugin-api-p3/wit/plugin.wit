@@ -23,6 +23,11 @@ interface host {
     fork: func() -> own<byte-source>;
     len: func() -> u64;
     read: func(offset: u64, length: u32) -> result<bytes, source-error>;
+    /// Benchmark-only ready-async counterpart to `read`.
+    read-async: async func(
+      offset: u64,
+      length: u32,
+    ) -> result<bytes, source-error>;
     read-stream: func(
       offset: u64,
       length: u64,
@@ -85,6 +90,17 @@ interface api {
     changes: list<entity-change>,
   }
 
+  record entity-change-stream {
+    count: u64,
+    items: stream<entity-change>,
+    done: future<result<_, plugin-error>>,
+  }
+
+  record streamed-file-transition {
+    document: own<document>,
+    changes: entity-change-stream,
+  }
+
   resource document {
     /// Constant-time immutable alias.
     fork: func() -> own<document>;
@@ -97,6 +113,27 @@ interface api {
       after: own<byte-source>,
       edits: list<input-splice>,
     ) -> result<file-transition, plugin-error>;
+
+    /// Benchmark arm: identical reads and inline output through an async ABI.
+    file-changed-async-inline: async func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<file-transition, plugin-error>;
+
+    /// Benchmark arm: async export plus ready async random-read imports.
+    file-changed-async-read-inline: async func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<file-transition, plugin-error>;
+
+    /// Benchmark arm: identical edit work with changes crossing a P3 stream.
+    file-changed-async-stream: async func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<streamed-file-transition, plugin-error>;
   }
 
   /// Control arm: the complete file crosses the Canonical ABI as one list.

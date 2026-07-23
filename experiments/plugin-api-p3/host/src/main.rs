@@ -43,6 +43,8 @@ const TARGET_BYTES: usize = 10 * 1024 * 1024;
 const MIB: usize = 1024 * 1024;
 const DEFAULT_GUEST_LINEAR_MEMORY_LIMIT_MIB: usize = 64;
 const DEFAULT_MAX_ENTITY_SUMMARIES: usize = 1_000_000;
+const DEFAULT_HOT_WARMUPS: usize = 2_400;
+const DEFAULT_HOT_SAMPLES: usize = 24_000;
 const PROPERTY_VALUE_BYTES: usize = 240;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -53,6 +55,9 @@ struct Settings {
     cold_samples: usize,
     warm_warmups: usize,
     warm_samples: usize,
+    hot_warmups: usize,
+    hot_samples: usize,
+    hot_print_raw: bool,
     guest_linear_memory_limit_bytes: usize,
     max_entity_summaries: usize,
 }
@@ -71,12 +76,27 @@ impl Settings {
             cold_samples: env_usize("LIX_P3_COLD_SAMPLES", 20)?,
             warm_warmups: env_usize("LIX_P3_WARM_WARMUPS", 10)?,
             warm_samples: env_usize("LIX_P3_WARM_SAMPLES", 100)?,
+            hot_warmups: env_usize("LIX_P3_HOT_WARMUPS", DEFAULT_HOT_WARMUPS)?,
+            hot_samples: env_usize("LIX_P3_HOT_SAMPLES", DEFAULT_HOT_SAMPLES)?,
+            hot_print_raw: env_bool("LIX_P3_HOT_PRINT_RAW", false)?,
             guest_linear_memory_limit_bytes,
             max_entity_summaries: env_usize(
                 "LIX_P3_MAX_ENTITY_SUMMARIES",
                 DEFAULT_MAX_ENTITY_SUMMARIES,
             )?,
         })
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => match value.as_str() {
+            "0" | "false" => Ok(false),
+            "1" | "true" => Ok(true),
+            _ => bail!("{name} must be one of: 0, 1, false, true"),
+        },
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).with_context(|| format!("read {name}")),
     }
 }
 
@@ -184,6 +204,34 @@ impl HasData for Host {
 impl host::Host for &mut State {}
 impl host::HostByteSource for &mut State {}
 
+fn read_source(
+    state: &mut State,
+    source: Resource<HostByteSource>,
+    offset: u64,
+    length: u32,
+) -> wasmtime::Result<Result<Vec<u8>, host::SourceError>> {
+    let (bytes, counters) = {
+        let source = state.table.get(&source)?;
+        (source.bytes.clone(), Arc::clone(&source.counters))
+    };
+    let start = match usize::try_from(offset) {
+        Ok(start) if start <= bytes.len() => start,
+        _ => return Ok(Err(host::SourceError::InvalidRange)),
+    };
+    let requested = usize::try_from(length).expect("u32 fits usize");
+    let Some(end) = start.checked_add(requested) else {
+        return Ok(Err(host::SourceError::InvalidRange));
+    };
+    if end > bytes.len() {
+        return Ok(Err(host::SourceError::InvalidRange));
+    }
+    let result = bytes.slice(start..end).to_vec();
+    let mut counters = counters.lock().expect("source counters mutex poisoned");
+    counters.read_calls += 1;
+    counters.read_bytes += u64::from(length);
+    Ok(Ok(result))
+}
+
 impl host::HostByteSourceWithStore<State> for Host {
     fn fork(
         mut store: Access<State, Self>,
@@ -236,27 +284,16 @@ impl host::HostByteSourceWithStore<State> for Host {
         offset: u64,
         length: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, host::SourceError>> {
-        let (bytes, counters) = {
-            let state = store.get();
-            let source = state.table.get(&source)?;
-            (source.bytes.clone(), Arc::clone(&source.counters))
-        };
-        let start = match usize::try_from(offset) {
-            Ok(start) if start <= bytes.len() => start,
-            _ => return Ok(Err(host::SourceError::InvalidRange)),
-        };
-        let requested = usize::try_from(length).expect("u32 fits usize");
-        let Some(end) = start.checked_add(requested) else {
-            return Ok(Err(host::SourceError::InvalidRange));
-        };
-        if end > bytes.len() {
-            return Ok(Err(host::SourceError::InvalidRange));
-        }
-        let result = bytes.slice(start..end).to_vec();
-        let mut counters = counters.lock().expect("source counters mutex poisoned");
-        counters.read_calls += 1;
-        counters.read_bytes += u64::from(length);
-        Ok(Ok(result))
+        read_source(store.get(), source, offset, length)
+    }
+
+    async fn read_async(
+        accessor: &Accessor<State, Self>,
+        source: Resource<HostByteSource>,
+        offset: u64,
+        length: u32,
+    ) -> wasmtime::Result<Result<Vec<u8>, host::SourceError>> {
+        accessor.with(|mut store| read_source(store.get(), source, offset, length))
     }
 
     fn read_stream(
@@ -550,6 +587,57 @@ impl Drop for SummaryCollector {
     }
 }
 
+struct ChangeCollector {
+    items: Vec<api::EntityChange>,
+    max_items: usize,
+    sender: Option<SignalSender<Vec<api::EntityChange>>>,
+}
+
+impl StreamConsumer<State> for ChangeCollector {
+    type Item = api::EntityChange;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        mut store: StoreContextMut<State>,
+        mut source: Source<'_, Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let remaining = source.remaining(&mut store);
+        if remaining == 0 {
+            return Poll::Ready(Ok(if finish {
+                StreamResult::Cancelled
+            } else {
+                StreamResult::Completed
+            }));
+        }
+        let Some(total) = self.items.len().checked_add(remaining) else {
+            return Poll::Ready(Err(wasmtime::Error::msg("change output count overflow")));
+        };
+        if total > self.max_items {
+            return Poll::Ready(Err(wasmtime::Error::msg(format!(
+                "change output exceeded host limit: {total} > {}",
+                self.max_items
+            ))));
+        }
+        if let Err(error) = self.items.try_reserve(remaining) {
+            return Poll::Ready(Err(wasmtime::Error::msg(format!(
+                "reserve change output: {error}"
+            ))));
+        }
+        source.read(&mut store, &mut self.items)?;
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+impl Drop for ChangeCollector {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            sender.send(std::mem::take(&mut self.items));
+        }
+    }
+}
+
 struct CancelCollector;
 
 impl StreamConsumer<State> for CancelCollector {
@@ -634,6 +722,48 @@ async fn drain_entities(
             items.len()
         ),
         Err(error) => bail!("entity stream terminal error: {error:?}"),
+    }
+}
+
+async fn drain_changes(
+    accessor: &Accessor<State>,
+    stream: api::EntityChangeStream,
+    max_items: usize,
+) -> Result<Vec<api::EntityChange>> {
+    let declared_count = stream.count;
+    let declared_count_usize = usize::try_from(declared_count)
+        .context("declared change count does not fit the host address space")?;
+    if declared_count_usize > max_items {
+        bail!("declared change count exceeded host limit: {declared_count_usize} > {max_items}");
+    }
+    let (items_sender, items_receiver) = signal();
+    let (done_sender, done_receiver) = signal();
+    accessor.with(|mut store| -> wasmtime::Result<()> {
+        stream.items.pipe(
+            &mut store,
+            ChangeCollector {
+                items: Vec::with_capacity(declared_count_usize.min(16)),
+                max_items,
+                sender: Some(items_sender),
+            },
+        )?;
+        stream.done.pipe(
+            &mut store,
+            TerminalCollector {
+                sender: Some(done_sender),
+            },
+        )?;
+        Ok(())
+    })?;
+    let (items, done) = tokio::join!(items_receiver, done_receiver);
+    let items = items?;
+    match done? {
+        Ok(()) if items.len() == declared_count_usize => Ok(items),
+        Ok(()) => bail!(
+            "change stream count mismatch: declared {declared_count}, received {}",
+            items.len()
+        ),
+        Err(error) => bail!("change stream terminal error: {error:?}"),
     }
 }
 
@@ -805,12 +935,27 @@ impl Case {
         edit_offset: u64,
         inserted: u8,
     ) -> Result<api::FileTransition> {
+        self.file_changed_sync_inline(
+            document,
+            before,
+            after,
+            vec![api::InputSplice {
+                offset: edit_offset,
+                delete_len: 1,
+                insert: vec![inserted],
+            }],
+        )
+        .await
+    }
+
+    async fn file_changed_sync_inline(
+        &mut self,
+        document: ResourceAny,
+        before: Resource<HostByteSource>,
+        after: Resource<HostByteSource>,
+        edits: Vec<api::InputSplice>,
+    ) -> Result<api::FileTransition> {
         let api = self.plugin.lix_plugin_p3_candidate_api().clone();
-        let edits = vec![api::InputSplice {
-            offset: edit_offset,
-            delete_len: 1,
-            insert: vec![inserted],
-        }];
         self.store
             .run_concurrent(async move |accessor| {
                 let result = api
@@ -818,6 +963,70 @@ impl Case {
                     .call_file_changed(accessor, document, before, after, edits)
                     .await?;
                 result.map_err(|error| anyhow!("file-changed plugin error: {error:?}"))
+            })
+            .await?
+    }
+
+    async fn file_changed_async_inline(
+        &mut self,
+        document: ResourceAny,
+        before: Resource<HostByteSource>,
+        after: Resource<HostByteSource>,
+        edits: Vec<api::InputSplice>,
+    ) -> Result<api::FileTransition> {
+        let api = self.plugin.lix_plugin_p3_candidate_api().clone();
+        self.store
+            .run_concurrent(async move |accessor| {
+                let result = api
+                    .document()
+                    .call_file_changed_async_inline(accessor, document, before, after, edits)
+                    .await?;
+                result.map_err(|error| anyhow!("async-inline plugin error: {error:?}"))
+            })
+            .await?
+    }
+
+    async fn file_changed_async_read_inline(
+        &mut self,
+        document: ResourceAny,
+        before: Resource<HostByteSource>,
+        after: Resource<HostByteSource>,
+        edits: Vec<api::InputSplice>,
+    ) -> Result<api::FileTransition> {
+        let api = self.plugin.lix_plugin_p3_candidate_api().clone();
+        self.store
+            .run_concurrent(async move |accessor| {
+                let result = api
+                    .document()
+                    .call_file_changed_async_read_inline(accessor, document, before, after, edits)
+                    .await?;
+                result.map_err(|error| anyhow!("async-read-inline plugin error: {error:?}"))
+            })
+            .await?
+    }
+
+    async fn file_changed_async_stream(
+        &mut self,
+        document: ResourceAny,
+        before: Resource<HostByteSource>,
+        after: Resource<HostByteSource>,
+        edits: Vec<api::InputSplice>,
+    ) -> Result<api::FileTransition> {
+        let api = self.plugin.lix_plugin_p3_candidate_api().clone();
+        let max_items = self.store.data().max_entity_summaries;
+        self.store
+            .run_concurrent(async move |accessor| {
+                let result = api
+                    .document()
+                    .call_file_changed_async_stream(accessor, document, before, after, edits)
+                    .await?;
+                let result =
+                    result.map_err(|error| anyhow!("async-stream plugin error: {error:?}"))?;
+                let changes = drain_changes(accessor, result.changes, max_items).await?;
+                Ok(api::FileTransition {
+                    document: result.document,
+                    changes,
+                })
             })
             .await?
     }
@@ -836,6 +1045,13 @@ impl Case {
         let limit = self.store.data().guest_linear_memory_limit_bytes;
         if peak > limit {
             bail!("guest linear-memory peak exceeded configured limit: {peak} > {limit}");
+        }
+        Ok(())
+    }
+
+    fn assert_host_table_empty(&self) -> Result<()> {
+        if !self.store.data().table.is_empty() {
+            bail!("host resource table retained an entry after hot-path cleanup");
         }
         Ok(())
     }
@@ -980,6 +1196,238 @@ struct TimingSummary {
     max: Duration,
 }
 
+const HOT_VARIANT_COUNT: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum HotVariant {
+    SyncInline = 0,
+    AsyncInline = 1,
+    AsyncReadInline = 2,
+    AsyncStream = 3,
+}
+
+impl HotVariant {
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SyncInline => "sync-export-sync-read-inline",
+            Self::AsyncInline => "async-export-sync-read-inline",
+            Self::AsyncReadInline => "async-export-async-read-inline",
+            Self::AsyncStream => "async-export-sync-read-stream",
+        }
+    }
+
+    const fn code(self) -> char {
+        match self {
+            Self::SyncInline => 'S',
+            Self::AsyncInline => 'A',
+            Self::AsyncReadInline => 'R',
+            Self::AsyncStream => 'T',
+        }
+    }
+}
+
+const HOT_VARIANTS: [HotVariant; HOT_VARIANT_COUNT] = [
+    HotVariant::SyncInline,
+    HotVariant::AsyncInline,
+    HotVariant::AsyncReadInline,
+    HotVariant::AsyncStream,
+];
+
+const HOT_ORDERS: [[HotVariant; HOT_VARIANT_COUNT]; 24] = [
+    [
+        HotVariant::SyncInline,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncStream,
+    ],
+    [
+        HotVariant::SyncInline,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncReadInline,
+    ],
+    [
+        HotVariant::SyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncStream,
+    ],
+    [
+        HotVariant::SyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncInline,
+    ],
+    [
+        HotVariant::SyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncReadInline,
+    ],
+    [
+        HotVariant::SyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncInline,
+    ],
+    [
+        HotVariant::AsyncInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncStream,
+    ],
+    [
+        HotVariant::AsyncInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncReadInline,
+    ],
+    [
+        HotVariant::AsyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncStream,
+    ],
+    [
+        HotVariant::AsyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncStream,
+        HotVariant::SyncInline,
+    ],
+    [
+        HotVariant::AsyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::SyncInline,
+        HotVariant::AsyncReadInline,
+    ],
+    [
+        HotVariant::AsyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncReadInline,
+        HotVariant::SyncInline,
+    ],
+    [
+        HotVariant::AsyncReadInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncStream,
+    ],
+    [
+        HotVariant::AsyncReadInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncInline,
+    ],
+    [
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncStream,
+    ],
+    [
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncStream,
+        HotVariant::SyncInline,
+    ],
+    [
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncStream,
+        HotVariant::SyncInline,
+        HotVariant::AsyncInline,
+    ],
+    [
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncStream,
+        HotVariant::AsyncInline,
+        HotVariant::SyncInline,
+    ],
+    [
+        HotVariant::AsyncStream,
+        HotVariant::SyncInline,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncReadInline,
+    ],
+    [
+        HotVariant::AsyncStream,
+        HotVariant::SyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncInline,
+    ],
+    [
+        HotVariant::AsyncStream,
+        HotVariant::AsyncInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncReadInline,
+    ],
+    [
+        HotVariant::AsyncStream,
+        HotVariant::AsyncInline,
+        HotVariant::AsyncReadInline,
+        HotVariant::SyncInline,
+    ],
+    [
+        HotVariant::AsyncStream,
+        HotVariant::AsyncReadInline,
+        HotVariant::SyncInline,
+        HotVariant::AsyncInline,
+    ],
+    [
+        HotVariant::AsyncStream,
+        HotVariant::AsyncReadInline,
+        HotVariant::AsyncInline,
+        HotVariant::SyncInline,
+    ],
+];
+
+#[derive(Clone, Copy, Debug)]
+struct PairedDeltaSummary {
+    p50_ns: i128,
+    p95_ns: i128,
+    mean_ns: f64,
+    mean_ci95_low_ns: f64,
+    mean_ci95_high_ns: f64,
+    candidate_slower_percent: f64,
+}
+
+fn paired_delta_summary(baseline: &[Duration], candidate: &[Duration]) -> PairedDeltaSummary {
+    assert_eq!(baseline.len(), candidate.len());
+    let mut deltas: Vec<i128> = baseline
+        .iter()
+        .zip(candidate)
+        .map(|(baseline, candidate)| {
+            i128::try_from(candidate.as_nanos()).expect("duration fits i128")
+                - i128::try_from(baseline.as_nanos()).expect("duration fits i128")
+        })
+        .collect();
+    deltas.sort_unstable();
+    let count = deltas.len();
+    let mean_ns = deltas.iter().map(|value| *value as f64).sum::<f64>() / count as f64;
+    let variance = deltas
+        .iter()
+        .map(|value| {
+            let difference = *value as f64 - mean_ns;
+            difference * difference
+        })
+        .sum::<f64>()
+        / (count.saturating_sub(1).max(1)) as f64;
+    let margin = 1.96 * (variance / count as f64).sqrt();
+    let slower = deltas.iter().filter(|value| **value > 0).count();
+    PairedDeltaSummary {
+        p50_ns: deltas[(count - 1) * 50 / 100],
+        p95_ns: deltas[(count - 1) * 95 / 100],
+        mean_ns,
+        mean_ci95_low_ns: mean_ns - margin,
+        mean_ci95_high_ns: mean_ns + margin,
+        candidate_slower_percent: slower as f64 * 100.0 / count as f64,
+    }
+}
+
 fn summarize(samples: &[Duration]) -> TimingSummary {
     let mut samples = samples.to_vec();
     samples.sort_unstable();
@@ -1024,6 +1472,302 @@ fn print_result(
         counters.stream_emitted_bytes,
         counters.drop_calls,
     );
+}
+
+struct PreparedHotCall {
+    before: Resource<HostByteSource>,
+    after: Resource<HostByteSource>,
+    before_counters: Arc<Mutex<SourceCounters>>,
+    after_counters: Arc<Mutex<SourceCounters>>,
+    edits: Vec<api::InputSplice>,
+}
+
+struct CompletedHotCall {
+    duration: Duration,
+    transition: api::FileTransition,
+    before_counters: Arc<Mutex<SourceCounters>>,
+    after_counters: Arc<Mutex<SourceCounters>>,
+}
+
+fn prepare_hot_call(case: &mut Case, fixture: &Fixture) -> Result<PreparedHotCall> {
+    let (before, before_counters) = case.push_source(fixture.before.clone())?;
+    let (after, after_counters) = case.push_source(fixture.after.clone())?;
+    Ok(PreparedHotCall {
+        before,
+        after,
+        before_counters,
+        after_counters,
+        edits: vec![api::InputSplice {
+            offset: fixture.edit_offset,
+            delete_len: 1,
+            insert: vec![fixture.inserted],
+        }],
+    })
+}
+
+async fn execute_hot_call(
+    case: &mut Case,
+    document: ResourceAny,
+    variant: HotVariant,
+    prepared: PreparedHotCall,
+) -> Result<CompletedHotCall> {
+    let PreparedHotCall {
+        before,
+        after,
+        before_counters,
+        after_counters,
+        edits,
+    } = prepared;
+    let (duration, transition) = match variant {
+        HotVariant::SyncInline => {
+            let started = Instant::now();
+            let transition = case
+                .file_changed_sync_inline(document, before, after, edits)
+                .await?;
+            (started.elapsed(), transition)
+        }
+        HotVariant::AsyncInline => {
+            let started = Instant::now();
+            let transition = case
+                .file_changed_async_inline(document, before, after, edits)
+                .await?;
+            (started.elapsed(), transition)
+        }
+        HotVariant::AsyncReadInline => {
+            let started = Instant::now();
+            let transition = case
+                .file_changed_async_read_inline(document, before, after, edits)
+                .await?;
+            (started.elapsed(), transition)
+        }
+        HotVariant::AsyncStream => {
+            let started = Instant::now();
+            let transition = case
+                .file_changed_async_stream(document, before, after, edits)
+                .await?;
+            (started.elapsed(), transition)
+        }
+    };
+    Ok(CompletedHotCall {
+        duration,
+        transition,
+        before_counters,
+        after_counters,
+    })
+}
+
+async fn run_hot_round(
+    case: &mut Case,
+    document: ResourceAny,
+    fixture: &Fixture,
+    order: &[HotVariant; HOT_VARIANT_COUNT],
+) -> Result<[Duration; HOT_VARIANT_COUNT]> {
+    let mut prepared: [Option<PreparedHotCall>; HOT_VARIANT_COUNT] = std::array::from_fn(|_| None);
+    for variant in HOT_VARIANTS {
+        prepared[variant.index()] = Some(prepare_hot_call(case, fixture)?);
+    }
+    let mut completed: [Option<CompletedHotCall>; HOT_VARIANT_COUNT] =
+        std::array::from_fn(|_| None);
+
+    for &variant in order {
+        let call = prepared[variant.index()]
+            .take()
+            .expect("each hot variant appears once");
+        completed[variant.index()] = Some(execute_hot_call(case, document, variant, call).await?);
+    }
+
+    let expected_counters =
+        warm_source_counters(fixture.before_entities[fixture.changed_index].length);
+    let mut durations = [Duration::ZERO; HOT_VARIANT_COUNT];
+    for &variant in order.iter().rev() {
+        let call = completed[variant.index()]
+            .take()
+            .expect("each hot variant completed once");
+        durations[variant.index()] = call.duration;
+        validate_transition(
+            &call.transition,
+            &fixture.after_entities[fixture.changed_index],
+            &fixture.changed_member,
+        )?;
+        assert_counters(
+            "hot comparison before",
+            &call.before_counters,
+            &expected_counters,
+        )?;
+        assert_counters(
+            "hot comparison after",
+            &call.after_counters,
+            &expected_counters,
+        )?;
+        let stats = case.stats(call.transition.document).await?;
+        validate_stats(&stats, fixture.after.len(), fixture.after_entities.len(), 1)?;
+        case.drop_document(call.transition.document).await?;
+    }
+    let base_stats = case.stats(document).await?;
+    validate_stats(
+        &base_stats,
+        fixture.before.len(),
+        fixture.before_entities.len(),
+        0,
+    )?;
+    case.assert_host_table_empty()?;
+    Ok(durations)
+}
+
+fn duration_delta_ns(candidate: Duration, baseline: Duration) -> i128 {
+    i128::try_from(candidate.as_nanos()).expect("duration fits i128")
+        - i128::try_from(baseline.as_nanos()).expect("duration fits i128")
+}
+
+fn print_hot_arm(variant: HotVariant, samples: &[Duration]) {
+    let summary = summarize(samples);
+    println!(
+        "hot-result\tvariant={}\tsamples={}\tp50_ns={}\tp95_ns={}\tmin_ns={}\tmax_ns={}",
+        variant.label(),
+        samples.len(),
+        summary.p50.as_nanos(),
+        summary.p95.as_nanos(),
+        summary.min.as_nanos(),
+        summary.max.as_nanos(),
+    );
+}
+
+fn print_hot_blocks(samples: &[Vec<Duration>; HOT_VARIANT_COUNT]) {
+    let block_size = samples[0].len().min(240);
+    for start in (0..samples[0].len()).step_by(block_size) {
+        let end = (start + block_size).min(samples[0].len());
+        let sync = summarize(&samples[HotVariant::SyncInline.index()][start..end]);
+        let async_inline = summarize(&samples[HotVariant::AsyncInline.index()][start..end]);
+        let async_read = summarize(&samples[HotVariant::AsyncReadInline.index()][start..end]);
+        let async_stream = summarize(&samples[HotVariant::AsyncStream.index()][start..end]);
+        println!(
+            "hot-block\tindex={}\tstart={start}\tend={end}\tsync_p50_ns={}\tasync_inline_p50_ns={}\tasync_read_p50_ns={}\tasync_stream_p50_ns={}\tasync_minus_sync_p50_ns={}\tasync_read_minus_async_p50_ns={}\tstream_minus_async_p50_ns={}",
+            start / block_size,
+            sync.p50.as_nanos(),
+            async_inline.p50.as_nanos(),
+            async_read.p50.as_nanos(),
+            async_stream.p50.as_nanos(),
+            duration_delta_ns(async_inline.p50, sync.p50),
+            duration_delta_ns(async_read.p50, async_inline.p50),
+            duration_delta_ns(async_stream.p50, async_inline.p50),
+        );
+    }
+}
+
+fn hot_conservative_gate(label: &str, baseline: &[Duration], candidate: &[Duration]) -> bool {
+    let baseline_summary = summarize(baseline);
+    let candidate_summary = summarize(candidate);
+    let delta = paired_delta_summary(baseline, candidate);
+    let p50_delta_ns = duration_delta_ns(candidate_summary.p50, baseline_summary.p50);
+    let p95_delta_ns = duration_delta_ns(candidate_summary.p95, baseline_summary.p95);
+    let p50_slowdown_percent =
+        (candidate_summary.p50.as_nanos() as f64 / baseline_summary.p50.as_nanos() as f64 - 1.0)
+            * 100.0;
+    let p95_slowdown_percent =
+        (candidate_summary.p95.as_nanos() as f64 / baseline_summary.p95.as_nanos() as f64 - 1.0)
+            * 100.0;
+    let p50_margin_ns = (baseline_summary.p50.as_nanos() as f64 * 0.10).min(500.0);
+    let p95_margin_ns = (baseline_summary.p95.as_nanos() as f64 * 0.15).min(1_000.0);
+    let point_gate_pass =
+        p50_delta_ns as f64 <= p50_margin_ns && p95_delta_ns as f64 <= p95_margin_ns;
+    // Samples within one process are serial and can be autocorrelated. Keep
+    // this IID interval as a conservative diagnostic, not the retained
+    // cross-process inference.
+    let iid_ci_guard_pass = delta.mean_ci95_high_ns <= p50_margin_ns;
+    let conservative_gate_pass = point_gate_pass && iid_ci_guard_pass;
+    println!(
+        "hot-comparison\tname={label}\tp50_delta_ns={p50_delta_ns}\tp95_delta_ns={p95_delta_ns}\tp50_slowdown_percent={p50_slowdown_percent:.3}\tp95_slowdown_percent={p95_slowdown_percent:.3}\tpaired_p50_delta_ns={}\tpaired_p95_delta_ns={}\tpaired_mean_delta_ns={:.3}\tiid_paired_mean_ci95_low_ns={:.3}\tiid_paired_mean_ci95_high_ns={:.3}\tcandidate_slower_percent={:.3}\tp50_margin_ns={p50_margin_ns:.3}\tp95_margin_ns={p95_margin_ns:.3}\tpoint_gate_pass={point_gate_pass}\tiid_ci_guard_pass={iid_ci_guard_pass}\tconservative_gate_pass={conservative_gate_pass}",
+        delta.p50_ns,
+        delta.p95_ns,
+        delta.mean_ns,
+        delta.mean_ci95_low_ns,
+        delta.mean_ci95_high_ns,
+        delta.candidate_slower_percent,
+    );
+    conservative_gate_pass
+}
+
+async fn benchmark_hot_abi(
+    engine: &Engine,
+    component: &Component,
+    linker: &Linker<State>,
+    fixture: &Fixture,
+    settings: Settings,
+) -> Result<()> {
+    let mut case = Case::new(
+        engine,
+        component,
+        linker,
+        settings.guest_linear_memory_limit_bytes,
+        settings.max_entity_summaries,
+    )
+    .await?;
+    let opened = case.open_list(fixture.before.to_vec()).await?;
+    validate_opened(&opened, &fixture.before_entities)?;
+    let document = opened.document;
+    let stats = case.stats(document).await?;
+    validate_stats(
+        &stats,
+        fixture.before.len(),
+        fixture.before_entities.len(),
+        0,
+    )?;
+
+    for round in 0..settings.hot_warmups {
+        let order = &HOT_ORDERS[round % HOT_ORDERS.len()];
+        let _ = run_hot_round(&mut case, document, fixture, order).await?;
+    }
+
+    let mut samples: [Vec<Duration>; HOT_VARIANT_COUNT] =
+        std::array::from_fn(|_| Vec::with_capacity(settings.hot_samples));
+    for round in 0..settings.hot_samples {
+        let order = &HOT_ORDERS[round % HOT_ORDERS.len()];
+        let durations = run_hot_round(&mut case, document, fixture, order).await?;
+        for variant in HOT_VARIANTS {
+            samples[variant.index()].push(durations[variant.index()]);
+        }
+        if settings.hot_print_raw {
+            println!(
+                "hot-sample\tindex={round}\torder={}{}{}{}\tsync_ns={}\tasync_inline_ns={}\tasync_read_ns={}\tasync_stream_ns={}",
+                order[0].code(),
+                order[1].code(),
+                order[2].code(),
+                order[3].code(),
+                durations[HotVariant::SyncInline.index()].as_nanos(),
+                durations[HotVariant::AsyncInline.index()].as_nanos(),
+                durations[HotVariant::AsyncReadInline.index()].as_nanos(),
+                durations[HotVariant::AsyncStream.index()].as_nanos(),
+            );
+        }
+    }
+
+    for variant in HOT_VARIANTS {
+        print_hot_arm(variant, &samples[variant.index()]);
+    }
+    print_hot_blocks(&samples);
+    let async_export_conservative_gate_pass = hot_conservative_gate(
+        "async-export-over-sync-export",
+        &samples[HotVariant::SyncInline.index()],
+        &samples[HotVariant::AsyncInline.index()],
+    );
+    let async_read_conservative_gate_pass = hot_conservative_gate(
+        "async-read-over-sync-read",
+        &samples[HotVariant::AsyncInline.index()],
+        &samples[HotVariant::AsyncReadInline.index()],
+    );
+    let async_stream_conservative_gate_pass = hot_conservative_gate(
+        "async-stream-over-inline-output",
+        &samples[HotVariant::AsyncInline.index()],
+        &samples[HotVariant::AsyncStream.index()],
+    );
+    println!(
+        "hot-decision\tscope=ready-262-byte-random-reads-one-change\tasync_export_conservative_gate_pass={async_export_conservative_gate_pass}\tasync_read_conservative_gate_pass={async_read_conservative_gate_pass}\tasync_stream_conservative_gate_pass={async_stream_conservative_gate_pass}\tstream_payload_bytes={}\tstream_memory_comparison=not-measured",
+        fixture.changed_member.len(),
+    );
+    case.drop_document(document).await?;
+    case.assert_host_table_empty()?;
+    case.assert_memory_limit()?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1542,7 +2286,7 @@ async fn main() -> Result<()> {
     Plugin::add_to_linker::<State, Host>(&mut linker, |state| state)?;
 
     println!(
-        "config\twasmtime=47.0.2\tfixture=json-top-level-object\tbytes={}\tentities={}\tchanged_entity={}\tchanged_member_bytes={}\tguest_per_linear_memory_limit_mib={}\tmax_entity_summaries={}\tcold_warmups={}\tcold_samples={}\twarm_warmups={}\twarm_samples={}\tguest_component_bytes={}",
+        "config\twasmtime=47.0.2\tfixture=json-top-level-object\tbytes={}\tentities={}\tchanged_entity={}\tchanged_member_bytes={}\tguest_per_linear_memory_limit_mib={}\tmax_entity_summaries={}\tcold_warmups={}\tcold_samples={}\twarm_warmups={}\twarm_samples={}\thot_warmups={}\thot_samples={}\thot_print_raw={}\tguest_component_bytes={}",
         fixture.before.len(),
         fixture.before_entities.len(),
         fixture.changed_index,
@@ -1553,6 +2297,9 @@ async fn main() -> Result<()> {
         settings.cold_samples,
         settings.warm_warmups,
         settings.warm_samples,
+        settings.hot_warmups,
+        settings.hot_samples,
+        settings.hot_print_raw,
         std::fs::metadata(&component_path)?.len(),
     );
 
@@ -1626,5 +2373,6 @@ async fn main() -> Result<()> {
         stateless,
         warm_stream,
     );
+    benchmark_hot_abi(&engine, &component, &linker, &fixture, settings).await?;
     Ok(())
 }

@@ -11,9 +11,10 @@ property in a roughly 10 MiB file, and compares:
 
 - a v1-shaped full-file reopen;
 - a whole-buffer `list<u8>` cold open;
-- a Preview 3 `stream<u8>` cold open; and
-- synchronous sparse edits on persistent documents created by either cold
-  path.
+- a Preview 3 `stream<u8>` cold open;
+- sparse edits on persistent documents created by either cold path; and
+- matched sync/async variants of the hot edit ABI, random reads, and sparse
+  output.
 
 ## Candidate boundary
 
@@ -53,6 +54,11 @@ That stream-plus-terminal-future shape follows the native P3 pattern: stream
 closure and operation success are separate, so the receiver must drain or drop
 the stream and still await `done`.
 
+The executable WIT also contains three explicitly benchmark-only
+`file-changed-async-*` methods and one `read-async` import. They are retained so
+the sync/async decision is reproducible; they are not part of the recommended
+candidate boundary.
+
 ## What this tests
 
 The guest uses generated `wit-bindgen` bindings directly. There is no Lix SDK
@@ -63,9 +69,10 @@ facade in this experiment. This makes the authorship result honest:
 - A plugin can consume input with ordinary Rust `async`/`await`.
 - Producing an output stream still requires a spawned producer, backpressure
   handling, cancellation handling, and a terminal future.
-- Warm sparse edits are easier and cheaper as synchronous calls; making the
-  complete plugin interface async would add machinery to the common path
-  without improving its algorithm.
+- For a resident source and one changed 262-byte JSON member, warm sparse edits
+  are measurably cheaper as synchronous calls. Making the complete interface
+  async adds ABI/scheduling machinery without improving this operation's
+  algorithm.
 
 The executable WIT uses typed entity summaries to measure the simplest raw
 author experience. A production Lix v3 should retain v2's bounded packet-v1
@@ -137,17 +144,47 @@ timings. The harness defaults to 64 MiB for comparison with PR2, but that is
 not an API limit; set
 `LIX_P3_GUEST_LINEAR_MEMORY_LIMIT_MIB` to test a larger or smaller deployment
 budget. `LIX_P3_MAX_ENTITY_SUMMARIES` independently configures the host output
-budget and defaults to one million.
+budget and defaults to one million. The matched hot benchmark defaults to
+2,400 warmup rounds and 24,000 measured rounds per arm. Override those with
+`LIX_P3_HOT_WARMUPS` and `LIX_P3_HOT_SAMPLES`; set
+`LIX_P3_HOT_PRINT_RAW=1` to print every paired sample.
 
 ## Retained result
 
 On the retained 10,485,811-byte / 39,870-property JSON fixture, the P3 cold
-stream was latency-neutral versus `list<u8>` (113.102 versus 112.837 ms p50)
-while reducing the largest guest linear memory from 15.312 MiB to 6.312 MiB.
+stream was latency-neutral versus `list<u8>` (109.146 versus 109.749 ms p50)
+while reducing the largest guest linear memory from 15.625 MiB to 6.625 MiB.
 Sequential synchronous persistent edits read only the affected 262-byte
-property from each source and measured 0.006162 ms p50, versus 112.771 ms for
+property from each source and measured 0.006031 ms p50, versus 109.441 ms for
 the v1-shaped full-reopen control. Cold and microsecond-scale p95s remain noisy
-in this unpaired VM run and are not an adoption signal.
+in this VM run and are not an adoption signal.
+
+The hot-path decision uses five fresh processes pinned to one CPU, with 24,000
+paired samples per arm in each process and all 24 execution orders:
+
+| Hot variant | Process-median p50 | Process-median p95 |
+|---|---:|---:|
+| Sync export, sync reads, inline change | 6.632 µs | 7.595 µs |
+| Async export, sync reads, inline change | 7.064 µs | 8.076 µs |
+| Async export, ready async reads, inline change | 7.855 µs | 9.228 µs |
+| Async export, sync reads, streamed change | 13.135 µs | 18.324 µs |
+
+Relative to its matched baseline, async export added a process-median 0.491 µs
+(7.6%), ready async reads added another 0.773 µs (10.9%), and streaming the
+single change added 6.030 µs (86.0%). All five processes observed each async
+variant as slower. Across fresh-process p50 deltas, ready-async reads and
+one-item streaming were materially beyond the 0.5 µs margin; async export's
+95% interval crossed that margin. Because async export adds no capability to
+this resident hot path, the selected boundary is still the synchronous export
+with synchronous random reads and inline sparse output.
+
+The reported costs are paired per-process deltas, not subtraction of the
+separately aggregated arm medians in the table.
+
+That decision is deliberately narrow. A source that actually waits on remote
+or disk I/O may benefit from async concurrency, and larger or multi-entity
+outputs need a payload-size/memory break-even sweep before choosing inline
+lists over streams.
 
 See [`RESULTS.md`](RESULTS.md) for the complete p50/p95 matrix, counters,
 limitations, and retained raw output.
