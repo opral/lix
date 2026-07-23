@@ -29,6 +29,7 @@ import {
 	record,
 	REMOTE_PROTOCOL_PATH,
 	remoteError,
+	type RemoteHandshakeRequest,
 	type RemoteObserveSubscription,
 	type WireRequestBlobSplice,
 	type WireRequestValue,
@@ -54,10 +55,15 @@ const COMPRESSION_SAMPLE_BYTES = 32 * 1024;
 const MAX_COMPRESSION_SAMPLE_RATIO = 0.7;
 const MAX_COMPRESSED_BODY_RATIO = 0.9;
 
+type RemoteLixClientOptions = {
+	initialActiveBranchId?: RemoteHandshakeRequest["activeBranchId"];
+};
+
 export async function openRemoteLixBinding(
 	options: RemoteLixServerOptions,
+	clientOptions: RemoteLixClientOptions = {},
 ): Promise<LixBinding> {
-	const client = new RemoteLixBinding(options);
+	const client = new RemoteLixBinding(options, clientOptions);
 	await client.open();
 	return client;
 }
@@ -66,6 +72,7 @@ class RemoteLixBinding implements LixBinding {
 	readonly #baseUrl: URL;
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
+	readonly #initialActiveBranchId: string | undefined;
 	readonly #observationHub: RemoteObservationHub;
 	readonly #requestBlobBases = new Map<string, RequestBlobBase>();
 	#sessionId: string | undefined;
@@ -75,7 +82,10 @@ class RemoteLixBinding implements LixBinding {
 	#operationQueue: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
 
-	constructor(options: RemoteLixServerOptions) {
+	constructor(
+		options: RemoteLixServerOptions,
+		clientOptions: RemoteLixClientOptions,
+	) {
 		if (!options || typeof options !== "object") {
 			throw new TypeError("openLix() remote server must be an object");
 		}
@@ -98,6 +108,13 @@ class RemoteLixBinding implements LixBinding {
 			);
 		}
 		this.#headers = options.headers;
+		if (
+			clientOptions.initialActiveBranchId !== undefined &&
+			clientOptions.initialActiveBranchId.length === 0
+		) {
+			throw new TypeError("initialActiveBranchId must be a non-empty string");
+		}
+		this.#initialActiveBranchId = clientOptions.initialActiveBranchId;
 		this.#observationHub = new RemoteObservationHub({
 			openStream: (subscriptions, signal) =>
 				this.#requestObserveStream(subscriptions, signal),
@@ -105,8 +122,12 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async open(): Promise<void> {
+		const path =
+			this.#initialActiveBranchId === undefined
+				? ""
+				: `?activeBranchId=${encodeURIComponent(this.#initialActiveBranchId)}`;
 		const handshake = decodeHandshake(
-			await this.#requestJson("", { method: "GET" }),
+			await this.#requestJson(path, { method: "GET" }),
 		);
 		this.#sessionId = handshake.sessionId;
 		this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
@@ -274,6 +295,7 @@ class RemoteLixBinding implements LixBinding {
 			if (value.branchId !== options.branchId) {
 				throw protocolError("switch branch response is invalid");
 			}
+			this.#observationHub.restart();
 			return { branchId: options.branchId };
 		});
 	}
@@ -290,9 +312,7 @@ class RemoteLixBinding implements LixBinding {
 		throw unsupportedRemoteOperation("mergeBranchPreview");
 	}
 
-	async mergeBranch(
-		_options: MergeBranchOptions,
-	): Promise<MergeBranchReceipt> {
+	async mergeBranch(_options: MergeBranchOptions): Promise<MergeBranchReceipt> {
 		this.#assertOpen();
 		throw unsupportedRemoteOperation("mergeBranch");
 	}
@@ -776,6 +796,10 @@ class RemoteObservationHub {
 		this.#observations.clear();
 	}
 
+	restart(): void {
+		if (!this.#closed) this.#restartStream();
+	}
+
 	#restartStream(): void {
 		this.#stopStream();
 		if (this.#startQueued) return;
@@ -881,10 +905,7 @@ class RemoteObservationHub {
 						observation.accept(event);
 						this.#retryAttempt = 0;
 					} catch (error) {
-						this.#failStream(
-							asObserveProtocolError(error, "next"),
-							controller,
-						);
+						this.#failStream(asObserveProtocolError(error, "next"), controller);
 						return;
 					}
 				} else if (frame.event === "error") {
@@ -1258,7 +1279,12 @@ function jsonValuesEqual(left: unknown, right: unknown): boolean {
 			left.every((value, index) => jsonValuesEqual(value, right[index]))
 		);
 	}
-	if (!left || !right || typeof left !== "object" || typeof right !== "object") {
+	if (
+		!left ||
+		!right ||
+		typeof left !== "object" ||
+		typeof right !== "object"
+	) {
 		return false;
 	}
 	const leftRecord = left as Record<string, unknown>;
@@ -1297,7 +1323,9 @@ function protocolBaseUrl(value: string | URL): URL {
 	return workspaceUrl;
 }
 
-function unsupportedRemoteOperation(operation: string): Error & { code: string } {
+function unsupportedRemoteOperation(
+	operation: string,
+): Error & { code: string } {
 	return remoteError(
 		"LIX_UNSUPPORTED_REMOTE_OPERATION",
 		`${operation} is not supported in remote mode`,

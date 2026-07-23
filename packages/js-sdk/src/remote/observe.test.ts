@@ -365,8 +365,7 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 	await lix.close();
 });
 
-test("a successful branch switch updates observations on the existing server stream", async () => {
-	let observeController: ReadableStreamDefaultController<Uint8Array> | undefined;
+test("a successful branch switch restarts observations on the pinned session", async () => {
 	let observeRequests = 0;
 	const lix = await openLix({
 		server: {
@@ -381,35 +380,32 @@ test("a successful branch switch updates observations on the existing server str
 					const body = (await request.json()) as { branchId: string };
 					if (body.branchId === "missing-id") {
 						return Response.json(
-								{
-									error: {
-										code: "LIX_BRANCH_NOT_FOUND",
-										message: "Branch not found",
-									},
+							{
+								error: {
+									code: "LIX_BRANCH_NOT_FOUND",
+									message: "Branch not found",
 								},
-								{ status: 404 },
-							);
+							},
+							{ status: 404 },
+						);
 					}
-					observeController?.enqueue(
-						new TextEncoder().encode(
-							sseFrame(
-								"next",
-								multiplexObservePayload("observe-1", body.branchId, 1, 1),
-							),
-						),
-					);
 					return Response.json({ branchId: body.branchId });
 				}
 				observeRequests += 1;
+				const observedBranch = observeRequests === 1 ? "main-id" : "draft-id";
 				return new Response(
 					new ReadableStream<Uint8Array>({
 						start(controller) {
-							observeController = controller;
 							controller.enqueue(
 								new TextEncoder().encode(
 									sseFrame(
 										"next",
-										multiplexObservePayload("observe-1", "main-id", 0, 0),
+										multiplexObservePayload(
+											"observe-1",
+											observedBranch,
+											0,
+											observeRequests - 1,
+										),
 									),
 								),
 							);
@@ -428,11 +424,11 @@ test("a successful branch switch updates observations on the existing server str
 	const switched = await afterSwitch;
 	expect(switched?.result.rows[0]?.get("value")).toBe("draft-id");
 	expect(switched?.sequence).toBe(1);
-	expect(observeRequests).toBe(1);
+	expect(observeRequests).toBe(2);
 	await expect(
 		lix.switchBranch({ branchId: "missing-id" }),
 	).rejects.toMatchObject({ code: "LIX_BRANCH_NOT_FOUND" });
-	expect(observeRequests).toBe(1);
+	expect(observeRequests).toBe(2);
 
 	events.close();
 	await lix.close();
@@ -494,11 +490,7 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 			"Bearer token-3",
 			"Bearer token-4",
 		]);
-		expect(observedSessionIds).toEqual([
-			"session-1",
-			"session-1",
-			"session-1",
-		]);
+		expect(observedSessionIds).toEqual(["session-1", "session-1", "session-1"]);
 
 		events.close();
 		await lix.close();
@@ -578,7 +570,11 @@ function closedSession(): Response {
 	return new Response(null, { status: 204 });
 }
 
-function observePayload(value: string, sequence: number, mutationSequence: number) {
+function observePayload(
+	value: string,
+	sequence: number,
+	mutationSequence: number,
+) {
 	return {
 		sequence,
 		mutationSequence,

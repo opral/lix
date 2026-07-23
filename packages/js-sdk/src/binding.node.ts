@@ -30,7 +30,9 @@ type NativeAddon = {
 };
 
 const require = createRequire(import.meta.url);
-const localNativePath = fileURLToPath(new URL("../lix_js_sdk.node", import.meta.url));
+const localNativePath = fileURLToPath(
+	new URL("../lix_js_sdk.node", import.meta.url),
+);
 
 const nativePackages = {
 	"linux-x64": "@lix-js/sdk-linux-x64",
@@ -41,7 +43,8 @@ const nativePackages = {
 
 function resolveNativePath() {
 	if (existsSync(localNativePath)) return localNativePath;
-	const key = `${process.platform}-${process.arch}` as keyof typeof nativePackages;
+	const key =
+		`${process.platform}-${process.arch}` as keyof typeof nativePackages;
 	const packageName = nativePackages[key];
 	let packageResolutionError: unknown;
 	if (packageName) {
@@ -80,6 +83,11 @@ export function openLixBinding(
 		: undefined;
 	switch (storage.kind) {
 		case "memory":
+			if (storage.snapshot !== undefined) {
+				throw new Error(
+					"Memory snapshots are only available in the browser binding",
+				);
+			}
 			return addon.Lix.openMemory(dispatch, nativeTelemetry);
 		case "sqlite":
 			return addon.Lix.openSQLite(storage.path, dispatch, nativeTelemetry);

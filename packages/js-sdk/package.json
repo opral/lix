@@ -17,13 +17,13 @@
 			"workerd": "./dist/workerd.js",
 			"default": "./dist/workerd.js"
 		},
-		"./remote": {
-			"types": "./dist/remote.d.ts",
-			"default": "./dist/remote.js"
-		},
 		"./remote-protocol": {
 			"types": "./dist/remote/protocol.d.ts",
 			"default": "./dist/remote/protocol.js"
+		},
+		"./local-storage-adapter": {
+			"types": "./dist/local-storage-adapter.d.ts",
+			"default": "./dist/local-storage-adapter.js"
 		}
 	},
 	"imports": {
@@ -72,6 +72,7 @@
 		"@types/node": "^24.10.2",
 		"playwright": "1.57.0",
 		"typescript": "^5.5.4",
+		"vite": "8.1.4",
 		"vitest": "4.1.10"
 	},
 	"dependencies": {

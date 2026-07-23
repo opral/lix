@@ -233,6 +233,11 @@ where
         self.transaction_manager.is_closed()
     }
 
+    #[doc(hidden)]
+    pub fn is_pinned(&self) -> bool {
+        matches!(self.mode, SessionMode::Pinned { .. })
+    }
+
     #[cfg(test)]
     pub(crate) fn operation_in_progress_count_for_test(&self) -> usize {
         self.transaction_manager.operation_count_for_test()

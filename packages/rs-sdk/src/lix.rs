@@ -8,6 +8,8 @@ use lix_engine::{
 };
 use std::sync::Arc;
 
+use crate::client_state::ClientState;
+
 /// Options for opening a Lix workspace session.
 #[expect(missing_debug_implementations)]
 pub struct OpenLixOptions<StorageImpl = Memory> {
@@ -102,6 +104,15 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Returns a borrowed handle to JSON state owned by this client storage.
+    ///
+    /// Remote SDK integrations should expose this handle from a separate
+    /// client-only local Lix while continuing to route workspace operations to
+    /// the remote Lix.
+    pub fn client_state(&self) -> ClientState<'_, StorageImpl> {
+        ClientState::new(self)
+    }
+
     /// Opens another workspace session on this handle's existing engine.
     ///
     /// The returned handle has independent session-local state, including its
@@ -117,6 +128,43 @@ where
             ));
         }
         let session = self.engine.open_workspace_session().await?;
+        Ok(Self {
+            engine: self.engine.clone(),
+            session,
+        })
+    }
+
+    /// Opens an independent session pinned to `active_branch_id` on this
+    /// handle's existing engine.
+    ///
+    /// Unlike a workspace session, a pinned session never reads or writes the
+    /// shared workspace branch selector. The requested branch is validated
+    /// before the child handle is returned. To switch it, use
+    /// [`Self::switch_branch_session`] and retain the returned replacement.
+    pub async fn open_session(
+        &self,
+        active_branch_id: impl Into<String>,
+    ) -> Result<Self, LixError> {
+        if self.session.is_closed() {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot open a pinned session from a closed Lix handle",
+            ));
+        }
+        let active_branch_id = active_branch_id.into();
+        if self
+            .engine
+            .load_branch_head_commit_id(&active_branch_id)
+            .await?
+            .is_none()
+        {
+            return Err(LixError::branch_not_found(
+                active_branch_id,
+                "open_session",
+                "target",
+            ));
+        }
+        let session = self.engine.open_session(active_branch_id).await?;
         Ok(Self {
             engine: self.engine.clone(),
             session,
@@ -196,8 +244,35 @@ where
         &self,
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
-        let (_session, receipt) = self.session.switch_branch(options).await?;
+        if self.session.is_pinned() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_SESSION_STATE,
+                "switch_branch() cannot replace a borrowed pinned Lix handle",
+            )
+            .with_hint("use switch_branch_session() and retain the returned Lix handle"));
+        }
+        let (_lix, receipt) = self.switch_branch_session(options).await?;
         Ok(receipt)
+    }
+
+    /// Switches branches and returns the replacement handle produced by the
+    /// engine session transition.
+    ///
+    /// Callers that own pinned sessions must retain the returned handle. The
+    /// compatibility [`Self::switch_branch`] method intentionally preserves
+    /// its existing receipt-only API for workspace sessions.
+    pub async fn switch_branch_session(
+        &self,
+        options: SwitchBranchOptions,
+    ) -> Result<(Self, SwitchBranchReceipt), LixError> {
+        let (session, receipt) = self.session.switch_branch(options).await?;
+        Ok((
+            Self {
+                engine: self.engine.clone(),
+                session,
+            },
+            receipt,
+        ))
     }
 
     pub async fn merge_branch(
@@ -343,5 +418,49 @@ mod tests {
         root.execute("SELECT 3", &[])
             .await
             .expect("root remains open");
+    }
+
+    #[tokio::test]
+    async fn pinned_sessions_validate_and_retain_branch_switches() {
+        let root = open_lix(OpenLixOptions::<Memory>::default())
+            .await
+            .expect("open root Lix");
+        let main_branch_id = root.active_branch_id().await.expect("main branch");
+        let draft = root
+            .create_branch(CreateBranchOptions {
+                id: Some("pinned-draft".to_string()),
+                name: "Pinned draft".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create draft");
+
+        let pinned = root
+            .open_session(main_branch_id.clone())
+            .await
+            .expect("open pinned main session");
+        let error = pinned
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft.id.clone(),
+            })
+            .await
+            .expect_err("receipt-only switching must reject pinned sessions");
+        assert_eq!(error.code, LixError::CODE_INVALID_SESSION_STATE);
+        let (switched, receipt) = pinned
+            .switch_branch_session(SwitchBranchOptions {
+                branch_id: draft.id.clone(),
+            })
+            .await
+            .expect("switch pinned session");
+
+        assert_eq!(receipt.branch_id, draft.id);
+        assert_eq!(pinned.active_branch_id().await.unwrap(), main_branch_id);
+        assert_eq!(switched.active_branch_id().await.unwrap(), "pinned-draft");
+        assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);
+
+        let Err(error) = root.open_session("missing-branch").await else {
+            panic!("missing branch must not open");
+        };
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
     }
 }

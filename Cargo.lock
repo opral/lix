@@ -3403,6 +3403,7 @@ dependencies = [
  "lru",
  "notify-debouncer-full",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "wasm-encoder 0.248.0",

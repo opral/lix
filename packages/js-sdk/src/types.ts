@@ -33,16 +33,33 @@ export type LixTelemetryOptions = {
 	onSpan(span: LixTelemetrySpan): void;
 };
 
+/**
+ * Persists opaque Lix snapshots under SDK-provided namespaces.
+ *
+ * Implementations must treat snapshots as bytes owned by Lix. The namespace
+ * selects one logical Lix and allows a single adapter to persist more than one
+ * instance without collisions.
+ */
+export interface LixSnapshotStorage {
+	load(namespace: string): Promise<Uint8Array | undefined>;
+	save(namespace: string, snapshot: Uint8Array): Promise<void>;
+}
+
 export type OpenLixOptions =
 	| {
 			storage?:
 				| import("./open-lix.js").SQLite
-				| import("./open-lix.js").LocalFilesystem;
+				| import("./open-lix.js").LocalFilesystem
+				| LixSnapshotStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  }
 	| {
-			storage?: never;
+			/**
+			 * Optional client-local storage. In remote mode workspace SQL remains on
+			 * the server; only `lix.clientState` is stored here.
+			 */
+			storage?: LixSnapshotStorage;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
 	  };

@@ -37,7 +37,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		});
 	});
 
-	function handleNotification(message: Exclude<WorkerInput, WorkerRequest>): void {
+	function handleNotification(
+		message: Exclude<WorkerInput, WorkerRequest>,
+	): void {
 		switch (message.kind) {
 			case "observe.close": {
 				const events = observations.get(message.observeId);
@@ -71,7 +73,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		}
 	}
 
-	async function handleFiniteOperation(operation: WorkerOperation): Promise<unknown> {
+	async function handleFiniteOperation(
+		operation: WorkerOperation,
+	): Promise<unknown> {
 		switch (operation.kind) {
 			case "open":
 				if (lix) throw workerStateError("Lix worker is already open");
@@ -120,6 +124,17 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			}
 			case "activeBranchId":
 				return requiredLix().activeBranchId();
+			case "clientState.entries":
+				return requiredClientStateMethod("clientStateEntries")();
+			case "clientState.get":
+				return requiredClientStateMethod("clientStateGet")(operation.key);
+			case "clientState.set":
+				return requiredClientStateMethod("clientStateSet")(
+					operation.key,
+					operation.value,
+				);
+			case "clientState.delete":
+				return requiredClientStateMethod("clientStateDelete")(operation.key);
 			case "createBranch":
 				return requiredLix().createBranch(operation.options);
 			case "switchBranch":
@@ -132,6 +147,16 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().importFilesystemPaths(operation.paths);
 			case "syncDiskToLix":
 				return requiredLix().syncDiskToLix();
+			case "exportSnapshot": {
+				const lix = requiredLix();
+				const exportSnapshot = lix.exportSnapshot;
+				if (!exportSnapshot) {
+					throw workerStateError(
+						"The open Lix storage does not support snapshot export",
+					);
+				}
+				return exportSnapshot.call(lix);
+			}
 			case "observe": {
 				const events = await requiredLix().observe(
 					operation.sql,
@@ -164,6 +189,22 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	function requiredLix(): LixBinding {
 		if (!lix) throw workerStateError("Lix worker is closed");
 		return lix;
+	}
+
+	function requiredClientStateMethod<
+		Key extends
+			| "clientStateEntries"
+			| "clientStateGet"
+			| "clientStateSet"
+			| "clientStateDelete",
+	>(key: Key): NonNullable<LixBinding[Key]> {
+		const method = requiredLix()[key];
+		if (!method) {
+			throw workerStateError(
+				"The open Lix binding does not support typed client state",
+			);
+		}
+		return method.bind(requiredLix()) as NonNullable<LixBinding[Key]>;
 	}
 
 	function requiredTransaction(transactionId: number): LixTransactionBinding {

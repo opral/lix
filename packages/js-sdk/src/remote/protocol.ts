@@ -34,6 +34,10 @@ export type RemoteHandshake = {
 	requestBlobSplice: boolean;
 };
 
+export type RemoteHandshakeRequest = {
+	activeBranchId?: string;
+};
+
 export type RemoteExecuteRequest = {
 	sql: string;
 	params: WireRequestValue[];
@@ -399,7 +403,8 @@ function decodeWireValue(value: unknown): NativeLixValue {
 	const wire = record(value, "wire value");
 	switch (wire.kind) {
 		case "null":
-			if (wire.value !== null) throw protocolError("null wire value is invalid");
+			if (wire.value !== null)
+				throw protocolError("null wire value is invalid");
 			return { kind: "null", value: null };
 		case "bool":
 			if (typeof wire.value !== "boolean") {
@@ -435,7 +440,10 @@ function decodeWireValue(value: unknown): NativeLixValue {
 }
 
 function stringArray(value: unknown, description: string): string[] {
-	if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+	if (
+		!Array.isArray(value) ||
+		!value.every((entry) => typeof entry === "string")
+	) {
 		throw protocolError(`${description} must be an array of strings`);
 	}
 	return [...value];
@@ -490,7 +498,9 @@ function bytesToBase64(bytes: Uint8Array): string {
 	let binary = "";
 	const chunkSize = 0x8000;
 	for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-		binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+		binary += String.fromCharCode(
+			...bytes.subarray(offset, offset + chunkSize),
+		);
 	}
 	return btoa(binary);
 }

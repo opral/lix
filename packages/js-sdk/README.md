@@ -50,25 +50,43 @@ files.close();
 await lix.close();
 ```
 
-Remote mode uses the server for persistence and does not open a local engine,
-so it does not take a client `storage`. Dynamic headers are resolved for every
-request and observation reconnect. An injected `fetch` can route requests
-through a service binding or another authorized server-side transport.
+Without `storage`, remote mode uses the server for all persistence and does not
+open a local engine. Dynamic headers are resolved for every request and
+observation reconnect. An injected `fetch` can route requests through a service
+binding or another authorized server-side transport.
 
-Browser deployments that only use remote mode can import the same API from the
-remote-only entrypoint. This keeps the local worker and engine WASM out of the
-bundle:
+Browser clients can opt into private, durable client state with the local
+storage adapter:
 
 ```ts
-import { openLix } from "@lix-js/sdk/remote";
+import { openLix } from "@lix-js/sdk";
+import { LocalStorage } from "@lix-js/sdk/local-storage-adapter";
 
 const lix = await openLix({
 	server: {
 		mode: "remote",
 		url: "https://lixray.com/@namespace/workspace",
 	},
+	storage: new LocalStorage(),
 });
+
+const previousUiState = lix.clientState.get("atelier-ui");
+await lix.clientState.set("atelier-ui", { sidebar: "history" });
 ```
+
+`lix.clientState` is hydrated before `openLix()` resolves, so reads are
+synchronous. Its JSON values and the client's active branch are stored in a
+private local Lix snapshot; workspace SQL continues to execute only on the
+server. Reopening the same remote URL with the same storage restores both. Each
+remote server session is branch-pinned, so switching one client does not switch
+another client.
+
+After a remote branch switch succeeds, saving that branch as the next-reopen
+preference is best effort: a client-storage failure does not turn the completed
+server switch into a rejected operation. Explicit `lix.clientState.set()` and
+`.delete()` calls report durability failures to their caller. Because the local
+Rust transaction has already committed, `get()` continues to expose that live
+session value; a later successful snapshot save can make it durable.
 
 Filesystem sync and SQLite persistence use native Node.js dependencies:
 
@@ -141,8 +159,9 @@ try {
 - Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
 - Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
 - Use `new SQLite({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
-- In browsers, `openLix()` loads the Rust engine as WebAssembly and uses the
-  in-memory storage.
+- In browsers, local mode and remote mode with client storage load the Rust
+  engine as WebAssembly. Supplying a snapshot storage adapter persists that
+  local Lix; in remote mode, the local engine contains only client state.
 - `LocalFilesystem` and `SQLite` are Node.js-only. Constructing them is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.

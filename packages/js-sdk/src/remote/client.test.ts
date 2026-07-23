@@ -1,6 +1,37 @@
 import { expect, test, vi } from "vitest";
 import { gunzipSync } from "fflate";
 import { openLix } from "../index.js";
+import { openRemoteLixBinding } from "./client.js";
+
+test("remote handshake requests a restored initial active branch", async () => {
+	const requests: Request[] = [];
+	const binding = await openRemoteLixBinding(
+		{
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request);
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				return Response.json({
+					protocolVersion: 1,
+					activeBranchId: "draft / one",
+					sessionId: "session-1",
+				});
+			},
+		},
+		{ initialActiveBranchId: "draft / one" },
+	);
+
+	const handshakeUrl = new URL(requests[0]?.url ?? "");
+	expect(handshakeUrl.pathname).toBe("/@acme/workspace/lix/v1/");
+	expect(handshakeUrl.searchParams.get("activeBranchId")).toBe("draft / one");
+	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
+
+	await binding.close();
+});
 
 async function requestJson(request: Request): Promise<unknown> {
 	const bytes = new Uint8Array(await request.arrayBuffer());
@@ -14,35 +45,37 @@ async function requestJson(request: Request): Promise<unknown> {
 test("remote mode uses the workspace protocol without loading a local engine", async () => {
 	const requests: Request[] = [];
 	let headerCalls = 0;
-	const remoteFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-		const request = new Request(input, init);
-		requests.push(request);
-		if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
-			return Response.json({
-				protocolVersion: 1,
-				activeBranchId: "main-id",
-				sessionId: "session-1",
-			});
-		}
-		if (new URL(request.url).pathname.endsWith("/lix/v1/execute")) {
-			return Response.json({
-				columns: ["n", "bytes", "json"],
-				rows: [
-					[
-						{ kind: "int", value: 42 },
-						{ kind: "blob", base64: "AQID" },
-						{ kind: "json", value: { ok: true } },
+	const remoteFetch = vi.fn(
+		async (input: RequestInfo | URL, init?: RequestInit) => {
+			const request = new Request(input, init);
+			requests.push(request);
+			if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
+				return Response.json({
+					protocolVersion: 1,
+					activeBranchId: "main-id",
+					sessionId: "session-1",
+				});
+			}
+			if (new URL(request.url).pathname.endsWith("/lix/v1/execute")) {
+				return Response.json({
+					columns: ["n", "bytes", "json"],
+					rows: [
+						[
+							{ kind: "int", value: 42 },
+							{ kind: "blob", base64: "AQID" },
+							{ kind: "json", value: { ok: true } },
+						],
 					],
-				],
-				rowsAffected: 0,
-				notices: [],
-			});
-		}
-		if (request.method === "DELETE") {
-			return new Response(null, { status: 204 });
-		}
-		throw new Error(`Unexpected request: ${request.url}`);
-	});
+					rowsAffected: 0,
+					notices: [],
+				});
+			}
+			if (request.method === "DELETE") {
+				return new Response(null, { status: 204 });
+			}
+			throw new Error(`Unexpected request: ${request.url}`);
+		},
+	);
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -524,10 +557,9 @@ test("remote branches preserve local Lix branch semantics", async () => {
 	await lix.switchBranch({ branchId: created.id });
 	expect(await lix.activeBranchId()).toBe("draft-id");
 	const posted = requests.filter((request) => request.method === "POST");
-	expect(await Promise.all(posted.map((request) => request.clone().json()))).toEqual([
-		{ name: "Draft" },
-		{ branchId: "draft-id" },
-	]);
+	expect(
+		await Promise.all(posted.map((request) => request.clone().json())),
+	).toEqual([{ name: "Draft" }, { branchId: "draft-id" }]);
 
 	await lix.close();
 });
@@ -564,37 +596,46 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 		},
 	});
 
-	await expect(lix.switchBranch({ branchId: "missing" })).rejects.toMatchObject({
-		name: "LixError",
-		code: "LIX_BRANCH_NOT_FOUND",
-		message: "Branch not found",
-		hint: "Choose an existing branch",
-		details: { branchId: "missing" },
-		status: 404,
-	});
+	await expect(lix.switchBranch({ branchId: "missing" })).rejects.toMatchObject(
+		{
+			name: "LixError",
+			code: "LIX_BRANCH_NOT_FOUND",
+			message: "Branch not found",
+			hint: "Choose an existing branch",
+			details: { branchId: "missing" },
+			status: 404,
+		},
+	);
 	expect(await lix.activeBranchId()).toBe("main-id");
 
 	await lix.close();
 });
 
-test("remote clients share the same workspace active branch", async () => {
-	let activeBranchId = "main-id";
+test("remote clients retain independent active branches", async () => {
 	let nextSessionId = 0;
+	const activeBranches = new Map<string, string>();
 	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 		const request = new Request(input, init);
 		const pathname = new URL(request.url).pathname;
 		if (pathname.endsWith("/lix/v1/")) {
+			const sessionId =
+				request.headers.get("lix-session-id") ?? `session-${++nextSessionId}`;
+			if (!activeBranches.has(sessionId)) {
+				activeBranches.set(sessionId, "main-id");
+			}
 			return Response.json({
 				protocolVersion: 1,
-				activeBranchId,
-				sessionId:
-					request.headers.get("lix-session-id") ??
-					`session-${++nextSessionId}`,
+				activeBranchId: activeBranches.get(sessionId),
+				sessionId,
 			});
 		}
 		if (pathname.endsWith("/branch/switch")) {
-			activeBranchId = ((await request.json()) as { branchId: string }).branchId;
-			return Response.json({ branchId: activeBranchId });
+			const sessionId = request.headers.get("lix-session-id");
+			if (sessionId === null) throw new Error("missing session id");
+			const branchId = ((await request.json()) as { branchId: string })
+				.branchId;
+			activeBranches.set(sessionId, branchId);
+			return Response.json({ branchId });
 		}
 		if (request.method === "DELETE") {
 			return new Response(null, { status: 204 });
@@ -613,7 +654,7 @@ test("remote clients share the same workspace active branch", async () => {
 
 	await first.switchBranch({ branchId: "draft-id" });
 	expect(await first.activeBranchId()).toBe("draft-id");
-	expect(await second.activeBranchId()).toBe("draft-id");
+	expect(await second.activeBranchId()).toBe("main-id");
 
 	await Promise.all([first.close(), second.close()]);
 });
@@ -762,28 +803,25 @@ test("remote mode rejects incompatible protocol versions", async () => {
 	).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
 });
 
-test.each([
-	undefined,
-	"",
-	" contains-space",
-	"contains\nnewline",
-	42,
-])("remote mode rejects an invalid handshake sessionId: %j", async (sessionId) => {
-	await expect(
-		openLix({
-			server: {
-				mode: "remote",
-				url: "https://lixray.test/workspace",
-				fetch: (async () =>
-					Response.json({
-						protocolVersion: 1,
-						activeBranchId: "main-id",
-						sessionId,
-					})) as typeof fetch,
-			},
-		}),
-	).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
-});
+test.each([undefined, "", " contains-space", "contains\nnewline", 42])(
+	"remote mode rejects an invalid handshake sessionId: %j",
+	async (sessionId) => {
+		await expect(
+			openLix({
+				server: {
+					mode: "remote",
+					url: "https://lixray.test/workspace",
+					fetch: (async () =>
+						Response.json({
+							protocolVersion: 1,
+							activeBranchId: "main-id",
+							sessionId,
+						})) as typeof fetch,
+				},
+			}),
+		).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
+	},
+);
 
 test("a later handshake cannot silently replace the remote session", async () => {
 	let handshakeCalls = 0;
@@ -848,7 +886,9 @@ test("an expired session mutation is propagated without a new handshake or retry
 		},
 	});
 
-	await expect(lix.execute("UPDATE lix_file SET data = $1")).rejects.toMatchObject({
+	await expect(
+		lix.execute("UPDATE lix_file SET data = $1"),
+	).rejects.toMatchObject({
 		code: "LIX_REMOTE_SESSION_EXPIRED",
 		status: 410,
 	});

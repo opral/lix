@@ -1,9 +1,9 @@
-//! Canonical HTTP transport for independent sessions on a workspace-mode
-//! [`lix_sdk::Lix`] handle.
+//! Canonical HTTP transport for independent pinned sessions on a workspace-mode
+//! root [`lix_sdk::Lix`] handle.
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
     middleware::{self, Next},
     response::{
@@ -30,7 +30,7 @@ use std::{
 };
 use tokio::{
     runtime::Handle,
-    sync::{Mutex as AsyncMutex, mpsc},
+    sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, mpsc},
     task::JoinHandle,
 };
 use tower_http::{
@@ -93,8 +93,8 @@ impl Default for ProtocolServerOptions {
 /// Persistent canonical protocol server for one Lix workspace.
 ///
 /// A server owns one root [`Lix`] and opens every remote client as an
-/// independent workspace session on that root's existing engine. Clones share
-/// the same bounded in-memory session registry.
+/// independent branch-pinned session on that root's existing engine. Clones
+/// share the same bounded in-memory session registry.
 #[expect(missing_debug_implementations)]
 pub struct LixProtocolServer<S>
 where
@@ -142,7 +142,7 @@ struct SessionRecord<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix: Arc<Lix<S>>,
+    lix: Arc<AsyncRwLock<Arc<Lix<S>>>>,
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
     request_blobs: Mutex<RequestBlobCache>,
@@ -196,7 +196,7 @@ where
 {
     fn new(lix: Lix<S>, now: Instant) -> Self {
         Self {
-            lix: Arc::new(lix),
+            lix: Arc::new(AsyncRwLock::new(Arc::new(lix))),
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
             request_blobs: Mutex::new(RequestBlobCache::default()),
@@ -293,7 +293,12 @@ where
         tokio::task::spawn_blocking(move || {
             let _operation_lease = operation_lease;
             tracing::dispatcher::with_default(&dispatch, || {
-                parent.in_scope(|| runtime.block_on(operation(lix)))
+                parent.in_scope(|| {
+                    runtime.block_on(async move {
+                        let lix = lix.read().await;
+                        operation(Arc::clone(&lix)).await
+                    })
+                })
             })
         })
         .await
@@ -305,9 +310,46 @@ where
         })?
     }
 
-    fn observe(&self, sql: &str, params: &[Value]) -> Result<ServerObserve<S>, LixError> {
+    async fn switch_branch(
+        &self,
+        options: SwitchBranchOptions,
+    ) -> Result<lix_sdk::SwitchBranchReceipt, LixError> {
+        let runtime = Handle::try_current().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("access Lix server runtime: {error}"),
+            )
+        })?;
+        let lix = Arc::clone(&self.record.lix);
+        let operation_lease = self.clone();
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            let _operation_lease = operation_lease;
+            tracing::dispatcher::with_default(&dispatch, || {
+                parent.in_scope(|| {
+                    runtime.block_on(async move {
+                        let mut lix = lix.write().await;
+                        let (switched, receipt) = lix.switch_branch_session(options).await?;
+                        *lix = Arc::new(switched);
+                        Ok(receipt)
+                    })
+                })
+            })
+        })
+        .await
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("join Lix server branch switch: {error}"),
+            )
+        })?
+    }
+
+    async fn observe(&self, sql: &str, params: &[Value]) -> Result<ServerObserve<S>, LixError> {
+        let lix = self.record.lix.read().await;
         Ok(ServerObserve {
-            events: Arc::new(Mutex::new(self.record.lix.observe(sql, params)?)),
+            events: Arc::new(Mutex::new(lix.observe(sql, params)?)),
         })
     }
 }
@@ -511,7 +553,7 @@ where
             .collect::<Vec<_>>();
         let mut first_error = None;
         for record in sessions {
-            if let Err(error) = record.lix.close().await
+            if let Err(error) = close_session_record(&record).await
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -526,9 +568,21 @@ where
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn create_session(&self) -> Result<SessionLease<S>, ApiError> {
+    async fn create_session(
+        &self,
+        initial_active_branch_id: Option<String>,
+    ) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
         ensure_server_open(registry.lifecycle)?;
+
+        let active_branch_id = match initial_active_branch_id {
+            Some(active_branch_id) => active_branch_id,
+            None => self.inner.root.active_branch_id().await?,
+        };
+        // Validate and open the pinned child before evicting any idle session.
+        // A stale client branch preference therefore cannot consume capacity or
+        // evict another client.
+        let child = self.inner.root.open_session(active_branch_id).await?;
 
         let now = Instant::now();
         let expired_ids = registry
@@ -553,6 +607,13 @@ where
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
             let Some(lru_idle_id) = lru_idle_id else {
+                if let Err(error) = child.close().await {
+                    tracing::warn!(
+                        code = %error.code,
+                        message = %error.message,
+                        "failed to close an unregistered Lix protocol session"
+                    );
+                }
                 return Err(ApiError::capacity());
             };
             if let Some(record) = registry.sessions.remove(&lru_idle_id) {
@@ -560,7 +621,6 @@ where
             }
         }
 
-        let child = self.inner.root.open_workspace_session().await?;
         let session_id = loop {
             let candidate = generate_session_id()?;
             if !registry.sessions.contains_key(&candidate) {
@@ -597,17 +657,25 @@ where
         let record = registry.sessions.remove(session_id);
         drop(registry);
         if let Some(record) = record {
-            record.lix.close().await?;
+            close_session_record(&record).await?;
         }
         Ok(())
     }
+}
+
+async fn close_session_record<S>(record: &SessionRecord<S>) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let lix = record.lix.write().await;
+    lix.close().await
 }
 
 async fn close_removed_session<S>(record: Arc<SessionRecord<S>>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    if let Err(error) = record.lix.close().await {
+    if let Err(error) = close_session_record(&record).await {
         tracing::warn!(
             code = %error.code,
             message = %error.message,
@@ -697,14 +765,35 @@ where
 
 async fn handshake<S>(
     State(state): State<HandlerState<S>>,
+    Query(request): Query<HandshakeRequest>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let lease = match optional_session_id(&headers)? {
-        Some(session_id) => state.lease(&session_id).await?,
-        None => state.server.create_session().await?,
+        Some(session_id) => {
+            if request.active_branch_id.is_some() {
+                return Err(ApiError::bad_request(
+                    "activeBranchId is only allowed when creating a session",
+                ));
+            }
+            state.lease(&session_id).await?
+        }
+        None => {
+            let active_branch_id = match request.active_branch_id {
+                Some(active_branch_id) if !active_branch_id.trim().is_empty() => {
+                    Some(active_branch_id)
+                }
+                Some(_) => {
+                    return Err(ApiError::bad_request(
+                        "activeBranchId must be a non-empty string",
+                    ));
+                }
+                None => None,
+            };
+            state.server.create_session(active_branch_id).await?
+        }
     };
     let active_branch_id = lease
         .run(|lix| async move { lix.active_branch_id().await })
@@ -842,9 +931,7 @@ where
     let options = SwitchBranchOptions {
         branch_id: required_non_empty(request.branch_id, "branchId")?,
     };
-    let receipt = lease
-        .run(move |lix| async move { lix.switch_branch(options).await })
-        .await?;
+    let receipt = lease.switch_branch(options).await?;
     Ok(Json(SwitchBranchResponse {
         branch_id: receipt.branch_id,
     }))
@@ -859,7 +946,7 @@ where
 {
     let sql = required_non_empty(request.sql, "sql")?;
     let params = decode_params(request.params)?;
-    let events = lease.observe(&sql, &params)?;
+    let events = lease.observe(&sql, &params).await?;
     let stream = async_stream::stream! {
         let _lease = lease;
         loop {
@@ -907,7 +994,7 @@ where
         let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
         let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
         let params = decode_params(subscription.params)?;
-        let events = lease.observe(&sql, &params)?;
+        let events = lease.observe(&sql, &params).await?;
         let sender = sender.clone();
         let parent = tracing::Span::current();
         tasks.push(tokio::spawn(
@@ -1426,6 +1513,12 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HandshakeRequest {
+    active_branch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1971,7 +2064,15 @@ mod tests {
     }
 
     async fn new_session(app: &Router) -> (String, JsonValue) {
-        let response = request(app, "GET", "/lix/v1", None, None).await;
+        new_session_at(app, None).await
+    }
+
+    async fn new_session_at(app: &Router, active_branch_id: Option<&str>) -> (String, JsonValue) {
+        let uri = active_branch_id.map_or_else(
+            || "/lix/v1".to_string(),
+            |active_branch_id| format!("/lix/v1?activeBranchId={active_branch_id}"),
+        );
+        let response = request(app, "GET", &uri, None, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CACHE_CONTROL),
@@ -2159,7 +2260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_and_switch_share_the_workspace_selector() {
+    async fn pinned_protocol_sessions_switch_branches_independently() {
         let app = app().await;
         let (first_session, before) = new_session(&app.router).await;
         let (second_session, _) = new_session(&app.router).await;
@@ -2189,8 +2290,105 @@ mod tests {
         )
         .await;
         assert_eq!(switched.status(), StatusCode::OK);
-        let after = request(&app.router, "GET", "/lix/v1/", Some(&second_session), None).await;
-        assert_eq!(response_json(after).await["activeBranchId"], draft);
+
+        let first_after = request(&app.router, "GET", "/lix/v1/", Some(&first_session), None).await;
+        assert_eq!(response_json(first_after).await["activeBranchId"], draft);
+        let second_after =
+            request(&app.router, "GET", "/lix/v1/", Some(&second_session), None).await;
+        assert_eq!(response_json(second_after).await["activeBranchId"], active);
+
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&first_session),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('remote-pinned-only', 'draft')"
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+        let main_count = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&second_session),
+            Some(json!({
+                "sql": "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'remote-pinned-only'"
+            })),
+        )
+        .await;
+        assert_eq!(main_count.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(main_count).await["rows"][0][0],
+            json!({ "kind": "int", "value": 0 })
+        );
+
+        let first_sql_branch = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&first_session),
+            Some(json!({ "sql": "SELECT lix_active_branch_id() AS branch_id" })),
+        )
+        .await;
+        assert_eq!(first_sql_branch.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(first_sql_branch).await["rows"][0][0],
+            json!({ "kind": "text", "value": draft })
+        );
+        let second_sql_branch = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&second_session),
+            Some(json!({ "sql": "SELECT lix_active_branch_id() AS branch_id" })),
+        )
+        .await;
+        assert_eq!(second_sql_branch.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(second_sql_branch).await["rows"][0][0],
+            json!({ "kind": "text", "value": active })
+        );
+
+        let (initial_draft_session, initial_draft) =
+            new_session_at(&app.router, Some(&draft)).await;
+        assert_eq!(initial_draft["activeBranchId"], draft);
+        let draft_count = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&initial_draft_session),
+            Some(json!({
+                "sql": "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'remote-pinned-only'"
+            })),
+        )
+        .await;
+        assert_eq!(draft_count.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(draft_count).await["rows"][0][0],
+            json!({ "kind": "int", "value": 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_branch_does_not_create_a_protocol_session() {
+        let app = app().await;
+        let before = app.server.inner.registry.lock().await.sessions.len();
+        let response = request(
+            &app.router,
+            "GET",
+            "/lix/v1?activeBranchId=missing-branch",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(response).await, LixError::CODE_BRANCH_NOT_FOUND);
+        assert_eq!(
+            app.server.inner.registry.lock().await.sessions.len(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -3162,7 +3360,11 @@ mod tests {
             ..ProtocolServerOptions::default()
         })
         .await;
-        let lease = app.server.create_session().await.expect("session lease");
+        let lease = app
+            .server
+            .create_session(None)
+            .await
+            .expect("session lease");
         let record = Arc::clone(&lease.record);
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (finish_sender, finish) = tokio::sync::oneshot::channel();
@@ -3204,13 +3406,16 @@ mod tests {
         let (session_id, _) = new_session(&app.router).await;
         let child = {
             let registry = app.server.inner.registry.lock().await;
-            Arc::clone(
+            let current = Arc::clone(
                 &registry
                     .sessions
                     .get(&session_id)
                     .expect("registered child")
                     .lix,
-            )
+            );
+            drop(registry);
+            let current = current.read().await;
+            Arc::clone(&*current)
         };
         let root = Arc::clone(&app.server.inner.root);
 

@@ -9,6 +9,7 @@ import type {
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	LixTelemetrySpan,
+	JsonValue,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
 
@@ -49,12 +50,18 @@ export type LixBinding = {
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;
+	clientStateEntries?(): Promise<Array<{ key: string; value: JsonValue }>>;
+	clientStateGet?(key: string): Promise<JsonValue | undefined>;
+	clientStateSet?(key: string, value: JsonValue): Promise<void>;
+	clientStateDelete?(key: string): Promise<void>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
 	importFilesystemPaths(paths: string[]): Promise<void>;
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
+	/** Internal snapshot capability implemented by browser memory bindings. */
+	exportSnapshot?(): Promise<Uint8Array>;
 	close(): Promise<void>;
 };
 
@@ -77,7 +84,7 @@ export type PluginRuntimeDispatch = (request: unknown) => Promise<unknown>;
 export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
 export type LixStorageConfig =
-	| { kind: "memory" }
+	| { kind: "memory"; snapshot?: Uint8Array }
 	| { kind: "sqlite"; path: string }
 	| {
 			kind: "localFilesystem";
