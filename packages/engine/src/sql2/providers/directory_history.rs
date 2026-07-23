@@ -84,6 +84,10 @@ where
         Arc::clone(&self.schema)
     }
 
+    fn history_anchor_column(&self) -> Option<&'static str> {
+        Some(HISTORY_COL_AS_OF_COMMIT_ID)
+    }
+
     fn table_type(&self) -> TableType {
         TableType::View
     }

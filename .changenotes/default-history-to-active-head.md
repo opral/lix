@@ -12,3 +12,5 @@ The obsolete `LIX_HISTORY_FILTER_REQUIRED` error code is retired.
 Exact equality and non-empty `IN` predicates on the history anchor still
 override the default for time travel. Other anchor predicates now fail
 explicitly instead of silently traversing from the active head.
+Validation follows the resolved history relation through aliases, subqueries,
+and joins; an unrelated table column with the same name is not an anchor.

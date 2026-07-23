@@ -30,6 +30,8 @@ use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
 use datafusion::catalog::TableProvider;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::logical_expr::TableSource;
 
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
@@ -38,6 +40,15 @@ pub(crate) use file::{
 };
 pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
+
+pub(crate) fn history_anchor_column(source: &dyn TableSource) -> Option<&'static str> {
+    let source = source.as_any().downcast_ref::<DefaultTableSource>()?;
+    let provider = source
+        .table_provider
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()?;
+    provider.history_anchor_column()
+}
 
 /// Execute an `INSERT ... ON CONFLICT` against a registered table provider.
 /// The four builtin writable surfaces are all [`spec::SpecTableProvider`]s.

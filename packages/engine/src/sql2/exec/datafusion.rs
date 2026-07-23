@@ -11,7 +11,8 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
-use datafusion::common::{Column, DFSchema, ParamValues, ScalarValue};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, JoinType, ParamValues, ScalarValue};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
@@ -29,7 +30,7 @@ use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurfa
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
-use crate::sql2::history_route::validate_history_anchor_filter_shape;
+use crate::sql2::history_route::invalid_history_anchor_error;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
@@ -255,41 +256,611 @@ fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> 
     params
 }
 
-fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
-    fn visit(plan: &LogicalPlan, inherited_filters: &[Expr]) -> Result<(), LixError> {
-        match plan {
-            LogicalPlan::Filter(filter) => {
-                let mut filters = inherited_filters.to_vec();
-                filters.push(filter.predicate.clone());
-                visit(&filter.input, &filters)
-            }
-            LogicalPlan::TableScan(scan) => {
-                let table_name = table_reference_name(&scan.table_name);
-                if !table_name.ends_with("_history") {
-                    return Ok(());
-                }
-                if scan
-                    .source
-                    .schema()
-                    .field_with_name("lixcol_as_of_commit_id")
-                    .is_ok()
-                {
-                    for filter in inherited_filters.iter().chain(&scan.filters) {
-                        validate_history_anchor_filter_shape(filter)?;
-                    }
-                }
-                Ok(())
-            }
-            other => {
-                for input in other.inputs() {
-                    visit(input, inherited_filters)?;
-                }
-                Ok(())
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryAnchorLineage {
+    Direct,
+    Derived,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryAnchorScope {
+    schema: DFSchemaRef,
+    columns: Vec<Option<HistoryAnchorLineage>>,
+}
+
+impl HistoryAnchorScope {
+    fn empty(schema: DFSchemaRef) -> Self {
+        Self {
+            columns: vec![None; schema.fields().len()],
+            schema,
         }
     }
 
-    visit(plan, &[])
+    fn resolve(&self, column: &Column) -> Option<(usize, HistoryAnchorLineage)> {
+        let index = self.schema.maybe_index_of_column(column)?;
+        self.columns
+            .get(index)
+            .copied()
+            .flatten()
+            .map(|lineage| (index, lineage))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryAnchorLocation {
+    Local,
+    Outer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedHistoryAnchor {
+    location: HistoryAnchorLocation,
+    scope_index: usize,
+    column_index: usize,
+    lineage: HistoryAnchorLineage,
+    column_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryAnchorKey {
+    scope_index: usize,
+    column_index: usize,
+}
+
+struct HistoryAnchorResolver<'a> {
+    local: &'a [HistoryAnchorScope],
+    outer: &'a [HistoryAnchorScope],
+}
+
+impl HistoryAnchorResolver<'_> {
+    fn resolve_local(&self, column: &Column) -> Option<ResolvedHistoryAnchor> {
+        Self::resolve(column, self.local, HistoryAnchorLocation::Local)
+    }
+
+    fn resolve_outer(&self, column: &Column) -> Option<ResolvedHistoryAnchor> {
+        Self::resolve(column, self.outer, HistoryAnchorLocation::Outer)
+    }
+
+    fn resolve(
+        column: &Column,
+        scopes: &[HistoryAnchorScope],
+        location: HistoryAnchorLocation,
+    ) -> Option<ResolvedHistoryAnchor> {
+        let mut schema_matches = scopes
+            .iter()
+            .enumerate()
+            .filter_map(|(scope_index, scope)| {
+                scope
+                    .schema
+                    .maybe_index_of_column(column)
+                    .map(|column_index| (scope_index, column_index, scope))
+            });
+        let first = schema_matches.next()?;
+        // An unqualified same-named column across multiple inputs is not enough
+        // to identify the history relation. DataFusion normally qualifies these
+        // references; keeping ambiguity non-history avoids relation-blind false
+        // positives if an extension plan does not.
+        if schema_matches.next().is_some() {
+            return None;
+        }
+        let lineage = first.2.columns.get(first.1).copied().flatten()?;
+        Some(ResolvedHistoryAnchor {
+            location,
+            scope_index: first.0,
+            column_index: first.1,
+            lineage,
+            column_name: column.name.clone(),
+        })
+    }
+}
+
+fn history_anchor_references(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> Vec<ResolvedHistoryAnchor> {
+    let mut references = expr
+        .column_refs()
+        .into_iter()
+        .filter_map(|column| resolver.resolve_local(column))
+        .collect::<Vec<_>>();
+    expr.apply(|nested| {
+        if let Expr::OuterReferenceColumn(_, column) = nested {
+            if let Some(reference) = resolver.resolve_outer(column) {
+                references.push(reference);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("history anchor expression traversal is infallible");
+    references
+}
+
+fn direct_history_anchor_reference(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> Option<ResolvedHistoryAnchor> {
+    match expr {
+        Expr::Alias(alias) => direct_history_anchor_reference(&alias.expr, resolver),
+        Expr::Column(column) => resolver.resolve_local(column),
+        Expr::OuterReferenceColumn(_, column) => resolver.resolve_outer(column),
+        _ => None,
+    }
+}
+
+fn routable_history_anchor_value_shape(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ScalarValue::Utf8(Some(_)), _) | Expr::Placeholder(_)
+    ) || matches!(
+        expr,
+        Expr::ScalarFunction(function)
+            if function.name() == "lix_active_branch_commit_id" && function.args.is_empty()
+    )
+}
+
+fn exact_history_anchor_equality_key(
+    binary: &BinaryExpr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> Option<HistoryAnchorKey> {
+    for (anchor, value) in [
+        (binary.left.as_ref(), binary.right.as_ref()),
+        (binary.right.as_ref(), binary.left.as_ref()),
+    ] {
+        let Some(reference) = direct_history_anchor_reference(anchor, resolver) else {
+            continue;
+        };
+        if reference.location == HistoryAnchorLocation::Local
+            && reference.lineage == HistoryAnchorLineage::Direct
+            && history_anchor_references(value, resolver).is_empty()
+            && routable_history_anchor_value_shape(value)
+        {
+            return Some(HistoryAnchorKey {
+                scope_index: reference.scope_index,
+                column_index: reference.column_index,
+            });
+        }
+    }
+    None
+}
+
+fn exact_history_anchor_term_key(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> Option<HistoryAnchorKey> {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            exact_history_anchor_equality_key(binary, resolver)
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            let left = exact_history_anchor_term_key(&binary.left, resolver)?;
+            let right = exact_history_anchor_term_key(&binary.right, resolver)?;
+            (left == right).then_some(left)
+        }
+        Expr::InList(in_list) if !in_list.negated && !in_list.list.is_empty() => {
+            let reference = direct_history_anchor_reference(&in_list.expr, resolver)?;
+            (reference.location == HistoryAnchorLocation::Local
+                && reference.lineage == HistoryAnchorLineage::Direct
+                && in_list.list.iter().all(routable_history_anchor_value_shape))
+            .then_some(HistoryAnchorKey {
+                scope_index: reference.scope_index,
+                column_index: reference.column_index,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn history_anchor_predicate_shape_is_exact(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> bool {
+    if history_anchor_references(expr, resolver).is_empty() {
+        return true;
+    }
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            history_anchor_predicate_shape_is_exact(&binary.left, resolver)
+                && history_anchor_predicate_shape_is_exact(&binary.right, resolver)
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            exact_history_anchor_term_key(expr, resolver).is_some()
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            exact_history_anchor_equality_key(binary, resolver).is_some()
+        }
+        Expr::InList(_) => exact_history_anchor_term_key(expr, resolver).is_some(),
+        _ => false,
+    }
+}
+
+fn validate_history_anchor_predicate(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> Result<(), LixError> {
+    let references = history_anchor_references(expr, resolver);
+    if references.is_empty() || history_anchor_predicate_shape_is_exact(expr, resolver) {
+        return Ok(());
+    }
+    Err(invalid_history_anchor_error(
+        &references[0].column_name,
+        None,
+    ))
+}
+
+fn join_on_history_anchor_side_is_pushable(join_type: JoinType, scope_index: usize) -> bool {
+    let (left, right) = match join_type {
+        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi => (true, true),
+        JoinType::Left | JoinType::LeftAnti | JoinType::LeftMark => (false, true),
+        JoinType::Right | JoinType::RightAnti | JoinType::RightMark => (true, false),
+        JoinType::Full => (false, false),
+    };
+    match scope_index {
+        0 => left,
+        1 => right,
+        _ => false,
+    }
+}
+
+fn validate_history_anchor_join_predicate(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+    join_type: JoinType,
+) -> Result<(), LixError> {
+    validate_history_anchor_predicate(expr, resolver)?;
+    let unpushable = history_anchor_references(expr, resolver)
+        .into_iter()
+        .find(|reference| {
+            reference.location == HistoryAnchorLocation::Local
+                && !join_on_history_anchor_side_is_pushable(join_type, reference.scope_index)
+        });
+    let Some(reference) = unpushable else {
+        return Ok(());
+    };
+    Err(invalid_history_anchor_error(&reference.column_name, None))
+}
+
+fn validate_embedded_history_anchor_predicates(
+    expr: &Expr,
+    resolver: &HistoryAnchorResolver<'_>,
+) -> Result<(), LixError> {
+    let mut result = Ok(());
+    expr.apply(|nested| {
+        let predicate = match nested {
+            Expr::AggregateFunction(function) => function.params.filter.as_deref(),
+            Expr::WindowFunction(function) => function.params.filter.as_deref(),
+            _ => None,
+        };
+        if let Some(predicate) = predicate {
+            if let Some(reference) = history_anchor_references(predicate, resolver).first() {
+                result = Err(invalid_history_anchor_error(&reference.column_name, None));
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("embedded history anchor predicate traversal is infallible");
+    result
+}
+
+fn projected_history_anchor_scope(
+    schema: DFSchemaRef,
+    expressions: &[Expr],
+    inputs: &[HistoryAnchorScope],
+    outer: &[HistoryAnchorScope],
+) -> HistoryAnchorScope {
+    let resolver = HistoryAnchorResolver {
+        local: inputs,
+        outer,
+    };
+    let mut output = HistoryAnchorScope::empty(schema);
+    for (index, expression) in expressions.iter().enumerate() {
+        let has_local_reference = history_anchor_references(expression, &resolver)
+            .into_iter()
+            .any(|reference| reference.location == HistoryAnchorLocation::Local);
+        if !has_local_reference {
+            continue;
+        }
+        let lineage = direct_history_anchor_reference(expression, &resolver)
+            .filter(|reference| reference.location == HistoryAnchorLocation::Local)
+            .map_or(HistoryAnchorLineage::Derived, |reference| reference.lineage);
+        if let Some(column) = output.columns.get_mut(index) {
+            *column = Some(lineage);
+        }
+    }
+    output
+}
+
+fn positional_history_anchor_scope(
+    schema: DFSchemaRef,
+    input: &HistoryAnchorScope,
+) -> HistoryAnchorScope {
+    let mut output = HistoryAnchorScope::empty(schema);
+    for (target, source) in output.columns.iter_mut().zip(&input.columns) {
+        *target = *source;
+    }
+    output
+}
+
+fn unroutable_history_anchor_scope(
+    schema: DFSchemaRef,
+    input: &HistoryAnchorScope,
+) -> HistoryAnchorScope {
+    let mut output = positional_history_anchor_scope(schema, input);
+    for lineage in output.columns.iter_mut().flatten() {
+        *lineage = HistoryAnchorLineage::Derived;
+    }
+    output
+}
+
+fn merged_history_anchor_scope(
+    schema: DFSchemaRef,
+    inputs: &[HistoryAnchorScope],
+) -> HistoryAnchorScope {
+    let mut output = HistoryAnchorScope::empty(schema);
+    for index in 0..output.columns.len() {
+        let column = Column::from(output.schema.qualified_field(index));
+        let mut matches = inputs.iter().filter_map(|input| input.resolve(&column));
+        let first = matches.next();
+        if matches.next().is_none() {
+            output.columns[index] = first.map(|(_, lineage)| lineage);
+        }
+    }
+    output
+}
+
+fn validate_history_anchor_subqueries(
+    expr: &Expr,
+    local: &[HistoryAnchorScope],
+    outer: &[HistoryAnchorScope],
+) -> Result<(), LixError> {
+    let nested_outer = local.iter().chain(outer).cloned().collect::<Vec<_>>();
+    let mut result = Ok(());
+    expr.apply(|nested| {
+        let subquery = match nested {
+            Expr::Exists(exists) => Some(exists.subquery.subquery.as_ref()),
+            Expr::InSubquery(in_subquery) => Some(in_subquery.subquery.subquery.as_ref()),
+            Expr::SetComparison(comparison) => Some(comparison.subquery.subquery.as_ref()),
+            Expr::ScalarSubquery(subquery) => Some(subquery.subquery.as_ref()),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            result = visit_history_anchor_plan(subquery, &nested_outer).map(|_| ());
+            if result.is_err() {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("history anchor subquery traversal is infallible");
+    result
+}
+
+fn visit_history_anchor_plan(
+    plan: &LogicalPlan,
+    outer: &[HistoryAnchorScope],
+) -> Result<HistoryAnchorScope, LixError> {
+    match plan {
+        LogicalPlan::TableScan(scan) => {
+            let Some(anchor_column) =
+                crate::sql2::providers::history_anchor_column(scan.source.as_ref())
+            else {
+                return Ok(HistoryAnchorScope::empty(scan.projected_schema.clone()));
+            };
+            let source_schema = std::sync::Arc::new(
+                DFSchema::try_from_qualified_schema(
+                    scan.table_name.clone(),
+                    scan.source.schema().as_ref(),
+                )
+                .map_err(datafusion_error_to_lix_error)?,
+            );
+            let mut source_scope = HistoryAnchorScope::empty(source_schema);
+            if let Some(index) = source_scope
+                .schema
+                .index_of_column_by_name(Some(&scan.table_name), anchor_column)
+            {
+                source_scope.columns[index] = Some(HistoryAnchorLineage::Direct);
+            }
+            let local = std::slice::from_ref(&source_scope);
+            let resolver = HistoryAnchorResolver { local, outer };
+            for filter in &scan.filters {
+                validate_history_anchor_subqueries(filter, local, outer)?;
+                validate_history_anchor_predicate(filter, &resolver)?;
+            }
+
+            let mut output = HistoryAnchorScope::empty(scan.projected_schema.clone());
+            if let Some(index) = output
+                .schema
+                .index_of_column_by_name(Some(&scan.table_name), anchor_column)
+            {
+                output.columns[index] = Some(HistoryAnchorLineage::Direct);
+            }
+            Ok(output)
+        }
+        LogicalPlan::Filter(filter) => {
+            let input = visit_history_anchor_plan(&filter.input, outer)?;
+            let local = std::slice::from_ref(&input);
+            validate_history_anchor_subqueries(&filter.predicate, local, outer)?;
+            validate_history_anchor_predicate(
+                &filter.predicate,
+                &HistoryAnchorResolver { local, outer },
+            )?;
+            Ok(positional_history_anchor_scope(
+                plan.schema().clone(),
+                &input,
+            ))
+        }
+        LogicalPlan::Projection(projection) => {
+            let input = visit_history_anchor_plan(&projection.input, outer)?;
+            let local = std::slice::from_ref(&input);
+            for expression in &projection.expr {
+                validate_history_anchor_subqueries(expression, local, outer)?;
+                validate_embedded_history_anchor_predicates(
+                    expression,
+                    &HistoryAnchorResolver { local, outer },
+                )?;
+            }
+            Ok(projected_history_anchor_scope(
+                projection.schema.clone(),
+                &projection.expr,
+                local,
+                outer,
+            ))
+        }
+        LogicalPlan::Aggregate(aggregate) => {
+            let input = visit_history_anchor_plan(&aggregate.input, outer)?;
+            let local = std::slice::from_ref(&input);
+            let expressions = aggregate
+                .group_expr
+                .iter()
+                .chain(&aggregate.aggr_expr)
+                .cloned()
+                .collect::<Vec<_>>();
+            for expression in &expressions {
+                validate_history_anchor_subqueries(expression, local, outer)?;
+                validate_embedded_history_anchor_predicates(
+                    expression,
+                    &HistoryAnchorResolver { local, outer },
+                )?;
+            }
+            let projected = projected_history_anchor_scope(
+                aggregate.schema.clone(),
+                &expressions,
+                local,
+                outer,
+            );
+            Ok(unroutable_history_anchor_scope(
+                aggregate.schema.clone(),
+                &projected,
+            ))
+        }
+        LogicalPlan::Window(window) => {
+            let input = visit_history_anchor_plan(&window.input, outer)?;
+            let local = std::slice::from_ref(&input);
+            for expression in &window.window_expr {
+                validate_history_anchor_subqueries(expression, local, outer)?;
+                validate_embedded_history_anchor_predicates(
+                    expression,
+                    &HistoryAnchorResolver { local, outer },
+                )?;
+            }
+            let mut output = positional_history_anchor_scope(window.schema.clone(), &input);
+            let input_width = input.schema.fields().len();
+            for (index, expression) in window.window_expr.iter().enumerate() {
+                if history_anchor_references(expression, &HistoryAnchorResolver { local, outer })
+                    .into_iter()
+                    .any(|reference| reference.location == HistoryAnchorLocation::Local)
+                {
+                    if let Some(column) = output.columns.get_mut(input_width + index) {
+                        *column = Some(HistoryAnchorLineage::Derived);
+                    }
+                }
+            }
+            Ok(unroutable_history_anchor_scope(
+                window.schema.clone(),
+                &output,
+            ))
+        }
+        LogicalPlan::Join(join) => {
+            let left = visit_history_anchor_plan(&join.left, outer)?;
+            let right = visit_history_anchor_plan(&join.right, outer)?;
+            let local = [left, right];
+            let resolver = HistoryAnchorResolver {
+                local: &local,
+                outer,
+            };
+            for (left, right) in &join.on {
+                let predicate = Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left.clone()),
+                    Operator::Eq,
+                    Box::new(right.clone()),
+                ));
+                validate_history_anchor_subqueries(&predicate, &local, outer)?;
+                validate_history_anchor_join_predicate(&predicate, &resolver, join.join_type)?;
+            }
+            if let Some(filter) = &join.filter {
+                validate_history_anchor_subqueries(filter, &local, outer)?;
+                validate_history_anchor_join_predicate(filter, &resolver, join.join_type)?;
+            }
+            Ok(merged_history_anchor_scope(join.schema.clone(), &local))
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            let input = visit_history_anchor_plan(&alias.input, outer)?;
+            Ok(positional_history_anchor_scope(
+                alias.schema.clone(),
+                &input,
+            ))
+        }
+        LogicalPlan::Limit(limit) => {
+            let input = visit_history_anchor_plan(&limit.input, outer)?;
+            for expression in plan.expressions() {
+                validate_history_anchor_subqueries(
+                    &expression,
+                    std::slice::from_ref(&input),
+                    outer,
+                )?;
+            }
+            Ok(unroutable_history_anchor_scope(
+                plan.schema().clone(),
+                &input,
+            ))
+        }
+        LogicalPlan::Union(union) => {
+            let inputs = union
+                .inputs
+                .iter()
+                .map(|input| visit_history_anchor_plan(input, outer))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut output = HistoryAnchorScope::empty(union.schema.clone());
+            for index in 0..output.columns.len() {
+                let lineages = inputs
+                    .iter()
+                    .filter_map(|input| input.columns.get(index).copied().flatten())
+                    .collect::<Vec<_>>();
+                if !lineages.is_empty() {
+                    output.columns[index] = Some(
+                        if lineages
+                            .iter()
+                            .all(|lineage| *lineage == HistoryAnchorLineage::Direct)
+                        {
+                            HistoryAnchorLineage::Direct
+                        } else {
+                            HistoryAnchorLineage::Derived
+                        },
+                    );
+                }
+            }
+            Ok(output)
+        }
+        other => {
+            let inputs = other
+                .inputs()
+                .into_iter()
+                .map(|input| visit_history_anchor_plan(input, outer))
+                .collect::<Result<Vec<_>, _>>()?;
+            for expression in other.expressions() {
+                validate_history_anchor_subqueries(&expression, &inputs, outer)?;
+                validate_embedded_history_anchor_predicates(
+                    &expression,
+                    &HistoryAnchorResolver {
+                        local: &inputs,
+                        outer,
+                    },
+                )?;
+            }
+            if inputs.len() == 1 {
+                Ok(positional_history_anchor_scope(
+                    other.schema().clone(),
+                    &inputs[0],
+                ))
+            } else {
+                Ok(merged_history_anchor_scope(other.schema().clone(), &inputs))
+            }
+        }
+    }
+}
+
+fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    visit_history_anchor_plan(plan, &[]).map(|_| ())
 }
 
 async fn execute_logical_plan(

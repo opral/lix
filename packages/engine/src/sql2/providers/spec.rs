@@ -205,6 +205,14 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     fn schema(&self) -> SchemaRef;
 
+    /// Public column that routes a history scan to an explicit commit.
+    ///
+    /// This is provider identity, not a name heuristic: ordinary entity
+    /// schemas may legitimately expose a property with the same name.
+    fn history_anchor_column(&self) -> Option<&'static str> {
+        None
+    }
+
     /// How the surface introspects in `information_schema.tables`.
     fn table_type(&self) -> TableType {
         TableType::Base
@@ -337,6 +345,10 @@ impl SpecTableProvider {
             spec,
             write_access,
         }
+    }
+
+    pub(super) fn history_anchor_column(&self) -> Option<&'static str> {
+        self.spec.history_anchor_column()
     }
 
     #[cfg(test)]

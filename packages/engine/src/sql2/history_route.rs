@@ -295,21 +295,6 @@ pub(crate) fn validate_history_anchor_filter(expr: &Expr) -> Result<(), LixError
     ))
 }
 
-/// Planning-time counterpart to [`validate_history_anchor_filter`].
-///
-/// Logical plans still contain bound placeholders before DataFusion prepares
-/// the physical scan, so this validates the exact routing *shape* while the
-/// provider-level validation later verifies the resolved commit-id values.
-pub(crate) fn validate_history_anchor_filter_shape(expr: &Expr) -> Result<(), LixError> {
-    if history_anchor_filter_shape_is_exact(expr) {
-        return Ok(());
-    }
-    Err(invalid_history_anchor_error(
-        HISTORY_COL_AS_OF_COMMIT_ID,
-        None,
-    ))
-}
-
 pub(crate) fn commit_graph_history_request(
     route: &HistoryRoute,
     schema_keys: Vec<String>,
@@ -430,7 +415,7 @@ pub(crate) fn invalid_history_anchor_error(
     LixError::new(
         LixError::CODE_UNSUPPORTED_SQL,
         format!(
-            "{surface}history anchor '{as_of_commit_column}' only supports exact equality or non-empty IN predicates"
+            "{surface}history anchor '{as_of_commit_column}' only supports exact equality or non-empty IN predicates that resolve directly to a history scan"
         ),
     )
     .with_hint(format!(
@@ -619,71 +604,6 @@ fn history_anchor_filter_is_exact(expr: &Expr) -> bool {
         ),
         _ => false,
     }
-}
-
-fn history_anchor_filter_shape_is_exact(expr: &Expr) -> bool {
-    if !history_filter_references_anchor(expr) {
-        return true;
-    }
-    match expr {
-        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-            history_anchor_filter_shape_is_exact(&binary_expr.left)
-                && history_anchor_filter_shape_is_exact(&binary_expr.right)
-        }
-        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-            exact_anchor_disjunction_shape(expr)
-        }
-        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
-            exact_anchor_equality_shape(binary_expr)
-        }
-        Expr::InList(in_list) => {
-            !in_list.negated
-                && !in_list.list.is_empty()
-                && matches!(
-                    in_list.expr.as_ref(),
-                    Expr::Column(column)
-                        if canonical_history_column_name(column.name.as_str())
-                            == Some("as_of_commit_id")
-                )
-                && in_list.list.iter().all(routable_anchor_value_shape)
-        }
-        _ => false,
-    }
-}
-
-fn exact_anchor_disjunction_shape(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-            exact_anchor_disjunction_shape(&binary_expr.left)
-                && exact_anchor_disjunction_shape(&binary_expr.right)
-        }
-        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
-            exact_anchor_equality_shape(binary_expr)
-        }
-        Expr::InList(_) => history_anchor_filter_shape_is_exact(expr),
-        _ => false,
-    }
-}
-
-fn exact_anchor_equality_shape(binary_expr: &datafusion::logical_expr::BinaryExpr) -> bool {
-    match (&*binary_expr.left, &*binary_expr.right) {
-        (Expr::Column(column), value) | (value, Expr::Column(column)) => {
-            canonical_history_column_name(column.name.as_str()) == Some("as_of_commit_id")
-                && routable_anchor_value_shape(value)
-        }
-        _ => false,
-    }
-}
-
-fn routable_anchor_value_shape(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ScalarValue::Utf8(Some(_)), _) | Expr::Placeholder(_)
-    ) || matches!(
-        expr,
-        Expr::ScalarFunction(function)
-            if function.name() == "lix_active_branch_commit_id" && function.args.is_empty()
-    )
 }
 
 fn history_filter_references_anchor(expr: &Expr) -> bool {

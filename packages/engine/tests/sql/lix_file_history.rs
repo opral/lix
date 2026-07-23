@@ -1885,37 +1885,49 @@ async fn lix_file_history_keeps_plugin_state_tombstones_in_deleted_file_provenan
     session.close().await.expect("session should close");
 }
 
-simulation_test!(
-    lix_file_history_requires_as_of_commit_id,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        let error = session
-            .execute("SELECT id FROM lix_file_history", &[])
+simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect_err("file history queries must provide an as-of commit");
+            .expect("main session should open"),
+        &engine,
+    );
 
-        assert!(
-            error
-                .to_string()
-                .contains("requires a lixcol_as_of_commit_id filter"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error
-                .hint()
-                .is_some_and(|hint| hint.contains("WHERE lixcol_as_of_commit_id")),
-            "unexpected error: {error}"
-        );
-    }
-);
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-default-file', '/history-default.txt', X'64656661756C74')",
+            &[],
+        )
+        .await
+        .expect("file insert should succeed");
+    let active_head = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("active head should load")
+        .expect("active head should exist");
+
+    let result = session
+        .execute(
+            "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
+                 FROM lix_file_history \
+                 WHERE id = 'history-default-file'",
+            &[],
+        )
+        .await
+        .expect("file history should default to the active head");
+
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text("history-default-file".to_string()),
+            Value::Text(active_head),
+            Value::Integer(0),
+        ]],
+    );
+});
 
 simulation_test!(
     lix_file_history_ignores_unrelated_file_scoped_state_events,

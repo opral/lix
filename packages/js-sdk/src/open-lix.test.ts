@@ -1222,9 +1222,11 @@ test("beginTransaction preserves handle after failed statement", async () => {
 		["failed-tx-task", "Before failure", false, JSON.stringify({ batch: 1 })],
 	);
 	await expect(
-		tx.execute("SELECT lixcol_entity_pk FROM lix_state_history"),
+		tx.execute(
+			"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+		),
 	).rejects.toMatchObject({
-		code: "LIX_HISTORY_FILTER_REQUIRED",
+		code: "LIX_UNSUPPORTED_SQL",
 	});
 	await tx.rollback();
 
@@ -1251,9 +1253,11 @@ test("beginTransaction can continue after failed statement", async () => {
 		],
 	);
 	await expect(
-		tx.execute("SELECT lixcol_entity_pk FROM lix_state_history"),
+		tx.execute(
+			"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+		),
 	).rejects.toMatchObject({
-		code: "LIX_HISTORY_FILTER_REQUIRED",
+		code: "LIX_UNSUPPORTED_SQL",
 	});
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
@@ -1384,16 +1388,16 @@ test("engine errors cross the native boundary", async () => {
 	const lix = await openLix();
 
 	try {
-		await lix.execute("SELECT lixcol_entity_pk FROM lix_state_history");
+		await lix.execute(
+			"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+		);
 		throw new Error("expected history query to fail");
 	} catch (error) {
 		expect(error).toMatchObject({
 			name: "LixError",
-			code: "LIX_HISTORY_FILTER_REQUIRED",
+			code: "LIX_UNSUPPORTED_SQL",
 		});
-		expect((error as { hint?: string }).hint).toContain(
-			"lix_active_branch_commit_id()",
-		);
+		expect((error as { hint?: string }).hint).toContain("pinned active branch head");
 	}
 
 	await lix.close();
