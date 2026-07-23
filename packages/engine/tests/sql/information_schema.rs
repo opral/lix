@@ -16,36 +16,30 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_column_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"active\":{\"type\":\"boolean\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"id\",\"title\",\"count\",\"ratio\",\"active\",\"metadata\"],\"additionalProperties\":false}'),\
-                   false,\
-                   false\
-                 )",
+                   lix_json('{\"x-lix-key\":\"engine_column_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"active\":{\"type\":\"boolean\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"id\",\"title\",\"count\",\"ratio\",\"active\",\"metadata\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
             .expect("registered schema insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_no_pk_contract\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}'),\
-                   false,\
-                   false\
-                 )",
+                   lix_json('{\"x-lix-key\":\"engine_no_pk_contract\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
             .expect("no-primary-key schema insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"columns\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"table_name\":{\"type\":\"string\"}},\"required\":[\"id\",\"table_name\"],\"additionalProperties\":false}'),\
-                   false,\
-                   false\
-                 )",
+                   lix_json('{\"x-lix-key\":\"columns\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"table_name\":{\"type\":\"string\"}},\"required\":[\"id\",\"table_name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -88,6 +82,90 @@ simulation_test!(
                 Value::Text("id".to_string()),
                 Value::Text("READ_ONLY".to_string()),
             ]],
+        );
+
+        let schema_management_contract = session
+            .execute(
+                "SELECT table_name, column_name, data_type, is_nullable, \
+                        lix_value_kind, lix_insert_policy \
+                 FROM information_schema.columns \
+                 WHERE (table_name = 'lix_schema_definition' \
+                        AND column_name IN ('key', 'definition')) \
+                    OR (table_name = 'lix_schema' \
+                        AND column_name IN ('key', 'table_name', 'primary_key', 'columns', 'surfaces', 'definition')) \
+                 ORDER BY table_name, column_name",
+                &[],
+            )
+            .await
+            .expect("schema management surfaces should share the executable catalog");
+        assert_rows_eq(
+            schema_management_contract,
+            vec![
+                vec![
+                    Value::Text("lix_schema".to_string()),
+                    Value::Text("columns".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSON".to_string()),
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema".to_string()),
+                    Value::Text("definition".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSON".to_string()),
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema".to_string()),
+                    Value::Text("key".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema".to_string()),
+                    Value::Text("primary_key".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSON".to_string()),
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema".to_string()),
+                    Value::Text("surfaces".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSON".to_string()),
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema".to_string()),
+                    Value::Text("table_name".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                    Value::Null,
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema_definition".to_string()),
+                    Value::Text("definition".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSON".to_string()),
+                    Value::Text("REQUIRED".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_schema_definition".to_string()),
+                    Value::Text("key".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                    Value::Text("READ_ONLY".to_string()),
+                ],
+            ],
         );
 
         let result = session
@@ -475,12 +553,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_scalar_cast_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"text_value\":{\"type\":\"string\"},\"integer_value\":{\"type\":\"integer\"},\"number_value\":{\"type\":\"number\"},\"boolean_value\":{\"type\":\"boolean\"},\"json_value\":{\"type\":\"object\"}},\"required\":[\"id\",\"text_value\",\"integer_value\",\"number_value\",\"boolean_value\",\"json_value\"],\"additionalProperties\":false}'),\
-                   false,\
-                   false\
-                 )",
+                   lix_json('{\"x-lix-key\":\"engine_scalar_cast_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"text_value\":{\"type\":\"string\"},\"integer_value\":{\"type\":\"integer\"},\"number_value\":{\"type\":\"number\"},\"boolean_value\":{\"type\":\"boolean\"},\"json_value\":{\"type\":\"object\"}},\"required\":[\"id\",\"text_value\",\"integer_value\",\"number_value\",\"boolean_value\",\"json_value\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -959,12 +1035,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                   false,\
-                   false\
-                 )",
+                   lix_json('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1110,12 +1184,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_excluded_typed_default\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"status\":{\"type\":\"string\",\"default\":\"fresh\"},\"mirror\":{\"type\":\"string\"},\"identity_copy\":{\"type\":\"array\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}'),\
-                   false,\
-                   false\
-                 )",
+                   lix_json('{\"x-lix-key\":\"engine_excluded_typed_default\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"status\":{\"type\":\"string\",\"default\":\"fresh\"},\"mirror\":{\"type\":\"string\"},\"identity_copy\":{\"type\":\"array\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1261,7 +1333,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (lix_json('{\"x-lix-key\":\"engine_required_nullable_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"payload\":{\"type\":[\"object\",\"null\"]}},\"required\":[\"id\",\"payload\"],\"additionalProperties\":false}'))",
                 &[],
             )
@@ -1361,7 +1433,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (lix_json('{\"x-lix-key\":\"engine_bigint_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"}},\"required\":[\"id\",\"count\"],\"additionalProperties\":false}'))",
                 &[],
             )

@@ -266,24 +266,22 @@ mod tests {
             "lix_label_assignment_history",
             "lix_label_by_branch",
             "lix_label_history",
-            "lix_registered_schema",
-            "lix_registered_schema_by_branch",
-            "lix_registered_schema_history",
+            "lix_schema",
+            "lix_schema_definition",
         ];
 
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn fixed_catalog_keeps_registry_surfaces_and_hides_storage_adapters() {
+    fn fixed_catalog_keeps_schema_api_and_hides_storage_adapters() {
         let catalog = PublicCatalog::fixed_system();
         for surface_name in [
             "lix_key_value",
             "lix_key_value_by_branch",
             "lix_key_value_history",
-            "lix_registered_schema",
-            "lix_registered_schema_by_branch",
-            "lix_registered_schema_history",
+            "lix_schema",
+            "lix_schema_definition",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),
@@ -303,6 +301,9 @@ mod tests {
             "lix_file_descriptor",
             "lix_file_descriptor_by_branch",
             "lix_file_descriptor_history",
+            "lix_registered_schema",
+            "lix_registered_schema_by_branch",
+            "lix_registered_schema_history",
         ] {
             assert!(
                 catalog.surface(surface_name).is_none(),

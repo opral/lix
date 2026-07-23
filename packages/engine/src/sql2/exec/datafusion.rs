@@ -1966,6 +1966,7 @@ fn canonical_json_text(raw: &str) -> Result<String, LixError> {
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
+        BoundWriteTarget::SchemaDefinition => Ok("lix_schema_definition".to_string()),
         BoundWriteTarget::LixState
             if plan.bound.branch_scope == BranchScope::Global
                 && plan.bound.op != BoundWriteOp::Insert =>
@@ -2124,7 +2125,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "DDL statements are not supported by Lix SQL",
             )
             .with_hint(
-                "Use Lix entity surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
+                "Use Lix entity surfaces such as lix_schema_definition, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
             ));
         }
         LogicalPlan::Statement(_) => {
@@ -2763,6 +2764,7 @@ mod tests {
                 "lix_directory_by_branch",
                 "lix_file",
                 "lix_file_by_branch",
+                "lix_schema_definition",
                 "lix_state",
                 "lix_state_by_branch",
             ]
@@ -3089,6 +3091,33 @@ mod tests {
         row
     }
 
+    fn live_registered_schema_row(
+        definition: &JsonValue,
+        branch_id: &str,
+        untracked: bool,
+    ) -> MaterializedLiveStateRow {
+        let key = crate::schema::schema_key_from_definition(definition)
+            .expect("registered schema key should derive")
+            .schema_key;
+        MaterializedLiveStateRow {
+            entity_pk: crate::schema::registered_schema_entity_pk(&key)
+                .expect("registered schema identity should derive"),
+            schema_key: "lix_registered_schema".to_string(),
+            file_id: None,
+            snapshot_content: Some(json!({ "value": definition }).to_string()),
+            metadata: None,
+            deleted: false,
+            branch_id: branch_id.to_string(),
+            change_id: Some(ChangeId::for_test_label(&format!("schema-change-{key}"))),
+            commit_id: (!untracked)
+                .then(|| CommitId::for_test_label(&format!("schema-commit-{key}"))),
+            global: branch_id == GLOBAL_BRANCH_ID,
+            untracked,
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
+        }
+    }
+
     fn live_directory_row(
         entity_pk: &str,
         branch_id: &str,
@@ -3377,12 +3406,10 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await?;
@@ -4842,6 +4869,89 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[tokio::test]
+    async fn schema_definition_upsert_preserves_visible_untracked_candidate() {
+        let existing = json!({
+            "x-lix-key": "acme_untracked_schema",
+            "x-lix-primary-key": ["/id"],
+            "description": "existing",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let amended = json!({
+            "x-lix-key": "acme_untracked_schema",
+            "x-lix-primary-key": ["/id"],
+            "description": "amended",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![live_registered_schema_row(&existing, "branch-a", true)],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![existing],
+        };
+
+        let do_nothing = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_schema_definition (definition) VALUES ($1) \
+             ON CONFLICT (key) DO NOTHING",
+            &[Value::Json(amended.clone())],
+        )
+        .await
+        .expect("DO NOTHING should recognize the visible untracked definition");
+        assert_eq!(do_nothing.rows, vec![vec![Value::Integer(0)]]);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .iter()
+                .all(|delta| delta.rows.is_empty()),
+            "DO NOTHING must not stage a tracked replacement"
+        );
+
+        let do_update = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_schema_definition (definition) VALUES ($1) \
+             ON CONFLICT (key) DO UPDATE SET definition = excluded.definition",
+            &[Value::Json(amended.clone())],
+        )
+        .await
+        .expect("DO UPDATE should amend the visible untracked definition");
+        assert_eq!(do_update.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let rows = staged_writes
+            .deltas
+            .iter()
+            .flat_map(|delta| delta.rows.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].untracked, "upsert must preserve durability");
+        assert_eq!(
+            rows[0]
+                .snapshot
+                .as_ref()
+                .map(crate::transaction::types::TransactionJson::value),
+            Some(&json!({ "value": amended }))
+        );
     }
 
     #[tokio::test]

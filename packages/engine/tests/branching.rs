@@ -920,7 +920,7 @@ simulation_test!(
 
         draft
             .execute(
-                "INSERT INTO lix_registered_schema (value) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"merge_task_item\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
                  )",
@@ -965,6 +965,132 @@ simulation_test!(
                 Value::Text("task-1".to_string()),
                 Value::Text("Adopted schema row".to_string()),
             ]
+        );
+    }
+);
+
+simulation_test!(
+    merge_branch_rejects_generated_schema_surface_collision,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+        main.execute(
+            "INSERT INTO lix_schema_definition (definition) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"acme_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
+             )",
+            &[],
+        )
+        .await
+        .expect("target schema registration should succeed independently");
+        draft
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"acme_note_history\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
+                 )",
+                &[],
+            )
+            .await
+            .expect("source schema registration should succeed independently");
+
+        let main_head_before = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let error = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
+            })
+            .await
+            .expect_err("merge must reject colliding generated SQL surfaces");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(error.message.contains("public SQL surface"), "{error:?}");
+        assert!(error.message.contains("acme_note_history"), "{error:?}");
+        assert_eq!(
+            engine
+                .load_branch_head_commit_id(sim.main_branch_id())
+                .await
+                .expect("main head should load after rejected merge"),
+            Some(main_head_before),
+            "rejected merge must not advance the target branch"
+        );
+
+        let schemas = main
+            .execute(
+                "SELECT key FROM lix_schema \
+                 WHERE key IN ('acme_note', 'acme_note_history') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .expect("target catalog should remain queryable after rejected merge");
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(
+            schemas.rows()[0].values(),
+            &[Value::Text("acme_note".to_string())]
+        );
+    }
+);
+
+simulation_test!(
+    merge_branch_batches_schema_dependencies_before_catalog_compile,
+    |sim| async move {
+        let (_engine, main, draft) = create_draft_from_main(&sim).await;
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) \
+             VALUES ('merge-schema-dependency-target', 'target')",
+            &[],
+        )
+        .await
+        .expect("main write should force a merge commit instead of fast-forward");
+        draft
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"z_merge_parent\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
+                 )",
+                &[],
+            )
+            .await
+            .expect("parent schema should register first on the source");
+        draft
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"a_merge_child\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"z_merge_parent\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}')\
+                 )",
+                &[],
+            )
+            .await
+            .expect("child schema should register after its parent on the source");
+
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "draft-branch".to_string(),
+        })
+        .await
+        .expect("merge should validate the final schema batch, not identity order");
+
+        let schemas = main
+            .execute(
+                "SELECT key FROM lix_schema \
+                 WHERE key IN ('a_merge_child', 'z_merge_parent') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .expect("both dependent schemas should be visible after merge");
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(
+            schemas.rows()[0].values(),
+            &[Value::Text("a_merge_child".to_string())]
+        );
+        assert_eq!(
+            schemas.rows()[1].values(),
+            &[Value::Text("z_merge_parent".to_string())]
         );
     }
 );

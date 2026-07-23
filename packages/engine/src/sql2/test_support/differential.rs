@@ -2,9 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::serialize_row_metadata;
-    use crate::entity_pk::EntityPk;
-    use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
         ACTIVE_BRANCH_PROBE_ID, DifferentialExpectation, DifferentialParam, DifferentialProbe,
@@ -396,12 +393,6 @@ mod tests {
     ) -> Vec<ProbeSnapshot> {
         let mut snapshots = Vec::with_capacity(probes.len());
         for probe in probes {
-            if let Some(snapshot) =
-                synthetic_staged_by_branch_probe(transaction, probe, active_branch_id).await
-            {
-                snapshots.push(snapshot);
-                continue;
-            }
             let query = probe_query(probe, active_branch_id);
             snapshots.push(ProbeSnapshot {
                 name: query.name,
@@ -429,43 +420,17 @@ mod tests {
         snapshots
     }
 
-    fn probe_query(probe: &DifferentialProbe, active_branch_id: &str) -> ProbeQuery {
+    fn probe_query(probe: &DifferentialProbe, _active_branch_id: &str) -> ProbeQuery {
         match probe {
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
-                name: "lix_registered_schema".to_string(),
-                sql: "SELECT lixcol_entity_pk, value, lixcol_metadata, lixcol_global, lixcol_untracked \
-                 FROM lix_registered_schema \
-                 ORDER BY lixcol_entity_pk"
+                name: "lix_schema_definition".to_string(),
+                sql: "SELECT key, definition \
+                 FROM lix_schema_definition \
+                 ORDER BY key"
                     .to_string(),
                 params: Vec::new(),
                 branch_column_indexes: &[],
             },
-            DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
-                let mut params = Vec::with_capacity(branch_ids.len());
-                let placeholders = branch_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(index, branch_id)| {
-                        params.push(Value::Text(resolve_probe_branch_id(
-                            branch_id,
-                            active_branch_id,
-                        )));
-                        format!("${}", index + 1)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ProbeQuery {
-                    name: format!("lix_registered_schema_by_branch:{branch_ids:?}"),
-                    sql: format!(
-                        "SELECT lixcol_entity_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global, lixcol_untracked \
-                         FROM lix_registered_schema_by_branch \
-                         WHERE lixcol_branch_id IN ({placeholders}) \
-                         ORDER BY lixcol_entity_pk, lixcol_branch_id"
-                    ),
-                    params,
-                    branch_column_indexes: &[2],
-                }
-            }
             DifferentialProbe::LixFileActive { paths } => {
                 let mut params = Vec::with_capacity(paths.len());
                 let placeholders = paths
@@ -489,113 +454,6 @@ mod tests {
                     branch_column_indexes: &[],
                 }
             }
-        }
-    }
-
-    async fn synthetic_staged_by_branch_probe(
-        transaction: &mut crate::session::SessionTransaction,
-        probe: &DifferentialProbe,
-        active_branch_id: &str,
-    ) -> Option<ProbeSnapshot> {
-        match probe {
-            DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
-                let rows = scan_transaction_live_state(
-                    transaction,
-                    "lix_registered_schema",
-                    &[],
-                    branch_ids,
-                    active_branch_id,
-                )
-                .await;
-                Some(ProbeSnapshot {
-                    name: format!("lix_registered_schema_by_branch_staged:{branch_ids:?}"),
-                    rows: registered_schema_by_branch_rows(rows, active_branch_id),
-                })
-            }
-            _ => None,
-        }
-    }
-
-    async fn scan_transaction_live_state(
-        transaction: &mut crate::session::SessionTransaction,
-        schema_key: &str,
-        entity_pks: &[&str],
-        branch_ids: &[&str],
-        active_branch_id: &str,
-    ) -> Vec<MaterializedLiveStateRow> {
-        transaction
-        .scan_live_state_for_test(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![schema_key.to_string()],
-                entity_pks: entity_pks
-                    .iter()
-                    .map(|entity_pk| EntityPk::single(*entity_pk))
-                    .collect(),
-                branch_ids: branch_ids
-                    .iter()
-                    .map(|branch_id| resolve_probe_branch_id(branch_id, active_branch_id))
-                    .collect(),
-                ..LiveStateFilter::default()
-            },
-            ..LiveStateScanRequest::default()
-        })
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "staged live-state differential probe failed for schema '{schema_key}': {error:?}"
-            )
-        })
-    }
-
-    fn registered_schema_by_branch_rows(
-        mut rows: Vec<MaterializedLiveStateRow>,
-        active_branch_id: &str,
-    ) -> Vec<Vec<Value>> {
-        rows.sort_by_key(|row| (row.entity_pk.clone(), row.branch_id.clone()));
-        rows.iter()
-            .map(|row| {
-                let value = row
-                    .snapshot_content
-                    .as_deref()
-                    .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
-                    .and_then(|snapshot| snapshot.get("value").cloned())
-                    .map(|value| {
-                        Value::Text(serde_json::to_string(&value).expect("JSON serializes"))
-                    })
-                    .unwrap_or(Value::Null);
-                canonical_probe_values(
-                    &[
-                        entity_pk_value(row),
-                        value,
-                        Value::Text(row.branch_id.clone()),
-                        row.metadata
-                            .as_deref()
-                            .map(serialize_row_metadata)
-                            .map(Value::Text)
-                            .unwrap_or(Value::Null),
-                        Value::Boolean(row.global),
-                        Value::Boolean(row.untracked),
-                    ],
-                    active_branch_id,
-                    &[2],
-                )
-            })
-            .collect()
-    }
-
-    fn entity_pk_value(row: &MaterializedLiveStateRow) -> Value {
-        Value::Text(
-            row.entity_pk
-                .as_json_array_text()
-                .expect("materialized entity pk should encode"),
-        )
-    }
-
-    fn resolve_probe_branch_id(branch_id: &str, active_branch_id: &str) -> String {
-        if branch_id == ACTIVE_BRANCH_PROBE_ID {
-            active_branch_id.to_string()
-        } else {
-            branch_id.to_string()
         }
     }
 

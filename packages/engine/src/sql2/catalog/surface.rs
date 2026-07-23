@@ -27,6 +27,8 @@ impl PublicSurfaceContract {
 // implementation-only cleanup lands after this public contract change.
 #[allow(dead_code)]
 pub(crate) enum PublicSurfaceKind {
+    Schema,
+    SchemaDefinition,
     LixState,
     LixStateByBranch,
     EntityBase { schema_key: String },

@@ -37,7 +37,9 @@ use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definiti
 use crate::schema::{
     format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
 };
-use crate::transaction::normalization::reject_reserved_schema_namespace;
+use crate::transaction::normalization::{
+    reject_reserved_schema_namespace, reject_visible_generated_surface_collision,
+};
 #[cfg(test)]
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::staging::duplicate_insert_identity_message;
@@ -366,6 +368,7 @@ async fn validate_registered_schema_identity_is_canonical(
             .expect("pending registered schema row has snapshot_content");
         let (key, _) = schema_from_registered_snapshot(pending_snapshot)?;
         reject_reserved_schema_namespace(&key)?;
+        reject_visible_generated_surface_collision(&key, &input.schema_catalog.schema_jsons())?;
 
         let Some(row) = load_committed_constraint_row(
             input.live_state,

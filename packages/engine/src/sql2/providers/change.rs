@@ -236,10 +236,11 @@ where
             .into_iter()
             .flatten()
             .filter(|change| {
-                change
-                    .file_id
-                    .as_deref()
-                    .is_some_and(|file_id| point_lookup.file_ids.contains(file_id))
+                change.schema_key != super::INTERNAL_SCHEMA_DEFINITION_KEY
+                    && change
+                        .file_id
+                        .as_deref()
+                        .is_some_and(|file_id| point_lookup.file_ids.contains(file_id))
             })
             .map(LixChangeRow::Direct)
             .collect::<Vec<_>>();
@@ -255,7 +256,12 @@ where
                 limit: Some(1024),
             })
             .await?;
-        changes.extend(scan.entries.into_iter().map(LixChangeRow::Direct));
+        changes.extend(
+            scan.entries
+                .into_iter()
+                .filter(|change| change.schema_key != super::INTERNAL_SCHEMA_DEFINITION_KEY)
+                .map(LixChangeRow::Direct),
+        );
         let Some(next) = scan.next_start_after else {
             break;
         };

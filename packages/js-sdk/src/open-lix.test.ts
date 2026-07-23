@@ -1853,7 +1853,7 @@ async function registerCrmTaskSchema(lix: Lix): Promise<void> {
 	} as const;
 
 	await lix.execute(
-		"INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+		"INSERT INTO lix_schema_definition (definition) VALUES (lix_json($1))",
 		[JSON.stringify(schema)],
 	);
 }

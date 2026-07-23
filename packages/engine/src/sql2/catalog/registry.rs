@@ -30,6 +30,7 @@ use crate::sql2::result_metadata::json_field;
 pub(crate) struct PublicCatalog {
     surfaces: BTreeMap<String, PublicSurfaceContract>,
     entity_specs: BTreeMap<String, EntitySurfaceSpec>,
+    schema_definitions: BTreeMap<String, JsonValue>,
 }
 
 impl PublicCatalog {
@@ -113,6 +114,20 @@ impl PublicCatalog {
         schema_key == "lix" || schema_key.starts_with("lix_")
     }
 
+    /// Returns the generated table name that would be claimed by both a
+    /// candidate schema key and an already-visible schema key.
+    pub(crate) fn generated_surface_collision_for_schema_key<'a>(
+        schema_key: &str,
+        visible_schema_keys: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        let candidate_names = generated_entity_surface_names(schema_key);
+        visible_schema_keys
+            .into_iter()
+            .filter(|visible_key| *visible_key != schema_key)
+            .flat_map(generated_entity_surface_names)
+            .find(|surface_name| candidate_names.contains(surface_name))
+    }
+
     pub(crate) fn surfaces(&self) -> impl Iterator<Item = &PublicSurfaceContract> {
         self.surfaces.values()
     }
@@ -121,10 +136,32 @@ impl PublicCatalog {
         self.entity_specs.get(schema_key)
     }
 
+    pub(crate) fn schema_definitions(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
+        self.schema_definitions
+            .iter()
+            .map(|(key, definition)| (key.as_str(), definition))
+    }
+
     #[cfg(test)]
     pub(crate) fn surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
         let surface = self.surface(table_name)?;
         Some(match &surface.kind {
+            PublicSurfaceKind::Schema => Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("table_name", DataType::Utf8, true),
+                Field::new("by_branch_table_name", DataType::Utf8, true),
+                Field::new("history_table_name", DataType::Utf8, true),
+                json_field("primary_key", false),
+                json_field("columns", false),
+                json_field("surfaces", false),
+                json_field("definition", false),
+            ])),
+            PublicSurfaceKind::SchemaDefinition => Arc::new(Schema::new(vec![
+                // Provider planning permits omission on INSERT even though
+                // every row emitted by the read surface has a non-null key.
+                Field::new("key", DataType::Utf8, true),
+                json_field("definition", false),
+            ])),
             PublicSurfaceKind::LixState => lix_state_schema(false),
             PublicSurfaceKind::LixStateByBranch => lix_state_schema(true),
             PublicSurfaceKind::File => filesystem_schema(false, true),
@@ -189,6 +226,30 @@ impl PublicCatalog {
     }
 
     fn insert_system_surfaces(&mut self) -> Result<(), LixError> {
+        self.insert(surface(
+            "lix_schema",
+            PublicSurfaceKind::Schema,
+            vec![
+                PublicColumn::public_read_only("key", false),
+                PublicColumn::public_read_only("table_name", true),
+                PublicColumn::public_read_only("by_branch_table_name", true),
+                PublicColumn::public_read_only("history_table_name", true),
+                PublicColumn::public_read_only("primary_key", false),
+                PublicColumn::public_read_only("columns", false),
+                PublicColumn::public_read_only("surfaces", false),
+                PublicColumn::public_read_only("definition", false),
+            ],
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_schema_definition",
+            PublicSurfaceKind::SchemaDefinition,
+            vec![
+                PublicColumn::public_read_only("key", false),
+                PublicColumn::public("definition", false),
+            ],
+            SurfaceCapabilities::insert_update(),
+        ))?;
         self.insert(surface(
             "lix_file",
             PublicSurfaceKind::File,
@@ -256,9 +317,9 @@ impl PublicCatalog {
     }
 
     fn insert_entity_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
-        if let Some(schema_key) = schema.get("x-lix-key").and_then(JsonValue::as_str)
-            && Self::runtime_schema_key_uses_reserved_namespace(schema_key)
-            && !crate::schema::is_seed_schema_key(schema_key)
+        let schema_key = crate::schema::schema_key_from_definition(schema)?.schema_key;
+        if Self::runtime_schema_key_uses_reserved_namespace(&schema_key)
+            && !crate::schema::is_seed_schema_key(&schema_key)
         {
             return Err(LixError::new(
                 LixError::CODE_RESERVED_SCHEMA_NAMESPACE,
@@ -271,9 +332,23 @@ impl PublicCatalog {
             ));
         }
 
+        if self
+            .schema_definitions
+            .insert(schema_key.clone(), schema.clone())
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("duplicate visible schema definition '{schema_key}'"),
+            ));
+        }
+
         let Ok(spec) = derive_entity_surface_spec_from_schema(schema) else {
             return Ok(());
         };
+
+        self.entity_specs
+            .insert(spec.schema_key.clone(), spec.clone());
 
         if !schema_exposed_as_entity_surface(&spec.schema_key) {
             return Ok(());
@@ -326,16 +401,22 @@ impl PublicCatalog {
             self.insert(surface(
                 format!("{}_history", spec.schema_key),
                 PublicSurfaceKind::EntityHistory {
-                    schema_key: spec.schema_key.clone(),
+                    schema_key: spec.schema_key,
                 },
                 history_columns,
                 SurfaceCapabilities::read_only(),
             ))?;
         }
-
-        self.entity_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
+}
+
+fn generated_entity_surface_names(schema_key: &str) -> [String; 3] {
+    [
+        schema_key.to_string(),
+        format!("{schema_key}_by_branch"),
+        format!("{schema_key}_history"),
+    ]
 }
 
 #[cfg(test)]
@@ -463,14 +544,11 @@ fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
     spec.columns
         .iter()
         .map(|column| {
-            let public_column =
-                if spec.schema_key == "lix_registered_schema" && column.name == "value" {
-                    PublicColumn::public(column.name.as_str(), column.read_nullable)
-                } else if primary_key_roots.contains(&column.name) {
-                    PublicColumn::public_insert_only(column.name.as_str(), column.read_nullable)
-                } else {
-                    PublicColumn::public(column.name.as_str(), column.read_nullable)
-                };
+            let public_column = if primary_key_roots.contains(&column.name) {
+                PublicColumn::public_insert_only(column.name.as_str(), column.read_nullable)
+            } else {
+                PublicColumn::public(column.name.as_str(), column.read_nullable)
+            };
             if let Some(default) = column.default_expression.as_deref() {
                 public_column.with_default(default)
             } else if !column.insert_required {

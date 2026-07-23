@@ -233,7 +233,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_schema_definition (definition) VALUES (lix_json($1))",
             &[Value::Text(schema.to_string())],
         )
         .await

@@ -132,11 +132,9 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-             false,\
-             true\
+             lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
              )",
             &[],
         )

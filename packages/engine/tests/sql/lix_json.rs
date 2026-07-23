@@ -199,12 +199,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_json_predicate_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"meta\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_json_predicate_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"meta\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -245,7 +243,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_schema_dml_rejects_bare_lixcol_entity_pk_text,
+    schema_definition_uses_plain_text_key_and_hides_storage_identity,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -256,27 +254,38 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
+        session
             .execute(
-                "UPDATE lix_registered_schema \
-                 SET value = lix_json('{\"x-lix-key\":\"engine_schema_update_history\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}') \
-                 WHERE lixcol_entity_pk = 'engine_schema_update_history'",
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES (lix_json('{\"x-lix-key\":\"engine_schema_text_key\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'))",
                 &[],
             )
             .await
-            .expect_err("bare text lixcol_entity_pk update should fail before matching rows");
+            .expect("schema definition should register");
 
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-
-        let error = session
+        let selected = session
             .execute(
-                "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = 'engine_schema_update_history'",
+                "SELECT key FROM lix_schema_definition \
+                 WHERE key = 'engine_schema_text_key'",
                 &[],
             )
             .await
-            .expect_err("bare text lixcol_entity_pk delete should fail before matching rows");
+            .expect("schema identity should be ordinary text");
+        assert_rows_eq(
+            selected,
+            vec![vec![Value::Text("engine_schema_text_key".to_string())]],
+        );
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        let error = session
+            .execute(
+                "UPDATE lix_schema_definition \
+                 SET definition = definition \
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_schema_text_key\"]')",
+                &[],
+            )
+            .await
+            .expect_err("the underlying generic entity identity must not leak");
+
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
     }
 );

@@ -17,4 +17,12 @@ impl SurfaceCapabilities {
             delete: true,
         }
     }
+
+    pub(crate) fn insert_update() -> Self {
+        Self {
+            insert: true,
+            update: true,
+            delete: false,
+        }
+    }
 }

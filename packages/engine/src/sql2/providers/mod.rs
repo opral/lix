@@ -21,9 +21,12 @@ mod file_history;
 mod filesystem_history_path;
 mod history;
 mod lix_state;
+mod schema_registry;
 mod spec;
 mod upsert;
 mod values;
+
+const INTERNAL_SCHEMA_DEFINITION_KEY: &str = "lix_registered_schema";
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -195,9 +198,10 @@ impl ProviderSelection {
     fn requires_visible_schemas(&self) -> bool {
         match self {
             Self::All => true,
-            Self::Only(names) => names
-                .iter()
-                .any(|name| PublicCatalog::fixed_system().surface(name).is_none()),
+            Self::Only(names) => names.iter().any(|name| {
+                matches!(name.as_str(), "lix_schema" | "lix_schema_definition")
+                    || PublicCatalog::fixed_system().surface(name).is_none()
+            }),
         }
     }
 }
@@ -321,6 +325,20 @@ where
             continue;
         }
         match &surface.kind {
+            PublicSurfaceKind::Schema => {
+                schema_registry::register_lix_schema_read_provider(
+                    session,
+                    &surface.name,
+                    catalog,
+                )?;
+            }
+            PublicSurfaceKind::SchemaDefinition => {
+                schema_registry::register_lix_schema_definition_read_provider(
+                    session,
+                    &surface.name,
+                    catalog,
+                )?;
+            }
             PublicSurfaceKind::LixState => {
                 lix_state::register_lix_state_active_provider(
                     session,
@@ -533,6 +551,14 @@ async fn register_write_from_catalog(
             continue;
         }
         match &surface.kind {
+            PublicSurfaceKind::SchemaDefinition => {
+                schema_registry::register_lix_schema_definition_write_provider(
+                    session,
+                    &surface.name,
+                    catalog,
+                    write_ctx.clone(),
+                )?;
+            }
             PublicSurfaceKind::LixState => {
                 lix_state::register_lix_state_active_write_provider(
                     session,
@@ -598,7 +624,8 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
-            PublicSurfaceKind::Change
+            PublicSurfaceKind::Schema
+            | PublicSurfaceKind::Change
             | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
@@ -642,7 +669,7 @@ mod tests {
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
-        file, file_history, is_write_surface, read_provider_selection,
+        file, file_history, is_write_surface, read_provider_selection, schema_registry,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -747,6 +774,10 @@ mod tests {
             selection_for_sql(&["SELECT * FROM information_schema.tables"])
                 .requires_visible_schemas()
         );
+        assert!(selection_for_sql(&["SELECT * FROM lix_schema"]).requires_visible_schemas());
+        assert!(
+            selection_for_sql(&["SELECT * FROM lix_schema_definition"]).requires_visible_schemas()
+        );
     }
 
     #[test]
@@ -802,6 +833,7 @@ mod tests {
                 "lix_change",
                 "lix_directory_history",
                 "lix_file_history",
+                "lix_schema",
                 "phase8_entity_history",
             ]
         );
@@ -813,15 +845,16 @@ mod tests {
                 "lix_directory_by_branch",
                 "lix_file",
                 "lix_file_by_branch",
+                "lix_schema_definition",
                 "phase8_entity",
                 "phase8_entity_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 18, "previous construction count");
+        assert_eq!(all_read + writable.len(), 21, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            11,
+            13,
             "new construction count"
         );
     }
@@ -840,7 +873,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 5, "previous standalone write count");
+        assert_eq!(all_writable, 6, "previous standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 
@@ -887,6 +920,16 @@ mod tests {
             &catalog,
             "lix_directory_history",
             directory_history::lix_directory_history_schema(),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_schema",
+            schema_registry::lix_schema_schema(),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_schema_definition",
+            schema_registry::lix_schema_definition_schema(),
         );
     }
 

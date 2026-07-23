@@ -62,6 +62,9 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
         "lix_commit" | "lix_commit_edge" | "lix_change" => Some(
             "Commit graph and changelog surfaces are read-only; Lix creates them when transactions commit.",
         ),
+        "lix_registered_schema" => Some(
+            "Use lix_schema_definition to register or amend schemas and lix_schema to inspect them.",
+        ),
         _ => None,
     }
 }

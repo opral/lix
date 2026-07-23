@@ -172,8 +172,8 @@ async fn sql_plugin_archive_upsert_installs_and_updates_plugin() {
 
     let schemas = session
         .execute(
-            "SELECT value FROM lix_registered_schema \
-             WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
+            "SELECT definition FROM lix_schema_definition \
+             WHERE key = 'plugin_note'",
             &[],
         )
         .await
@@ -282,8 +282,8 @@ async fn active_plugin_prevents_public_mutation_of_its_registered_schema() {
     });
     let error = session
         .execute(
-            "UPDATE lix_registered_schema SET value = $1 \
-             WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
+            "UPDATE lix_schema_definition SET definition = $1 \
+             WHERE key = 'plugin_note'",
             &[Value::Json(replacement)],
         )
         .await
@@ -2098,8 +2098,8 @@ where
 {
     session
         .execute_sql(
-            "SELECT value FROM lix_registered_schema \
-             WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
+            "SELECT definition FROM lix_schema_definition \
+             WHERE key = 'plugin_note'",
             &[],
         )
         .await

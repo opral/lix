@@ -347,12 +347,21 @@ impl TableSpec for LixStateSpec {
     ) -> Result<PlannedScan> {
         let route = LixStateByBranchRoute::from_filters(filters);
         let schema = projected_schema(&self.schema, projection);
+        let may_include_internal_registry = route
+            .schema_keys
+            .as_ref()
+            .is_none_or(|schema_keys| schema_keys.contains(super::INTERNAL_SCHEMA_DEFINITION_KEY));
+        let storage_limit = if may_include_internal_registry {
+            None
+        } else {
+            limit
+        };
         let mut request = lix_state_scan_request(
             &self.schema,
             self.branch_binding.active_branch_id(),
             projection,
             &route,
-            limit,
+            storage_limit,
         );
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -366,12 +375,17 @@ impl TableSpec for LixStateSpec {
             schema: Arc::clone(&schema),
             ordering: None,
             load: row_source(
-                (Arc::clone(&self.live_state), schema, request),
-                |(live_state, schema, request)| async move {
+                (Arc::clone(&self.live_state), schema, request, limit),
+                |(live_state, schema, request, limit)| async move {
                     let rows = live_state
                         .scan_rows(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
+                    let rows = rows
+                        .into_iter()
+                        .filter(|row| row.schema_key != super::INTERNAL_SCHEMA_DEFINITION_KEY)
+                        .take(limit.unwrap_or(usize::MAX))
+                        .collect::<Vec<_>>();
                     LIVE_STATE_COLS
                         .build(schema, &rows)
                         .map_err(lix_state_batch_error)

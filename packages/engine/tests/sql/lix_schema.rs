@@ -7,7 +7,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    lix_registered_schema_insert_makes_typed_schema_surface_visible,
+    lix_schema_definition_insert_makes_typed_schema_surface_visible,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -20,11 +20,9 @@ simulation_test!(
 
         let register_schema_result = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -34,33 +32,30 @@ simulation_test!(
 
         let registered_schema_row = session
             .execute(
-                "SELECT lixcol_entity_pk, value \
-                 FROM lix_registered_schema",
+                "SELECT key, definition \
+                 FROM lix_schema_definition \
+                 WHERE key = 'engine_dummy_schema'",
                 &[],
             )
             .await
             .expect("registered schema read should succeed");
-        let registered_schema_rows = registered_schema_row;
-        let registered_schema_entity_pk = registered_schema_rows
-            .rows()
-            .iter()
-            .find_map(|row| match row.values() {
-                [Value::Json(entity_pk), Value::Json(value)]
-                    if value.get("x-lix-key").and_then(serde_json::Value::as_str)
-                        == Some("engine_dummy_schema") =>
-                {
-                    Some(entity_pk)
-                }
-                [Value::Json(entity_pk), Value::Text(value)] => {
-                    let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                    (value.get("x-lix-key").and_then(serde_json::Value::as_str)
-                        == Some("engine_dummy_schema"))
-                    .then_some(entity_pk)
-                }
-                _ => None,
-            })
-            .expect("registered schema row should be visible");
-        assert_eq!(registered_schema_entity_pk, &json!(["engine_dummy_schema"]));
+        assert_rows_eq(
+            registered_schema_row,
+            vec![vec![
+                Value::Text("engine_dummy_schema".to_string()),
+                Value::Json(json!({
+                    "x-lix-key": "engine_dummy_schema",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["id", "name"],
+                    "additionalProperties": false
+                })),
+            ]],
+        );
 
         let insert_state_result = session
             .execute(
@@ -94,6 +89,244 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_schema_definition_batches_foreign_key_dependencies,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let parent = json!({
+            "x-lix-key": "batch_parent",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let child = json!({
+            "x-lix-key": "batch_child",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-foreign-keys": [{
+                "properties": ["/parent_id"],
+                "references": {
+                    "schemaKey": "batch_parent",
+                    "properties": ["/id"]
+                }
+            }],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "parent_id": { "type": "string" }
+            },
+            "required": ["id", "parent_id"],
+            "additionalProperties": false
+        });
+
+        let reverse_order = session
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES ($1), ($2)",
+                &[Value::Json(child), Value::Json(parent)],
+            )
+            .await
+            .expect("one schema batch should resolve dependencies independent of row order");
+        assert_eq!(reverse_order, ExecuteResult::from_rows_affected(2));
+
+        let left = json!({
+            "x-lix-key": "batch_mutual_left",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-foreign-keys": [{
+                "properties": ["/right_id"],
+                "references": {
+                    "schemaKey": "batch_mutual_right",
+                    "properties": ["/id"]
+                }
+            }],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "right_id": { "type": "string" }
+            },
+            "required": ["id", "right_id"],
+            "additionalProperties": false
+        });
+        let right = json!({
+            "x-lix-key": "batch_mutual_right",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-foreign-keys": [{
+                "properties": ["/left_id"],
+                "references": {
+                    "schemaKey": "batch_mutual_left",
+                    "properties": ["/id"]
+                }
+            }],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "left_id": { "type": "string" }
+            },
+            "required": ["id", "left_id"],
+            "additionalProperties": false
+        });
+
+        let mutual = session
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES ($1), ($2)",
+                &[Value::Json(left), Value::Json(right)],
+            )
+            .await
+            .expect("one schema batch should compile mutually dependent definitions atomically");
+        assert_eq!(mutual, ExecuteResult::from_rows_affected(2));
+
+        let registered = session
+            .execute(
+                "SELECT key FROM lix_schema \
+                 WHERE key LIKE 'batch_%' \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .expect("every schema in both dependency batches should be visible");
+        assert_rows_eq(
+            registered,
+            vec![
+                vec![Value::Text("batch_child".to_string())],
+                vec![Value::Text("batch_mutual_left".to_string())],
+                vec![Value::Text("batch_mutual_right".to_string())],
+                vec![Value::Text("batch_parent".to_string())],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    lix_schema_exposes_one_semantic_contract_for_discovery_and_introspection,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let definition = json!({
+            "x-lix-key": "app_catalog_contract",
+            "x-lix-primary-key": ["/tenant", "/id"],
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "id": {
+                    "type": "string",
+                    "x-lix-default": "lix_uuid_v7()"
+                },
+                "payload": { "type": ["object", "null"] },
+                "score": { "type": "number" }
+            },
+            "required": ["tenant", "id", "score"],
+            "additionalProperties": false
+        });
+
+        session
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) VALUES ($1)",
+                &[Value::Json(definition.clone())],
+            )
+            .await
+            .expect("schema definition should register");
+
+        let result = session
+            .execute(
+                "SELECT key, table_name, by_branch_table_name, history_table_name, \
+                        primary_key, columns, surfaces, definition \
+                 FROM lix_schema \
+                 WHERE key = 'app_catalog_contract'",
+                &[],
+            )
+            .await
+            .expect("semantic schema catalog should be queryable");
+        let [row] = result.rows() else {
+            panic!("expected one schema catalog row, got {}", result.len());
+        };
+        let [
+            Value::Text(key),
+            Value::Text(table_name),
+            Value::Text(by_branch_table_name),
+            Value::Text(history_table_name),
+            Value::Json(primary_key),
+            Value::Json(columns),
+            Value::Json(surfaces),
+            Value::Json(returned_definition),
+        ] = row.values()
+        else {
+            panic!("unexpected schema catalog row: {:?}", row.values());
+        };
+        assert_eq!(key, "app_catalog_contract");
+        assert_eq!(table_name, "app_catalog_contract");
+        assert_eq!(by_branch_table_name, "app_catalog_contract_by_branch");
+        assert_eq!(history_table_name, "app_catalog_contract_history");
+        assert_eq!(primary_key, &json!(["/tenant", "/id"]));
+        assert_eq!(
+            surfaces,
+            &json!([
+                "app_catalog_contract",
+                "app_catalog_contract_by_branch",
+                "app_catalog_contract_history"
+            ])
+        );
+        assert_eq!(returned_definition, &definition);
+
+        let columns = columns
+            .as_array()
+            .expect("column contracts should be a JSON array");
+        let id = columns
+            .iter()
+            .find(|column| column["name"] == "id")
+            .expect("id contract should exist");
+        assert_eq!(id["data_type"], "TEXT");
+        assert!(id["lix_value_kind"].is_null());
+        assert_eq!(id["is_nullable"], false);
+        assert_eq!(id["is_insertable"], true);
+        assert_eq!(id["is_updatable"], false);
+        assert_eq!(id["lix_insert_policy"], "DEFAULT");
+        assert_eq!(id["column_default"], "lix_uuid_v7()");
+
+        let payload = columns
+            .iter()
+            .find(|column| column["name"] == "payload")
+            .expect("payload contract should exist");
+        assert_eq!(payload["data_type"], "TEXT");
+        assert_eq!(payload["lix_value_kind"], "JSON");
+        assert_eq!(payload["is_nullable"], true);
+        assert_eq!(payload["lix_insert_policy"], "OPTIONAL");
+
+        let internal = session
+            .execute(
+                "SELECT table_name, by_branch_table_name, history_table_name, surfaces \
+                 FROM lix_schema \
+                 WHERE key = 'lix_registered_schema'",
+                &[],
+            )
+            .await
+            .expect("internal registered-schema definition remains discoverable");
+        assert_rows_eq(
+            internal,
+            vec![vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Json(json!([])),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
     sql_catalog_templates_follow_committed_transaction_snapshots,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -111,12 +344,10 @@ simulation_test!(
 
         transaction
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -166,7 +397,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    untracked_registered_schema_does_not_authorize_tracked_typed_write,
+    lix_schema_definition_derives_read_only_key_and_rejects_null,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -177,35 +408,220 @@ simulation_test!(
             &engine,
         );
 
-        session
+        let null_error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_untracked_only_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 true\
-                 )",
+                "INSERT INTO lix_schema_definition (definition) VALUES (NULL)",
                 &[],
             )
             .await
-            .expect("untracked schema registration should succeed");
+            .expect_err("explicit NULL must be rejected");
+        assert_eq!(null_error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(null_error.message.contains("does not allow explicit NULL"));
 
-        let error = session
+        let key_error = session
             .execute(
-                "INSERT INTO engine_untracked_only_schema \
-                 (id, name, lixcol_untracked) \
-                 VALUES ('tracked-1', 'Tracked', false)",
+                "INSERT INTO lix_schema_definition (key, definition) \
+                 VALUES ('wrong', lix_json('{\"x-lix-key\":\"derived\"}'))",
                 &[],
             )
             .await
-            .expect_err("tracked rows must not validate against committed untracked schemas");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+            .expect_err("derived key must not be writable");
+        assert_eq!(key_error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(key_error.message.contains("key"));
     }
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_reserved_lix_namespace,
+    lix_schema_definition_upsert_uses_derived_key_and_preserves_identity,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let initial = json!({
+            "x-lix-key": "app_upsert_schema",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let amended = json!({
+            "x-lix-key": "app_upsert_schema",
+            "x-lix-primary-key": ["/id"],
+            "description": "amended",
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+
+        for definition in [&initial, &amended] {
+            let result = session
+                .execute(
+                    "INSERT INTO lix_schema_definition (definition) VALUES ($1) \
+                     ON CONFLICT (key) DO UPDATE SET definition = excluded.definition",
+                    &[Value::Json(definition.clone())],
+                )
+                .await
+                .expect("derived-key upsert should succeed");
+            assert_eq!(result, ExecuteResult::from_rows_affected(1));
+        }
+
+        let selected = session
+            .execute(
+                "SELECT definition FROM lix_schema_definition \
+                 WHERE key = 'app_upsert_schema'",
+                &[],
+            )
+            .await
+            .expect("upserted definition should be readable");
+        assert_rows_eq(selected, vec![vec![Value::Json(amended)]]);
+
+        let changed_identity = json!({
+            "x-lix-key": "app_different_schema",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let error = session
+            .execute(
+                "UPDATE lix_schema_definition SET definition = $1 \
+                 WHERE key = 'app_upsert_schema'",
+                &[Value::Json(changed_identity)],
+            )
+            .await
+            .expect_err("UPDATE must not change the derived identity");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("cannot change derived key"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    schema_definition_relations_use_exact_branch_scope,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let global = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let global_definition = json!({
+            "x-lix-key": "app_global_schema",
+            "x-lix-primary-key": ["/id"],
+            "description": "global",
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let local_definition = json!({
+            "x-lix-key": "app_global_schema",
+            "x-lix-primary-key": ["/id"],
+            "description": "local override",
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+
+        global
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) VALUES ($1)",
+                &[Value::Json(global_definition.clone())],
+            )
+            .await
+            .expect("global schema should register through the global session");
+
+        let main_definition = main
+            .execute(
+                "SELECT key FROM lix_schema_definition \
+                 WHERE key = 'app_global_schema'",
+                &[],
+            )
+            .await
+            .expect("main definition catalog should remain queryable");
+        assert_eq!(main_definition.len(), 0);
+        let main_catalog = main
+            .execute(
+                "SELECT key FROM lix_schema \
+                 WHERE key = 'app_global_schema'",
+                &[],
+            )
+            .await
+            .expect("main semantic catalog should remain queryable");
+        assert_eq!(main_catalog.len(), 0);
+
+        let main_update = main
+            .execute(
+                "UPDATE lix_schema_definition SET definition = definition \
+                 WHERE key = 'app_global_schema'",
+                &[],
+            )
+            .await
+            .expect("UPDATE should use the same exact-scope row set as SELECT");
+        assert_eq!(main_update, ExecuteResult::from_rows_affected(0));
+
+        let global_update = global
+            .execute(
+                "UPDATE lix_schema_definition SET definition = definition \
+                 WHERE key = 'app_global_schema'",
+                &[],
+            )
+            .await
+            .expect("the global session should update its exact-scope definition");
+        assert_eq!(global_update, ExecuteResult::from_rows_affected(1));
+
+        main.execute(
+            "INSERT INTO lix_schema_definition (definition) VALUES ($1) \
+             ON CONFLICT (key) DO UPDATE SET definition = excluded.definition",
+            &[Value::Json(local_definition.clone())],
+        )
+        .await
+        .expect("main upsert should create a branch-local override");
+
+        let main_row = main
+            .execute(
+                "SELECT definition FROM lix_schema_definition \
+                 WHERE key = 'app_global_schema'",
+                &[],
+            )
+            .await
+            .expect("main override should be visible");
+        assert_rows_eq(main_row, vec![vec![Value::Json(local_definition)]]);
+
+        let global_row = global
+            .execute(
+                "SELECT definition FROM lix_schema_definition \
+                 WHERE key = 'app_global_schema'",
+                &[],
+            )
+            .await
+            .expect("global definition should remain visible");
+        assert_rows_eq(global_row, vec![vec![Value::Json(global_definition)]]);
+    }
+);
+
+simulation_test!(
+    lix_schema_definition_reserves_lix_namespace_and_generated_names,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -236,9 +652,9 @@ simulation_test!(
             });
             let error = session
                 .execute(
-                    "INSERT INTO lix_registered_schema \
-                     (value, lixcol_global, lixcol_untracked) \
-                     VALUES ($1, false, false)",
+                    "INSERT INTO lix_schema_definition \
+                     (definition) \
+                     VALUES ($1)",
                     &[Value::Json(schema)],
                 )
                 .await
@@ -269,18 +685,39 @@ simulation_test!(
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, false, false)",
+                "INSERT INTO lix_schema_definition \
+                 (definition) \
+                 VALUES ($1)",
                 &[Value::Json(noncolliding_schema)],
             )
             .await
             .expect("an application-owned schema namespace should remain registerable");
+
+        let generated_name_collision = json!({
+            "x-lix-key": "acme_plugin_note_history",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false,
+        });
+        let collision_error = session
+            .execute(
+                "INSERT INTO lix_schema_definition (definition) VALUES ($1)",
+                &[Value::Json(generated_name_collision)],
+            )
+            .await
+            .expect_err("a generated history table must reserve its name");
+        assert_eq!(collision_error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            collision_error.message.contains("public SQL surface"),
+            "{collision_error:?}"
+        );
     }
 );
 
 simulation_test!(
-    hidden_storage_schemas_remain_registered_without_public_sql_relations,
+    hidden_storage_schemas_remain_discoverable_without_public_sql_relations,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -292,11 +729,7 @@ simulation_test!(
         );
 
         let registered = session
-            .execute(
-                "SELECT lix_json_get_text(value, 'x-lix-key') \
-                 FROM lix_registered_schema",
-                &[],
-            )
+            .execute("SELECT key FROM lix_schema", &[])
             .await
             .expect("registered schemas should remain discoverable");
         let registered_keys = registered
@@ -348,9 +781,8 @@ simulation_test!(
             "lix_key_value",
             "lix_key_value_by_branch",
             "lix_key_value_history",
-            "lix_registered_schema",
-            "lix_registered_schema_by_branch",
-            "lix_registered_schema_history",
+            "lix_schema",
+            "lix_schema_definition",
         ] {
             assert!(
                 public_table_names.contains(surface_name),
@@ -361,6 +793,9 @@ simulation_test!(
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",
+            "lix_registered_schema",
+            "lix_registered_schema_by_branch",
+            "lix_registered_schema_history",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",
@@ -379,7 +814,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
+simulation_test!(lix_schema_definition_delete_is_rejected, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -391,50 +826,19 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
 
     session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
             .expect("schema should register before delete attempt");
 
-    let registered_schema_rows = session
-        .execute(
-            "SELECT lixcol_entity_pk, value \
-                 FROM lix_registered_schema",
-            &[],
-        )
-        .await
-        .expect("registered schema read should succeed");
-    let delete_schema_entity_pk = registered_schema_rows
-        .rows()
-        .iter()
-        .find_map(|row| match row.values() {
-            [Value::Json(entity_pk), Value::Json(value)]
-                if value.get("x-lix-key").and_then(serde_json::Value::as_str)
-                    == Some("engine_delete_schema") =>
-            {
-                Some(entity_pk.clone())
-            }
-            [Value::Json(entity_pk), Value::Text(value)] => {
-                let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                (value.get("x-lix-key").and_then(serde_json::Value::as_str)
-                    == Some("engine_delete_schema"))
-                .then_some(entity_pk.clone())
-            }
-            _ => None,
-        })
-        .expect("registered schema entity pk should be discoverable");
-
     let error = session
         .execute(
-            "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = $1",
-            &[Value::Json(delete_schema_entity_pk)],
+            "DELETE FROM lix_schema_definition WHERE key = 'engine_delete_schema'",
+            &[],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -443,14 +847,14 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
     assert!(
         error
             .message
-            .contains("delete lix_registered_schema is not supported"),
+            .contains("DELETE FROM lix_schema_definition is not supported"),
         "unexpected error: {error:?}"
     );
 
     let like_error = session
         .execute(
-            "DELETE FROM lix_registered_schema \
-             WHERE lix_json_get_text(value, 'x-lix-key') LIKE 'engine_delete%'",
+            "DELETE FROM lix_schema_definition \
+             WHERE key LIKE 'engine_delete%'",
             &[],
         )
         .await
@@ -459,13 +863,13 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
     assert!(
         like_error
             .message
-            .contains("delete lix_registered_schema is not supported"),
+            .contains("DELETE FROM lix_schema_definition is not supported"),
         "unexpected error: {like_error:?}"
     );
 });
 
 simulation_test!(
-    tracked_registered_schema_update_allows_compatible_amendment_and_history,
+    schema_definition_update_is_tracked_without_exposing_internal_storage_history,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -503,8 +907,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, false, false)",
+                "INSERT INTO lix_schema_definition (definition) \
+                 VALUES ($1)",
                 &[Value::Json(initial_schema.clone())],
             )
             .await
@@ -517,9 +921,9 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_registered_schema \
-                 SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]')",
+                "UPDATE lix_schema_definition \
+                 SET definition = $1 \
+                 WHERE key = 'engine_schema_update_history'",
                 &[Value::Json(amended_schema.clone())],
             )
             .await
@@ -531,39 +935,43 @@ simulation_test!(
             .expect("second head should exist");
         assert_ne!(first_commit_id, second_commit_id);
 
-        let result = session
+        let hidden_changes = session
             .execute(
-                &format!(
-                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_as_of_commit_id, lixcol_depth \
-                     FROM lix_registered_schema_history \
-                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
-                     ORDER BY lixcol_depth"
-                ),
+                "SELECT id FROM lix_change \
+                 WHERE schema_key = 'lix_registered_schema'",
                 &[],
             )
             .await
-            .expect("tracked registered schema history read should succeed");
+            .expect("change activity should remain queryable");
+        assert_eq!(hidden_changes.len(), 0);
 
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Json(amended_schema),
-                    Value::Json(json!(["engine_schema_update_history"])),
-                    Value::Text(second_commit_id.clone()),
-                    Value::Text(second_commit_id.clone()),
-                    Value::Integer(0),
-                ],
-                vec![
-                    Value::Json(initial_schema),
-                    Value::Json(json!(["engine_schema_update_history"])),
-                    Value::Text(first_commit_id),
-                    Value::Text(second_commit_id),
-                    Value::Integer(1),
-                ],
-            ],
-        );
+        let current = session
+            .execute(
+                "SELECT definition FROM lix_schema_definition \
+                 WHERE key = 'engine_schema_update_history'",
+                &[],
+            )
+            .await
+            .expect("amended schema definition should be readable");
+        assert_rows_eq(current, vec![vec![Value::Json(amended_schema)]]);
+
+        for retired_name in [
+            "lix_state",
+            "lix_state_by_branch",
+            "lix_state_history",
+            "lix_registered_schema",
+            "lix_registered_schema_by_branch",
+            "lix_registered_schema_history",
+        ] {
+            let error = session
+                .execute(&format!("SELECT * FROM {retired_name}"), &[])
+                .await
+                .expect_err("retired public surfaces must not resolve");
+            assert!(
+                error.message.contains(retired_name),
+                "unexpected error for {retired_name}: {error:?}"
+            );
+        }
     }
 );
 
@@ -581,12 +989,10 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -627,12 +1033,10 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}'),\
-                 true,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -673,11 +1077,9 @@ simulation_test!(
         .expect("target branch should be created before schema registration");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -723,11 +1125,9 @@ simulation_test!(
         .expect("target branch should be created before schema divergence");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
                 &[],
             )
@@ -767,12 +1167,10 @@ simulation_test!(
 
         target
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -780,9 +1178,9 @@ simulation_test!(
 
         let main_result = main
             .execute(
-                "SELECT value \
-                 FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
+                "SELECT definition \
+                 FROM lix_schema_definition \
+                 WHERE key = 'engine_divergent_schema'",
                 &[],
             )
             .await
@@ -791,9 +1189,9 @@ simulation_test!(
 
         let target_result = target
             .execute(
-                "SELECT value \
-                 FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
+                "SELECT definition \
+                 FROM lix_schema_definition \
+                 WHERE key = 'engine_divergent_schema'",
                 &[],
             )
             .await
@@ -851,8 +1249,8 @@ simulation_test!(
         });
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES ($1, false, false)",
+            "INSERT INTO lix_schema_definition (definition) \
+             VALUES ($1)",
             &[Value::Json(base_schema)],
         )
         .await
@@ -876,9 +1274,9 @@ simulation_test!(
 
         let main_update = main
             .execute(
-                "UPDATE lix_registered_schema \
-                 SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                "UPDATE lix_schema_definition \
+                 SET definition = $1 \
+                 WHERE key = 'engine_branch_schema_amendment'",
                 &[Value::Json(main_schema.clone())],
             )
             .await
@@ -887,9 +1285,9 @@ simulation_test!(
 
         let draft_update = draft
             .execute(
-                "UPDATE lix_registered_schema \
-                 SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                "UPDATE lix_schema_definition \
+                 SET definition = $1 \
+                 WHERE key = 'engine_branch_schema_amendment'",
                 &[Value::Json(draft_schema.clone())],
             )
             .await
@@ -898,9 +1296,9 @@ simulation_test!(
 
         let main_result = main
             .execute(
-                "SELECT value \
-                 FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                "SELECT definition \
+                 FROM lix_schema_definition \
+                 WHERE key = 'engine_branch_schema_amendment'",
                 &[],
             )
             .await
@@ -909,9 +1307,9 @@ simulation_test!(
 
         let draft_result = draft
             .execute(
-                "SELECT value \
-                 FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                "SELECT definition \
+                 FROM lix_schema_definition \
+                 WHERE key = 'engine_branch_schema_amendment'",
                 &[],
             )
             .await
@@ -941,11 +1339,9 @@ simulation_test!(
         .expect("target branch should be created before FK schemas");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -953,11 +1349,9 @@ simulation_test!(
         .expect("parent schema should register on active main");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1015,12 +1409,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1070,12 +1462,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1141,11 +1531,9 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
 
     global_session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             true,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1154,11 +1542,9 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1220,12 +1606,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1263,12 +1647,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1320,12 +1702,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1378,12 +1758,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1464,12 +1842,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1521,12 +1897,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1577,11 +1951,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1653,11 +2025,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1711,12 +2081,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1755,12 +2123,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1799,12 +2165,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -1841,11 +2205,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1897,11 +2259,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -1993,11 +2353,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -2090,11 +2448,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -2202,12 +2558,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -2259,12 +2613,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await

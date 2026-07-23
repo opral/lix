@@ -46,7 +46,6 @@ pub(crate) enum DifferentialParam {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DifferentialProbe {
     RegisteredSchemaActive,
-    RegisteredSchemaByBranch { branch_ids: &'static [&'static str] },
     LixFileActive { paths: &'static [&'static str] },
 }
 
@@ -57,12 +56,7 @@ const EMPTY_PARAMS: &[DifferentialParam] = &[];
 pub(crate) const ACTIVE_BRANCH_PROBE_ID: &str = "__active_branch__";
 
 #[cfg(test)]
-const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[
-    DifferentialProbe::RegisteredSchemaActive,
-    DifferentialProbe::RegisteredSchemaByBranch {
-        branch_ids: &[ACTIVE_BRANCH_PROBE_ID, "global", "branch-a", "branch-b"],
-    },
-];
+const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[DifferentialProbe::RegisteredSchemaActive];
 
 #[cfg(test)]
 const FILE_AND_REGISTERED_SCHEMA_PROBES: &[DifferentialProbe] = &[
@@ -139,7 +133,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/base-entity-branch-override".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_registered_schema SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}') WHERE lixcol_branch_id = 'branch-b'".into(),
+            sql: "UPDATE lix_schema_definition SET definition = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}') WHERE lixcol_branch_id = 'branch-b'".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -151,7 +145,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/base-entity-insert-hidden-branch-column".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_registered_schema (value, lixcol_branch_id) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'branch-b')".into(),
+            sql: "INSERT INTO lix_schema_definition (definition, lixcol_branch_id) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'branch-b')".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -163,7 +157,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/unknown-typed-entity-insert-column".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_registered_schema (value, unknown_column) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'x')".into(),
+            sql: "INSERT INTO lix_schema_definition (definition, unknown_column) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'x')".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -429,7 +423,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/entity-base/reject-hidden-branch".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "DELETE FROM lix_registered_schema WHERE lixcol_branch_id = 'branch-a'".into(),
+            sql: "UPDATE lix_schema_definition SET definition = definition WHERE lixcol_branch_id = 'branch-a'".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,

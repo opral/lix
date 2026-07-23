@@ -109,7 +109,7 @@ mod sql {
     mod lix_json;
     mod lix_key_value;
     mod lix_label_assignment;
-    mod lix_registered_schema;
+    mod lix_schema;
     mod metadata;
     mod read_only;
     mod udfs;

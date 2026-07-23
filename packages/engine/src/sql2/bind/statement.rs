@@ -114,7 +114,8 @@ pub(super) fn bind_insert_bound(
     if conflict.is_some() {
         if !matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityBase { .. }
+            PublicSurfaceKind::SchemaDefinition
+                | PublicSurfaceKind::EntityBase { .. }
                 | PublicSurfaceKind::EntityByBranch { .. }
                 | PublicSurfaceKind::LixState
                 | PublicSurfaceKind::LixStateByBranch
@@ -542,7 +543,9 @@ fn bind_insert_input(
     let SetExpr::Values(values) = source.body.as_ref() else {
         if matches!(
             surface_kind,
-            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
+            PublicSurfaceKind::SchemaDefinition
+                | PublicSurfaceKind::EntityBase { .. }
+                | PublicSurfaceKind::EntityByBranch { .. }
         ) {
             return Err(super::error::unsupported(
                 "INSERT ... SELECT is not supported for entity SQL surfaces yet",
@@ -1216,6 +1219,15 @@ fn require_write_capability(
     surface: &PublicSurfaceContract,
     op: BoundWriteOp,
 ) -> Result<(), LixError> {
+    if matches!(
+        (&surface.kind, &op),
+        (PublicSurfaceKind::SchemaDefinition, BoundWriteOp::Delete)
+    ) {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "DELETE FROM lix_schema_definition is not supported because schema deletion is not supported",
+        ));
+    }
     let allowed = match op {
         BoundWriteOp::Insert => surface.capabilities.insert,
         BoundWriteOp::Update => surface.capabilities.update,
@@ -1248,6 +1260,7 @@ fn require_write_capability(
 
 fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
     match kind {
+        PublicSurfaceKind::SchemaDefinition => BoundWriteTarget::SchemaDefinition,
         PublicSurfaceKind::LixState => BoundWriteTarget::LixState,
         PublicSurfaceKind::LixStateByBranch => BoundWriteTarget::LixStateByBranch,
         PublicSurfaceKind::EntityBase { schema_key } => {
@@ -1267,7 +1280,8 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
             BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch)
         }
         PublicSurfaceKind::Branch => BoundWriteTarget::Branch,
-        PublicSurfaceKind::EntityHistory { .. }
+        PublicSurfaceKind::Schema
+        | PublicSurfaceKind::EntityHistory { .. }
         | PublicSurfaceKind::FileHistory
         | PublicSurfaceKind::DirectoryHistory
         | PublicSurfaceKind::Change

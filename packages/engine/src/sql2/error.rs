@@ -108,7 +108,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
 
     if lower.contains("unsupported sql type json") {
         return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
-            .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_registered_schema; SQL type JSON is not supported.");
+            .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_schema_definition; SQL type JSON is not supported.");
     }
 
     if looks_like_type_mismatch(&lower) {

@@ -39,7 +39,7 @@ Lix stores application state as typed entities. Register a schema once, then rea
 
 ```ts
 await lix.execute(
-	"INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+	"INSERT INTO lix_schema_definition (definition) VALUES (lix_json($1))",
 	[
 		JSON.stringify({
 			$schema: "https://json-schema.org/draft/2020-12/schema",
@@ -58,7 +58,9 @@ await lix.execute(
 );
 ```
 
-`lix_json($1)` parses the JSON text into the JSON-typed `value` column. Schema details (the `x-lix-*` fields, primary keys, uniqueness) are covered in [Schemas](./schemas.md).
+`lix_json($1)` parses bound JSON text into a semantic JSON value before the
+schema definition is registered. Schema details (the `x-lix-*` fields, primary
+keys, uniqueness) are covered in [Schemas](./schemas.md).
 
 ## Write and read state
 

@@ -12,9 +12,10 @@ Lix exposes logical application data through typed SQL relations:
 | Files | `lix_file` | `lix_file_by_branch` | `lix_file_history` |
 | Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history` |
 
-`lix_registered_schema*` provides schema discovery, `lix_key_value*` provides
-shared workspace metadata, and `lix_change` provides workspace-wide activity.
-There is no generic `lix_state*` SQL family.
+`lix_schema` provides schema discovery, `lix_schema_definition` provides the
+schema mutation surface, `lix_key_value*` provides shared workspace metadata,
+and `lix_change` provides workspace-wide activity. There is no generic
+`lix_state*` SQL family.
 
 ## The executable column contract
 
@@ -114,18 +115,24 @@ There are no bare history aliases. Every public history surface uses the
 
 ## Schema discovery and interoperability
 
-`lix_registered_schema` remains the authoritative schema registry:
+`lix_schema` is the authoritative read-only schema catalog:
 
 ```sql
-SELECT
-  lix_json_get_text(value, 'x-lix-key') AS schema_key,
-  lix_json_get(value, 'x-lix-primary-key') AS primary_key
-FROM lix_registered_schema
-ORDER BY schema_key;
+SELECT key, primary_key, surfaces, definition
+FROM lix_schema
+ORDER BY key;
 ```
 
-The registry contains both application schemas and schemas bootstrapped by
-Lix. Registration does not imply that a Lix bootstrap schema has a public SQL
+Write definitions through `lix_schema_definition`; its `key` is derived from
+`definition."x-lix-key"` and is read-only:
+
+```sql
+INSERT INTO lix_schema_definition (definition)
+VALUES (lix_json($1));
+```
+
+The catalog contains both application schemas and schemas bootstrapped by Lix.
+Registration does not imply that a Lix bootstrap schema has a public SQL
 relation. The storage-level schemas `lix_file_descriptor`,
 `lix_directory_descriptor`, and `lix_binary_blob_ref` remain registered for
 interoperability while their implementation relations are private.
@@ -239,4 +246,4 @@ The public SQL catalog has no compatibility aliases for `lix_state`,
 | Current and historical directories | `lix_directory*` |
 | Shared workspace metadata | `lix_key_value*` |
 | Workspace-wide heterogeneous activity | `lix_change` |
-| Schema discovery | `lix_registered_schema*` |
+| Schema discovery | `lix_schema` |

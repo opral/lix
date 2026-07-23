@@ -9,16 +9,21 @@ Schemas describe the entities Lix tracks. You declare each entity type as a JSON
 Schemas are also the foundation file-format plugins build on: a plugin parses a file format (XLSX, DOCX, CAD, ...) into entities described by a schema. You can register schemas yourself, and plugin authors can register schemas for the entities their format exposes.
 
 > [!NOTE]
-> **For agents.** Lix is self-documenting. When operating against a Lix repository, query `lix_registered_schema` to discover every schema currently in effect (including Lix's own internal schemas `lix_*`) rather than relying on a snapshot of these docs. The schemas you read back are authoritative and current.
+> **For agents.** Lix is self-documenting. Query `lix_schema` to discover every
+> schema currently in effect, the SQL surfaces it generates, its ordered primary
+> key, and its executable column contract. This includes Lix's internal
+> `lix_*` schemas. The rows you read back are authoritative and current.
 >
 > ```sql
-> SELECT value FROM lix_registered_schema;
+> SELECT key, table_name, primary_key, columns, surfaces, definition
+> FROM lix_schema
+> ORDER BY key;
 > ```
 
 ## Register a schema
 
 ```sql
-INSERT INTO lix_registered_schema (value) VALUES (lix_json('{
+INSERT INTO lix_schema_definition (definition) VALUES (lix_json('{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-lix-key": "acme_section",
   "x-lix-primary-key": ["/id"],
@@ -33,7 +38,18 @@ INSERT INTO lix_registered_schema (value) VALUES (lix_json('{
 }'));
 ```
 
-After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `UPDATE`, and `DELETE` against. A sibling table `acme_section_by_version` exposes the same rows across all versions (see [Versions & Merging](./versions.md)).
+`lix_schema_definition` is the only schema-authoring surface. Its `key` column
+is read-only and is derived from `definition['x-lix-key']`; explicit `NULL`
+definitions are rejected. `DELETE` is not supported.
+
+Schema discovery and authoring use the session's exact branch scope. A schema
+registered from a global session is visible and mutable through `lix_schema`
+and `lix_schema_definition` only from a global session; it does not implicitly
+provision a typed SQL surface on active workspace branches.
+
+After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`,
+`UPDATE`, and `DELETE` against. `acme_section_by_branch` exposes branch-scoped
+rows, and `acme_section_history` exposes entity history.
 
 ## The `x-lix-*` extensions
 
@@ -89,7 +105,11 @@ Always include `additionalProperties: false`. Lix validates writes against the s
 
 ## Schema amendment rules
 
-A registered schema's `x-lix-key` is the relation's durable identity. You can re-register the same `x-lix-key` to amend the schema, but Lix only accepts changes that keep existing data valid. The rules are mechanical: a diff of old vs new must satisfy every constraint below or the amendment is rejected.
+A registered schema's `x-lix-key` is the relation's durable identity. Amend its
+definition with `UPDATE lix_schema_definition SET definition = ... WHERE key =
+...`, or use `INSERT ... ON CONFLICT (key) DO UPDATE`. Lix only accepts changes
+that keep existing data valid. The rules are mechanical: a diff of old vs new
+must satisfy every constraint below or the amendment is rejected.
 
 ### Why amendments must be backward compatible
 
@@ -145,12 +165,12 @@ Mint a new `x-lix-key`. Ship `acme_section_v2` as a separate schema, write migra
 
 Why it matters: a single Lix can hold many files and many schemas at once.
 App-level entities, file-format plugins (XLSX, DOCX, CAD, ...), and Lix's own
-internal schemas all share the `lix_registered_schema` namespace. An
-unprefixed `task` collides the moment a second source registers the same name.
-The exact key `lix` and the `lix_*` prefix are reserved and enforced for
-schemas bootstrapped by Lix; public runtime registration in that namespace
-fails with
-`LIX_RESERVED_SCHEMA_NAMESPACE`.
+internal schemas share one schema-key namespace. An unprefixed `task` collides
+the moment a second source registers the same name. The exact key `lix` and
+every `lix_*` key are reserved automatically for Lix; public runtime
+registration in that namespace fails with `LIX_RESERVED_SCHEMA_NAMESPACE`.
+Lix also rejects a key when its generated base, `_by_branch`, or `_history`
+table name would collide with another schema's generated name.
 
 Treat `x-lix-key` like a package name: lowercase, stable, namespaced. Once data is written, the key is permanent (see the amendment rules above).
 
@@ -163,9 +183,10 @@ You don't need `created_at` or `updated_at` on app schemas. Lix already records 
 ### Inspecting registered schemas
 
 ```sql
-SELECT lixcol_entity_pk, value
-FROM lix_registered_schema
-ORDER BY lixcol_entity_pk;
+SELECT key, table_name, by_branch_table_name, history_table_name,
+       primary_key, columns, surfaces, definition
+FROM lix_schema
+ORDER BY key;
 ```
 
 ### Design for querying, not for merging

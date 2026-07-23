@@ -1341,20 +1341,6 @@ where
             }
         }
     }
-
-    #[cfg(test)]
-    pub(crate) async fn scan_live_state_for_test(
-        &mut self,
-        request: &crate::live_state::LiveStateScanRequest,
-    ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
-        let transaction = self.transaction_mut()?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state(
-            transaction,
-            request,
-        )
-        .await
-    }
 }
 
 async fn execute_transaction_write_auto<StorageImpl>(
@@ -2783,7 +2769,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_schema_definition (definition) VALUES (lix_json($1))",
                 &[Value::Text(custom_schema.to_string())],
             )
             .await

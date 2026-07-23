@@ -361,12 +361,6 @@ impl TableSpec for EntitySpec {
         filters: &[Expr],
     ) -> Result<PlannedDml> {
         reject_read_only_entity_surface(&self.spec.schema_key, "DELETE")?;
-        if self.spec.schema_key == "lix_registered_schema" {
-            return Err(lix_error_to_datafusion_error(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "delete lix_registered_schema is not supported",
-            )));
-        }
         if !filters.iter().any(contains_like_filter) {
             return not_impl_err!(
                 "raw DataFusion DELETE is disabled; use the sql2 bound write pipeline"

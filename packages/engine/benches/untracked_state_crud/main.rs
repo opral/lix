@@ -904,8 +904,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let sql = format!(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-         VALUES (lix_json('{}'), false, false)",
+        "INSERT INTO lix_schema_definition (definition)
+         VALUES (lix_json('{}'))",
         sql_string(JSON_POINTER_SCHEMA_JSON)
     );
     let affected = session

@@ -274,6 +274,7 @@ where
     .await?;
     let mut rows = entries
         .into_iter()
+        .filter(|entry| entry.change.schema_key != super::INTERNAL_SCHEMA_DEFINITION_KEY)
         .map(|entry| -> Result<StateHistorySqlRow, LixError> {
             Ok(StateHistorySqlRow {
                 entity_pk: entry.change.entity_pk.as_json_array_text()?,

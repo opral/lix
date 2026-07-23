@@ -72,7 +72,7 @@ Parses a JSON string into a JSON-typed value. Use this when binding a JSON param
 
 ```ts
 await lix.execute(
-  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+  "INSERT INTO lix_schema_definition (definition) VALUES (lix_json($1))",
   [JSON.stringify(schema)],
 );
 ```
@@ -82,9 +82,9 @@ await lix.execute(
 Returns the value at a JSON path, **preserving JSON type** (objects, arrays, numbers, booleans, strings stay as JSON). Variadic path: pass each segment as a separate argument.
 
 ```sql
-SELECT lix_json_get(value, 'x-lix-primary-key')
-FROM lix_registered_schema
-WHERE lix_json_get_text(value, 'x-lix-key') = 'acme_task';
+SELECT lix_json_get(definition, 'x-lix-primary-key')
+FROM lix_schema
+WHERE key = 'acme_task';
 -- returns ["/id"] as JSON
 ```
 
@@ -93,9 +93,9 @@ WHERE lix_json_get_text(value, 'x-lix-key') = 'acme_task';
 Same as `lix_json_get` but returns the value as plain text. Useful for filtering or display:
 
 ```sql
-SELECT lix_json_get_text(value, 'x-lix-key') AS schema_key
-FROM lix_registered_schema
-WHERE lix_json_get_text(value, 'type') = 'object';
+SELECT key
+FROM lix_schema
+WHERE lix_json_get_text(definition, 'type') = 'object';
 ```
 
 Both return `NULL` if the path is missing or the underlying value is `null`.

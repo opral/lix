@@ -265,7 +265,7 @@ async fn register_poison_task_schema(session: &lix_engine::SessionContext) {
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_schema_definition (definition) VALUES (lix_json($1))",
             &[Value::Text(schema.to_string())],
         )
         .await

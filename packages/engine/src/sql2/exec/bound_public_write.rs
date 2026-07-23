@@ -6,6 +6,9 @@ use crate::changelog::CommitId;
 use crate::common::validate_row_metadata;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
+use crate::schema::{
+    registered_schema_entity_pk, schema_key_from_definition, validate_lix_schema_definition,
+};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -29,6 +32,7 @@ use super::SqlWriteResult;
 #[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
+        BoundWriteTarget::SchemaDefinition => true,
         BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
         BoundWriteTarget::File(surface) => {
             fast_file_path_write_shape(plan, surface).is_some()
@@ -49,6 +53,9 @@ pub(crate) async fn try_execute_bound_public_write(
     params: &[Value],
 ) -> Result<BoundPublicWriteExecution, LixError> {
     match &plan.bound.target {
+        BoundWriteTarget::SchemaDefinition => execute_schema_definition_write(ctx, plan, params)
+            .await
+            .map(BoundPublicWriteExecution::Executed),
         BoundWriteTarget::Entity(surface) if bound_public_write_shape_supported(plan) => {
             execute_entity_write(ctx, plan, surface, params)
                 .await
@@ -71,6 +78,440 @@ pub(crate) async fn try_execute_bound_public_write(
             }
         }
         _ => Ok(BoundPublicWriteExecution::Unsupported),
+    }
+}
+
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+
+async fn execute_schema_definition_write(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+) -> Result<SqlWriteResult, LixError> {
+    let spec = schema_definition_eval_spec();
+    validate_bound_write_supported(plan, &spec)?;
+    if matches!(plan.bound.branch_scope, BranchScope::Empty)
+        || matches!(plan.filters.rows, FilterSet::None)
+    {
+        return Ok(SqlWriteResult::affected(0));
+    }
+    let active_branch_commit_id = load_active_branch_commit_id(ctx).await?;
+    match plan.bound.op {
+        BoundWriteOp::Insert => {
+            let proposed = schema_definition_insert_rows(
+                ctx,
+                plan,
+                params,
+                active_branch_commit_id.as_ref(),
+                &spec,
+            )?;
+            if let Some(conflict) = &plan.bound.conflict {
+                schema_definition_upsert(
+                    ctx,
+                    plan,
+                    params,
+                    active_branch_commit_id.as_ref(),
+                    &spec,
+                    proposed,
+                    conflict,
+                )
+                .await
+                .map(SqlWriteResult::affected)
+            } else {
+                let rows = proposed.into_iter().map(|row| row.storage_row).collect();
+                stage_rows(ctx, TransactionWriteMode::Insert, rows)
+                    .await
+                    .map(SqlWriteResult::affected)
+            }
+        }
+        BoundWriteOp::Update => {
+            schema_definition_update(ctx, plan, params, active_branch_commit_id.as_ref(), &spec)
+                .await
+                .map(SqlWriteResult::affected)
+        }
+        BoundWriteOp::Delete => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "DELETE FROM lix_schema_definition is not supported because schema deletion is not supported",
+        )),
+    }
+}
+
+struct ProposedSchemaDefinition {
+    key: String,
+    definition: JsonValue,
+    storage_row: TransactionWriteRow,
+}
+
+fn schema_definition_insert_rows(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+    spec: &EntitySurfaceSpec,
+) -> Result<Vec<ProposedSchemaDefinition>, LixError> {
+    let BoundWriteInput::Values(values) = &plan.bound.input else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT into lix_schema_definition supports VALUES only",
+        ));
+    };
+    if values.columns.len() != 1 || values.columns[0].name != "definition" {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT into lix_schema_definition requires exactly the definition column; key is derived and read-only",
+        ));
+    }
+    let context = EntityEvalContext::insert(&JsonValue::Null, &spec.columns);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut proposed = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let [definition_expr] = row.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "INSERT into lix_schema_definition rows must contain one definition",
+            ));
+        };
+        let definition = schema_definition_from_eval_value(eval_expr_value(
+            definition_expr,
+            &context,
+            ctx,
+            params,
+            active_branch_commit_id,
+        )?)?;
+        let key = validated_schema_definition_key(&definition)?;
+        if !seen.insert(key.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("INSERT into lix_schema_definition contains duplicate derived key '{key}'"),
+            ));
+        }
+        let branch_id = entity_row_branch_id(plan, None, false)?;
+        let storage_row = schema_definition_storage_row(&key, definition.clone(), branch_id)?;
+        proposed.push(ProposedSchemaDefinition {
+            key,
+            definition,
+            storage_row,
+        });
+    }
+    Ok(proposed)
+}
+
+async fn schema_definition_upsert(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+    spec: &EntitySurfaceSpec,
+    proposed: Vec<ProposedSchemaDefinition>,
+    conflict: &BoundInsertConflict,
+) -> Result<u64, LixError> {
+    if conflict.target_columns.len() != 1 || conflict.target_columns[0].name != "key" {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT ON CONFLICT on lix_schema_definition must target the derived key column",
+        ));
+    }
+    let candidates = scan_entity_candidates(ctx, plan, &storage_registered_schema_spec()).await?;
+    let mut rows = Vec::new();
+    let mut affected = 0_u64;
+    for proposed in proposed {
+        let proposed_storage = &proposed.storage_row;
+        let matching = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.entity_pk
+                    == *proposed_storage
+                        .entity_pk
+                        .as_ref()
+                        .expect("schema definition insert identity")
+                    && candidate.file_id.as_deref() == proposed_storage.file_id.as_deref()
+                    && candidate.global == proposed_storage.global
+                    && (candidate.global || candidate.branch_id == proposed_storage.branch_id)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "schema definition '{}' is visible from more than one storage domain",
+                    proposed.key
+                ),
+            ));
+        }
+        let Some(candidate) = matching.first().copied() else {
+            rows.push(proposed.storage_row);
+            affected += 1;
+            continue;
+        };
+        match &conflict.action {
+            BoundConflictAction::DoNothing => {}
+            BoundConflictAction::DoUpdate { assignments } => {
+                let (existing_key, existing_definition, existing_view) =
+                    schema_definition_candidate_view(candidate)?;
+                let excluded_view = schema_definition_view(&proposed.key, &proposed.definition);
+                let context = EntityEvalContext::conflict(
+                    &existing_view,
+                    candidate,
+                    &excluded_view,
+                    &proposed.storage_row,
+                    spec,
+                );
+                let definition = schema_definition_assignment_value(
+                    assignments,
+                    &context,
+                    ctx,
+                    params,
+                    active_branch_commit_id,
+                )?
+                .unwrap_or(existing_definition);
+                enforce_schema_definition_identity(&existing_key, &definition)?;
+                rows.push(schema_definition_replace_row(candidate, definition, spec)?);
+                affected += 1;
+            }
+        }
+    }
+    stage_rows(ctx, TransactionWriteMode::Replace, rows).await?;
+    Ok(affected)
+}
+
+async fn schema_definition_update(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+    spec: &EntitySurfaceSpec,
+) -> Result<u64, LixError> {
+    let candidates = scan_entity_candidates(ctx, plan, &storage_registered_schema_spec()).await?;
+    let mut rows = Vec::new();
+    for candidate in &candidates {
+        if candidate.global != schema_definition_targets_global(&plan.bound.branch_scope) {
+            continue;
+        }
+        let (existing_key, existing_definition, view) =
+            schema_definition_candidate_view(candidate)?;
+        let context = EntityEvalContext::live(&view, candidate, spec);
+        if !predicate_matches(
+            &plan.bound.predicate,
+            &context,
+            spec,
+            ctx,
+            params,
+            active_branch_commit_id,
+        )? {
+            continue;
+        }
+        let definition = schema_definition_assignment_value(
+            &plan.bound.assignments,
+            &context,
+            ctx,
+            params,
+            active_branch_commit_id,
+        )?
+        .unwrap_or(existing_definition);
+        enforce_schema_definition_identity(&existing_key, &definition)?;
+        rows.push(schema_definition_replace_row(candidate, definition, spec)?);
+    }
+    stage_rows(ctx, TransactionWriteMode::Replace, rows).await
+}
+
+fn schema_definition_targets_global(scope: &BranchScope) -> bool {
+    match scope {
+        BranchScope::Global => true,
+        BranchScope::Active { branch_id } => branch_id == crate::GLOBAL_BRANCH_ID,
+        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
+            branch_ids.len() == 1 && branch_ids.contains(crate::GLOBAL_BRANCH_ID)
+        }
+        BranchScope::ExplicitDynamic { .. }
+        | BranchScope::ExplicitRequiredDynamic { .. }
+        | BranchScope::Empty => false,
+    }
+}
+
+fn schema_definition_assignment_value(
+    assignments: &[BoundAssignment],
+    context: &EntityEvalContext<'_>,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<Option<JsonValue>, LixError> {
+    let Some(assignment) = assignments.first() else {
+        return Ok(None);
+    };
+    if assignments.len() != 1 || assignment.column.name != "definition" {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "UPDATE lix_schema_definition may assign only the definition column",
+        ));
+    }
+    schema_definition_from_eval_value(eval_expr_value(
+        &assignment.value,
+        context,
+        ctx,
+        params,
+        active_branch_commit_id,
+    )?)
+    .map(Some)
+}
+
+fn schema_definition_from_eval_value(value: EntityEvalValue) -> Result<JsonValue, LixError> {
+    let definition = match value {
+        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null) => {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                "lix_schema_definition.definition does not allow explicit NULL",
+            ));
+        }
+        EntityEvalValue::SqlText(raw) => serde_json::from_str(&raw).map_err(|error| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("lix_schema_definition.definition is not valid JSON: {error}"),
+            )
+        })?,
+        EntityEvalValue::Json(value) => value,
+    };
+    if !definition.is_object() {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "lix_schema_definition.definition must be a JSON object",
+        ));
+    }
+    Ok(definition)
+}
+
+fn validated_schema_definition_key(definition: &JsonValue) -> Result<String, LixError> {
+    validate_lix_schema_definition(definition)?;
+    Ok(schema_key_from_definition(definition)?.schema_key)
+}
+
+fn enforce_schema_definition_identity(
+    existing_key: &str,
+    definition: &JsonValue,
+) -> Result<(), LixError> {
+    let updated_key = validated_schema_definition_key(definition)?;
+    if updated_key == existing_key {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_SCHEMA_DEFINITION,
+        format!(
+            "UPDATE lix_schema_definition cannot change derived key '{existing_key}' to '{updated_key}'"
+        ),
+    )
+    .with_hint("Insert a new schema definition when a different x-lix-key is intended."))
+}
+
+fn schema_definition_candidate_view(
+    candidate: &crate::live_state::MaterializedLiveStateRow,
+) -> Result<(String, JsonValue, JsonValue), LixError> {
+    let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "visible schema definition cannot be a tombstone",
+        )
+    })?;
+    let definition = snapshot.get("value").cloned().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "stored lix_registered_schema row is missing value",
+        )
+    })?;
+    let key = schema_key_from_definition(&definition)?.schema_key;
+    let view = schema_definition_view(&key, &definition);
+    Ok((key, definition, view))
+}
+
+fn schema_definition_view(key: &str, definition: &JsonValue) -> JsonValue {
+    serde_json::json!({
+        "key": key,
+        "definition": definition,
+    })
+}
+
+fn schema_definition_storage_row(
+    key: &str,
+    definition: JsonValue,
+    branch_id: String,
+) -> Result<TransactionWriteRow, LixError> {
+    let global = branch_id == crate::GLOBAL_BRANCH_ID;
+    Ok(TransactionWriteRow {
+        entity_pk: Some(registered_schema_entity_pk(key)?),
+        schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+        file_id: None,
+        snapshot: Some(TransactionJson::from_value(
+            serde_json::json!({ "value": definition }),
+            "lix_schema_definition insert",
+        )?),
+        metadata: None,
+        origin: None,
+        created_at: None,
+        updated_at: None,
+        global,
+        change_id: None,
+        commit_id: None,
+        untracked: false,
+        branch_id,
+    })
+}
+
+fn schema_definition_replace_row(
+    candidate: &crate::live_state::MaterializedLiveStateRow,
+    definition: JsonValue,
+    spec: &EntitySurfaceSpec,
+) -> Result<TransactionWriteRow, LixError> {
+    Ok(TransactionWriteRow {
+        entity_pk: Some(candidate.entity_pk.clone()),
+        schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+        file_id: candidate.file_id.clone(),
+        snapshot: Some(TransactionJson::from_value(
+            serde_json::json!({ "value": definition }),
+            "lix_schema_definition update",
+        )?),
+        metadata: inherited_metadata(candidate, spec)?,
+        origin: None,
+        created_at: None,
+        updated_at: None,
+        global: candidate.global,
+        change_id: None,
+        commit_id: None,
+        untracked: candidate.untracked,
+        branch_id: if candidate.global {
+            crate::GLOBAL_BRANCH_ID.to_string()
+        } else {
+            candidate.branch_id.clone()
+        },
+    })
+}
+
+fn schema_definition_eval_spec() -> EntitySurfaceSpec {
+    EntitySurfaceSpec {
+        schema_key: "lix_schema_definition".to_string(),
+        primary_key_paths: vec![vec!["key".to_string()]],
+        columns: vec![
+            EntitySurfaceColumn {
+                name: "key".to_string(),
+                column_type: EntityColumnType::String,
+                read_nullable: false,
+                insert_required: true,
+                default_expression: None,
+            },
+            EntitySurfaceColumn {
+                name: "definition".to_string(),
+                column_type: EntityColumnType::Json,
+                read_nullable: false,
+                insert_required: true,
+                default_expression: None,
+            },
+        ],
+        defaults: crate::catalog::DefaultPlan::default(),
+    }
+}
+
+fn storage_registered_schema_spec() -> EntitySurfaceSpec {
+    EntitySurfaceSpec {
+        schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+        primary_key_paths: Vec::new(),
+        columns: Vec::new(),
+        defaults: crate::catalog::DefaultPlan::default(),
     }
 }
 
@@ -161,13 +602,6 @@ async fn execute_entity_write(
     };
     reject_read_only_entity_surface(schema_key, entity_action(&plan.bound.op))
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-
-    if schema_key == "lix_registered_schema" && plan.bound.op == BoundWriteOp::Delete {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "delete lix_registered_schema is not supported",
-        ));
-    }
 
     let spec = entity_spec(ctx, schema_key)?;
     validate_bound_write_supported(plan, &spec)?;

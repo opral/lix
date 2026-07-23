@@ -106,6 +106,21 @@ impl CatalogSnapshot {
         Ok(self.by_identity.get(&identity).copied().unwrap_or(plan_id))
     }
 
+    pub(crate) fn insert_schemas_for_domains(
+        &mut self,
+        schemas: impl IntoIterator<Item = (Domain, SchemaKey, JsonValue)>,
+    ) -> Result<(), LixError> {
+        let mut candidate = Self::from_entries(self.entries.clone())?;
+        for (domain, key, schema) in schemas {
+            let key = SchemaCatalogKey::from_schema_key(key);
+            let identity = DomainSchemaIdentity::new(domain, key.schema_key.clone());
+            candidate.remember_schema_identity(identity, key, schema)?;
+        }
+        candidate.rebuild_plans()?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn from_entries(entries: Vec<CatalogEntry>) -> Result<Self, LixError> {
         let mut catalog = Self::default();
         for entry in entries {
@@ -365,6 +380,19 @@ impl TransactionCatalog {
             unreachable!("transaction catalog is owned after copy-on-write");
         };
         snapshot.insert_schema_for_domain(domain, key, schema)
+    }
+
+    pub(crate) fn insert_schemas_for_domains(
+        &mut self,
+        schemas: impl IntoIterator<Item = (Domain, SchemaKey, JsonValue)>,
+    ) -> Result<(), LixError> {
+        if let Self::Shared(snapshot) = self {
+            *self = Self::Owned(snapshot.rebuild_owned()?);
+        }
+        let Self::Owned(snapshot) = self else {
+            unreachable!("transaction catalog is owned after copy-on-write");
+        };
+        snapshot.insert_schemas_for_domains(schemas)
     }
 }
 

@@ -51,8 +51,8 @@ FROM acme_task_history
 ORDER BY lixcol_depth, id;
 ```
 
-Discover schemas through `lix_registered_schema` when the agent works across
-applications. Use `lix_change` only for workspace-global activity; it is not
+Discover schemas through the read-only `lix_schema` catalog when the agent
+works across applications. Use `lix_change` only for workspace-global activity; it is not
 implicitly scoped to the agent's active branch. See
 [Change History](./history.md) for the scope distinction and more recipes.
 

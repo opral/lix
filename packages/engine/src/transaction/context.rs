@@ -65,7 +65,7 @@ use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY, normalize_transaction_write_row,
-    remember_pending_registered_schema,
+    remember_pending_registered_schemas,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
@@ -1547,6 +1547,7 @@ where
                 .schema_resolver
                 .catalog_for_row_normalization(&live_state, &staged, &domain)
                 .await?;
+            let mut pending_registered_schemas = Vec::new();
             for (_, row) in &rows {
                 if row.schema_key != REGISTERED_SCHEMA_KEY {
                     continue;
@@ -1558,12 +1559,12 @@ where
                     )
                     .with_hint("Schema definitions are scoped by branch and durability only; write them with null file_id."));
                 }
-                remember_pending_registered_schema(
+                pending_registered_schemas.push((
                     row.snapshot.as_ref().map(TransactionJson::value),
                     Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked),
-                    catalog,
-                )?;
+                ));
             }
+            remember_pending_registered_schemas(pending_registered_schemas, catalog)?;
             let normalized_rows = rows
                 .into_iter()
                 .map(|(index, row)| {
@@ -1588,6 +1589,8 @@ where
         &mut self,
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
+        self.validate_prepared_schema_sql_catalogs(prepared_writes)
+            .await?;
         let validation_index = prepared_writes.validation_index();
         for scope in validation_index.schema_scopes() {
             #[cfg(feature = "storage-benches")]
@@ -1612,6 +1615,146 @@ where
                 validation_input = validation_input.with_trusted_filesystem_planner();
             }
             validate_prepared_writes(validation_input).await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_prepared_schema_sql_catalogs(
+        &mut self,
+        prepared_writes: &PreparedWriteSet,
+    ) -> Result<(), LixError> {
+        let mut rows_by_branch = BTreeMap::<String, Vec<&PreparedStateRow>>::new();
+        for row in &prepared_writes.state_rows {
+            if row.schema_key != REGISTERED_SCHEMA_KEY {
+                continue;
+            }
+            let branch_id = if row.global {
+                GLOBAL_BRANCH_ID
+            } else {
+                row.branch_id.as_str()
+            };
+            rows_by_branch
+                .entry(branch_id.to_string())
+                .or_default()
+                .push(row);
+        }
+        let mut selected_schema_refs_by_branch =
+            BTreeMap::<String, Vec<&StagedCommitChangeRef>>::new();
+        for (branch_id, change_refs) in &prepared_writes.commit_change_refs_by_branch {
+            for change_ref in &change_refs.selected_change_refs {
+                if change_ref.schema_key == REGISTERED_SCHEMA_KEY {
+                    selected_schema_refs_by_branch
+                        .entry(branch_id.clone())
+                        .or_default()
+                        .push(change_ref);
+                }
+            }
+        }
+        if rows_by_branch.is_empty() && selected_schema_refs_by_branch.is_empty() {
+            return Ok(());
+        }
+
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let live_state = self.live_state.reader(&read);
+        let selected_schema_payloads = crate::changelog::materialize_change_payloads(
+            &read,
+            selected_schema_refs_by_branch
+                .values()
+                .flatten()
+                .map(|change_ref| change_ref.change_id),
+            crate::changelog::ChangeRecordProjection {
+                snapshot_content: true,
+                metadata: false,
+            },
+            "merged schema definition",
+        )
+        .await?;
+        let affected_branches = rows_by_branch
+            .keys()
+            .chain(selected_schema_refs_by_branch.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for branch_id in affected_branches {
+            let mut sql_catalog = self
+                .schema_resolver
+                .catalog_for_validation(
+                    &live_state,
+                    &Domain::schema_catalog(branch_id.clone(), true),
+                )
+                .await?
+                .rebuild_owned()?;
+            let mut proposed_schemas = Vec::new();
+            for row in rows_by_branch.remove(&branch_id).unwrap_or_default() {
+                let snapshot = row.snapshot.as_ref().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        "lix_registered_schema rows cannot be deleted yet; schema deletion is not supported",
+                    )
+                })?;
+                let (key, schema) = parse_runtime_schema_snapshot(snapshot.value.as_ref())?;
+                proposed_schemas.push((
+                    Domain::schema_catalog(branch_id.clone(), row.untracked),
+                    key,
+                    schema,
+                ));
+            }
+            for change_ref in selected_schema_refs_by_branch
+                .remove(&branch_id)
+                .unwrap_or_default()
+            {
+                let payload = selected_schema_payloads
+                    .get(&change_ref.change_id)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "merged schema definition change '{}' could not be loaded",
+                                change_ref.change_id
+                            ),
+                        )
+                    })?;
+                let snapshot_content = payload.snapshot_content.as_deref().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        "merging a deleted schema definition is not supported",
+                    )
+                })?;
+                let snapshot =
+                    serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_DEFINITION,
+                            format!(
+                                "merged schema definition contains invalid snapshot JSON: {error}"
+                            ),
+                        )
+                    })?;
+                let (key, schema) = parse_runtime_schema_snapshot(&snapshot)?;
+                proposed_schemas.push((
+                    Domain::schema_catalog(branch_id.clone(), false),
+                    key,
+                    schema,
+                ));
+            }
+            let mut public_definitions = sql_catalog
+                .schema_jsons()
+                .into_iter()
+                .map(|schema| {
+                    let key = crate::schema::schema_key_from_definition(&schema)?.schema_key;
+                    Ok((key, schema))
+                })
+                .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+            for (_, key, schema) in &proposed_schemas {
+                public_definitions.insert(key.schema_key.clone(), schema.clone());
+            }
+            crate::sql2::PublicCatalog::from_visible_schemas(
+                &public_definitions.into_values().collect::<Vec<_>>(),
+            )?;
+            sql_catalog.insert_schemas_for_domains(proposed_schemas)?;
+            crate::sql2::PublicCatalog::from_visible_schemas(&sql_catalog.schema_jsons())?;
         }
         Ok(())
     }
@@ -2193,6 +2336,14 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .values()
         .flat_map(|change_refs| change_refs.selected_change_refs.iter())
         .any(|change_ref| change_ref.schema_key == REGISTERED_SCHEMA_KEY)
+}
+
+fn parse_runtime_schema_snapshot(
+    snapshot: &JsonValue,
+) -> Result<(crate::schema::SchemaKey, JsonValue), LixError> {
+    let (key, schema) = crate::schema::schema_from_registered_snapshot(snapshot)?;
+    crate::transaction::normalization::reject_reserved_schema_namespace(&key)?;
+    Ok((key, schema))
 }
 
 pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
@@ -3503,6 +3654,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_rejects_schema_key_visible_from_tracked_and_untracked_catalogs() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+
+        transaction
+            .stage_rows(vec![registered_schema_stage_row(
+                "acme_duplicate_schema",
+                true,
+            )])
+            .await
+            .expect("untracked schema should stage independently");
+        transaction
+            .commit(&runtime_functions)
+            .await
+            .expect("untracked schema should commit independently");
+
+        let (_live_state, _binary_cas, _branch_ref, runtime_functions, mut transaction) =
+            reopen_test_transaction(&storage).await;
+        transaction
+            .stage_rows(vec![registered_schema_stage_row(
+                "acme_duplicate_schema",
+                false,
+            )])
+            .await
+            .expect("tracked schema should stage independently");
+
+        let error = transaction
+            .commit(&runtime_functions)
+            .await
+            .expect_err("one SQL-visible schema key cannot occupy two durability domains");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("more than one schema domain"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_generated_schema_surface_collision_across_durability() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+
+        transaction
+            .stage_rows(vec![registered_schema_stage_row("acme_note_history", true)])
+            .await
+            .expect("untracked schema should stage independently");
+        transaction
+            .stage_rows(vec![registered_schema_stage_row("acme_note", false)])
+            .await
+            .expect("tracked schema should stage independently");
+
+        let error = transaction
+            .commit(&runtime_functions)
+            .await
+            .expect_err("generated SQL names must be unique across durability domains");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(error.message.contains("public SQL surface"), "{error:?}");
+        assert!(error.message.contains("acme_note_history"), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn stage_rows_rejects_primary_key_entity_pk_mismatch_without_sql() {
         let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
@@ -3534,9 +3748,36 @@ mod tests {
         FunctionContext,
         Transaction,
     ) {
+        open_test_transaction_with_seed(storage, true).await
+    }
+
+    async fn reopen_test_transaction(
+        storage: &Memory,
+    ) -> (
+        Arc<LiveStateContext>,
+        Arc<BinaryCasContext>,
+        Arc<BranchContext>,
+        FunctionContext,
+        Transaction,
+    ) {
+        open_test_transaction_with_seed(storage, false).await
+    }
+
+    async fn open_test_transaction_with_seed(
+        storage: &Memory,
+        seed_schemas: bool,
+    ) -> (
+        Arc<LiveStateContext>,
+        Arc<BinaryCasContext>,
+        Arc<BranchContext>,
+        FunctionContext,
+        Transaction,
+    ) {
         let storage = StorageAdapter::new(storage.clone());
         let live_state = Arc::new(live_state_context());
-        seed_visible_schema_rows(storage.clone()).await;
+        if seed_schemas {
+            seed_visible_schema_rows(storage.clone()).await;
+        }
         let binary_cas = Arc::new(BinaryCasContext::new());
         let branch_ctx = Arc::new(BranchContext::new());
         let catalog_context = Arc::new(CatalogContext::new());
@@ -3652,6 +3893,39 @@ mod tests {
             snapshot: Some(TransactionJson::from_value_for_test(json!({
                 "key": key,
                 "value": value,
+            }))),
+            metadata: None,
+            origin: None,
+            created_at: None,
+            updated_at: None,
+            global: true,
+            change_id: None,
+            commit_id: None,
+            untracked,
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+        }
+    }
+
+    fn registered_schema_stage_row(key: &str, untracked: bool) -> TransactionWriteRow {
+        let definition = json!({
+            "x-lix-key": key,
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        TransactionWriteRow {
+            entity_pk: Some(
+                crate::schema::registered_schema_entity_pk(key)
+                    .expect("registered schema identity should derive"),
+            ),
+            schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+            file_id: None,
+            snapshot: Some(TransactionJson::from_value_for_test(json!({
+                "value": definition
             }))),
             metadata: None,
             origin: None,

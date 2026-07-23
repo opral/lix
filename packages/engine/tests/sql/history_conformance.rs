@@ -17,11 +17,9 @@ simulation_test!(
 
         session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_schema_definition (definition) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_history_table_type\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-             false,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_history_table_type\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -105,12 +103,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -188,12 +184,10 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
 
     session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_conformance\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_history_conformance\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -325,12 +319,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
@@ -405,12 +397,10 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_schema_definition (definition) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_nested_pk\",\"x-lix-primary-key\":[\"/identity/tenant\",\"/identity/id\"],\"type\":\"object\",\"properties\":{\"identity\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"tenant\",\"id\"],\"additionalProperties\":false},\"value\":{\"type\":\"string\"}},\"required\":[\"identity\",\"value\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
+                 lix_json('{\"x-lix-key\":\"engine_history_nested_pk\",\"x-lix-primary-key\":[\"/identity/tenant\",\"/identity/id\"],\"type\":\"object\",\"properties\":{\"identity\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"tenant\",\"id\"],\"additionalProperties\":false},\"value\":{\"type\":\"string\"}},\"required\":[\"identity\",\"value\"],\"additionalProperties\":false}')\
+             )",
                 &[],
             )
             .await
