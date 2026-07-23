@@ -1,5 +1,6 @@
 mod chunking;
 mod codec;
+mod compression;
 mod context;
 pub(crate) mod kv;
 pub(crate) mod metrics;

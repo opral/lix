@@ -1,4 +1,5 @@
 const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
+pub(super) const MAX_BINARY_CAS_CHUNK_BYTES: usize = 4096 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BinaryCasChunking {
@@ -13,7 +14,7 @@ impl BinaryCasChunking {
         Self {
             min_chunk_bytes: 256 * 1024,
             avg_chunk_bytes: 1024 * 1024,
-            max_chunk_bytes: 4096 * 1024,
+            max_chunk_bytes: MAX_BINARY_CAS_CHUNK_BYTES,
             single_chunk_fast_path_max_bytes: SINGLE_CHUNK_FAST_PATH_MAX_BYTES,
         }
     }
@@ -66,7 +67,7 @@ mod tests {
 
         assert_eq!(chunking.min_chunk_bytes, 256 * 1024);
         assert_eq!(chunking.avg_chunk_bytes, 1024 * 1024);
-        assert_eq!(chunking.max_chunk_bytes, 4096 * 1024);
+        assert_eq!(chunking.max_chunk_bytes, MAX_BINARY_CAS_CHUNK_BYTES);
         assert_eq!(chunking.single_chunk_fast_path_max_bytes, 64 * 1024);
     }
 
