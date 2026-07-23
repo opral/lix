@@ -39,7 +39,10 @@ use crate::sql2::branch_scope::{
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
-use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
+use crate::sql2::write_normalization::{
+    InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
+    defaultable_text_insert_value, insert_column_is_omitted,
+};
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
@@ -67,7 +70,8 @@ use super::spec::{
     register_spec_table, row_source,
 };
 use super::upsert::{
-    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport, validate_target_columns,
+    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport,
+    materialize_omitted_column, validate_target_columns,
 };
 use crate::entity_pk::EntityPk;
 
@@ -736,6 +740,50 @@ impl UpsertSupport for LixDirectorySpec {
         Ok(StagedUpsert::rows(rows))
     }
 
+    fn validate_proposed_batch(&self, batch: &RecordBatch) -> Result<()> {
+        for row_index in 0..batch.num_rows() {
+            defaultable_text_insert_value(batch, row_index, "id", "INSERT into lix_directory")?;
+            defaultable_bool_insert_value(
+                batch,
+                row_index,
+                "lixcol_global",
+                "INSERT into lix_directory",
+            )?;
+            defaultable_bool_insert_value(
+                batch,
+                row_index,
+                "lixcol_untracked",
+                "INSERT into lix_directory",
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn materialize_excluded_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let materialized = if insert_column_is_omitted(proposed, "id") {
+            let ids = (0..proposed.num_rows())
+                .map(|_| Some(self.functions.call_uuid_v7().to_string()))
+                .collect::<StringArray>();
+            materialize_omitted_column(proposed, "id", Arc::new(ids))?
+        } else {
+            proposed.clone()
+        };
+        let materialized = materialize_omitted_column(
+            &materialized,
+            "lixcol_global",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )?;
+        materialize_omitted_column(
+            &materialized,
+            "lixcol_untracked",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )
+    }
+
     /// Scan the existing directories that could conflict with `proposed`,
     /// scoped to the active/explicit branch and narrowed to the proposed
     /// directory ids or exact paths, returned as a batch in this table's
@@ -1226,7 +1274,8 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         }
 
         let path = optional_string_value(batch, row_index, "path")?;
-        let id = optional_string_value(batch, row_index, "id")?;
+        let id =
+            defaultable_text_insert_value(batch, row_index, "id", "INSERT into lix_directory")?;
         let context = directory_row_context_from_batch(batch, row_index, branch_binding)?;
 
         if let Some(path) = path.filter(|_| reject_read_only_fields) {
@@ -1354,7 +1403,12 @@ fn directory_row_context_from_batch(
     branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
     let scope = resolve_write_branch_scope(
-        optional_bool_value(batch, row_index, "lixcol_global")?,
+        defaultable_bool_insert_value(
+            batch,
+            row_index,
+            "lixcol_global",
+            "INSERT into lix_directory",
+        )?,
         optional_string_value(batch, row_index, "lixcol_branch_id")?,
         branch_binding,
         "INSERT into lix_directory_by_branch",
@@ -1364,7 +1418,13 @@ fn directory_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        untracked: defaultable_bool_insert_value(
+            batch,
+            row_index,
+            "lixcol_untracked",
+            "INSERT into lix_directory",
+        )?
+        .unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_directory")?,
     })

@@ -120,13 +120,23 @@ INSERT INTO event (id, occurred_at) VALUES (lix_uuid_v7(), lix_timestamp());
 
 ## Text & bytes
 
-Use standard SQL casts to convert between UTF-8 text and bytes:
+Lix accepts the canonical public cast names advertised by
+`information_schema.columns`: `TEXT`, `BYTEA`, `BIGINT`,
+`DOUBLE PRECISION`, and `BOOLEAN`. The same spellings work in `SELECT` and in
+bound `INSERT`/`UPDATE` expressions. Bound writes use those canonical names and
+retire the ambiguous binary spelling `BINARY` in favor of `BYTEA`.
+
+Read expressions retain DataFusion's wider SQL cast dialect, including types
+such as `DATE`, `INTEGER`, `DECIMAL`, and `TIMESTAMP`; the public column types
+above describe Lix surfaces rather than limiting query expressions.
+
+Use `TEXT` and `BYTEA` to convert between UTF-8 text and bytes:
 
 ```sql
 SELECT CAST(data AS TEXT) FROM lix_file WHERE path = '/notes/readme.md';
 
 INSERT INTO lix_file (path, data)
-VALUES ('/notes/hello.txt', CAST('hello world' AS BINARY));
+VALUES ('/notes/hello.txt', CAST('hello world' AS BYTEA));
 ```
 
 ## Notes

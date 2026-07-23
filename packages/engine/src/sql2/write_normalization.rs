@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::physical_expr::PhysicalExpr;
@@ -107,6 +108,18 @@ impl InsertColumnIntents {
             .as_ref()
             .is_none_or(|columns| columns.contains(column_name))
     }
+
+    pub(crate) fn omitted_columns(&self, schema: &Schema) -> BTreeSet<String> {
+        let Some(explicit_columns) = self.explicit_columns.as_ref() else {
+            return BTreeSet::new();
+        };
+        schema
+            .fields()
+            .iter()
+            .filter(|field| !explicit_columns.contains(field.name().as_str()))
+            .map(|field| field.name().clone())
+            .collect()
+    }
 }
 
 fn field_is_omitted_insert_default(field: &datafusion::arrow::datatypes::Field) -> bool {
@@ -114,6 +127,117 @@ fn field_is_omitted_insert_default(field: &datafusion::arrow::datatypes::Field) 
         .metadata()
         .get(LIX_INSERT_COLUMN_OMITTED_METADATA_KEY)
         .is_some_and(|value| value == "true")
+}
+
+pub(crate) fn insert_column_is_omitted(batch: &RecordBatch, column_name: &str) -> bool {
+    batch
+        .schema()
+        .field_with_name(column_name)
+        .is_ok_and(field_is_omitted_insert_default)
+}
+
+/// Reads a defaultable text input without collapsing an omitted column into an
+/// explicitly provided SQL `NULL`.
+pub(crate) fn defaultable_text_insert_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<String>> {
+    let schema = batch.schema();
+    let Ok(column_index) = schema.index_of(column_name) else {
+        return Ok(None);
+    };
+    let field = schema.field(column_index);
+    if field_is_omitted_insert_default(field) {
+        return Ok(None);
+    }
+    match ScalarValue::try_from_array(batch.column(column_index).as_ref(), row_index)? {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Ok(Some(value)),
+        value if value.is_null() => {
+            Err(super::error::lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!(
+                    "{context} column '{column_name}' may be omitted to use its default, but explicit NULL is not allowed"
+                ),
+            )))
+        }
+        other => Err(super::error::lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("{context} expected text-compatible column '{column_name}', got {other:?}"),
+        ))),
+    }
+}
+
+/// Reads a defaultable boolean input without collapsing an omitted column into
+/// an explicitly provided SQL `NULL`.
+pub(crate) fn defaultable_bool_insert_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<bool>> {
+    let schema = batch.schema();
+    let Ok(column_index) = schema.index_of(column_name) else {
+        return Ok(None);
+    };
+    let field = schema.field(column_index);
+    if field_is_omitted_insert_default(field) {
+        return Ok(None);
+    }
+    match ScalarValue::try_from_array(batch.column(column_index).as_ref(), row_index)? {
+        ScalarValue::Boolean(Some(value)) => Ok(Some(value)),
+        value if value.is_null() => {
+            Err(super::error::lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!(
+                    "{context} column '{column_name}' may be omitted to use its default, but explicit NULL is not allowed"
+                ),
+            )))
+        }
+        other => Err(super::error::lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("{context} expected boolean column '{column_name}', got {other:?}"),
+        ))),
+    }
+}
+
+/// Restores insert-column intent metadata at the provider boundary.
+///
+/// DataFusion can discard alias metadata while executing a physical
+/// projection, so detecting omission only from the resulting batch would
+/// collapse omitted defaults into explicit `NULL`. The provider computes the
+/// intent from the physical input plan and reapplies it here.
+pub(crate) fn mark_omitted_insert_columns(
+    batch: RecordBatch,
+    omitted_columns: &BTreeSet<String>,
+) -> Result<RecordBatch> {
+    if omitted_columns.is_empty() {
+        return Ok(batch);
+    }
+    let batch_schema = batch.schema();
+    let fields = batch_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if !omitted_columns.contains(field.name().as_str()) {
+                return field.as_ref().clone();
+            }
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                LIX_INSERT_COLUMN_OMITTED_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+            field.as_ref().clone().with_metadata(metadata)
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch_schema.metadata().clone(),
+    ));
+    Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
 }
 
 pub(crate) fn scalar_is_binary_or_null(value: &ScalarValue) -> bool {

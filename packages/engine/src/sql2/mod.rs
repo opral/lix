@@ -10,6 +10,7 @@ mod exec;
 mod file_view;
 mod history_projection;
 mod history_route;
+mod information_schema;
 mod optimize;
 mod parse;
 mod plan;
@@ -24,6 +25,7 @@ mod session;
 #[cfg(test)]
 mod test_support;
 mod udfs;
+mod value_contract;
 mod write_normalization;
 
 #[cfg(test)]

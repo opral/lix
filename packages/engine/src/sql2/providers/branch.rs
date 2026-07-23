@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::{BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
@@ -25,7 +26,10 @@ use crate::live_state::{
     MaterializedLiveStateRow,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
+use crate::sql2::write_normalization::{
+    InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
+    defaultable_text_insert_value, insert_column_is_omitted,
+};
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
@@ -36,10 +40,8 @@ use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{
     PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table, row_source,
 };
-use super::upsert::{StagedUpsert, UpsertSupport};
-use super::values::{
-    optional_bool_value, optional_string_value, required_bool_value, required_string_value,
-};
+use super::upsert::{StagedUpsert, UpsertSupport, materialize_omitted_column};
+use super::values::{required_bool_value, required_string_value};
 
 pub(super) async fn register_lix_branch_read_provider(
     session: &datafusion::prelude::SessionContext,
@@ -321,6 +323,44 @@ impl UpsertSupport for BranchSpec {
             .flat_map(branch_insert_stage_rows)
             .collect::<Vec<_>>();
         Ok(StagedUpsert::rows(rows))
+    }
+
+    fn validate_proposed_batch(&self, batch: &RecordBatch) -> Result<()> {
+        for row_index in 0..batch.num_rows() {
+            defaultable_bool_insert_value(batch, row_index, "hidden", "INSERT into lix_branch")?;
+            defaultable_text_insert_value(batch, row_index, "commit_id", "INSERT into lix_branch")?;
+        }
+        Ok(())
+    }
+
+    async fn materialize_excluded_defaults(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let materialized = materialize_omitted_column(
+            proposed,
+            "hidden",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )?;
+        if !insert_column_is_omitted(&materialized, "commit_id") {
+            return Ok(materialized);
+        }
+        let default_commit_id = self
+            .branch_ref
+            .load_head(&write_ctx.active_branch_id())
+            .await
+            .map_err(lix_error_to_datafusion_error)?
+            .map(|head| head.commit_id)
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "INSERT into lix_branch could not resolve active branch head".to_string(),
+                )
+            })?;
+        let values = (0..materialized.num_rows())
+            .map(|_| Some(default_commit_id.to_string()))
+            .collect::<StringArray>();
+        materialize_omitted_column(&materialized, "commit_id", Arc::new(values))
     }
 
     async fn scan_conflict_candidates(
@@ -663,15 +703,24 @@ fn branch_insert_rows_from_batch(
         .map(|row_index| {
             let id = required_string_value(batch, row_index, "id", "INSERT lix_branch")?;
             let name = required_string_value(batch, row_index, "name", "INSERT lix_branch")?;
-            let hidden = optional_bool_value(batch, row_index, "hidden", "INSERT lix_branch")?
-                .unwrap_or(false);
-            let commit_id =
-                optional_string_value(batch, row_index, "commit_id", "INSERT lix_branch")?
-                    .map(|commit_id| {
-                        parse_branch_row_commit_id(commit_id, TransactionWriteOperation::Insert)
-                    })
-                    .transpose()?
-                    .unwrap_or(*default_commit_id);
+            let hidden = defaultable_bool_insert_value(
+                batch,
+                row_index,
+                "hidden",
+                "INSERT into lix_branch",
+            )?
+            .unwrap_or(false);
+            let commit_id = defaultable_text_insert_value(
+                batch,
+                row_index,
+                "commit_id",
+                "INSERT into lix_branch",
+            )?
+            .map(|commit_id| {
+                parse_branch_row_commit_id(commit_id, TransactionWriteOperation::Insert)
+            })
+            .transpose()?
+            .unwrap_or(*default_commit_id);
             Ok(BranchRow {
                 id,
                 name,

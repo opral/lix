@@ -357,14 +357,14 @@ fn entity_history_column_array(
         EntityColumnType::Integer => Arc::new(Int64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| entity_i64_value(snapshot.as_ref()))
-                .collect::<Vec<_>>(),
+                .map(|snapshot| entity_i64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Number => Arc::new(Float64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| entity_f64_value(snapshot.as_ref()))
-                .collect::<Vec<_>>(),
+                .map(|snapshot| entity_f64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Boolean => Arc::new(BooleanArray::from(
             projected_values

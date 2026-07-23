@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
@@ -29,7 +30,9 @@ use crate::live_state::{
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_stage_rows;
-use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
+use crate::sql2::write_normalization::{
+    InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
+};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{LixError, NullableKeyFilter, parse_row_metadata_value};
 
@@ -46,7 +49,7 @@ use super::spec::{
     PlannedDml, PlannedScan, RowSource, TableSpec, projected_schema, register_spec_table,
     row_source,
 };
-use super::upsert::{StagedUpsert, UpsertSupport};
+use super::upsert::{StagedUpsert, UpsertSupport, materialize_omitted_column};
 use super::values::string_expr_literal;
 
 pub(super) async fn register_lix_state_active_provider(
@@ -201,6 +204,31 @@ impl UpsertSupport for LixStateSpec {
         let rows = lix_state_write_rows_from_batch(batch, branch_binding, "INSERT into lix_state")?;
         reject_read_only_stage_rows(&rows, "INSERT into lix_state")?;
         Ok(StagedUpsert::rows(rows))
+    }
+
+    fn validate_proposed_batch(&self, batch: &RecordBatch) -> Result<()> {
+        for row_index in 0..batch.num_rows() {
+            defaultable_bool_insert_value(batch, row_index, "global", "INSERT into lix_state")?;
+            defaultable_bool_insert_value(batch, row_index, "untracked", "INSERT into lix_state")?;
+        }
+        Ok(())
+    }
+
+    async fn materialize_excluded_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let materialized = materialize_omitted_column(
+            proposed,
+            "global",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )?;
+        materialize_omitted_column(
+            &materialized,
+            "untracked",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )
     }
 
     async fn scan_conflict_candidates(
@@ -495,7 +523,8 @@ fn lix_state_update_write_rows_from_batch(
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
     (0..batch.num_rows())
         .map(|row_index| {
-            let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
+            let global =
+                update_required_bool_value(batch, &assignment_values, row_index, "global")?;
             let branch_id =
                 optional_string_value(batch, row_index, "branch_id")?.unwrap_or_else(|| {
                     if global {
@@ -544,11 +573,45 @@ fn lix_state_update_write_rows_from_batch(
                 global,
                 change_id: None,
                 commit_id: None,
-                untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
+                untracked: update_required_bool_value(
+                    batch,
+                    &assignment_values,
+                    row_index,
+                    "untracked",
+                )?,
                 branch_id,
             })
         })
         .collect()
+}
+
+fn update_required_bool_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<bool> {
+    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
+        InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(value),
+        InsertCell::Omitted => {
+            optional_bool_value(batch, row_index, column_name)?.ok_or_else(|| {
+                lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("UPDATE lix_state requires non-null boolean column '{column_name}'"),
+                ))
+            })
+        }
+        InsertCell::Provided(SqlCell::Null) => Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("UPDATE lix_state requires non-null boolean column '{column_name}'"),
+        ))),
+        InsertCell::Provided(SqlCell::Value(other)) => {
+            Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("UPDATE lix_state expected boolean column '{column_name}', got {other:?}"),
+            )))
+        }
+    }
 }
 
 fn lix_state_deletable_write_rows_from_batch(
@@ -617,7 +680,9 @@ fn lix_state_write_rows_from_batch(
 ) -> Result<Vec<TransactionWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
-            let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
+            let global =
+                defaultable_bool_insert_value(batch, row_index, "global", "INSERT into lix_state")?
+                    .unwrap_or(false);
             let branch_id =
                 optional_string_value(batch, row_index, "branch_id")?.unwrap_or_else(|| {
                     if global {
@@ -655,7 +720,13 @@ fn lix_state_write_rows_from_batch(
                 global,
                 change_id: optional_string_value(batch, row_index, "change_id")?,
                 commit_id: optional_string_value(batch, row_index, "commit_id")?,
-                untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
+                untracked: defaultable_bool_insert_value(
+                    batch,
+                    row_index,
+                    "untracked",
+                    "INSERT into lix_state",
+                )?
+                .unwrap_or(false),
                 branch_id,
             })
         })

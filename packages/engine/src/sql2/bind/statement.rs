@@ -9,6 +9,7 @@ use datafusion::sql::sqlparser::ast::{
     Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
     Value, Visit, Visitor, WildcardAdditionalOptions,
 };
+#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
@@ -17,7 +18,7 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKi
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 
-use super::expr::{BoundCastType, BoundExpr, BoundLiteral, BoundParamRef};
+use super::expr::{BoundExpr, BoundLiteral, BoundParamRef, bind_public_cast_type};
 use super::read::BoundRead;
 use super::table::{
     BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
@@ -926,19 +927,9 @@ fn bind_cast_expr(
     params: &mut ParamBinder,
     bind_inner: impl FnOnce(&Expr, &mut ParamBinder) -> Result<BoundExpr, LixError>,
 ) -> Result<BoundExpr, LixError> {
-    if kind != &CastKind::Cast
-        || array
-        || has_format
-        || !matches!(data_type, SqlDataType::Binary(None))
-    {
-        return Err(super::error::unsupported(format!(
-            "unsupported SQL cast 'CAST({expr} AS {data_type})'"
-        )));
-    }
-
     Ok(BoundExpr::Cast {
         expr: Box::new(bind_inner(expr, params)?),
-        data_type: BoundCastType::Binary,
+        data_type: bind_public_cast_type(kind, expr, data_type, array, has_format)?,
     })
 }
 
@@ -962,17 +953,20 @@ fn bind_number_literal(value: &str) -> Result<BoundExpr, LixError> {
     if let Ok(value) = value.parse::<i64>() {
         return Ok(BoundExpr::Literal(BoundLiteral::Integer(value)));
     }
-    let value = value
-        .parse::<f64>()
-        .map_err(|_| super::error::unsupported(format!("unsupported numeric literal '{value}'")))?;
-    let Some(number) = serde_json::Number::from_f64(value) else {
-        return Err(super::error::unsupported(
-            "unsupported non-finite numeric literal",
-        ));
-    };
-    Ok(BoundExpr::Literal(BoundLiteral::Json(JsonValue::Number(
-        number,
-    ))))
+    let number = value.parse::<serde_json::Number>().or_else(|_| {
+        value
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .ok_or(())
+    });
+    number
+        .map(|number| BoundLiteral::Number {
+            raw: value.to_string(),
+            value: number,
+        })
+        .map(BoundExpr::Literal)
+        .map_err(|()| super::error::unsupported(format!("unsupported numeric literal '{value}'")))
 }
 
 fn bind_negative_number_expr(expr: &Expr) -> Result<BoundExpr, LixError> {
@@ -1241,6 +1235,11 @@ fn require_write_capability(
                 | PublicSurfaceKind::History
         ) {
             error = error.with_hint("History views are query-only.");
+        } else if let PublicSurfaceKind::EntityBase { schema_key }
+        | PublicSurfaceKind::EntityByBranch { schema_key } = &surface.kind
+            && let Some(hint) = crate::sql2::read_only::read_only_entity_surface_hint(schema_key)
+        {
+            error = error.with_hint(hint);
         }
         Err(error)
     }
@@ -2131,7 +2130,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_public_values_functions() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), CAST('hello' AS BINARY))",
+            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), CAST('hello' AS BYTEA))",
         );
         let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
@@ -2446,6 +2445,17 @@ mod tests {
             write.assignments[0].value,
             BoundExpr::Literal(BoundLiteral::Integer(-1))
         ));
+    }
+
+    #[test]
+    fn bind_number_literal_keeps_sql_numbers_distinct_from_json() {
+        for raw in ["1.0", "01.0", "9223372036854775808"] {
+            let BoundExpr::Literal(BoundLiteral::Number { .. }) =
+                bind_number_literal(raw).expect("SQL numeric literal should bind")
+            else {
+                panic!("{raw} should bind as a SQL number");
+            };
+        }
     }
 
     #[test]

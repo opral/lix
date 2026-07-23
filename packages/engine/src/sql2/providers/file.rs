@@ -61,6 +61,7 @@ use crate::sql2::predicate_typecheck::{
 };
 use crate::sql2::write_normalization::{
     InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
+    defaultable_bool_insert_value, defaultable_text_insert_value, insert_column_is_omitted,
     lix_file_data_type_error, lix_file_data_type_error_with_value, scalar_is_binary_or_null,
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
@@ -100,7 +101,8 @@ use super::spec::{
     finish_scan_batch, register_spec_table, row_source,
 };
 use super::upsert::{
-    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport, validate_target_columns,
+    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport,
+    materialize_omitted_column, validate_target_columns,
 };
 
 pub(super) async fn register_lix_file_active_provider(
@@ -945,9 +947,14 @@ impl TableSpec for LixFileSpec {
         input: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<InsertApply>> {
         let insert_intents = InsertColumnIntents::from_input(input);
-        let include_data_writes = self.schema.field_with_name("data").is_ok()
-            && insert_intents.includes_column("data")
-            && !self.options.omitted_insert_columns.contains("data");
+        let data_is_explicit = write_ctx.explicit_insert_columns().map_or_else(
+            || {
+                insert_intents.includes_column("data")
+                    && !self.options.omitted_insert_columns.contains("data")
+            },
+            |columns| columns.contains("data"),
+        );
+        let include_data_writes = self.schema.field_with_name("data").is_ok() && data_is_explicit;
         let sink = Arc::new(LixFileInsertSink::new(
             write_ctx,
             self.functions.clone(),
@@ -1269,6 +1276,61 @@ impl UpsertSupport for LixFileSpec {
             staged.state_rows,
             staged.file_data_writes,
         ))
+    }
+
+    fn validate_proposed_batch(&self, batch: &RecordBatch) -> Result<()> {
+        for row_index in 0..batch.num_rows() {
+            defaultable_text_insert_value(batch, row_index, "id", "INSERT into lix_file")?;
+            defaultable_bool_insert_value(
+                batch,
+                row_index,
+                "lixcol_global",
+                "INSERT into lix_file",
+            )?;
+            defaultable_bool_insert_value(
+                batch,
+                row_index,
+                "lixcol_untracked",
+                "INSERT into lix_file",
+            )?;
+            if !insert_column_is_omitted(batch, "data") {
+                insert_optional_binary_value(batch, row_index, "data")?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn materialize_excluded_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let materialized = if insert_column_is_omitted(proposed, "id") {
+            let ids = (0..proposed.num_rows())
+                .map(|_| Some(self.functions.call_uuid_v7().to_string()))
+                .collect::<StringArray>();
+            materialize_omitted_column(proposed, "id", Arc::new(ids))?
+        } else {
+            proposed.clone()
+        };
+        let materialized = materialize_omitted_column(
+            &materialized,
+            "data",
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(&[][..]);
+                proposed.num_rows()
+            ])),
+        )?;
+        let materialized = materialize_omitted_column(
+            &materialized,
+            "lixcol_global",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )?;
+        materialize_omitted_column(
+            &materialized,
+            "lixcol_untracked",
+            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
+        )
     }
 
     async fn scan_conflict_candidates(
@@ -2995,7 +3057,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         }
 
         let path = optional_string_value(batch, row_index, "path")?;
-        let id = optional_string_value(batch, row_index, "id")?;
+        let id = defaultable_text_insert_value(batch, row_index, "id", "INSERT into lix_file")?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         let data = if include_data_writes {
             insert_optional_binary_value(batch, row_index, "data")?
@@ -3265,7 +3327,7 @@ fn file_row_context_from_batch(
 ) -> Result<FilesystemRowContext> {
     let explicit_branch_id = optional_string_value(batch, row_index, "lixcol_branch_id")?;
     let scope = resolve_write_branch_scope(
-        optional_bool_value(batch, row_index, "lixcol_global")?,
+        defaultable_bool_insert_value(batch, row_index, "lixcol_global", "INSERT into lix_file")?,
         explicit_branch_id,
         branch_binding,
         "INSERT into lix_file_by_branch",
@@ -3275,7 +3337,13 @@ fn file_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        untracked: defaultable_bool_insert_value(
+            batch,
+            row_index,
+            "lixcol_untracked",
+            "INSERT into lix_file",
+        )?
+        .unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_file")?,
     })

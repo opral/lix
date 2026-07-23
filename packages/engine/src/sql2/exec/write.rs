@@ -234,7 +234,12 @@ fn resolve_parameterized_branch_scope(
             mut branch_ids,
             param_indexes,
         } => {
-            insert_branch_param_values(&mut branch_ids, &param_indexes, params)?;
+            insert_branch_param_values(
+                &mut branch_ids,
+                &param_indexes,
+                params,
+                BranchParamNullPolicy::Reject,
+            )?;
             if branch_ids.is_empty() {
                 BranchScope::Empty
             } else {
@@ -258,7 +263,12 @@ fn resolve_parameterized_branch_scope(
                         BranchScope::ExplicitRequired { branch_ids }
                     }
                     ResolvedBranchSelector::Missing => {
-                        insert_branch_param_values(&mut branch_ids, &param_indexes, params)?;
+                        insert_branch_param_values(
+                            &mut branch_ids,
+                            &param_indexes,
+                            params,
+                            BranchParamNullPolicy::Ignore,
+                        )?;
                         if branch_ids.is_empty() {
                             BranchScope::Empty
                         } else {
@@ -268,7 +278,12 @@ fn resolve_parameterized_branch_scope(
                 }
             }
             None => {
-                insert_branch_param_values(&mut branch_ids, &param_indexes, params)?;
+                insert_branch_param_values(
+                    &mut branch_ids,
+                    &param_indexes,
+                    params,
+                    BranchParamNullPolicy::Ignore,
+                )?;
                 if branch_ids.is_empty() {
                     BranchScope::Empty
                 } else {
@@ -673,13 +688,20 @@ fn insert_branch_param_values(
     branch_ids: &mut BTreeSet<String>,
     param_indexes: &BTreeSet<usize>,
     params: &[Value],
+    null_policy: BranchParamNullPolicy,
 ) -> Result<(), LixError> {
     for index in param_indexes {
         match params.get(index.saturating_sub(1)) {
             Some(Value::Text(branch_id)) => {
                 branch_ids.insert(branch_id.clone());
             }
-            Some(Value::Null) => {}
+            Some(Value::Null) if null_policy == BranchParamNullPolicy::Ignore => {}
+            Some(Value::Null) => {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "INSERT into a by-branch SQL surface requires non-null text branch-id parameters",
+                ));
+            }
             Some(_) => {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
@@ -695,6 +717,12 @@ fn insert_branch_param_values(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchParamNullPolicy {
+    Reject,
+    Ignore,
 }
 
 fn normalize_bound_public_write_error(error: LixError) -> LixError {

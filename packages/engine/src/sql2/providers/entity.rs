@@ -28,6 +28,7 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
+use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
@@ -875,21 +876,22 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
             return None;
         };
         let column_name = self.filterable_column_name(&column.name)?;
+        let column_type = self
+            .spec
+            .visible_column(column_name)
+            .expect("filterable column should exist")
+            .column_type;
         let values = in_list
             .list
             .iter()
-            .map(entity_filter_value_literal)
+            .map(|expr| entity_filter_value_literal(expr, column_type))
             .collect::<Option<Vec<_>>>()?;
         if values.is_empty() {
             return None;
         }
         Some(EntityRowFilter::ColumnIn {
             column: column_name.to_string(),
-            column_type: self
-                .spec
-                .visible_column(column_name)
-                .expect("filterable column should exist")
-                .column_type,
+            column_type,
             values,
         })
     }
@@ -903,14 +905,15 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
             return None;
         };
         let column_name = self.filterable_column_name(&column.name)?;
+        let column_type = self
+            .spec
+            .visible_column(column_name)
+            .expect("filterable column should exist")
+            .column_type;
         Some(EntityRowFilter::ColumnEq {
             column: column_name.to_string(),
-            column_type: self
-                .spec
-                .visible_column(column_name)
-                .expect("filterable column should exist")
-                .column_type,
-            value: entity_filter_value_literal(literal_expr)?,
+            column_type,
+            value: entity_filter_value_literal(literal_expr, column_type)?,
         })
     }
 
@@ -951,38 +954,45 @@ enum EntityRowFilter {
 }
 
 impl EntityRowFilter {
-    fn matches_snapshot(&self, snapshot: Option<&JsonValue>) -> bool {
+    fn matches_snapshot(&self, snapshot: Option<&JsonValue>, schema_key: &str) -> Result<bool> {
         match self {
             Self::ColumnEq {
                 column,
                 column_type,
                 value,
-            } => entity_snapshot_value(snapshot, column, *column_type)
-                .is_some_and(|actual| entity_filter_values_equal(&actual, value, *column_type)),
+            } => Ok(
+                entity_snapshot_value(snapshot, schema_key, column, *column_type)?
+                    .is_some_and(|actual| entity_filter_values_equal(&actual, value, *column_type)),
+            ),
             Self::ColumnIn {
                 column,
                 column_type,
                 values,
-            } => entity_snapshot_value(snapshot, column, *column_type).is_some_and(|actual| {
-                values
-                    .iter()
-                    .any(|expected| entity_filter_values_equal(&actual, expected, *column_type))
-            }),
-            Self::And(left, right) => {
-                left.matches_snapshot(snapshot) && right.matches_snapshot(snapshot)
-            }
-            Self::Or(left, right) => {
-                left.matches_snapshot(snapshot) || right.matches_snapshot(snapshot)
-            }
+            } => Ok(
+                entity_snapshot_value(snapshot, schema_key, column, *column_type)?.is_some_and(
+                    |actual| {
+                        values.iter().any(|expected| {
+                            entity_filter_values_equal(&actual, expected, *column_type)
+                        })
+                    },
+                ),
+            ),
+            Self::And(left, right) => Ok(left.matches_snapshot(snapshot, schema_key)?
+                && right.matches_snapshot(snapshot, schema_key)?),
+            Self::Or(left, right) => Ok(left.matches_snapshot(snapshot, schema_key)?
+                || right.matches_snapshot(snapshot, schema_key)?),
         }
     }
 }
 
-fn entity_filter_value_literal(expr: &Expr) -> Option<EntityFilterValue> {
+fn entity_filter_value_literal(
+    expr: &Expr,
+    column_type: EntityColumnType,
+) -> Option<EntityFilterValue> {
     let Expr::Literal(literal, _) = expr else {
         return None;
     };
-    match literal {
+    let value = match literal {
         ScalarValue::Boolean(Some(value)) => Some(EntityFilterValue::Boolean(*value)),
         ScalarValue::Int8(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
         ScalarValue::Int16(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
@@ -1000,25 +1010,42 @@ fn entity_filter_value_literal(expr: &Expr) -> Option<EntityFilterValue> {
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => Some(EntityFilterValue::String(value.clone())),
         _ => None,
+    }?;
+    match (&value, column_type) {
+        (EntityFilterValue::Boolean(_), EntityColumnType::Boolean)
+        | (EntityFilterValue::Integer(_), EntityColumnType::Integer)
+        | (
+            EntityFilterValue::Integer(_) | EntityFilterValue::Number(_),
+            EntityColumnType::Number,
+        )
+        | (EntityFilterValue::String(_), EntityColumnType::String) => Some(value),
+        _ => None,
     }
 }
 
 fn entity_snapshot_value(
     snapshot: Option<&JsonValue>,
+    schema_key: &str,
     column: &str,
     column_type: EntityColumnType,
-) -> Option<EntityFilterValue> {
-    let value = snapshot?.get(column)?;
-    match column_type {
+) -> Result<Option<EntityFilterValue>> {
+    let Some(value) = snapshot.and_then(|snapshot| snapshot.get(column)) else {
+        return Ok(None);
+    };
+    Ok(match column_type {
         EntityColumnType::String => match value {
             JsonValue::String(value) => Some(EntityFilterValue::String(value.clone())),
             _ => None,
         },
-        EntityColumnType::Integer => entity_i64_value(Some(value)).map(EntityFilterValue::Integer),
-        EntityColumnType::Number => entity_f64_value(Some(value)).map(EntityFilterValue::Number),
+        EntityColumnType::Integer => {
+            entity_i64_value(Some(value), schema_key, column)?.map(EntityFilterValue::Integer)
+        }
+        EntityColumnType::Number => {
+            entity_f64_value(Some(value), schema_key, column)?.map(EntityFilterValue::Number)
+        }
         EntityColumnType::Boolean => value.as_bool().map(EntityFilterValue::Boolean),
         EntityColumnType::Json => None,
-    }
+    })
 }
 
 #[expect(clippy::cast_precision_loss, clippy::float_cmp)]
@@ -1207,10 +1234,14 @@ fn apply_entity_row_filters(
                 ),
             )))
         })?;
-        if filters
-            .iter()
-            .all(|filter| filter.matches_snapshot(Some(&snapshot)))
-        {
+        let mut matches = true;
+        for filter in filters {
+            if !filter.matches_snapshot(Some(&snapshot), &row.schema_key)? {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
             filtered_rows.push(row);
         }
     }
@@ -1327,14 +1358,14 @@ fn entity_column_array(
         EntityColumnType::Integer => Arc::new(Int64Array::from(
             values
                 .iter()
-                .map(|value| entity_i64_value(*value))
-                .collect::<Vec<_>>(),
+                .map(|value| entity_i64_value(*value, &spec.schema_key, column_name))
+                .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Number => Arc::new(Float64Array::from(
             values
                 .iter()
-                .map(|value| entity_f64_value(*value))
-                .collect::<Vec<_>>(),
+                .map(|value| entity_f64_value(*value, &spec.schema_key, column_name))
+                .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Boolean => Arc::new(BooleanArray::from(
             values
@@ -1404,20 +1435,20 @@ pub(super) fn entity_json_text_value(
     })
 }
 
-pub(super) fn entity_i64_value(value: Option<&JsonValue>) -> Option<i64> {
-    match value {
-        Some(JsonValue::Number(number)) => number.as_i64(),
-        Some(JsonValue::String(value)) => value.parse::<i64>().ok(),
-        _ => None,
-    }
+pub(super) fn entity_i64_value(
+    value: Option<&JsonValue>,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<i64>> {
+    json_bigint_value(value, schema_key, column_name).map_err(lix_error_to_datafusion_error)
 }
 
-pub(super) fn entity_f64_value(value: Option<&JsonValue>) -> Option<f64> {
-    match value {
-        Some(JsonValue::Number(number)) => number.as_f64(),
-        Some(JsonValue::String(value)) => value.parse::<f64>().ok(),
-        _ => None,
-    }
+pub(super) fn entity_f64_value(
+    value: Option<&JsonValue>,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<f64>> {
+    json_double_value(value, schema_key, column_name).map_err(lix_error_to_datafusion_error)
 }
 
 fn json_to_string(value: &JsonValue) -> Result<String> {
@@ -1639,9 +1670,10 @@ mod tests {
                     "id": { "type": "string" },
                     "kind": { "type": "string" },
                     "score": { "type": "number" },
+                    "count": { "type": "integer" },
                     "meta": { "type": "object" }
                 },
-                "required": ["id", "kind", "score"]
+                "required": ["id", "kind", "score", "count"]
             }))
             .expect("schema should derive entity surface spec"),
         )
@@ -1761,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_schema_allows_defaulted_identity_columns_to_be_omitted() {
+    fn read_schema_keeps_defaulted_required_identity_non_null() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
             "x-lix-primary-key": ["/id"],
@@ -1775,11 +1807,11 @@ mod tests {
 
         let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(
-            schema
+            !schema
                 .field_with_name("id")
                 .expect("id field")
                 .is_nullable(),
-            "defaulted primary-key property should be nullable at SQL input"
+            "read nullability must not encode that INSERT may omit a defaulted id"
         );
         assert!(
             schema
@@ -1863,6 +1895,63 @@ mod tests {
                 .value(0),
             "branch-a"
         );
+    }
+
+    #[test]
+    fn bigint_projection_normalizes_integral_reals_and_rejects_invalid_values() {
+        for (raw, expected) in [
+            ("1.0", 1_i64),
+            ("-0.0", 0_i64),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+        ] {
+            let value =
+                serde_json::from_str::<serde_json::Value>(raw).expect("test value should parse");
+            assert_eq!(
+                super::entity_i64_value(Some(&value), "integer_contract", "count")
+                    .expect("in-range integral JSON number should project"),
+                Some(expected),
+                "{raw}"
+            );
+        }
+
+        for raw in ["1.5", "9223372036854775808", "\"1\""] {
+            let value =
+                serde_json::from_str::<serde_json::Value>(raw).expect("test value should parse");
+            let error = super::entity_i64_value(Some(&value), "integer_contract", "count")
+                .expect_err("invalid BIGINT value should not project as NULL");
+            let error = crate::sql2::error::datafusion_error_to_lix_error(error);
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{raw}");
+            assert!(error.message.contains("integer_contract"), "{error:?}");
+            assert!(error.message.contains("count"), "{error:?}");
+            assert!(error.message.contains("BIGINT"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn double_projection_accepts_numbers_and_rejects_other_json_kinds() {
+        for (raw, expected) in [("1", 1.0), ("1.5", 1.5)] {
+            let value =
+                serde_json::from_str::<serde_json::Value>(raw).expect("test value should parse");
+            assert_eq!(
+                super::entity_f64_value(Some(&value), "number_contract", "ratio")
+                    .expect("JSON number should project"),
+                Some(expected),
+                "{raw}"
+            );
+        }
+
+        for raw in ["\"1\"", "true"] {
+            let value =
+                serde_json::from_str::<serde_json::Value>(raw).expect("test value should parse");
+            let error = super::entity_f64_value(Some(&value), "number_contract", "ratio")
+                .expect_err("non-number JSON values should not project as DOUBLE PRECISION");
+            let error = crate::sql2::error::datafusion_error_to_lix_error(error);
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{raw}");
+            assert!(error.message.contains("number_contract"), "{error:?}");
+            assert!(error.message.contains("ratio"), "{error:?}");
+            assert!(error.message.contains("DOUBLE PRECISION"), "{error:?}");
+        }
     }
 
     #[tokio::test]
@@ -2077,6 +2166,42 @@ mod tests {
         assert!(row_filters.is_empty());
     }
 
+    #[tokio::test]
+    async fn integer_filter_does_not_claim_exact_pushdown_for_real_literal() {
+        let spec = filter_pushdown_spec();
+        let provider = super::EntitySpec::by_branch(
+            Arc::clone(&spec),
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+        );
+        let entity_pk_index = provider
+            .schema
+            .index_of("lixcol_entity_pk")
+            .expect("system entity-pk column should exist");
+        let projection = vec![entity_pk_index];
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column("count")),
+            Operator::Eq,
+            Box::new(Expr::Literal(ScalarValue::Float64(Some(1.0)), None)),
+        ));
+
+        let (_schema, request, row_filters) = provider
+            .plan_scan_parts(Some(&projection), &[filter], Some(5))
+            .await
+            .expect("scan should plan");
+
+        assert_eq!(request.limit, Some(5));
+        assert!(
+            !request
+                .projection
+                .columns
+                .iter()
+                .any(|column| column == "snapshot_content"),
+            "coercive integer comparisons must remain with DataFusion"
+        );
+        assert!(row_filters.is_empty());
+    }
+
     #[test]
     fn payload_row_filter_invalid_snapshot_errors() {
         let mut rows = vec![MaterializedLiveStateRow {
@@ -2098,5 +2223,26 @@ mod tests {
                 .contains("could not parse snapshot_content"),
             "error should explain invalid snapshot_content: {error}"
         );
+    }
+
+    #[test]
+    fn payload_integer_filter_rejects_out_of_bigint_snapshot() {
+        let mut rows = vec![MaterializedLiveStateRow {
+            snapshot_content: Some(r#"{"body":"hello","count":9223372036854775808}"#.to_string()),
+            ..live_row()
+        }];
+        let filters = vec![super::EntityRowFilter::ColumnEq {
+            column: "count".to_string(),
+            column_type: EntityColumnType::Integer,
+            value: super::EntityFilterValue::Integer(1),
+        }];
+
+        let error = super::apply_entity_row_filters(&mut rows, &filters)
+            .expect_err("out-of-BIGINT values must not be silently filtered out");
+        let error = crate::sql2::error::datafusion_error_to_lix_error(error);
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error.message.contains("count"), "{error:?}");
+        assert!(error.message.contains("BIGINT"), "{error:?}");
     }
 }

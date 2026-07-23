@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, UInt64Array};
+use datafusion::arrow::array::{Array, ArrayRef, UInt64Array};
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -26,6 +26,7 @@ use datafusion::physical_expr::PhysicalExpr;
 
 use crate::sql2::SqlWriteContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
+use crate::sql2::write_normalization::{insert_column_is_omitted, mark_omitted_insert_columns};
 use crate::transaction::types::{
     TransactionFileData, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
@@ -143,6 +144,29 @@ pub(super) trait UpsertSupport: Send + Sync {
         batch: &RecordBatch,
     ) -> Result<StagedUpsert>;
 
+    /// Validate every proposed row before conflict routing. INSERT-only
+    /// constraints must still run when the conflict action bypasses the
+    /// plain-insert builder.
+    fn validate_proposed_batch(&self, _batch: &RecordBatch) -> Result<()> {
+        Ok(())
+    }
+
+    /// Materialize provider defaults that a `DO UPDATE` expression can read
+    /// through `excluded.*`.
+    ///
+    /// DataFusion represents omitted INSERT columns as typed NULLs plus intent
+    /// metadata at the provider boundary. That is sufficient for plain INSERT
+    /// staging, but `excluded.*` denotes the proposed row after defaults have
+    /// been applied. Providers with defaults that can be referenced by a
+    /// conflict assignment replace those placeholders here.
+    async fn materialize_excluded_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        Ok(proposed.clone())
+    }
+
     /// Scan existing rows whose identity matches a proposed row, returned as a
     /// batch in this table's column schema.
     async fn scan_conflict_candidates(
@@ -189,8 +213,25 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
     let conflict_columns = target.columns();
     let mut staged = StagedUpsert::default();
     let mut affected: u64 = 0;
+    let proposed_batches = proposed_batches
+        .into_iter()
+        .map(|batch| {
+            let Some(explicit_columns) = write_ctx.explicit_insert_columns() else {
+                return Ok(batch);
+            };
+            let omitted_columns = batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| !explicit_columns.contains(field.name().as_str()))
+                .map(|field| field.name().clone())
+                .collect::<BTreeSet<_>>();
+            mark_omitted_insert_columns(batch, &omitted_columns)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     for batch in &proposed_batches {
+        spec.validate_proposed_batch(batch)?;
         let existing = spec
             .scan_conflict_candidates(write_ctx, batch, target)
             .await?;
@@ -225,6 +266,9 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
             if let UpsertAction::DoUpdate { assignments } = action {
                 let existing_matched = take_rows(&existing, &matched_existing)?;
                 let proposed_matched = take_rows(batch, &matched_proposed)?;
+                let proposed_matched = spec
+                    .materialize_excluded_defaults(write_ctx, &proposed_matched)
+                    .await?;
                 let augmented = augment_with_excluded(&existing_matched, &proposed_matched)?;
                 staged.extend(
                     spec.apply_conflict_update(write_ctx, &augmented, assignments)
@@ -255,6 +299,28 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
             .map_err(lix_error_to_datafusion_error)?;
     }
     Ok(affected)
+}
+
+/// Replace one omitted INSERT placeholder with its provider-evaluated default.
+///
+/// Keep the omission metadata on the field: it records how the SQL row was
+/// authored, while the replacement array is the semantic value visible
+/// through `excluded.*`.
+pub(super) fn materialize_omitted_column<A>(
+    proposed: &RecordBatch,
+    column_name: &str,
+    values: Arc<A>,
+) -> Result<RecordBatch>
+where
+    A: Array + 'static,
+{
+    if !insert_column_is_omitted(proposed, column_name) {
+        return Ok(proposed.clone());
+    }
+    let column_index = proposed.schema().index_of(column_name)?;
+    let mut columns = proposed.columns().to_vec();
+    columns[column_index] = values;
+    RecordBatch::try_new(proposed.schema(), columns).map_err(DataFusionError::from)
 }
 
 pub(super) fn validate_target_columns(

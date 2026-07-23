@@ -14,8 +14,7 @@ use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapab
 use crate::sql2::catalog::entity_surface_schema;
 use crate::sql2::catalog::{
     EntitySurfaceShape, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
-    entity_system_fields, schema_exposed_as_entity_history_surface,
-    schema_exposed_as_entity_surface,
+    schema_exposed_as_entity_history_surface, schema_exposed_as_entity_surface,
 };
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
@@ -208,10 +207,11 @@ impl PublicCatalog {
             "lix_branch",
             PublicSurfaceKind::Branch,
             vec![
-                PublicColumn::public_insert_only("id"),
-                PublicColumn::public("name"),
-                PublicColumn::public("hidden"),
-                PublicColumn::public("commit_id"),
+                PublicColumn::public_insert_only("id", false),
+                PublicColumn::public("name", false),
+                PublicColumn::public("hidden", false).with_default("FALSE"),
+                PublicColumn::public("commit_id", false)
+                    .with_default("lix_active_branch_commit_id()"),
             ],
             SurfaceCapabilities::read_write(),
         ))?;
@@ -219,14 +219,14 @@ impl PublicCatalog {
             "lix_change",
             PublicSurfaceKind::Change,
             public_columns([
-                "id",
-                "entity_pk",
-                "schema_key",
-                "file_id",
-                "metadata",
-                "created_at",
-                "origin_key",
-                "snapshot_content",
+                ("id", false),
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("metadata", true),
+                ("created_at", false),
+                ("origin_key", true),
+                ("snapshot_content", true),
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
@@ -261,7 +261,13 @@ impl PublicCatalog {
         }
 
         let mut columns = entity_columns(&spec);
-        columns.extend(entity_hidden_columns(false));
+        columns.extend(entity_hidden_columns(&spec, false));
+        let capabilities = if crate::sql2::read_only::is_read_only_entity_surface(&spec.schema_key)
+        {
+            SurfaceCapabilities::read_only()
+        } else {
+            SurfaceCapabilities::read_write()
+        };
 
         self.insert(surface(
             &spec.schema_key,
@@ -269,11 +275,11 @@ impl PublicCatalog {
                 schema_key: spec.schema_key.clone(),
             },
             columns,
-            SurfaceCapabilities::read_write(),
+            capabilities.clone(),
         ))?;
 
         let mut by_branch_columns = entity_columns(&spec);
-        by_branch_columns.extend(entity_hidden_columns(true));
+        by_branch_columns.extend(entity_hidden_columns(&spec, true));
 
         self.insert(surface(
             format!("{}_by_branch", spec.schema_key),
@@ -281,16 +287,22 @@ impl PublicCatalog {
                 schema_key: spec.schema_key.clone(),
             },
             by_branch_columns,
-            SurfaceCapabilities::read_write(),
+            capabilities,
         ))?;
 
         if schema_exposed_as_entity_history_surface(&spec.schema_key) {
+            let history_identity_roots = primary_key_roots(&spec);
             let mut history_columns = spec
                 .columns
                 .iter()
-                .map(|column| PublicColumn::public(column.name.as_str()))
+                .map(|column| {
+                    PublicColumn::public(
+                        column.name.as_str(),
+                        !history_identity_roots.contains(&column.name),
+                    )
+                })
                 .collect::<Vec<_>>();
-            history_columns.extend(entity_system_columns(EntitySurfaceShape::History));
+            history_columns.extend(entity_history_system_columns());
 
             self.insert(surface(
                 format!("{}_history", spec.schema_key),
@@ -413,57 +425,76 @@ fn surface(
     }
 }
 
-fn public_columns<const N: usize>(names: [&str; N]) -> Vec<PublicColumn> {
-    names.into_iter().map(PublicColumn::public).collect()
+fn public_columns<const N: usize>(columns: [(&str, bool); N]) -> Vec<PublicColumn> {
+    columns
+        .into_iter()
+        .map(|(name, read_nullable)| PublicColumn::public(name, read_nullable))
+        .collect()
+}
+
+fn primary_key_roots(spec: &EntitySurfaceSpec) -> std::collections::BTreeSet<&String> {
+    spec.primary_key_paths
+        .iter()
+        .filter_map(|path| path.first())
+        .collect()
 }
 
 fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
-    let primary_key_roots = spec
-        .primary_key_paths
-        .iter()
-        .filter_map(|path| path.first())
-        .collect::<std::collections::BTreeSet<_>>();
+    let primary_key_roots = primary_key_roots(spec);
     spec.columns
         .iter()
         .map(|column| {
-            if spec.schema_key == "lix_registered_schema" && column.name == "value" {
-                PublicColumn::public(column.name.as_str())
-            } else if primary_key_roots.contains(&column.name) {
-                PublicColumn::public_insert_only(column.name.as_str())
+            let public_column =
+                if spec.schema_key == "lix_registered_schema" && column.name == "value" {
+                    PublicColumn::public(column.name.as_str(), column.read_nullable)
+                } else if primary_key_roots.contains(&column.name) {
+                    PublicColumn::public_insert_only(column.name.as_str(), column.read_nullable)
+                } else {
+                    PublicColumn::public(column.name.as_str(), column.read_nullable)
+                };
+            if let Some(default) = column.default_expression.as_deref() {
+                public_column.with_default(default)
+            } else if !column.insert_required {
+                public_column.optional_on_insert()
             } else {
-                PublicColumn::public(column.name.as_str())
+                public_column
             }
         })
         .collect()
 }
 
 fn lix_state_columns(by_branch: bool) -> Vec<PublicColumn> {
+    let global = if by_branch {
+        PublicColumn::public("global", false).conditional_on_insert()
+    } else {
+        PublicColumn::public("global", false).with_default("FALSE")
+    };
     let mut columns = vec![
-        PublicColumn::public_insert_only("entity_pk"),
-        PublicColumn::public_insert_only("schema_key"),
-        PublicColumn::public_insert_only("file_id"),
-        PublicColumn::public("snapshot_content"),
-        PublicColumn::public("metadata"),
-        PublicColumn::public_insert_only("created_at"),
-        PublicColumn::public_insert_only("updated_at"),
-        PublicColumn::public_insert_only("global"),
-        PublicColumn::public_insert_only("change_id"),
-        PublicColumn::public_insert_only("commit_id"),
-        PublicColumn::public_insert_only("untracked"),
+        PublicColumn::public_insert_only("entity_pk", false),
+        PublicColumn::public_insert_only("schema_key", false),
+        PublicColumn::public_insert_only("file_id", true).optional_on_insert(),
+        PublicColumn::public("snapshot_content", true).optional_on_insert(),
+        PublicColumn::public("metadata", true).optional_on_insert(),
+        PublicColumn::public_read_only("created_at", false),
+        PublicColumn::public_read_only("updated_at", false),
+        global,
+        PublicColumn::public_read_only("change_id", true),
+        PublicColumn::public_read_only("commit_id", true),
+        PublicColumn::public("untracked", false).with_default("FALSE"),
     ];
     if by_branch {
-        columns.push(PublicColumn::public_insert_only("branch_id"));
+        columns.push(PublicColumn::public_insert_only("branch_id", false).conditional_on_insert());
     }
     columns
 }
 
 fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::public_insert_only("id"),
-        PublicColumn::public("path"),
-        PublicColumn::public("directory_id"),
-        PublicColumn::public("name"),
-        PublicColumn::public("data"),
+        PublicColumn::public_insert_only("id", false).with_default("lix_uuid_v7()"),
+        PublicColumn::public("path", false).conditional_on_insert(),
+        PublicColumn::public("directory_id", true).conditional_on_insert(),
+        PublicColumn::public("name", false).conditional_on_insert(),
+        PublicColumn::public("data", false).with_default("X''"),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
     columns
@@ -471,112 +502,140 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
 
 fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::public_insert_only("id"),
-        PublicColumn::public("path"),
-        PublicColumn::public("parent_id"),
-        PublicColumn::public("name"),
+        PublicColumn::public_insert_only("id", false).with_default("lix_uuid_v7()"),
+        PublicColumn::public("path", true).conditional_on_insert(),
+        PublicColumn::public("parent_id", true).conditional_on_insert(),
+        PublicColumn::public("name", false).conditional_on_insert(),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
     columns
 }
 
-fn entity_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
-    entity_system_columns(if by_branch {
-        EntitySurfaceShape::ByBranch
-    } else {
-        EntitySurfaceShape::Active
-    })
+fn entity_hidden_columns(spec: &EntitySurfaceSpec, by_branch: bool) -> Vec<PublicColumn> {
+    entity_system_columns(
+        spec,
+        if by_branch {
+            EntitySurfaceShape::ByBranch
+        } else {
+            EntitySurfaceShape::Active
+        },
+    )
 }
 
 fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::hidden("lixcol_entity_pk"),
-        PublicColumn::hidden("lixcol_schema_key"),
-        PublicColumn::hidden("lixcol_file_id"),
-        PublicColumn::public_insert_only("lixcol_global"),
-        PublicColumn::public_read_only("lixcol_change_id"),
-        PublicColumn::hidden("lixcol_created_at"),
-        PublicColumn::hidden("lixcol_updated_at"),
-        PublicColumn::hidden("lixcol_commit_id"),
-        PublicColumn::public_insert_only("lixcol_untracked"),
-        PublicColumn::public("lixcol_metadata"),
+        PublicColumn::hidden("lixcol_entity_pk", false),
+        PublicColumn::hidden("lixcol_schema_key", false),
+        PublicColumn::hidden("lixcol_file_id", true),
+        PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
+        PublicColumn::public_read_only("lixcol_change_id", true),
+        PublicColumn::hidden("lixcol_created_at", false),
+        PublicColumn::hidden("lixcol_updated_at", false),
+        PublicColumn::hidden("lixcol_commit_id", true),
+        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
+        PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
     ];
     if by_branch {
-        columns.push(PublicColumn::public_insert_only("lixcol_branch_id"));
+        columns.push(PublicColumn::public_insert_only("lixcol_branch_id", false));
     }
     columns
 }
 
-fn entity_system_columns(variant: EntitySurfaceShape) -> Vec<PublicColumn> {
-    if variant == EntitySurfaceShape::History {
-        return entity_system_fields(variant)
-            .into_iter()
-            .map(|field| PublicColumn::public(field.name().as_str()))
-            .collect();
+fn entity_system_columns(
+    spec: &EntitySurfaceSpec,
+    variant: EntitySurfaceShape,
+) -> Vec<PublicColumn> {
+    debug_assert_ne!(variant, EntitySurfaceShape::History);
+    let entity_pk = PublicColumn::public_insert_only("lixcol_entity_pk", false);
+    let entity_pk = if spec.primary_key_paths.is_empty() {
+        entity_pk
+    } else {
+        entity_pk.conditional_on_insert()
+    };
+    let mut columns = vec![
+        entity_pk,
+        PublicColumn::public_read_only("lixcol_schema_key", false),
+        PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
+        PublicColumn::hidden("lixcol_snapshot_content", true),
+        PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
+        PublicColumn::public_read_only("lixcol_created_at", false),
+        PublicColumn::public_read_only("lixcol_updated_at", false),
+        PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
+        PublicColumn::public_read_only("lixcol_change_id", true),
+        PublicColumn::public_read_only("lixcol_commit_id", true),
+        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
+    ];
+    if variant == EntitySurfaceShape::ByBranch {
+        columns.push(PublicColumn::public_insert_only("lixcol_branch_id", false));
     }
+    columns
+}
 
-    entity_system_fields(variant)
-        .into_iter()
-        .map(|field| match field.name().as_str() {
-            "lixcol_schema_key" | "lixcol_change_id" | "lixcol_created_at"
-            | "lixcol_updated_at" | "lixcol_commit_id" => {
-                PublicColumn::public_read_only(field.name().as_str())
-            }
-            "lixcol_entity_pk" | "lixcol_file_id" | "lixcol_global" | "lixcol_untracked"
-            | "lixcol_branch_id" => PublicColumn::public_insert_only(field.name().as_str()),
-            "lixcol_metadata" => PublicColumn::public(field.name().as_str()),
-            _ => PublicColumn::hidden(field.name().as_str()),
-        })
-        .collect()
+fn entity_history_system_columns() -> Vec<PublicColumn> {
+    public_columns([
+        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_SCHEMA_KEY, false),
+        (HISTORY_COL_FILE_ID, true),
+        (HISTORY_COL_SNAPSHOT_CONTENT, true),
+        (HISTORY_COL_METADATA, true),
+        (HISTORY_COL_CHANGE_ID, false),
+        (HISTORY_COL_CHANGE_CREATED_AT, false),
+        (HISTORY_COL_ORIGIN_KEY, true),
+        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
+        (HISTORY_COL_COMMIT_CREATED_AT, false),
+        (HISTORY_COL_AS_OF_COMMIT_ID, false),
+        (HISTORY_COL_DEPTH, false),
+        (HISTORY_COL_IS_DELETED, false),
+    ])
 }
 
 fn state_history_columns() -> Vec<PublicColumn> {
     public_columns([
-        HISTORY_COL_ENTITY_PK,
-        HISTORY_COL_SCHEMA_KEY,
-        HISTORY_COL_FILE_ID,
-        HISTORY_COL_SNAPSHOT_CONTENT,
-        HISTORY_COL_METADATA,
-        HISTORY_COL_CHANGE_ID,
-        HISTORY_COL_CHANGE_CREATED_AT,
-        HISTORY_COL_ORIGIN_KEY,
-        HISTORY_COL_OBSERVED_COMMIT_ID,
-        HISTORY_COL_COMMIT_CREATED_AT,
-        HISTORY_COL_AS_OF_COMMIT_ID,
-        HISTORY_COL_DEPTH,
-        HISTORY_COL_IS_DELETED,
+        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_SCHEMA_KEY, false),
+        (HISTORY_COL_FILE_ID, true),
+        (HISTORY_COL_SNAPSHOT_CONTENT, true),
+        (HISTORY_COL_METADATA, true),
+        (HISTORY_COL_CHANGE_ID, false),
+        (HISTORY_COL_CHANGE_CREATED_AT, false),
+        (HISTORY_COL_ORIGIN_KEY, true),
+        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
+        (HISTORY_COL_COMMIT_CREATED_AT, false),
+        (HISTORY_COL_AS_OF_COMMIT_ID, false),
+        (HISTORY_COL_DEPTH, false),
+        (HISTORY_COL_IS_DELETED, false),
     ])
 }
 
 fn file_history_columns() -> Vec<PublicColumn> {
     public_columns([
-        "id",
-        "path",
-        "directory_id",
-        "name",
-        "data",
-        HISTORY_COL_ENTITY_PK,
-        HISTORY_COL_SOURCE_CHANGES,
-        HISTORY_COL_OBSERVED_COMMIT_ID,
-        HISTORY_COL_COMMIT_CREATED_AT,
-        HISTORY_COL_AS_OF_COMMIT_ID,
-        HISTORY_COL_DEPTH,
-        HISTORY_COL_IS_DELETED,
+        ("id", false),
+        ("path", true),
+        ("directory_id", true),
+        ("name", true),
+        ("data", true),
+        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_SOURCE_CHANGES, false),
+        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
+        (HISTORY_COL_COMMIT_CREATED_AT, false),
+        (HISTORY_COL_AS_OF_COMMIT_ID, false),
+        (HISTORY_COL_DEPTH, false),
+        (HISTORY_COL_IS_DELETED, false),
     ])
 }
 
 fn directory_history_columns() -> Vec<PublicColumn> {
     public_columns([
-        "id",
-        "path",
-        "parent_id",
-        "name",
-        HISTORY_COL_ENTITY_PK,
-        HISTORY_COL_SOURCE_CHANGES,
-        HISTORY_COL_OBSERVED_COMMIT_ID,
-        HISTORY_COL_COMMIT_CREATED_AT,
-        HISTORY_COL_AS_OF_COMMIT_ID,
-        HISTORY_COL_DEPTH,
-        HISTORY_COL_IS_DELETED,
+        ("id", false),
+        ("path", true),
+        ("parent_id", true),
+        ("name", true),
+        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_SOURCE_CHANGES, false),
+        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
+        (HISTORY_COL_COMMIT_CREATED_AT, false),
+        (HISTORY_COL_AS_OF_COMMIT_ID, false),
+        (HISTORY_COL_DEPTH, false),
+        (HISTORY_COL_IS_DELETED, false),
     ])
 }

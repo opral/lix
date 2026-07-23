@@ -126,6 +126,7 @@ where
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SqlWriteSessionOptions {
     pub(crate) omitted_insert_columns: BTreeSet<String>,
+    pub(crate) explicit_insert_columns: Option<BTreeSet<String>>,
 }
 
 pub(crate) async fn build_write_session_with_options(
@@ -134,7 +135,8 @@ pub(crate) async fn build_write_session_with_options(
     provider_selection: &providers::ProviderSelection,
 ) -> Result<SessionContext, LixError> {
     let session = new_sql_session_context();
-    let write_ctx = SqlWriteContext::new(ctx);
+    let write_ctx = SqlWriteContext::new(ctx)
+        .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let active_branch_id = write_ctx.active_branch_id();
     let branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(Arc::new(
         super::WriteContextBranchRefReader::new(write_ctx.clone()),
@@ -164,7 +166,7 @@ pub(crate) async fn build_write_session_with_options(
 pub(crate) fn new_sql_session_context() -> SessionContext {
     SessionContext::new_with_config(
         SessionConfig::new()
-            .with_information_schema(true)
+            .with_information_schema(false)
             .with_target_partitions(1)
             .set_bool("datafusion.optimizer.repartition_aggregations", false)
             .set_bool("datafusion.optimizer.repartition_joins", false)

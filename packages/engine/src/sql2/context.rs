@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -151,6 +152,7 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 pub(crate) struct SqlWriteContext {
     ptr: Arc<SqlWriteContextPtr>,
     gate: Arc<Mutex<()>>,
+    explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
 }
 
 struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
@@ -173,7 +175,20 @@ impl SqlWriteContext {
         Self {
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
+            explicit_insert_columns: None,
         }
+    }
+
+    pub(crate) fn with_explicit_insert_columns(
+        mut self,
+        columns: Option<BTreeSet<String>>,
+    ) -> Self {
+        self.explicit_insert_columns = columns.map(Arc::new);
+        self
+    }
+
+    pub(crate) fn explicit_insert_columns(&self) -> Option<&BTreeSet<String>> {
+        self.explicit_insert_columns.as_deref()
     }
 
     pub(crate) fn functions(&self) -> FunctionProviderHandle {

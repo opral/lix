@@ -18,7 +18,7 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix();
 
 await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES (?, CAST(? AS BINARY))",
+  "INSERT INTO lix_file (path, data) VALUES (?, CAST(? AS BYTEA))",
   ["/hello.txt", "hello"],
 );
 
