@@ -25,6 +25,12 @@ pub(crate) enum BinaryCasManifest {
         size_bytes: u64,
         chunk_count: u32,
     },
+    Inline {
+        size_bytes: u64,
+        codec: BinaryChunkCodec,
+        #[musli(bytes)]
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Encode, Decode)]
@@ -43,12 +49,24 @@ struct BinaryCasChunkRef<'a> {
     payload: &'a [u8],
 }
 
+#[derive(Encode)]
+enum InlineBinaryCasManifestRef<'a> {
+    #[musli(Binary, name = 3)]
+    Inline {
+        size_bytes: u64,
+        codec: BinaryChunkCodec,
+        #[musli(bytes)]
+        payload: &'a [u8],
+    },
+}
+
 impl BinaryCasManifest {
     pub(crate) fn size_bytes(&self) -> u64 {
         match self {
             Self::Empty { size_bytes }
             | Self::SingleChunk { size_bytes, .. }
-            | Self::Chunked { size_bytes, .. } => *size_bytes,
+            | Self::Chunked { size_bytes, .. }
+            | Self::Inline { size_bytes, .. } => *size_bytes,
         }
     }
 }
@@ -91,6 +109,22 @@ pub(crate) fn encode_binary_cas_manifest(manifest: &BinaryCasManifest) -> Vec<u8
 
 pub(crate) fn decode_binary_cas_manifest(bytes: &[u8]) -> Result<BinaryCasManifest, LixError> {
     storage_codec::decode("binary CAS manifest", bytes)
+}
+
+pub(crate) fn encode_inline_binary_cas_manifest(
+    size_bytes: u64,
+    codec: BinaryChunkCodec,
+    payload: &[u8],
+) -> Vec<u8> {
+    storage_codec::encode(
+        "inline binary CAS manifest",
+        &InlineBinaryCasManifestRef::Inline {
+            size_bytes,
+            codec,
+            payload,
+        },
+    )
+    .expect("inline binary CAS manifest storage encoding should not fail")
 }
 
 pub(crate) fn encode_binary_cas_manifest_chunk(
@@ -164,6 +198,7 @@ mod tests {
     const EMPTY_MANIFEST_STORAGE_BYTES: usize = 4;
     const SINGLE_CHUNK_MANIFEST_STORAGE_BYTES: usize = 38;
     const CHUNKED_MANIFEST_STORAGE_BYTES: usize = 6;
+    const INLINE_MANIFEST_STORAGE_OVERHEAD_BYTES: usize = 8;
     const MANIFEST_CHUNK_STORAGE_BYTES: usize = 35;
     const CHUNK_STORAGE_OVERHEAD_BYTES: usize = 3;
 
@@ -195,6 +230,25 @@ mod tests {
             assert_eq!(encoded.len(), expected_len);
             assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
         }
+    }
+
+    #[test]
+    fn inline_manifest_roundtrips_borrowed_payload_bytes() {
+        let manifest = BinaryCasManifest::Inline {
+            size_bytes: 5,
+            codec: BinaryChunkCodec::Raw,
+            payload: b"hello".to_vec(),
+        };
+
+        let encoded =
+            encode_inline_binary_cas_manifest(5, BinaryChunkCodec::Raw, b"hello".as_slice());
+
+        assert_eq!(encoded, encode_binary_cas_manifest(&manifest));
+        assert_eq!(
+            encoded.len(),
+            b"hello".len() + INLINE_MANIFEST_STORAGE_OVERHEAD_BYTES
+        );
+        assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
     }
 
     #[test]

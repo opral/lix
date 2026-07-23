@@ -1,4 +1,4 @@
-const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
+pub(super) const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BINARY_CAS_CHUNK_BYTES: usize = 4096 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
