@@ -458,9 +458,8 @@ mod tests {
         assert_eq!(switched.active_branch_id().await.unwrap(), "pinned-draft");
         assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);
 
-        let error = match root.open_session("missing-branch").await {
-            Ok(_) => panic!("missing branch must not open"),
-            Err(error) => error,
+        let Err(error) = root.open_session("missing-branch").await else {
+            panic!("missing branch must not open");
         };
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
     }
