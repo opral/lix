@@ -55,3 +55,29 @@ LIX_PROFILE_WARMUPS=4 \
 LIX_PROFILE_ROUNDS=21 \
 profile_plugin_large_file rocksdb-fs edit <fixture-dir>
 ```
+
+## Layer 2: interned direct hydration
+
+The recursive entity import path now interns repeated semantic identity strings
+while packets arrive, then emits the canonical JSON bytes and persistent
+document nodes in one graph traversal. It removes the previous full
+render → JSON parse → identity overlay pipeline.
+
+| Shape | Metric | Layer 1 | Layer 2 | Change |
+| --- | ---: | ---: | ---: | ---: |
+| flat | guest high-water | 160,169,984 B | 101,056,512 B | -36.9% |
+| nested | guest high-water | 202,833,920 B | 101,515,264 B | -50.0% |
+| flat | cold setup | 10.205 s | 9.750 s | -4.5% |
+| nested | cold setup | 10.258 s | 10.158 s | -1.0% |
+| flat | sparse edit p50 | 65.118 ms | 65.023 ms | -0.1% |
+| nested | sparse edit p50 | 70.520 ms | 72.020 ms | +2.1% |
+
+Layer 2 edit measurements used 2 warmups and 11 samples. The Layer 1 edit
+reference is the pooled 36-sample result above; this layer targets cold
+hydration, and the hot-path deltas remain within the 5% no-regression gate.
+Every edit retained the Layer 1 work invariants.
+
+Correctness was checked by all 21 `plugin_json_incremental_v2` unit tests,
+including recursive object/array cold reopen, escaped JSON keys, exact semantic
+rendering, identity preservation, sparse edits, and the flat and nested 10 MB
+fixtures. Strict plugin Clippy also passed.
