@@ -156,6 +156,30 @@ def reset_directory(root: Path, child: Path) -> Path:
     return resolved
 
 
+def ensure_directory(root: Path, child: Path) -> Path:
+    """Create or validate a run-owned directory without removing its contents."""
+
+    resolved = checked_child(root, child)
+    if child.is_symlink():
+        raise ValueError(f"run-owned path must not be a symbolic link: {child}")
+    if child.exists() and not child.is_dir():
+        raise ValueError(f"run-owned path must be a directory: {child}")
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def remove_directory(root: Path, child: Path) -> None:
+    """Remove one exact run-owned directory, if present."""
+
+    resolved = checked_child(root, child)
+    if child.is_symlink():
+        raise ValueError(f"run-owned path must not be a symbolic link: {child}")
+    if child.exists():
+        if not child.is_dir():
+            raise ValueError(f"run-owned path must be a directory: {child}")
+        shutil.rmtree(resolved)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -457,6 +481,200 @@ def validate_configuration(
         raise ValueError("process timeout must be positive")
 
 
+def validate_log_record(root: Path, record: Any) -> None:
+    if not isinstance(record, dict):
+        raise ValueError("resume artifact log record must be an object")
+    relative = record.get("path")
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("resume artifact log path must be a nonempty string")
+    log = checked_child(root, root / relative)
+    if log.is_symlink() or not log.is_file():
+        raise ValueError(f"resume artifact log is missing or unsafe: {log}")
+    if record.get("bytes") != log.stat().st_size:
+        raise ValueError(f"resume artifact log size changed: {log}")
+    if record.get("sha256") != sha256_file(log):
+        raise ValueError(f"resume artifact log hash changed: {log}")
+
+
+def validate_backend_progress(
+    root: Path,
+    backend: str,
+    result: Any,
+    blocks: int,
+    samples: int,
+) -> None:
+    if not isinstance(result, dict):
+        raise ValueError(f"resume artifact backend {backend} must be an object")
+    status = result.get("status")
+    if status not in {"pending", "running", "complete"}:
+        raise ValueError(f"resume artifact backend {backend} has invalid status")
+
+    setup = result.get("setup")
+    if not isinstance(setup, dict) or not set(setup).issubset(APIS):
+        raise ValueError(f"resume artifact backend {backend} has invalid setup")
+    for api, setup_record in setup.items():
+        if (
+            not isinstance(setup_record, dict)
+            or setup_record.get("runtime") != RUNTIMES[api]
+            or not isinstance(setup_record.get("plugin_archive"), dict)
+        ):
+            raise ValueError(
+                f"resume artifact backend {backend} has invalid {api} setup"
+            )
+        validate_log_record(root, setup_record.get("log"))
+
+    lengths: dict[str, int] = {}
+    for mode in ("edit", "render"):
+        measured_blocks = result.get(mode)
+        if not isinstance(measured_blocks, list):
+            raise ValueError(
+                f"resume artifact backend {backend} {mode} blocks must be an array"
+            )
+        lengths[mode] = len(measured_blocks)
+        if lengths[mode] > blocks:
+            raise ValueError(
+                f"resume artifact backend {backend} has too many {mode} blocks"
+            )
+        for expected_index, block in enumerate(measured_blocks):
+            order = APIS if expected_index % 2 == 0 else tuple(reversed(APIS))
+            if (
+                not isinstance(block, dict)
+                or block.get("index") != expected_index
+                or block.get("order") != "-".join(order)
+                or set(block.get("arms", {})) != set(APIS)
+            ):
+                raise ValueError(
+                    f"resume artifact backend {backend} has invalid "
+                    f"{mode} block {expected_index}"
+                )
+            for api in APIS:
+                arm = block["arms"][api]
+                sample_values = arm.get("sample_ms") if isinstance(arm, dict) else None
+                counters = arm.get("counters") if isinstance(arm, dict) else None
+                expected_counters = samples if mode == "edit" and api == "v2" else 0
+                if (
+                    not isinstance(sample_values, list)
+                    or len(sample_values) != samples
+                    or not isinstance(counters, list)
+                    or len(counters) != expected_counters
+                ):
+                    raise ValueError(
+                        f"resume artifact backend {backend} has invalid "
+                        f"{mode} block {expected_index} {api} arm"
+                    )
+                validate_log_record(root, arm.get("log"))
+
+    if lengths["edit"] != lengths["render"]:
+        raise ValueError(
+            f"resume artifact backend {backend} has unpaired edit/render progress"
+        )
+    if lengths["edit"] and set(setup) != set(APIS):
+        raise ValueError(
+            f"resume artifact backend {backend} has samples without both setups"
+        )
+    if status == "complete" and lengths["edit"] != blocks:
+        raise ValueError(
+            f"resume artifact backend {backend} is complete without all blocks"
+        )
+
+
+def validate_resume_artifact(
+    artifact: Any,
+    root: Path,
+    benchmark: Path,
+    manifests: dict[str, dict[str, Any]],
+    *,
+    blocks: int,
+    warmups: int,
+    samples: int,
+    memory_mib: int,
+    bootstrap_draws: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Reject a resume unless executable, plugins, design, and evidence match."""
+
+    if not isinstance(artifact, dict) or artifact.get("schema_version") != 1:
+        raise ValueError("resume artifact must use JSON paired schema version 1")
+    if artifact.get("status") != "running":
+        raise ValueError("resume artifact status must be running")
+
+    design = artifact.get("design")
+    if not isinstance(design, dict):
+        raise ValueError("resume artifact design must be an object")
+    expected_design = {
+        "format": "json",
+        "apis": list(APIS),
+        "same_benchmark_executable": True,
+        "fixture_bytes": FIXTURE_BYTES,
+        "properties": PROPERTY_COUNT,
+        "edit_property": EDIT_PROPERTY,
+        "blocks": blocks,
+        "warmups_per_arm_block": warmups,
+        "measured_per_arm_block": samples,
+        "wasm_memory_mib": memory_mib,
+        "backends": list(BACKENDS),
+    }
+    mismatches = {
+        key: (design.get(key), expected)
+        for key, expected in expected_design.items()
+        if design.get(key) != expected
+    }
+    analysis = design.get("analysis")
+    if not isinstance(analysis, dict) or analysis.get("draws") != bootstrap_draws:
+        mismatches["bootstrap_draws"] = (
+            analysis.get("draws") if isinstance(analysis, dict) else None,
+            bootstrap_draws,
+        )
+    environment_record = artifact.get("environment")
+    if (
+        not isinstance(environment_record, dict)
+        or environment_record.get("process_timeout_seconds") != timeout_seconds
+    ):
+        mismatches["process_timeout_seconds"] = (
+            environment_record.get("process_timeout_seconds")
+            if isinstance(environment_record, dict)
+            else None,
+            timeout_seconds,
+        )
+    if mismatches:
+        raise ValueError(f"resume arguments do not match the artifact: {mismatches}")
+
+    if artifact.get("benchmark") != file_fingerprint(benchmark):
+        raise ValueError("resume benchmark executable fingerprint changed")
+    plugins = artifact.get("plugins")
+    if not isinstance(plugins, dict) or set(plugins) != set(APIS):
+        raise ValueError("resume artifact plugins must contain exactly v1 and v2")
+    for api in APIS:
+        recorded = plugins[api]
+        expected = manifests[api]
+        if not isinstance(recorded, dict) or any(
+            recorded.get(key) != expected[key]
+            for key in ("path", "bytes", "sha256", "manifest")
+        ):
+            raise ValueError(f"resume {api} manifest fingerprint changed")
+
+    original_runner = artifact.get("runner")
+    if (
+        not isinstance(original_runner, dict)
+        or original_runner.get("path") != str(Path(__file__).resolve())
+    ):
+        raise ValueError("resume artifact came from a different runner path")
+    backends = artifact.get("backends")
+    if not isinstance(backends, dict) or set(backends) != set(BACKENDS):
+        raise ValueError("resume artifact backends must match the paired campaign")
+    for backend in BACKENDS:
+        validate_backend_progress(root, backend, backends[backend], blocks, samples)
+        for api, setup in backends[backend]["setup"].items():
+            if (
+                setup["plugin_archive"]
+                != plugins[api].get("archive_observed_at_setup")
+            ):
+                raise ValueError(
+                    f"resume artifact {backend} {api} setup archive changed"
+                )
+    return artifact
+
+
 def run_campaign(
     benchmark: Path,
     requested_root: Path,
@@ -470,6 +688,8 @@ def run_campaign(
     memory_mib: int = DEFAULT_MEMORY_MIB,
     bootstrap_draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     timeout_seconds: int = DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    resume: bool = False,
+    resume_reason: str | None = None,
 ) -> Path:
     validate_configuration(
         blocks, warmups, samples, memory_mib, bootstrap_draws, timeout_seconds
@@ -479,18 +699,81 @@ def run_campaign(
         raise ValueError(f"benchmark executable does not exist: {benchmark}")
     if not os.access(benchmark, os.X_OK):
         raise ValueError(f"benchmark executable is not executable: {benchmark}")
+    if resume and (resume_reason is None or not resume_reason.strip()):
+        raise ValueError("resume requires a nonempty resume reason")
+    if not resume and resume_reason is not None:
+        raise ValueError("resume reason is only valid with resume")
 
     root = prepare_root(requested_root)
-    templates_root = reset_directory(root, root / "templates")
-    cases_root = reset_directory(root, root / "cases")
-    logs_root = reset_directory(root, root / "logs")
     artifact_path = (
         checked_child(root, root / ARTIFACT)
         if output is None
         else output.expanduser().resolve()
     )
+    manifests = {
+        "v1": load_manifest(v1_manifest, "v1"),
+        "v2": load_manifest(v2_manifest, "v2"),
+    }
     acceptance = is_acceptance_design(blocks, warmups, samples, bootstrap_draws)
-    artifact: dict[str, Any] = {
+    if resume:
+        if not artifact_path.is_file() or artifact_path.is_symlink():
+            raise ValueError(
+                f"resume artifact does not exist or is unsafe: {artifact_path}"
+            )
+        try:
+            loaded_artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"resume artifact is invalid JSON: {error}") from error
+        artifact = validate_resume_artifact(
+            loaded_artifact,
+            root,
+            benchmark,
+            manifests,
+            blocks=blocks,
+            warmups=warmups,
+            samples=samples,
+            memory_mib=memory_mib,
+            bootstrap_draws=bootstrap_draws,
+            timeout_seconds=timeout_seconds,
+        )
+        templates_root = ensure_directory(root, root / "templates")
+        cases_root = ensure_directory(root, root / "cases")
+        logs_root = ensure_directory(root, root / "logs")
+        continuations = artifact.setdefault("continuations", [])
+        if not isinstance(continuations, list):
+            raise ValueError("resume artifact continuations must be an array")
+        continuations.append(
+            {
+                "reason": resume_reason.strip(),
+                "runner": file_fingerprint(Path(__file__)),
+                "segments_preserved": {
+                    backend: {
+                        "status": artifact["backends"][backend]["status"],
+                        "paired_blocks": len(artifact["backends"][backend]["edit"]),
+                    }
+                    for backend in BACKENDS
+                },
+                "segment_resumed": next(
+                    (
+                        {
+                            "backend": backend,
+                            "first_block": len(
+                                artifact["backends"][backend]["edit"]
+                            ),
+                        }
+                        for backend in BACKENDS
+                        if artifact["backends"][backend]["status"] != "complete"
+                    ),
+                    None,
+                ),
+            }
+        )
+        write_artifact(artifact_path, artifact)
+    else:
+        templates_root = reset_directory(root, root / "templates")
+        cases_root = reset_directory(root, root / "cases")
+        logs_root = reset_directory(root, root / "logs")
+        artifact = {
         "schema_version": 1,
         "status": "running",
         "classification": (
@@ -549,51 +832,72 @@ def run_campaign(
         },
         "benchmark": file_fingerprint(benchmark),
         "runner": file_fingerprint(Path(__file__)),
-        "plugins": {
-            "v1": load_manifest(v1_manifest, "v1"),
-            "v2": load_manifest(v2_manifest, "v2"),
-        },
+        "plugins": manifests,
         "backends": {
             backend: {"status": "pending", "setup": {}, "edit": [], "render": []}
             for backend in BACKENDS
         },
-    }
-    write_artifact(artifact_path, artifact)
+        }
+        write_artifact(artifact_path, artifact)
 
     observed_plugin_archives: dict[str, dict[str, Any]] = {}
+    for api in APIS:
+        archive = artifact["plugins"][api].get("archive_observed_at_setup")
+        if archive is not None:
+            if not isinstance(archive, dict):
+                raise ValueError(f"{api} observed plugin archive must be an object")
+            observed_plugin_archives[api] = archive
+
     for backend in BACKENDS:
         backend_result = artifact["backends"][backend]
+        if backend_result["status"] == "complete":
+            remove_directory(root, templates_root / backend)
+            print(f"preserved completed JSON {backend} segment", flush=True)
+            continue
+
         backend_result["status"] = "running"
+        remove_directory(root, cases_root / backend)
+        ensure_directory(root, cases_root / backend)
         templates: dict[str, Path] = {}
         for api in APIS:
             template = templates_root / backend / api
-            template.mkdir(parents=True)
-            setup_log = logs_root / backend / f"setup-{api}.log"
-            setup_output = run_process(
-                benchmark,
-                backend,
-                "setup",
-                template,
-                environment(api, warmups, samples, memory_mib),
-                setup_log,
-                timeout_seconds,
-            )
-            archive = validate_setup(setup_output, api)
+            if api in backend_result["setup"]:
+                if template.is_symlink() or not template.is_dir():
+                    raise ValueError(
+                        f"resume requires the validated {backend} {api} "
+                        f"setup template: {template}"
+                    )
+                archive = backend_result["setup"][api]["plugin_archive"]
+            else:
+                remove_directory(root, template)
+                template.mkdir(parents=True)
+                setup_log = logs_root / backend / f"setup-{api}.log"
+                setup_output = run_process(
+                    benchmark,
+                    backend,
+                    "setup",
+                    template,
+                    environment(api, warmups, samples, memory_mib),
+                    setup_log,
+                    timeout_seconds,
+                )
+                archive = validate_setup(setup_output, api)
+                backend_result["setup"][api] = {
+                    "runtime": RUNTIMES[api],
+                    "plugin_archive": archive,
+                    "log": relative_log_record(root, setup_log),
+                }
             previous_archive = observed_plugin_archives.setdefault(api, archive)
             if archive != previous_archive:
                 raise ValueError(
                     f"{api} setup observed different plugin archives across backends"
                 )
             artifact["plugins"][api]["archive_observed_at_setup"] = archive
-            backend_result["setup"][api] = {
-                "runtime": RUNTIMES[api],
-                "plugin_archive": archive,
-                "log": relative_log_record(root, setup_log),
-            }
             templates[api] = template
             write_artifact(artifact_path, artifact)
 
-        for block_index in range(blocks):
+        first_block = len(backend_result["edit"])
+        for block_index in range(first_block, blocks):
             order = APIS if block_index % 2 == 0 else tuple(reversed(APIS))
             for mode in ("edit", "render"):
                 block: dict[str, Any] = {
@@ -604,6 +908,7 @@ def run_campaign(
                 for api in order:
                     case = cases_root / backend / mode / f"block-{block_index:02d}-{api}"
                     case.parent.mkdir(parents=True, exist_ok=True)
+                    remove_directory(root, case)
                     shutil.copytree(templates[api], case)
                     log = (
                         logs_root
@@ -640,7 +945,7 @@ def run_campaign(
                         "counters": counter_rows,
                         "log": relative_log_record(root, log),
                     }
-                    shutil.rmtree(checked_child(root, case))
+                    remove_directory(root, case)
                 backend_result[mode].append(block)
             write_artifact(artifact_path, artifact)
             print(
@@ -650,6 +955,7 @@ def run_campaign(
 
         backend_result["status"] = "complete"
         write_artifact(artifact_path, artifact)
+        remove_directory(root, templates_root / backend)
 
     artifact["status"] = "complete"
     write_artifact(artifact_path, artifact)
@@ -684,6 +990,18 @@ def main() -> None:
         action="store_true",
         help="use 2 blocks, 1 warmup, 2 samples, and 200 bootstrap draws",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "continue a validated running artifact without rerunning completed "
+            "backend segments or setup"
+        ),
+    )
+    parser.add_argument(
+        "--resume-reason",
+        help="auditable reason for continuing an interrupted campaign",
+    )
     args = parser.parse_args()
     if args.fast_smoke:
         args.blocks = 2
@@ -702,6 +1020,8 @@ def main() -> None:
         memory_mib=args.memory_mib,
         bootstrap_draws=args.bootstrap_draws,
         timeout_seconds=args.process_timeout_seconds,
+        resume=args.resume,
+        resume_reason=args.resume_reason,
     )
     print(f"wrote {artifact}")
 

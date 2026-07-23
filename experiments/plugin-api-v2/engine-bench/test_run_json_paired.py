@@ -238,6 +238,69 @@ else:
                 "smoke-only; checks passed, no acceptance decision",
             )
 
+            rocks_before = json.loads(
+                json.dumps(artifact["backends"]["rocksdb-fs"])
+            )
+            artifact["status"] = "running"
+            artifact["backends"]["slatedb-cached"]["status"] = "running"
+            artifact["backends"]["slatedb-cached"]["edit"] = []
+            artifact["backends"]["slatedb-cached"]["render"] = []
+            runner.write_artifact(output, artifact)
+            for api in runner.APIS:
+                template = run_dir / "templates" / "slatedb-cached" / api
+                template.mkdir(parents=True)
+                (template / "pristine").write_text(api, encoding="utf-8")
+            stale_case = (
+                run_dir
+                / "cases"
+                / "slatedb-cached"
+                / "edit"
+                / "block-00-v1"
+            )
+            stale_case.mkdir(parents=True)
+            (stale_case / "partial-copy").write_text("stale", encoding="utf-8")
+
+            resumed_output = runner.run_campaign(
+                binary,
+                run_dir,
+                v1_manifest=v1_manifest,
+                v2_manifest=v2_manifest,
+                blocks=2,
+                warmups=1,
+                samples=2,
+                memory_mib=256,
+                bootstrap_draws=200,
+                timeout_seconds=30,
+                resume=True,
+                resume_reason="test interruption before first SlateDB sample",
+            )
+            resumed = json.loads(resumed_output.read_text(encoding="utf-8"))
+            self.assertEqual(resumed["status"], "complete")
+            self.assertEqual(
+                resumed["backends"]["rocksdb-fs"],
+                rocks_before,
+            )
+            self.assertEqual(
+                resumed["continuations"][-1]["reason"],
+                "test interruption before first SlateDB sample",
+            )
+            self.assertEqual(
+                resumed["continuations"][-1]["segment_resumed"],
+                {"backend": "slatedb-cached", "first_block": 0},
+            )
+            self.assertEqual(
+                resumed["continuations"][-1]["segments_preserved"][
+                    "rocksdb-fs"
+                ],
+                {"status": "complete", "paired_blocks": 2},
+            )
+            self.assertEqual(
+                resumed["runner"],
+                artifact["runner"],
+            )
+            self.assertFalse(stale_case.exists())
+            self.assertEqual(list((run_dir / "cases").glob("*/*/*")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
