@@ -1,0 +1,78 @@
+{
+  "backends": {
+    "rocksdb-fs": {
+      "edit": {
+        "p50": {
+          "one_sided_95_upper": 0.009929660112514992,
+          "pass": true,
+          "pooled_ratio": 0.009774890839676987,
+          "required_upper_strictly_below": 0.8
+        },
+        "p95": {
+          "one_sided_95_upper": 0.011180639789066579,
+          "pass": true,
+          "pooled_ratio": 0.010387820308198516,
+          "required_upper_strictly_below": 0.8
+        },
+        "paired_blocks": 12,
+        "pass": true
+      },
+      "pass": true,
+      "render": {
+        "p50": {
+          "one_sided_95_upper": 0.008185756906503827,
+          "pass": true,
+          "pooled_ratio": 0.00777261926766918,
+          "required_upper_at_most": 1.05
+        },
+        "p95": {
+          "one_sided_95_upper": 0.008221727332899876,
+          "pass": true,
+          "pooled_ratio": 0.007670799717477186,
+          "required_upper_at_most": 1.1
+        },
+        "paired_blocks": 12,
+        "pass": true
+      }
+    },
+    "slatedb-cached": {
+      "edit": {
+        "p50": {
+          "one_sided_95_upper": 0.008653616535708135,
+          "pass": true,
+          "pooled_ratio": 0.008300988180529673,
+          "required_upper_strictly_below": 0.8
+        },
+        "p95": {
+          "one_sided_95_upper": 0.011610502585884452,
+          "pass": true,
+          "pooled_ratio": 0.010865984322659684,
+          "required_upper_strictly_below": 0.8
+        },
+        "paired_blocks": 12,
+        "pass": true
+      },
+      "pass": true,
+      "render": {
+        "p50": {
+          "one_sided_95_upper": 0.0009008949606980559,
+          "pass": true,
+          "pooled_ratio": 0.0008417200586839074,
+          "required_upper_at_most": 1.05
+        },
+        "p95": {
+          "one_sided_95_upper": 0.0014083303455265173,
+          "pass": true,
+          "pooled_ratio": 0.001195977419107859,
+          "required_upper_at_most": 1.1
+        },
+        "paired_blocks": 12,
+        "pass": true
+      }
+    }
+  },
+  "draws": 10000,
+  "method": "paired hierarchical cluster bootstrap of log p50/p95 ratios",
+  "pass": true,
+  "seed": "0x4c495832"
+}

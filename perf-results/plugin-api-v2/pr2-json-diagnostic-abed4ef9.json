@@ -1,0 +1,167 @@
+{
+  "backends": {
+    "rocksdb-fs": {
+      "edit": {
+        "log": "logs/rocksdb-fs/edit.log",
+        "sample_ms": [
+          7591.676890000001,
+          7655.839655000001,
+          7709.499243,
+          7739.647021,
+          7754.716477,
+          7805.124540999999,
+          7809.413985,
+          7823.415173,
+          7826.578312,
+          7831.845656,
+          7870.19249,
+          7881.356763000001,
+          7882.825414,
+          7917.195933,
+          7935.361941,
+          7942.258789,
+          7962.592453,
+          7967.609968,
+          7993.483188,
+          8029.76996
+        ],
+        "summary": {
+          "max_ms": 8029.76996,
+          "min_ms": 7591.676890000001,
+          "p50_ms": 7831.845656,
+          "p95_ms": 7993.483188,
+          "samples": 20
+        }
+      },
+      "render": {
+        "log": "logs/rocksdb-fs/render.log",
+        "sample_ms": [
+          2561.830945,
+          2588.778758,
+          2626.065481,
+          2640.862685,
+          2641.1942590000003,
+          2642.9036730000003,
+          2645.861856,
+          2650.0164379999997,
+          2652.502903,
+          2660.01561,
+          2664.0939289999997,
+          2669.136322,
+          2673.713427,
+          2677.770948,
+          2677.875482,
+          2678.6532850000003,
+          2679.77191,
+          2685.29785,
+          2689.446712,
+          2693.170653
+        ],
+        "summary": {
+          "max_ms": 2693.170653,
+          "min_ms": 2561.830945,
+          "p50_ms": 2660.01561,
+          "p95_ms": 2689.446712,
+          "samples": 20
+        }
+      },
+      "setup_log": "logs/rocksdb-fs/setup.log",
+      "status": "complete"
+    },
+    "slatedb-cached": {
+      "edit": {
+        "log": "logs/slatedb-cached/edit.log",
+        "sample_ms": [
+          9564.916508,
+          9717.467722,
+          9749.629227,
+          9821.198364,
+          9932.691094000002,
+          9987.974178,
+          10076.391855,
+          10101.605026,
+          10111.81635,
+          10119.875661,
+          10135.733681,
+          10166.592315999998,
+          10197.918331,
+          10202.165609,
+          10216.617623,
+          10319.633933000001,
+          10442.593485,
+          10525.012513,
+          10601.273602,
+          10627.916111999999
+        ],
+        "summary": {
+          "max_ms": 10627.916111999999,
+          "min_ms": 9564.916508,
+          "p50_ms": 10119.875661,
+          "p95_ms": 10601.273602,
+          "samples": 20
+        }
+      },
+      "render": {
+        "log": "logs/slatedb-cached/render.log",
+        "sample_ms": [
+          7521.695085,
+          7531.744732,
+          7614.067219,
+          7650.390211000001,
+          7712.929528,
+          7760.839758,
+          7787.161422,
+          7816.583177,
+          7863.472327,
+          8006.399224000001,
+          8047.2254920000005,
+          8071.9094669999995,
+          8094.870182999999,
+          8157.461208000001,
+          8199.841899000001,
+          8202.521347,
+          8229.029312,
+          8330.295311,
+          8379.292446000001,
+          8404.07809
+        ],
+        "summary": {
+          "max_ms": 8404.07809,
+          "min_ms": 7521.695085,
+          "p50_ms": 8006.399224000001,
+          "p95_ms": 8379.292446000001,
+          "samples": 20
+        }
+      },
+      "setup_log": "logs/slatedb-cached/setup.log",
+      "status": "complete"
+    }
+  },
+  "candidate": {
+    "commit": "abed4ef9b97905649a04b15df52c944bced19b88",
+    "path": "/root/projects/lixray/.artifacts/pr2/profile_plugin_large_file-candidate-abed4ef9",
+    "sha256": "21131d39faeb2776da9eb654dcd39ee564b448820f166fad153d36d9eb61bd1c"
+  },
+  "classification": "candidate-only mechanism diagnostic; not PR2 v2 acceptance",
+  "design": {
+    "backends": [
+      "rocksdb-fs",
+      "slatedb-cached"
+    ],
+    "diagnostic_wasm_memory_mib": 256,
+    "edit": "one byte, alternating original/edited property value",
+    "edit_property": "property_110000",
+    "fixture_bytes": 10000000,
+    "format": "json",
+    "isolation": "pristine setup-template copy and fresh process per measured mode",
+    "measured_per_process": 20,
+    "mechanism_only": true,
+    "pr2_v2_acceptance": false,
+    "production_default_wasm_memory_mib": 64,
+    "properties": 220000,
+    "runtime": "wasm-component-v1",
+    "warmups_per_process": 5
+  },
+  "source_artifact_sha256_before_commit_annotation": "e694229317929f66b734fc53ec234aeceaba0ba2adce586ef8a2ac5639591dcf",
+  "status": "complete"
+}

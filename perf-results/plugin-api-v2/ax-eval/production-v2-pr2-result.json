@@ -1,0 +1,266 @@
+{
+  "schema": 1,
+  "tool": {
+    "slug": "the-production-lix-plugin-api-in-this-repository",
+    "name": "the production Lix plugin API in this repository",
+    "version": "6dd5612b0c6c02e9ce002ce33f3336d7e6c9383c",
+    "install": "detached git worktree at 6dd5612b0c6c02e9ce002ce33f3336d7e6c9383c"
+  },
+  "task": "Implement and test a Wasm Component v2 plugin that round-trips a two-column TSV file and emits one sparse entity upsert for a localized row edit",
+  "round": "production-v2-pr2",
+  "ts": "2026-07-23T03:56:20.453705Z",
+  "config": {
+    "agent_model": "gpt-5.6-sol",
+    "agent_count": 10,
+    "temperature": 0,
+    "tools": [
+      "shell",
+      "apply_patch"
+    ],
+    "mcp_servers": [],
+    "system_prompt": "Codex built-in system/developer instructions (implicit)",
+    "max_turns": 40,
+    "prompt_template": "{task} using {tool}",
+    "docs_included": false,
+    "overrides": {
+      "model": "claude-opus-4-7 is unavailable in the required Codex CLI; used gpt-5.6-sol",
+      "temperature": "codex exec exposes no temperature control; 0 is the pinned target but is not enforceable",
+      "tools": "Claude allow-list ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'] is unavailable; used Codex built-in shell/apply_patch with web, apps, MCP, and subagents disabled",
+      "system_prompt": "none is unavailable; codex exec uses its built-in system/developer instructions",
+      "mode": "workspace-write plus the shared Cargo target replaced bypassPermissions",
+      "max_turns": "codex exec exposes no max-turn limit; 40 is recorded but the enforced bound is a 3600s process timeout",
+      "log_format": "raw codex exec --json JSONL replaced Claude Code session JSONL",
+      "duration_source": "codex exec JSONL has no event timestamps; duration uses retained monotonic process timing metadata",
+      "cargo_target_dir": "all tested and judge processes inherited /root/projects/lixray/vendor/lix/target"
+    }
+  },
+  "agents": [
+    {
+      "id": 1,
+      "success": true,
+      "success_reason": "The log shows the real wasm32-wasip2 CSV-v2 archive passed an end-to-end TSV round-trip test asserting exactly one plugin-owned csv_row upsert, stable row identities, and zero full-state materialization.",
+      "duration_sec": 361.8,
+      "tool_calls": 14,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 2,
+      "scores": {
+        "friction": 100,
+        "speed": 42,
+        "efficiency": 67,
+        "errorRecovery": 87,
+        "final": 75
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|component v2|plugin API|plugin.*v2|upsert\\\" . -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -200\"",
+        "/bin/bash -lc \"find . -maxdepth 3 -type f | sort | head -200 && find plugins packages -maxdepth 3 -type f \\\\( -name '*.rs' -o -name '*.wit' -o -name 'Cargo.toml' \\\\) | sort | rg 'v2|sdk' | head -200 && git status --short\"",
+        "/bin/bash -lc \"cat packages/engine/AGENTS.md; sed -n '1,240p' plugins/csv-v2/Cargo.toml; sed -n '1,260p' plugins/csv-v2/src/lib.rs; sed -n '1,280p' plugins/csv-v2/src/core.rs; sed -n '1,260p' plugins/csv-v2/src/tests.rs; sed -n '1,180p' Cargo.toml\""
+      ]
+    },
+    {
+      "id": 2,
+      "success": true,
+      "success_reason": "The log shows `plugin_tsv_v2` built successfully for `wasm32-wasip2`, and all tests passed, including `localized_edit_emits_one_sparse_upsert_and_semantic_replay_round_trips`.",
+      "duration_sec": 317.1,
+      "tool_calls": 18,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 4,
+      "scores": {
+        "friction": 100,
+        "speed": 50,
+        "efficiency": 56,
+        "errorRecovery": 73,
+        "final": 72
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|Component v2|plugin API|plugin.*wasm|sparse entity|entity upsert\\\" -S . -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -200\"",
+        "/bin/bash -lc \"cat packages/engine/AGENTS.md && sed -n '1,220p' packages/engine/wit/v2/README.md && find plugins/csv-v2 -maxdepth 3 -type f -print && sed -n '1,260p' plugins/csv-v2/src/lib.rs && cat plugins/csv-v2/Cargo.toml && cat plugins/csv-v2/manifest.json\"",
+        "/bin/bash -lc \"cat experiments/plugin-api-v2/ax-eval/tasks/production-v2-tsv.md && cat plugins/csv-v2/README.md && sed -n '1,240p' plugins/csv-v2/src/tests.rs && sed -n '1,220p' Cargo.toml\""
+      ]
+    },
+    {
+      "id": 3,
+      "success": true,
+      "success_reason": "The log shows `cargo test -p plugin_tsv_v2` passing the exact two-column round-trip/single-sparse-upsert test and a successful release build for `wasm32-wasip2`.",
+      "duration_sec": 138.4,
+      "tool_calls": 11,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 3,
+      "scores": {
+        "friction": 100,
+        "speed": 81,
+        "efficiency": 74,
+        "errorRecovery": 80,
+        "final": 85
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|Component v2|plugin API|entity upsert|sparse\\\" -S . -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -200\"",
+        "/bin/bash -lc \"sed -n '1,220p' experiments/plugin-api-v2/ax-eval/tasks/production-v2-tsv.md && find .. -name AGENTS.md -print && git status --short && sed -n '1,180p' packages/engine/wit/v2/README.md && rg --files plugins | sort | head -100\"",
+        "/bin/bash -lc \"sed -n '1,160p' Cargo.toml; sed -n '1,160p' plugins/csv-v2/Cargo.toml; sed -n '1,200p' plugins/csv-v2/manifest.json; sed -n '1,160p' plugins/csv-v2/schema/csv_row.json; sed -n '1,120p' plugins/csv-v2/schema/csv_table.json; sed -n '1,240p' plugins/csv-v2/src/lib.rs; sed -n '1,280p' plugins/csv-v2/src/bindings.rs\""
+      ]
+    },
+    {
+      "id": 4,
+      "success": true,
+      "success_reason": "The log shows `cargo test -p plugin_tsv_v2 --locked` passing the exact round-trip and single-beta-upsert tests, and the `wasm32-wasip2` component build succeeding.",
+      "duration_sec": 161.8,
+      "tool_calls": 13,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 2,
+      "scores": {
+        "friction": 100,
+        "speed": 77,
+        "efficiency": 69,
+        "errorRecovery": 87,
+        "final": 85
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|component v2|plugin API|entity upsert|upsert\\\" -g '\"'!node_modules'\"' -g '\"'!target'\"' . | head -200\"",
+        "/bin/bash -lc \"sed -n '1,220p' experiments/plugin-api-v2/ax-eval/tasks/production-v2-tsv.md; git status --short; find plugins/csv-v2 -maxdepth 3 -type f -print; sed -n '1,240p' plugins/csv-v2/Cargo.toml; sed -n '1,240p' plugins/csv-v2/src/lib.rs; rg -n \\\"csv-v2|plugin-v2|default_wasm_runtime_v2\\\" Cargo.toml packages plugins -g 'Cargo.toml' -g '*.rs' | head -200\"",
+        "/bin/bash -lc \"sed -n '1,240p' plugins/csv-v2/manifest.json; sed -n '1,200p' plugins/csv-v2/schema/csv_table.json; sed -n '1,200p' plugins/csv-v2/schema/csv_row.json; rg -n \\\"enum Dialect|delimiter|Comma|Semicolon|Tab|parse.*file|InitialChanges|localized|warm|fork|retry|eof\\\" plugins/csv-v2/src/core.rs plugins/csv-v2/src/tests.rs | head -300; sed -n '1,180p' Cargo.toml; sed -n '930,1060p' packages/rs-sdk-tests/tests/e2e.rs\""
+      ]
+    },
+    {
+      "id": 5,
+      "success": true,
+      "success_reason": "The log shows `cargo test -p plugin_tsv_v2` passing the exact round-trip and single localized-upsert tests, followed by a successful `wasm32-wasip2` component build.",
+      "duration_sec": 225.7,
+      "tool_calls": 11,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 2,
+      "scores": {
+        "friction": 100,
+        "speed": 66,
+        "efficiency": 74,
+        "errorRecovery": 87,
+        "final": 83
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg --files | head -120\"",
+        "/bin/bash -lc \"git status --short && find plugins/csv-v2 -maxdepth 3 -type f -print && sed -n '1,240p' plugins/csv-v2/src/lib.rs && sed -n '1,280p' plugins/csv-v2/src/core.rs && sed -n '1,260p' plugins/csv-v2/src/tests.rs\"",
+        "/bin/bash -lc \"sed -n '1,240p' plugins/csv-v2/Cargo.toml; sed -n '1,240p' plugins/csv-v2/README.md; sed -n '1,260p' plugins/csv-v2/src/bindings.rs; sed -n '1,260p' plugins/csv-v2/src/packet.rs; rg -n \\\"csv-v2|plugin-api-v2|sparse|Component v2|component v2\\\" Cargo.toml crates packages plugins experiments -g '*.toml' -g '*.rs' -g '*.md' | head -240\""
+      ]
+    },
+    {
+      "id": 6,
+      "success": true,
+      "success_reason": "The log shows a compiled Component v2 archive installed end-to-end, exact TSV bytes round-tripped, one retained-identity csv_row upsert asserted, and both targeted e2e and all 22 plugin tests passed.",
+      "duration_sec": 280.6,
+      "tool_calls": 15,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 3,
+      "scores": {
+        "friction": 100,
+        "speed": 56,
+        "efficiency": 64,
+        "errorRecovery": 80,
+        "final": 77
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|component v2|plugin api|entity upsert|upsert\\\" . -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -200\"",
+        "/bin/bash -lc \"git status --short && sed -n '1,220p' experiments/plugin-api-v2/ax-eval/tasks/csv.md && find plugins/csv-v2 -maxdepth 3 -type f -print | sort && sed -n '1,180p' plugins/csv-v2/Cargo.toml && sed -n '1,220p' plugins/csv-v2/src/lib.rs\"",
+        "/bin/bash -lc \"rg -n 'csv-v2|plugins/' Cargo.toml && sed -n '1,240p' plugins/csv-v2/README.md && sed -n '1,260p' plugins/csv-v2/src/bindings.rs && sed -n '1,220p' plugins/csv-v2/manifest.json && sed -n '1,160p' plugins/csv-v2/schema/csv_row.json && sed -n '1,240p' plugins/csv-v2/src/tests.rs\""
+      ]
+    },
+    {
+      "id": 7,
+      "success": true,
+      "success_reason": "The log shows the new plugin_tsv_v2 unit test passed and its wasm32-wasip2 component build completed successfully, covering exact TSV round-trip, stable beta ID, and exactly one row upsert.",
+      "duration_sec": 480.4,
+      "tool_calls": 31,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 8,
+      "scores": {
+        "friction": 100,
+        "speed": 21,
+        "efficiency": 23,
+        "errorRecovery": 47,
+        "final": 52
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|component v2|plugin API|entity upsert|upsert\\\" -g '\"'!node_modules'\"' -g '\"'!target'\"' . | head -200\"",
+        "/bin/bash -lc \"sed -n '1,240p' packages/engine/AGENTS.md; git status --short; find plugins/csv-v2 -maxdepth 3 -type f -print; sed -n '1,180p' plugins/csv-v2/Cargo.toml; sed -n '1,220p' plugins/csv-v2/src/lib.rs; rg -n \\\"csv-v2\\\" Cargo.toml packages plugins -g 'Cargo.toml' -g '*.rs' -g '*.ts' | head -120\"",
+        "/bin/bash -lc \"sed -n '1,220p' plugins/csv-v2/README.md; sed -n '1,240p' plugins/csv-v2/src/tests.rs; sed -n '1,220p' packages/engine/wit/lix-plugin.wit; sed -n '900,1080p' packages/rs-sdk-tests/tests/e2e.rs; sed -n '1560,1650p' packages/rs-sdk-tests/tests/e2e.rs; sed -n '1,100p' Cargo.toml\""
+      ]
+    },
+    {
+      "id": 8,
+      "success": true,
+      "success_reason": "The log shows a new executable plugins/tsv-v2 crate was added, its localized-edit and exact-round-trip tests passed (4 unit tests plus doctest), and the wasm32-wasip2 release component built successfully.",
+      "duration_sec": 313.8,
+      "tool_calls": 16,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 3,
+      "scores": {
+        "friction": 100,
+        "speed": 50,
+        "efficiency": 62,
+        "errorRecovery": 80,
+        "final": 75
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Component v2|component v2|Wasm Component|sparse entity|entity upsert|plugin API\\\" . -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -200\"",
+        "/bin/bash -lc \"cat packages/engine/AGENTS.md && cat experiments/plugin-api-v2/ax-eval/tasks/production-v2-tsv.md && cat packages/engine/wit/v2/README.md && sed -n '1,260p' plugins/csv-v2/src/lib.rs && sed -n '1,220p' plugins/csv-v2/Cargo.toml\"",
+        "/bin/bash -lc \"rg -n \\\"plugin_csv_v2|csv-v2\\\" Cargo.toml packages/rs-sdk-tests/Cargo.toml packages/rs-sdk-tests/tests/e2e.rs | head -100; find plugins/csv-v2 -maxdepth 3 -type f -print; sed -n '1,260p' plugins/csv-v2/src/core.rs; sed -n '1,260p' plugins/csv-v2/src/tests.rs\""
+      ]
+    },
+    {
+      "id": 9,
+      "success": true,
+      "success_reason": "The log shows `cargo test -p plugin_tsv_v2` passing the round-trip/single-sparse-upsert test and a successful release build for `wasm32-wasip2` producing the component artifact.",
+      "duration_sec": 247.9,
+      "tool_calls": 15,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 1,
+      "scores": {
+        "friction": 100,
+        "speed": 62,
+        "efficiency": 64,
+        "errorRecovery": 93,
+        "final": 82
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|Component v2|plugin API|plugin.*v2|TSV|sparse entity|upsert\\\" . -g '\"'!node_modules'\"' -g '\"'!target'\"'\"",
+        "/bin/bash -lc \"sed -n '1,240p' packages/engine/AGENTS.md; find . -maxdepth 3 -type f | sort | head -200; find plugins -maxdepth 3 -type f | sort; find packages/engine/wit/v2 -type f -maxdepth 2 -print\"",
+        "/bin/bash -lc \"git status --short; sed -n '1,240p' plugins/csv-v2/README.md; sed -n '1,240p' plugins/csv-v2/src/lib.rs; sed -n '1,300p' plugins/csv-v2/src/core.rs; sed -n '1,320p' plugins/csv-v2/src/tests.rs; cat plugins/csv-v2/Cargo.toml; cat plugins/csv-v2/manifest.json\""
+      ]
+    },
+    {
+      "id": 10,
+      "success": true,
+      "success_reason": "The log records a passing production Wasmtime e2e test for two-column TSV round-trip and exactly one sparse row upsert, six passing plugin tests, and a successful wasm32-wasip2 release build.",
+      "duration_sec": 427.6,
+      "tool_calls": 25,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 1,
+      "scores": {
+        "friction": 100,
+        "speed": 30,
+        "efficiency": 38,
+        "errorRecovery": 93,
+        "final": 69
+      },
+      "first_3_commands": [
+        "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|component v2|plugin API|plugin.*v2|wit\\\" -g '\"'!node_modules'\"' -g '\"'!target'\"' . | head -200\"",
+        "/bin/bash -lc \"git status --short && sed -n '1,240p' packages/engine/AGENTS.md && sed -n '1,240p' packages/engine/wit/v2/README.md && sed -n '1,260p' plugins/csv-v2/README.md && rg --files plugins/csv-v2 packages/engine/wit/v2 | sort\"",
+        "/bin/bash -lc \"sed -n '1,260p' experiments/plugin-api-v2/ax-eval/tasks/production-v2-tsv.md && sed -n '1,180p' plugins/csv-v2/Cargo.toml && sed -n '1,180p' plugins/csv-v2/manifest.json && sed -n '1,220p' plugins/csv-v2/src/lib.rs && rg -n \\\"plugin_csv_v2|csv-v2|artifact\\\" Cargo.toml packages/rs-sdk-tests/Cargo.toml packages/rs-sdk-tests/tests/e2e.rs | head -160\""
+      ]
+    }
+  ],
+  "summary": {
+    "success_rate": 1.0,
+    "median_final": 76.0,
+    "p25_final": 72.75,
+    "p75_final": 82.75,
+    "common_first_command": "/bin/bash -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!target'\"' | head -50 && rg -n \\\"Wasm Component|component v2|plugin API|entity upsert|upsert\\\" -g '\"'!node_modules'\"' -g '\"'!target'\"' . | head -200\" (2/10)"
+  }
+}
