@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::future::Future;
 use std::sync::Arc;
 
@@ -13,7 +14,9 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::commit_graph::CommitGraphReader;
-use crate::serialize_row_metadata;
+use crate::tracked_state::{
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateScanRequest,
+};
 
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
@@ -21,12 +24,11 @@ use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
-    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection,
-    HistoryRoute, HistoryViewDescriptor, history_descriptor_event_matches, load_history_entries,
-    parse_history_filter,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
+    HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SOURCE_CHANGES, HISTORY_COL_START_COMMIT_ID,
+    HistoryColumnStyle, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
+    HistoryViewDescriptor, load_history_entries, parse_history_filter,
+    serialize_history_source_changes,
 };
 use crate::sql2::providers::filesystem_history_path::{
     HistoryDirectoryPathRecord, resolve_history_directory_path,
@@ -171,7 +173,6 @@ struct DirectoryHistoryOutputRow {
     path: Option<String>,
     parent_id: Option<String>,
     name: Option<String>,
-    descriptor_change: MaterializedChange,
     event: DirectoryHistoryEvent,
 }
 
@@ -180,7 +181,7 @@ struct DirectoryHistoryEvent {
     directory_id: String,
     start_commit_id: String,
     depth: u32,
-    change: MaterializedChange,
+    source_changes: Vec<MaterializedChange>,
     observed_commit_id: String,
     commit_created_at: String,
 }
@@ -202,42 +203,50 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let event_route = route.traversal_only();
-    let context_route = route.starts_only();
-    let (event_entries, context_entries) =
-        load_directory_history_entry_sets(&event_route, &context_route, move |route| {
-            let commit_graph = Arc::clone(&commit_graph);
-            let json_reader = query_source.json_reader.clone();
-            async move {
-                load_history_entries(
-                    HistoryViewDescriptor {
-                        view_name: "lix_directory_history",
-                        start_commit_column: HISTORY_COL_START_COMMIT_ID,
-                    },
-                    commit_graph,
-                    json_reader,
-                    &route,
-                    vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                    metadata_projection,
-                )
-                .await
-            }
-        })
-        .await?;
+    let event_entries = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_directory_history",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
+        },
+        commit_graph,
+        query_source.json_reader.clone(),
+        &event_route,
+        vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        metadata_projection,
+    )
+    .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
-    let descriptors = parse_directory_history_records(&context_entries)?;
+    let events = grouped_directory_history_events(&event_descriptors);
+    let observed_commit_ids = events
+        .iter()
+        .map(|event| event.observed_commit_id.clone())
+        .collect::<BTreeSet<_>>();
+    let observed_states =
+        load_directory_history_observed_states(query_source, observed_commit_ids).await?;
     let mut output = Vec::new();
 
-    for descriptor in &event_descriptors {
-        let event = directory_history_event_from_entry(&descriptor.id, &descriptor.entry);
-        let Some(visible_descriptor) = nearest_directory_descriptor(&descriptors, &event) else {
+    for event in events {
+        let Some(descriptors) = observed_states.get(&event.observed_commit_id) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "lix_directory_history did not load observed commit '{}'",
+                    event.observed_commit_id
+                ),
+            ));
+        };
+        let Some(visible_descriptor) = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == event.directory_id)
+        else {
             continue;
         };
         let path = if visible_descriptor.name.is_some() {
             resolve_history_directory_path(
                 &visible_descriptor.id,
-                &event.start_commit_id,
-                event.depth,
-                &descriptors,
+                &event.observed_commit_id,
+                0,
+                descriptors,
                 &mut BTreeMap::new(),
                 &mut BTreeSet::new(),
             )
@@ -257,7 +266,6 @@ where
             path,
             parent_id: visible_descriptor.parent_id.clone(),
             name: visible_descriptor.name.clone(),
-            descriptor_change: visible_descriptor.entry.change.clone(),
             event,
         });
     }
@@ -281,11 +289,11 @@ where
                     .observed_commit_id
                     .cmp(&right.event.observed_commit_id),
             )
-            .then(left.event.change.id.cmp(&right.event.change.id))
     });
     Ok(output)
 }
 
+#[cfg(test)]
 async fn load_directory_history_entry_sets<Load, LoadFuture>(
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
@@ -302,6 +310,66 @@ where
         load(context_route.clone()).await?
     };
     Ok((event_entries, context_entries))
+}
+
+async fn load_directory_history_observed_states<S>(
+    query_source: SqlHistoryQuerySource<S>,
+    observed_commit_ids: BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<DirectoryHistoryRecord>>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    // Equal-depth commits can be siblings. Resolve the directory projection
+    // from the observed commit's root so no sibling descriptor can leak into
+    // the row merely because it has the same traversal depth.
+    let mut reader = TrackedStateContext::new().reader(query_source.store);
+    let mut states = BTreeMap::new();
+    for observed_commit_id in observed_commit_ids {
+        let rows = reader
+            .scan_rows_at_commit(
+                &observed_commit_id,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                        include_tombstones: true,
+                        ..TrackedStateFilter::default()
+                    },
+                    ..TrackedStateScanRequest::default()
+                },
+            )
+            .await?;
+        let entries = rows
+            .into_iter()
+            .map(|row| directory_history_entry_from_observed_state(row, &observed_commit_id))
+            .collect::<Vec<_>>();
+        states.insert(
+            observed_commit_id,
+            parse_directory_history_records(&entries)?,
+        );
+    }
+    Ok(states)
+}
+
+fn directory_history_entry_from_observed_state(
+    row: MaterializedTrackedStateRow,
+    observed_commit_id: &str,
+) -> HistoryEntry {
+    HistoryEntry {
+        change: MaterializedChange {
+            id: row.change_id.to_string(),
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            snapshot_content: row.snapshot_content,
+            metadata: row.metadata,
+            created_at: row.updated_at.clone(),
+            origin_key: None,
+        },
+        observed_commit_id: observed_commit_id.to_string(),
+        commit_created_at: row.updated_at,
+        start_commit_id: observed_commit_id.to_string(),
+        depth: 0,
+    }
 }
 
 fn parse_directory_history_records(
@@ -336,6 +404,52 @@ fn parse_directory_history_records(
         .collect()
 }
 
+fn grouped_directory_history_events(
+    descriptors: &[DirectoryHistoryRecord],
+) -> Vec<DirectoryHistoryEvent> {
+    let mut grouped = BTreeMap::<(String, String, String), DirectoryHistoryEvent>::new();
+    for descriptor in descriptors {
+        let mut event = directory_history_event_from_entry(&descriptor.id, &descriptor.entry);
+        let key = (
+            event.directory_id.clone(),
+            event.start_commit_id.clone(),
+            event.observed_commit_id.clone(),
+        );
+        match grouped.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(event);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let grouped_event = entry.get_mut();
+                debug_assert_eq!(grouped_event.depth, event.depth);
+                // When commit metadata is not projected, history loading uses
+                // each source change's timestamp as an intentionally unused
+                // fallback. Those timestamps may differ within one commit.
+                grouped_event
+                    .source_changes
+                    .append(&mut event.source_changes);
+            }
+        }
+    }
+    let mut events = grouped.into_values().collect::<Vec<_>>();
+    for event in &mut events {
+        event
+            .source_changes
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        event
+            .source_changes
+            .dedup_by(|left, right| left.id == right.id);
+    }
+    events.sort_by(|left, right| {
+        left.directory_id
+            .cmp(&right.directory_id)
+            .then(left.start_commit_id.cmp(&right.start_commit_id))
+            .then(left.depth.cmp(&right.depth))
+            .then(left.observed_commit_id.cmp(&right.observed_commit_id))
+    });
+    events
+}
+
 fn directory_history_event_from_entry(
     directory_id: &str,
     entry: &HistoryEntry,
@@ -344,32 +458,10 @@ fn directory_history_event_from_entry(
         directory_id: directory_id.to_string(),
         start_commit_id: entry.start_commit_id.clone(),
         depth: entry.depth,
-        change: entry.change.clone(),
+        source_changes: vec![entry.change.clone()],
         observed_commit_id: entry.observed_commit_id.clone(),
         commit_created_at: entry.commit_created_at.clone(),
     }
-}
-
-fn nearest_directory_descriptor<'a>(
-    descriptors: &'a [DirectoryHistoryRecord],
-    event: &DirectoryHistoryEvent,
-) -> Option<&'a DirectoryHistoryRecord> {
-    descriptors
-        .iter()
-        .filter(|descriptor| {
-            let exact_descriptor_event =
-                history_descriptor_event_matches(&descriptor.entry, event.depth, &event.change.id);
-            (exact_descriptor_event || descriptor.name.is_some())
-                && descriptor.id == event.directory_id
-                && descriptor.entry.start_commit_id == event.start_commit_id
-                && descriptor.entry.depth >= event.depth
-        })
-        .min_by(|left, right| {
-            left.entry
-                .depth
-                .cmp(&right.entry.depth)
-                .then(left.entry.change.id.cmp(&right.entry.change.id))
-        })
 }
 
 static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = ColumnTable {
@@ -383,29 +475,10 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
             Col::Utf8Fallible(|row| entity_pk_json_array(&row.entity_pk).map(Some)),
         ),
         (
-            HISTORY_COL_SCHEMA_KEY,
-            Col::Utf8(|_row| Some(DIRECTORY_DESCRIPTOR_SCHEMA_KEY)),
-        ),
-        (HISTORY_COL_FILE_ID, Col::Utf8(|_row| None)),
-        (
-            HISTORY_COL_CHANGE_ID,
-            Col::Utf8(|row| Some(row.event.change.id.as_str())),
-        ),
-        (
-            HISTORY_COL_ORIGIN_KEY,
-            Col::Utf8(|row| row.event.change.origin_key.as_deref()),
-        ),
-        (
-            HISTORY_COL_SNAPSHOT_CONTENT,
-            Col::Utf8(|row| row.descriptor_change.snapshot_content.as_deref()),
-        ),
-        (
-            HISTORY_COL_METADATA,
-            Col::Utf8Owned(|row| {
-                row.descriptor_change
-                    .metadata
-                    .as_deref()
-                    .map(serialize_row_metadata)
+            HISTORY_COL_SOURCE_CHANGES,
+            Col::Utf8Fallible(|row| {
+                serialize_history_source_changes(&row.event.source_changes, "lix_directory_history")
+                    .map(Some)
             }),
         ),
         (
@@ -450,12 +523,7 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
         json_field(HISTORY_COL_ENTITY_PK, false),
-        Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
-        Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
-        json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
-        Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
-        Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
-        json_field(HISTORY_COL_METADATA, true),
+        json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
         Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),

@@ -13,8 +13,7 @@ mod registry;
 mod storage;
 
 pub(crate) use archive::{
-    ParsedPluginArchive, load_installed_plugin_from_archive_bytes,
-    load_installed_plugin_metadata_from_archive_bytes, parse_plugin_archive_for_install,
+    ParsedPluginArchive, load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install,
 };
 pub(crate) use component::{
     CachedPluginComponent, PluginComponentHost, PluginRuntimeHost, load_or_init_plugin_component,
@@ -22,11 +21,10 @@ pub(crate) use component::{
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{
     PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
-    select_best_glob_match,
 };
 pub(crate) use materializer::{
     PluginDetectedChange, detect_changes_with_component_instance,
-    plugin_state_live_state_projection, render_materialized_plugin_file,
+    plugin_state_live_state_projection, render_plugin_state,
     render_plugin_state_with_component_instance, retain_plugin_state_rows,
     retain_plugin_state_rows_for_schema_keys,
 };

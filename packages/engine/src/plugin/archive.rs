@@ -9,7 +9,9 @@ use crate::LixError;
 use crate::binary_cas::BlobHash;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
-use super::{InstalledPlugin, InstalledPluginMetadata, PluginManifest, parse_plugin_manifest_json};
+#[cfg(test)]
+use super::InstalledPluginMetadata;
+use super::{InstalledPlugin, PluginManifest, parse_plugin_manifest_json};
 
 /// Fully validated plugin package data needed by the install transaction.
 ///
@@ -155,6 +157,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
     plugin_key: &str,
     archive_path: &str,

@@ -1868,6 +1868,7 @@ where
 
     fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
         HistoryQuerySource {
+            store: self.read_store.clone(),
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
         }
     }

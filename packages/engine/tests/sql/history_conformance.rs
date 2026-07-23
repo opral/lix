@@ -57,6 +57,38 @@ simulation_test!(
         .collect::<Vec<_>>();
 
         assert_eq!(rows, expected);
+
+        let provenance_columns = select_rows(
+            &session,
+            "SELECT table_name, column_name \
+             FROM information_schema.columns \
+             WHERE table_name IN ('lix_file_history', 'lix_directory_history') \
+               AND column_name IN (\
+                 'lixcol_source_changes',\
+                 'lixcol_schema_key',\
+                 'lixcol_file_id',\
+                 'lixcol_snapshot_content',\
+                 'lixcol_change_id',\
+                 'lixcol_origin_key',\
+                 'lixcol_metadata'\
+               ) \
+             ORDER BY table_name, column_name",
+        )
+        .await;
+        assert_eq!(
+            provenance_columns,
+            vec![
+                vec![
+                    Value::Text("lix_directory_history".to_string()),
+                    Value::Text("lixcol_source_changes".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_file_history".to_string()),
+                    Value::Text("lixcol_source_changes".to_string()),
+                ],
+            ],
+            "composed histories expose aggregate provenance without singular aliases"
+        );
     }
 );
 
@@ -96,7 +128,7 @@ simulation_test!(
              ) \
                AND (\
                  column_name IN ('path', 'directory_id', 'parent_id', 'name', 'data', 'id', 'count', 'active', 'meta') \
-                 OR column_name = 'lixcol_snapshot_content'\
+                 OR column_name IN ('lixcol_snapshot_content', 'lixcol_source_changes')\
                ) \
              ORDER BY table_name, column_name",
         )
@@ -113,14 +145,14 @@ simulation_test!(
             ),
             ("engine_history_contract_schema_history", "meta", "YES"),
             ("lix_directory_history", "id", "NO"),
-            ("lix_directory_history", "lixcol_snapshot_content", "YES"),
+            ("lix_directory_history", "lixcol_source_changes", "NO"),
             ("lix_directory_history", "name", "YES"),
             ("lix_directory_history", "parent_id", "YES"),
             ("lix_directory_history", "path", "YES"),
             ("lix_file_history", "data", "YES"),
             ("lix_file_history", "directory_id", "YES"),
             ("lix_file_history", "id", "NO"),
-            ("lix_file_history", "lixcol_snapshot_content", "YES"),
+            ("lix_file_history", "lixcol_source_changes", "NO"),
             ("lix_file_history", "name", "YES"),
             ("lix_file_history", "path", "YES"),
         ]
@@ -405,7 +437,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, data, lixcol_entity_pk, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, name, data, lixcol_entity_pk, lixcol_depth \
              FROM lix_file_history \
              WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND id = 'history-conformance-file' \
@@ -420,8 +452,6 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Json(serde_json::json!(["history-conformance-file"])),
-                Value::Text("history-conformance-file".to_string()),
-                Value::Null,
                 Value::Integer(0),
             ]]
         );
@@ -478,7 +508,7 @@ simulation_test!(
 
         let directory_rows = select_rows(
             &session,
-            "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_depth \
              FROM lix_directory_history \
              WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND id = 'history-conformance-dir' \
@@ -493,7 +523,6 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Json(serde_json::json!(["history-conformance-dir"])),
-                Value::Null,
                 Value::Integer(0),
             ]]
         );

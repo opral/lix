@@ -20,11 +20,11 @@ use crate::live_state::MaterializedLiveStateRow;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
-use super::InstalledPlugin;
 use super::manifest::{
     PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
+use super::{InstalledPlugin, InstalledPluginMetadata};
 
 pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v1";
 pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v1";
@@ -127,6 +127,17 @@ impl PluginRegistryEntry {
 
     pub(crate) fn archive_blob_hash(&self) -> &str {
         &self.archive_blob_hash
+    }
+
+    pub(crate) fn to_installed_plugin_metadata(&self) -> InstalledPluginMetadata {
+        InstalledPluginMetadata {
+            key: self.key.clone(),
+            archive_path: self.archive_path.clone(),
+            archive_blob_hash: self.archive_blob_hash.clone(),
+            path_glob: self.path_glob.clone(),
+            content_type: self.content_type,
+            schema_keys: self.schema_keys.clone(),
+        }
     }
 
     pub(crate) fn wasm_blob_hash(&self) -> &str {
@@ -480,7 +491,15 @@ impl PluginFileOwner {
             return Ok(None);
         }
         let snapshot = parse_snapshot_content(row, "plugin owner")?;
-        let value = decode_key_value_snapshot(&snapshot, PLUGIN_OWNER_KEY)?;
+        Self::from_snapshot(file_id, &snapshot).map(Some)
+    }
+
+    pub(crate) fn from_snapshot(
+        file_id: impl Into<String>,
+        snapshot: &JsonValue,
+    ) -> Result<Self, LixError> {
+        let file_id = file_id.into();
+        let value = decode_key_value_snapshot(snapshot, PLUGIN_OWNER_KEY)?;
         let owner_value: PluginFileOwnerValue =
             serde_json::from_value(value.clone()).map_err(|error| {
                 invalid_registry(format!(
@@ -493,11 +512,7 @@ impl PluginFileOwner {
                 owner_value.version
             )));
         }
-        Ok(Some(Self::new(
-            file_id,
-            owner_value.plugin_key,
-            owner_value.schema_keys,
-        )?))
+        Self::new(file_id, owner_value.plugin_key, owner_value.schema_keys)
     }
 
     pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {

@@ -1,4 +1,4 @@
-use lix_engine::Value;
+use lix_engine::{CreateBranchOptions, MergeBranchOptions, Value};
 use serde_json::json;
 
 use super::assert_rows_eq;
@@ -81,10 +81,10 @@ simulation_test!(
             ],
         );
 
-        let snapshot_result = session
+        let source_changes_result = session
             .execute(
                 &format!(
-                    "SELECT lixcol_snapshot_content \
+                    "SELECT lixcol_source_changes \
                      FROM lix_directory_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND id = 'history-dir-guides' \
@@ -93,15 +93,44 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("directory history descriptor snapshot should be selectable");
-        let snapshot = snapshot_result.rows()[0]
-            .get::<Value>("lixcol_snapshot_content")
-            .expect("snapshot_content should be present");
-        let Value::Json(snapshot) = snapshot else {
-            panic!("snapshot_content should be semantic JSON, got {snapshot:?}");
+            .expect("directory history source changes should be selectable");
+        let source_changes = source_changes_result.rows()[0]
+            .get::<Value>("lixcol_source_changes")
+            .expect("source_changes should be present");
+        let Value::Json(source_changes) = source_changes else {
+            panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
-        assert_eq!(snapshot["parent_id"], json!("history-dir-docs"));
-        assert_eq!(snapshot["name"], json!("guides"));
+        assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            source_changes[0]["schema_key"],
+            json!("lix_directory_descriptor")
+        );
+        assert_eq!(
+            source_changes[0]["snapshot_content"]["parent_id"],
+            json!("history-dir-docs")
+        );
+        assert_eq!(
+            source_changes[0]["snapshot_content"]["name"],
+            json!("guides")
+        );
+        assert_eq!(
+            source_changes[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "created_at",
+                "entity_pk",
+                "file_id",
+                "id",
+                "metadata",
+                "origin_key",
+                "schema_key",
+                "snapshot_content",
+            ]
+        );
     }
 );
 
@@ -134,6 +163,116 @@ simulation_test!(
                 .is_some_and(|hint| hint.contains("WHERE lixcol_start_commit_id")),
             "unexpected error: {error}"
         );
+    }
+);
+
+simulation_test!(
+    lix_directory_history_preserves_equal_depth_siblings_in_a_diamond,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_directory (id, path) VALUES ('diamond-dir', '/before/')",
+            &[],
+        )
+        .await
+        .expect("base directory should insert");
+        main.create_branch(CreateBranchOptions {
+            id: Some("diamond-dir-draft".to_string()),
+            name: "Diamond directory draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft branch should be created");
+        let draft = sim.wrap_session(
+            engine
+                .open_session("diamond-dir-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "UPDATE lix_directory SET name = 'same' WHERE id = 'diamond-dir'",
+            &[],
+        )
+        .await
+        .expect("main rename should succeed");
+        let main_sibling = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main sibling should load")
+            .expect("main sibling should exist");
+        draft
+            .execute(
+                "UPDATE lix_directory SET name = 'same' WHERE id = 'diamond-dir'",
+                &[],
+            )
+            .await
+            .expect("draft rename should succeed");
+        let draft_sibling = engine
+            .load_branch_head_commit_id("diamond-dir-draft")
+            .await
+            .expect("draft sibling should load")
+            .expect("draft sibling should exist");
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "diamond-dir-draft".to_string(),
+            })
+            .await
+            .expect("convergent sibling renames should merge");
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .expect("convergent sibling renames should create an empty merge commit");
+
+        let rows = main
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_observed_commit_id, lixcol_depth \
+                     FROM lix_directory_history \
+                     WHERE lixcol_start_commit_id = '{merge_commit_id}' \
+                       AND id = 'diamond-dir' \
+                       AND lixcol_depth = 1 \
+                     ORDER BY lixcol_observed_commit_id"
+                ),
+                &[],
+            )
+            .await
+            .expect("diamond directory history should load");
+
+        assert_eq!(rows.len(), 2, "both equal-depth sibling revisions survive");
+        let mut observed = rows
+            .rows()
+            .iter()
+            .map(|row| {
+                assert_eq!(
+                    row.get::<Value>("path").expect("path should decode"),
+                    Value::Text("/same/".to_string())
+                );
+                assert_eq!(
+                    row.get::<Value>("lixcol_depth")
+                        .expect("history depth should decode"),
+                    Value::Integer(1)
+                );
+                match row
+                    .get::<Value>("lixcol_observed_commit_id")
+                    .expect("observed commit should exist")
+                {
+                    Value::Text(commit_id) => commit_id,
+                    value => panic!("observed commit should be text, got {value:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        observed.sort();
+        let mut expected = vec![main_sibling, draft_sibling];
+        expected.sort();
+        assert_eq!(observed, expected);
     }
 );
 
@@ -182,7 +321,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-					"SELECT id, path, name, lixcol_snapshot_content, lixcol_schema_key, lixcol_start_commit_id, lixcol_depth \
+					"SELECT id, path, name, lixcol_source_changes, lixcol_start_commit_id, lixcol_depth \
 	                 FROM lix_directory_history \
 	                 WHERE lixcol_start_commit_id = '{delete_commit_id}' \
 	                   AND lixcol_entity_pk IN (lix_json('[\"history-delete-docs\"]'), lix_json('[\"history-delete-guides\"]')) \
@@ -194,28 +333,34 @@ simulation_test!(
             .await
             .expect("directory delete history read should succeed");
 
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("history-delete-docs".to_string()),
+        assert_eq!(result.len(), 2);
+        for (row, expected_id) in result
+            .rows()
+            .iter()
+            .zip(["history-delete-docs", "history-delete-guides"])
+        {
+            assert_eq!(
+                &row.values()[..3],
+                &[
+                    Value::Text(expected_id.to_string()),
                     Value::Null,
                     Value::Null,
-                    Value::Null,
-                    Value::Text("lix_directory_descriptor".to_string()),
-                    Value::Text(delete_commit_id.clone()),
-                    Value::Integer(0),
-                ],
-                vec![
-                    Value::Text("history-delete-guides".to_string()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Text("lix_directory_descriptor".to_string()),
-                    Value::Text(delete_commit_id),
-                    Value::Integer(0),
-                ],
-            ],
-        );
+                ]
+            );
+            let Value::Json(source_changes) = &row.values()[3] else {
+                panic!("delete source changes should be JSON");
+            };
+            assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
+            assert_eq!(
+                source_changes[0]["schema_key"],
+                json!("lix_directory_descriptor")
+            );
+            assert_eq!(
+                source_changes[0]["snapshot_content"],
+                serde_json::Value::Null
+            );
+            assert_eq!(row.values()[4], Value::Text(delete_commit_id.clone()));
+            assert_eq!(row.values()[5], Value::Integer(0));
+        }
     }
 );
