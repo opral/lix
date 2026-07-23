@@ -244,26 +244,25 @@ pub(crate) fn remember_pending_registered_schema(
         validate_lix_schema(registered_schema_definition, snapshot)?;
     }
     let (key, schema) = schema_from_registered_snapshot(snapshot)?;
-    reject_fixed_system_schema_collision(&key)?;
+    reject_reserved_schema_namespace(&key)?;
     validate_lix_schema_definition(&schema)?;
     schema_catalog.insert_schema_for_domain(domain, key, schema)?;
     Ok(())
 }
 
-pub(crate) fn reject_fixed_system_schema_collision(key: &SchemaKey) -> Result<(), LixError> {
-    let Some(surface_name) = PublicCatalog::fixed_system_collision_for_schema_key(&key.schema_key)
-    else {
+pub(crate) fn reject_reserved_schema_namespace(key: &SchemaKey) -> Result<(), LixError> {
+    if !PublicCatalog::runtime_schema_key_uses_reserved_namespace(&key.schema_key) {
         return Ok(());
-    };
+    }
     Err(LixError::new(
-        LixError::CODE_SCHEMA_DEFINITION,
+        LixError::CODE_RESERVED_SCHEMA_NAMESPACE,
         format!(
-            "schema '{}' conflicts with fixed system schema or public SQL surface '{}' and cannot be registered at runtime",
-            key.schema_key, surface_name
+            "schema '{}' uses the reserved Lix schema namespace and cannot be registered at runtime",
+            key.schema_key
         ),
     )
     .with_hint(
-        "Choose a schema key whose base, `_by_branch`, and `_history` table names do not overlap a fixed Lix surface.",
+        "Choose an application-owned x-lix-key outside the reserved `lix` and `lix_*` namespace, for example `acme_task`.",
     ))
 }
 
@@ -524,16 +523,20 @@ mod tests {
     }
 
     #[test]
-    fn normalization_rejects_fixed_and_generated_system_surface_schema_keys() {
+    fn normalization_rejects_the_complete_reserved_lix_schema_namespace() {
         let mut catalog = catalog_with(vec![
             seed_schema_definition(REGISTERED_SCHEMA_KEY)
                 .expect("registered schema builtin")
                 .clone(),
         ]);
 
-        for (schema_key, collision_kind) in [
-            ("lix_file", "fixed base surface"),
-            ("lix_key_value_history", "generated system history surface"),
+        for schema_key in [
+            "lix",
+            "lix_file",
+            "lix_key_value_history",
+            "lix_state_history",
+            "lix_file_descriptor",
+            "lix_plugin_note",
         ] {
             let mut schema = dynamic_schema_definition();
             schema["x-lix-key"] = json!(schema_key);
@@ -545,10 +548,13 @@ mod tests {
             };
 
             let error = normalize_transaction_write_row(registered, &mut catalog, functions())
-                .expect_err(collision_kind);
+                .expect_err("lix_* should be reserved");
 
-            assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-            assert!(error.message.contains("fixed system schema"), "{error:?}");
+            assert_eq!(error.code, LixError::CODE_RESERVED_SCHEMA_NAMESPACE);
+            assert!(
+                error.message.contains("reserved Lix schema namespace"),
+                "{error:?}"
+            );
             assert!(error.message.contains(schema_key), "{error:?}");
             assert!(
                 !catalog.snapshot().contains(schema_key),
@@ -558,14 +564,14 @@ mod tests {
     }
 
     #[test]
-    fn normalization_allows_noncolliding_lix_prefixed_schema_key() {
+    fn normalization_allows_application_owned_schema_key() {
         let mut catalog = catalog_with(vec![
             seed_schema_definition(REGISTERED_SCHEMA_KEY)
                 .expect("registered schema builtin")
                 .clone(),
         ]);
         let mut schema = dynamic_schema_definition();
-        schema["x-lix-key"] = json!("lix_plugin_note");
+        schema["x-lix-key"] = json!("acme_plugin_note");
         let registered = TransactionWriteRow {
             entity_pk: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
@@ -574,8 +580,8 @@ mod tests {
         };
 
         normalize_transaction_write_row(registered, &mut catalog, functions())
-            .expect("a noncolliding lix-prefixed key remains valid");
-        assert!(catalog.snapshot().contains("lix_plugin_note"));
+            .expect("an application-owned key remains valid");
+        assert!(catalog.snapshot().contains("acme_plugin_note"));
     }
 
     #[test]

@@ -2663,7 +2663,7 @@ mod tests {
         let statements: [(&str, &[Value]); 3] = [
             ("SELECT 1 AS one", &[]),
             ("SELECT COUNT(*) AS files FROM lix_file", &[]),
-            ("SELECT COUNT(*) AS states FROM lix_state", &[]),
+            ("SELECT COUNT(*) AS changes FROM lix_change", &[]),
         ];
 
         let batch = session
@@ -2674,7 +2674,7 @@ mod tests {
         assert_eq!(batch.results.len(), 3);
         assert_eq!(batch.results[0].rows()[0].get::<i64>("one").unwrap(), 1);
         assert_eq!(batch.results[1].rows()[0].get::<i64>("files").unwrap(), 0);
-        assert!(batch.results[2].rows()[0].get::<i64>("states").unwrap() > 0);
+        assert!(batch.results[2].rows()[0].get::<i64>("changes").unwrap() > 0);
     }
 
     #[tokio::test]
@@ -2687,10 +2687,10 @@ mod tests {
                  FROM files AS file_a \
                  JOIN files AS file_b ON file_a.id = file_b.id \
                  LEFT JOIN (\
-                     SELECT entity_pk FROM lix_state \
+                     SELECT entity_pk FROM lix_change \
                      UNION ALL \
-                     SELECT entity_pk FROM lix_state\
-                 ) AS states ON false",
+                     SELECT entity_pk FROM lix_change\
+                 ) AS changes ON false",
                 &[],
             )
             .await
@@ -2748,7 +2748,7 @@ mod tests {
         session
             .execute(
                 "SELECT COUNT(*) AS rows FROM lix_key_value AS kv \
-                 JOIN lix_state AS state ON false",
+                 JOIN lix_change AS change ON false",
                 &[],
             )
             .await

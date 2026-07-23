@@ -136,11 +136,19 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
 }
 
 pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
-    !matches!(schema_key, "lix_active_account" | "lix_change")
+    !matches!(
+        schema_key,
+        "lix_active_account"
+            | "lix_binary_blob_ref"
+            | "lix_change"
+            | "lix_directory_descriptor"
+            | "lix_file_descriptor"
+    )
 }
 
 pub(crate) fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
-    !matches!(schema_key, "lix_commit" | "lix_commit_edge")
+    schema_exposed_as_entity_surface(schema_key)
+        && !matches!(schema_key, "lix_commit" | "lix_commit_edge")
 }
 
 pub(crate) fn entity_surface_schema(

@@ -507,62 +507,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    metadata_rejects_invalid_json_on_lix_state_writes,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        assert_invalid_metadata_error(
-            session
-                .execute(
-                    "INSERT INTO lix_state (\
-                     entity_pk, schema_key, file_id, snapshot_content, metadata\
-                     ) VALUES (\
-                     lix_json('[\"metadata-state-insert\"]'), 'lix_key_value', NULL, \
-                     lix_json('{\"key\":\"metadata-state-insert\",\"value\":\"value\"}'), \
-                     '{bad'\
-                     )",
-                    &[],
-                )
-                .await
-                .expect_err("invalid lix_state metadata should be rejected on INSERT"),
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content\
-                 ) VALUES (\
-                 lix_json('[\"metadata-state-update\"]'), 'lix_key_value', NULL, \
-                 lix_json('{\"key\":\"metadata-state-update\",\"value\":\"value\"}')\
-                 )",
-                &[],
-            )
-            .await
-            .expect("lix_state insert should succeed");
-
-        assert_invalid_metadata_error(
-            session
-                .execute(
-                    "UPDATE lix_state \
-                     SET metadata = '{bad' \
-                     WHERE entity_pk = lix_json('[\"metadata-state-update\"]') \
-                       AND schema_key = 'lix_key_value'",
-                    &[],
-                )
-                .await
-                .expect_err("invalid lix_state metadata should be rejected on UPDATE"),
-        );
-    }
-);
-
-simulation_test!(
     valid_object_metadata_survives_live_change_and_history_reads,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -614,21 +558,6 @@ simulation_test!(
             session
                 .execute(
                     "SELECT metadata \
-                     FROM lix_state \
-                     WHERE entity_pk = lix_json('[\"metadata-valid-object\"]') \
-                       AND schema_key = 'lix_key_value'",
-                    &[],
-                )
-                .await
-                .expect("lix_state metadata should read"),
-            "metadata",
-            &expected,
-        );
-
-        assert_metadata_value(
-            session
-                .execute(
-                    "SELECT metadata \
                      FROM lix_change \
                      WHERE entity_pk = lix_json('[\"metadata-valid-object\"]') \
                        AND schema_key = 'lix_key_value'",
@@ -645,15 +574,14 @@ simulation_test!(
                 .execute(
                     &format!(
                         "SELECT lixcol_metadata \
-                         FROM lix_state_history \
+                         FROM lix_key_value_history \
                          WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                           AND lixcol_entity_pk = lix_json('[\"metadata-valid-object\"]') \
-                           AND lixcol_schema_key = 'lix_key_value'"
+                           AND key = 'metadata-valid-object'"
                     ),
                     &[],
                 )
                 .await
-                .expect("lix_state_history metadata should read"),
+                .expect("typed history metadata should read"),
             "lixcol_metadata",
             &expected,
         );

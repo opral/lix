@@ -41,18 +41,20 @@ if (preview.conflicts.length === 0) {
 
 ## Showing the work
 
-The point of routing agent writes through Lix is that you can ask SQL what the agent did:
+The point of routing agent writes through Lix is that you can ask SQL what the
+agent did. Query the typed history relation for each application schema:
 
 ```sql
-SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_snapshot_content,
-       lixcol_depth, lixcol_observed_commit_id, lixcol_is_deleted
-FROM lix_state_history
-WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()
-  AND lixcol_depth >= 0
-ORDER BY lixcol_depth, lixcol_schema_key, lixcol_entity_pk;
+SELECT id, title, status, lixcol_depth,
+       lixcol_observed_commit_id, lixcol_is_deleted
+FROM acme_task_history
+ORDER BY lixcol_depth, id;
 ```
 
-This is the data your review UI renders. See [Change History](./history.md) for more recipes (per-entity history, who-changed-what, diffs between versions).
+Discover schemas through `lix_registered_schema` when the agent works across
+applications. Use `lix_change` only for workspace-global activity; it is not
+implicitly scoped to the agent's active branch. See
+[Change History](./history.md) for the scope distinction and more recipes.
 
 ## Conflicts
 

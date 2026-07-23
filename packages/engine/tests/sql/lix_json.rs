@@ -99,7 +99,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT entity_pk FROM lix_state WHERE entity_pk = 'state-latest'",
+                "SELECT entity_pk FROM lix_change WHERE entity_pk = 'state-latest'",
                 &[],
             )
             .await
@@ -126,7 +126,7 @@ simulation_test!(
         );
 
         for sql in [
-            "SELECT entity_pk FROM lix_state WHERE entity_pk = '[ \"state-latest\" ]'",
+            "SELECT entity_pk FROM lix_change WHERE entity_pk = '[ \"state-latest\" ]'",
             "SELECT id FROM lix_file WHERE lixcol_entity_pk = '[ \"file-readme\" ]'",
             "SELECT id FROM lix_directory WHERE lixcol_entity_pk = '[ \"directory-root\" ]'",
         ] {
@@ -143,7 +143,7 @@ simulation_test!(
         }
 
         for sql in [
-            "SELECT entity_pk FROM lix_state WHERE entity_pk = $1",
+            "SELECT entity_pk FROM lix_change WHERE entity_pk = $1",
             "SELECT id FROM lix_file WHERE lixcol_entity_pk = $1",
             "SELECT id FROM lix_directory WHERE lixcol_entity_pk = $1",
         ] {
@@ -177,7 +177,7 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT entity_pk FROM lix_state WHERE entity_pk = lix_json('[\"state-latest\"]')",
+                "SELECT entity_pk FROM lix_change WHERE entity_pk = lix_json('[\"state-latest\"]')",
                 &[],
             )
             .await

@@ -7,7 +7,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    lix_registered_schema_insert_makes_schema_visible_to_lix_state,
+    lix_registered_schema_insert_makes_typed_schema_surface_visible,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -63,35 +63,31 @@ simulation_test!(
         assert_eq!(registered_schema_entity_pk, &json!(["engine_dummy_schema"]));
 
         let insert_state_result = session
-        .execute(
-            "INSERT INTO lix_state (\
-             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-             ) VALUES (\
-             lix_json('[\"dummy-1\"]'), 'engine_dummy_schema', NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), false, true\
-             )",
-            &[],
-        )
-        .await
-        .expect("lix_state insert for registered schema should succeed");
+            .execute(
+                "INSERT INTO engine_dummy_schema (id, name, lixcol_untracked) \
+             VALUES ('dummy-1', 'Dummy', true)",
+                &[],
+            )
+            .await
+            .expect("typed insert for registered schema should succeed");
         assert_eq!(insert_state_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
-                "SELECT entity_pk, schema_key, snapshot_content \
-             FROM lix_state \
-             WHERE schema_key = 'engine_dummy_schema' AND entity_pk = lix_json('[\"dummy-1\"]')",
+                "SELECT id, name \
+             FROM engine_dummy_schema \
+             WHERE id = 'dummy-1'",
                 &[],
             )
             .await
-            .expect("lix_state read should succeed");
+            .expect("typed read should succeed");
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         assert_eq!(
             row_set.rows()[0].values(),
             &[
-                Value::Json(json!(["dummy-1"])),
-                Value::Text("engine_dummy_schema".to_string()),
-                Value::Json(json!({"id": "dummy-1", "name": "Dummy"})),
+                Value::Text("dummy-1".to_string()),
+                Value::Text("Dummy".to_string()),
             ]
         );
     }
@@ -170,7 +166,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    untracked_registered_schema_does_not_authorize_tracked_state_write,
+    untracked_registered_schema_does_not_authorize_tracked_typed_write,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -196,11 +192,9 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-                 ) VALUES (\
-                 lix_json('[\"tracked-1\"]'), 'engine_untracked_only_schema', NULL, lix_json('{\"id\":\"tracked-1\",\"name\":\"Tracked\"}'), false, false\
-                 )",
+                "INSERT INTO engine_untracked_only_schema \
+                 (id, name, lixcol_untracked) \
+                 VALUES ('tracked-1', 'Tracked', false)",
                 &[],
             )
             .await
@@ -211,7 +205,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_fixed_system_surface_collisions,
+    lix_registered_schema_insert_rejects_reserved_lix_namespace,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -222,9 +216,15 @@ simulation_test!(
             &engine,
         );
 
-        for (schema_key, collision_kind) in [
-            ("lix_file", "fixed base surface"),
-            ("lix_key_value_history", "generated system history surface"),
+        for schema_key in [
+            "lix",
+            "lix_file",
+            "lix_key_value_history",
+            "lix_state",
+            "lix_state_history",
+            "lix_file_descriptor",
+            "lix_file_descriptor_history",
+            "lix_plugin_note",
         ] {
             let schema = json!({
                 "x-lix-key": schema_key,
@@ -242,15 +242,25 @@ simulation_test!(
                     &[Value::Json(schema)],
                 )
                 .await
-                .expect_err(collision_kind);
+                .expect_err("every lix_* runtime schema key should be reserved");
 
-            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-            assert!(error.message.contains("fixed system schema"), "{error:?}");
+            assert_eq!(error.code, LixError::CODE_RESERVED_SCHEMA_NAMESPACE);
+            assert!(
+                error.message.contains("reserved Lix schema namespace"),
+                "{error:?}"
+            );
             assert!(error.message.contains(schema_key), "{error:?}");
+            assert!(
+                error
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("acme_task")),
+                "{error:?}"
+            );
         }
 
         let noncolliding_schema = json!({
-            "x-lix-key": "lix_plugin_note",
+            "x-lix-key": "acme_plugin_note",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": { "id": { "type": "string" } },
@@ -265,7 +275,107 @@ simulation_test!(
                 &[Value::Json(noncolliding_schema)],
             )
             .await
-            .expect("a noncolliding lix-prefixed key remains registerable");
+            .expect("an application-owned schema namespace should remain registerable");
+    }
+);
+
+simulation_test!(
+    hidden_storage_schemas_remain_registered_without_public_sql_relations,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let registered = session
+            .execute(
+                "SELECT lix_json_get_text(value, 'x-lix-key') \
+                 FROM lix_registered_schema",
+                &[],
+            )
+            .await
+            .expect("registered schemas should remain discoverable");
+        let registered_keys = registered
+            .rows()
+            .iter()
+            .filter_map(|row| match row.values() {
+                [Value::Text(schema_key)] => Some(schema_key.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for schema_key in [
+            "lix_account",
+            "lix_active_account",
+            "lix_binary_blob_ref",
+            "lix_branch_descriptor",
+            "lix_branch_ref",
+            "lix_change",
+            "lix_change_author",
+            "lix_commit",
+            "lix_commit_edge",
+            "lix_directory_descriptor",
+            "lix_file_descriptor",
+            "lix_key_value",
+            "lix_label",
+            "lix_label_assignment",
+            "lix_registered_schema",
+        ] {
+            assert!(
+                registered_keys.contains(schema_key),
+                "{schema_key} should remain registered"
+            );
+        }
+
+        let public_tables = session
+            .execute("SELECT table_name FROM information_schema.tables", &[])
+            .await
+            .expect("public tables should be introspectable");
+        let public_table_names = public_tables
+            .rows()
+            .iter()
+            .filter_map(|row| match row.values() {
+                [Value::Text(table_name)] => Some(table_name.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for surface_name in [
+            "lix_key_value",
+            "lix_key_value_by_branch",
+            "lix_key_value_history",
+            "lix_registered_schema",
+            "lix_registered_schema_by_branch",
+            "lix_registered_schema_history",
+        ] {
+            assert!(
+                public_table_names.contains(surface_name),
+                "{surface_name} should remain public"
+            );
+        }
+        for surface_name in [
+            "lix_state",
+            "lix_state_by_branch",
+            "lix_state_history",
+            "lix_binary_blob_ref",
+            "lix_binary_blob_ref_by_branch",
+            "lix_binary_blob_ref_history",
+            "lix_directory_descriptor",
+            "lix_directory_descriptor_by_branch",
+            "lix_directory_descriptor_history",
+            "lix_file_descriptor",
+            "lix_file_descriptor_by_branch",
+            "lix_file_descriptor_history",
+        ] {
+            assert!(
+                !public_table_names.contains(surface_name),
+                "{surface_name} should not be public"
+            );
+        }
     }
 );
 

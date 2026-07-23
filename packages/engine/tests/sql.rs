@@ -110,8 +110,6 @@ mod sql {
     mod lix_key_value;
     mod lix_label_assignment;
     mod lix_registered_schema;
-    mod lix_state;
-    mod lix_state_history;
     mod metadata;
     mod read_only;
     mod udfs;

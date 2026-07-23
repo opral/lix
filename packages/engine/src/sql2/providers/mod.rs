@@ -642,7 +642,7 @@ mod tests {
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
-        file, file_history, history, is_write_surface, lix_state, read_provider_selection,
+        file, file_history, is_write_surface, read_provider_selection,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -735,7 +735,7 @@ mod tests {
             !selection_for_sql(&["SELECT * FROM lix_key_value_history"]).requires_visible_schemas()
         );
         assert!(
-            !selection_for_sql(&["SELECT * FROM lix_key_value JOIN lix_state ON false"])
+            !selection_for_sql(&["SELECT * FROM lix_key_value JOIN lix_file ON false"])
                 .requires_visible_schemas()
         );
         assert!(selection_for_sql(&["SELECT * FROM custom_entity"]).requires_visible_schemas());
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn referenced_provider_selection_filters_transaction_capabilities_symmetrically() {
         let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
-        let selection = selected_names(&["lix_file", "lix_state_history"]);
+        let selection = selected_names(&["lix_file", "lix_file_history"]);
 
         let committed_read_names = catalog
             .surfaces()
@@ -767,7 +767,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(committed_read_names, vec!["lix_state_history"]);
+        assert_eq!(committed_read_names, vec!["lix_file_history"]);
         assert_eq!(overlay_write_names, vec!["lix_file"]);
     }
 
@@ -802,7 +802,6 @@ mod tests {
                 "lix_change",
                 "lix_directory_history",
                 "lix_file_history",
-                "lix_state_history",
                 "phase8_entity_history",
             ]
         );
@@ -814,17 +813,15 @@ mod tests {
                 "lix_directory_by_branch",
                 "lix_file",
                 "lix_file_by_branch",
-                "lix_state",
-                "lix_state_by_branch",
                 "phase8_entity",
                 "phase8_entity_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 23, "previous construction count");
+        assert_eq!(all_read + writable.len(), 18, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            14,
+            11,
             "new construction count"
         );
     }
@@ -843,7 +840,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 7, "previous standalone write count");
+        assert_eq!(all_writable, 5, "previous standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 
@@ -851,16 +848,6 @@ mod tests {
     fn provider_history_schemas_match_catalog_contract_order() {
         let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
 
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_state",
-            lix_state::lix_state_schema(),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_state_by_branch",
-            lix_state::lix_state_by_branch_schema(),
-        );
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_file",
@@ -890,11 +877,6 @@ mod tests {
             &catalog,
             "lix_change",
             change::lix_change_schema(),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_state_history",
-            history::lix_state_history_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,

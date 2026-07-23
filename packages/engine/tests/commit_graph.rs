@@ -95,7 +95,7 @@ simulation_test!(
         assert_eq!(
             commit_ids(&global_session, &main_head_after).await,
             vec![main_head_after.clone()],
-            "the touched-branch commit should still be globally visible through lix_state"
+            "the touched-branch commit should still be globally visible through lix_commit"
         );
     }
 );

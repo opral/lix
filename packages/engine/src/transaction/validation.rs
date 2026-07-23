@@ -36,7 +36,7 @@ use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definiti
 use crate::schema::{
     format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
 };
-use crate::transaction::normalization::reject_fixed_system_schema_collision;
+use crate::transaction::normalization::reject_reserved_schema_namespace;
 #[cfg(test)]
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::staging::duplicate_insert_identity_message;
@@ -307,7 +307,7 @@ async fn validate_registered_schema_identity_is_canonical(
             .snapshot_json()
             .expect("pending registered schema row has snapshot_content");
         let (key, _) = schema_from_registered_snapshot(pending_snapshot)?;
-        reject_fixed_system_schema_collision(&key)?;
+        reject_reserved_schema_namespace(&key)?;
 
         let Some(row) = load_committed_constraint_row(
             input.live_state,
@@ -2816,7 +2816,7 @@ fn validate_pending_registered_schema(
     // `lix_registered_schema` schema, and the inner definition must be a valid
     // Lix schema before it can extend the transaction-visible catalog.
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
-    reject_fixed_system_schema_collision(&key)?;
+    reject_reserved_schema_namespace(&key)?;
     validate_lix_schema_definition(&schema)?;
     validate_lix_schema(registered_schema_definition, &snapshot)?;
     Ok((key, schema))

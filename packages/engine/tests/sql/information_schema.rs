@@ -74,7 +74,7 @@ simulation_test!(
             .execute(
                 "SELECT table_name, column_name, lix_insert_policy \
                  FROM information_schema.columns \
-                 WHERE table_name IN ('lix_commit', 'lix_file_descriptor') \
+                 WHERE table_name = 'lix_commit' \
                    AND column_name = 'id' \
                  ORDER BY table_name",
                 &[],
@@ -83,18 +83,11 @@ simulation_test!(
             .expect("read-only generated entity surfaces should introspect");
         assert_rows_eq(
             read_only_entity_contract,
-            vec![
-                vec![
-                    Value::Text("lix_commit".to_string()),
-                    Value::Text("id".to_string()),
-                    Value::Text("READ_ONLY".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_file_descriptor".to_string()),
-                    Value::Text("id".to_string()),
-                    Value::Text("READ_ONLY".to_string()),
-                ],
-            ],
+            vec![vec![
+                Value::Text("lix_commit".to_string()),
+                Value::Text("id".to_string()),
+                Value::Text("READ_ONLY".to_string()),
+            ]],
         );
 
         let result = session
@@ -378,72 +371,6 @@ simulation_test!(
         assert_rows_eq(
             filesystem_system_contract,
             expected_filesystem_system_contract,
-        );
-
-        let raw_state_contract = session
-            .execute(
-                "SELECT column_name, is_nullable, column_default, lix_insert_policy \
-                 FROM information_schema.columns \
-                 WHERE table_name = 'lix_state' \
-                 ORDER BY column_name",
-                &[],
-            )
-            .await
-            .expect("raw state contract query should succeed");
-        let expected_raw_state_contract = [
-            ("change_id", "YES", None, "READ_ONLY"),
-            ("commit_id", "YES", None, "READ_ONLY"),
-            ("created_at", "NO", None, "READ_ONLY"),
-            ("entity_pk", "NO", None, "REQUIRED"),
-            ("file_id", "YES", None, "OPTIONAL"),
-            ("global", "NO", Some("FALSE"), "DEFAULT"),
-            ("metadata", "YES", None, "OPTIONAL"),
-            ("schema_key", "NO", None, "REQUIRED"),
-            ("snapshot_content", "YES", None, "OPTIONAL"),
-            ("untracked", "NO", Some("FALSE"), "DEFAULT"),
-            ("updated_at", "NO", None, "READ_ONLY"),
-        ]
-        .into_iter()
-        .map(
-            |(column_name, is_nullable, column_default, insert_policy)| {
-                vec![
-                    Value::Text(column_name.to_string()),
-                    Value::Text(is_nullable.to_string()),
-                    column_default.map_or(Value::Null, |value| Value::Text(value.to_string())),
-                    Value::Text(insert_policy.to_string()),
-                ]
-            },
-        )
-        .collect();
-        assert_rows_eq(raw_state_contract, expected_raw_state_contract);
-
-        let raw_state_branch_contract = session
-            .execute(
-                "SELECT column_name, is_nullable, column_default, lix_insert_policy \
-                 FROM information_schema.columns \
-                 WHERE table_name = 'lix_state_by_branch' \
-                   AND column_name IN ('branch_id', 'global') \
-                 ORDER BY column_name",
-                &[],
-            )
-            .await
-            .expect("raw state branch contract query should succeed");
-        assert_rows_eq(
-            raw_state_branch_contract,
-            vec![
-                vec![
-                    Value::Text("branch_id".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
-                ],
-                vec![
-                    Value::Text("global".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
-                ],
-            ],
         );
 
         let history_contract = session
@@ -1032,49 +959,6 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_state (\
-                   entity_pk, schema_key, snapshot_content, global, untracked\
-                 ) \
-                 VALUES (\
-                   lix_json('[\"excluded-default-state\"]'), \
-                   'lix_key_value', \
-                   lix_json('{\"key\":\"excluded-default-state\",\"value\":\"before\"}'), \
-                   true, \
-                   true\
-                 )",
-                &[],
-            )
-            .await
-            .expect("generic state default seed should insert");
-        session
-            .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
-                 VALUES (\
-                   lix_json('[\"excluded-default-state\"]'), \
-                   'lix_key_value', \
-                   lix_json('{\"key\":\"excluded-default-state\",\"value\":\"after\"}')\
-                 ) \
-                 ON CONFLICT (entity_pk, schema_key, file_id) DO UPDATE \
-                 SET global = excluded.global, untracked = excluded.untracked",
-                &[],
-            )
-            .await
-            .expect("excluded state booleans should materialize advertised defaults");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT global, untracked FROM lix_state \
-                     WHERE schema_key = 'lix_key_value' \
-                       AND entity_pk = lix_json('[\"excluded-default-state\"]')",
-                    &[],
-                )
-                .await
-                .expect("defaulted state booleans should be readable"),
-            vec![vec![Value::Boolean(false), Value::Boolean(false)]],
-        );
-
-        session
-            .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
@@ -1198,20 +1082,6 @@ simulation_test!(
              VALUES ('/null-global-directory/', NULL)",
             "INSERT INTO lix_directory (path, lixcol_untracked) \
              VALUES ('/null-untracked-directory/', NULL)",
-            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) \
-             VALUES (\
-               lix_json('[\"null-global-state\"]'), \
-               'lix_key_value', \
-               lix_json('{\"key\":\"null-global-state\",\"value\":null}'), \
-               NULL\
-             )",
-            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, untracked) \
-             VALUES (\
-               lix_json('[\"null-untracked-state\"]'), \
-               'lix_key_value', \
-               lix_json('{\"key\":\"null-untracked-state\",\"value\":null}'), \
-               NULL\
-             )",
         ] {
             let error = session
                 .execute(sql, &[])
@@ -1378,137 +1248,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_by_branch_scope_is_materialized_before_conflict_routing,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        for sql in [
-            "INSERT INTO lix_state_by_branch \
-             (entity_pk, schema_key, snapshot_content, branch_id) VALUES \
-             (lix_json('[\"null-branch-insert\"]'), 'lix_key_value', lix_json('{\"key\":\"null-branch-insert\",\"value\":\"invalid\"}'), $1)",
-            "INSERT INTO lix_state_by_branch \
-             (entity_pk, schema_key, snapshot_content, branch_id) VALUES \
-             (lix_json('[\"null-branch-upsert\"]'), 'lix_key_value', lix_json('{\"key\":\"null-branch-upsert\",\"value\":\"invalid\"}'), $1) \
-             ON CONFLICT (entity_pk, schema_key, file_id, branch_id) DO NOTHING",
-        ] {
-            let error = session
-                .execute(sql, &[Value::Null])
-                .await
-                .expect_err("NULL INSERT branch parameters must not become empty-scope no-ops");
-            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{sql}");
-            assert!(error.message.contains("branch-id"), "{error:?}");
-        }
-
-        session
-            .execute(
-                "INSERT INTO lix_state_by_branch \
-                 (entity_pk, schema_key, file_id, snapshot_content, branch_id) VALUES \
-                 (lix_json('[\"nothing-branch\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"nothing-branch\",\"value\":\"old\"}'), 'global'), \
-                 (lix_json('[\"update-branch\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"update-branch\",\"value\":\"old\"}'), 'global')",
-                &[],
-            )
-            .await
-            .expect("branch-id spelling should seed global rows");
-        session
-            .execute(
-                "INSERT INTO lix_state_by_branch \
-                 (entity_pk, schema_key, file_id, snapshot_content, global) VALUES \
-                 (lix_json('[\"nothing-global\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"nothing-global\",\"value\":\"old\"}'), true), \
-                 (lix_json('[\"update-global\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"update-global\",\"value\":\"old\"}'), true)",
-                &[],
-            )
-            .await
-            .expect("global spelling should seed rows with a derived global branch id");
-
-        let do_nothing = session
-            .execute(
-                "INSERT INTO lix_state_by_branch \
-                 (entity_pk, schema_key, file_id, snapshot_content, global) VALUES \
-                 (lix_json('[\"nothing-branch\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"nothing-branch\",\"value\":\"ignored\"}'), true) \
-                 ON CONFLICT (entity_pk, schema_key, file_id, branch_id) DO NOTHING",
-                &[],
-            )
-            .await
-            .expect("global spelling should match branch-spelled conflict identity");
-        assert_eq!(do_nothing.rows_affected(), 0);
-        let do_nothing = session
-            .execute(
-                "INSERT INTO lix_state_by_branch \
-                 (entity_pk, schema_key, file_id, snapshot_content, branch_id) VALUES \
-                 (lix_json('[\"nothing-global\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"nothing-global\",\"value\":\"ignored\"}'), 'global') \
-                 ON CONFLICT (entity_pk, schema_key, file_id, branch_id) DO NOTHING",
-                &[],
-            )
-            .await
-            .expect("branch spelling should match global-spelled conflict identity");
-        assert_eq!(do_nothing.rows_affected(), 0);
-
-        let do_update = session
-            .execute(
-                "INSERT INTO lix_state_by_branch \
-                 (entity_pk, schema_key, file_id, snapshot_content, global) VALUES \
-                 (lix_json('[\"update-branch\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"update-branch\",\"value\":\"new\"}'), true) \
-                 ON CONFLICT (entity_pk, schema_key, file_id, branch_id) \
-                 DO UPDATE SET snapshot_content = excluded.snapshot_content",
-                &[],
-            )
-            .await
-            .expect("global spelling should update branch-spelled conflict identity");
-        assert_eq!(do_update.rows_affected(), 1);
-        let do_update = session
-            .execute(
-                "INSERT INTO lix_state_by_branch \
-                 (entity_pk, schema_key, file_id, snapshot_content, branch_id) VALUES \
-                 (lix_json('[\"update-global\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"update-global\",\"value\":\"new\"}'), 'global') \
-                 ON CONFLICT (entity_pk, schema_key, file_id, branch_id) \
-                 DO UPDATE SET snapshot_content = excluded.snapshot_content",
-                &[],
-            )
-            .await
-            .expect("branch spelling should update global-spelled conflict identity");
-        assert_eq!(do_update.rows_affected(), 1);
-
-        for (id, expected_value) in [
-            ("nothing-branch", "old"),
-            ("nothing-global", "old"),
-            ("update-branch", "new"),
-            ("update-global", "new"),
-        ] {
-            assert_rows_eq(
-                session
-                    .execute(
-                        &format!(
-                            "SELECT snapshot_content, branch_id, global \
-                             FROM lix_state_by_branch \
-                             WHERE entity_pk = lix_json('[\"{id}\"]') \
-                               AND schema_key = 'lix_key_value' \
-                               AND branch_id = 'global'"
-                        ),
-                        &[],
-                    )
-                    .await
-                    .expect("global conflict result should be readable"),
-                vec![vec![
-                    Value::Json(serde_json::json!({
-                        "key": id,
-                        "value": expected_value,
-                    })),
-                    Value::Text("global".to_string()),
-                    Value::Boolean(true),
-                ]],
-            );
-        }
-    }
-);
-
-simulation_test!(
     required_nullable_columns_separate_read_and_insert_contracts,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -1630,16 +1369,12 @@ simulation_test!(
             .expect("integer schema should register");
         session
             .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
-                 VALUES (\
-                   lix_json('[\"integral-real\"]'),\
-                   'engine_bigint_contract',\
-                   lix_json('{\"id\":\"integral-real\",\"count\":1.0}')\
-                 )",
+                "INSERT INTO engine_bigint_contract (id, count) \
+                 VALUES ('integral-real', 1.0)",
                 &[],
             )
             .await
-            .expect("raw state should accept a mathematically integral JSON real");
+            .expect("typed BIGINT should accept an exact integral real spelling");
 
         assert_rows_eq(
             session
@@ -1742,6 +1477,8 @@ simulation_test!(
              VALUES ('rounded-fraction-insert', 9007199254740992.5)",
             "INSERT INTO engine_bigint_contract (id, count) \
              VALUES ('underflow-insert', 1e-400)",
+            "INSERT INTO engine_bigint_contract (id, count) \
+             VALUES ('non-integral-insert', 1.5)",
             "UPDATE engine_bigint_contract SET count = 9007199254740992.5 \
              WHERE id = 'integral-real'",
             "UPDATE engine_bigint_contract SET ratio = 9 \
@@ -1796,16 +1533,12 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
-                 VALUES (\
-                   lix_json('[\"delete-integral-real\"]'),\
-                   'engine_bigint_contract',\
-                   lix_json('{\"id\":\"delete-integral-real\",\"count\":2.0,\"ratio\":1}')\
-                 )",
+                "INSERT INTO engine_bigint_contract (id, count, ratio) \
+                 VALUES ('delete-integral-real', 2.0, 1)",
                 &[],
             )
             .await
-            .expect("raw integral-real delete fixture should insert");
+            .expect("typed integral-real delete fixture should insert");
         let deleted = session
             .execute(
                 "DELETE FROM engine_bigint_contract \
@@ -1816,100 +1549,5 @@ simulation_test!(
             .expect("DELETE predicates and RETURNING should apply the typed numeric contract");
         assert_eq!(deleted.rows_affected(), 1);
         assert_rows_eq(deleted, vec![vec![Value::Integer(2), Value::Real(1.0)]]);
-
-        session
-            .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
-                 VALUES (\
-                   lix_json('[\"out-of-range\"]'),\
-                   'engine_bigint_contract',\
-                   lix_json('{\"id\":\"out-of-range\",\"count\":9223372036854775808}')\
-                 )",
-                &[],
-            )
-            .await
-            .expect("raw interoperability write should preserve a valid JSON-Schema integer");
-
-        for sql in [
-            "SELECT count FROM engine_bigint_contract WHERE id = 'out-of-range'",
-            "SELECT id FROM engine_bigint_contract WHERE count = 1",
-            "SELECT id FROM engine_bigint_contract WHERE count = 1.0",
-            "SELECT count FROM engine_bigint_contract_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND lixcol_entity_pk = lix_json('[\"out-of-range\"]')",
-        ] {
-            let error = session
-                .execute(sql, &[])
-                .await
-                .expect_err("typed BIGINT reads must reject values outside the i64 range");
-            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{sql}");
-            assert!(
-                error.message.contains("engine_bigint_contract"),
-                "{error:?}"
-            );
-            assert!(error.message.contains("count"), "{error:?}");
-            assert!(error.message.contains("BIGINT"), "{error:?}");
-        }
-
-        let update_error = session
-            .execute(
-                "UPDATE engine_bigint_contract SET ratio = 4 \
-                 WHERE count = 1",
-                &[],
-            )
-            .await
-            .expect_err("bound numeric predicates must reject an out-of-BIGINT stored value");
-        assert_eq!(update_error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(update_error.message.contains("count"), "{update_error:?}");
-        assert!(update_error.message.contains("BIGINT"), "{update_error:?}");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT ratio FROM engine_bigint_contract \
-                     WHERE id = 'integral-real'",
-                    &[],
-                )
-                .await
-                .expect("failed bound UPDATE must not stage earlier candidate mutations"),
-            vec![vec![Value::Real(3.0)]],
-        );
-
-        let delete_error = session
-            .execute(
-                "DELETE FROM engine_bigint_contract \
-                 WHERE id = 'out-of-range' RETURNING count",
-                &[],
-            )
-            .await
-            .expect_err("DELETE RETURNING must reject an out-of-BIGINT stored value");
-        assert_eq!(delete_error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(delete_error.message.contains("count"), "{delete_error:?}");
-        assert!(delete_error.message.contains("BIGINT"), "{delete_error:?}");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT entity_pk FROM lix_state \
-                     WHERE schema_key = 'engine_bigint_contract' \
-                       AND entity_pk = lix_json('[\"out-of-range\"]')",
-                    &[],
-                )
-                .await
-                .expect("failed DELETE RETURNING must leave raw state untouched"),
-            vec![vec![Value::Json(serde_json::json!(["out-of-range"]))]],
-        );
-
-        let non_integral = session
-            .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
-                 VALUES (\
-                   lix_json('[\"non-integral\"]'),\
-                   'engine_bigint_contract',\
-                   lix_json('{\"id\":\"non-integral\",\"count\":1.5}')\
-                 )",
-                &[],
-            )
-            .await
-            .expect_err("schema validation should reject a non-integral raw value");
-        assert_eq!(non_integral.code, LixError::CODE_SCHEMA_VALIDATION);
     }
 );

@@ -180,12 +180,12 @@ mod tests {
     fn quoted_table_names_are_case_sensitive() {
         let catalog = catalog();
 
-        bind_public_table(&catalog, &table_name("SELECT * FROM \"lix_state\""))
+        bind_public_table(&catalog, &table_name("SELECT * FROM \"lix_file\""))
             .expect("quoted exact case should bind");
-        let error = bind_public_table(&catalog, &table_name("SELECT * FROM \"LIX_STATE\""))
+        let error = bind_public_table(&catalog, &table_name("SELECT * FROM \"LIX_FILE\""))
             .expect_err("quoted mixed case should not be folded");
 
-        assert!(error.message.contains("unknown SQL table 'LIX_STATE'"));
+        assert!(error.message.contains("unknown SQL table 'LIX_FILE'"));
     }
 
     #[test]
@@ -200,21 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_rejects_duplicate_public_surface_names() {
+    fn catalog_rejects_runtime_schema_in_reserved_namespace_before_surface_collision() {
         let error = PublicCatalog::from_visible_schemas(&[json!({
             "x-lix-key": "lix_file",
             "properties": {
                 "id": { "type": "string" }
             }
         })])
-        .expect_err("system table collisions should be rejected");
+        .expect_err("the complete lix_* runtime namespace should be rejected");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error
-                .message
-                .contains("duplicate public SQL surface 'lix_file'")
-        );
+        assert_eq!(error.code, LixError::CODE_RESERVED_SCHEMA_NAMESPACE);
+        assert!(error.message.contains("lix_file"));
     }
 
     #[test]
@@ -228,6 +224,110 @@ mod tests {
         .expect("invalid entity schemas should match provider behavior and be skipped");
 
         assert!(catalog.surface("bad_entity").is_none());
+    }
+
+    #[test]
+    fn fixed_catalog_exposes_only_the_deliberate_lix_sql_contract() {
+        let actual = PublicCatalog::fixed_system()
+            .surfaces()
+            .map(|surface| surface.name.as_str())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "lix_account",
+            "lix_account_by_branch",
+            "lix_account_history",
+            "lix_branch",
+            "lix_branch_descriptor",
+            "lix_branch_descriptor_by_branch",
+            "lix_branch_descriptor_history",
+            "lix_branch_ref",
+            "lix_branch_ref_by_branch",
+            "lix_branch_ref_history",
+            "lix_change",
+            "lix_change_author",
+            "lix_change_author_by_branch",
+            "lix_change_author_history",
+            "lix_commit",
+            "lix_commit_by_branch",
+            "lix_commit_edge",
+            "lix_commit_edge_by_branch",
+            "lix_directory",
+            "lix_directory_by_branch",
+            "lix_directory_history",
+            "lix_file",
+            "lix_file_by_branch",
+            "lix_file_history",
+            "lix_key_value",
+            "lix_key_value_by_branch",
+            "lix_key_value_history",
+            "lix_label",
+            "lix_label_assignment",
+            "lix_label_assignment_by_branch",
+            "lix_label_assignment_history",
+            "lix_label_by_branch",
+            "lix_label_history",
+            "lix_registered_schema",
+            "lix_registered_schema_by_branch",
+            "lix_registered_schema_history",
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fixed_catalog_keeps_registry_surfaces_and_hides_storage_adapters() {
+        let catalog = PublicCatalog::fixed_system();
+        for surface_name in [
+            "lix_key_value",
+            "lix_key_value_by_branch",
+            "lix_key_value_history",
+            "lix_registered_schema",
+            "lix_registered_schema_by_branch",
+            "lix_registered_schema_history",
+        ] {
+            assert!(
+                catalog.surface(surface_name).is_some(),
+                "{surface_name} should remain public"
+            );
+        }
+        for surface_name in [
+            "lix_state",
+            "lix_state_by_branch",
+            "lix_state_history",
+            "lix_binary_blob_ref",
+            "lix_binary_blob_ref_by_branch",
+            "lix_binary_blob_ref_history",
+            "lix_directory_descriptor",
+            "lix_directory_descriptor_by_branch",
+            "lix_directory_descriptor_history",
+            "lix_file_descriptor",
+            "lix_file_descriptor_by_branch",
+            "lix_file_descriptor_history",
+        ] {
+            assert!(
+                catalog.surface(surface_name).is_none(),
+                "{surface_name} should not be public"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_schema_namespace_check_matches_unquoted_sql_normalization() {
+        for schema_key in [
+            "lix",
+            "LIX",
+            "lix_plugin_note",
+            "LIX_PLUGIN_NOTE",
+            "LiX_PlUgIn_NoTe",
+        ] {
+            assert!(
+                PublicCatalog::runtime_schema_key_uses_reserved_namespace(schema_key),
+                "{schema_key} should normalize into the reserved namespace"
+            );
+        }
+        assert!(!PublicCatalog::runtime_schema_key_uses_reserved_namespace(
+            "acme_lix_note"
+        ));
     }
 
     #[test]

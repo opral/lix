@@ -143,7 +143,14 @@ Mint a new `x-lix-key`. Ship `acme_section_v2` as a separate schema, write migra
 | `xlsx_cell`, `xlsx_sheet`    | `cell`, `sheet`   |
 | `figma_layer`, `figma_frame` | `layer`, `frame`  |
 
-Why it matters: a single Lix can hold many files and many schemas at once. App-level entities, file-format plugins (XLSX, DOCX, CAD, ...), and Lix's own internal schemas all share the `lix_registered_schema` namespace. An unprefixed `task` collides the moment a second source registers the same name. The `lix_*` prefix is reserved for Lix-internal schemas; don't use it for your own.
+Why it matters: a single Lix can hold many files and many schemas at once.
+App-level entities, file-format plugins (XLSX, DOCX, CAD, ...), and Lix's own
+internal schemas all share the `lix_registered_schema` namespace. An
+unprefixed `task` collides the moment a second source registers the same name.
+The exact key `lix` and the `lix_*` prefix are reserved and enforced for
+schemas bootstrapped by Lix; public runtime registration in that namespace
+fails with
+`LIX_RESERVED_SCHEMA_NAMESPACE`.
 
 Treat `x-lix-key` like a package name: lowercase, stable, namespaced. Once data is written, the key is permanent (see the amendment rules above).
 

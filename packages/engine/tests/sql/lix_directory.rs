@@ -513,7 +513,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_descriptor_write_rejects_slash_in_name_at_schema_boundary,
+    lix_directory_write_rejects_slash_in_name_at_schema_boundary,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -526,17 +526,12 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-                 ) VALUES (lix_json('[\"dir-slash\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
-                &[Value::Json(json!({
-                    "id": "dir-slash",
-                    "parent_id": null,
-                    "name": "nested/name",
-                }))],
+                "INSERT INTO lix_directory (id, parent_id, name) \
+                 VALUES ('dir-slash', NULL, 'nested/name')",
+                &[],
             )
             .await
-            .expect_err("directory descriptor name must keep '/' as structural separator");
+            .expect_err("directory name must keep '/' as structural separator");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(error.message.contains("lix_directory_descriptor"));
@@ -586,7 +581,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_descriptor_writes_preserve_opaque_names,
+    lix_directory_writes_preserve_opaque_names,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -604,31 +599,21 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-                 ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
-                &[Value::Json(json!({
-                    "id": "dir-cafe-decomposed",
-                    "parent_id": null,
-                    "name": "Cafe\u{301}",
-                                    }))],
+                "INSERT INTO lix_directory (id, parent_id, name) \
+                 VALUES ('dir-cafe-decomposed', NULL, 'Cafe\u{301}')",
+                &[],
             )
             .await
-            .expect("decomposed descriptor name should remain distinct");
+            .expect("decomposed directory name should remain distinct");
 
         session
             .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-                 ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
-                &[Value::Json(json!({
-                    "id": "dir-zero-width",
-                    "parent_id": null,
-                    "name": "zero\u{200D}width",
-                                    }))],
+                "INSERT INTO lix_directory (id, parent_id, name) \
+                 VALUES ('dir-zero-width', NULL, 'zero\u{200D}width')",
+                &[],
             )
             .await
-            .expect("zero-width descriptor name should be preserved");
+            .expect("zero-width directory name should be preserved");
 
         let result = session
             .execute(
@@ -658,7 +643,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_insert_rejects_directory_parent_cycle,
+    lix_directory_insert_rejects_directory_parent_cycle,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -671,22 +656,20 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-                 ) VALUES \
-                 (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\"}'), false, false), \
-                 (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\"}'), false, false)",
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES \
+                 ('dir-a', 'dir-b', 'a'), \
+                 ('dir-b', 'dir-a', 'b')",
                 &[],
             )
             .await
-            .expect_err("descriptor cycles staged through lix_state must be rejected");
+            .expect_err("directory cycles must be rejected");
 
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
     }
 );
 
 simulation_test!(
-    lix_state_insert_rejects_directory_file_namespace_conflict,
+    lix_directory_insert_rejects_directory_file_namespace_conflict,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -704,14 +687,12 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_state (\
-                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-                 ) VALUES \
-                 (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\"}'), false, false)",
+                "INSERT INTO lix_directory (id, parent_id, name) \
+                 VALUES ('dir-foo', NULL, 'foo')",
                 &[],
             )
             .await
-            .expect_err("lix_state directory descriptor must not bypass filesystem namespace");
+            .expect_err("directory insert must not bypass filesystem namespace");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
@@ -808,17 +789,6 @@ simulation_test!(
             .expect("directory id read before delete should succeed");
         let directory_id_rows = directory_ids_result;
         assert_eq!(directory_id_rows.len(), 2);
-        let directory_ids = directory_id_rows
-            .rows()
-            .iter()
-            .map(|row| {
-                let Value::Text(id) = &row.values()[0] else {
-                    panic!("directory id should be text");
-                };
-                id.clone()
-            })
-            .collect::<Vec<_>>();
-
         let delete_result = session
             .execute("DELETE FROM lix_directory WHERE path = '/docs/'", &[])
             .await
@@ -856,26 +826,6 @@ simulation_test!(
             file_rows.len(),
             0,
             "recursive directory delete should delete nested files"
-        );
-
-        let state_result = session
-            .execute(
-                &format!(
-                    "SELECT entity_pk, schema_key \
-                 FROM lix_state \
-                 WHERE entity_pk IN (lix_json('[\"{}\"]'), lix_json('[\"{}\"]'), lix_json('[\"file-readme\"]')) \
-                 ORDER BY schema_key, entity_pk",
-                    directory_ids[0], directory_ids[1]
-                ),
-                &[],
-            )
-            .await
-            .expect("state read after delete should succeed");
-        let state_rows = state_result;
-        assert_eq!(
-            state_rows.len(),
-            0,
-            "recursive directory delete should make descriptor/blob-ref state rows not visible"
         );
     }
 );

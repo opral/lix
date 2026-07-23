@@ -221,7 +221,7 @@ fn bench_e2e(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("insert_10k_insert_state", |b| {
+    group.bench_function("insert_10k_insert_file_scoped", |b| {
         b.iter_batched(
             || {
                 runtime.block_on(async {
@@ -234,7 +234,7 @@ fn bench_e2e(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("insert_10k_insert_state_inmemory", |b| {
+    group.bench_function("insert_10k_insert_file_scoped_inmemory", |b| {
         b.iter_batched(
             || {
                 runtime.block_on(async {
@@ -327,7 +327,7 @@ fn bench_e2e(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("merge_10k_insert_state", |b| {
+    group.bench_function("merge_10k_insert_file_scoped", |b| {
         b.iter_batched(
             || {
                 runtime.block_on(async {
@@ -345,7 +345,7 @@ fn bench_e2e(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("merge_10k_insert_state_inmemory", |b| {
+    group.bench_function("merge_10k_insert_file_scoped_inmemory", |b| {
         b.iter_batched(
             || {
                 runtime.block_on(async {
@@ -427,9 +427,12 @@ struct LargeCsvFixture {
 struct ExtractedCsvChangesFixture {
     lix: BenchLix,
     file_id: String,
-    change_count: usize,
-    state_insert_sql: String,
-    state_params: Vec<Value>,
+    table_insert_sql: Option<String>,
+    table_params: Vec<Value>,
+    table_count: usize,
+    row_insert_sql: String,
+    row_params: Vec<Value>,
+    row_count: usize,
     expected_active_row_count: usize,
 }
 
@@ -609,13 +612,7 @@ async fn csv_changes_insert_fixture(
     assert_eq!(lix.read_file(CSV_PATH).await.unwrap(), Some(Vec::new()));
 
     if !existing_changes.is_empty() {
-        let existing_insert_sql = bulk_insert_file_changes_sql(existing_changes.len());
-        let existing_params = bulk_insert_file_changes_params(&file_id, existing_changes);
-        let result = lix
-            .execute(&existing_insert_sql, &existing_params)
-            .await
-            .unwrap();
-        assert_eq!(result.rows_affected(), existing_changes.len() as u64);
+        bulk_insert_file_changes(&lix, &file_id, existing_changes).await;
     }
 
     let existing_row_count = existing_changes
@@ -627,14 +624,36 @@ async fn csv_changes_insert_fixture(
         existing_row_count
     );
 
-    let state_insert_sql = bulk_insert_file_changes_sql(insert_changes.len());
-    let state_params = bulk_insert_file_changes_params(&file_id, insert_changes);
+    let table_changes = insert_changes
+        .iter()
+        .filter(|change| change.schema_key == "csv_table")
+        .collect::<Vec<_>>();
+    let row_changes = insert_changes
+        .iter()
+        .filter(|change| change.schema_key == "csv_row")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        table_changes.len() + row_changes.len(),
+        insert_changes.len(),
+        "CSV file changes should contain only csv_table and csv_row entities"
+    );
+    assert!(!row_changes.is_empty());
+
+    let table_insert_sql = (!table_changes.is_empty())
+        .then(|| bulk_insert_csv_table_for_file_sql(table_changes.len()));
+    let table_params = bulk_insert_csv_table_for_file_params(&file_id, &table_changes);
+    let row_insert_sql = bulk_insert_csv_row_for_file_sql(row_changes.len());
+    let row_params = bulk_insert_csv_row_for_file_params(&file_id, &row_changes);
+
     ExtractedCsvChangesFixture {
         lix,
         file_id,
-        change_count: insert_changes.len(),
-        state_insert_sql,
-        state_params,
+        table_insert_sql,
+        table_params,
+        table_count: table_changes.len(),
+        row_insert_sql,
+        row_params,
+        row_count: row_changes.len(),
         expected_active_row_count,
     }
 }
@@ -764,8 +783,8 @@ async fn assert_large_csv_overwrite_result(fixture: &LargeCsvFixture, updated_cs
         .lix
         .execute(
             "SELECT COUNT(*) AS row_count \
-             FROM lix_state \
-             WHERE file_id = $1 AND schema_key = 'csv_row'",
+             FROM csv_row \
+             WHERE lixcol_file_id = $1",
             &[Value::Text(fixture.file_id.clone())],
         )
         .await
@@ -780,8 +799,8 @@ async fn active_csv_row_count(lix: &BenchLix, file_id: &str) -> usize {
     let active_rows = lix
         .execute(
             "SELECT COUNT(*) AS row_count \
-             FROM lix_state \
-             WHERE file_id = $1 AND schema_key = 'csv_row'",
+             FROM csv_row \
+             WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_string())],
         )
         .await
@@ -798,16 +817,26 @@ async fn active_csv_schema_row_count(lix: &BenchLix) -> usize {
 }
 
 async fn manual_bulk_insert_file_changes(fixture: ExtractedCsvChangesFixture) {
-    let rows_affected = execute_bulk_insert_file_changes(&fixture).await;
-    black_box(rows_affected);
-    black_box(fixture.state_insert_sql);
-    black_box(fixture.state_params);
+    let (table_rows_affected, row_rows_affected) = execute_bulk_insert_file_changes(&fixture).await;
+    black_box(table_rows_affected);
+    black_box(row_rows_affected);
+    black_box(fixture.table_insert_sql);
+    black_box(fixture.table_params);
+    black_box(fixture.row_insert_sql);
+    black_box(fixture.row_params);
     fixture.lix.close().await.unwrap();
 }
 
 async fn validate_manual_bulk_insert_file_changes(fixture: ExtractedCsvChangesFixture) {
-    let rows_affected = execute_bulk_insert_file_changes(&fixture).await;
-    assert_eq!(rows_affected, fixture.change_count as u64);
+    let (table_rows_affected, row_rows_affected) = execute_bulk_insert_file_changes(&fixture).await;
+    assert_eq!(
+        table_rows_affected,
+        fixture
+            .table_insert_sql
+            .as_ref()
+            .map(|_| fixture.table_count as u64)
+    );
+    assert_eq!(row_rows_affected, fixture.row_count as u64);
 
     assert_eq!(
         active_csv_row_count(&fixture.lix, &fixture.file_id).await,
@@ -817,13 +846,25 @@ async fn validate_manual_bulk_insert_file_changes(fixture: ExtractedCsvChangesFi
     fixture.lix.close().await.unwrap();
 }
 
-async fn execute_bulk_insert_file_changes(fixture: &ExtractedCsvChangesFixture) -> u64 {
-    let result = fixture
+async fn execute_bulk_insert_file_changes(
+    fixture: &ExtractedCsvChangesFixture,
+) -> (Option<u64>, u64) {
+    let table_rows_affected = if let Some(table_insert_sql) = fixture.table_insert_sql.as_ref() {
+        let table_result = fixture
+            .lix
+            .execute(table_insert_sql, &fixture.table_params)
+            .await
+            .unwrap();
+        Some(table_result.rows_affected())
+    } else {
+        None
+    };
+    let row_result = fixture
         .lix
-        .execute(&fixture.state_insert_sql, &fixture.state_params)
+        .execute(&fixture.row_insert_sql, &fixture.row_params)
         .await
         .unwrap();
-    result.rows_affected()
+    (table_rows_affected, row_result.rows_affected())
 }
 
 async fn manual_bulk_insert_schema_changes(fixture: ExtractedCsvSchemaChangesFixture) {
@@ -879,40 +920,33 @@ async fn execute_bulk_insert_schema_changes(
     (table_rows_affected, row_result.rows_affected())
 }
 
-fn bulk_insert_file_changes_sql(change_count: usize) -> String {
-    assert!(change_count > 0);
-    let mut sql = String::from(
-        "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content) VALUES ",
+async fn bulk_insert_file_changes(lix: &BenchLix, file_id: &str, changes: &[FileChange]) {
+    let table_changes = changes
+        .iter()
+        .filter(|change| change.schema_key == "csv_table")
+        .collect::<Vec<_>>();
+    let row_changes = changes
+        .iter()
+        .filter(|change| change.schema_key == "csv_row")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        table_changes.len() + row_changes.len(),
+        changes.len(),
+        "CSV file changes should contain only csv_table and csv_row entities"
     );
-    for index in 0..change_count {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        let base = 2 + index * 3;
-        sql.push('(');
-        write!(sql, "${}, ${}, $1, ${}", base, base + 1, base + 2)
-            .expect("writing to String cannot fail");
-        sql.push(')');
-    }
-    sql
-}
 
-fn bulk_insert_file_changes_params(file_id: &str, changes: &[FileChange]) -> Vec<Value> {
-    let mut params = Vec::with_capacity(1 + changes.len() * 3);
-    params.push(Value::Text(file_id.to_string()));
-    for change in changes {
-        params.push(Value::Json(change.entity_pk.clone()));
-        params.push(Value::Text(change.schema_key.clone()));
-        params.push(
-            change
-                .snapshot_content
-                .as_ref()
-                .map_or(Value::Null, |snapshot_content| {
-                    Value::Json(snapshot_content.clone())
-                }),
-        );
+    if !table_changes.is_empty() {
+        let table_insert_sql = bulk_insert_csv_table_for_file_sql(table_changes.len());
+        let table_params = bulk_insert_csv_table_for_file_params(file_id, &table_changes);
+        let result = lix.execute(&table_insert_sql, &table_params).await.unwrap();
+        assert_eq!(result.rows_affected(), table_changes.len() as u64);
     }
-    params
+    if !row_changes.is_empty() {
+        let row_insert_sql = bulk_insert_csv_row_for_file_sql(row_changes.len());
+        let row_params = bulk_insert_csv_row_for_file_params(file_id, &row_changes);
+        let result = lix.execute(&row_insert_sql, &row_params).await.unwrap();
+        assert_eq!(result.rows_affected(), row_changes.len() as u64);
+    }
 }
 
 async fn bulk_insert_schema_changes(lix: &BenchLix, changes: &[FileChange]) {
@@ -978,6 +1012,31 @@ fn bulk_insert_csv_table_params(changes: &[&FileChange]) -> Vec<Value> {
     params
 }
 
+fn bulk_insert_csv_table_for_file_sql(change_count: usize) -> String {
+    assert!(change_count > 0);
+    let mut sql = String::from("INSERT INTO csv_table (id, dialect, lixcol_file_id) VALUES ");
+    for index in 0..change_count {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        let base = 2 + index * 2;
+        sql.push('(');
+        write!(sql, "${}, ${}, $1", base, base + 1).expect("writing to String cannot fail");
+        sql.push(')');
+    }
+    sql
+}
+
+fn bulk_insert_csv_table_for_file_params(file_id: &str, changes: &[&FileChange]) -> Vec<Value> {
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    let mut params = Vec::with_capacity(1 + changes.len() * 2);
+    params.push(Value::Text(file_id.to_string()));
+    params.extend(bulk_insert_csv_table_params(changes));
+    params
+}
+
 fn bulk_insert_csv_row_sql(change_count: usize) -> String {
     assert!(change_count > 0);
     let mut sql = String::from("INSERT INTO csv_row (id, order_key, cells) VALUES ");
@@ -1022,6 +1081,31 @@ fn bulk_insert_csv_row_params(changes: &[&FileChange]) -> Vec<Value> {
                 .clone(),
         ));
     }
+    params
+}
+
+fn bulk_insert_csv_row_for_file_sql(change_count: usize) -> String {
+    assert!(change_count > 0);
+    let mut sql =
+        String::from("INSERT INTO csv_row (id, order_key, cells, lixcol_file_id) VALUES ");
+    for index in 0..change_count {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        let base = 2 + index * 3;
+        sql.push('(');
+        write!(sql, "${}, ${}, ${}, $1", base, base + 1, base + 2)
+            .expect("writing to String cannot fail");
+        sql.push(')');
+    }
+    sql
+}
+
+fn bulk_insert_csv_row_for_file_params(file_id: &str, changes: &[&FileChange]) -> Vec<Value> {
+    assert!(!changes.is_empty());
+    let mut params = Vec::with_capacity(1 + changes.len() * 3);
+    params.push(Value::Text(file_id.to_string()));
+    params.extend(bulk_insert_csv_row_params(changes));
     params
 }
 

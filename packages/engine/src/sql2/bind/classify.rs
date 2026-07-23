@@ -72,7 +72,7 @@ fn validate_supported_query(query: &Query) -> Result<(), LixError> {
     if query.with.as_ref().is_some_and(|with| with.recursive) {
         return Err(
             unsupported_sql_error("recursive CTEs are not supported by Lix SQL").with_hint(
-                "Use explicit commit graph surfaces such as lix_commit, lix_commit_edge, and lix_state_history instead of WITH RECURSIVE.",
+                "Use explicit commit graph surfaces such as lix_commit and lix_commit_edge, or a typed <schema>_history surface, instead of WITH RECURSIVE.",
             ),
         );
     }
