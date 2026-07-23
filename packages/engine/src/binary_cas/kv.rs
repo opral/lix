@@ -19,8 +19,14 @@ use crate::storage_adapter::{
     StorageScanOptions, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use std::collections::{HashMap, HashSet};
 use web_time::Instant;
+
+// Keep independent manifest scans bounded so large blob batches do not create
+// unbounded backend pressure. Eight matches the engine's other remote scan
+// fan-out and is enough to hide storage latency without a large request burst.
+const MANIFEST_SCAN_CONCURRENCY: usize = 8;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -267,11 +273,63 @@ pub(crate) async fn load_bytes_many(
     hashes: &[BlobHash],
 ) -> Result<BlobBytesBatch, LixError> {
     let metadata = load_metadata_many(store, hashes).await?.into_vec();
-    let mut chunked_manifests = Vec::new();
+    let mut seen_manifest_hashes = HashSet::new();
+    let chunked_blobs = metadata
+        .iter()
+        .filter_map(|metadata| {
+            let metadata = metadata.as_ref()?;
+            let BlobLayout::Chunked { chunk_count } = &metadata.layout else {
+                return None;
+            };
+            seen_manifest_hashes
+                .insert(metadata.hash)
+                .then_some((metadata.hash, *chunk_count))
+        })
+        .collect::<Vec<_>>();
+    let scan_count = chunked_blobs.len();
+    // Consume completions out of order so a slow early scan does not prevent
+    // the bounded window from refilling. Results cross the gate below only in
+    // first-request order, preserving deterministic error selection.
+    let mut scans = stream::iter(chunked_blobs.into_iter().enumerate())
+        .map(|(order, (blob_hash, chunk_count))| async move {
+            let result = async {
+                let manifest_chunks = scan_manifest_chunks(store, blob_hash).await?;
+                if manifest_chunks.len() != chunk_count as usize {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS blob '{}' expected {} chunks, found {}",
+                            blob_hash.to_hex(),
+                            chunk_count,
+                            manifest_chunks.len()
+                        ),
+                    ));
+                }
+                Ok(manifest_chunks)
+            }
+            .await;
+            (order, blob_hash, result)
+        })
+        .buffer_unordered(MANIFEST_SCAN_CONCURRENCY);
+    let mut completed = Vec::with_capacity(scan_count);
+    completed.resize_with(scan_count, || None);
+    let mut next_order = 0;
+    let mut chunked_manifests_by_hash = HashMap::with_capacity(scan_count);
+    while let Some((order, blob_hash, result)) = scans.next().await {
+        completed[order] = Some((blob_hash, result));
+        while next_order < completed.len() {
+            let Some((blob_hash, result)) = completed[next_order].take() else {
+                break;
+            };
+            chunked_manifests_by_hash.insert(blob_hash, result?);
+            next_order += 1;
+        }
+    }
+    debug_assert_eq!(next_order, scan_count);
     let mut requested_chunks = Vec::new();
     let mut seen_chunks = HashSet::new();
 
-    for (index, metadata) in metadata.iter().enumerate() {
+    for metadata in &metadata {
         let Some(metadata) = metadata else {
             continue;
         };
@@ -282,26 +340,25 @@ pub(crate) async fn load_bytes_many(
                     requested_chunks.push(*chunk_hash);
                 }
             }
-            BlobLayout::Chunked { chunk_count } => {
-                let manifest_chunks = scan_manifest_chunks(store, metadata.hash).await?;
-                if manifest_chunks.len() != *chunk_count as usize {
-                    return Err(LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "binary CAS blob '{}' expected {} chunks, found {}",
-                            metadata.hash.to_hex(),
-                            chunk_count,
-                            manifest_chunks.len()
-                        ),
-                    ));
-                }
-                for manifest_chunk in &manifest_chunks {
+            BlobLayout::Chunked { .. } => {
+                let manifest_chunks =
+                    chunked_manifests_by_hash
+                        .get(&metadata.hash)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "binary CAS blob '{}' missing chunk manifest",
+                                    metadata.hash.to_hex()
+                                ),
+                            )
+                        })?;
+                for manifest_chunk in manifest_chunks {
                     let chunk_hash = BlobHash::from_bytes(manifest_chunk.chunk_hash);
                     if seen_chunks.insert(chunk_hash) {
                         requested_chunks.push(chunk_hash);
                     }
                 }
-                chunked_manifests.push((index, manifest_chunks));
             }
         }
     }
@@ -311,20 +368,16 @@ pub(crate) async fn load_bytes_many(
         .into_iter()
         .zip(chunk_rows)
         .collect::<HashMap<_, _>>();
-    let chunked_manifests_by_index = chunked_manifests
-        .into_iter()
-        .collect::<HashMap<usize, Vec<KvBlobManifestChunk>>>();
 
     let entries = metadata
         .into_iter()
-        .enumerate()
-        .map(|(index, metadata)| {
+        .map(|metadata| {
             metadata
                 .map(|metadata| {
                     assemble_blob_bytes(
                         &metadata,
                         &chunk_rows_by_hash,
-                        chunked_manifests_by_index.get(&index),
+                        chunked_manifests_by_hash.get(&metadata.hash),
                     )
                 })
                 .transpose()
@@ -851,6 +904,11 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Bound;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn definitely_multi_chunk_blob_bytes() -> Vec<u8> {
         (0..5_000_000)
@@ -861,8 +919,187 @@ mod tests {
     use crate::binary_cas::BlobPayload;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
-        Memory, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+        Memory, StorageError, StorageGetManyResult, StorageKeyRange, StorageReadOptions,
+        StorageScanChunk, StorageWriteOptions, StorageWriteSet,
     };
+
+    struct DelayedManifestScanRead<R> {
+        inner: R,
+        default_manifest_delay: Duration,
+        blocked_manifest: Option<(BlobHash, BlobHash)>,
+        blocked_manifest_release: Notify,
+        active_manifest_scans: AtomicUsize,
+        max_active_manifest_scans: AtomicUsize,
+        manifest_scan_calls: AtomicUsize,
+        chunk_get_many_calls: AtomicUsize,
+        chunk_keys_requested: AtomicUsize,
+        completed_manifest_hashes: Mutex<Vec<BlobHash>>,
+    }
+
+    impl<R> DelayedManifestScanRead<R> {
+        fn new(inner: R, default_manifest_delay: Duration) -> Self {
+            Self {
+                inner,
+                default_manifest_delay,
+                blocked_manifest: None,
+                blocked_manifest_release: Notify::new(),
+                active_manifest_scans: AtomicUsize::new(0),
+                max_active_manifest_scans: AtomicUsize::new(0),
+                manifest_scan_calls: AtomicUsize::new(0),
+                chunk_get_many_calls: AtomicUsize::new(0),
+                chunk_keys_requested: AtomicUsize::new(0),
+                completed_manifest_hashes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn block_manifest_until(
+            mut self,
+            blocked_manifest: BlobHash,
+            completed_manifest: BlobHash,
+        ) -> Self {
+            self.blocked_manifest = Some((blocked_manifest, completed_manifest));
+            self
+        }
+    }
+
+    impl<R> StorageAdapterRead for DelayedManifestScanRead<R>
+    where
+        R: StorageAdapterRead,
+    {
+        async fn get_many(
+            &self,
+            space: StorageSpaceId,
+            keys: &[StorageKey],
+            opts: StorageGetOptions,
+        ) -> Result<StorageGetManyResult, StorageError> {
+            if space == BINARY_CAS_CHUNK_SPACE.id {
+                self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
+                self.chunk_keys_requested
+                    .fetch_add(keys.len(), Ordering::Relaxed);
+            }
+            self.inner.get_many(space, keys, opts).await
+        }
+
+        async fn scan(
+            &self,
+            space: StorageSpaceId,
+            range: StorageKeyRange,
+            opts: StorageScanOptions,
+        ) -> Result<StorageScanChunk, StorageError> {
+            let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE.id;
+            let manifest_hash = if is_manifest_scan {
+                manifest_hash_from_range(&range)
+            } else {
+                None
+            };
+            if is_manifest_scan {
+                self.manifest_scan_calls.fetch_add(1, Ordering::Relaxed);
+                let active = self.active_manifest_scans.fetch_add(1, Ordering::Relaxed) + 1;
+                self.max_active_manifest_scans
+                    .fetch_max(active, Ordering::Relaxed);
+                if self
+                    .blocked_manifest
+                    .as_ref()
+                    .is_some_and(|(blocked, _)| Some(*blocked) == manifest_hash)
+                {
+                    self.blocked_manifest_release.notified().await;
+                } else if !self.default_manifest_delay.is_zero() {
+                    tokio::time::sleep(self.default_manifest_delay).await;
+                }
+            }
+            let result = self.inner.scan(space, range, opts).await;
+            if is_manifest_scan {
+                self.active_manifest_scans.fetch_sub(1, Ordering::Relaxed);
+                if let Some(manifest_hash) = manifest_hash {
+                    self.completed_manifest_hashes
+                        .lock()
+                        .expect("completed manifest lock")
+                        .push(manifest_hash);
+                    if self
+                        .blocked_manifest
+                        .as_ref()
+                        .is_some_and(|(_, completed)| *completed == manifest_hash)
+                    {
+                        self.blocked_manifest_release.notify_one();
+                    }
+                }
+            }
+            result
+        }
+    }
+
+    fn manifest_hash_from_range(range: &StorageKeyRange) -> Option<BlobHash> {
+        let Bound::Included(StorageKey(bytes)) = &range.lower else {
+            return None;
+        };
+        let hash = <[u8; 32]>::try_from(bytes.get(..32)?).ok()?;
+        Some(BlobHash::from_bytes(hash))
+    }
+
+    fn stage_two_chunk_blob(writes: &mut StorageWriteSet, ordinal: usize) -> (BlobHash, Vec<u8>) {
+        let left = format!("blob-{ordinal}-left").into_bytes();
+        let right = format!("blob-{ordinal}-right").into_bytes();
+        let bytes = [left.as_slice(), right.as_slice()].concat();
+        let blob_hash = BlobHash::from_content(&bytes);
+        let chunks = [left, right];
+
+        stage_manifest(
+            writes,
+            blob_hash,
+            &BinaryCasManifest::Chunked {
+                size_bytes: bytes.len() as u64,
+                chunk_count: u32::try_from(chunks.len())
+                    .expect("test chunk count should fit in u32"),
+            },
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_hash = BlobHash::from_content(chunk);
+            stage_manifest_chunk(
+                writes,
+                blob_hash,
+                index as u64,
+                &KvBlobManifestChunk {
+                    chunk_hash: chunk_hash.into_bytes(),
+                    chunk_size: chunk.len() as u64,
+                },
+            );
+            stage_chunk(
+                writes,
+                chunk_hash,
+                BinaryChunkCodec::Raw,
+                chunk.len() as u64,
+                chunk,
+            );
+        }
+        (blob_hash, bytes)
+    }
+
+    fn stage_incomplete_manifest(
+        writes: &mut StorageWriteSet,
+        label: &[u8],
+        declared_chunk_count: u32,
+    ) -> BlobHash {
+        let blob_hash = BlobHash::from_content(label);
+        let chunk_hash = BlobHash::from_content(label);
+        stage_manifest(
+            writes,
+            blob_hash,
+            &BinaryCasManifest::Chunked {
+                size_bytes: label.len() as u64,
+                chunk_count: declared_chunk_count,
+            },
+        );
+        stage_manifest_chunk(
+            writes,
+            blob_hash,
+            0,
+            &KvBlobManifestChunk {
+                chunk_hash: chunk_hash.into_bytes(),
+                chunk_size: label.len() as u64,
+            },
+        );
+        blob_hash
+    }
 
     async fn stage_test_payload(
         storage: &StorageAdapter<Memory>,
@@ -960,6 +1197,204 @@ mod tests {
                     chunk_size: 6,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_chunked_blob_reads_bound_and_overlap_manifest_scans() {
+        let storage = StorageAdapter::new(Memory::new());
+        let blob_count = MANIFEST_SCAN_CONCURRENCY + 3;
+        let mut hashes = Vec::with_capacity(blob_count);
+        let mut expected = Vec::with_capacity(blob_count);
+
+        {
+            let mut writes = storage.new_write_set();
+            for ordinal in 0..blob_count {
+                let (hash, bytes) = stage_two_chunk_blob(&mut writes, ordinal);
+                hashes.push(hash);
+                expected.push(Some(bytes));
+            }
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("chunked blob fixtures should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let delayed = DelayedManifestScanRead::new(store, Duration::from_millis(20));
+        let actual = load_bytes_many(&delayed, &hashes)
+            .await
+            .expect("chunked blobs should load")
+            .into_vec();
+
+        assert_eq!(
+            actual, expected,
+            "batch results should retain request order"
+        );
+        assert_eq!(
+            delayed.manifest_scan_calls.load(Ordering::Relaxed),
+            blob_count
+        );
+        assert_eq!(
+            delayed.max_active_manifest_scans.load(Ordering::Relaxed),
+            MANIFEST_SCAN_CONCURRENCY,
+            "the batch should fill, but never exceed, the manifest scan bound"
+        );
+        assert_eq!(
+            delayed.chunk_get_many_calls.load(Ordering::Relaxed),
+            1,
+            "manifest fan-out should still feed one batched chunk point read"
+        );
+        assert_eq!(
+            delayed.chunk_keys_requested.load(Ordering::Relaxed),
+            blob_count * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_chunked_blob_requests_share_manifest_and_chunk_reads() {
+        let storage = StorageAdapter::new(Memory::new());
+        let (blob_hash, bytes) = {
+            let mut writes = storage.new_write_set();
+            let fixture = stage_two_chunk_blob(&mut writes, 0);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("chunked blob fixture should commit");
+            fixture
+        };
+        let missing_hash = BlobHash::from_content(b"missing duplicate fixture");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let delayed = DelayedManifestScanRead::new(store, Duration::from_millis(5));
+        let actual = load_bytes_many(&delayed, &[blob_hash, missing_hash, blob_hash])
+            .await
+            .expect("duplicate chunked blobs should load")
+            .into_vec();
+
+        assert_eq!(
+            actual,
+            vec![Some(bytes.clone()), None, Some(bytes)],
+            "deduplication must retain every requested output slot"
+        );
+        assert_eq!(
+            delayed.manifest_scan_calls.load(Ordering::Relaxed),
+            1,
+            "one chunked hash should issue one manifest scan"
+        );
+        assert_eq!(delayed.chunk_get_many_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(delayed.chunk_keys_requested.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn slow_first_manifest_does_not_block_scan_window_refill() {
+        let storage = StorageAdapter::new(Memory::new());
+        let blob_count = MANIFEST_SCAN_CONCURRENCY + 3;
+        let mut hashes = Vec::with_capacity(blob_count);
+        {
+            let mut writes = storage.new_write_set();
+            for ordinal in 0..blob_count {
+                hashes.push(stage_two_chunk_blob(&mut writes, ordinal).0);
+            }
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("chunked blob fixtures should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let release_after = *hashes.last().expect("fixture should not be empty");
+        let delayed = DelayedManifestScanRead::new(store, Duration::ZERO)
+            .block_manifest_until(hashes[0], release_after);
+        tokio::time::timeout(Duration::from_secs(5), load_bytes_many(&delayed, &hashes))
+            .await
+            .expect("unordered scan window should refill before the timeout")
+            .expect("skewed chunked blobs should load");
+
+        let completed = delayed
+            .completed_manifest_hashes
+            .lock()
+            .expect("completed manifest lock");
+        let slow_position = completed
+            .iter()
+            .position(|hash| *hash == hashes[0])
+            .expect("slow manifest should complete");
+        for hash in &hashes[MANIFEST_SCAN_CONCURRENCY..] {
+            let position = completed
+                .iter()
+                .position(|completed_hash| completed_hash == hash)
+                .expect("refilled manifest should complete");
+            assert!(
+                position < slow_position,
+                "a scan beyond the initial window should complete before the slow first scan"
+            );
+        }
+        let max_active = delayed.max_active_manifest_scans.load(Ordering::Relaxed);
+        assert!(
+            (2..=MANIFEST_SCAN_CONCURRENCY).contains(&max_active),
+            "skewed scans should overlap without exceeding the concurrency cap; observed {max_active}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_manifest_scan_errors_follow_request_order() {
+        let storage = StorageAdapter::new(Memory::new());
+        let (first, second) = {
+            let mut writes = storage.new_write_set();
+            let first = stage_incomplete_manifest(&mut writes, b"first-invalid", 2);
+            let second = stage_incomplete_manifest(&mut writes, b"second-invalid", 3);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("invalid manifest fixtures should commit");
+            (first, second)
+        };
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let delayed =
+            DelayedManifestScanRead::new(store, Duration::ZERO).block_manifest_until(first, second);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            load_bytes_many(&delayed, &[first, second]),
+        )
+        .await
+        .expect("the later manifest should release the first before timeout")
+        .expect_err("the first requested malformed manifest should fail");
+
+        assert_eq!(
+            *delayed
+                .completed_manifest_hashes
+                .lock()
+                .expect("completed manifest lock"),
+            vec![second, first],
+            "the later malformed manifest should complete first"
+        );
+        assert!(
+            error.message.contains(&first.to_hex()),
+            "later scan completion must not replace the first requested error: {error:?}"
+        );
+        assert!(error.message.contains("expected 2 chunks, found 1"));
+        assert_eq!(
+            delayed.max_active_manifest_scans.load(Ordering::Relaxed),
+            2,
+            "the later manifest should finish while the first scan is delayed"
+        );
+        assert_eq!(
+            delayed.chunk_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "manifest validation should still precede the batched chunk fetch"
         );
     }
 
