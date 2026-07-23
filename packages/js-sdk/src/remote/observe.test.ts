@@ -419,15 +419,18 @@ test("a successful branch switch restarts observations on the pinned session", a
 
 	const events = lix.observe("SELECT active_branch");
 	expect((await events.next())?.result.rows[0]?.get("value")).toBe("main-id");
+	expect(await lix.activeBranchId()).toBe("main-id");
 	const afterSwitch = events.next();
 	await lix.switchBranch({ branchId: "draft-id" });
 	const switched = await afterSwitch;
 	expect(switched?.result.rows[0]?.get("value")).toBe("draft-id");
 	expect(switched?.sequence).toBe(1);
+	expect(await lix.activeBranchId()).toBe("draft-id");
 	expect(observeRequests).toBe(2);
 	await expect(
 		lix.switchBranch({ branchId: "missing-id" }),
 	).rejects.toMatchObject({ code: "LIX_BRANCH_NOT_FOUND" });
+	expect(await lix.activeBranchId()).toBe("draft-id");
 	expect(observeRequests).toBe(2);
 
 	events.close();

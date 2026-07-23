@@ -111,17 +111,15 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 		new Uint8Array([1, 2, 3]),
 	);
 	expect(result.rows[0]?.get("json")).toEqual({ ok: true });
-	expect(headerCalls).toBe(3);
+	expect(headerCalls).toBe(2);
 	expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
-		"/@acme/workspace/lix/v1/",
 		"/@acme/workspace/lix/v1/",
 		"/@acme/workspace/lix/v1/execute",
 	]);
-	expect(requests[2]?.headers.get("authorization")).toBe("Bearer token-3");
+	expect(requests[1]?.headers.get("authorization")).toBe("Bearer token-2");
 	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
 	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
-	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
-	expect(await requests[2]?.json()).toEqual({
+	expect(await requests[1]?.json()).toEqual({
 		sql: "SELECT $1, $2, $3, $4, $5, $6, $7",
 		params: [
 			{ kind: "null", value: null },
@@ -136,11 +134,11 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	});
 
 	await lix.close();
-	expect(new URL(requests[3]?.url ?? "").pathname).toBe(
+	expect(new URL(requests[2]?.url ?? "").pathname).toBe(
 		"/@acme/workspace/lix/v1/session",
 	);
-	expect(requests[3]?.method).toBe("DELETE");
-	expect(requests[3]?.headers.get("lix-session-id")).toBe("session-1");
+	expect(requests[2]?.method).toBe("DELETE");
+	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
 });
 
 test("remote mode compresses only large compressible JSON requests", async () => {
@@ -560,11 +558,13 @@ test("remote branches preserve local Lix branch semantics", async () => {
 	expect(
 		await Promise.all(posted.map((request) => request.clone().json())),
 	).toEqual([{ name: "Draft" }, { branchId: "draft-id" }]);
+	expect(requests.filter((request) => request.method === "GET")).toHaveLength(1);
 
 	await lix.close();
 });
 
 test("a failed remote branch switch leaves the active branch unchanged", async () => {
+	let handshakeCalls = 0;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -575,23 +575,25 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
-				return pathname.endsWith("/lix/v1/")
-					? Response.json({
-							protocolVersion: 1,
-							activeBranchId: "main-id",
-							sessionId: "session-1",
-						})
-					: Response.json(
-							{
-								error: {
-									code: "LIX_BRANCH_NOT_FOUND",
-									message: "Branch not found",
-									hint: "Choose an existing branch",
-									details: { branchId: "missing" },
-								},
-							},
-							{ status: 404 },
-						);
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				return Response.json(
+					{
+						error: {
+							code: "LIX_BRANCH_NOT_FOUND",
+							message: "Branch not found",
+							hint: "Choose an existing branch",
+							details: { branchId: "missing" },
+						},
+					},
+					{ status: 404 },
+				);
 			}) as typeof fetch,
 		},
 	});
@@ -607,6 +609,91 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 		},
 	);
 	expect(await lix.activeBranchId()).toBe("main-id");
+	expect(handshakeCalls).toBe(1);
+
+	await lix.close();
+});
+
+test("an ambiguous remote branch switch is reconciled by the next branch read", async () => {
+	let activeBranchId = "main-id";
+	let handshakeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId,
+						sessionId: "session-1",
+					});
+				}
+				if (pathname.endsWith("/branch/switch")) {
+					const body = (await request.json()) as { branchId: string };
+					activeBranchId = body.branchId;
+					return Response.json({ branchId: "malformed-response" });
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			}) as typeof fetch,
+		},
+	});
+
+	await expect(
+		lix.switchBranch({ branchId: "draft-id" }),
+	).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
+	expect(await lix.activeBranchId()).toBe("draft-id");
+	expect(handshakeCalls).toBe(2);
+
+	await lix.close();
+});
+
+test("branch reconciliation rejects and never caches a replacement session", async () => {
+	let handshakeCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "draft-id",
+						sessionId: handshakeCalls === 1 ? "session-1" : "session-2",
+					});
+				}
+				if (pathname.endsWith("/branch/switch")) {
+					return Response.json({ branchId: "malformed-response" });
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			}) as typeof fetch,
+		},
+	});
+
+	await expect(
+		lix.switchBranch({ branchId: "draft-id" }),
+	).rejects.toMatchObject({ code: "LIX_REMOTE_PROTOCOL_ERROR" });
+	await expect(lix.activeBranchId()).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote handshake changed sessionId",
+	});
+	await expect(lix.activeBranchId()).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote handshake changed sessionId",
+	});
+	expect(handshakeCalls).toBe(3);
 
 	await lix.close();
 });
@@ -704,12 +791,18 @@ test("remote operations preserve normal Lix call ordering", async () => {
 	});
 
 	const switching = lix.switchBranch({ branchId: "draft-id" });
+	const readingActiveBranch = lix.activeBranchId();
 	const executing = lix.execute("SELECT 1");
 	await Promise.resolve();
 	await Promise.resolve();
 	expect(requestOrder).toEqual(["switch"]);
 	finishSwitch?.();
-	await Promise.all([switching, executing]);
+	const [, activeBranchId] = await Promise.all([
+		switching,
+		readingActiveBranch,
+		executing,
+	]);
+	expect(activeBranchId).toBe("draft-id");
 	expect(requestOrder).toEqual(["switch", "execute"]);
 	expect(executeBody).toEqual({ sql: "SELECT 1", params: [] });
 
@@ -823,7 +916,7 @@ test.each([undefined, "", " contains-space", "contains\nnewline", 42])(
 	},
 );
 
-test("a later handshake cannot silently replace the remote session", async () => {
+test("active branch reads reuse the initial handshake without another GET", async () => {
 	let handshakeCalls = 0;
 	const lix = await openLix({
 		server: {
@@ -838,16 +931,15 @@ test("a later handshake cannot silently replace the remote session", async () =>
 				return Response.json({
 					protocolVersion: 1,
 					activeBranchId: "main-id",
-					sessionId: handshakeCalls === 1 ? "session-1" : "session-2",
+					sessionId: "session-1",
 				});
 			},
 		},
 	});
 
-	await expect(lix.activeBranchId()).rejects.toMatchObject({
-		code: "LIX_REMOTE_PROTOCOL_ERROR",
-		message: "remote handshake changed sessionId",
-	});
+	expect(await lix.activeBranchId()).toBe("main-id");
+	expect(await lix.activeBranchId()).toBe("main-id");
+	expect(handshakeCalls).toBe(1);
 	await lix.close();
 });
 
