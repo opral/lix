@@ -1094,9 +1094,10 @@ fn reject_unsupported_function_modifiers(function: &Function) -> Result<(), LixE
 fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixError> {
     match name {
         "lix_json" => expect_exact_function_arity(name, actual, 1),
-        "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
-            expect_exact_function_arity(name, actual, 0)
-        }
+        "lix_timestamp"
+        | "lix_uuid_v7"
+        | "lix_active_branch_id"
+        | "lix_active_branch_commit_id" => expect_exact_function_arity(name, actual, 0),
         "lix_json_get" | "lix_json_get_text" => expect_min_function_arity(name, actual, 2),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL function '{name}'"
@@ -1144,6 +1145,7 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
         | "lix_json_get_text"
         | "lix_timestamp"
         | "lix_uuid_v7"
+        | "lix_active_branch_id"
         | "lix_active_branch_commit_id" => Ok(name),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL function '{name}'"

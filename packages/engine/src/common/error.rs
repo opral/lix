@@ -134,6 +134,9 @@ impl LixError {
     /// durability boundary.
     pub const CODE_CLOSED: &'static str = "LIX_ERROR_CLOSED";
 
+    /// An operation is incompatible with the current session mode or state.
+    pub const CODE_INVALID_SESSION_STATE: &'static str = "LIX_INVALID_SESSION_STATE";
+
     /// A merge found incompatible changes to the same tracked-state identity.
     pub const CODE_MERGE_CONFLICT: &'static str = "LIX_MERGE_CONFLICT";
 

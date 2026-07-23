@@ -12,6 +12,7 @@ export {
 } from "./bundled-plugins.js";
 export { Row } from "./result.js";
 export { Value } from "./value.js";
+export type { LixClientState } from "./client-state.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -33,6 +34,7 @@ export type {
 	OpenLixOptions,
 	LixTelemetryOptions,
 	LixTelemetrySpan,
+	LixSnapshotStorage,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
 	SqlParam,

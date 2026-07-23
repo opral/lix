@@ -63,7 +63,12 @@ where
             .await?
             .map(|head| head.commit_id.to_string()),
     };
-    register_sql2_functions(&session, ctx.functions(), active_branch_commit_id);
+    register_sql2_functions(
+        &session,
+        ctx.functions(),
+        Some(ctx.active_branch_id().to_string()),
+        active_branch_commit_id,
+    );
     let provider_selection = providers::read_provider_selection(&session, statements);
     providers::register_read(&session, ctx, branch_ref, &provider_selection).await?;
 
@@ -85,7 +90,12 @@ where
         .load_head(read_ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
-    register_sql2_functions(&session, read_ctx.functions(), active_branch_commit_id);
+    register_sql2_functions(
+        &session,
+        read_ctx.functions(),
+        Some(read_ctx.active_branch_id().to_string()),
+        active_branch_commit_id,
+    );
     let write_ctx = SqlWriteContext::new(write_ctx);
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
@@ -135,6 +145,7 @@ pub(crate) async fn build_write_session_with_options(
     register_sql2_functions(
         &session,
         write_ctx.functions(),
+        Some(active_branch_id),
         Some(active_branch_commit_id.commit_id.to_string()),
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;

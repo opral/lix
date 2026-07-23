@@ -1403,6 +1403,9 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
             EntityEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
         ),
+        BoundExpr::Function { name, args } if name == "lix_active_branch_id" && args.is_empty() => {
+            Ok(EntityEvalValue::SqlText(ctx.active_branch_id().to_string()))
+        }
         BoundExpr::Function { name, args }
             if name == "lix_active_branch_commit_id" && args.is_empty() =>
         {
@@ -1829,7 +1832,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}
-                "lix_uuid_v7" | "lix_timestamp" | "lix_active_branch_commit_id"
+                "lix_uuid_v7"
+                | "lix_timestamp"
+                | "lix_active_branch_id"
+                | "lix_active_branch_commit_id"
                     if args.is_empty() => {}
                 "lix_json_get" | "lix_json_get_text" if args.len() >= 2 => {}
                 _ => {

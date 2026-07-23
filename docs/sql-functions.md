@@ -1,16 +1,17 @@
 ---
-description: Built-in scalar SQL functions provided by the Lix engine. Covers JSON parsing and projection, ID and timestamp generation, and the active-version commit id helper used to scope history queries.
+description: Built-in scalar SQL functions provided by the Lix engine. Covers JSON parsing and projection, ID and timestamp generation, and helpers for the active branch.
 ---
 
 # SQL Functions
 
-Lix's DataFusion-backed engine registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between standard SQL and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, and resolving the active version's commit id for history queries.
+Lix's DataFusion-backed engine registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between standard SQL and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, and resolving the active branch and its commit id.
 
 ## At a glance
 
 | Function | Returns | Use for |
 | :-- | :-- | :-- |
-| `lix_active_version_commit_id()` | text | Scoping `_history` queries to the active version. |
+| `lix_active_branch_id()` | text | Reading the current SQL session's active branch id. |
+| `lix_active_branch_commit_id()` | text | Scoping `_history` queries to the active branch head. |
 | `lix_json(text)` | JSON | Parse a JSON string parameter into a JSON-typed value. |
 | `lix_json_get(json, path...)` | JSON | Project a value out of a JSON column, preserving JSON type. |
 | `lix_json_get_text(json, path...)` | text | Project a value out of a JSON column as plain text. |
@@ -19,30 +20,34 @@ Lix's DataFusion-backed engine registers a small set of scalar functions for use
 
 All functions are scalar; call them anywhere a SQL expression is allowed.
 
-## Version & history
+## Branch & history
 
-### `lix_active_version_commit_id()`
+### `lix_active_branch_id()`
 
-Returns the commit id at the tip of the **currently active** version, as resolved when the SQL statement was planned.
+Returns the active branch id of the current SQL session. Branch-pinned clients therefore get their own branch id even when multiple sessions query the same Lix.
 
-History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) require a literal or bound-parameter equality on `start_commit_id` (or `lixcol_start_commit_id`). A correlated subquery against `lix_version` is rejected by the planner. `lix_active_version_commit_id()` is the canonical way to scope history to the active version in a single statement:
+### `lix_active_branch_commit_id()`
+
+Returns the commit id at the tip of the **currently active** branch, as resolved when the SQL statement was planned.
+
+History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) require a literal or bound-parameter equality on `start_commit_id` (or `lixcol_start_commit_id`). A correlated subquery against `lix_branch` is rejected by the planner. `lix_active_branch_commit_id()` is the canonical way to scope history to the active branch in a single statement:
 
 ```sql
--- Walk one entity's history from the active version's tip
+-- Walk one entity's history from the active branch's tip
 SELECT depth, observed_commit_id, snapshot_content
 FROM lix_state_history
 WHERE schema_key = 'task'
   AND lix_json_get_text(entity_pk, 0) = 't1'
-  AND start_commit_id = lix_active_version_commit_id()
+  AND start_commit_id = lix_active_branch_commit_id()
 ORDER BY depth;
 ```
 
-For an arbitrary version, resolve the commit id with one query and pass it as a parameter:
+For an arbitrary branch, resolve the commit id with one query and pass it as a parameter:
 
 ```ts
 const { rows } = await lix.execute(
-  "SELECT commit_id FROM lix_version WHERE id = $1",
-  [versionId],
+  "SELECT commit_id FROM lix_branch WHERE id = $1",
+  [branchId],
 );
 const commitId = rows[0].value("commit_id").asText();
 
@@ -126,4 +131,4 @@ VALUES ('/notes/hello.txt', CAST('hello world' AS BINARY));
 
 - Functions are pure scalars; they do not consume rows or take aggregates.
 - Bound parameters can use `?` or `$1`, `$2`, …
-- `lix_active_version_commit_id()`, `lix_uuid_v7()`, and `lix_timestamp()` reflect the engine's current view at planning/execution time and are stable across the rows of a single statement.
+- `lix_active_branch_id()`, `lix_active_branch_commit_id()`, `lix_uuid_v7()`, and `lix_timestamp()` reflect the engine's current view at planning/execution time and are stable across the rows of a single statement.

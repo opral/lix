@@ -5,7 +5,8 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 } from "../binding-types.js";
-import type { LixTelemetryOptions } from "../types.js";
+import type { LixSnapshotStorage, LixTelemetryOptions } from "../types.js";
+import { snapshotPersistenceAfterCommitError } from "../snapshot-persistence.js";
 import {
 	deserializeWorkerError,
 	type WorkerConnection,
@@ -59,6 +60,68 @@ export async function openLixWorkerBinding(
 	return workerBinding(client);
 }
 
+export type OpenPersistentLixWorkerBindingOptions = {
+	storage: LixSnapshotStorage;
+	namespace: string;
+	telemetry?: LixTelemetryOptions;
+};
+
+/**
+ * Opens a browser memory binding from an opaque snapshot and persists a fresh
+ * snapshot after every successful mutation. This is an internal composition
+ * seam for public storage adapters; it does not route workspace operations.
+ */
+export async function openPersistentLixWorkerBinding(
+	options: OpenPersistentLixWorkerBindingOptions,
+): Promise<LixBinding> {
+	if (!options || typeof options !== "object") {
+		throw new TypeError(
+			"openPersistentLixWorkerBinding() options must be an object",
+		);
+	}
+	if (
+		!options.storage ||
+		typeof options.storage.load !== "function" ||
+		typeof options.storage.save !== "function"
+	) {
+		throw new TypeError(
+			"openPersistentLixWorkerBinding() storage must implement load() and save()",
+		);
+	}
+	if (typeof options.namespace !== "string" || options.namespace.length === 0) {
+		throw new TypeError(
+			"openPersistentLixWorkerBinding() namespace must be a non-empty string",
+		);
+	}
+
+	const snapshot = await options.storage.load(options.namespace);
+	if (snapshot !== undefined && !(snapshot instanceof Uint8Array)) {
+		throw new TypeError("Snapshot storage load() must return a Uint8Array");
+	}
+	const binding = await openLixWorkerBinding(
+		{
+			kind: "memory",
+			...(snapshot === undefined ? {} : { snapshot }),
+		},
+		undefined,
+		options.telemetry,
+	);
+	const persistent = persistentSnapshotBinding(
+		binding,
+		options.storage,
+		options.namespace,
+	);
+	if (snapshot === undefined) {
+		try {
+			await persistent.persist();
+		} catch (error) {
+			await binding.close().catch(() => undefined);
+			throw error;
+		}
+	}
+	return persistent.binding;
+}
+
 function workerBinding(client: LixWorkerClient): LixBinding {
 	let closed = false;
 	const request: RequestWorker = (operation) => {
@@ -89,16 +152,20 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 			return workerTransactionBinding(request, transactionId);
 		},
 		activeBranchId: () => request({ kind: "activeBranchId" }),
-		createBranch: (options) =>
-			request({ kind: "createBranch", options }),
-		switchBranch: (options) =>
-			request({ kind: "switchBranch", options }),
+		clientStateEntries: () => request({ kind: "clientState.entries" }),
+		clientStateGet: (key) => request({ kind: "clientState.get", key }),
+		clientStateSet: (key, value) =>
+			request({ kind: "clientState.set", key, value }),
+		clientStateDelete: (key) => request({ kind: "clientState.delete", key }),
+		createBranch: (options) => request({ kind: "createBranch", options }),
+		switchBranch: (options) => request({ kind: "switchBranch", options }),
 		importFilesystemPaths: (paths) =>
 			request({ kind: "importFilesystemPaths", paths }),
 		mergeBranchPreview: (options) =>
 			request({ kind: "mergeBranchPreview", options }),
 		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
 		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
+		exportSnapshot: () => request({ kind: "exportSnapshot" }),
 		close: async () => {
 			if (closed) return;
 			await request({ kind: "close" });
@@ -106,6 +173,137 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 			await releaseWorker(client);
 		},
 	};
+}
+
+function persistentSnapshotBinding(
+	binding: LixBinding,
+	storage: LixSnapshotStorage,
+	namespace: string,
+): { binding: LixBinding; persist(): Promise<void> } {
+	let persistenceTail: Promise<void> = Promise.resolve();
+	let closePromise: Promise<void> | undefined;
+	let bindingClosed = false;
+
+	const persist = (): Promise<void> => {
+		const operation = persistenceTail.then(async () => {
+			const exportSnapshot = binding.exportSnapshot;
+			if (!exportSnapshot) {
+				throw new Error(
+					"The open Lix binding does not support snapshot export",
+				);
+			}
+			const snapshot = await exportSnapshot.call(binding);
+			await storage.save(namespace, snapshot);
+		});
+		persistenceTail = operation.catch(() => undefined);
+		return operation;
+	};
+
+	const afterMutation = async <T>(operation: Promise<T>): Promise<T> => {
+		const result = await operation;
+		try {
+			await persist();
+		} catch (error) {
+			// The Rust transaction is already committed. Preserve that fact so
+			// synchronous facades can reflect the live session value while still
+			// reporting that durability failed.
+			throw snapshotPersistenceAfterCommitError(error);
+		}
+		return result;
+	};
+
+	const persistentBinding: LixBinding = {
+		execute: (sql, params, executeOptions) =>
+			afterMutation(binding.execute(sql, params, executeOptions)),
+		executeBatch: (statements, batchOptions) =>
+			afterMutation(binding.executeBatch(statements, batchOptions)),
+		observe: (sql, params) => binding.observe(sql, params),
+		beginTransaction: async () => {
+			const transaction = await binding.beginTransaction();
+			return {
+				execute: (sql, params, executeOptions) =>
+					transaction.execute(sql, params, executeOptions),
+				commit: () => afterMutation(transaction.commit()),
+				rollback: () => transaction.rollback(),
+			};
+		},
+		activeBranchId: () => binding.activeBranchId(),
+		clientStateEntries: () => {
+			const method = binding.clientStateEntries;
+			if (!method) return Promise.reject(clientStateUnsupportedError());
+			return method.call(binding);
+		},
+		clientStateGet: (key) => {
+			const method = binding.clientStateGet;
+			if (!method) return Promise.reject(clientStateUnsupportedError());
+			return method.call(binding, key);
+		},
+		clientStateSet: (key, value) => {
+			const method = binding.clientStateSet;
+			if (!method) return Promise.reject(clientStateUnsupportedError());
+			return afterMutation(method.call(binding, key, value));
+		},
+		clientStateDelete: (key) => {
+			const method = binding.clientStateDelete;
+			if (!method) return Promise.reject(clientStateUnsupportedError());
+			return afterMutation(method.call(binding, key));
+		},
+		createBranch: (branchOptions) =>
+			afterMutation(binding.createBranch(branchOptions)),
+		switchBranch: (branchOptions) =>
+			afterMutation(binding.switchBranch(branchOptions)),
+		importFilesystemPaths: (paths) =>
+			afterMutation(binding.importFilesystemPaths(paths)),
+		mergeBranchPreview: (branchOptions) =>
+			binding.mergeBranchPreview(branchOptions),
+		mergeBranch: (branchOptions) =>
+			afterMutation(binding.mergeBranch(branchOptions)),
+		syncDiskToLix: () => afterMutation(binding.syncDiskToLix()),
+		exportSnapshot: () => {
+			const exportSnapshot = binding.exportSnapshot;
+			if (!exportSnapshot) {
+				return Promise.reject(
+					new Error("The open Lix binding does not support snapshot export"),
+				);
+			}
+			return exportSnapshot.call(binding);
+		},
+		close: () => {
+			if (closePromise) return closePromise;
+			closePromise = (async () => {
+				let persistenceError: unknown;
+				try {
+					await persist();
+				} catch (error) {
+					persistenceError = error;
+				}
+				await binding.close();
+				bindingClosed = true;
+				if (persistenceError !== undefined) throw persistenceError;
+			})();
+			void closePromise.catch((error: unknown) => {
+				if (!bindingClosed && isActiveTransactionCloseError(error)) {
+					closePromise = undefined;
+				}
+			});
+			return closePromise;
+		},
+	};
+
+	return { binding: persistentBinding, persist };
+}
+
+function isActiveTransactionCloseError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		error.code === "LIX_INVALID_TRANSACTION_STATE"
+	);
+}
+
+function clientStateUnsupportedError(): Error {
+	return new Error("The open Lix binding does not support typed client state");
 }
 
 function workerTransactionBinding(
@@ -165,10 +363,7 @@ export class LixWorkerClient {
 		return this.disposed;
 	}
 
-	beginLease(
-		onDisposed?: () => void,
-		telemetry?: LixTelemetryOptions,
-	): void {
+	beginLease(onDisposed?: () => void, telemetry?: LixTelemetryOptions): void {
 		if (this.disposed || this.leased) throw workerClosedError();
 		this.leased = true;
 		this.onDisposed = onDisposed;

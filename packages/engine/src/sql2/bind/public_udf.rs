@@ -56,9 +56,10 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
 
     match name {
         "lix_json" => expect_exact_arity(name, arity, 1),
-        "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
-            expect_exact_arity(name, arity, 0)
-        }
+        "lix_timestamp"
+        | "lix_uuid_v7"
+        | "lix_active_branch_id"
+        | "lix_active_branch_commit_id" => expect_exact_arity(name, arity, 0),
         _ => Ok(()),
     }
 }
@@ -156,6 +157,7 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         "lix_json" => Some("lix_json"),
         "lix_timestamp" => Some("lix_timestamp"),
         "lix_uuid_v7" => Some("lix_uuid_v7"),
+        "lix_active_branch_id" => Some("lix_active_branch_id"),
         "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
         _ => None,
     }
