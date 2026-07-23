@@ -110,11 +110,15 @@ async fn run_case(
 
     println!(
         "small_blob_cas,backend={backend},operation={operation},size_bytes={size},\
-         warmups={warmups},samples={samples},p50_us={},p95_us={},mean_us={},\
+         warmups={warmups},samples={samples},p50_ns={},p95_ns={},mean_ns={},\
+         p50_us={},p95_us={},mean_us={},\
          chunk_lookups={},chunk_lookup_batches={},chunk_lookup_hits={},\
          chunk_lookup_misses={},chunk_lookup_us={},manifest_rows={},\
          manifest_value_bytes={},manifest_chunk_rows={},payload_rows={},\
          payload_value_bytes={},presence_rows={}",
+        percentile(&timings, 50, 100).as_nanos(),
+        percentile(&timings, 95, 100).as_nanos(),
+        (timings.iter().sum::<Duration>() / samples as u32).as_nanos(),
         duration_us(percentile(&timings, 50, 100)),
         duration_us(percentile(&timings, 95, 100)),
         duration_us(timings.iter().sum::<Duration>() / samples as u32),
