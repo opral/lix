@@ -30,7 +30,7 @@ def counter_row(round_index: int) -> dict:
         "returned_change_payloads": 1,
         "durable_semantic_changes": 1,
         "private_document_cache_hits": 1,
-        "shared_renderer_cache_hits": 1,
+        "shared_renderer_cache_hits": 0,
         "full_document_reparses": 0,
         "full_renderer_invocations": 0,
         "filesystem_sync_full_renders": 0,

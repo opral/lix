@@ -120,7 +120,7 @@ class JsonPairedRunnerTests(unittest.TestCase):
             "full_state_semantic_rows_materialized=0 "
             "change_payload_requests=1 returned_change_payloads=1 "
             "durable_semantic_changes=1 private_document_cache_hits=1 "
-            "shared_renderer_cache_hits=1 full_document_reparses=0 "
+            "shared_renderer_cache_hits=0 full_document_reparses=0 "
             "full_renderer_invocations=0 filesystem_sync_full_renders=0\n"
         )
         rows = runner.parse_v2_counters(counter, 1)
@@ -177,7 +177,7 @@ elif mode == "edit":
                 "full_state_semantic_rows_materialized=0 "
                 "change_payload_requests=1 returned_change_payloads=1 "
                 "durable_semantic_changes=1 private_document_cache_hits=1 "
-                "shared_renderer_cache_hits=1 full_document_reparses=0 "
+                "shared_renderer_cache_hits=0 full_document_reparses=0 "
                 "full_renderer_invocations=0 "
                 "filesystem_sync_full_renders=0"
             )

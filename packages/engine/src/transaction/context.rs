@@ -2001,7 +2001,6 @@ where
                         write.splice_provenance(),
                         limits,
                     )?;
-                    let expected_delta = built_splices.edits.clone();
                     let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
                     let observed_source = ArcByteSource::new(Arc::clone(&observed_bytes));
                     let submitted_source = ArcByteSource::new(Arc::clone(&submitted_bytes));
@@ -2046,73 +2045,93 @@ where
                         return Err(lease.handle_guest_call_error(error));
                     }
 
-                    // Detection happened against the session's observed
-                    // document (which may now be historical). Apply its sparse
-                    // merge-resolved delta to the actor's current accepted
-                    // document so concurrent different-row edits compose and
-                    // same-row edits obey transaction commit order.
                     let changes = detected_transition.changes;
                     let detection_document = detected_transition.document;
-                    if let Err(error) = lease.actor_mut().drop_document(detection_document).await {
-                        return Err(lease.handle_guest_call_error(error));
-                    }
-                    let current_document = lease.accepted_document();
-                    let current_bytes = lease.accepted_bytes();
-                    let change_source = match VecEntityChangeSource::new(changes.clone(), limits) {
-                        Ok(source) => source,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
-                    };
-                    let activated_entities = match VecEntitySource::empty(limits) {
-                        Ok(source) => source,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
-                    };
-                    let current_entities = match VecEntitySource::empty(limits) {
-                        Ok(source) => source,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
-                    };
-                    let renderer_input =
-                        match lease.actor_mut().fork_document(current_document).await {
-                            Ok(document) => document,
+                    let mut counters = detected_transition.counters;
+                    let (successor_document, materialized_bytes) = if observation_is_current {
+                        // The actor lease serializes this file and the durable
+                        // root still equals the acknowledged observation. The
+                        // validated file successor is therefore already the
+                        // exact merge result; rendering the same sparse change
+                        // onto the same base would only repeat guest work.
+                        (detection_document, Arc::clone(&submitted_bytes))
+                    } else {
+                        // Detection happened against a historical session
+                        // document. Apply its sparse merge-resolved delta to
+                        // the actor's current accepted document so concurrent
+                        // different-entity edits compose and same-entity edits
+                        // obey transaction commit order.
+                        if let Err(error) =
+                            lease.actor_mut().drop_document(detection_document).await
+                        {
+                            return Err(lease.handle_guest_call_error(error));
+                        }
+                        let current_document = lease.accepted_document();
+                        let current_bytes = lease.accepted_bytes();
+                        let change_source =
+                            match VecEntityChangeSource::new(changes.clone(), limits) {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    return Err(lease.handle_guest_call_error(error));
+                                }
+                            };
+                        let activated_entities = match VecEntitySource::empty(limits) {
+                            Ok(source) => source,
                             Err(error) => return Err(lease.handle_guest_call_error(error)),
                         };
-                    let renderer_transition = match lease
-                        .actor_mut()
-                        .entities_changed(
-                            renderer_input,
+                        let current_entities = match VecEntitySource::empty(limits) {
+                            Ok(source) => source,
+                            Err(error) => return Err(lease.handle_guest_call_error(error)),
+                        };
+                        let renderer_input =
+                            match lease.actor_mut().fork_document(current_document).await {
+                                Ok(document) => document,
+                                Err(error) => return Err(lease.handle_guest_call_error(error)),
+                            };
+                        let renderer_transition = match lease
+                            .actor_mut()
+                            .entities_changed(
+                                renderer_input,
+                                limits,
+                                WasmEntityUpdate {
+                                    before_descriptor,
+                                    after_descriptor,
+                                    before: Arc::new(ArcByteSource::new(Arc::clone(
+                                        &current_bytes,
+                                    ))),
+                                    changes: Box::new(change_source),
+                                    activated_entities: Box::new(activated_entities),
+                                    current_entities: Box::new(current_entities),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(transition) => transition,
+                            Err(error) => return Err(lease.handle_guest_call_error(error)),
+                        };
+                        let rendered_transition = match drain_entity_transition_edits(
+                            lease.actor_mut(),
+                            renderer_transition,
+                            &current_bytes,
+                            None,
+                            None,
                             limits,
-                            WasmEntityUpdate {
-                                before_descriptor,
-                                after_descriptor,
-                                before: Arc::new(ArcByteSource::new(Arc::clone(&current_bytes))),
-                                changes: Box::new(change_source),
-                                activated_entities: Box::new(activated_entities),
-                                current_entities: Box::new(current_entities),
-                            },
                         )
                         .await
-                    {
-                        Ok(transition) => transition,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
+                        {
+                            Ok(transition) => transition,
+                            Err(error) => return Err(lease.handle_guest_call_error(error)),
+                        };
+                        if let Err(error) = lease.actor_mut().drop_document(renderer_input).await {
+                            return Err(lease.handle_guest_call_error(error));
+                        }
+                        counters.accumulate(rendered_transition.counters);
+                        counters.shared_renderer_cache_hits = 1;
+                        (
+                            rendered_transition.document,
+                            Arc::clone(&rendered_transition.bytes),
+                        )
                     };
-                    let rendered_transition = match drain_entity_transition_edits(
-                        lease.actor_mut(),
-                        renderer_transition,
-                        &current_bytes,
-                        observation_is_current.then(|| Arc::clone(&submitted_bytes)),
-                        observation_is_current.then_some(expected_delta.as_slice()),
-                        limits,
-                    )
-                    .await
-                    {
-                        Ok(transition) => transition,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
-                    };
-                    if let Err(error) = lease.actor_mut().drop_document(renderer_input).await {
-                        return Err(lease.handle_guest_call_error(error));
-                    }
-
-                    let mut counters = detected_transition.counters;
-                    counters.accumulate(rendered_transition.counters);
                     counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
                     counters.host_full_content_classification_bytes =
                         full_content_classification_bytes
@@ -2120,13 +2139,11 @@ where
                             .copied()
                             .unwrap_or(0);
                     counters.private_document_cache_hits = 1;
-                    counters.shared_renderer_cache_hits = 1;
                     counters.durable_semantic_changes =
                         u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
                     self.plugin_host.record_v2_transition_counters(counters);
-                    let materialized_bytes = Arc::clone(&rendered_transition.bytes);
                     lease.complete_guest_call(
-                        rendered_transition.document,
+                        successor_document,
                         Arc::clone(&materialized_bytes),
                         materialization_version.clone(),
                     )?;
