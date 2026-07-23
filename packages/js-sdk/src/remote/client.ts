@@ -264,12 +264,38 @@ class RemoteLixBinding implements LixBinding {
 
 	async activeBranchId(): Promise<string> {
 		this.#assertOpen();
+		const establishedSessionId = this.#sessionId;
+		if (establishedSessionId === undefined) {
+			throw protocolError("remote session is not initialized");
+		}
 		return this.#enqueue(async () => {
-			const handshake = decodeHandshake(
-				await this.#requestJson("", { method: "GET" }),
-			);
-			if (handshake.sessionId !== this.#sessionId) {
+			this.#assertOpen();
+			if (this.#sessionId !== establishedSessionId) {
+				await this.#failClosedSession(establishedSessionId);
+				throw protocolError("remote session changed before handshake");
+			}
+			const rawHandshake = await this.#requestJson("", { method: "GET" });
+			let handshake: ReturnType<typeof decodeHandshake>;
+			try {
+				handshake = decodeHandshake(rawHandshake);
+			} catch (error) {
+				await this.#failClosedSession(establishedSessionId);
+				throw error;
+			}
+			if (handshake.sessionId !== establishedSessionId) {
+				await this.#failClosedSession(establishedSessionId);
 				throw protocolError("remote handshake changed sessionId");
+			}
+			if (
+				this.#branchId !== undefined &&
+				(handshake.sessionScope?.kind !== "branch" ||
+					handshake.sessionScope.branchId !== this.#branchId ||
+					handshake.activeBranchId !== this.#branchId)
+			) {
+				await this.#failClosedSession(establishedSessionId);
+				throw protocolError(
+					"remote server did not preserve the requested branch-pinned session",
+				);
 			}
 			return handshake.activeBranchId;
 		});
@@ -353,9 +379,20 @@ class RemoteLixBinding implements LixBinding {
 		this.#observationHub.close();
 		this.#closePromise = this.#enqueue(async () => {
 			this.#observationHub.close();
+			if (this.#sessionId === undefined) return;
 			await this.#requestJson("session", { method: "DELETE" }, "empty");
 		});
 		return this.#closePromise;
+	}
+
+	async #failClosedSession(sessionId: string): Promise<void> {
+		this.#acceptingOperations = false;
+		this.#observationHub.close();
+		const release = this.#releaseSessionBestEffort(sessionId);
+		if (this.#closePromise === undefined) {
+			this.#closePromise = release;
+		}
+		await release;
 	}
 
 	async #requestJson(

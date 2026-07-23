@@ -945,12 +945,14 @@ test.each([
 
 test("a later handshake cannot silently replace the remote session", async () => {
 	let handshakeCalls = 0;
+	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
 			mode: "remote",
 			url: "https://lixray.test/workspace",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
+				requests.push(request.clone());
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
@@ -968,8 +970,182 @@ test("a later handshake cannot silently replace the remote session", async () =>
 		code: "LIX_REMOTE_PROTOCOL_ERROR",
 		message: "remote handshake changed sessionId",
 	});
+	expect(requests.map((request) => request.method)).toEqual([
+		"GET",
+		"GET",
+		"DELETE",
+	]);
+	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
+	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
 	await lix.close();
 });
+
+test("a queued handshake does not run after an earlier handshake fails closed", async () => {
+	let handshakeCalls = 0;
+	const requests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				handshakeCalls += 1;
+				return Response.json({
+					protocolVersion: 1,
+					activeBranchId: "main-id",
+					sessionId: handshakeCalls === 1 ? "session-1" : "session-2",
+				});
+			},
+		},
+	});
+
+	const failing = lix.activeBranchId();
+	const queued = lix.activeBranchId();
+	await expect(failing).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote handshake changed sessionId",
+	});
+	await expect(queued).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
+	expect(requests.map((request) => request.method)).toEqual([
+		"GET",
+		"GET",
+		"DELETE",
+	]);
+	await lix.close();
+});
+
+test("concurrent close shares fail-closed handshake cleanup", async () => {
+	let handshakeCalls = 0;
+	const resumedHandshakeStarted = deferred<void>();
+	const resumedHandshake = deferred<Response>();
+	const requests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				handshakeCalls += 1;
+				if (handshakeCalls === 1) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				resumedHandshakeStarted.resolve();
+				return await resumedHandshake.promise;
+			},
+		},
+	});
+
+	const refreshing = lix.activeBranchId();
+	await resumedHandshakeStarted.promise;
+	const closing = lix.close();
+	resumedHandshake.resolve(
+		Response.json({
+			protocolVersion: 1,
+			activeBranchId: "main-id",
+			sessionId: "session-2",
+		}),
+	);
+
+	await expect(refreshing).rejects.toMatchObject({
+		code: "LIX_REMOTE_PROTOCOL_ERROR",
+		message: "remote handshake changed sessionId",
+	});
+	await expect(closing).resolves.toBeUndefined();
+	expect(requests.map((request) => request.method)).toEqual([
+		"GET",
+		"GET",
+		"DELETE",
+	]);
+	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
+});
+
+test.each([
+	[
+		"scope kind",
+		{
+			activeBranchId: "draft-id",
+			sessionScope: { kind: "workspace" },
+		},
+	],
+	[
+		"scope branchId",
+		{
+			activeBranchId: "draft-id",
+			sessionScope: { kind: "branch", branchId: "other-id" },
+		},
+	],
+	[
+		"activeBranchId",
+		{
+			activeBranchId: "other-id",
+			sessionScope: { kind: "branch", branchId: "draft-id" },
+		},
+	],
+])(
+	"a resumed branch-pinned handshake fails closed when %s changes",
+	async (_field, resumedHandshake) => {
+		let handshakeCalls = 0;
+		const requests: Request[] = [];
+		const lix = await openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/workspace",
+				branchId: "draft-id",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					requests.push(request.clone());
+					if (request.method === "DELETE") {
+						return new Response(null, { status: 204 });
+					}
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 1,
+						sessionId: "session-1",
+						...(handshakeCalls === 1
+							? {
+								activeBranchId: "draft-id",
+								sessionScope: {
+									kind: "branch",
+									branchId: "draft-id",
+								},
+							}
+							: resumedHandshake),
+					});
+				},
+			},
+		});
+
+		await expect(lix.activeBranchId()).rejects.toMatchObject({
+			code: "LIX_REMOTE_PROTOCOL_ERROR",
+			message:
+				"remote server did not preserve the requested branch-pinned session",
+		});
+		expect(requests.map((request) => request.method)).toEqual([
+			"GET",
+			"GET",
+			"DELETE",
+		]);
+		expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
+		await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
+			code: "LIX_ERROR_CLOSED",
+		});
+		await lix.close();
+	},
+);
 
 test("an expired session mutation is propagated without a new handshake or retry", async () => {
 	let handshakeCalls = 0;

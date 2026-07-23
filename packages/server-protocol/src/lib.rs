@@ -565,13 +565,6 @@ where
             }
         }
 
-        let child = match &scope {
-            SessionScope::Workspace => self.inner.root.open_workspace_session().await?,
-            SessionScope::Branch { branch_id } => {
-                self.inner.root.open_session(branch_id.clone()).await?
-            }
-        };
-
         let lru_idle_id = if registry.sessions.len() >= self.inner.options.max_sessions {
             let candidate = registry
                 .sessions
@@ -580,12 +573,18 @@ where
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
             let Some(candidate) = candidate else {
-                close_unregistered_session(&child).await;
                 return Err(ApiError::capacity());
             };
             Some(candidate)
         } else {
             None
+        };
+
+        let child = match &scope {
+            SessionScope::Workspace => self.inner.root.open_workspace_session().await?,
+            SessionScope::Branch { branch_id } => {
+                self.inner.root.open_session(branch_id.clone()).await?
+            }
         };
 
         let session_id = loop {
@@ -3375,6 +3374,34 @@ mod tests {
         .await;
         assert_eq!(existing_response.status(), StatusCode::OK);
         assert_eq!(app.server.inner.registry.lock().await.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn leased_capacity_is_rejected_before_branch_validation() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_sessions: 1,
+            session_idle_timeout: Duration::from_mins(1),
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (existing, _) = new_session(&app.router).await;
+        let lease = app.server.lease(&existing).await.expect("existing session");
+
+        let at_capacity = request(
+            &app.router,
+            "GET",
+            "/lix/v1?branchId=missing-branch",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error_code(at_capacity).await,
+            "LIX_ERROR_PROTOCOL_SESSION_CAPACITY"
+        );
+
+        drop(lease);
     }
 
     #[tokio::test]
