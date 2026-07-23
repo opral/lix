@@ -493,10 +493,10 @@ impl Node {
         match &self.relation {
             NodeRelation::Root => EntityIdentity::Root,
             NodeRelation::Object { parent_id, key, .. } => EntityIdentity::Object {
-                parent_id: parent_id.to_string(),
-                key: key.to_string(),
+                parent_id: Arc::clone(parent_id),
+                key: Arc::clone(key),
             },
-            NodeRelation::Array { id, .. } => EntityIdentity::Array(id.to_string()),
+            NodeRelation::Array { id, .. } => EntityIdentity::Array(Arc::clone(id)),
         }
     }
 }
@@ -504,8 +504,8 @@ impl Node {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum EntityIdentity {
     Root,
-    Object { parent_id: String, key: String },
-    Array(String),
+    Object { parent_id: Arc<str>, key: Arc<str> },
+    Array(Arc<str>),
 }
 
 impl EntityIdentity {
@@ -520,8 +520,10 @@ impl EntityIdentity {
     fn entity_pk(&self) -> Vec<String> {
         match self {
             Self::Root => vec![ROOT_ID.to_owned()],
-            Self::Object { parent_id, key } => vec![parent_id.clone(), key.clone()],
-            Self::Array(id) => vec![id.clone()],
+            Self::Object { parent_id, key } => {
+                vec![parent_id.to_string(), key.to_string()]
+            }
+            Self::Array(id) => vec![id.to_string()],
         }
     }
 
@@ -530,13 +532,13 @@ impl EntityIdentity {
             (ROOT_SCHEMA_KEY, [id]) if id == ROOT_ID => Ok(Self::Root),
             (ROOT_SCHEMA_KEY, _) => Err("json_root requires the single key \"root\"".to_owned()),
             (OBJECT_MEMBER_SCHEMA_KEY, [parent_id, key]) => Ok(Self::Object {
-                parent_id: parent_id.clone(),
-                key: key.clone(),
+                parent_id: Arc::from(parent_id.as_str()),
+                key: Arc::from(key.as_str()),
             }),
             (OBJECT_MEMBER_SCHEMA_KEY, _) => {
                 Err("json_object_member requires parent_id and key components".to_owned())
             }
-            (ARRAY_ITEM_SCHEMA_KEY, [id]) => Ok(Self::Array(id.clone())),
+            (ARRAY_ITEM_SCHEMA_KEY, [id]) => Ok(Self::Array(Arc::from(id.as_str()))),
             (ARRAY_ITEM_SCHEMA_KEY, _) => {
                 Err("json_array_item requires one ID component".to_owned())
             }
@@ -545,13 +547,34 @@ impl EntityIdentity {
     }
 }
 
+fn intern_string(strings: &mut HashSet<Arc<str>>, value: &str) -> Arc<str> {
+    if let Some(existing) = strings.get(value) {
+        return Arc::clone(existing);
+    }
+    let value = Arc::<str>::from(value);
+    strings.insert(Arc::clone(&value));
+    value
+}
+
+fn intern_identity(identity: EntityIdentity, strings: &mut HashSet<Arc<str>>) -> EntityIdentity {
+    match identity {
+        EntityIdentity::Root => EntityIdentity::Root,
+        EntityIdentity::Object { parent_id, key } => EntityIdentity::Object {
+            parent_id: intern_string(strings, parent_id.as_ref()),
+            key: intern_string(strings, key.as_ref()),
+        },
+        EntityIdentity::Array(id) => EntityIdentity::Array(intern_string(strings, id.as_ref())),
+    }
+}
+
 fn identity_fingerprint(identity: &EntityIdentity) -> [u8; 16] {
     match identity {
         EntityIdentity::Root => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
-        EntityIdentity::Object { parent_id, key } => {
-            fingerprint_components(OBJECT_MEMBER_SCHEMA_KEY, &[parent_id, key])
-        }
-        EntityIdentity::Array(id) => fingerprint_components(ARRAY_ITEM_SCHEMA_KEY, &[id]),
+        EntityIdentity::Object { parent_id, key } => fingerprint_components(
+            OBJECT_MEMBER_SCHEMA_KEY,
+            &[parent_id.as_ref(), key.as_ref()],
+        ),
+        EntityIdentity::Array(id) => fingerprint_components(ARRAY_ITEM_SCHEMA_KEY, &[id.as_ref()]),
     }
 }
 
@@ -1257,19 +1280,26 @@ impl Document {
         let Some(snapshot) = &change.snapshot else {
             return Ok(None);
         };
-        let entity = SemanticEntity::parse(EntityRecord {
-            schema_key: change.schema_key.clone(),
-            entity_pk: change.entity_pk.clone(),
-            snapshot: snapshot.clone(),
-        })?;
+        let mut strings = HashSet::new();
+        let entity = SemanticEntity::parse(
+            EntityRecord {
+                schema_key: change.schema_key.clone(),
+                entity_pk: change.entity_pk.clone(),
+                snapshot: snapshot.clone(),
+            },
+            &mut strings,
+        )?;
         if entity.identity() != identity || entity.kind().is_container() {
             return Ok(None);
         }
-        let current = SemanticEntity::parse(EntityRecord {
-            schema_key: change.schema_key.clone(),
-            entity_pk: change.entity_pk.clone(),
-            snapshot: self.node_snapshot(node_index)?,
-        })?;
+        let current = SemanticEntity::parse(
+            EntityRecord {
+                schema_key: change.schema_key.clone(),
+                entity_pk: change.entity_pk.clone(),
+                snapshot: self.node_snapshot(node_index)?,
+            },
+            &mut strings,
+        )?;
         if !entity.same_location(&current) {
             return Ok(None);
         }
@@ -1359,6 +1389,7 @@ impl Iterator for InitialChanges {
 #[derive(Debug, Default)]
 pub struct EntityImportBuilder {
     entities: Vec<SemanticEntity>,
+    strings: HashSet<Arc<str>>,
 }
 
 impl EntityImportBuilder {
@@ -1367,16 +1398,17 @@ impl EntityImportBuilder {
     }
 
     pub fn push(&mut self, entity: EntityRecord) -> Result<(), String> {
-        self.entities.push(SemanticEntity::parse(entity)?);
+        self.entities
+            .push(SemanticEntity::parse(entity, &mut self.strings)?);
         Ok(())
     }
 
     pub fn finish(self) -> Result<(Document, ByteEdit), String> {
-        let model = SemanticModel::new(self.entities)?;
-        let rendered = Arc::new(model.render()?);
-        let mut nodes = JsonParser::parse(rendered.as_slice(), IdNamespace([0; 16]))?;
-        model.overlay(&mut nodes)?;
-        drop(model);
+        let Self { entities, strings } = self;
+        drop(strings);
+        let model = SemanticModel::new(entities)?;
+        let (rendered, nodes) = model.render_document()?;
+        let rendered = Arc::new(rendered);
         let document = Document::from_parts(
             PersistentBlob::from_shared(Arc::clone(&rendered))?,
             nodes,
@@ -1400,25 +1432,28 @@ enum SemanticEntity {
         scalar_json: Option<String>,
     },
     Object {
-        parent_id: String,
-        key: String,
-        order_key: String,
+        parent_id: Arc<str>,
+        key: Arc<str>,
+        order_key: Arc<str>,
         kind: NodeKind,
         scalar_json: Option<String>,
-        container_id: Option<String>,
+        container_id: Option<Arc<str>>,
     },
     Array {
-        id: String,
-        parent_id: String,
-        order_key: String,
+        id: Arc<str>,
+        parent_id: Arc<str>,
+        order_key: Arc<str>,
         kind: NodeKind,
         scalar_json: Option<String>,
     },
 }
 
 impl SemanticEntity {
-    fn parse(record: EntityRecord) -> Result<Self, String> {
-        let identity = EntityIdentity::from_parts(&record.schema_key, &record.entity_pk)?;
+    fn parse(record: EntityRecord, strings: &mut HashSet<Arc<str>>) -> Result<Self, String> {
+        let identity = intern_identity(
+            EntityIdentity::from_parts(&record.schema_key, &record.entity_pk)?,
+            strings,
+        );
         let value: Value = serde_json::from_slice(&record.snapshot)
             .map_err(|error| format!("invalid JSON entity snapshot: {error}"))?;
         reject_numbers(&value)?;
@@ -1442,8 +1477,8 @@ impl SemanticEntity {
                     &["parent_id", "key", "order_key", "kind"],
                     &["scalar_json", "container_id"],
                 )?;
-                if required_string(object, "parent_id")? != parent_id
-                    || required_string(object, "key")? != key
+                if required_string(object, "parent_id")? != parent_id.as_ref()
+                    || required_string(object, "key")? != key.as_ref()
                 {
                     return Err(
                         "json_object_member snapshot does not match its primary key".to_owned()
@@ -1465,10 +1500,12 @@ impl SemanticEntity {
                 Ok(Self::Object {
                     parent_id,
                     key,
-                    order_key,
+                    order_key: intern_string(strings, &order_key),
                     kind,
                     scalar_json,
-                    container_id,
+                    container_id: container_id
+                        .as_deref()
+                        .map(|value| intern_string(strings, value)),
                 })
             }
             EntityIdentity::Array(id) => {
@@ -1477,15 +1514,15 @@ impl SemanticEntity {
                     &["id", "parent_id", "order_key", "kind"],
                     &["scalar_json"],
                 )?;
-                if required_string(object, "id")? != id {
+                if required_string(object, "id")? != id.as_ref() {
                     return Err("json_array_item snapshot ID does not match its key".to_owned());
                 }
                 let parent_id = required_string(object, "parent_id")?.to_owned();
                 let order_key = parse_order_key(required_string(object, "order_key")?)?;
                 Ok(Self::Array {
                     id,
-                    parent_id,
-                    order_key,
+                    parent_id: intern_string(strings, &parent_id),
+                    order_key: intern_string(strings, &order_key),
                     kind,
                     scalar_json,
                 })
@@ -1497,10 +1534,10 @@ impl SemanticEntity {
         match self {
             Self::Root { .. } => EntityIdentity::Root,
             Self::Object { parent_id, key, .. } => EntityIdentity::Object {
-                parent_id: parent_id.clone(),
-                key: key.clone(),
+                parent_id: Arc::clone(parent_id),
+                key: Arc::clone(key),
             },
-            Self::Array { id, .. } => EntityIdentity::Array(id.clone()),
+            Self::Array { id, .. } => EntityIdentity::Array(Arc::clone(id)),
         }
     }
 
@@ -1518,17 +1555,21 @@ impl SemanticEntity {
         }
     }
 
-    fn parent_id(&self) -> Option<&str> {
+    fn parent_id_arc(&self) -> Option<Arc<str>> {
         match self {
             Self::Root { .. } => None,
-            Self::Object { parent_id, .. } | Self::Array { parent_id, .. } => Some(parent_id),
+            Self::Object { parent_id, .. } | Self::Array { parent_id, .. } => {
+                Some(Arc::clone(parent_id))
+            }
         }
     }
 
     fn order_key(&self) -> Option<&str> {
         match self {
             Self::Root { .. } => None,
-            Self::Object { order_key, .. } | Self::Array { order_key, .. } => Some(order_key),
+            Self::Object { order_key, .. } | Self::Array { order_key, .. } => {
+                Some(order_key.as_ref())
+            }
         }
     }
 
@@ -1539,7 +1580,35 @@ impl SemanticEntity {
         match self {
             Self::Root { .. } => Some(ROOT_ID),
             Self::Object { container_id, .. } => container_id.as_deref(),
-            Self::Array { id, .. } => Some(id),
+            Self::Array { id, .. } => Some(id.as_ref()),
+        }
+    }
+
+    fn node_relation(&self) -> NodeRelation {
+        match self {
+            Self::Root { .. } => NodeRelation::Root,
+            Self::Object {
+                parent_id,
+                key,
+                order_key,
+                container_id,
+                ..
+            } => NodeRelation::Object {
+                parent_id: Arc::clone(parent_id),
+                key: Arc::clone(key),
+                order_key: Arc::clone(order_key),
+                container_id: container_id.clone(),
+            },
+            Self::Array {
+                id,
+                parent_id,
+                order_key,
+                ..
+            } => NodeRelation::Array {
+                id: Arc::clone(id),
+                parent_id: Arc::clone(parent_id),
+                order_key: Arc::clone(order_key),
+            },
         }
     }
 
@@ -1581,18 +1650,18 @@ impl SemanticEntity {
 
 struct SemanticModel {
     entities: HashMap<EntityIdentity, SemanticEntity>,
-    children: HashMap<String, Vec<EntityIdentity>>,
+    children: HashMap<Arc<str>, Vec<EntityIdentity>>,
 }
 
 impl SemanticModel {
     fn new(entities: Vec<SemanticEntity>) -> Result<Self, String> {
         let mut by_identity = HashMap::with_capacity(entities.len());
-        let mut children: HashMap<String, Vec<EntityIdentity>> = HashMap::new();
+        let mut children: HashMap<Arc<str>, Vec<EntityIdentity>> = HashMap::new();
         for entity in entities {
             let identity = entity.identity();
-            if let Some(parent_id) = entity.parent_id() {
+            if let Some(parent_id) = entity.parent_id_arc() {
                 children
-                    .entry(parent_id.to_owned())
+                    .entry(parent_id)
                     .or_default()
                     .push(identity.clone());
             }
@@ -1617,13 +1686,16 @@ impl SemanticModel {
         })
     }
 
-    fn render(&self) -> Result<Vec<u8>, String> {
+    fn render_document(&self) -> Result<(Vec<u8>, Vec<Node>), String> {
         let mut output = Vec::new();
+        let mut nodes = Vec::with_capacity(self.entities.len());
         let mut visiting = HashSet::new();
         let mut visited = HashSet::new();
         self.render_entity(
             &EntityIdentity::Root,
+            None,
             &mut output,
+            &mut nodes,
             &mut visiting,
             &mut visited,
             0,
@@ -1631,17 +1703,19 @@ impl SemanticModel {
         if visited.len() != self.entities.len() {
             return Err("JSON entity graph contains unreachable entities".to_owned());
         }
-        Ok(output)
+        Ok((output, nodes))
     }
 
     fn render_entity(
         &self,
         identity: &EntityIdentity,
+        parent: Option<u32>,
         output: &mut Vec<u8>,
+        nodes: &mut Vec<Node>,
         visiting: &mut HashSet<EntityIdentity>,
         visited: &mut HashSet<EntityIdentity>,
         depth: usize,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         if depth > 1024 {
             return Err("JSON entity graph nesting exceeds 1024 levels".to_owned());
         }
@@ -1652,6 +1726,19 @@ impl SemanticModel {
             .entities
             .get(identity)
             .ok_or_else(|| format!("missing JSON entity {identity:?}"))?;
+        let start = u32::try_from(output.len()).map_err(|_| "JSON output offset exceeds 4GiB")?;
+        let node_index =
+            u32::try_from(nodes.len()).map_err(|_| "JSON has too many semantic nodes")?;
+        nodes.push(Node {
+            relation: entity.node_relation(),
+            kind: entity.kind(),
+            parent,
+            first_child: None,
+            next_sibling: None,
+            value_start: start,
+            value_len: 0,
+        });
+        let mut rendered_children = Vec::new();
         match entity.kind() {
             NodeKind::Object => {
                 output.push(b'{');
@@ -1671,11 +1758,19 @@ impl SemanticModel {
                         output.push(b',');
                     }
                     output.extend(
-                        serde_json::to_vec(key)
+                        serde_json::to_vec(key.as_ref())
                             .map_err(|error| format!("failed to render JSON key: {error}"))?,
                     );
                     output.push(b':');
-                    self.render_entity(child_identity, output, visiting, visited, depth + 1)?;
+                    rendered_children.push(self.render_entity(
+                        child_identity,
+                        Some(node_index),
+                        output,
+                        nodes,
+                        visiting,
+                        visited,
+                        depth + 1,
+                    )?);
                 }
                 output.push(b'}');
             }
@@ -1695,7 +1790,15 @@ impl SemanticModel {
                     if position > 0 {
                         output.push(b',');
                     }
-                    self.render_entity(child_identity, output, visiting, visited, depth + 1)?;
+                    rendered_children.push(self.render_entity(
+                        child_identity,
+                        Some(node_index),
+                        output,
+                        nodes,
+                        visiting,
+                        visited,
+                        depth + 1,
+                    )?);
                 }
                 output.push(b']');
             }
@@ -1706,80 +1809,23 @@ impl SemanticModel {
                     .as_bytes(),
             ),
         }
+        if let Some(first) = rendered_children.first().copied() {
+            nodes[usize::try_from(node_index).expect("u32 fits usize")].first_child = Some(first);
+        }
+        for pair in rendered_children.windows(2) {
+            nodes[usize::try_from(pair[0]).expect("u32 fits usize")].next_sibling = Some(pair[1]);
+        }
+        nodes[usize::try_from(node_index).expect("u32 fits usize")].value_len =
+            u32::try_from(output.len())
+                .map_err(|_| "JSON output size exceeds 4GiB")?
+                .checked_sub(start)
+                .ok_or_else(|| "JSON output span underflow".to_owned())?;
         visiting.remove(identity);
         if !visited.insert(identity.clone()) {
             return Err("JSON entity graph has multiple owning parents".to_owned());
         }
-        Ok(())
+        Ok(node_index)
     }
-
-    fn overlay(&self, nodes: &mut [Node]) -> Result<(), String> {
-        let mut parsed_lookup = HashMap::<EntityIdentity, u32>::new();
-        overlay_node(self, nodes, 0, &EntityIdentity::Root, &mut parsed_lookup)?;
-        if parsed_lookup.len() != nodes.len() {
-            return Err("rendered JSON node count differs from entity graph".to_owned());
-        }
-        Ok(())
-    }
-}
-
-fn overlay_node(
-    model: &SemanticModel,
-    nodes: &mut [Node],
-    node_index: u32,
-    identity: &EntityIdentity,
-    seen: &mut HashMap<EntityIdentity, u32>,
-) -> Result<(), String> {
-    let entity = model
-        .entities
-        .get(identity)
-        .ok_or_else(|| format!("missing overlay entity {identity:?}"))?;
-    let index = usize::try_from(node_index).expect("u32 fits usize");
-    nodes[index].relation = match entity {
-        SemanticEntity::Root { .. } => NodeRelation::Root,
-        SemanticEntity::Object {
-            parent_id,
-            key,
-            order_key,
-            container_id,
-            ..
-        } => NodeRelation::Object {
-            parent_id: Arc::from(parent_id.as_str()),
-            key: Arc::from(key.as_str()),
-            order_key: Arc::from(order_key.as_str()),
-            container_id: container_id
-                .as_ref()
-                .map(|value| Arc::<str>::from(value.as_str())),
-        },
-        SemanticEntity::Array {
-            id,
-            parent_id,
-            order_key,
-            ..
-        } => NodeRelation::Array {
-            id: Arc::from(id.as_str()),
-            parent_id: Arc::from(parent_id.as_str()),
-            order_key: Arc::from(order_key.as_str()),
-        },
-    };
-    if nodes[index].kind != entity.kind() {
-        return Err("rendered JSON kind differs from entity graph".to_owned());
-    }
-    if seen.insert(identity.clone(), node_index).is_some() {
-        return Err("entity graph overlays one identity more than once".to_owned());
-    }
-    let semantic_children = entity
-        .container_id()
-        .and_then(|container| model.children.get(container))
-        .map_or(&[][..], Vec::as_slice);
-    let parsed_children = direct_children(nodes, node_index);
-    if parsed_children.len() != semantic_children.len() {
-        return Err("rendered JSON child count differs from entity graph".to_owned());
-    }
-    for (child_index, child_identity) in parsed_children.into_iter().zip(semantic_children.iter()) {
-        overlay_node(model, nodes, child_index, child_identity, seen)?;
-    }
-    Ok(())
 }
 
 fn snapshot_node(
