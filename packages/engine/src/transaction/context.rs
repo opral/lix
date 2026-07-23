@@ -35,6 +35,7 @@ use crate::filesystem::{
     load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::gc::CheckpointRecoveryRef;
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection,
     LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -1786,6 +1787,28 @@ where
             .stage_selected_commit_change_refs(branch_id.clone(), selected_changes)?;
         self.staged_writes
             .add_commit_parent(branch_id, source_parent_commit_id)?;
+        Ok(commit_id)
+    }
+
+    pub(crate) fn stage_checkpoint_commit(
+        &self,
+        branch_id: String,
+        previous_checkpoint_commit_id: CommitId,
+        recovered_head_commit_id: CommitId,
+        selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
+    ) -> Result<String, LixError> {
+        let commit_id = self
+            .staged_writes
+            .stage_selected_commit_change_refs(branch_id.clone(), selected_changes)?;
+        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "staged checkpoint commit id")?;
+        self.staged_writes
+            .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
+        self.staged_writes
+            .add_checkpoint_recovery_ref(CheckpointRecoveryRef {
+                branch_id,
+                recovered_head_commit_id,
+                checkpoint_commit_id,
+            })?;
         Ok(commit_id)
     }
 

@@ -20,6 +20,7 @@ use crate::entity_pk::EntityPk;
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
+use crate::gc::CheckpointRecoveryRef;
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
@@ -48,6 +49,8 @@ pub(crate) struct TransactionWriteBuffer {
     by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
     insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>>,
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
+    first_commit_parent_override_by_branch: Mutex<BTreeMap<String, CommitId>>,
+    checkpoint_recovery_refs: Mutex<Vec<CheckpointRecoveryRef>>,
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
 }
@@ -62,6 +65,8 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) state_rows: Vec<PreparedStateRow>,
     pub(crate) insert_identities: BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
+    pub(crate) first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
+    pub(crate) checkpoint_recovery_refs: Vec<CheckpointRecoveryRef>,
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
 }
@@ -298,6 +303,8 @@ impl TransactionWriteBuffer {
             by_identity: Mutex::new(HashMap::new()),
             insert_identities: Mutex::new(BTreeMap::new()),
             commit_change_refs_by_branch: Mutex::new(BTreeMap::new()),
+            first_commit_parent_override_by_branch: Mutex::new(BTreeMap::new()),
+            checkpoint_recovery_refs: Mutex::new(Vec::new()),
             extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
@@ -342,6 +349,22 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged extra commit parents lock",
             )
         })?;
+        let mut first_parent_overrides_guard = self
+            .first_commit_parent_override_by_branch
+            .lock()
+            .map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged first commit parent overrides lock",
+            )
+        })?;
+        let mut checkpoint_recovery_refs_guard =
+            self.checkpoint_recovery_refs.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged checkpoint recovery refs lock",
+                )
+            })?;
         let result = Ok(PreparedWriteSet {
             state_rows: std::mem::take(&mut *rows_guard)
                 .into_iter()
@@ -349,11 +372,53 @@ impl TransactionWriteBuffer {
                 .collect(),
             insert_identities: std::mem::take(&mut *insert_identities_guard),
             commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
+            first_commit_parent_override_by_branch: std::mem::take(
+                &mut *first_parent_overrides_guard,
+            ),
+            checkpoint_recovery_refs: std::mem::take(&mut *checkpoint_recovery_refs_guard),
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         });
         by_identity_guard.clear();
         result
+    }
+
+    pub(crate) fn add_checkpoint_recovery_ref(
+        &self,
+        recovery: CheckpointRecoveryRef,
+    ) -> Result<(), LixError> {
+        self.checkpoint_recovery_refs
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged checkpoint recovery refs lock",
+                )
+            })?
+            .push(recovery);
+        Ok(())
+    }
+
+    /// Overrides the normal branch-head first parent for a staged commit.
+    ///
+    /// Checkpoint compaction uses the previous checkpoint as the new commit's
+    /// first parent, making intervening auto-commits unreachable from the
+    /// branch while preserving their net state in the checkpoint commit.
+    pub(crate) fn set_first_commit_parent(
+        &self,
+        branch_id: String,
+        parent_commit_id: CommitId,
+    ) -> Result<(), LixError> {
+        self.first_commit_parent_override_by_branch
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged first commit parent overrides lock",
+                )
+            })?
+            .insert(branch_id, parent_commit_id);
+        Ok(())
     }
 
     /// Records an additional parent for the commit generated for `branch_id`.

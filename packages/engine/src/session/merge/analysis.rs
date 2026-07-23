@@ -51,10 +51,10 @@ where
     let base_commit_id = commits.base_commit_id.to_string();
     let source_commit_id = commits.source_commit_id.to_string();
     let target_commit_id = commits.target_commit_id.to_string();
-    let source_diff = reader
+    let mut source_diff = reader
         .diff_commits(&base_commit_id, &source_commit_id, &request)
         .await?;
-    let target_diff = if commits.base_commit_id == commits.source_commit_id
+    let mut target_diff = if commits.base_commit_id == commits.source_commit_id
         || commits.base_commit_id == commits.target_commit_id
     {
         TrackedStateDiff::default()
@@ -63,6 +63,8 @@ where
             .diff_commits(&base_commit_id, &target_commit_id, &request)
             .await?
     };
+    exclude_internal_checkpoint_markers(&mut source_diff);
+    exclude_internal_checkpoint_markers(&mut target_diff);
 
     let outcome = if commits.base_commit_id == commits.source_commit_id {
         MergeOutcome::AlreadyUpToDate
@@ -106,4 +108,10 @@ where
         conflicts,
         merge_plan,
     })
+}
+
+fn exclude_internal_checkpoint_markers(diff: &mut TrackedStateDiff) {
+    diff.entries.retain(|entry| {
+        entry.identity.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+    });
 }

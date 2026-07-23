@@ -838,6 +838,66 @@ simulation_test!(
 );
 
 simulation_test!(
+    merge_branch_does_not_import_source_checkpoint_marker,
+    |sim| async move {
+        let (_engine, main, draft) = create_draft_from_main(&sim).await;
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-merge-target', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should diverge the target");
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-merge-source', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+        draft
+            .create_checkpoint()
+            .await
+            .expect("draft checkpoint should succeed");
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
+            })
+            .await
+            .expect("checkpointed source should merge");
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
+        assert_eq!(
+            receipt.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 1,
+                modified: 0,
+                removed: 0,
+            },
+            "checkpoint metadata must not count as a merged user change"
+        );
+
+        let checkpoints = main
+            .execute(
+                "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_depth",
+                &[],
+            )
+            .await
+            .expect("target checkpoint history should remain queryable");
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "selecting a source marker must not label the target merge commit"
+        );
+        assert_eq!(
+            checkpoints.rows()[0].values(),
+            &[Value::Text(sim.initial_commit_id().to_string())]
+        );
+        assert_key_value(&main, "checkpoint-merge-source", Some("\"draft\"")).await;
+    }
+);
+
+simulation_test!(
     merge_branch_selects_source_change_without_minting_equivalent_copy,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;

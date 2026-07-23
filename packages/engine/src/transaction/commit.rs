@@ -45,6 +45,9 @@ pub(crate) async fn commit_prepared_writes(
     prepared_writes: PreparedWriteSet,
 ) -> Result<StorageWriteSet, LixError> {
     let mut writes = StorageWriteSet::new();
+    for recovery in &prepared_writes.checkpoint_recovery_refs {
+        crate::gc::stage_recovery_ref_rotation(&mut writes, recovery)?;
+    }
     let mut json_writer = JsonStoreContext::new().writer();
 
     if !prepared_writes.file_data_writes.is_empty() {
@@ -79,6 +82,7 @@ pub(crate) async fn commit_prepared_writes(
         .collect::<BTreeSet<_>>();
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
+        prepared_writes.first_commit_parent_override_by_branch,
         prepared_writes.extra_commit_parents_by_branch,
         branch_ctx,
         &*read,
@@ -894,6 +898,7 @@ struct PendingTrackedRoot {
 
 async fn finalize_commit_rows(
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
+    first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     branch_ctx: &BranchContext,
     read: &(impl StorageAdapterRead + ?Sized),
@@ -912,12 +917,17 @@ async fn finalize_commit_rows(
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
         let selected_change_refs = change_refs.selected_change_refs;
-        let parent_commit_ids = branch_ctx
-            .ref_reader(read)
-            .load_head_commit_id(&branch_id)
-            .await?
-            .into_iter()
-            .collect::<Vec<_>>();
+        let parent_commit_ids =
+            if let Some(parent) = first_commit_parent_override_by_branch.get(&branch_id) {
+                vec![*parent]
+            } else {
+                branch_ctx
+                    .ref_reader(read)
+                    .load_head_commit_id(&branch_id)
+                    .await?
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
         let parent_commit_ids = merge_parent_commit_ids(
             parent_commit_ids,
             extra_commit_parents_by_branch
@@ -1039,6 +1049,8 @@ mod tests {
                     GLOBAL_BRANCH_ID.to_string(),
                     change_refs(["change-1"]),
                 )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_recovery_refs: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1243,6 +1255,8 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_recovery_refs: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1322,6 +1336,8 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![untracked_global_row("change-untracked")],
                 commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_recovery_refs: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1351,6 +1367,8 @@ mod tests {
                     GLOBAL_BRANCH_ID.to_string(),
                     change_refs(["change-tracked"]),
                 )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_recovery_refs: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1430,6 +1448,8 @@ mod tests {
                             "setup-branch-ref-change",
                         ),
                     )]),
+                    first_commit_parent_override_by_branch: BTreeMap::new(),
+                    checkpoint_recovery_refs: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
                     file_data_writes: Vec::new(),
                 },
@@ -1460,6 +1480,8 @@ mod tests {
                         "deterministic-mode-change",
                     )],
                     commit_change_refs_by_branch: BTreeMap::new(),
+                    first_commit_parent_override_by_branch: BTreeMap::new(),
+                    checkpoint_recovery_refs: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
                     file_data_writes: Vec::new(),
                 },
@@ -1506,6 +1528,8 @@ mod tests {
                     GLOBAL_BRANCH_ID.to_string(),
                     change_refs(["change-tracked"]),
                 )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_recovery_refs: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1634,6 +1658,8 @@ mod tests {
                     "branch-a".to_string(),
                     change_refs(["change-branch-a"]),
                 )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_recovery_refs: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1712,6 +1738,7 @@ mod tests {
                 change_refs(["change-a", "change-b"]),
             )]),
             BTreeMap::new(),
+            BTreeMap::new(),
             &branch_ctx,
             &mut read,
         )
@@ -1748,6 +1775,7 @@ mod tests {
                 StagedCommitChangeRefs::default(),
             )]),
             BTreeMap::new(),
+            BTreeMap::new(),
             &branch_ctx,
             &mut read,
         )
@@ -1772,6 +1800,7 @@ mod tests {
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
+            BTreeMap::new(),
             BTreeMap::new(),
             &branch_ctx,
             &mut read,
@@ -1798,6 +1827,7 @@ mod tests {
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
+            BTreeMap::new(),
             BTreeMap::from([(
                 "branch-a".to_string(),
                 vec![CommitId::for_test_label("source-head")],

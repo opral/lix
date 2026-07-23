@@ -9,6 +9,7 @@ import type {
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
+	CreateCheckpointReceipt,
 	ExecuteOptions,
 	LixBatchOptions,
 	MergeBranchOptions,
@@ -283,6 +284,23 @@ class RemoteLixBinding implements LixBinding {
 				hidden: value.hidden,
 				commitId: value.commitId,
 			};
+		});
+	}
+
+	async createCheckpoint(): Promise<CreateCheckpointReceipt> {
+		this.#assertOpen();
+		return this.#enqueue(async () => {
+			const value = record(
+				await this.#requestJson("checkpoint/create", { method: "POST" }),
+				"create checkpoint response",
+			);
+			if (
+				typeof value.commitId !== "string" ||
+				value.commitId.length === 0
+			) {
+				throw protocolError("create checkpoint response is invalid");
+			}
+			return { commitId: value.commitId };
 		});
 	}
 

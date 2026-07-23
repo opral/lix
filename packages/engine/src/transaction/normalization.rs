@@ -47,6 +47,7 @@ pub(crate) fn normalize_transaction_write_row(
     functions: FunctionProviderHandle,
 ) -> Result<NormalizedTransactionWriteRow, LixError> {
     validate_transaction_write_row_schema_identity(&row)?;
+    ensure_internal_checkpoint_schema(&row, schema_catalog)?;
 
     let Some((schema_plan_id, schema_plan)) =
         schema_catalog.snapshot().plan_for_key(&row.schema_key)
@@ -108,6 +109,37 @@ pub(crate) fn normalize_transaction_write_row(
         schema_plan_id,
         facts: PreparedRowFacts::default(),
     })
+}
+
+/// Checkpoint markers were introduced after repositories already existed.
+///
+/// Their schema is fixed and intentionally hidden from public entity
+/// surfaces, so legacy stores can validate this one engine-owned row from the
+/// compile-time definition without mutating their visible schema catalog.
+fn ensure_internal_checkpoint_schema(
+    row: &TransactionWriteRow,
+    schema_catalog: &mut TransactionCatalog,
+) -> Result<(), LixError> {
+    if row.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+        || schema_catalog.snapshot().schema(&row.schema_key).is_some()
+    {
+        return Ok(());
+    }
+    let schema = crate::schema::seed_schema_definition(&row.schema_key)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "compile-time checkpoint marker schema is missing",
+            )
+        })?
+        .clone();
+    let key = crate::schema::schema_key_from_definition(&schema)?;
+    schema_catalog.insert_schema_for_domain(
+        Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked),
+        key,
+        schema,
+    )?;
+    Ok(())
 }
 
 fn validate_transaction_write_row_schema_identity(
@@ -722,6 +754,32 @@ mod tests {
 
         let snapshot = normalized_snapshot(&row);
         assert_eq!(snapshot["name"], "foo.bar");
+    }
+
+    #[test]
+    fn normalization_supports_checkpoint_markers_in_legacy_catalogs() {
+        let mut catalog = catalog_with(Vec::new());
+        let branch_id = "legacy-main";
+        let row = TransactionWriteRow {
+            entity_pk: None,
+            schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
+            snapshot: Some(transaction_json(json!({ "branch_id": branch_id }))),
+            global: false,
+            untracked: false,
+            branch_id: branch_id.to_string(),
+            ..base_stage_row()
+        };
+
+        let normalized = normalize_transaction_write_row(row, &mut catalog, functions())
+            .expect("legacy catalog should use the fixed internal checkpoint schema");
+
+        assert_eq!(normalized.row.entity_pk, Some(EntityPk::single(branch_id)));
+        assert!(
+            catalog
+                .snapshot()
+                .schema(crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY)
+                .is_some()
+        );
     }
 
     fn normalized_snapshot(row: &NormalizedTransactionWriteRow) -> &JsonValue {

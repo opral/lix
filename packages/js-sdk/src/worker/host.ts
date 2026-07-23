@@ -137,6 +137,8 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredClientStateMethod("clientStateDelete")(operation.key);
 			case "createBranch":
 				return requiredLix().createBranch(operation.options);
+			case "createCheckpoint":
+				return requiredLix().createCheckpoint();
 			case "switchBranch":
 				return requiredLix().switchBranch(operation.options);
 			case "mergeBranchPreview":
