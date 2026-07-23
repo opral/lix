@@ -50,17 +50,18 @@ omits production filesystem synchronization and is not a substitute for
 Latency runs do not use the I/O-counting wrapper. Logical I/O is collected in
 separate single-round runs with `LIX_PROFILE_IO_STATS=1`.
 
-Every measured CSV edit resets and prints the engine's aggregate v2 transition
-counters as `plugin_v2_counters`. The harness fails the run unless the warm
-single-row edit materializes no full semantic state, requests and returns fewer
-than 64 change payloads, persists exactly one semantic change, hits both the
-private actor and shared renderer documents once, and performs no full document
-reparse, full renderer invocation, or filesystem-sync full render. These are
-work invariants in addition to the latency gate; a faster sample cannot hide a
-regression to document-sized work. It also requires a nonzero measured guest
-linear-memory high-water no larger than the 64 MiB production ceiling, even
-when the paired timing run gives both arms the same larger diagnostic cap.
-For provenance-backed edits, `host_full_diff_bytes_compared` and
+Every measured Component v2 edit (CSV or the JSON v2 arm) resets and prints the
+engine's aggregate transition counters as `plugin_v2_counters`. The harness
+fails the run unless the warm single-row or single-property edit materializes
+no full semantic state, requests and returns fewer than 64 change payloads,
+persists exactly one semantic change, hits both the private actor and shared
+renderer documents once, and performs no full document reparse, full renderer
+invocation, or filesystem-sync full render. These are work invariants in
+addition to the latency gate; a faster sample cannot hide a regression to
+document-sized work. CSV additionally stays under its 64 MiB production
+ceiling. The JSON paired diagnostic checks against its explicitly configured
+equal-arm ceiling and reports the observed high-water. For provenance-backed
+edits, `host_full_diff_bytes_compared` and
 `host_full_content_classification_bytes` must both be zero: the host validates
 the localized splice and its UTF-8 boundary window instead of rescanning the
 complete file before entering the component.
@@ -190,10 +191,62 @@ can be reused, in which case only the runner-owned templates, cases, and logs
 are replaced.
 
 This JSON result is explicitly a candidate-only, Component Model v1 mechanism
-diagnostic. It is **not** a PR2 v2 acceptance result and is not analyzed by the
-paired CSV gate below.
+diagnostic. It is **not** a PR2 v2 acceptance result and is not analyzed by
+either paired gate below.
 
-## Paired acceptance run
+## JSON v1-v2 paired gate
+
+`run_json_paired.py` compares the real Component v1 and Component v2 JSON
+plugins through one benchmark executable. The runner selects the embedded arm
+with `LIX_PROFILE_JSON_API=v1|v2`; this avoids treating build-to-build noise as
+an API effect. For each backend and metric, it alternates arm order across 12
+blocks and gives every fresh process a copy of that API's pristine setup
+template. The default design uses five warmups, twenty measured samples per
+arm/block, a common 256 MiB diagnostic ceiling, and 10,000 bootstrap draws:
+
+```sh
+python experiments/plugin-api-v2/engine-bench/run_json_paired.py \
+  --benchmark <profile-binary-containing-both-json-plugins> \
+  --run-dir <new-dedicated-json-paired-directory>
+
+python experiments/plugin-api-v2/engine-bench/json_paired_gate.py \
+  <new-dedicated-json-paired-directory>/json-v1-v2-paired-raw.json \
+  --output <json-paired-gate-result.json>
+```
+
+The raw artifact records the executable, runner, and both manifests with byte
+counts and SHA-256 hashes, plus exact sample arrays, per-round v2 hot-path
+counters, counterbalanced execution order, and hashed raw logs. The analyzer
+requires the exact 10,000,000-byte, 220,000-property fixture. On each backend,
+the one-sided 95% upper v2/v1 ratio must be strictly below 0.80 for edit p50
+and p95. Exact-render guardrails are at most 1.05 for p50 and 1.10 for p95.
+The v2 edit counter gate also rejects source reads for the inline one-byte
+splice, host full-blob diff/classification, full semantic materialization,
+full reparses/renders, missing single-entity persistence/cache hits, or guest
+memory above the configured campaign ceiling.
+
+A dependency-free E2E smoke checks packaging, execution, parsing, and analysis
+without claiming acceptance:
+
+```sh
+python experiments/plugin-api-v2/engine-bench/run_json_paired.py \
+  --benchmark <profile-binary-containing-both-json-plugins> \
+  --run-dir <new-dedicated-json-smoke-directory> \
+  --fast-smoke
+
+python experiments/plugin-api-v2/engine-bench/json_paired_gate.py \
+  <new-dedicated-json-smoke-directory>/json-v1-v2-paired-raw.json \
+  --allow-smoke
+```
+
+The smoke analyzer still exits nonzero when its latency guardrails or hot-path
+counters fail; a successful smoke only means the reduced checks passed, never
+that the candidate met the acceptance design.
+
+The 256 MiB value is a configurable, equal-arm diagnostic ceiling, not a
+statement that Wasm has a fixed 64 MiB limit.
+
+## CSV paired acceptance run
 
 `run_paired.py` executes the preregistered minimum of 12 fresh-process blocks
 per backend. Each block contains exactly five unreported warmups and twenty

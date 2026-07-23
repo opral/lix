@@ -1,0 +1,24 @@
+[package]
+name = "plugin_json_incremental_v2"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Incremental JSON file plugin for the Lix Wasm Component v2 API"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = { version = "1", features = ["raw_value"] }
+wit-bindgen = "0.57"

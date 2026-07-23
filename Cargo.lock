@@ -3431,6 +3431,7 @@ dependencies = [
  "object_store 0.14.0",
  "plugin_csv",
  "plugin_csv_v2",
+ "plugin_json_incremental_v2",
  "plugin_json_v2",
  "rusqlite",
  "serde_json",
@@ -4248,6 +4249,14 @@ name = "plugin_csv_v2"
 version = "0.8.4"
 dependencies = [
  "base64 0.22.1",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "plugin_json_incremental_v2"
+version = "0.8.4"
+dependencies = [
  "serde_json",
  "wit-bindgen 0.57.1",
 ]
