@@ -76,6 +76,7 @@ class RemoteLixBinding implements LixBinding {
 	readonly #observationHub: RemoteObservationHub;
 	readonly #requestBlobBases = new Map<string, RequestBlobBase>();
 	#sessionId: string | undefined;
+	#activeBranchId: string | undefined;
 	#supportsRequestBlobSplice = false;
 	#requestBlobBaseBytes = 0;
 	#acceptingOperations = true;
@@ -130,6 +131,7 @@ class RemoteLixBinding implements LixBinding {
 			await this.#requestJson(path, { method: "GET" }),
 		);
 		this.#sessionId = handshake.sessionId;
+		this.#activeBranchId = handshake.activeBranchId;
 		this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
 	}
 
@@ -241,13 +243,17 @@ class RemoteLixBinding implements LixBinding {
 	async activeBranchId(): Promise<string> {
 		this.#assertOpen();
 		return this.#enqueue(async () => {
-			const handshake = decodeHandshake(
-				await this.#requestJson("", { method: "GET" }),
-			);
-			if (handshake.sessionId !== this.#sessionId) {
-				throw protocolError("remote handshake changed sessionId");
+			if (this.#activeBranchId === undefined) {
+				const handshake = decodeHandshake(
+					await this.#requestJson("", { method: "GET" }),
+				);
+				if (handshake.sessionId !== this.#sessionId) {
+					throw protocolError("remote handshake changed sessionId");
+				}
+				this.#activeBranchId = handshake.activeBranchId;
+				this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
 			}
-			return handshake.activeBranchId;
+			return this.#activeBranchId;
 		});
 	}
 
@@ -285,18 +291,35 @@ class RemoteLixBinding implements LixBinding {
 	): Promise<SwitchBranchReceipt> {
 		this.#assertOpen();
 		return this.#enqueue(async () => {
-			const value = record(
-				await this.#requestJson("branch/switch", {
-					method: "POST",
-					body: JSON.stringify(options),
-				}),
-				"switch branch response",
-			);
-			if (value.branchId !== options.branchId) {
-				throw protocolError("switch branch response is invalid");
+			let requestAttempted = false;
+			try {
+				const value = record(
+					await this.#requestJson(
+						"branch/switch",
+						{
+							method: "POST",
+							body: JSON.stringify(options),
+						},
+						"json",
+						() => {
+							requestAttempted = true;
+						},
+					),
+					"switch branch response",
+				);
+				if (value.branchId !== options.branchId) {
+					throw protocolError("switch branch response is invalid");
+				}
+				this.#activeBranchId = options.branchId;
+				this.#observationHub.restart();
+				return { branchId: options.branchId };
+			} catch (error) {
+				if (requestAttempted && !isDefinitiveClientError(error)) {
+					this.#activeBranchId = undefined;
+					this.#observationHub.restart();
+				}
+				throw error;
 			}
-			this.#observationHub.restart();
-			return { branchId: options.branchId };
 		});
 	}
 
@@ -337,6 +360,7 @@ class RemoteLixBinding implements LixBinding {
 		path: string,
 		init: RequestInit,
 		responseKind: "json" | "empty" = "json",
+		onRequestAttempt?: () => void,
 	): Promise<unknown> {
 		const headers = new Headers(await resolveHeaders(this.#headers));
 		if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
@@ -356,11 +380,16 @@ class RemoteLixBinding implements LixBinding {
 			}
 		}
 		let response: Response;
+		const url = new URL(path, this.#baseUrl);
+		const fetchInit = {
+			...requestInit,
+			headers,
+		};
+		// A custom fetch may transmit before throwing, so failures become
+		// ambiguous only once control is handed to it.
+		onRequestAttempt?.();
 		try {
-			response = await this.#fetch(new URL(path, this.#baseUrl), {
-				...requestInit,
-				headers,
-			});
+			response = await this.#fetch(url, fetchInit);
 		} catch (cause) {
 			throw remoteError(
 				"LIX_REMOTE_UNAVAILABLE",
@@ -1196,6 +1225,18 @@ async function errorFromHttpResponse(response: Response): Promise<Error> {
 			},
 		);
 	}
+}
+
+function isDefinitiveClientError(error: unknown): boolean {
+	if (!(error instanceof Error) || !("status" in error)) return false;
+	const status = (error as { status?: unknown }).status;
+	return (
+		typeof status === "number" &&
+		status >= 400 &&
+		status < 500 &&
+		status !== 408 &&
+		status !== 429
+	);
 }
 
 function isRetryableObserveStatus(status: number): boolean {
