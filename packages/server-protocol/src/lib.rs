@@ -23,14 +23,14 @@ use std::{
     convert::Infallible,
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Once,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
     runtime::Handle,
-    sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, mpsc},
+    sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, mpsc, watch},
     task::JoinHandle,
 };
 use tower_http::{
@@ -70,11 +70,19 @@ const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
+const SESSION_OPEN_GATE_CLOSING: usize = 1 << (usize::BITS - 1);
+const SESSION_OPEN_GATE_COUNT_MASK: usize = !SESSION_OPEN_GATE_CLOSING;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Resource limits for one workspace's remote protocol sessions.
 #[derive(Clone, Copy, Debug)]
 pub struct ProtocolServerOptions {
+    /// Maximum number of retained remote sessions and their per-session caches.
+    ///
+    /// Handshakes may briefly validate up to this many lightweight candidate
+    /// handles alongside retained sessions. A candidate is registered only
+    /// after validation succeeds, and the retained sessions plus their
+    /// per-session caches never exceed this limit.
     pub max_sessions: usize,
     pub session_idle_timeout: Duration,
     pub max_request_body_bytes: usize,
@@ -121,9 +129,12 @@ where
     root: Arc<Lix<S>>,
     options: ProtocolServerOptions,
     registry: AsyncMutex<SessionRegistry<S>>,
+    session_open_gate: Arc<SessionOpenGate>,
+    close_started: Once,
+    close_result: watch::Sender<Option<Result<(), LixError>>>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerLifecycle {
     Open,
     Closing,
@@ -136,6 +147,79 @@ where
 {
     lifecycle: ServerLifecycle,
     sessions: HashMap<String, Arc<SessionRecord<S>>>,
+}
+
+#[derive(Default)]
+struct SessionOpenGate {
+    state: AtomicUsize,
+    drained: Notify,
+}
+
+struct PendingSessionOpen {
+    gate: Arc<SessionOpenGate>,
+    active: bool,
+}
+
+impl SessionOpenGate {
+    fn reserve(self: &Arc<Self>, limit: usize) -> Result<PendingSessionOpen, ApiError> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & SESSION_OPEN_GATE_CLOSING != 0 {
+                return Err(ApiError::server_closed());
+            }
+            if (state & SESSION_OPEN_GATE_COUNT_MASK) >= limit {
+                return Err(ApiError::capacity());
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(PendingSessionOpen {
+                        gate: Arc::clone(self),
+                        active: true,
+                    });
+                }
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn start_closing(&self) {
+        self.state
+            .fetch_or(SESSION_OPEN_GATE_CLOSING, Ordering::AcqRel);
+    }
+
+    fn pending(&self) -> usize {
+        self.state.load(Ordering::Acquire) & SESSION_OPEN_GATE_COUNT_MASK
+    }
+}
+
+impl PendingSessionOpen {
+    fn commit(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let previous = self.gate.state.fetch_sub(1, Ordering::AcqRel);
+        let previous_pending = previous & SESSION_OPEN_GATE_COUNT_MASK;
+        debug_assert!(previous_pending > 0, "pending session open count underflow");
+        if previous_pending == 1 {
+            self.gate.drained.notify_one();
+        }
+    }
+}
+
+impl Drop for PendingSessionOpen {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 struct SessionRecord<S>
@@ -465,12 +549,19 @@ where
                 "protocol max_sessions must be greater than zero",
             ));
         }
+        if options.max_sessions > SESSION_OPEN_GATE_COUNT_MASK {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "protocol max_sessions exceeds the supported session-open limit",
+            ));
+        }
         if options.max_request_body_bytes == 0 {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "protocol max_request_body_bytes must be greater than zero",
             ));
         }
+        let (close_result, _) = watch::channel(None);
         Ok(Self {
             inner: Arc::new(ServerInner {
                 root,
@@ -479,6 +570,9 @@ where
                     lifecycle: ServerLifecycle::Open,
                     sessions: HashMap::new(),
                 }),
+                session_open_gate: Arc::new(SessionOpenGate::default()),
+                close_started: Once::new(),
+                close_result,
             }),
         })
     }
@@ -531,6 +625,9 @@ where
         let Ok(registry) = self.inner.registry.try_lock() else {
             return false;
         };
+        if self.inner.session_open_gate.pending() != 0 {
+            return false;
+        }
         let now = Instant::now();
         registry
             .sessions
@@ -541,16 +638,51 @@ where
     /// Closes every child session and finally the root workspace session.
     /// Repeated calls are safe.
     pub async fn close(&self) -> Result<(), LixError> {
-        let mut registry = self.inner.registry.lock().await;
-        if registry.lifecycle == ServerLifecycle::Closed {
-            return Ok(());
+        let mut close_result = self.inner.close_result.subscribe();
+        self.inner.close_started.call_once(|| {
+            self.inner.session_open_gate.start_closing();
+            let server = self.clone();
+            tokio::spawn(async move {
+                let closing_server = server.clone();
+                let result =
+                    match tokio::spawn(async move { closing_server.close_once().await }).await {
+                        Ok(result) => result,
+                        Err(error) => Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("join Lix protocol server close: {error}"),
+                        )),
+                    };
+                server.inner.close_result.send_replace(Some(result));
+            });
+        });
+        loop {
+            let completed = close_result.borrow().clone();
+            if let Some(result) = completed {
+                return result;
+            }
+            close_result
+                .changed()
+                .await
+                .expect("protocol server owns its close result channel");
         }
-        registry.lifecycle = ServerLifecycle::Closing;
-        let sessions = registry
-            .sessions
-            .drain()
-            .map(|(_, record)| record)
-            .collect::<Vec<_>>();
+    }
+
+    async fn close_once(&self) -> Result<(), LixError> {
+        {
+            let mut registry = self.inner.registry.lock().await;
+            registry.lifecycle = ServerLifecycle::Closing;
+        }
+        while self.inner.session_open_gate.pending() != 0 {
+            self.inner.session_open_gate.drained.notified().await;
+        }
+        let sessions = {
+            let mut registry = self.inner.registry.lock().await;
+            registry
+                .sessions
+                .drain()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>()
+        };
         let mut first_error = None;
         for record in sessions {
             if let Err(error) = close_session_record(&record).await
@@ -564,6 +696,7 @@ where
         {
             first_error = Some(error);
         }
+        let mut registry = self.inner.registry.lock().await;
         registry.lifecycle = ServerLifecycle::Closed;
         first_error.map_or(Ok(()), Err)
     }
@@ -572,8 +705,7 @@ where
         &self,
         initial_active_branch_id: Option<String>,
     ) -> Result<SessionLease<S>, ApiError> {
-        let mut registry = self.inner.registry.lock().await;
-        ensure_server_open(registry.lifecycle)?;
+        let pending_open = self.reserve_session_open()?;
 
         let active_branch_id = match initial_active_branch_id {
             Some(active_branch_id) => active_branch_id,
@@ -584,6 +716,25 @@ where
         // evict another client.
         let child = self.inner.root.open_session(active_branch_id).await?;
 
+        let mut registry = self.inner.registry.lock().await;
+        if let Err(error) = ensure_server_open(registry.lifecycle) {
+            drop(registry);
+            close_unregistered_session(child).await;
+            return Err(error);
+        }
+        let session_id = loop {
+            let candidate = match generate_session_id() {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    drop(registry);
+                    close_unregistered_session(child).await;
+                    return Err(error);
+                }
+            };
+            if !registry.sessions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let now = Instant::now();
         let expired_ids = registry
             .sessions
@@ -593,12 +744,12 @@ where
             })
             .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
+        let mut removed_sessions = Vec::with_capacity(expired_ids.len().saturating_add(1));
         for session_id in expired_ids {
             if let Some(record) = registry.sessions.remove(&session_id) {
-                close_removed_session(record).await;
+                removed_sessions.push(record);
             }
         }
-
         if registry.sessions.len() >= self.inner.options.max_sessions {
             let lru_idle_id = registry
                 .sessions
@@ -607,31 +758,34 @@ where
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
             let Some(lru_idle_id) = lru_idle_id else {
-                if let Err(error) = child.close().await {
-                    tracing::warn!(
-                        code = %error.code,
-                        message = %error.message,
-                        "failed to close an unregistered Lix protocol session"
-                    );
+                drop(registry);
+                for record in removed_sessions {
+                    close_removed_session(record).await;
                 }
+                close_unregistered_session(child).await;
                 return Err(ApiError::capacity());
             };
             if let Some(record) = registry.sessions.remove(&lru_idle_id) {
-                close_removed_session(record).await;
+                removed_sessions.push(record);
             }
         }
-
-        let session_id = loop {
-            let candidate = generate_session_id()?;
-            if !registry.sessions.contains_key(&candidate) {
-                break candidate;
-            }
-        };
         let record = Arc::new(SessionRecord::new(child, now));
         registry
             .sessions
             .insert(session_id.clone(), Arc::clone(&record));
-        Ok(SessionLease::new(session_id, record))
+        let lease = SessionLease::new(session_id, record);
+        drop(registry);
+        for record in removed_sessions {
+            close_removed_session(record).await;
+        }
+        pending_open.commit();
+        Ok(lease)
+    }
+
+    fn reserve_session_open(&self) -> Result<PendingSessionOpen, ApiError> {
+        self.inner
+            .session_open_gate
+            .reserve(self.inner.options.max_sessions)
     }
 
     async fn lease(&self, session_id: &str) -> Result<SessionLease<S>, ApiError> {
@@ -680,6 +834,19 @@ where
             code = %error.code,
             message = %error.message,
             "failed to close an evicted Lix protocol session"
+        );
+    }
+}
+
+async fn close_unregistered_session<S>(session: Lix<S>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    if let Err(error) = session.close().await {
+        tracing::warn!(
+            code = %error.code,
+            message = %error.message,
+            "failed to close an unregistered Lix protocol session"
         );
     }
 }
@@ -1950,7 +2117,8 @@ mod tests {
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix_sdk::{
-        Memory, OpenLixOptions, TracingTelemetrySink, open_lix, open_lix_with_telemetry,
+        Memory, MemoryRead, MemoryWrite, OpenLixOptions, ReadOptions, StorageError,
+        TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
     };
     use serde_json::{Value as JsonValue, json};
     use std::{
@@ -2005,6 +2173,66 @@ mod tests {
     struct TestApp {
         server: LixProtocolServer<Memory>,
         router: Router,
+    }
+
+    #[derive(Clone, Debug)]
+    struct GatedReadStorage {
+        inner: Memory,
+        first_reads: Arc<GatedReads>,
+    }
+
+    #[derive(Debug)]
+    struct GatedReads {
+        remaining: AtomicUsize,
+        barrier: tokio::sync::Barrier,
+    }
+
+    impl GatedReadStorage {
+        fn new(participants: usize) -> Self {
+            Self {
+                inner: Memory::new(),
+                first_reads: Arc::new(GatedReads {
+                    remaining: AtomicUsize::new(0),
+                    barrier: tokio::sync::Barrier::new(participants),
+                }),
+            }
+        }
+
+        fn gate_next_reads(&self, count: usize) {
+            self.first_reads.remaining.store(count, Ordering::Release);
+        }
+    }
+
+    impl Storage for GatedReadStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self
+                .first_reads
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.first_reads.barrier.wait().await;
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
     }
 
     async fn app() -> TestApp {
@@ -2389,6 +2617,28 @@ mod tests {
             app.server.inner.registry.lock().await.sessions.len(),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_branch_does_not_evict_an_idle_session_at_capacity() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_sessions: 1,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (existing_session, _) = new_session(&app.router).await;
+        let invalid = request(
+            &app.router,
+            "GET",
+            "/lix/v1?activeBranchId=missing-branch",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+
+        let resumed = request(&app.router, "GET", "/lix/v1", Some(&existing_session), None).await;
+        assert_eq!(resumed.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3302,6 +3552,259 @@ mod tests {
         .await;
         let (_session_id, _) = new_session(&expired.router).await;
         assert!(expired.server.is_idle());
+    }
+
+    #[tokio::test]
+    async fn pending_session_open_reservations_are_bounded_and_cancel_safe() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_sessions: 1,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let pending = app
+            .server
+            .reserve_session_open()
+            .expect("reserve pending session open");
+        assert!(!app.server.is_idle());
+
+        let Err(at_capacity) = app.server.reserve_session_open() else {
+            panic!("pending opens must be bounded");
+        };
+        assert_eq!(at_capacity.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(pending);
+        assert!(app.server.is_idle());
+        drop(
+            app.server
+                .reserve_session_open()
+                .expect("released reservation can be reused"),
+        );
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_pending_session_opens_before_closing_the_root() {
+        let app = app().await;
+        let pending = app
+            .server
+            .reserve_session_open()
+            .expect("reserve pending session open");
+        let server = app.server.clone();
+        let closing = tokio::spawn(async move { server.close().await });
+
+        loop {
+            let lifecycle = app.server.inner.registry.lock().await.lifecycle;
+            if lifecycle == ServerLifecycle::Closing {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!closing.is_finished());
+        let Err(closed) = app.server.reserve_session_open() else {
+            panic!("closing server must reject new reservations");
+        };
+        assert_eq!(closed.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(pending);
+        closing
+            .await
+            .expect("join server close")
+            .expect("close server");
+        assert_eq!(
+            app.server.inner.registry.lock().await.lifecycle,
+            ServerLifecycle::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_eviction_cleanup_in_a_pending_session_open() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_sessions: 1,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let first = app
+            .server
+            .create_session(None)
+            .await
+            .expect("open first session");
+        let first_session_id = first.session_id.clone();
+        let first_record = Arc::clone(&first.record);
+        drop(first);
+
+        // Keep eviction cleanup blocked after the replacement is registered.
+        // Shutdown must continue to track the whole create operation, not only
+        // the child open and registry mutation.
+        let first_session_read = first_record.lix.read().await;
+        let branch_id = app
+            .server
+            .inner
+            .root
+            .active_branch_id()
+            .await
+            .expect("active branch");
+        let server = app.server.clone();
+        let replacement = tokio::spawn(async move { server.create_session(Some(branch_id)).await });
+
+        loop {
+            let replaced = {
+                let registry = app.server.inner.registry.lock().await;
+                registry.sessions.len() == 1 && !registry.sessions.contains_key(&first_session_id)
+            };
+            if replaced {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.server.inner.session_open_gate.pending(), 1);
+
+        let server = app.server.clone();
+        let mut closing = tokio::spawn(async move { server.close().await });
+        loop {
+            if app.server.inner.registry.lock().await.lifecycle != ServerLifecycle::Open {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut closing)
+                .await
+                .is_err(),
+            "close completed before pending eviction cleanup"
+        );
+
+        drop(first_session_read);
+        let replacement = replacement
+            .await
+            .expect("join replacement open")
+            .expect("open replacement session");
+        drop(replacement);
+        closing
+            .await
+            .expect("join server close")
+            .expect("close server");
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_caller_does_not_cancel_server_shutdown() {
+        let app = app().await;
+        let pending = app
+            .server
+            .reserve_session_open()
+            .expect("reserve pending session open");
+        let server = app.server.clone();
+        let closing = tokio::spawn(async move { server.close().await });
+
+        loop {
+            if app.server.inner.registry.lock().await.lifecycle == ServerLifecycle::Closing {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        closing.abort();
+        assert!(
+            closing
+                .await
+                .expect_err("close caller should be cancelled")
+                .is_cancelled()
+        );
+
+        drop(pending);
+        app.server
+            .close()
+            .await
+            .expect("detached server close should complete");
+        assert_eq!(
+            app.server.inner.registry.lock().await.lifecycle,
+            ServerLifecycle::Closed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_session_opens_do_not_hold_the_registry_lock_during_storage_reads() {
+        const SESSION_COUNT: usize = 8;
+        let storage = GatedReadStorage::new(SESSION_COUNT);
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let branch_id = root.active_branch_id().await.expect("active branch");
+        let server = LixProtocolServer::with_options(
+            root,
+            ProtocolServerOptions {
+                max_sessions: SESSION_COUNT,
+                ..ProtocolServerOptions::default()
+            },
+        )
+        .expect("protocol server");
+        storage.gate_next_reads(SESSION_COUNT);
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..SESSION_COUNT {
+            let server = server.clone();
+            let branch_id = branch_id.clone();
+            tasks.spawn(async move {
+                server
+                    .create_session(Some(branch_id))
+                    .await
+                    .expect("open protocol session")
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                drop(result.expect("join session open"));
+            }
+        })
+        .await
+        .expect("all session opens should reach the storage barrier concurrently");
+        assert_eq!(
+            server.inner.registry.lock().await.sessions.len(),
+            SESSION_COUNT
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "manual concurrent session-open performance diagnostic"]
+    async fn concurrent_session_open_perf() {
+        const OPERATIONS: usize = 512;
+        const OPERATIONS_AS_F64: f64 = 512.0;
+        for concurrency in [1_usize, 8, 32, 64] {
+            let app = app_with_options(ProtocolServerOptions {
+                max_sessions: OPERATIONS + 16,
+                ..ProtocolServerOptions::default()
+            })
+            .await;
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let batch_started = Instant::now();
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..OPERATIONS {
+                let router = app.router.clone();
+                let semaphore = Arc::clone(&semaphore);
+                tasks.spawn(async move {
+                    let permit = semaphore.acquire_owned().await.expect("semaphore open");
+                    let request_started = Instant::now();
+                    let response = request(&router, "GET", "/lix/v1", None, None).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    drop(permit);
+                    request_started.elapsed()
+                });
+            }
+            let mut samples = Vec::with_capacity(OPERATIONS);
+            while let Some(result) = tasks.join_next().await {
+                samples.push(result.expect("join handshake"));
+            }
+            let elapsed = batch_started.elapsed();
+            samples.sort_unstable();
+            let p50 = samples[OPERATIONS / 2];
+            let p95 = samples[OPERATIONS * 95 / 100];
+            eprintln!(
+                "session_open concurrency={concurrency} operations={OPERATIONS} ops_s={:.1} p50_us={} p95_us={} elapsed_ms={}",
+                OPERATIONS_AS_F64 / elapsed.as_secs_f64(),
+                p50.as_micros(),
+                p95.as_micros(),
+                elapsed.as_millis(),
+            );
+        }
     }
 
     #[tokio::test]
