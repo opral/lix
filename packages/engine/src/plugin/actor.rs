@@ -96,6 +96,22 @@ pub(crate) struct PluginActorCache {
     cold_open_gate: Arc<AsyncMutex<()>>,
 }
 
+pub(crate) enum PluginActorColdOpen {
+    Ready(PluginObservation),
+    Build(PluginActorColdInstall),
+}
+
+pub(crate) struct PluginActorColdInstall {
+    key: PluginActorKey,
+    expected_stale: Option<PluginActorExpectedStale>,
+}
+
+struct PluginActorExpectedStale {
+    slot: Arc<PluginActorSlot>,
+    revision: u64,
+    semantic_root: Arc<str>,
+}
+
 impl Default for PluginActorCache {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_PLUGIN_FILE_ACTORS)
@@ -127,6 +143,56 @@ impl PluginActorCache {
     /// multiple full semantic snapshots plus Wasm Stores concurrently.
     pub(crate) async fn cold_open_guard(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.cold_open_gate).lock_owned().await
+    }
+
+    /// Captures the exact same-key slot that a cold open is allowed to replace.
+    ///
+    /// The token is compare-and-replace authority, not general cache authority:
+    /// publication succeeds only if that slot still has the same revision and
+    /// semantic root. A concurrent warm commit or cold install therefore wins
+    /// without being clobbered by the slower builder.
+    pub(crate) async fn prepare_cold_open(
+        &self,
+        key: &PluginActorKey,
+        semantic_root: &str,
+    ) -> Result<PluginActorColdOpen, LixError> {
+        loop {
+            let slot = match self.lookup_slot(key) {
+                Ok(slot) => slot,
+                Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
+                    return Ok(PluginActorColdOpen::Build(PluginActorColdInstall {
+                        key: key.clone(),
+                        expected_stale: None,
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
+            let accepted = Arc::clone(&slot.state).lock_owned().await;
+            if slot.retired.load(Ordering::Acquire) {
+                drop(accepted);
+                self.remove_if_same(key, &slot);
+                continue;
+            }
+            let revision = slot.revision.load(Ordering::Acquire);
+            if accepted.semantic_root.as_ref() == semantic_root {
+                return Ok(PluginActorColdOpen::Ready(PluginObservation {
+                    key: key.clone(),
+                    actor_nonce: slot.nonce,
+                    revision,
+                    semantic_root: Arc::clone(&accepted.semantic_root),
+                }));
+            }
+            let stale_root = Arc::clone(&accepted.semantic_root);
+            drop(accepted);
+            return Ok(PluginActorColdOpen::Build(PluginActorColdInstall {
+                key: key.clone(),
+                expected_stale: Some(PluginActorExpectedStale {
+                    slot,
+                    revision,
+                    semantic_root: stale_root,
+                }),
+            }));
+        }
     }
 
     /// Publishes an already-opened document. Callers invoke this only after
@@ -180,13 +246,15 @@ impl PluginActorCache {
         }
     }
 
-    /// Publishes a cold-opened snapshot only while the key is still vacant.
+    /// Publishes a cold-opened snapshot only while the key is still vacant or
+    /// the exact stale slot captured by `prepare_cold_open` remains unchanged.
     /// A concurrently committed actor is authoritative and is never replaced
-    /// by the stale cold candidate. The losing Store is explicitly retired,
+    /// by the slower cold candidate. The losing Store is explicitly retired,
     /// then the caller observes the winner only if it represents the same
     /// semantic root.
     pub(crate) async fn install_cold_if_absent(
         &self,
+        cold_install: PluginActorColdInstall,
         key: PluginActorKey,
         actor: Box<dyn WasmComponentV2Actor>,
         document: WasmDocumentHandle,
@@ -194,7 +262,20 @@ impl PluginActorCache {
         semantic_root: impl Into<Arc<str>>,
     ) -> Result<PluginObservation, LixError> {
         let semantic_root = semantic_root.into();
+        if cold_install.key != key {
+            let mut actor = actor;
+            let _ = actor.drop_document(document).await;
+            let _ = actor.retire().await;
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "cold plugin actor install token belongs to a different key",
+            ));
+        }
         let mut candidate = Some((actor, document, bytes));
+        let expected_guard = match &cold_install.expected_stale {
+            Some(expected) => Some(Arc::clone(&expected.slot.state).lock_owned().await),
+            None => None,
+        };
         let installed = {
             let mut state = self.lock();
             if state
@@ -204,7 +285,22 @@ impl PluginActorCache {
             {
                 state.actors.remove(&key);
             }
-            if state.actors.contains_key(&key) {
+            let may_install = match (
+                &cold_install.expected_stale,
+                expected_guard.as_deref(),
+                state.actors.get(&key),
+            ) {
+                (None, None, None) => true,
+                (Some(expected), Some(accepted), Some(current)) => {
+                    Arc::ptr_eq(current, &expected.slot)
+                        && !expected.slot.retired.load(Ordering::Acquire)
+                        && expected.slot.revision.load(Ordering::Acquire) == expected.revision
+                        && accepted.semantic_root == expected.semantic_root
+                        && accepted.semantic_root != semantic_root
+                }
+                _ => false,
+            };
+            if !may_install {
                 None
             } else {
                 let (actor, document, bytes) = candidate
@@ -227,7 +323,9 @@ impl PluginActorCache {
                         history: VecDeque::new(),
                     })),
                 });
-                state.actors.insert(key.clone(), slot);
+                if let Some(replaced) = state.actors.insert(key.clone(), slot) {
+                    replaced.retire();
+                }
                 while state.actors.len() > self.capacity.get() {
                     let evicted_key = state
                         .actors
@@ -247,6 +345,7 @@ impl PluginActorCache {
                 })
             }
         };
+        drop(expected_guard);
         if let Some(observation) = installed {
             return Ok(observation);
         }
@@ -1091,10 +1190,15 @@ mod tests {
     async fn stale_cold_install_never_replaces_a_committed_actor() {
         let cache = PluginActorCache::new(2).unwrap();
         let key = key("main", "/data.csv", "g1");
+        let cold_install = match cache.prepare_cold_open(&key, "root-stale").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("vacant key cannot already be ready"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
         let committed = install(&cache, key.clone(), 2, b"new", "root-new");
         let retirement_probe = Arc::new(AtomicBool::new(false));
         let error = cache
             .install_cold_if_absent(
+                cold_install,
                 key.clone(),
                 Box::new(TestActor {
                     retirement_probe: Some(Arc::clone(&retirement_probe)),
@@ -1109,6 +1213,70 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
         assert!(retirement_probe.load(Ordering::Acquire));
         assert_eq!(cache.observe(&key, "root-new").await.unwrap(), committed);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_open_replaces_the_exact_stale_same_key_actor() {
+        let cache = PluginActorCache::new(2).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let stale = install(&cache, key.clone(), 1, b"old", "root-old");
+        let cold_install = match cache.prepare_cold_open(&key, "root-new").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("stale root cannot already be ready"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+
+        let replacement = cache
+            .install_cold_if_absent(
+                cold_install,
+                key.clone(),
+                Box::new(TestActor::default()),
+                WasmDocumentHandle(2),
+                Arc::from(&b"new"[..]),
+                Arc::<str>::from("root-new"),
+            )
+            .await
+            .expect("the captured stale actor should be replaced");
+
+        assert_eq!(cache.observe(&key, "root-new").await.unwrap(), replacement);
+        assert!(cache.lease(&stale).await.is_err());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_cold_token_does_not_replace_a_concurrent_same_slot_successor() {
+        let cache = PluginActorCache::new(2).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let old = install(&cache, key.clone(), 1, b"old", "root-old");
+        let cold_install = match cache.prepare_cold_open(&key, "root-cold").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("different root cannot already be ready"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+
+        let mut lease = cache.lease(&old).await.unwrap();
+        lease.begin_guest_call().unwrap();
+        lease
+            .complete_guest_call(
+                WasmDocumentHandle(2),
+                Arc::from(&b"winner"[..]),
+                Arc::<str>::from("root-winner"),
+            )
+            .unwrap();
+        let winner = lease.commit_successor().await.unwrap();
+
+        let error = cache
+            .install_cold_if_absent(
+                cold_install,
+                key.clone(),
+                Box::new(TestActor::default()),
+                WasmDocumentHandle(3),
+                Arc::from(&b"cold"[..]),
+                Arc::<str>::from("root-cold"),
+            )
+            .await
+            .expect_err("a revised same-slot winner must not be replaced");
+        assert_eq!(error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
+        assert_eq!(cache.observe(&key, "root-winner").await.unwrap(), winner);
         assert_eq!(cache.len(), 1);
     }
 

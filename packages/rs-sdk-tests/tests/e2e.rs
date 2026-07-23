@@ -789,6 +789,66 @@ async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen(
 }
 
 #[tokio::test]
+async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_commit() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage_a = LocalFilesystem::open(tempdir.path())
+        .await
+        .expect("first shared filesystem storage opens");
+    let lix_a = open_lix_with_storage(storage_a)
+        .await
+        .expect("first independent Lix engine opens");
+    let archive = build_csv_v2_plugin_archive();
+    install_plugin(&lix_a, "plugin_csv_v2", &archive)
+        .await
+        .unwrap();
+
+    let path = "/cross-engine-root.csv";
+    let initial = b"first,one\nsecond,two\n".to_vec();
+    write_file(&lix_a, path, initial.clone()).await.unwrap();
+    assert_eq!(
+        read_file(&lix_a, path).await.unwrap(),
+        Some(initial.clone())
+    );
+
+    // A separately opened Lix owns a distinct plugin runtime/actor cache while
+    // sharing the same durable RocksDB-backed workspace.
+    let storage_b = LocalFilesystem::open(tempdir.path())
+        .await
+        .expect("second shared filesystem storage opens");
+    let lix_b = open_lix_with_storage(storage_b)
+        .await
+        .expect("second independent Lix engine opens");
+    assert_eq!(read_file(&lix_b, path).await.unwrap(), Some(initial));
+    let advanced = b"first,ONE\nsecond,two\n".to_vec();
+    write_file(&lix_b, path, advanced.clone()).await.unwrap();
+
+    // Engine A still owns the root-old actor. Its exact SQL read must cold-open
+    // root-new and replace only that captured stale slot, rather than returning
+    // observation-stale forever.
+    lix_a.reset_plugin_v2_transition_counters();
+    assert_eq!(
+        read_file(&lix_a, path).await.unwrap(),
+        Some(advanced.clone())
+    );
+    let counters = lix_a.plugin_v2_transition_counters();
+    assert_eq!(
+        counters.full_state_semantic_rows_materialized, 3,
+        "cold reconstruction materializes the table entity and both row entities"
+    );
+    assert_eq!(counters.full_renderer_invocations, 1);
+
+    // The recovered read published root-new authority into A's session.
+    let final_bytes = b"first,ONE\nsecond,TWO\n".to_vec();
+    write_file(&lix_a, path, final_bytes.clone())
+        .await
+        .expect("the recovered root-new observation authorizes the next sparse edit");
+    assert_eq!(read_file(&lix_a, path).await.unwrap(), Some(final_bytes));
+
+    lix_b.close().await.unwrap();
+    lix_a.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_csv_cold_open_preserves_legacy_uuid_rows_while_allocating_new_compact_ids() {
     let tempdir = tempfile::tempdir().unwrap();
     let archive = build_csv_v2_plugin_archive();

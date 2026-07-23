@@ -45,11 +45,12 @@ use crate::live_state::{
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
-    PluginRegistry, PluginRegistryEntry, PluginRuntime, PluginRuntimeHost, VecEntitySource,
-    drain_entity_transition_edits, is_plugin_storage_path, plugin_key_from_archive_file_id,
-    plugin_key_from_archive_path, plugin_state_live_state_projection,
-    plugin_storage_archive_file_id, render_plugin_state_with_component_instance,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
+    PluginActorColdOpen, PluginActorKey, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+    PluginRuntime, PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
+    is_plugin_storage_path, plugin_key_from_archive_file_id, plugin_key_from_archive_path,
+    plugin_state_live_state_projection, plugin_storage_archive_file_id,
+    render_plugin_state_with_component_instance,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -4497,11 +4498,11 @@ async fn cold_open_materialized_v2_actor(
     // Another reader may have populated this actor while we waited. Recheck
     // under the shared cold gate before scanning full semantic state or
     // instantiating another Store.
-    match cache.observe(actor_key, semantic_root).await {
-        Ok(observation) => return Ok(observation),
-        Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {}
-        Err(error) => return Err(error),
-    }
+    let cold_install: PluginActorColdInstall =
+        match cache.prepare_cold_open(actor_key, semantic_root).await? {
+            PluginActorColdOpen::Ready(observation) => return Ok(observation),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
     let limits = WasmTransitionLimits::default();
     let factory = resolve_v2_factory(&plugin_render.host, blob_reader, plugin).await?;
     let mut rows = plugin_render
@@ -4600,6 +4601,7 @@ async fn cold_open_materialized_v2_actor(
     plugin_render.host.record_v2_transition_counters(counters);
     cache
         .install_cold_if_absent(
+            cold_install,
             actor_key.clone(),
             actor,
             validated.document,

@@ -15,7 +15,10 @@ mod materializer;
 mod registry;
 mod storage;
 
-pub(crate) use actor::{PluginActorCache, PluginActorKey, PluginActorLease, PluginObservation};
+pub(crate) use actor::{
+    PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
+    PluginActorLease, PluginObservation,
+};
 pub(crate) use archive::{
     ParsedPluginArchive, load_installed_plugin_from_archive_bytes,
     load_installed_plugin_metadata_from_archive_bytes, parse_plugin_archive_for_install,
