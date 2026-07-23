@@ -22,7 +22,7 @@ lix_engine = { workspace = true }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 object_store = { version = "0.14", default-features = false, features = ["fs"] }
-slatedb = { version = "0.14.1", default-features = false, features = ["moka"] }
+slatedb = { version = "0.14.1", default-features = false, features = ["lz4", "moka"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 

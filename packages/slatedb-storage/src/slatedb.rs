@@ -22,8 +22,8 @@ use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use slatedb::config::{
-    ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDBScanOptions, Settings,
-    WriteOptions as SlateDBWriteOptions,
+    CompressionCodec, ObjectStoreCacheOptions, PreloadLevel, ScanOptions as SlateDBScanOptions,
+    Settings, WriteOptions as SlateDBWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
@@ -674,18 +674,16 @@ fn open_slatedb(
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
         let mut builder = Db::builder(db_path, object_store);
+        let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
-            let settings = Settings {
-                object_store_cache_options: ObjectStoreCacheOptions {
-                    root_folder: Some(cache.root_folder),
-                    max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
-                    part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
-                    cache_puts: true,
-                    preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
-                    scan_interval: None,
-                    ..ObjectStoreCacheOptions::default()
-                },
-                ..Settings::default()
+            settings.object_store_cache_options = ObjectStoreCacheOptions {
+                root_folder: Some(cache.root_folder),
+                max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
+                part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
+                cache_puts: true,
+                preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+                scan_interval: None,
+                ..ObjectStoreCacheOptions::default()
             };
             let db_cache = SplitCache::new()
                 .with_block_cache(moka_cache(cache.block_cache_bytes))
@@ -698,10 +696,17 @@ fn open_slatedb(
             // The SlateDB dependency is compiled with Moka support so cached
             // callers can choose bounded capacities. Keep default construction
             // cacheless instead of accepting SlateDB's much larger defaults.
-            builder = builder.with_db_cache_disabled();
+            builder = builder.with_settings(settings).with_db_cache_disabled();
         }
         builder.build().await.map_err(slatedb_error)
     })
+}
+
+fn slatedb_settings() -> Settings {
+    Settings {
+        compression_codec: Some(CompressionCodec::Lz4),
+        ..Settings::default()
+    }
 }
 
 fn validate_object_store_options(options: &SlateDBObjectStoreOptions) -> Result<(), StorageError> {
@@ -1009,9 +1014,136 @@ mod tests {
         ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
         PutResult, RenameOptions, Result as ObjectStoreResult,
     };
+    use slatedb::config::{FlushOptions, FlushType};
     use std::ops::Range;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn uses_lz4_compression_by_default() {
+        assert_eq!(
+            slatedb_settings().compression_codec,
+            Some(CompressionCodec::Lz4)
+        );
+    }
+
+    #[test]
+    fn lz4_storage_reopens_uncompressed_and_mixed_data() {
+        let store = Arc::new(InMemory::new());
+        let db_path = "test-lz4-backward-compatibility";
+        let space = SpaceId(7);
+        let old_key = Key(Bytes::from_static(b"uncompressed-key"));
+        let old_value = Bytes::from_static(b"uncompressed-value");
+
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build raw SlateDB test runtime")
+            .block_on(async {
+                let settings = Settings {
+                    compression_codec: None,
+                    ..Settings::default()
+                };
+                let db = Db::builder(db_path, store.clone())
+                    .with_settings(settings)
+                    .with_db_cache_disabled()
+                    .build()
+                    .await
+                    .expect("open uncompressed SlateDB");
+                let mut batch = WriteBatch::new();
+                batch.put_bytes(
+                    physical_key(space, &old_key)
+                        .expect("encode old physical key")
+                        .0,
+                    old_value.clone(),
+                );
+                db.write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: false,
+                        ..SlateDBWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("write uncompressed row");
+                db.flush().await.expect("flush uncompressed row");
+                db.close().await.expect("close uncompressed SlateDB");
+            });
+
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen uncompressed data with LZ4 enabled");
+        {
+            let read =
+                block_on(storage.begin_read(ReadOptions::default())).expect("begin old row read");
+            let result = block_on(read.get_many(
+                space,
+                std::slice::from_ref(&old_key),
+                GetOptions::default(),
+            ))
+            .expect("read uncompressed row");
+            assert_eq!(
+                result.values,
+                vec![Some(ProjectedValue::FullValue(old_value.clone()))]
+            );
+        }
+
+        let new_key = Key(Bytes::from_static(b"lz4-key"));
+        let new_value = Bytes::from_static(b"lz4-value");
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin LZ4 write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: new_key.clone(),
+                    value: StoredValue {
+                        bytes: new_value.clone(),
+                    },
+                }],
+            },
+        ))
+        .expect("stage LZ4 row");
+        block_on(write.commit()).expect("commit LZ4 row");
+        block_on(storage.flush()).expect("flush LZ4 row");
+        block_on(storage.worker.call(|db| async move {
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .map_err(slatedb_error)?;
+            assert!(
+                db.manifest()
+                    .l0()
+                    .iter()
+                    .any(|view| { view.sst.info.compression_codec == Some(CompressionCodec::Lz4) }),
+                "new physical SST must record the LZ4 codec"
+            );
+            Ok(())
+        }))
+        .expect("flush and inspect LZ4 SST");
+        drop(storage);
+
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store,
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen mixed uncompressed and LZ4 data");
+        let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin mixed read");
+        let result = block_on(read.get_many(space, &[old_key, new_key], GetOptions::default()))
+            .expect("read mixed rows");
+        assert_eq!(
+            result.values,
+            vec![
+                Some(ProjectedValue::FullValue(old_value)),
+                Some(ProjectedValue::FullValue(new_value)),
+            ]
+        );
+    }
 
     #[test]
     fn open_object_store_round_trips_with_memory_store() {
