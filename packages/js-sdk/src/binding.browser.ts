@@ -26,9 +26,24 @@ export async function openLixBinding(
 		);
 	}
 	await initializeWasm();
-	return openMemoryFromSnapshot(
-		dispatch,
-		telemetry,
-		storage.snapshot,
-	) as Promise<LixBinding>;
+	const openMemory = openMemoryFromSnapshot as unknown as {
+		(
+			dispatch: PluginRuntimeDispatch,
+			telemetry: TelemetryDispatch | undefined,
+			snapshot: Uint8Array | undefined,
+		): Promise<LixBinding>;
+		length: number;
+	};
+	if (openMemory.length >= 3) {
+		return openMemory(dispatch, telemetry, storage.snapshot);
+	}
+	// The published fallback WASM predates optional telemetry. Its second
+	// argument is the snapshot, so passing the current signature would silently
+	// discard persisted client state.
+	return (
+		openMemory as unknown as (
+			dispatch: PluginRuntimeDispatch,
+			snapshot: Uint8Array | undefined,
+		) => Promise<LixBinding>
+	)(dispatch, storage.snapshot);
 }

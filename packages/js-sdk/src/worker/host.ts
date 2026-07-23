@@ -5,6 +5,8 @@ import type {
 	ObserveEventsBinding,
 	PluginRuntimeDispatch,
 } from "../binding-types.js";
+import type { JsonValue } from "../types.js";
+import type { NativeLixValue } from "../value.js";
 import { createPluginRuntimeDispatch } from "../plugin-runtime.js";
 import {
 	serializeWorkerError,
@@ -125,16 +127,13 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			case "activeBranchId":
 				return requiredLix().activeBranchId();
 			case "clientState.entries":
-				return requiredClientStateMethod("clientStateEntries")();
+				return clientStateEntries();
 			case "clientState.get":
-				return requiredClientStateMethod("clientStateGet")(operation.key);
+				return clientStateGet(operation.key);
 			case "clientState.set":
-				return requiredClientStateMethod("clientStateSet")(
-					operation.key,
-					operation.value,
-				);
+				return clientStateSet(operation.key, operation.value);
 			case "clientState.delete":
-				return requiredClientStateMethod("clientStateDelete")(operation.key);
+				return clientStateDelete(operation.key);
 			case "createBranch":
 				return requiredLix().createBranch(operation.options);
 			case "switchBranch":
@@ -191,20 +190,68 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		return lix;
 	}
 
-	function requiredClientStateMethod<
-		Key extends
-			| "clientStateEntries"
-			| "clientStateGet"
-			| "clientStateSet"
-			| "clientStateDelete",
-	>(key: Key): NonNullable<LixBinding[Key]> {
-		const method = requiredLix()[key];
-		if (!method) {
+	async function clientStateEntries(): Promise<
+		Array<{ key: string; value: JsonValue }>
+	> {
+		const openLix = requiredLix();
+		if (openLix.clientStateEntries) {
+			return openLix.clientStateEntries();
+		}
+		const result = await openLix.execute(CLIENT_STATE_ENTRIES_SQL, []);
+		const keyColumn = requiredColumn(result.columns, "key");
+		const valueColumn = requiredColumn(result.columns, "value");
+		const entries: Array<{ key: string; value: JsonValue }> = [];
+		for (const row of result.rows) {
+			const key = requiredText(row[keyColumn], "client state key");
+			if (!key.startsWith(CLIENT_STATE_KEY_PREFIX)) continue;
+			entries.push({
+				key: key.slice(CLIENT_STATE_KEY_PREFIX.length),
+				value: requiredJson(row[valueColumn], "client state value"),
+			});
+		}
+		return entries;
+	}
+
+	async function clientStateGet(key: string): Promise<JsonValue | undefined> {
+		const openLix = requiredLix();
+		if (openLix.clientStateGet) return openLix.clientStateGet(key);
+		const result = await openLix.execute(CLIENT_STATE_GET_SQL, [
+			textValue(physicalClientStateKey(key)),
+		]);
+		if (result.rows.length > 1) {
 			throw workerStateError(
-				"The open Lix binding does not support typed client state",
+				"Client state key resolved to more than one lix_key_value row",
 			);
 		}
-		return method.bind(requiredLix()) as NonNullable<LixBinding[Key]>;
+		const row = result.rows[0];
+		if (!row) return undefined;
+		return requiredJson(
+			row[requiredColumn(result.columns, "value")],
+			"client state value",
+		);
+	}
+
+	async function clientStateSet(key: string, value: JsonValue): Promise<void> {
+		const openLix = requiredLix();
+		if (openLix.clientStateSet) {
+			await openLix.clientStateSet(key, value);
+			return;
+		}
+		await openLix.execute(CLIENT_STATE_SET_SQL, [
+			textValue(physicalClientStateKey(key)),
+			{ kind: "json", value },
+		]);
+	}
+
+	async function clientStateDelete(key: string): Promise<void> {
+		const openLix = requiredLix();
+		if (openLix.clientStateDelete) {
+			await openLix.clientStateDelete(key);
+			return;
+		}
+		await openLix.execute(CLIENT_STATE_DELETE_SQL, [
+			textValue(physicalClientStateKey(key)),
+		]);
 	}
 
 	function requiredTransaction(transactionId: number): LixTransactionBinding {
@@ -215,6 +262,74 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			throw error;
 		}
 		return transaction;
+	}
+}
+
+const CLIENT_STATE_KEY_PREFIX = "lix_client_state:";
+const CLIENT_STATE_GET_SQL =
+	"SELECT value FROM lix_key_value_by_branch " +
+	"WHERE key = $1 AND lixcol_branch_id = 'global' " +
+	"AND lixcol_untracked = true";
+const CLIENT_STATE_ENTRIES_SQL =
+	"SELECT key, value FROM lix_key_value_by_branch " +
+	"WHERE lixcol_branch_id = 'global' AND lixcol_untracked = true " +
+	"ORDER BY key";
+const CLIENT_STATE_SET_SQL =
+	"INSERT INTO lix_key_value_by_branch " +
+	"(key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) " +
+	"VALUES ($1, $2, 'global', true, true) " +
+	"ON CONFLICT (key, lixcol_branch_id) " +
+	"DO UPDATE SET value = excluded.value";
+const CLIENT_STATE_DELETE_SQL =
+	"DELETE FROM lix_key_value_by_branch " +
+	"WHERE key = $1 AND lixcol_branch_id = 'global' " +
+	"AND lixcol_untracked = true";
+
+function physicalClientStateKey(key: string): string {
+	if (key.length === 0) {
+		throw workerStateError("Client state key must be a non-empty string");
+	}
+	return `${CLIENT_STATE_KEY_PREFIX}${key}`;
+}
+
+function textValue(value: string): NativeLixValue {
+	return { kind: "text", value };
+}
+
+function requiredColumn(columns: string[], name: string): number {
+	const index = columns.indexOf(name);
+	if (index === -1) {
+		throw workerStateError(`Client state query did not return '${name}'`);
+	}
+	return index;
+}
+
+function requiredText(
+	value: NativeLixValue | undefined,
+	description: string,
+): string {
+	if (value?.kind !== "text") {
+		throw workerStateError(`${description} was not text`);
+	}
+	return value.value;
+}
+
+function requiredJson(
+	value: NativeLixValue | undefined,
+	description: string,
+): JsonValue {
+	if (!value) throw workerStateError(`${description} was missing`);
+	switch (value.kind) {
+		case "null":
+			return null;
+		case "boolean":
+		case "integer":
+		case "real":
+		case "text":
+		case "json":
+			return value.value;
+		case "blob":
+			throw workerStateError(`${description} was a blob instead of JSON`);
 	}
 }
 
