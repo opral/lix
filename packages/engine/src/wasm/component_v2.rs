@@ -39,7 +39,11 @@ impl Default for WasmTransitionLimits {
             max_record_bytes: MIB_U32,
             max_page_bytes: MIB_U32,
             max_pages: 1_024,
-            max_total_bytes: 64 * MIB,
+            // A 10 MiB recursive JSON import can legitimately carry roughly
+            // one compact entity per leaf plus packet keys. Keep the
+            // transition bounded, but do not confuse aggregate paging traffic
+            // with the component's independent linear-memory ceiling.
+            max_total_bytes: 128 * MIB,
             max_inline_edits: 4_096,
             max_inline_input_bytes: MIB,
             max_attachment_refs: 4_096,

@@ -16,7 +16,11 @@
 //!
 //! Environment variables:
 //! - `LIX_PROFILE_FORMAT` (`csv`, the default production-v2 lane, or `json`,
-//!   the real v1-plugin mechanism lane)
+//!   whose API is selected separately)
+//! - `LIX_PROFILE_JSON_API` (`v1`, the default current mechanism, or `v2`, the
+//!   incremental Component v2 candidate; ignored for CSV)
+//! - `LIX_PROFILE_JSON_SHAPE` (`flat`, the default 220,000-property root
+//!   object, or `nested`, the same properties below one `payload` member)
 //! - `LIX_PROFILE_INITIAL_ROWS` (CSV only; default 10,000)
 //! - `LIX_PROFILE_NEW_ROWS` (CSV merge only; default 10,000)
 //! - `LIX_PROFILE_WARMUPS` (default 0; unreported no-op/edit/render operations
@@ -25,11 +29,11 @@
 //! - `LIX_PROFILE_IO_STATS=1` (print logical storage calls and row counts for
 //!   the measured operation, followed by read counts sorted by `SpaceId`;
 //!   warmup I/O is excluded)
-//! - `LIX_PROFILE_SPLICE_PROVENANCE=1` (CSV edit only; attach the same
-//!   already-validated splice/hash sidecar produced by the remote protocol)
+//! - `LIX_PROFILE_SPLICE_PROVENANCE=1` (Component v2 edits only; attach the
+//!   same already-validated splice/hash sidecar produced by the remote protocol)
 //! - `LIX_PROFILE_WASM_MEMORY_MIB` (diagnostic only; wraps the SDK runtime with
 //!   a non-production memory ceiling so an otherwise-OOM 10 MiB v1 operation
-//!   can be timed; omitted means the production 64 MiB policy)
+//!   can be timed; omitted means the production 256 MiB policy)
 //!
 //! Differences from the merge_10k criterion bench (benches/e2e.rs): the bench's
 //! measured region includes `lix.close()`, which this marker frame excludes, and
@@ -71,6 +75,7 @@ const JSON_PROPERTY_COUNT: usize = 220_000;
 // fixture exactly 10,000,000 bytes without a pathological padding property.
 const JSON_LONG_VALUE_COUNT: usize = 99_999;
 const JSON_FIXTURE_SEED: u64 = 0x6a73_6f6e_2d31_306d;
+const PRODUCTION_WASM_MEMORY_MIB: u64 = 256;
 const SLATEDB_CACHED_DB_PATH: &str = "workspace";
 const SLATEDB_CACHED_DISK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SLATEDB_CACHED_BLOCK_CACHE_BYTES: u64 = 4 * 1024 * 1024;
@@ -94,13 +99,80 @@ impl ProfileFormat {
     }
 }
 
-struct FlatJsonFixture {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonApi {
+    V1,
+    V2,
+}
+
+impl JsonApi {
+    fn from_env() -> Self {
+        match std::env::var("LIX_PROFILE_JSON_API") {
+            Ok(raw) => Self::parse(Some(&raw)).unwrap_or_else(|message| panic!("{message}")),
+            Err(std::env::VarError::NotPresent) => Self::V1,
+            Err(error) => panic!("LIX_PROFILE_JSON_API must be valid Unicode: {error}"),
+        }
+    }
+
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw {
+            None => Ok(Self::V1),
+            Some(raw) if raw.eq_ignore_ascii_case("v1") => Ok(Self::V1),
+            Some(raw) if raw.eq_ignore_ascii_case("v2") => Ok(Self::V2),
+            Some(raw) => Err(format!(
+                "LIX_PROFILE_JSON_API must be 'v1' or 'v2', got '{raw}'"
+            )),
+        }
+    }
+
+    const fn plugin_key(self) -> &'static str {
+        match self {
+            Self::V1 => "plugin_json_v2",
+            Self::V2 => "plugin_json_incremental_v2",
+        }
+    }
+
+    const fn runtime(self) -> &'static str {
+        match self {
+            Self::V1 => "wasm-component-v1",
+            Self::V2 => "wasm-component-v2",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonShape {
+    Flat,
+    Nested,
+}
+
+impl JsonShape {
+    fn from_env() -> Self {
+        match std::env::var("LIX_PROFILE_JSON_SHAPE") {
+            Ok(raw) if raw.eq_ignore_ascii_case("flat") => Self::Flat,
+            Ok(raw) if raw.eq_ignore_ascii_case("nested") => Self::Nested,
+            Ok(raw) => panic!("LIX_PROFILE_JSON_SHAPE must be 'flat' or 'nested', got '{raw}'"),
+            Err(std::env::VarError::NotPresent) => Self::Flat,
+            Err(error) => panic!("LIX_PROFILE_JSON_SHAPE must be valid Unicode: {error}"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Nested => "nested",
+        }
+    }
+}
+
+struct JsonFixture {
     initial: Vec<u8>,
     edited_value_offset: usize,
     edited_property: String,
+    shape: JsonShape,
 }
 
-impl FlatJsonFixture {
+impl JsonFixture {
     fn edited_bytes(&self) -> Vec<u8> {
         let mut edited = self.initial.clone();
         assert!(
@@ -119,7 +191,10 @@ enum LargeFileFixture {
         initial_rows: Vec<String>,
         new_rows: Vec<String>,
     },
-    Json(FlatJsonFixture),
+    Json {
+        fixture: JsonFixture,
+        api: JsonApi,
+    },
 }
 
 impl LargeFileFixture {
@@ -138,28 +213,24 @@ impl LargeFileFixture {
                     new_rows: random_csv_rows("new", new_row_count, 0xf3bb_91d4_6a8c_2e73),
                 }
             }
-            ProfileFormat::Json => Self::Json(flat_json_fixture()),
-        }
-    }
-
-    fn format(&self) -> ProfileFormat {
-        match self {
-            Self::Csv { .. } => ProfileFormat::Csv,
-            Self::Json(_) => ProfileFormat::Json,
+            ProfileFormat::Json => Self::Json {
+                fixture: json_fixture(JsonShape::from_env()),
+                api: JsonApi::from_env(),
+            },
         }
     }
 
     fn path(&self) -> &'static str {
         match self {
             Self::Csv { .. } => CSV_PATH,
-            Self::Json(_) => JSON_PATH,
+            Self::Json { .. } => JSON_PATH,
         }
     }
 
     fn plugin_warmup_path(&self) -> &'static str {
         match self {
             Self::Csv { .. } => CSV_PLUGIN_WARMUP_PATH,
-            Self::Json(_) => JSON_PLUGIN_WARMUP_PATH,
+            Self::Json { .. } => JSON_PLUGIN_WARMUP_PATH,
         }
     }
 
@@ -168,21 +239,56 @@ impl LargeFileFixture {
             // The v2 actor opens from a canonical blob materialization; an
             // empty warmup would not establish that observation.
             Self::Csv { .. } => b"warmup\n".to_vec(),
-            Self::Json(_) => b"{}".to_vec(),
+            Self::Json { .. } => b"{}".to_vec(),
         }
     }
 
     fn plugin_key(&self) -> &'static str {
         match self {
             Self::Csv { .. } => "plugin_csv_v2",
-            Self::Json(_) => "plugin_json_v2",
+            Self::Json { api, .. } => api.plugin_key(),
         }
     }
 
     fn initial_bytes(&self) -> Vec<u8> {
         match self {
             Self::Csv { initial_rows, .. } => csv_bytes_from_rows(initial_rows),
-            Self::Json(fixture) => fixture.initial.clone(),
+            Self::Json { fixture, .. } => fixture.initial.clone(),
+        }
+    }
+
+    fn uses_component_v2(&self) -> bool {
+        matches!(
+            self,
+            Self::Csv { .. }
+                | Self::Json {
+                    api: JsonApi::V2,
+                    ..
+                }
+        )
+    }
+
+    fn json_shape(&self) -> Option<JsonShape> {
+        match self {
+            Self::Json { fixture, .. } => Some(fixture.shape),
+            Self::Csv { .. } => None,
+        }
+    }
+
+    fn v2_memory_assertion_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Csv { .. } => Some(PRODUCTION_WASM_MEMORY_MIB * 1024 * 1024),
+            Self::Json {
+                api: JsonApi::V2, ..
+            } => Some(
+                profile_wasm_memory_mib()
+                    .unwrap_or(PRODUCTION_WASM_MEMORY_MIB)
+                    .checked_mul(1024 * 1024)
+                    .expect("configured JSON v2 memory ceiling exceeds u64 bytes"),
+            ),
+            Self::Json {
+                api: JsonApi::V1, ..
+            } => None,
         }
     }
 }
@@ -368,7 +474,9 @@ where
 {
     let lix = open_lix(open_options(storage)).await.unwrap();
     if mode == "setup" {
-        let plugin = build_plugin(fixture.format());
+        let plugin = build_plugin(fixture);
+        let plugin_archive_sha256 = sha256_hex(&plugin);
+        let plugin_archive_bytes = plugin.len();
         install_plugin(&lix, fixture.plugin_key(), &plugin).await;
         let initial_file = fixture.initial_bytes();
         match fixture {
@@ -379,12 +487,17 @@ where
                     initial_file.len()
                 );
             }
-            LargeFileFixture::Json(json) => {
+            LargeFileFixture::Json { fixture: json, api } => {
                 eprintln!(
-                    "setup format=json runtime=wasm-component-v1 mechanism_only=true properties={} bytes={} edit_property={}",
+                    "setup format=json shape={} runtime={} mechanism_only={} properties={} bytes={} edit_property={} plugin_archive_bytes={} plugin_archive_sha256={}",
+                    json.shape.label(),
+                    api.runtime(),
+                    api == &JsonApi::V1,
                     JSON_PROPERTY_COUNT,
                     initial_file.len(),
-                    json.edited_property
+                    json.edited_property,
+                    plugin_archive_bytes,
+                    plugin_archive_sha256,
                 );
             }
         }
@@ -460,8 +573,12 @@ where
                     initial_rows.len(),
                     updated_file.len()
                 ),
-                LargeFileFixture::Json(_) => eprintln!(
-                    "noop format=json properties={} bytes={} warmups={warmups} rounds={rounds}",
+                LargeFileFixture::Json { .. } => eprintln!(
+                    "noop format=json shape={} properties={} bytes={} warmups={warmups} rounds={rounds}",
+                    fixture
+                        .json_shape()
+                        .expect("JSON fixture has a JSON shape")
+                        .label(),
                     JSON_PROPERTY_COUNT,
                     updated_file.len()
                 ),
@@ -497,12 +614,14 @@ where
                         csv_bytes_from_rows(&edited_rows),
                     )
                 }
-                LargeFileFixture::Json(json) => (json.initial.clone(), json.edited_bytes()),
+                LargeFileFixture::Json { fixture: json, .. } => {
+                    (json.initial.clone(), json.edited_bytes())
+                }
             };
             let warmups = env_usize("LIX_PROFILE_WARMUPS", 0);
             let rounds = env_usize("LIX_PROFILE_ROUNDS", 1);
             let splice_provenance =
-                env_flag("LIX_PROFILE_SPLICE_PROVENANCE") && fixture.format() == ProfileFormat::Csv;
+                env_flag("LIX_PROFILE_SPLICE_PROVENANCE") && fixture.uses_component_v2();
             let forward_splice =
                 splice_provenance.then(|| request_splice_provenance(&initial_file, &updated_file));
             let reverse_splice =
@@ -513,8 +632,9 @@ where
                     initial_rows.len(),
                     updated_file.len()
                 ),
-                LargeFileFixture::Json(json) => eprintln!(
-                    "edit format=json properties={} bytes={} property={} warmups={warmups} rounds={rounds}",
+                LargeFileFixture::Json { fixture: json, .. } => eprintln!(
+                    "edit format=json shape={} properties={} bytes={} property={} warmups={warmups} rounds={rounds}",
+                    json.shape.label(),
                     JSON_PROPERTY_COUNT,
                     updated_file.len(),
                     json.edited_property
@@ -546,7 +666,7 @@ where
                 } else {
                     initial_file.clone()
                 };
-                if fixture.format() == ProfileFormat::Csv {
+                if fixture.uses_component_v2() {
                     lix.reset_plugin_v2_transition_counters();
                 }
                 let sample_start = Instant::now();
@@ -558,10 +678,17 @@ where
                 profile_file_write_phase_with_splice(&lix, fixture.path(), payload, provenance)
                     .await;
                 samples.push(sample_start.elapsed());
-                if fixture.format() == ProfileFormat::Csv {
+                if fixture.uses_component_v2() {
                     let counters = lix.plugin_v2_transition_counters();
                     print_v2_transition_counters("edit", round, counters);
-                    assert_warm_single_row_edit_counters(round, counters, splice_provenance);
+                    assert_warm_single_entity_edit_counters(
+                        round,
+                        counters,
+                        splice_provenance,
+                        fixture
+                            .v2_memory_assertion_bytes()
+                            .expect("v2 fixture has a memory assertion ceiling"),
+                    );
                 }
             }
             measured_elapsed = Some(measured_start.elapsed());
@@ -577,9 +704,13 @@ where
                         initial_rows.len()
                     );
                 }
-                LargeFileFixture::Json(_) => {
+                LargeFileFixture::Json { .. } => {
                     eprintln!(
-                        "{mode} format=json properties={JSON_PROPERTY_COUNT} warmups={warmups} rounds={rounds}",
+                        "{mode} format=json shape={} properties={JSON_PROPERTY_COUNT} warmups={warmups} rounds={rounds}",
+                        fixture
+                            .json_shape()
+                            .expect("JSON fixture has a JSON shape")
+                            .label(),
                     );
                 }
             }
@@ -606,6 +737,9 @@ where
             }
             measured_elapsed = Some(measured_start.elapsed());
             print_samples(mode, &mut samples);
+            if mode == "render" && io_stats.is_none() {
+                assert_exact_file_bytes(&lix, fixture.path(), fixture.initial_bytes()).await;
+            }
         }
         _ => unreachable!("validated profiling mode"),
     }
@@ -625,7 +759,7 @@ fn open_options<S>(storage: S) -> OpenLixOptions<S> {
         return options;
     };
     let memory_mib = profile_wasm_memory_mib().expect("profiling runtime requires memory limit");
-    eprintln!("diagnostic_wasm_memory_mib={memory_mib} production_default_mib=64");
+    eprintln!("diagnostic_wasm_memory_mib={memory_mib} production_default_mib=256");
     options.with_wasm_runtime(wasm_runtime)
 }
 
@@ -769,6 +903,25 @@ where
     black_box(result);
 }
 
+async fn assert_exact_file_bytes<S>(lix: &lix_sdk::Lix<S>, path: &str, expected: Vec<u8>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let result = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1, "exact render check requires one file row");
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Blob(expected)],
+        "rendered file bytes differ from the pristine fixture"
+    );
+}
+
 /// Render the same unique point row without granting delete authority. The
 /// zero offset is semantically inert, but acknowledgement deliberately rejects
 /// every offset. This isolates the cost of retaining a rich session file view
@@ -859,67 +1012,68 @@ fn print_v2_transition_counters(label: &str, round: usize, counters: WasmTransit
     );
 }
 
-fn assert_warm_single_row_edit_counters(
+fn assert_warm_single_entity_edit_counters(
     round: usize,
     counters: WasmTransitionCounters,
     splice_provenance: bool,
+    max_guest_memory_bytes: u64,
 ) {
     assert!(
         counters.guest_linear_memory_high_water_bytes > 0,
-        "warm CSV edit round {round} did not report guest memory high-water"
+        "warm v2 edit round {round} did not report guest memory high-water"
     );
     assert!(
-        counters.guest_linear_memory_high_water_bytes <= 64 * 1024 * 1024,
-        "warm CSV edit round {round} exceeded the 64 MiB guest limit: {} bytes",
-        counters.guest_linear_memory_high_water_bytes
+        counters.guest_linear_memory_high_water_bytes <= max_guest_memory_bytes,
+        "warm v2 edit round {round} exceeded its {max_guest_memory_bytes}-byte guest limit: {} bytes",
+        counters.guest_linear_memory_high_water_bytes,
     );
     assert_eq!(
         counters.full_state_semantic_rows_materialized, 0,
-        "warm CSV edit round {round} materialized the full semantic state"
+        "warm v2 edit round {round} materialized the full semantic state"
     );
     if splice_provenance {
         assert_eq!(
             counters.host_full_diff_bytes_compared, 0,
-            "warm CSV edit round {round} ignored validated splice provenance"
+            "warm v2 edit round {round} ignored validated splice provenance"
         );
         assert_eq!(
             counters.host_full_content_classification_bytes, 0,
-            "warm CSV edit round {round} rescanned the full payload for content classification"
+            "warm v2 edit round {round} rescanned the full payload for content classification"
         );
     }
     assert!(
         counters.change_payload_requests < 64,
-        "warm CSV edit round {round} requested {} change payloads (limit: <64)",
+        "warm v2 edit round {round} requested {} change payloads (limit: <64)",
         counters.change_payload_requests
     );
     assert!(
         counters.returned_change_payloads < 64,
-        "warm CSV edit round {round} returned {} change payloads (limit: <64)",
+        "warm v2 edit round {round} returned {} change payloads (limit: <64)",
         counters.returned_change_payloads
     );
     assert_eq!(
         counters.durable_semantic_changes, 1,
-        "warm CSV edit round {round} must durably change exactly one semantic row"
+        "warm v2 edit round {round} must durably change exactly one semantic entity"
     );
     assert_eq!(
         counters.private_document_cache_hits, 1,
-        "warm CSV edit round {round} must use exactly one private actor document"
+        "warm v2 edit round {round} must use exactly one private actor document"
     );
     assert_eq!(
         counters.shared_renderer_cache_hits, 1,
-        "warm CSV edit round {round} must use exactly one cached renderer document"
+        "warm v2 edit round {round} must use exactly one cached renderer document"
     );
     assert_eq!(
         counters.full_document_reparses, 0,
-        "warm CSV edit round {round} performed a full document reparse"
+        "warm v2 edit round {round} performed a full document reparse"
     );
     assert_eq!(
         counters.full_renderer_invocations, 0,
-        "warm CSV edit round {round} performed a full renderer invocation"
+        "warm v2 edit round {round} performed a full renderer invocation"
     );
     assert_eq!(
         counters.filesystem_sync_full_renders, 0,
-        "warm CSV edit round {round} triggered a filesystem sync full render"
+        "warm v2 edit round {round} triggered a filesystem sync full render"
     );
 }
 
@@ -1272,54 +1426,82 @@ fn csv_bytes_from_rows(rows: &[String]) -> Vec<u8> {
     csv.into_bytes()
 }
 
-fn flat_json_fixture() -> FlatJsonFixture {
-    let mut initial = Vec::with_capacity(JSON_TARGET_BYTE_COUNT);
+fn json_fixture(shape: JsonShape) -> JsonFixture {
+    let envelope_bytes = match shape {
+        JsonShape::Flat => 0,
+        JsonShape::Nested => br#"{"payload":"#.len() + 1,
+    };
+    let long_value_count = JSON_LONG_VALUE_COUNT
+        .checked_sub(envelope_bytes)
+        .expect("nested JSON envelope fits the deterministic padding");
+    let mut object = Vec::with_capacity(JSON_TARGET_BYTE_COUNT - envelope_bytes);
     let mut rng = SplitMix64(JSON_FIXTURE_SEED);
     let middle = JSON_PROPERTY_COUNT / 2;
-    let edited_property = format!("property_{middle:06}");
+    let edited_property = match shape {
+        JsonShape::Flat => format!("property_{middle:06}"),
+        JsonShape::Nested => format!("/payload/property_{middle:06}"),
+    };
     let mut edited_value_offset = None;
 
-    initial.push(b'{');
+    object.push(b'{');
     for index in 0..JSON_PROPERTY_COUNT {
         if index > 0 {
-            initial.push(b',');
+            object.push(b',');
         }
         let first = rng.next_u64();
         let second = u32::try_from(rng.next_u64() & u64::from(u32::MAX))
             .expect("masked low 32 bits must fit in u32");
         write!(
-            &mut initial,
+            &mut object,
             "\"property_{index:06}\":\"{first:016x}{second:08x}"
         )
         .expect("write deterministic JSON property");
         if index == middle {
-            edited_value_offset = Some(initial.len() - 24);
+            edited_value_offset = Some(object.len() - 24);
         }
-        if index < JSON_LONG_VALUE_COUNT {
-            initial.push(b'f');
+        if index < long_value_count {
+            object.push(b'f');
         }
-        initial.push(b'"');
+        object.push(b'"');
     }
-    initial.push(b'}');
+    object.push(b'}');
+
+    let (initial, edited_value_offset) = match shape {
+        JsonShape::Flat => (
+            object,
+            edited_value_offset.expect("middle JSON property exists"),
+        ),
+        JsonShape::Nested => {
+            let prefix = br#"{"payload":"#;
+            let mut initial = Vec::with_capacity(JSON_TARGET_BYTE_COUNT);
+            initial.extend_from_slice(prefix);
+            initial.extend_from_slice(&object);
+            initial.push(b'}');
+            (
+                initial,
+                prefix.len() + edited_value_offset.expect("middle JSON property exists"),
+            )
+        }
+    };
 
     assert_eq!(
         initial.len(),
         JSON_TARGET_BYTE_COUNT,
-        "flat JSON fixture must remain exactly 10,000,000 bytes"
+        "JSON fixture must remain exactly 10,000,000 bytes"
     );
-    let edited_value_offset = edited_value_offset.expect("middle JSON property exists");
 
-    FlatJsonFixture {
+    JsonFixture {
         initial,
         edited_value_offset,
         edited_property,
+        shape,
     }
 }
 
-fn build_plugin(format: ProfileFormat) -> Vec<u8> {
-    match format {
-        ProfileFormat::Csv => build_csv_plugin(),
-        ProfileFormat::Json => build_json_plugin(),
+fn build_plugin(fixture: &LargeFileFixture) -> Vec<u8> {
+    match fixture {
+        LargeFileFixture::Csv { .. } => build_csv_plugin(),
+        LargeFileFixture::Json { api, .. } => build_json_plugin(*api),
     }
 }
 
@@ -1356,10 +1538,17 @@ fn build_csv_plugin() -> Vec<u8> {
     )
 }
 
-fn build_json_plugin() -> Vec<u8> {
+fn build_json_plugin(api: JsonApi) -> Vec<u8> {
+    match api {
+        JsonApi::V1 => build_json_v1_plugin(),
+        JsonApi::V2 => build_json_v2_plugin(),
+    }
+}
+
+fn build_json_v1_plugin() -> Vec<u8> {
     let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_V2_plugin_json_v2") else {
         eprintln!(
-            "JSON plugin wasm path unavailable; build via `cargo build --bench \
+            "JSON v1 plugin wasm path unavailable; build via `cargo build --bench \
              profile_plugin_large_file --features \
              default_wasm_runtime,local_filesystem,__profile_wasm_memory` so cargo provides the \
              bindep artifact"
@@ -1382,6 +1571,43 @@ fn build_json_plugin() -> Vec<u8> {
     )
 }
 
+fn build_json_v2_plugin() -> Vec<u8> {
+    let Some(wasm_path) =
+        option_env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_INCREMENTAL_V2_plugin_json_incremental_v2")
+    else {
+        eprintln!(
+            "JSON v2 plugin wasm path unavailable; build via `cargo build --bench \
+             profile_plugin_large_file --features \
+             default_wasm_runtime,local_filesystem,__profile_wasm_memory` so cargo provides the \
+             bindep artifact"
+        );
+        std::process::exit(2);
+    };
+    let wasm =
+        std::fs::read(Path::new(wasm_path)).expect("read bindep-built incremental JSON v2 wasm");
+    build_plugin_archive(
+        &wasm,
+        &[
+            (
+                "manifest.json",
+                include_str!("../../../plugins/json-v2/manifest.json").as_bytes(),
+            ),
+            (
+                "schema/json_root.json",
+                include_str!("../../../plugins/json-v2/schema/json_root.json").as_bytes(),
+            ),
+            (
+                "schema/json_object_member.json",
+                include_str!("../../../plugins/json-v2/schema/json_object_member.json").as_bytes(),
+            ),
+            (
+                "schema/json_array_item.json",
+                include_str!("../../../plugins/json-v2/schema/json_array_item.json").as_bytes(),
+            ),
+        ],
+    )
+}
+
 fn build_plugin_archive(wasm: &[u8], metadata: &[(&str, &[u8])]) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
@@ -1397,6 +1623,40 @@ fn build_plugin_archive(wasm: &[u8], metadata: &[(&str, &[u8])]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+
+    #[allow(dead_code)] // `cargo check --bench` compiles this test module without its tests.
+    fn archive_manifest(archive: &[u8]) -> serde_json::Value {
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("open plugin archive");
+        let mut manifest = String::new();
+        archive
+            .by_name("manifest.json")
+            .expect("manifest archive entry")
+            .read_to_string(&mut manifest)
+            .expect("read plugin manifest");
+        serde_json::from_str(&manifest).expect("plugin manifest is JSON")
+    }
+
+    #[test]
+    fn json_api_config_defaults_to_v1_and_uses_distinct_plugin_keys() {
+        assert_eq!(super::JsonApi::parse(None), Ok(super::JsonApi::V1));
+        assert_eq!(super::JsonApi::parse(Some("V1")), Ok(super::JsonApi::V1));
+        assert_eq!(super::JsonApi::parse(Some("v2")), Ok(super::JsonApi::V2));
+        assert!(super::JsonApi::parse(Some("preview3")).is_err());
+        assert_eq!(super::JsonApi::V1.plugin_key(), "plugin_json_v2");
+        assert_eq!(
+            super::JsonApi::V2.plugin_key(),
+            "plugin_json_incremental_v2"
+        );
+        assert_ne!(
+            super::JsonApi::V1.plugin_key(),
+            super::JsonApi::V2.plugin_key()
+        );
+        assert_eq!(super::JsonApi::V1.runtime(), "wasm-component-v1");
+        assert_eq!(super::JsonApi::V2.runtime(), "wasm-component-v2");
+    }
+
     #[test]
     fn csv_exact_fixture_size_is_preserved() {
         let rows = super::random_csv_rows("initial", 220_000, 0x8ae7_b4b1_9f4c_d215);
@@ -1405,7 +1665,7 @@ mod tests {
 
     #[test]
     fn json_fixture_is_exact_and_changes_only_the_middle_property() {
-        let fixture = super::flat_json_fixture();
+        let fixture = super::json_fixture(super::JsonShape::Flat);
         let edited_bytes = fixture.edited_bytes();
         assert_eq!(fixture.initial.len(), super::JSON_TARGET_BYTE_COUNT);
         assert_eq!(edited_bytes.len(), super::JSON_TARGET_BYTE_COUNT);
@@ -1441,20 +1701,85 @@ mod tests {
     }
 
     #[test]
-    fn json_lane_packages_the_real_wasm_plugin() {
-        let archive = super::build_json_plugin();
-        let mut archive =
-            zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("open plugin archive");
+    fn nested_json_fixture_is_exact_and_changes_only_one_recursive_leaf() {
+        let fixture = super::json_fixture(super::JsonShape::Nested);
+        let edited_bytes = fixture.edited_bytes();
+        assert_eq!(fixture.initial.len(), super::JSON_TARGET_BYTE_COUNT);
+        assert_eq!(edited_bytes.len(), super::JSON_TARGET_BYTE_COUNT);
+        assert_eq!(
+            fixture
+                .initial
+                .iter()
+                .zip(&edited_bytes)
+                .filter(|(before, after)| before != after)
+                .count(),
+            1
+        );
+        let initial: serde_json::Value =
+            serde_json::from_slice(&fixture.initial).expect("initial fixture is valid JSON");
+        let edited: serde_json::Value =
+            serde_json::from_slice(&edited_bytes).expect("edited fixture is valid JSON");
+        let initial = initial["payload"]
+            .as_object()
+            .expect("payload is the nested object");
+        let edited = edited["payload"]
+            .as_object()
+            .expect("payload is the nested object");
+        assert_eq!(initial.len(), super::JSON_PROPERTY_COUNT);
+        assert_eq!(edited.len(), super::JSON_PROPERTY_COUNT);
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|(key, before)| edited.get(*key) != Some(*before))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture.edited_property,
+            format!("/payload/property_{:06}", super::JSON_PROPERTY_COUNT / 2)
+        );
+    }
+
+    #[test]
+    fn json_v1_lane_packages_the_real_wasm_plugin() {
+        let archive = super::build_json_plugin(super::JsonApi::V1);
+        let mut opened =
+            zip::ZipArchive::new(std::io::Cursor::new(&archive)).expect("open plugin archive");
         for path in ["manifest.json", "schema/json_pointer.json", "plugin.wasm"] {
-            let entry = archive.by_name(path).expect("required archive entry");
+            let entry = opened.by_name(path).expect("required archive entry");
             assert!(entry.size() > 0, "archive entry '{path}' must not be empty");
         }
+        drop(opened);
+        let manifest = archive_manifest(&archive);
+        assert_eq!(manifest["key"], "plugin_json_v2");
+        assert_eq!(manifest["runtime"], "wasm-component-v1");
+        assert_eq!(manifest["api_version"], "0.1.0");
+    }
+
+    #[test]
+    fn json_v2_lane_packages_the_incremental_component_and_manifest() {
+        let archive = super::build_json_plugin(super::JsonApi::V2);
+        let mut opened =
+            zip::ZipArchive::new(std::io::Cursor::new(&archive)).expect("open plugin archive");
+        for path in [
+            "manifest.json",
+            "schema/json_root.json",
+            "schema/json_object_member.json",
+            "schema/json_array_item.json",
+            "plugin.wasm",
+        ] {
+            let entry = opened.by_name(path).expect("required archive entry");
+            assert!(entry.size() > 0, "archive entry '{path}' must not be empty");
+        }
+        drop(opened);
+        let manifest = archive_manifest(&archive);
+        assert_eq!(manifest["key"], "plugin_json_incremental_v2");
+        assert_eq!(manifest["runtime"], "wasm-component-v2");
+        assert_eq!(manifest["api_version"], "2.0.0");
     }
 
     #[test]
     fn csv_lane_packages_the_v2_component_and_manifest() {
-        use std::io::Read as _;
-
         let archive = super::build_csv_plugin();
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("open plugin archive");

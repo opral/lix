@@ -53,7 +53,10 @@ pub struct WasmLimits {
 impl Default for WasmLimits {
     fn default() -> Self {
         Self {
-            max_memory_bytes: 64 * 1024 * 1024,
+            // Recursive plugins retain semantic indexes alongside accepted
+            // source bytes. The sandbox remains bounded, but 64 MiB is below
+            // the measured working set of the 10 MiB / 220k-node JSON case.
+            max_memory_bytes: 256 * 1024 * 1024,
             max_fuel: None,
             timeout_ms: None,
         }

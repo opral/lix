@@ -49,7 +49,7 @@ pub use lix_engine::{
 /// This deliberately exists only behind the non-default internal
 /// `__profile_wasm_memory`
 /// feature. The harness wraps it to sweep diagnostic memory ceilings without
-/// changing the production 64 MiB policy.
+/// changing the production 256 MiB policy.
 #[cfg(all(feature = "default_wasm_runtime", feature = "__profile_wasm_memory"))]
 #[doc(hidden)]
 pub fn profiling_default_wasm_runtime() -> Result<std::sync::Arc<dyn WasmRuntime>, LixError> {

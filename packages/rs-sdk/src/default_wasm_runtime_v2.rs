@@ -2231,7 +2231,7 @@ mod tests {
     fn fresh_v2_actor_stores_have_isolated_resource_tables() {
         let engine = create_engine(false, true).expect("test engine should initialize");
         let limits = WasmLimits::default();
-        assert_eq!(limits.max_memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_memory_bytes, 256 * 1024 * 1024);
         let mut first = create_store(&engine, limits).expect("first Store should initialize");
         let second = create_store(&engine, limits).expect("second Store should initialize");
         let budget = Arc::new(Mutex::new(
@@ -2250,7 +2250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_csv_v2_initial_import_stays_under_64_mib() {
+    async fn csv_v2_initial_import_retains_64_mib_efficiency_invariant() {
         let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
             panic!("the CSV v2 artifact dependency must be available");
         };
@@ -2263,7 +2263,7 @@ mod tests {
         let mut actor = factory
             .instantiate_actor()
             .await
-            .expect("CSV v2 actor should instantiate under the 64 MiB limit");
+            .expect("CSV v2 actor should instantiate under the bounded default");
         let limits = WasmTransitionLimits {
             total_deadline_nanoseconds: 120_000_000_000,
             ..WasmTransitionLimits::default()
@@ -2318,7 +2318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_csv_v2_cold_open_and_warm_edit_stay_under_64_mib() {
+    async fn csv_v2_cold_open_and_warm_edit_retain_64_mib_efficiency_invariant() {
         let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
             panic!("the CSV v2 artifact dependency must be available");
         };
@@ -2331,7 +2331,7 @@ mod tests {
         let mut actor = factory
             .instantiate_actor()
             .await
-            .expect("CSV v2 actor should instantiate under the 64 MiB limit");
+            .expect("CSV v2 actor should instantiate under the bounded default");
         let limits = WasmTransitionLimits {
             total_deadline_nanoseconds: 120_000_000_000,
             ..WasmTransitionLimits::default()
@@ -2544,7 +2544,7 @@ mod tests {
                 },
             )
             .await
-            .expect("one-row warm renderer transition must fit under 64 MiB");
+            .expect("one-row warm renderer transition should remain sparse");
         let edit_page = actor
             .next_edit_page(
                 rendered.transition,

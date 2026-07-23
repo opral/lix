@@ -272,7 +272,7 @@ def run_diagnostic(candidate: Path, requested_root: Path) -> Path:
             "warmups_per_process": WARMUPS,
             "measured_per_process": MEASURED,
             "diagnostic_wasm_memory_mib": MEMORY_MIB,
-            "production_default_wasm_memory_mib": 64,
+            "production_default_wasm_memory_mib": 256,
             "backends": list(BACKENDS),
             "isolation": "pristine setup-template copy and fresh process per measured mode",
         },
