@@ -118,20 +118,22 @@ streaming it. Larger and multi-change outputs need a 4 KiB/64 KiB/1 MiB
 latency-and-memory break-even sweep with a true producing stream before
 selecting their transport.
 
-## Relationship to the existing production JSON path
+## Relationship to the production recursive JSON path
 
-PR2 already retained a separate full-engine diagnostic for the current v1 JSON
-plugin: one changed property in an exact 10,000,000-byte / 220,000-property
-file measured 7,831.846/7,993.483 ms p50/p95 on RocksDB LocalFilesystem and
-10,119.876/10,601.274 ms on cached SlateDB. That run required a diagnostic
-256 MiB guest ceiling. See
-[`incremental-csv-v2-pr2-2026-07-22.md`](../../perf-results/plugin-api-v2/incremental-csv-v2-pr2-2026-07-22.md#10-mb-json-diagnostic).
+The preceding stack layers now provide the production recursive JSON v2
+vertical slice that this experiment originally called for. On the exact
+10,000,000-byte / 220,000-leaf RocksDB fixture, its warm edit performs one
+semantic change with zero full-file reads, imports, reparses, or renderer
+calls. Direct interned hydration reduced guest high-water to 101,056,512 bytes
+for flat JSON and 101,515,264 bytes for nested JSON. See
+[`json-v2-pareto-stack-2026-07-23.md`](../../perf-results/plugin-api-v2/json-v2-pareto-stack-2026-07-23.md).
 
-Those end-to-end values must not be divided by this experiment's six-
-microsecond guest call: the fixtures, entity counts, memory caps, and measured
-boundaries differ. Together they identify the next vertical slice, however:
-port JSON to the persistent document + splice + sparse semantic output path,
-use P3 only for cold hydration, then rerun the paired RocksDB/SlateDB gate.
+Those end-to-end values still must not be divided by this experiment's
+microsecond guest call: the fixtures, recursive entity count, memory model, and
+measured boundaries differ. In particular, the 6.625 MiB P3 result uses a
+coarser top-level range index and typed summaries, not the production recursive
+entity graph and packet-v1 snapshots. It proves the cold transport mechanism;
+it does not predict that the recursive production plugin will use 6.625 MiB.
 
 ## Mechanism checks
 

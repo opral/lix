@@ -81,3 +81,35 @@ Correctness was checked by all 21 `plugin_json_incremental_v2` unit tests,
 including recursive object/array cold reopen, escaped JSON keys, exact semantic
 rendering, identity preservation, sparse edits, and the flat and nested 10 MB
 fixtures. Strict plugin Clippy also passed.
+
+## Layer 3: Preview 3 cold-transport candidate
+
+This layer deliberately remains a dual-version experiment. It keeps the
+production recursive v2 hot path synchronous and adds an executable P3
+candidate for `async func`, `stream<T>`, and `future<T>` on cold input/output.
+Its JSON index is top-level and therefore is not a substitute for the recursive
+production model measured above.
+
+A fresh reduced-sample validation on the same 10,485,811-byte /
+39,870-property retained fixture reproduced the transport result:
+
+| Cold transport | p50 | p95 | Guest high-water |
+| --- | ---: | ---: | ---: |
+| Canonical ABI `list<u8>` | 108.955 ms | 109.174 ms | 15.625 MiB |
+| P3 `stream<u8>` | 108.876 ms | 108.997 ms | 6.625 MiB |
+| Change | -0.1% | -0.2% | -57.6% |
+
+The fail-closed short stream, terminal-error, output-cancellation, and host
+entity-count-limit checks all passed. The Wasm component also passed
+`wasm-tools validate --features=component-model,cm-async`.
+
+The hot-path decision remains synchronous. In the fresh 1,000-sample check,
+ready async reads added 10.2% at p50 and a one-item output stream added 84.2%.
+The retained, higher-power five-process result found +10.9% and +86.0%
+respectively. P3 is therefore accepted only for cold, large transfers.
+
+The raw-WIT exploratory AX cohort built successfully for 3/3 agents, but its
+median score was 64 and all efficiency scores were zero. The result supports
+the WIT shape as implementable, not yet intuitive; a future small transport
+helper must earn adoption in a paired N=10 evaluation. No broad SDK is added
+by this stack.
