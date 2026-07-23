@@ -1,7 +1,9 @@
 ---
-type: patch
+type: minor
 ---
 
-Reduced SlateDB storage and network usage with LZ4 compression.
+Changed SlateDB storage to a versioned LZ4 physical layout.
 
-New SlateDB writes use fast block compression while existing uncompressed databases remain readable without migration.
+Existing SlateDB-backed Lixes must be recreated. The new layout does not read
+the previous physical namespace and provides no migration or compatibility
+fallback.

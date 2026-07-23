@@ -33,6 +33,7 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, oneshot};
 
 const DB_PATH: &str = "db";
+const LZ4_FORMAT_PATH: &str = "lix-lz4-v1";
 const SPACE_PREFIX_LEN: usize = 4;
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
 const RUNTIME_WORKER_THREADS: usize = 2;
@@ -673,7 +674,8 @@ fn open_slatedb(
     options: SlateDBObjectStoreOptions,
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
-        let mut builder = Db::builder(db_path, object_store);
+        let physical_db_path = join_db_path(&db_path, LZ4_FORMAT_PATH);
+        let mut builder = Db::builder(physical_db_path, object_store);
         let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
             settings.object_store_cache_options = ObjectStoreCacheOptions {
@@ -700,6 +702,15 @@ fn open_slatedb(
         }
         builder.build().await.map_err(slatedb_error)
     })
+}
+
+fn join_db_path(db_path: &str, child: &str) -> String {
+    let db_path = db_path.trim_end_matches('/');
+    if db_path.is_empty() {
+        child.to_string()
+    } else {
+        format!("{db_path}/{child}")
+    }
 }
 
 fn slatedb_settings() -> Settings {
@@ -1028,80 +1039,33 @@ mod tests {
     }
 
     #[test]
-    fn lz4_storage_reopens_uncompressed_and_mixed_data() {
+    fn opens_fresh_local_versioned_storage() {
+        let directory = tempfile::tempdir().expect("create fresh local storage directory");
+        let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
+        assert_eq!(storage.path(), directory.path());
+    }
+
+    #[test]
+    fn fresh_storage_uses_versioned_lz4_format() {
         let store = Arc::new(InMemory::new());
-        let db_path = "test-lz4-backward-compatibility";
+        let db_path = "test-lz4-physical-format";
         let space = SpaceId(7);
-        let old_key = Key(Bytes::from_static(b"uncompressed-key"));
-        let old_value = Bytes::from_static(b"uncompressed-value");
-
-        Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build raw SlateDB test runtime")
-            .block_on(async {
-                let settings = Settings {
-                    compression_codec: None,
-                    ..Settings::default()
-                };
-                let db = Db::builder(db_path, store.clone())
-                    .with_settings(settings)
-                    .with_db_cache_disabled()
-                    .build()
-                    .await
-                    .expect("open uncompressed SlateDB");
-                let mut batch = WriteBatch::new();
-                batch.put_bytes(
-                    physical_key(space, &old_key)
-                        .expect("encode old physical key")
-                        .0,
-                    old_value.clone(),
-                );
-                db.write_with_options(
-                    batch,
-                    &SlateDBWriteOptions {
-                        await_durable: false,
-                        ..SlateDBWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("write uncompressed row");
-                db.flush().await.expect("flush uncompressed row");
-                db.close().await.expect("close uncompressed SlateDB");
-            });
-
         let storage = SlateDB::open_object_store_with_options(
             db_path,
             store.clone(),
             SlateDBObjectStoreOptions::default(),
         )
-        .expect("reopen uncompressed data with LZ4 enabled");
-        {
-            let read =
-                block_on(storage.begin_read(ReadOptions::default())).expect("begin old row read");
-            let result = block_on(read.get_many(
-                space,
-                std::slice::from_ref(&old_key),
-                GetOptions::default(),
-            ))
-            .expect("read uncompressed row");
-            assert_eq!(
-                result.values,
-                vec![Some(ProjectedValue::FullValue(old_value.clone()))]
-            );
-        }
+        .expect("open fresh LZ4 storage");
 
-        let new_key = Key(Bytes::from_static(b"lz4-key"));
-        let new_value = Bytes::from_static(b"lz4-value");
         let mut write =
             block_on(storage.begin_write(WriteOptions::default())).expect("begin LZ4 write");
         block_on(write.put_many(
             space,
             PutBatch {
                 entries: vec![PutEntry {
-                    key: new_key.clone(),
+                    key: Key(Bytes::from_static(b"lz4-key")),
                     value: StoredValue {
-                        bytes: new_value.clone(),
+                        bytes: Bytes::from_static(b"lz4-value"),
                     },
                 }],
             },
@@ -1127,21 +1091,26 @@ mod tests {
         .expect("flush and inspect LZ4 SST");
         drop(storage);
 
-        let storage = SlateDB::open_object_store_with_options(
-            db_path,
-            store,
-            SlateDBObjectStoreOptions::default(),
-        )
-        .expect("reopen mixed uncompressed and LZ4 data");
-        let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin mixed read");
-        let result = block_on(read.get_many(space, &[old_key, new_key], GetOptions::default()))
-            .expect("read mixed rows");
-        assert_eq!(
-            result.values,
-            vec![
-                Some(ProjectedValue::FullValue(old_value)),
-                Some(ProjectedValue::FullValue(new_value)),
-            ]
+        let physical_prefix = format!("{db_path}/{LZ4_FORMAT_PATH}/");
+        let object_paths = block_on(async {
+            let mut objects = store.list(None);
+            let mut paths = Vec::new();
+            while let Some(object) = objects.next().await {
+                paths.push(
+                    object
+                        .expect("list fresh LZ4 storage object")
+                        .location
+                        .to_string(),
+                );
+            }
+            paths
+        });
+        assert!(!object_paths.is_empty(), "fresh storage must write objects");
+        assert!(
+            object_paths
+                .iter()
+                .all(|path| path.starts_with(&physical_prefix)),
+            "all objects must use the versioned LZ4 namespace: {object_paths:?}"
         );
     }
 
