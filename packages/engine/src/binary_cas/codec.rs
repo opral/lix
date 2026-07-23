@@ -9,6 +9,7 @@ const HASH_BYTES: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum BinaryChunkCodec {
     Raw,
+    Zstd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -210,12 +211,15 @@ mod tests {
     #[test]
     fn chunk_roundtrips_payload_as_remaining_bytes() {
         let payload = b"hello payload";
-        let encoded = encode_binary_cas_chunk(BinaryChunkCodec::Raw, payload.len() as u64, payload);
-        assert_eq!(encoded.len(), CHUNK_STORAGE_OVERHEAD_BYTES + payload.len());
-        let (codec, uncompressed_len, decoded_payload) = decode_binary_cas_chunk(&encoded).unwrap();
-        assert_eq!(codec, BinaryChunkCodec::Raw);
-        assert_eq!(uncompressed_len, payload.len() as u64);
-        assert_eq!(decoded_payload, payload);
+        for codec in [BinaryChunkCodec::Raw, BinaryChunkCodec::Zstd] {
+            let encoded = encode_binary_cas_chunk(codec, payload.len() as u64, payload);
+            assert_eq!(encoded.len(), CHUNK_STORAGE_OVERHEAD_BYTES + payload.len());
+            let (decoded_codec, uncompressed_len, decoded_payload) =
+                decode_binary_cas_chunk(&encoded).unwrap();
+            assert_eq!(decoded_codec, codec);
+            assert_eq!(uncompressed_len, payload.len() as u64);
+            assert_eq!(decoded_payload, payload);
+        }
     }
 
     #[test]

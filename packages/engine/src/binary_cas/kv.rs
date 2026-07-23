@@ -1,12 +1,13 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::fastcdc_chunk_ranges_with_chunking;
+use crate::binary_cas::chunking::{MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking};
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
     encode_binary_cas_manifest_chunk,
 };
+use crate::binary_cas::compression::{decode_zstd_chunk, encode_chunk_payload};
 use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
     BlobWriteReceipt,
@@ -20,6 +21,7 @@ use crate::storage_adapter::{
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use web_time::Instant;
 
@@ -173,6 +175,22 @@ pub(crate) fn stage_chunk(
         key(chunk_key(chunk_hash)),
         value(encode_binary_cas_chunk(codec, uncompressed_len, payload)),
     );
+}
+
+fn stage_content_chunk(
+    writes: &mut StorageWriteSet,
+    chunk_hash: BlobHash,
+    chunk_data: &[u8],
+) -> Result<(), LixError> {
+    let encoded = encode_chunk_payload(chunk_hash, chunk_data)?;
+    stage_chunk(
+        writes,
+        chunk_hash,
+        encoded.codec,
+        chunk_data.len() as u64,
+        &encoded.data,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -465,7 +483,7 @@ fn assemble_blob_bytes(
             )?;
             if cfg!(debug_assertions)
                 && *chunk_hash != metadata.hash
-                && BlobHash::from_content(chunk) != metadata.hash
+                && BlobHash::from_content(&chunk) != metadata.hash
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -475,7 +493,7 @@ fn assemble_blob_bytes(
                     ),
                 ));
             }
-            chunk.to_vec()
+            chunk.into_owned()
         }
         BlobLayout::Chunked { chunk_count } => {
             let Some(manifest_chunks) = chunked_manifest else {
@@ -509,7 +527,7 @@ fn assemble_blob_bytes(
                     chunk_hash,
                     expected_chunk_size,
                 )?;
-                out.extend_from_slice(chunk);
+                out.extend_from_slice(&chunk);
             }
             if out.len() != expected_blob_size {
                 return Err(LixError::new(
@@ -542,7 +560,7 @@ fn decode_chunk_from_map(
     blob_hash: BlobHash,
     chunk_hash: BlobHash,
     expected_chunk_size: usize,
-) -> Result<&[u8], LixError> {
+) -> Result<Cow<'_, [u8]>, LixError> {
     let Some(Some(chunk_bytes)) = chunk_rows_by_hash.get(&chunk_hash) else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -561,8 +579,21 @@ fn decode_and_verify_chunk(
     expected_chunk_size: usize,
     blob_hash: BlobHash,
     chunk_hash: BlobHash,
-) -> Result<&[u8], LixError> {
+) -> Result<Cow<'_, [u8]>, LixError> {
     let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
+    if expected_chunk_size > MAX_BINARY_CAS_CHUNK_BYTES
+        || uncompressed_len > MAX_BINARY_CAS_CHUNK_BYTES as u64
+    {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS chunk '{}' for blob '{}' exceeds the {} byte format maximum",
+                chunk_hash.to_hex(),
+                blob_hash.to_hex(),
+                MAX_BINARY_CAS_CHUNK_BYTES
+            ),
+        ));
+    }
     if uncompressed_len != expected_chunk_size as u64 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -575,8 +606,15 @@ fn decode_and_verify_chunk(
             ),
         ));
     }
-    let BinaryChunkCodec::Raw = codec;
-    if chunk_payload.len() != expected_chunk_size {
+    let decoded = match codec {
+        BinaryChunkCodec::Raw => Cow::Borrowed(chunk_payload),
+        BinaryChunkCodec::Zstd => Cow::Owned(decode_zstd_chunk(
+            chunk_hash,
+            chunk_payload,
+            expected_chunk_size,
+        )?),
+    };
+    if decoded.len() != expected_chunk_size {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
@@ -584,11 +622,15 @@ fn decode_and_verify_chunk(
                 chunk_hash.to_hex(),
                 blob_hash.to_hex(),
                 expected_chunk_size,
-                chunk_payload.len()
+                decoded.len()
             ),
         ));
     }
-    if cfg!(debug_assertions) && BlobHash::from_content(chunk_payload) != chunk_hash {
+    // Native zstd level 1 does not enable frame checksums. Always authenticate
+    // decoded compressed bytes against the CAS key, including in release builds.
+    if (matches!(codec, BinaryChunkCodec::Zstd) || cfg!(debug_assertions))
+        && BlobHash::from_content(&decoded) != chunk_hash
+    {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
@@ -598,7 +640,7 @@ fn decode_and_verify_chunk(
             ),
         ));
     }
-    Ok(chunk_payload)
+    Ok(decoded)
 }
 
 pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
@@ -720,13 +762,7 @@ fn stage_prepared_blob_write(
                 },
             );
             if should_stage_chunk(chunk_hash)? {
-                stage_chunk(
-                    writes,
-                    chunk_hash,
-                    BinaryChunkCodec::Raw,
-                    bytes.len() as u64,
-                    bytes,
-                );
+                stage_content_chunk(writes, chunk_hash, bytes)?;
             }
         }
         BlobLayout::Chunked { chunk_count } => {
@@ -743,13 +779,7 @@ fn stage_prepared_blob_write(
                 let chunk_data = &bytes[chunk.start..chunk.end];
                 let chunk_hash = chunk.hash;
                 if should_stage_chunk(chunk_hash)? {
-                    stage_chunk(
-                        writes,
-                        chunk_hash,
-                        BinaryChunkCodec::Raw,
-                        chunk_data.len() as u64,
-                        chunk_data,
-                    );
+                    stage_content_chunk(writes, chunk_hash, chunk_data)?;
                 }
 
                 stage_manifest_chunk(
@@ -915,6 +945,18 @@ mod tests {
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>()
     }
+
+    fn deterministic_high_entropy_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut counter = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(blake3::hash(&counter.to_le_bytes()).as_bytes());
+            counter += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
     use crate::binary_cas::BinaryCasContext;
     use crate::binary_cas::BlobPayload;
     use crate::storage_adapter::StorageAdapter;
@@ -1503,6 +1545,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_kv_api_compresses_repetitive_single_chunk_blob() {
+        let storage = StorageAdapter::new(Memory::new());
+        let data = b"component-section:function-signature\n".repeat(1024);
+        let blob_hash = BlobHash::from_content(&data);
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &data).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("blob write should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let stored = load_chunk(&store, blob_hash)
+            .await
+            .expect("chunk should load")
+            .expect("chunk should exist");
+        assert_eq!(stored.codec, BinaryChunkCodec::Zstd);
+        assert_eq!(stored.uncompressed_len, data.len() as u64);
+        assert!(stored.data.len() < data.len() / 4);
+
+        assert_eq!(
+            load_bytes_many(&store, &[blob_hash])
+                .await
+                .expect("blob should load")
+                .into_vec(),
+            vec![Some(data)]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_kv_api_keeps_high_entropy_single_chunk_raw() {
+        let storage = StorageAdapter::new(Memory::new());
+        let data = deterministic_high_entropy_bytes(32 * 1024);
+        let blob_hash = BlobHash::from_content(&data);
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &data).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("blob write should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let stored = load_chunk(&store, blob_hash)
+            .await
+            .expect("chunk should load")
+            .expect("chunk should exist");
+        assert_eq!(stored.codec, BinaryChunkCodec::Raw);
+        assert_eq!(stored.uncompressed_len, data.len() as u64);
+        assert_eq!(stored.data, data);
+    }
+
+    #[tokio::test]
     async fn existing_chunk_aware_writer_skips_persisted_chunk_payloads() {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"hello chunked kv cas";
@@ -1758,6 +1864,92 @@ mod tests {
                 .message
                 .contains("failed content-address verification")
         );
+    }
+
+    #[tokio::test]
+    async fn read_rejects_truncated_zstd_chunk() {
+        let storage = StorageAdapter::new(Memory::new());
+        let data = b"compressible binary CAS bytes".repeat(4096);
+        let blob_hash = BlobHash::from_content(&data);
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &data).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("blob write should commit");
+        }
+
+        let encoded = encode_chunk_payload(blob_hash, &data).expect("chunk should encode");
+        assert_eq!(encoded.codec, BinaryChunkCodec::Zstd);
+        let mut corrupted = encoded.data.into_owned();
+        corrupted.truncate(corrupted.len() / 2);
+        {
+            let mut writes = storage.new_write_set();
+            writes.put(
+                BINARY_CAS_CHUNK_SPACE,
+                key(chunk_key(blob_hash)),
+                value(encode_binary_cas_chunk(
+                    BinaryChunkCodec::Zstd,
+                    data.len() as u64,
+                    &corrupted,
+                )),
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("corrupt chunk should overwrite");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = load_bytes_many(&store, &[blob_hash])
+            .await
+            .expect_err("corrupt chunk should be rejected");
+        assert!(error.message.contains("decompression failed"));
+    }
+
+    #[test]
+    fn decode_rejects_same_length_valid_zstd_frame_for_wrong_hash() {
+        let expected = vec![b'a'; 128 * 1024];
+        let substituted = vec![b'b'; expected.len()];
+        assert_eq!(expected.len(), substituted.len());
+        let expected_hash = BlobHash::from_content(&expected);
+        let substituted_hash = BlobHash::from_content(&substituted);
+        let encoded = encode_chunk_payload(substituted_hash, &substituted)
+            .expect("substituted chunk should encode");
+        assert_eq!(encoded.codec, BinaryChunkCodec::Zstd);
+        let row =
+            encode_binary_cas_chunk(BinaryChunkCodec::Zstd, expected.len() as u64, &encoded.data);
+
+        let error = decode_and_verify_chunk(&row, expected.len(), expected_hash, expected_hash)
+            .expect_err("valid zstd frame for different bytes should be rejected");
+
+        assert!(
+            error
+                .message
+                .contains("failed content-address verification")
+        );
+    }
+
+    #[test]
+    fn decode_rejects_chunks_above_the_format_maximum_before_decompression() {
+        let data = b"valid compressed content".repeat(4096);
+        let chunk_hash = BlobHash::from_content(&data);
+        let encoded = encode_chunk_payload(chunk_hash, &data).expect("chunk should encode");
+        assert_eq!(encoded.codec, BinaryChunkCodec::Zstd);
+        let oversized_len = MAX_BINARY_CAS_CHUNK_BYTES + 1;
+        let row =
+            encode_binary_cas_chunk(BinaryChunkCodec::Zstd, oversized_len as u64, &encoded.data);
+
+        let error = decode_and_verify_chunk(&row, oversized_len, chunk_hash, chunk_hash)
+            .expect_err("oversized chunk metadata should be rejected");
+
+        assert!(error.message.contains("exceeds"));
+        assert!(error.message.contains("format maximum"));
     }
 
     #[tokio::test]
