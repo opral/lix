@@ -61,6 +61,7 @@ pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a CatalogSnapshot,
     live_state: &'a dyn LiveStateReader,
+    trust_filesystem_planner: bool,
 }
 
 impl<'a> TransactionValidationInput<'a> {
@@ -73,7 +74,16 @@ impl<'a> TransactionValidationInput<'a> {
             staged_writes,
             schema_catalog,
             live_state,
+            trust_filesystem_planner: false,
         }
+    }
+
+    /// Trust namespace checks performed while a serialized, bounded write
+    /// statement was planned. Explicit transactions retain commit-time
+    /// validation because their planner snapshot can become stale.
+    pub(crate) fn with_trusted_filesystem_planner(mut self) -> Self {
+        self.trust_filesystem_planner = true;
+        self
     }
 
     #[cfg(test)]
@@ -639,6 +649,17 @@ async fn filesystem_namespace_domain_changed(
     {
         return Ok(false);
     }
+    // Bounded filesystem writes are serialized from planning through commit.
+    // Their transaction-visible namespace resolver already rejects duplicate
+    // paths and cross-kind collisions. TransactionWriteOrigin is crate-private,
+    // so an exact origin/row match can identify those planner-owned inserts.
+    if input.trust_filesystem_planner
+        && descriptor_rows
+            .iter()
+            .all(|row| filesystem_planner_validated_insert(row))
+    {
+        return Ok(false);
+    }
     if descriptor_rows.len() > 1 {
         return Ok(true);
     }
@@ -675,6 +696,43 @@ async fn filesystem_namespace_domain_changed(
         return Ok(true);
     };
     Ok(committed_occupant != filesystem_namespace_occupant_from_staged_row(row, snapshot)?)
+}
+
+fn filesystem_planner_validated_insert(row: &PreparedValidationRow<'_>) -> bool {
+    if row.snapshot_json().is_none() {
+        return false;
+    }
+    let Some(origin) = row.origin() else {
+        return false;
+    };
+    if origin.operation != TransactionWriteOperation::Insert {
+        return false;
+    }
+    let surface_matches_schema = match row.schema_key() {
+        FILE_DESCRIPTOR_SCHEMA_KEY => {
+            matches!(origin.surface.as_str(), "lix_file" | "lix_file_by_branch")
+        }
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+            matches!(
+                origin.surface.as_str(),
+                "lix_directory" | "lix_directory_by_branch"
+            )
+        }
+        _ => false,
+    };
+    if !surface_matches_schema {
+        return false;
+    }
+    let Some(primary_key) = origin.primary_key.as_ref() else {
+        return false;
+    };
+    primary_key.columns.len() == 1
+        && primary_key.columns[0] == "id"
+        && primary_key.values.len() == 1
+        && row
+            .entity_pk()
+            .as_single_string()
+            .is_ok_and(|entity_pk| primary_key.values[0] == entity_pk)
 }
 
 fn staged_filesystem_namespace_domains(
@@ -2906,7 +2964,7 @@ mod tests {
     use super::*;
     use crate::live_state::{LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
-    use crate::transaction::types::{StageJson, TransactionJson};
+    use crate::transaction::types::{LogicalPrimaryKey, StageJson, TransactionJson};
 
     struct EmptyLiveStateReader;
 
@@ -3030,6 +3088,7 @@ mod tests {
 
     async fn filesystem_namespace_validation_scan_count_for_test(
         staged_writes: PreparedWriteSet,
+        trust_filesystem_planner: bool,
     ) -> Result<usize, LixError> {
         let validation_set = staged_writes.validation_set_for_tests();
         let staged_rows = validation_set.rows().collect::<Vec<_>>();
@@ -3041,9 +3100,23 @@ mod tests {
             rows: Vec::new(),
             scan_count: AtomicUsize::new(0),
         };
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let mut input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        if trust_filesystem_planner {
+            input = input.with_trusted_filesystem_planner();
+        }
         validate_filesystem_namespace(&input, &staged_rows).await?;
         Ok(live_state.scan_count.load(Ordering::Relaxed))
+    }
+
+    fn filesystem_insert_origin(surface: &str, entity_id: &str) -> TransactionWriteOrigin {
+        TransactionWriteOrigin {
+            surface: surface.to_string(),
+            operation: TransactionWriteOperation::Insert,
+            primary_key: Some(LogicalPrimaryKey {
+                columns: vec!["id".to_string()],
+                values: vec![entity_id.to_string()],
+            }),
+        }
     }
 
     fn catalog_from_transaction_input<'a>(
@@ -3491,7 +3564,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         assert_eq!(
-            filesystem_namespace_validation_scan_count_for_test(delete_write)
+            filesystem_namespace_validation_scan_count_for_test(delete_write, false)
                 .await
                 .expect("descriptor deletion should validate"),
             0,
@@ -3503,7 +3576,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         assert_eq!(
-            filesystem_namespace_validation_scan_count_for_test(mixed_write)
+            filesystem_namespace_validation_scan_count_for_test(mixed_write, false)
                 .await
                 .expect("mixed namespace mutation should validate"),
             1,
@@ -3512,25 +3585,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_namespace_inserts_do_not_add_a_point_read_before_full_validation() {
-        let mut logical_insert = staged_file_descriptor_row("logical-insert", "branch-a");
-        logical_insert.origin = Some(TransactionWriteOrigin {
+    async fn filesystem_planner_inserts_skip_redundant_namespace_scan() {
+        for (surface, schema_key) in [
+            ("lix_file", FILE_DESCRIPTOR_SCHEMA_KEY),
+            ("lix_file_by_branch", FILE_DESCRIPTOR_SCHEMA_KEY),
+            ("lix_directory", DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+            ("lix_directory_by_branch", DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+        ] {
+            let mut logical_insert = if schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
+                staged_file_descriptor_row(surface, "branch-a")
+            } else {
+                directory_descriptor_row(surface, None, surface, "branch-a")
+            };
+            logical_insert.origin = Some(filesystem_insert_origin(surface, surface));
+            let untrusted_transaction_write = PreparedWriteSet {
+                state_rows: vec![logical_insert.clone()],
+                ..empty_staged_write_set()
+            };
+            assert_eq!(
+                filesystem_namespace_validation_scan_count_for_test(
+                    untrusted_transaction_write,
+                    false,
+                )
+                .await
+                .expect("explicit transaction insert should succeed"),
+                1,
+                "{surface} must be revalidated when planning was not serialized"
+            );
+            let logical_write = PreparedWriteSet {
+                state_rows: vec![logical_insert],
+                ..empty_staged_write_set()
+            };
+            assert_eq!(
+                filesystem_namespace_validation_scan_count_for_test(logical_write, true)
+                    .await
+                    .expect("planner-validated insert should succeed"),
+                0,
+                "{surface} already validated the transaction-visible namespace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_planner_certificate_must_match_final_descriptor() {
+        let mut wrong_surface = staged_file_descriptor_row("wrong-surface", "branch-a");
+        wrong_surface.origin = Some(filesystem_insert_origin("lix_directory", "wrong-surface"));
+        let mut missing_key = staged_file_descriptor_row("missing-key", "branch-a");
+        missing_key.origin = Some(TransactionWriteOrigin {
             surface: "lix_file".to_string(),
             operation: TransactionWriteOperation::Insert,
             primary_key: None,
         });
-        let logical_write = PreparedWriteSet {
-            state_rows: vec![logical_insert],
-            ..empty_staged_write_set()
-        };
-        assert_eq!(
-            filesystem_namespace_validation_scan_count_for_test(logical_write)
-                .await
-                .expect("logical insert validation should succeed"),
-            1,
-            "logical inserts should perform only the complete namespace scan"
-        );
+        let mut wrong_key = staged_file_descriptor_row("wrong-key", "branch-a");
+        wrong_key.origin = Some(filesystem_insert_origin("lix_file", "different-id"));
+        let mut update = staged_file_descriptor_row("update", "branch-a");
+        update.origin = Some(TransactionWriteOrigin {
+            operation: TransactionWriteOperation::Update,
+            ..filesystem_insert_origin("lix_file", "update")
+        });
+        let mut near_match = staged_file_descriptor_row("near-match", "branch-a");
+        near_match.origin = Some(filesystem_insert_origin("lix_file_internal", "near-match"));
 
+        for (row, scenario) in [
+            (wrong_surface, "wrong schema/surface pair"),
+            (missing_key, "missing logical primary key"),
+            (wrong_key, "logical primary key mismatch"),
+            (update, "non-insert operation"),
+            (near_match, "near-match surface"),
+        ] {
+            let staged_writes = PreparedWriteSet {
+                state_rows: vec![row],
+                ..empty_staged_write_set()
+            };
+            assert!(
+                filesystem_namespace_validation_scan_count_for_test(staged_writes, true)
+                    .await
+                    .unwrap_or_else(|error| panic!("{scenario}: {error}"))
+                    >= 1,
+                "{scenario} must retain commit-time namespace validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_and_mixed_descriptor_inserts_keep_namespace_scan() {
         let explicit_insert = staged_file_descriptor_row("explicit-insert", "branch-a");
         let mut explicit_write = PreparedWriteSet {
             state_rows: vec![explicit_insert.clone()],
@@ -3538,11 +3676,25 @@ mod tests {
         };
         explicit_write.remember_insert_identity_for_tests(&explicit_insert);
         assert_eq!(
-            filesystem_namespace_validation_scan_count_for_test(explicit_write)
+            filesystem_namespace_validation_scan_count_for_test(explicit_write, true)
                 .await
                 .expect("explicit insert validation should succeed"),
             1,
-            "explicit inserts should perform only the complete namespace scan"
+            "direct descriptor inserts have no trusted planner certificate"
+        );
+
+        let mut logical_insert = staged_file_descriptor_row("logical-insert", "branch-a");
+        logical_insert.origin = Some(filesystem_insert_origin("lix_file", "logical-insert"));
+        let mixed_write = PreparedWriteSet {
+            state_rows: vec![logical_insert, explicit_insert],
+            ..empty_staged_write_set()
+        };
+        assert_eq!(
+            filesystem_namespace_validation_scan_count_for_test(mixed_write, true)
+                .await
+                .expect("mixed insert validation should succeed"),
+            1,
+            "one untrusted descriptor keeps validation for the whole domain"
         );
     }
 
@@ -3602,11 +3754,6 @@ mod tests {
         inserted.snapshot = Some(test_stage_json(
             r#"{"id":"file-new","directory_id":null,"name":"occupied"}"#,
         ));
-        inserted.origin = Some(TransactionWriteOrigin {
-            surface: "lix_file".to_string(),
-            operation: TransactionWriteOperation::Insert,
-            primary_key: None,
-        });
         let staged_writes = PreparedWriteSet {
             state_rows: vec![inserted],
             ..empty_staged_write_set()

@@ -28,6 +28,7 @@ pub struct SessionTransaction<StorageImpl: Storage = Memory> {
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
     write_access: Option<SessionWriteAccess>,
+    collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
@@ -76,6 +77,7 @@ where
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             _deterministic_runtime_guard: deterministic_runtime_guard,
             write_access: Some(write_access),
+            collaboration_write_gate: Arc::clone(&self.collaboration_write_gate),
             telemetry: self.telemetry.clone(),
         })
     }
@@ -101,6 +103,12 @@ where
     }
 
     pub async fn commit(mut self) -> Result<(), LixError> {
+        // Explicit transactions may remain open across application awaits, so
+        // they do not hold the collaboration gate while planning. Serialize
+        // their commit-time revalidation and persistence with bounded writes.
+        let _collaboration_write_guard = Arc::clone(&self.collaboration_write_gate)
+            .lock_owned()
+            .await;
         let operation_guard = self.begin_session_commit_operation()?;
         let transaction = self
             .transaction

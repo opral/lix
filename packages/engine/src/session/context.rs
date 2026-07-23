@@ -470,6 +470,7 @@ where
             &'tx mut Transaction<StorageImpl>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        let planner_validation_is_serialized = write_access.serializes_collaboration_writes();
         let _deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
             Some(self.lock_deterministic_runtime().await)
         } else {
@@ -495,6 +496,9 @@ where
         self.ensure_open()?;
         let mut transaction = opened.transaction;
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
+        if planner_validation_is_serialized {
+            transaction.trust_serialized_filesystem_planner();
+        }
         let runtime_functions = opened.runtime_functions;
 
         match f(&mut transaction)
@@ -547,6 +551,12 @@ where
 pub(super) struct SessionWriteAccess {
     _write_lease: SessionWriteLease,
     _collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl SessionWriteAccess {
+    fn serializes_collaboration_writes(&self) -> bool {
+        self._collaboration_write_guard.is_some()
+    }
 }
 
 pub(super) fn closed_error() -> LixError {
@@ -862,6 +872,38 @@ mod tests {
             .await
             .expect("transaction commit should succeed");
         assert!(!session.commit_in_progress_for_test());
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_commit_waits_for_collaboration_write_gate() {
+        let session = open_session().await;
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('serialized-commit', 'value')",
+                &[],
+            )
+            .await
+            .expect("transaction write should stage");
+
+        let collaboration_guard = std::sync::Arc::clone(&session.collaboration_write_gate)
+            .lock_owned()
+            .await;
+        let mut commit = Box::pin(transaction.commit());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(
+            matches!(commit.as_mut().poll(&mut cx), Poll::Pending),
+            "explicit commit should wait behind a bounded collaboration write"
+        );
+
+        drop(collaboration_guard);
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, commit)
+            .await
+            .expect("commit should resume after collaboration gate release")
+            .expect("explicit transaction commit should succeed");
     }
 
     #[tokio::test]

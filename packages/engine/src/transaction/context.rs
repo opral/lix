@@ -151,6 +151,7 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     storage: StorageAdapter<StorageImpl>,
     functions: FunctionProviderHandle,
     commit_boundary: Option<TransactionCommitBoundary>,
+    trust_filesystem_planner: bool,
     origin_key: Option<String>,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -352,6 +353,7 @@ where
                 storage,
                 functions,
                 commit_boundary: None,
+                trust_filesystem_planner: false,
                 origin_key: None,
                 session_file_views,
                 pending_file_view_mutations: BTreeMap::new(),
@@ -471,6 +473,10 @@ where
 
     pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
         self.commit_boundary = Some(boundary);
+    }
+
+    pub(crate) fn trust_serialized_filesystem_planner(&mut self) {
+        self.trust_filesystem_planner = true;
     }
 
     /// Rolls back the storage transaction.
@@ -1597,12 +1603,15 @@ where
                 .schema_resolver
                 .catalog_for_validation(&live_state, scope)
                 .await?;
-            validate_prepared_writes(TransactionValidationInput::new(
+            let mut validation_input = TransactionValidationInput::new(
                 &branch_prepared_writes,
                 schema_catalog,
                 &live_state,
-            ))
-            .await?;
+            );
+            if self.trust_filesystem_planner {
+                validation_input = validation_input.with_trusted_filesystem_planner();
+            }
+            validate_prepared_writes(validation_input).await?;
         }
         Ok(())
     }
