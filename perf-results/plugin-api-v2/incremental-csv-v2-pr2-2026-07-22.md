@@ -9,7 +9,9 @@ PR2 branch: `codex/incremental-csv-plugin-v2`
 
 Control commit: `65e1b92d154b7a79fb7aa161830a9684880f35bb`
 
-Candidate commit: `abed4ef9b97905649a04b15df52c944bced19b88`
+Measured candidate commit: `abed4ef9b97905649a04b15df52c944bced19b88`
+
+Post-campaign CI cleanup: `1960b3439b8081fd0ea1204154b0cbf1f5a3ebb4`
 
 ## Result
 
@@ -40,7 +42,7 @@ reported below as a separate 10,000,000-byte mechanism diagnostic.
 ## Exact revisions and binaries
 
 The control is a merge of the PR1 head with `origin/main` at `8649dad5`, which
-was current when the original immutable A/B campaign began. The final
+was current when the original immutable A/B campaign began. The measured
 `abed4ef9` acceptance rerun deliberately reused that same control after live
 `main` advanced. The candidate is that exact control plus the PR2
 implementation (`6dd5612b`), stale-actor cold-recovery fix (`eea45b96`), and
@@ -50,6 +52,21 @@ runtime lifecycle hardening (`abed4ef9`).
 |---|---|---|
 | Control | `65e1b92d154b7a79fb7aa161830a9684880f35bb` | `5da4594050cd431e00d0ad7967d33459af6c1e263eba49d8702f5a8402b7ba99` |
 | Candidate | `abed4ef9b97905649a04b15df52c944bced19b88` | `21131d39faeb2776da9eb654dcd39ee564b448820f166fad153d36d9eb61bd1c` |
+
+Commit `1960b343` follows the immutable measured candidate. It resolves the
+strict workspace Clippy gate with behavior-preserving checked conversions and
+equivalent expression cleanup in the CSV guest and engine, boxes oversized
+setup, test, filesystem-open, and explicit-transaction futures, and changes
+the server mutation-replay gate from a synchronous to an async-aware mutex
+while retaining the guard across execution and therefore preserving
+single-flight semantics. The full affected library suites, protocol replay
+tests, CSV tests, SDK e2e tests, and fixture tests pass at this commit.
+
+The paired CSV and 10,000,000-byte JSON campaigns were not rerun after that
+cleanup. Their binary identities and all numerical claims therefore apply
+only to `abed4ef9`, not to `1960b343` or the PR head. The cleanup does not
+change the intended incremental algorithm or public API, but it must be
+included in the next fresh paired campaign after any rebase.
 
 After the campaign completed, live `main` advanced to `defa42a96a0debd68e9f22afc3fbb47d9b85f3a9`
 when [`#698`](https://github.com/opral/lix/pull/698) merged on top of
@@ -216,8 +233,8 @@ The fallback, logical-I/O/RSS, and CPU-profile evidence in the next three
 sections was collected from the initial `6dd5612b` implementation before the
 `eea45b96` stale-actor recovery and `abed4ef9` runtime lifecycle hardening.
 These diagnostics characterize the incremental mechanism but do not validate
-the final candidate's recovery or lifecycle behavior. Final-SHA evidence is the
-paired gate, production-cap run, JSON diagnostic, and final correctness suites.
+the measured candidate's recovery or lifecycle behavior. Measured-SHA evidence
+is the paired gate, production-cap run, JSON diagnostic, and correctness suites.
 
 ### Missing-provenance fallback
 
@@ -319,7 +336,7 @@ processes for edit and render, with five warmups and twenty measured samples.
 
 The complete samples are in
 [`pr2-json-diagnostic-abed4ef9.json`](pr2-json-diagnostic-abed4ef9.json).
-This is final-`abed4ef9`, candidate-only Component v1 mechanism evidence under
+This is measured-`abed4ef9`, candidate-only Component v1 mechanism evidence under
 a 256 MiB diagnostic guest ceiling. It has no v2 control/candidate gate and
 must not be used to claim that JSON is incremental or production-ready under
 64 MiB. Its multi-second timings instead quantify the next format vertical
@@ -366,7 +383,7 @@ crate. All completed without human intervention.
 
 The 100% task success supports the narrow claim that the `6dd5612b` contract
 and reference were discoverable and usable in this authoring setup. It does not
-validate the final candidate's runtime correctness or performance. The median
+validate the measured candidate's runtime correctness or performance. The median
 score of 76 and the recovered command errors still expose authoring overhead:
 packet/binding glue is reference code rather than a typed standalone SDK, and
 several agents had to discover how much of the CSV implementation to reuse.
@@ -412,6 +429,15 @@ Validated suites before evidence publication:
 - `cargo test -p lix_sdk --lib`: 23 passed, 1 ignored, 0 failed;
 - composed `cargo test -p lix_sdk_tests --test e2e`: 13 passed; and
 - `cargo fmt --all -- --check` and `git diff --check` passed.
+
+The post-campaign `1960b343` cleanup separately passed:
+
+- `cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings`;
+- combined library tests: engine 1,202 passed / 6 ignored, SDK 23 passed / 1
+  ignored, server protocol 39 passed / 1 ignored, and CSV v2 21 passed;
+- the composed SDK e2e suite: 13 passed;
+- the exact CSV/JSON fixture and plugin-package suite: 4 passed; and
+- `cargo fmt --all -- --check` plus branch-wide `git diff --check`.
 
 Before the two recovery/lifecycle commits, the initial `6dd5612b`
 implementation also passed 21 `plugin_csv_v2` unit tests plus documentation
