@@ -1,8 +1,8 @@
 use lix_sdk::{
     CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    LocalFilesystem, LocalFilesystemOpenOptions, Memory,
+    CreateCheckpointReceipt, ExecuteBatchStatement as RsExecuteBatchStatement,
+    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, LocalFilesystem, LocalFilesystemOpenOptions, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
@@ -96,6 +96,7 @@ type NativeExecuteBatchDeferred = NativeDeferred<Vec<ExecuteResult>>;
 type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeStringDeferred = NativeDeferred<String>;
 type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
+type NativeCreateCheckpointDeferred = NativeDeferred<CreateCheckpointReceiptDto>;
 type NativeSwitchBranchDeferred = NativeDeferred<SwitchBranchReceiptDto>;
 type NativeMergePreviewDeferred = NativeDeferred<MergeBranchPreviewDto>;
 type NativeMergeReceiptDeferred = NativeDeferred<MergeBranchReceiptDto>;
@@ -123,6 +124,7 @@ enum LixCommand {
         options: RsCreateBranchOptions,
         deferred: NativeCreateBranchDeferred,
     },
+    CreateCheckpoint(NativeCreateCheckpointDeferred),
     SwitchBranch {
         options: RsSwitchBranchOptions,
         deferred: NativeSwitchBranchDeferred,
@@ -286,6 +288,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::CreateCheckpoint(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::SwitchBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::MergeBranchPreview { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
@@ -365,6 +368,13 @@ fn handle_lix_command(
             let result = rt
                 .block_on(state.lix.create_branch(options))
                 .map(CreateBranchReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::CreateCheckpoint(deferred) => {
+            let result = rt
+                .block_on(state.lix.create_checkpoint())
+                .map(CreateCheckpointReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
@@ -487,6 +497,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::CreateBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::CreateCheckpoint(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::SwitchBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -590,6 +603,14 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.create_branch(options).await,
             Self::SQLite(lix) => lix.create_branch(options).await,
             Self::LocalFilesystem(lix, _) => lix.create_branch(options).await,
+        }
+    }
+
+    async fn create_checkpoint(&self) -> std::result::Result<CreateCheckpointReceipt, LixError> {
+        match self {
+            Self::Memory(lix) => lix.create_checkpoint().await,
+            Self::SQLite(lix) => lix.create_checkpoint().await,
+            Self::LocalFilesystem(lix, _) => lix.create_checkpoint().await,
         }
     }
 
@@ -1041,6 +1062,15 @@ impl NativeLix {
                 options: options.into(),
                 deferred,
             });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "createCheckpoint")]
+    pub fn create_checkpoint<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeCreateCheckpointDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::CreateCheckpoint);
         Ok(promise)
     }
 
@@ -1501,6 +1531,19 @@ impl From<CreateBranchReceipt> for CreateBranchReceiptDto {
             id: receipt.id,
             name: receipt.name,
             hidden: receipt.hidden,
+            commit_id: receipt.commit_id,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct CreateCheckpointReceiptDto {
+    pub commit_id: String,
+}
+
+impl From<CreateCheckpointReceipt> for CreateCheckpointReceiptDto {
+    fn from(receipt: CreateCheckpointReceipt) -> Self {
+        Self {
             commit_id: receipt.commit_id,
         }
     }

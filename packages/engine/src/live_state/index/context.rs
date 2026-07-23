@@ -7,8 +7,8 @@ use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 #[cfg(test)]
 use super::storage::load_value;
 use super::storage::{
-    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_values, scan_values, stage_delete,
-    stage_put,
+    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_values, scan_all_values, scan_values,
+    stage_delete, stage_put,
 };
 use super::{
     LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
@@ -57,6 +57,14 @@ impl<S> LiveStateIndexStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) async fn scan_all_index_rows(&self) -> Result<Vec<LiveStateIndexRow>, LixError> {
+        Ok(scan_all_values(&self.store)
+            .await?
+            .into_iter()
+            .map(|(identity, value)| index_row(identity, value))
+            .collect())
+    }
+
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateIndexScanRequest,

@@ -10,6 +10,7 @@ mod types;
 
 pub(crate) use chunking::BinaryCasChunking;
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
+pub(crate) use kv::BinaryCasGcSweep;
 pub(crate) use types::{
     BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobPayload,
     BlobWriteReceipt, InlineBlob,

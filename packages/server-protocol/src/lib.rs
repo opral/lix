@@ -705,6 +705,7 @@ where
                 post(upsert_file_data_batch::<S>),
             )
             .route("/lix/v1/branch/create", post(create_branch::<S>))
+            .route("/lix/v1/checkpoint/create", post(create_checkpoint::<S>))
             .route("/lix/v1/branch/switch", post(switch_branch::<S>))
             .route("/lix/v1/observe", post(observe::<S>))
             .route("/lix/v1/observe/multiplex", post(observe_multiplex::<S>))
@@ -1412,6 +1413,20 @@ where
         id: receipt.id,
         name: receipt.name,
         hidden: receipt.hidden,
+        commit_id: receipt.commit_id,
+    }))
+}
+
+async fn create_checkpoint<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+) -> Result<Json<CreateCheckpointResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let receipt = lease
+        .run(move |lix| async move { lix.create_checkpoint().await })
+        .await?;
+    Ok(Json(CreateCheckpointResponse {
         commit_id: receipt.commit_id,
     }))
 }
@@ -2162,6 +2177,12 @@ struct CreateBranchResponse {
     id: String,
     name: String,
     hidden: bool,
+    commit_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateCheckpointResponse {
     commit_id: String,
 }
 
@@ -3604,6 +3625,53 @@ mod tests {
         assert_eq!(
             response_json(draft_count).await["rows"][0][0],
             json!({ "kind": "int", "value": 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_checkpoint_returns_the_new_pinned_session_head() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')"
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let created = request(
+            &app.router,
+            "POST",
+            "/lix/v1/checkpoint/create",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let checkpoint_id = response_json(created).await["commitId"]
+            .as_str()
+            .expect("checkpoint commit id")
+            .to_string();
+
+        let head = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT lix_active_branch_commit_id() AS commit_id"
+            })),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(head).await["rows"][0][0],
+            json!({ "kind": "text", "value": checkpoint_id })
         );
     }
 

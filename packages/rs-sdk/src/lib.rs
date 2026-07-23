@@ -30,7 +30,8 @@ pub use lix_engine::wasm::{
 };
 pub use lix_engine::{
     Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
-    CreateBranchReceipt as CreateBranchResult, ExecuteBatchStatement, ExecuteOptions,
+    CreateBranchReceipt as CreateBranchResult, CreateCheckpointReceipt,
+    CreateCheckpointReceipt as CreateCheckpointResult, ExecuteBatchStatement, ExecuteOptions,
     ExecuteResult, ExecutionDisposition, GetManyResult, GetOptions, Key, KeyRange, LixError,
     LixNotice, MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,

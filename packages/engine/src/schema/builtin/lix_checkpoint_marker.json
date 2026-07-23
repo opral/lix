@@ -1,0 +1,18 @@
+{
+  "x-lix-key": "lix_checkpoint_marker",
+  "description": "Internal tracked marker identifying commits created by the checkpoint API. This schema is intentionally hidden from generated entity SQL surfaces.",
+  "x-lix-primary-key": [
+    "/branch_id"
+  ],
+  "type": "object",
+  "properties": {
+    "branch_id": {
+      "type": "string",
+      "description": "Branch on which the checkpoint was created."
+    }
+  },
+  "required": [
+    "branch_id"
+  ],
+  "additionalProperties": false
+}

@@ -276,6 +276,24 @@ async fn rs_sdk_native_file_read_distinguishes_missing_and_empty_files() {
 }
 
 #[tokio::test]
+async fn rs_sdk_create_checkpoint_returns_the_new_active_head() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')",
+        &[],
+    )
+    .await
+    .unwrap();
+    let before = active_head_commit_id(&lix).await;
+
+    let checkpoint = lix.create_checkpoint().await.unwrap();
+
+    assert_ne!(checkpoint.commit_id, before);
+    assert_eq!(checkpoint.commit_id, active_head_commit_id(&lix).await);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     let main_branch_id = lix.active_branch_id().await.unwrap();
@@ -355,6 +373,17 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     assert!(task_done(&lix, "task-1").await);
 
     lix.close().await.unwrap();
+}
+
+async fn active_head_commit_id(lix: &Lix<Memory>) -> String {
+    let result = lix
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .unwrap();
+    match &result.rows()[0].values()[0] {
+        Value::Text(commit_id) => commit_id.clone(),
+        value => panic!("expected text commit id, got {value:?}"),
+    }
 }
 
 #[tokio::test]

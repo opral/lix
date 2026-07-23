@@ -69,6 +69,35 @@ test("loads and executes the engine outside the browser main thread", async () =
 	}
 });
 
+test("createCheckpoint returns the new active head through browser WASM", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const lix = await openLix();
+	try {
+		await lix.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+			["checkpoint-test", "working"],
+		);
+		const before = (
+			await lix.execute(
+				"SELECT lix_active_branch_commit_id() AS commit_id",
+			)
+		).rows[0]?.get("commit_id");
+
+		const checkpoint = await lix.createCheckpoint();
+
+		expect(checkpoint.commitId).not.toBe(before);
+		expect(
+			(
+				await lix.execute(
+					"SELECT lix_active_branch_commit_id() AS commit_id",
+				)
+			).rows[0]?.get("commit_id"),
+		).toBe(checkpoint.commitId);
+	} finally {
+		await lix.close();
+	}
+});
+
 test("executes a globally ordered union plan in browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();

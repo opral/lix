@@ -102,6 +102,15 @@ impl TrackedStateContext {
         let _ = self;
         TrackedStateRootRebuilder { store, writes }
     }
+
+    pub(crate) async fn reachable_tree_chunk_hashes(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        roots: impl IntoIterator<Item = TrackedStateRootId>,
+    ) -> Result<BTreeSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>, LixError>
+    {
+        self.tree.reachable_chunk_hashes(store, roots).await
+    }
 }
 
 /// Store-backed tracked-state reader created by `TrackedStateContext`.
