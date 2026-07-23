@@ -120,6 +120,15 @@ pub(crate) fn entity_surface_schema(
     spec: &EntitySurfaceSpec,
     shape: EntitySurfaceShape,
 ) -> SchemaRef {
+    let history_identity_roots = if shape == EntitySurfaceShape::History {
+        spec.primary_key_paths
+            .iter()
+            .filter_map(|path| path.first())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let mut fields = spec
         .columns
         .iter()
@@ -127,7 +136,7 @@ pub(crate) fn entity_surface_schema(
             let field = Field::new(
                 &column.name,
                 arrow_data_type_for_entity_column_type(column.column_type),
-                true,
+                !history_identity_roots.contains(&column.name),
             );
             if column.column_type == EntityColumnType::Json {
                 mark_json_field(field)
@@ -296,5 +305,66 @@ fn collect_entity_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a s
                 collect_entity_type_kinds(branch, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        EntitySurfaceShape, derive_entity_surface_spec_from_schema, entity_surface_schema,
+    };
+
+    #[test]
+    fn history_identity_roots_are_non_null_even_for_nested_keys() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "localized_document",
+            "x-lix-primary-key": ["/identity/tenant", "/identity/id", "/locale"],
+            "type": "object",
+            "properties": {
+                "identity": {
+                    "type": "object",
+                    "properties": {
+                        "tenant": { "type": "string" },
+                        "id": { "type": "string" }
+                    },
+                    "required": ["tenant", "id"]
+                },
+                "locale": { "type": "string" },
+                "body": { "type": "string" }
+            },
+            "required": ["identity", "locale", "body"]
+        }))
+        .expect("schema should derive");
+
+        let history = entity_surface_schema(&spec, EntitySurfaceShape::History);
+        assert!(
+            !history
+                .field_with_name("identity")
+                .expect("nested identity root")
+                .is_nullable()
+        );
+        assert!(
+            !history
+                .field_with_name("locale")
+                .expect("top-level identity")
+                .is_nullable()
+        );
+        assert!(
+            history
+                .field_with_name("body")
+                .expect("payload")
+                .is_nullable()
+        );
+
+        let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+        assert!(
+            active
+                .field_with_name("identity")
+                .expect("active identity input")
+                .is_nullable(),
+            "write surfaces keep omission/default input semantics"
+        );
     }
 }

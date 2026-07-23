@@ -101,6 +101,10 @@ impl HistoryRoute {
             || self.max_depth.is_some_and(|depth| depth < 0)
     }
 
+    pub(crate) fn constrain_entity_pks(&mut self, entity_pks: Vec<String>) {
+        self.contradictory |= apply_conjunctive_values_filter(&mut self.entity_pks, entity_pks);
+    }
+
     /// Checks filters that refer to the row exposed by a shaped history surface.
     pub(crate) fn matches_surface_row(
         &self,

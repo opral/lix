@@ -97,6 +97,17 @@ WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
+Typed history preserves every declared primary-key root on deletion rows, including nested JSON roots. For a composite key, constrain every public key column for an exact entity lookup; Lix encodes the identity in the schema's `x-lix-primary-key` order, regardless of predicate order:
+
+```sql
+SELECT lixcol_depth, value
+FROM localized_message_history
+WHERE key = 'welcome'
+  AND locale = 'en'
+  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
+ORDER BY lixcol_depth;
+```
+
 When you need the typed columns, reach for the per-entity sugar. When you're querying across schemas, drop down to `lix_state*`. Same data either way.
 
 ## Files
@@ -137,6 +148,8 @@ FROM lix_file_history
 WHERE path = '/orders.xlsx'
 ORDER BY lixcol_depth;
 ```
+
+`path` has ordinary SQL row semantics on history: this query returns only revisions whose path was `/orders.xlsx`. Filter by immutable `id` when you want the complete lineage across renames and moves.
 
 In JavaScript, pass a `Uint8Array` or `ArrayBuffer` for `$1`. Read `data` with `row.value("data").asBytes()`.
 

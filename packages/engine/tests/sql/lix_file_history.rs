@@ -901,6 +901,10 @@ simulation_test!(
             )
             .await
             .expect("file history read should succeed");
+        assert!(
+            result.notices().is_empty(),
+            "ordinary path predicates should not emit identity heuristics"
+        );
 
         assert_rows_eq(
             result,
@@ -922,6 +926,26 @@ simulation_test!(
                     Value::Integer(1),
                 ],
             ],
+        );
+
+        let old_path_result = session
+            .execute(
+                "SELECT id, path, lixcol_depth \
+                 FROM lix_file_history \
+                 WHERE lixcol_as_of_commit_id = $1 \
+                   AND path = '/docs/guides/readme.md' \
+                 ORDER BY lixcol_depth",
+                &[Value::Text(second_commit_id.clone())],
+            )
+            .await
+            .expect("historical path predicate should execute");
+        assert_rows_eq(
+            old_path_result,
+            vec![vec![
+                Value::Text("history-file".to_string()),
+                Value::Text("/docs/guides/readme.md".to_string()),
+                Value::Integer(1),
+            ]],
         );
 
         let source_changes_result = session
@@ -1138,6 +1162,73 @@ simulation_test!(
         let mut expected = vec![main_sibling, draft_sibling];
         expected.sort();
         assert_eq!(observed, expected);
+    }
+);
+
+simulation_test!(
+    joined_history_filters_keep_relation_local_sql_semantics,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-join-dir', '/joined/')",
+                &[],
+            )
+            .await
+            .expect("directory insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-join-file', '/joined/old.txt', X'6F6E65')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        session
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/joined/new.txt' \
+                 WHERE id = 'history-join-file'",
+                &[],
+            )
+            .await
+            .expect("file rename should succeed");
+
+        let result = session
+            .execute(
+                "SELECT file.id, file.path, directory.id \
+                 FROM lix_file_history AS file \
+                 JOIN lix_directory_history AS directory \
+                   ON file.directory_id = directory.id \
+                 WHERE file.lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+                   AND directory.lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+                   AND file.path = '/joined/old.txt'",
+                &[],
+            )
+            .await
+            .expect("joined history query should succeed");
+
+        assert!(
+            result.notices().is_empty(),
+            "join predicates must not be attributed to unrelated history relations"
+        );
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("history-join-file".to_string()),
+                Value::Text("/joined/old.txt".to_string()),
+                Value::Text("history-join-dir".to_string()),
+            ]],
+        );
     }
 );
 

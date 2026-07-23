@@ -537,23 +537,25 @@ fn entity_delete_stage_rows_from_batch(
         .collect()
 }
 
-fn entity_pks_from_primary_key_filters(
+pub(super) fn entity_pks_from_primary_key_filters(
     spec: &EntitySurfaceSpec,
     filters: &[Expr],
 ) -> Result<Option<Vec<EntityPk>>> {
     let analyzer = EntityPrimaryKeyFilterAnalyzer::new(spec);
-    let mut entity_pks: Option<BTreeSet<EntityPk>> = None;
+    let mut constraint: Option<EntityPkConstraint> = None;
     for filter in filters {
-        let Some(filter_ids) = analyzer.analyze(filter)? else {
+        let Some(filter_constraint) = analyzer.analyze_conjunctive_constraint(filter)? else {
             continue;
         };
-        entity_pks = Some(match entity_pks {
-            Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
-            None => filter_ids,
+        constraint = Some(match constraint {
+            Some(existing) => existing.intersect(filter_constraint, &analyzer.primary_key_columns),
+            None => filter_constraint,
         });
     }
 
-    Ok(entity_pks.map(|ids| ids.into_iter().collect()))
+    Ok(constraint
+        .and_then(|constraint| constraint.into_entity_pks(&analyzer.primary_key_columns))
+        .map(|ids| ids.into_iter().collect()))
 }
 
 fn apply_exact_entity_pk_filters(
@@ -597,7 +599,7 @@ fn apply_exact_branch_id_filter(
     }
 }
 
-struct EntityPrimaryKeyFilterAnalyzer<'a> {
+pub(super) struct EntityPrimaryKeyFilterAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
 }
 
@@ -689,14 +691,19 @@ fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr)
 }
 
 impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
-    fn new(spec: &'a EntitySurfaceSpec) -> Self {
+    pub(super) fn new(spec: &'a EntitySurfaceSpec) -> Self {
         Self {
             primary_key_columns: string_primary_key_columns(spec),
         }
     }
 
-    fn supports(&self, expr: &Expr) -> bool {
+    pub(super) fn supports(&self, expr: &Expr) -> bool {
         self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    pub(super) fn contains_routable_conjunct(&self, expr: &Expr) -> bool {
+        self.analyze_conjunctive_constraint(expr)
             .is_ok_and(|constraint| constraint.is_some())
     }
 
@@ -708,6 +715,30 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
             return Ok(None);
         };
         Ok(constraint.into_entity_pks(&self.primary_key_columns))
+    }
+
+    /// Extracts identity constraints that are guaranteed conjuncts while
+    /// refusing to partially route a disjunction. This lets DataFusion pass
+    /// separately planned composite-key terms without turning a payload
+    /// predicate into identity semantics.
+    fn analyze_conjunctive_constraint(&self, expr: &Expr) -> Result<Option<EntityPkConstraint>> {
+        if self.primary_key_columns.is_empty() {
+            return Ok(None);
+        }
+        let Expr::BinaryExpr(binary_expr) = expr else {
+            return self.analyze_constraint(expr);
+        };
+        if binary_expr.op != Operator::And {
+            return self.analyze_constraint(expr);
+        }
+
+        let left = self.analyze_conjunctive_constraint(&binary_expr.left)?;
+        let right = self.analyze_conjunctive_constraint(&binary_expr.right)?;
+        Ok(match (left, right) {
+            (Some(left), Some(right)) => Some(left.intersect(right, &self.primary_key_columns)),
+            (Some(constraint), None) | (None, Some(constraint)) => Some(constraint),
+            (None, None) => None,
+        })
     }
 
     fn analyze_constraint(&self, expr: &Expr) -> Result<Option<EntityPkConstraint>> {
@@ -1142,6 +1173,9 @@ fn identity_matches_parts(
     parts: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
     let identity_parts = identity.parts.as_slice();
+    if identity_parts.len() != primary_key_columns.len() {
+        return false;
+    }
     primary_key_columns
         .iter()
         .zip(identity_parts.iter())
@@ -1879,6 +1913,37 @@ mod tests {
         assert_eq!(
             entity_pks,
             vec![crate::entity_pk::EntityPk::single("entity-a")]
+        );
+    }
+
+    #[test]
+    fn split_composite_primary_key_filters_use_declared_path_order() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "localized_message",
+            "x-lix-primary-key": ["/locale", "/key"],
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "locale": { "type": "string" },
+                "body": { "type": "string" }
+            },
+            "required": ["key", "locale", "body"]
+        }))
+        .expect("schema should derive");
+        // SQL predicate order is deliberately the reverse of the schema's
+        // primary-key order.
+        let filters = vec![eq_filter("key", "welcome"), eq_filter("locale", "en")];
+
+        let entity_pks = super::entity_pks_from_primary_key_filters(&spec, &filters)
+            .expect("composite primary-key filters should analyze")
+            .expect("all composite parts should produce an exact identity");
+
+        assert_eq!(
+            entity_pks,
+            vec![
+                crate::entity_pk::EntityPk::tuple(vec!["en".to_string(), "welcome".to_string(),])
+                    .expect("test identity should be valid")
+            ]
         );
     }
 
