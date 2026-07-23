@@ -38,6 +38,7 @@ ZERO_COUNTERS = (
     "host_full_diff_bytes_compared",
     "host_full_content_classification_bytes",
     "full_state_semantic_rows_materialized",
+    "shared_renderer_cache_hits",
     "full_document_reparses",
     "full_renderer_invocations",
     "filesystem_sync_full_renders",
@@ -45,7 +46,6 @@ ZERO_COUNTERS = (
 ONE_COUNTERS = (
     "durable_semantic_changes",
     "private_document_cache_hits",
-    "shared_renderer_cache_hits",
 )
 
 

@@ -54,9 +54,10 @@ Every measured Component v2 edit (CSV or the JSON v2 arm) resets and prints the
 engine's aggregate transition counters as `plugin_v2_counters`. The harness
 fails the run unless the warm single-row or single-property edit materializes
 no full semantic state, requests and returns fewer than 64 change payloads,
-persists exactly one semantic change, hits both the private actor and shared
-renderer documents once, and performs no full document reparse, full renderer
-invocation, or filesystem-sync full render. These are work invariants in
+persists exactly one semantic change, hits the private actor document once,
+skips the shared renderer for an uncontended current-base edit, and performs
+no full document reparse, full renderer invocation, or filesystem-sync full
+render. These are work invariants in
 addition to the latency gate; a faster sample cannot hide a regression to
 document-sized work. CSV additionally retains its stricter 64 MiB efficiency
 invariant inside the production sandbox. The JSON paired diagnostic checks

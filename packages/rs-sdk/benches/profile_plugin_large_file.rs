@@ -1060,8 +1060,8 @@ fn assert_warm_single_entity_edit_counters(
         "warm v2 edit round {round} must use exactly one private actor document"
     );
     assert_eq!(
-        counters.shared_renderer_cache_hits, 1,
-        "warm v2 edit round {round} must use exactly one cached renderer document"
+        counters.shared_renderer_cache_hits, 0,
+        "uncontended warm v2 edit round {round} redundantly invoked the shared renderer"
     );
     assert_eq!(
         counters.full_document_reparses, 0,
