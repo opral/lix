@@ -512,6 +512,59 @@ async fn stage_flat_current_rows(
     let mut writer = current.writer(read, writes);
     let mut compactable_change_ids = BTreeSet::new();
     for branch_id in &branch_ids {
+        let has_tracked_rows = state_rows
+            .iter()
+            .any(|row| row.branch_id == *branch_id && !row.untracked);
+        let has_tracked_insert = state_rows.iter().any(|row| {
+            row.branch_id == *branch_id
+                && !row.untracked
+                && row.snapshot.is_some()
+                && insert_identities
+                    .get(&PreparedStateRowIdentity::from(row))
+                    .is_some_and(|insert| !insert.untracked())
+        });
+        let untracked_state_deltas = state_rows
+            .iter()
+            .filter(|row| row.branch_id == *branch_id && row.untracked)
+            .map(current_delta_from_state_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let engine_deltas = engine_rows
+            .iter()
+            .filter(|row| row.branch_id == *branch_id)
+            .map(current_delta_from_engine_row)
+            .collect::<Vec<_>>();
+        let new_deltas = untracked_state_deltas
+            .into_iter()
+            .chain(engine_deltas)
+            .collect::<Vec<_>>();
+
+        if !has_tracked_rows {
+            if !new_deltas.is_empty() {
+                compactable_change_ids
+                    .extend(writer.stage_branch_rows(branch_id, new_deltas).await?);
+            }
+            continue;
+        }
+
+        // Tracked rows are served exclusively from immutable commit roots.
+        // On the normal path the branch has no untracked sidecar rows, so a
+        // single range-empty precondition proves there is no durability
+        // collision. Do not construct one mutable-index delta per tracked row
+        // only for the writer to discard it.
+        if !branch_has_local_untracked_rows(&index_reader, branch_id).await? {
+            if has_tracked_insert {
+                preconditions.push(branch_empty_precondition(branch_id)?);
+            }
+            if !new_deltas.is_empty() {
+                compactable_change_ids
+                    .extend(writer.stage_branch_rows(branch_id, new_deltas).await?);
+            }
+            continue;
+        }
+
+        // A populated sidecar is rare. Retain the existing per-row lowering
+        // here so tracked writes can atomically reject collisions and clear a
+        // sidecar row on the internal durability-promotion path.
         let state_deltas = state_rows
             .iter()
             .filter(|row| row.branch_id == *branch_id)
@@ -522,51 +575,37 @@ async fn stage_flat_current_rows(
             .filter(|row| row.branch_id == *branch_id)
             .map(current_delta_from_engine_row)
             .collect::<Vec<_>>();
-        let new_deltas = state_deltas
+        let all_deltas = state_deltas
             .into_iter()
             .chain(engine_deltas)
             .collect::<Vec<_>>();
-
-        if !new_deltas.is_empty() {
-            let absence_guards = state_rows
+        let absence_guards = state_rows
+            .iter()
+            .filter(|row| {
+                row.branch_id == *branch_id
+                    && row.snapshot.is_some()
+                    && insert_identities
+                        .get(&PreparedStateRowIdentity::from(*row))
+                        .is_some_and(|insert| !insert.untracked())
+            })
+            .map(|row| LiveStateIndexRowRequest {
+                branch_id: row.branch_id.clone(),
+                schema_key: row.schema_key.clone(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        preconditions.extend(
+            absence_guards
                 .iter()
-                .filter(|row| {
-                    row.branch_id == *branch_id
-                        && row.snapshot.is_some()
-                        && insert_identities
-                            .get(&PreparedStateRowIdentity::from(*row))
-                            .is_some_and(|insert| !insert.untracked())
-                })
-                .map(|row| LiveStateIndexRowRequest {
-                    branch_id: row.branch_id.clone(),
-                    schema_key: row.schema_key.clone(),
-                    entity_pk: row.entity_pk.clone(),
-                    file_id: row.file_id.clone(),
-                })
-                .collect::<BTreeSet<_>>();
-            let superseded = if absence_guards.is_empty()
-                || !branch_has_local_untracked_rows(&index_reader, branch_id).await?
-            {
-                if !absence_guards.is_empty() {
-                    preconditions.push(branch_empty_precondition(branch_id)?);
-                }
-                let known_absent = absence_guards.iter().cloned().collect::<Vec<_>>();
-                writer
-                    .stage_branch_rows_with_known_absent(branch_id, new_deltas, &known_absent)
-                    .await?
-            } else {
-                preconditions.extend(
-                    absence_guards
-                        .iter()
-                        .map(row_absent_precondition)
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                writer
-                    .stage_branch_rows_with_absence_guards(branch_id, new_deltas, &absence_guards)
-                    .await?
-            };
-            compactable_change_ids.extend(superseded);
-        }
+                .map(row_absent_precondition)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        compactable_change_ids.extend(
+            writer
+                .stage_branch_rows_with_absence_guards(branch_id, all_deltas, &absence_guards)
+                .await?,
+        );
     }
     if compactable_change_ids.is_empty() {
         return Ok(Vec::new());

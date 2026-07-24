@@ -282,6 +282,15 @@ impl TrackedStateTree {
         mut mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
+        // The normal bulk tracked-write path already arrives in primary-key
+        // order.  With no parent root there is nothing to merge it with, so
+        // preserve that order directly instead of routing every row through a
+        // BTreeMap merely to sort it again.
+        if base_root.is_none() && mutations_are_strictly_sorted(&mutations) {
+            return self
+                .build_and_stage_sorted_mutations(writes, overlay, mutations, commit_id)
+                .await;
+        }
         if let Some(root_id) = base_root {
             if mutations.len() == 1 {
                 let mutation = mutations.pop().expect("single mutation should exist");
@@ -760,14 +769,10 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
-        mutations: Vec<TrackedStateMutation>,
+        mut mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
     ) -> Result<MutationApply<Vec<TrackedStateMutation>>, LixError> {
-        let mut mutation_map = BTreeMap::new();
-        for mutation in mutations {
-            mutation_map.insert(mutation.encoded_key, mutation.encoded_value);
-        }
-        if mutation_map.is_empty() {
+        if mutations.is_empty() {
             return Ok(MutationApply::Fallback(Vec::new()));
         }
 
@@ -775,28 +780,47 @@ impl TrackedStateTree {
             .collect_summary_levels_with_overlay(store, overlay, root_id)
             .await?;
         let Some(leaves) = levels.first() else {
-            return Ok(MutationApply::Fallback(
-                mutation_map
-                    .into_iter()
-                    .map(|(encoded_key, encoded_value)| TrackedStateMutation {
-                        encoded_key,
-                        encoded_value,
-                    })
-                    .collect(),
-            ));
+            return Ok(MutationApply::Fallback(mutations));
         };
 
+        let mutations_are_sorted = mutations_are_strictly_sorted(&mutations);
+        let mut mutation_map = (!mutations_are_sorted).then(|| {
+            std::mem::take(&mut mutations)
+                .into_iter()
+                .map(|mutation| (mutation.encoded_key, mutation.encoded_value))
+                .collect::<BTreeMap<_, _>>()
+        });
         let base_row_count = leaves
             .iter()
             .map(|leaf| leaf.subtree_count as usize)
             .sum::<usize>();
-        let first_mutation_key = mutation_map
-            .keys()
-            .next()
-            .expect("non-empty mutation map should have first key");
+        let first_mutation_key = mutation_map.as_ref().map_or_else(
+            || &mutations[0].encoded_key,
+            |mutations| {
+                mutations
+                    .keys()
+                    .next()
+                    .expect("non-empty mutation map should have first key")
+            },
+        );
         let append_only = leaves
             .last()
             .is_some_and(|leaf| first_mutation_key.as_slice() > leaf.last_key.as_slice());
+        if mutations_are_sorted && !append_only && mutations.len() * 2 > base_row_count {
+            return Ok(MutationApply::Applied(
+                self.rebuild_from_sorted_mutations(
+                    store, writes, overlay, root_id, mutations, commit_id,
+                )
+                .await?,
+            ));
+        }
+
+        let mutation_map = mutation_map.take().unwrap_or_else(|| {
+            mutations
+                .into_iter()
+                .map(|mutation| (mutation.encoded_key, mutation.encoded_value))
+                .collect()
+        });
         if !append_only && mutation_map.len() * 2 > base_row_count {
             return Ok(MutationApply::Fallback(
                 mutation_map
@@ -919,6 +943,73 @@ impl TrackedStateTree {
             self.persist_built_tree(writes, overlay, built, commit_id)
                 .await?,
         ))
+    }
+
+    async fn build_and_stage_sorted_mutations(
+        &self,
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        mutations: Vec<TrackedStateMutation>,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
+        let built = self.build_tree_from_entries(
+            mutations
+                .into_iter()
+                .map(|mutation| EncodedLeafEntry {
+                    key: mutation.encoded_key,
+                    value: mutation.encoded_value,
+                })
+                .collect(),
+        )?;
+        self.persist_built_tree(writes, overlay, built, commit_id)
+            .await
+    }
+
+    async fn rebuild_from_sorted_mutations(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        root_id: &TrackedStateRootId,
+        mutations: Vec<TrackedStateMutation>,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
+        let base_entries = self
+            .collect_leaf_entries_with_overlay(store, overlay, root_id)
+            .await?;
+        let mut entries = Vec::with_capacity(base_entries.len() + mutations.len());
+        let mut mutations = mutations.into_iter().peekable();
+        for entry in base_entries {
+            while mutations
+                .peek()
+                .is_some_and(|mutation| mutation.encoded_key < entry.key)
+            {
+                let mutation = mutations.next().expect("peeked mutation should exist");
+                entries.push(EncodedLeafEntry {
+                    key: mutation.encoded_key,
+                    value: mutation.encoded_value,
+                });
+            }
+            if mutations
+                .peek()
+                .is_some_and(|mutation| mutation.encoded_key == entry.key)
+            {
+                let mutation = mutations.next().expect("peeked mutation should exist");
+                entries.push(EncodedLeafEntry {
+                    key: mutation.encoded_key,
+                    value: mutation.encoded_value,
+                });
+            } else {
+                entries.push(entry);
+            }
+        }
+        entries.extend(mutations.map(|mutation| EncodedLeafEntry {
+            key: mutation.encoded_key,
+            value: mutation.encoded_value,
+        }));
+        let built = self.build_tree_from_entries(entries)?;
+        self.persist_built_tree(writes, overlay, built, commit_id)
+            .await
     }
 
     #[expect(clippy::cast_possible_truncation)]
@@ -1892,6 +1983,12 @@ struct InternalChunkRefAccumulator<'a> {
     children: Vec<ChildSummaryRef<'a>>,
     first_key_bytes: usize,
     last_key_bytes: usize,
+}
+
+fn mutations_are_strictly_sorted(mutations: &[TrackedStateMutation]) -> bool {
+    mutations
+        .windows(2)
+        .all(|pair| pair[0].encoded_key < pair[1].encoded_key)
 }
 
 fn chunk_leaf_entries(
@@ -3484,7 +3581,9 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let updates = (10..25)
+        // More than half of the parent is replaced, which exercises the
+        // sorted full-rebuild path instead of the sparse chunk patcher.
+        let updates = (10..90)
             .map(|index| {
                 (
                     key("schema", None, &format!("entity-{index:03}")),
