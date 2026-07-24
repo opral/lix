@@ -203,7 +203,7 @@ impl Storage for SlateDB {
         async move {
             let snapshot = self
                 .worker
-                .call(|db| async move { db.snapshot().await.map_err(slatedb_error) })
+                .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
                 .await?;
             Ok(SlateDBRead {
                 worker: self.worker.clone(),
@@ -248,7 +248,7 @@ impl StorageRead for SlateDBRead {
             let snapshot = Arc::clone(&self.snapshot);
             let values = self
                 .worker
-                .call(move |_db| get_snapshot_values(snapshot, physical_keys))
+                .call_read(move |_db| get_snapshot_values(snapshot, physical_keys))
                 .await?;
             Ok(GetManyResult::new(
                 values
@@ -290,7 +290,7 @@ impl StorageRead for SlateDBRead {
             let snapshot = Arc::clone(&self.snapshot);
             let mut iter = Some(
                 self.worker
-                    .call(move |_db| open_snapshot_scan(snapshot, bounds))
+                    .call_read(move |_db| open_snapshot_scan(snapshot, bounds))
                     .await?,
             );
             let mut all_entries = Vec::with_capacity(opts.page_size());
@@ -305,7 +305,7 @@ impl StorageRead for SlateDBRead {
                 let projection = opts.projection;
                 let batch = self
                     .worker
-                    .call(move |_db| {
+                    .call_read(move |_db| {
                         scan_snapshot_batch(current_iter, batch_limit, projection, lookahead)
                     })
                     .await?;
@@ -590,6 +590,12 @@ impl SlateDBWorker {
         }
     }
 
+    /// Runs an operation that must retain completion semantics after its caller
+    /// is dropped.
+    ///
+    /// Mutating operations and flushes use this path so a cancelled caller
+    /// cannot turn an already-started publication or durability operation into
+    /// an ambiguous outcome. Read-only work uses [`Self::call_read`] instead.
     async fn call<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
     where
         R: Send + 'static,
@@ -607,6 +613,42 @@ impl SlateDBWorker {
             let _in_flight = in_flight;
             let result = operation(db).await;
             let _ = reply_tx.send(result);
+        });
+        reply_rx
+            .await
+            .map_err(|error| StorageError::Io(format!("receive slatedb worker reply: {error}")))?
+    }
+
+    /// Runs a read operation which can be safely abandoned with its caller.
+    ///
+    /// Writes and flushes deliberately continue through [`Self::call`]: after
+    /// a caller drops its future, letting a mutating operation finish preserves
+    /// a single, well-defined publication and durability outcome. Reads have
+    /// no such side effects, so canceling them also releases the in-flight
+    /// guard that manager shutdown waits on.
+    async fn call_read<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, StorageError>> + Send + 'static,
+    {
+        let (mut reply_tx, reply_rx) = oneshot::channel();
+        // Manager shutdown waits for this guard. The guard is deliberately
+        // independent of `SlateDBWorkerInner`: keeping the inner Arc in a task
+        // running on its own runtime would make its synchronous manager join
+        // self-deadlock when the task released the final Arc.
+        let in_flight = self.inner.in_flight.enter();
+        let db = Arc::clone(&self.inner.db);
+        self.inner.runtime.spawn(async move {
+            let _in_flight = in_flight;
+            let result = tokio::select! {
+                biased;
+                () = reply_tx.closed() => None,
+                result = operation(db) => Some(result),
+            };
+            if let Some(result) = result {
+                let _ = reply_tx.send(result);
+            }
         });
         reply_rx
             .await
@@ -1562,6 +1604,61 @@ mod tests {
         let result = point_read.await.expect("finish async object-store read");
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
         releaser.join().expect("join SST read releaser");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_pending_read_cancels_it_before_storage_close() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-cancel-pending-read",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open cancellable read storage");
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_for_read = Arc::clone(&release);
+        let (started_tx, started_rx) = oneshot::channel();
+        let worker = storage.worker.clone();
+        let pending_read = tokio::spawn(async move {
+            worker
+                .call_read(move |_db| {
+                    let release = Arc::clone(&release_for_read);
+                    async move {
+                        let _ = started_tx.send(());
+                        release.notified().await;
+                        Ok::<(), StorageError>(())
+                    }
+                })
+                .await
+        });
+
+        started_rx
+            .await
+            .expect("pending read operation should start before cancellation");
+        pending_read.abort();
+        let error = pending_read
+            .await
+            .expect_err("dropping the caller should cancel its read future");
+        assert!(
+            error.is_cancelled(),
+            "pending read task should be cancelled"
+        );
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            drop(storage);
+            let _ = closed_tx.send(());
+        });
+        if let Err(error) = closed_rx.recv_timeout(Duration::from_secs(2)) {
+            // Keep the regression test self-cleaning if read cancellation ever
+            // regresses: the old detached operation can finish before joining.
+            release.notify_one();
+            closed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("close should finish after releasing pending read");
+            closer.join().expect("join fallback closer");
+            panic!("storage close should wait only for the cancelled read to drain: {error:?}");
+        }
+        closer.join().expect("join storage closer");
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
