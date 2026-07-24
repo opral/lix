@@ -98,8 +98,16 @@ jobs:
         run: cargo test --profile test --workspace --all-features
 
   js-sdk-test:
-    name: JS SDK Test
+    name: JS SDK ${{ matrix.name }} Test
     runs-on: blacksmith-32vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Native
+            runtime: native
+          - name: Browser
+            runtime: browser
 
     steps:
       - name: Checkout repository
@@ -127,6 +135,7 @@ jobs:
           EOF
 
       - name: Install LLVM build dependencies
+        if: matrix.runtime == 'native'
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang
@@ -146,10 +155,15 @@ jobs:
           RUSTC_WRAPPER=sccache
           EOF
 
-      - name: Install WebAssembly build target
+      - name: Install plugin build target
+        run: rustup target add wasm32-wasip2
+
+      - name: Install browser WebAssembly build target
+        if: matrix.runtime == 'browser'
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-bindgen CLI
+        if: matrix.runtime == 'browser'
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.122
@@ -166,16 +180,32 @@ jobs:
         run: npm ci
 
       - name: Install Chromium
+        if: matrix.runtime == 'browser'
         working-directory: packages/js-sdk
         run: npx playwright install --with-deps chromium
 
-      - name: Build JS SDK bindings
-        working-directory: packages/js-sdk
-        run: npm run build
-
-      - name: Run JS SDK tests
+      - name: Build native JS SDK
+        if: matrix.runtime == 'native'
         working-directory: packages/js-sdk
         run: |
-          npm exec -- vitest run
+          npm run clean
+          npm run build:native
+          npm run build:ts
+          npm run build:plugins
+
+      - name: Run native JS SDK tests
+        if: matrix.runtime == 'native'
+        working-directory: packages/js-sdk
+        run: npm exec -- vitest run
+
+      - name: Build browser JS SDK
+        if: matrix.runtime == 'browser'
+        working-directory: packages/js-sdk
+        run: npm run build:browser
+
+      - name: Run browser JS SDK tests
+        if: matrix.runtime == 'browser'
+        working-directory: packages/js-sdk
+        run: |
           npm run test:browser:built
           node ./scripts/test-packed-vite.js
