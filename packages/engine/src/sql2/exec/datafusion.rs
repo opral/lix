@@ -142,12 +142,11 @@ async fn create_logical_plan_in_session_from_parsed(
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
-    let notices = history_filter_notices(&plan);
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session: session.session.clone(),
         plan,
-        notices,
+        notices: Vec::new(),
         json_predicate_params,
     }))
 }
@@ -180,12 +179,11 @@ async fn create_transaction_read_logical_plan_from_parsed(
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
-    let notices = history_filter_notices(&plan);
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session,
         plan,
-        notices,
+        notices: Vec::new(),
         json_predicate_params,
     }))
 }
@@ -2130,125 +2128,6 @@ pub(crate) fn query_result_from_batches(
     })
 }
 
-fn history_filter_notices(plan: &LogicalPlan) -> Vec<LixNotice> {
-    let mut observations = Vec::new();
-    collect_notice_observations(plan, &Vec::new(), &mut observations);
-
-    let mut notices = Vec::new();
-    let mut emitted_codes = HashSet::<String>::new();
-    for observation in observations {
-        for rule in HISTORY_NOTICE_RULES {
-            if observation.table_name != rule.table_name {
-                continue;
-            }
-            if !observation.references_any(rule.payload_columns)
-                || observation.references_any(rule.identity_columns)
-            {
-                continue;
-            }
-
-            let code = format!("LIX_HISTORY_NON_IDENTITY_FILTER:{}", rule.table_name);
-            if emitted_codes.insert(code) {
-                notices.push(history_non_identity_filter_notice(rule.table_name));
-            }
-        }
-    }
-    notices
-}
-
-#[derive(Debug)]
-struct NoticeObservation {
-    table_name: String,
-    filter_columns: HashSet<String>,
-}
-
-impl NoticeObservation {
-    fn references_any(&self, columns: &[&str]) -> bool {
-        columns
-            .iter()
-            .any(|column| self.filter_columns.contains(*column))
-    }
-}
-
-struct HistoryNoticeRule {
-    table_name: &'static str,
-    payload_columns: &'static [&'static str],
-    identity_columns: &'static [&'static str],
-}
-
-const HISTORY_NOTICE_RULES: &[HistoryNoticeRule] = &[
-    HistoryNoticeRule {
-        table_name: "lix_file_history",
-        payload_columns: &["path", "directory_id", "name", "data"],
-        identity_columns: &["id", "lixcol_entity_pk"],
-    },
-    HistoryNoticeRule {
-        table_name: "lix_directory_history",
-        payload_columns: &["path", "parent_id", "name"],
-        identity_columns: &["id", "lixcol_entity_pk"],
-    },
-];
-
-fn collect_notice_observations(
-    plan: &LogicalPlan,
-    active_filter_columns: &Vec<HashSet<String>>,
-    observations: &mut Vec<NoticeObservation>,
-) {
-    match plan {
-        LogicalPlan::Filter(filter) => {
-            let mut next_filters = active_filter_columns.clone();
-            next_filters.push(expr_column_names(&filter.predicate));
-            collect_notice_observations(&filter.input, &next_filters, observations);
-        }
-        LogicalPlan::TableScan(scan) => {
-            let mut filter_columns = HashSet::new();
-            for columns in active_filter_columns {
-                filter_columns.extend(columns.iter().cloned());
-            }
-            for filter in &scan.filters {
-                filter_columns.extend(expr_column_names(filter));
-            }
-            if !filter_columns.is_empty() {
-                observations.push(NoticeObservation {
-                    table_name: table_reference_name(&scan.table_name),
-                    filter_columns,
-                });
-            }
-        }
-        other => {
-            for input in other.inputs() {
-                collect_notice_observations(input, active_filter_columns, observations);
-            }
-        }
-    }
-}
-
-fn expr_column_names(expr: &Expr) -> HashSet<String> {
-    expr.column_refs()
-        .iter()
-        .map(|column| column.name.clone())
-        .collect()
-}
-
-fn table_reference_name(table: &datafusion::common::TableReference) -> String {
-    match table {
-        datafusion::common::TableReference::Bare { table } => table.to_string(),
-        datafusion::common::TableReference::Partial { table, .. } => table.to_string(),
-        datafusion::common::TableReference::Full { table, .. } => table.to_string(),
-    }
-}
-
-fn history_non_identity_filter_notice(view_name: &str) -> LixNotice {
-    LixNotice {
-        code: "LIX_HISTORY_NON_IDENTITY_FILTER".to_string(),
-        message: format!("{view_name} was filtered without an identity predicate."),
-        hint: Some(
-            "Filter by id or lixcol_entity_pk to include tombstones and renamed history."
-                .to_string(),
-        ),
-    }
-}
-
 fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Result<Value, LixError> {
     match value {
         ScalarValue::Null => Ok(Value::Null),
@@ -3683,11 +3562,10 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sql2 execute should attach notices to name-filtered directory history reads");
-        assert_eq!(name_filtered_result.notices().len(), 1);
-        assert_eq!(
-            name_filtered_result.notices()[0].code,
-            "LIX_HISTORY_NON_IDENTITY_FILTER"
+            .expect("name-filtered directory history should execute");
+        assert!(
+            name_filtered_result.notices().is_empty(),
+            "ordinary SQL predicates should not emit identity heuristics"
         );
     }
 
@@ -3744,11 +3622,10 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sql2 execute should attach notices to path-filtered file history reads");
-        assert_eq!(path_filtered_result.notices().len(), 1);
-        assert_eq!(
-            path_filtered_result.notices()[0].code,
-            "LIX_HISTORY_NON_IDENTITY_FILTER"
+            .expect("path-filtered file history should execute");
+        assert!(
+            path_filtered_result.notices().is_empty(),
+            "ordinary SQL predicates should not emit identity heuristics"
         );
     }
 

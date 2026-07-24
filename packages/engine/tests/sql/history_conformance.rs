@@ -108,7 +108,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
                  false,\
                  false\
                  )",
@@ -137,7 +137,7 @@ simulation_test!(
         let expected = vec![
             ("engine_history_contract_schema_history", "active", "YES"),
             ("engine_history_contract_schema_history", "count", "YES"),
-            ("engine_history_contract_schema_history", "id", "YES"),
+            ("engine_history_contract_schema_history", "id", "NO"),
             (
                 "engine_history_contract_schema_history",
                 "lixcol_is_deleted",
@@ -404,6 +404,102 @@ simulation_test!(
                 ],
             ]
         );
+    }
+);
+
+simulation_test!(
+    typed_entity_history_reconstructs_nested_primary_key_roots_on_tombstones,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_history_nested_pk\",\"x-lix-primary-key\":[\"/identity/tenant\",\"/identity/id\"],\"type\":\"object\",\"properties\":{\"identity\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"tenant\",\"id\"],\"additionalProperties\":false},\"value\":{\"type\":\"string\"}},\"required\":[\"identity\",\"value\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_history_nested_pk \
+                 (identity, value, lixcol_untracked) \
+                 VALUES (lix_json('{\"tenant\":\"acme\",\"id\":\"7\"}'), 'one', false)",
+                &[],
+            )
+            .await
+            .expect("nested-key entity insert should succeed");
+        session
+            .execute(
+                "DELETE FROM engine_history_nested_pk \
+                 WHERE lixcol_entity_pk = lix_json('[\"acme\",\"7\"]')",
+                &[],
+            )
+            .await
+            .expect("nested-key entity delete should succeed");
+
+        let rows = select_rows(
+            &session,
+            "SELECT identity, value, lixcol_snapshot_content, lixcol_depth \
+             FROM engine_history_nested_pk_history \
+             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+               AND lix_json_get_text(identity, 'tenant') = 'acme' \
+               AND lix_json_get_text(identity, 'id') = '7' \
+             ORDER BY lixcol_depth",
+        )
+        .await;
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Json(serde_json::json!({
+                        "tenant": "acme",
+                        "id": "7"
+                    })),
+                    Value::Null,
+                    Value::Null,
+                    Value::Integer(0),
+                ],
+                vec![
+                    Value::Json(serde_json::json!({
+                        "tenant": "acme",
+                        "id": "7"
+                    })),
+                    Value::Text("one".to_string()),
+                    Value::Json(serde_json::json!({
+                        "identity": {
+                            "tenant": "acme",
+                            "id": "7"
+                        },
+                        "value": "one"
+                    })),
+                    Value::Integer(1),
+                ],
+            ]
+        );
+
+        let nullability = select_rows(
+            &session,
+            "SELECT is_nullable \
+             FROM information_schema.columns \
+             WHERE table_name = 'engine_history_nested_pk_history' \
+               AND column_name = 'identity'",
+        )
+        .await;
+        assert_eq!(nullability, vec![vec![Value::Text("NO".to_string())]]);
     }
 );
 

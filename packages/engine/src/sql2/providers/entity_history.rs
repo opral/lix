@@ -35,6 +35,7 @@ use crate::sql2::providers::entity::{
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
+use super::entity::{EntityPrimaryKeyFilterAnalyzer, entity_pks_from_primary_key_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 
 pub(super) fn register_entity_history_surface<S>(
@@ -96,8 +97,13 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter).is_some() {
+        let identity_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
+        if parse_history_filter(filter).is_some() || identity_analyzer.supports(filter) {
             TableProviderFilterPushDown::Exact
+        } else if identity_analyzer.contains_routable_conjunct(filter) {
+            // Keep DataFusion's residual evaluation for mixed predicates while
+            // still receiving exact identity conjuncts for commit-graph routing.
+            TableProviderFilterPushDown::Inexact
         } else {
             TableProviderFilterPushDown::Unsupported
         }
@@ -114,7 +120,7 @@ where
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        let mut route = HistoryRoute::from_filters(filters);
+        let mut route = entity_history_route_from_filters(&self.spec, filters)?;
         route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
@@ -146,6 +152,22 @@ where
             ),
         })
     }
+}
+
+fn entity_history_route_from_filters(
+    spec: &EntitySurfaceSpec,
+    filters: &[Expr],
+) -> Result<HistoryRoute> {
+    let mut route = HistoryRoute::from_filters(filters);
+    if let Some(entity_pks) = entity_pks_from_primary_key_filters(spec, filters)? {
+        let entity_pks = entity_pks
+            .into_iter()
+            .map(|entity_pk| entity_pk.as_json_array_text())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(lix_error_to_datafusion_error)?;
+        route.constrain_entity_pks(entity_pks);
+    }
+    Ok(route)
 }
 
 #[derive(Debug, Clone)]
@@ -374,4 +396,91 @@ fn entity_history_column_value(
         HistoryIdentityProjection::PrimaryKeyPaths(&spec.primary_key_paths),
     )
     .map_err(|error| DataFusionError::Execution(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::{Column, ScalarValue};
+    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use serde_json::json;
+
+    use crate::sql2::catalog::derive_entity_surface_spec_from_schema;
+
+    use super::entity_history_route_from_filters;
+
+    #[test]
+    fn public_composite_key_filters_route_in_schema_order() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "localized_message",
+            "x-lix-primary-key": ["/locale", "/key"],
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "locale": { "type": "string" },
+                "body": { "type": "string" }
+            },
+            "required": ["key", "locale", "body"]
+        }))
+        .expect("schema should derive");
+        let filters = vec![
+            eq("lixcol_as_of_commit_id", "commit-head"),
+            // Deliberately reverse the declared primary-key path order.
+            eq("key", "welcome"),
+            eq("locale", "en"),
+        ];
+
+        let route = entity_history_route_from_filters(&spec, &filters)
+            .expect("history route should derive");
+
+        assert_eq!(route.as_of_commit_ids, vec!["commit-head"]);
+        assert_eq!(route.entity_pks, vec![r#"["en","welcome"]"#]);
+        assert!(!route.is_contradictory());
+    }
+
+    #[test]
+    fn public_and_opaque_identity_filters_intersect() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "localized_message",
+            "x-lix-primary-key": ["/locale", "/key"],
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "locale": { "type": "string" }
+            },
+            "required": ["key", "locale"]
+        }))
+        .expect("schema should derive");
+        let filters = vec![
+            eq("key", "welcome"),
+            eq("locale", "en"),
+            eq("lixcol_entity_pk", r#"["fr","welcome"]"#),
+        ];
+
+        let route = entity_history_route_from_filters(&spec, &filters)
+            .expect("history route should derive");
+
+        assert!(route.is_contradictory());
+
+        let wrong_arity_route = entity_history_route_from_filters(
+            &spec,
+            &[
+                eq("key", "welcome"),
+                eq("locale", "en"),
+                eq("lixcol_entity_pk", r#"["en"]"#),
+            ],
+        )
+        .expect("wrong-arity identity should produce a route");
+        assert!(wrong_arity_route.is_contradictory());
+    }
+
+    fn eq(column: &str, value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name(column))),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(value.to_string())),
+                None,
+            )),
+        ))
+    }
 }
