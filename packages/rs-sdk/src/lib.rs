@@ -29,7 +29,7 @@ pub use lix_engine::wasm::{
     WasmPluginFile, WasmRuntime,
 };
 pub use lix_engine::{
-    CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
+    Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
     CreateBranchReceipt as CreateBranchResult, ExecuteBatchStatement, ExecuteOptions,
     ExecuteResult, GetManyResult, GetOptions, Key, KeyRange, LixError, LixNotice,
     MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, MergeBranchOptions, MergeBranchOutcome,

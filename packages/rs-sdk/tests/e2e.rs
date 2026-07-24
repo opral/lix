@@ -45,6 +45,49 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
 }
 
 #[tokio::test]
+async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
+    let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
+
+    assert_eq!(
+        lix.upsert_file_data("/native/file.bin", b"first".as_slice())
+            .await
+            .expect("create native file"),
+        1
+    );
+    assert_eq!(
+        lix.upsert_file_data("/native/file.bin", b"second".as_slice())
+            .await
+            .expect("update native file"),
+        1
+    );
+    assert_eq!(
+        read_file(&lix, "/native/file.bin")
+            .await
+            .expect("read native file"),
+        Some(b"second".to_vec())
+    );
+
+    assert_eq!(
+        lix.upsert_file_data("/native/file.bin", Vec::<u8>::new())
+            .await
+            .expect("write empty native file"),
+        1
+    );
+    assert_eq!(
+        read_file(&lix, "/native/file.bin")
+            .await
+            .expect("read empty native file"),
+        Some(Vec::new())
+    );
+
+    let error = lix
+        .upsert_file_data("relative.bin", b"invalid".as_slice())
+        .await
+        .expect_err("relative native file path should be rejected");
+    assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+}
+
+#[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     let main_branch_id = lix.active_branch_id().await.unwrap();

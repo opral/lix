@@ -404,6 +404,12 @@ enum ExecuteBatchExecution {
     Transaction(Vec<datafusion::sql::parser::Statement>),
 }
 
+// Keep the rare legacy-topology fallback semantically identical to the public
+// `lix_file` upsert. The native route stays on the allocation-light direct
+// path for normal workspaces and only plans SQL when that helper declines.
+const NATIVE_FILE_UPSERT_SQL: &str = "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+    ON CONFLICT (path) DO UPDATE SET data = excluded.data";
+
 impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -428,6 +434,56 @@ where
     ) -> Result<ExecuteResult, LixError> {
         self.execute_with_kind(sql, params, options, "execute")
             .await
+    }
+
+    /// Upserts one file's bytes by its full logical path without constructing
+    /// a SQL parser or DataFusion plan for normal filesystem layouts.
+    ///
+    /// This is the structured file-transfer path. It deliberately delegates
+    /// planning and staging to the existing filesystem fast-write helper, so
+    /// plugin reconciliation, transactional visibility, and commit behavior
+    /// remain identical to the corresponding `lix_file` upsert.
+    pub async fn upsert_file_data(&self, path: String, data: Blob) -> Result<u64, LixError> {
+        self.ensure_open()?;
+        // Preserve the public filesystem path contract before entering a
+        // write transaction. The lower-level fast helper maps this validation
+        // through DataFusion for SQL callers; this native surface should keep
+        // its specific path errors intact.
+        crate::common::LixPath::try_from_file_path(&path)?;
+        let write_access = self.begin_session_write_access().await?;
+        let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
+        self.with_write_transaction_reserved(write_access, |transaction| {
+            Box::pin(async move {
+                // `Blob` is reference-counted. Retaining a copy lets the rare
+                // general-write fallback reuse the same payload without a
+                // second allocation or a second transaction.
+                let fast_path = sql2::execute_fast_lix_file_path_writes(
+                    transaction,
+                    vec![(path.clone(), data.clone(), None)],
+                    sql2::FastLixFilePathWriteConflict::UpdateData,
+                )
+                .await?;
+                if let Some(count) = fast_path {
+                    return Ok(count);
+                }
+
+                // The fast helper declines pre-existing cross-scope path
+                // collisions before staging anything. The general provider
+                // handles those valid legacy layouts, so keep this request in
+                // the same transaction and use its public upsert semantics.
+                let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
+                let plan = transaction
+                    .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
+                sql2::execute_write_logical_plan_result(
+                    transaction,
+                    plan,
+                    &[Value::Text(path), Value::Blob(data)],
+                )
+                .await
+                .map(|result| result.rows_affected)
+            })
+        })
+        .await
     }
 
     pub(crate) async fn execute_for_observe(
