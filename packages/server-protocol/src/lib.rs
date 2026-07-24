@@ -14,15 +14,16 @@ use axum::{
     routing::{delete, get, post},
 };
 use lix_sdk::{
-    CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Lix, LixError,
+    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Lix, LixError,
     ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     future::Future,
+    mem::size_of,
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicUsize, Ordering},
@@ -57,6 +58,11 @@ pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// so 64 MiB carries the engine's 32 MiB maximum plugin archive with room for
 /// the SQL envelope and also covers ordinary larger document blobs.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Largest number of file entries accepted by one native batch request.
+///
+/// Keeping this bounded makes the fast path predictable for the normal bulk
+/// upload shape while keeping one request from monopolizing a session.
+const MAX_BINARY_FILE_UPSERT_BATCH_ENTRIES: usize = 1024;
 const MIN_COMPRESSION_BODY_BYTES: u16 = 32 * 1024;
 /// Maximum number of queries multiplexed onto one observation stream.
 pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
@@ -587,6 +593,10 @@ where
             .route("/lix/v1/execute", post(execute::<S>))
             .route("/lix/v1/execute-batch", post(execute_batch::<S>))
             .route("/lix/v1/file/upsert", post(upsert_file_data::<S>))
+            .route(
+                "/lix/v1/file/upsert-batch",
+                post(upsert_file_data_batch::<S>),
+            )
             .route("/lix/v1/branch/create", post(create_branch::<S>))
             .route("/lix/v1/branch/switch", post(switch_branch::<S>))
             .route("/lix/v1/observe", post(observe::<S>))
@@ -976,6 +986,7 @@ where
             capabilities: ProtocolCapabilities {
                 request_blob_splice: true,
                 binary_file_upsert: true,
+                binary_file_upsert_batch: true,
             },
         }),
     ))
@@ -1088,6 +1099,156 @@ where
     Ok(Json(ExecuteResponse::try_from(
         ExecuteResult::from_rows_affected(result),
     )?))
+}
+
+/// Upserts a bounded batch of files from one deterministic octet-stream frame.
+///
+/// The frame is `u32be entry_count`, followed by one `u32be path_length`,
+/// `u32be data_length`, UTF-8 path, and raw data sequence per entry. Data
+/// payloads remain `Bytes` slices through the SDK boundary; only paths need a
+/// `String` allocation.
+async fn upsert_file_data_batch<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+    body: Bytes,
+) -> Result<Json<ExecuteResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let writes = parse_binary_file_upsert_batch(body)?;
+    let result = lease
+        .run(move |lix| async move { lix.upsert_file_data_batch(writes).await })
+        .await?;
+    Ok(Json(ExecuteResponse::try_from(
+        ExecuteResult::from_rows_affected(result),
+    )?))
+}
+
+fn parse_binary_file_upsert_batch(body: Bytes) -> Result<Vec<(String, Blob)>, ApiError> {
+    let mut offset = 0;
+    let count = usize::try_from(read_binary_file_upsert_batch_u32(
+        &body,
+        &mut offset,
+        "entry count",
+    )?)
+    .map_err(|_| ApiError::bad_request("batch frame entry count does not fit this platform"))?;
+    if count == 0 {
+        return Err(ApiError::bad_request(
+            "batch frame must contain at least one file entry",
+        ));
+    }
+    if count > MAX_BINARY_FILE_UPSERT_BATCH_ENTRIES {
+        return Err(ApiError::bad_request(format!(
+            "batch frame has {count} file entries; maximum is {MAX_BINARY_FILE_UPSERT_BATCH_ENTRIES}",
+        )));
+    }
+
+    let mut writes = Vec::with_capacity(count);
+    let mut paths = HashSet::with_capacity(count);
+    for entry_index in 0..count {
+        let path_length = usize::try_from(read_binary_file_upsert_batch_u32(
+            &body,
+            &mut offset,
+            "path length",
+        )?)
+        .map_err(|_| {
+            ApiError::bad_request(format!(
+                "batch frame path length for entry {entry_index} does not fit this platform",
+            ))
+        })?;
+        let data_length = usize::try_from(read_binary_file_upsert_batch_u32(
+            &body,
+            &mut offset,
+            "data length",
+        )?)
+        .map_err(|_| {
+            ApiError::bad_request(format!(
+                "batch frame data length for entry {entry_index} does not fit this platform",
+            ))
+        })?;
+        let path_range = take_binary_file_upsert_batch_range(
+            &body,
+            &mut offset,
+            path_length,
+            "path",
+            entry_index,
+        )?;
+        let path = std::str::from_utf8(&body[path_range])
+            .map_err(|_| {
+                ApiError::bad_request(format!(
+                    "batch frame path for entry {entry_index} must be valid UTF-8",
+                ))
+            })?
+            .to_owned();
+        // Reject duplicate entries as a malformed frame before opening an
+        // engine transaction. Payload bytes remain zero-copy; only bounded
+        // path metadata is cloned for this protocol-level validation.
+        if !paths.insert(path.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "batch frame contains duplicate path for entry {entry_index}",
+            )));
+        }
+        let data_range = take_binary_file_upsert_batch_range(
+            &body,
+            &mut offset,
+            data_length,
+            "data",
+            entry_index,
+        )?;
+        // `Bytes::slice` preserves the request allocation. Do not replace it
+        // with `to_vec`: large file bodies are intentionally forwarded as
+        // shared immutable Blob storage.
+        writes.push((path, Blob::from(body.slice(data_range))));
+    }
+
+    if offset != body.len() {
+        return Err(ApiError::bad_request(
+            "batch frame contains trailing bytes after its declared entries",
+        ));
+    }
+    Ok(writes)
+}
+
+fn read_binary_file_upsert_batch_u32(
+    body: &Bytes,
+    offset: &mut usize,
+    field: &str,
+) -> Result<u32, ApiError> {
+    let end = offset.checked_add(size_of::<u32>()).ok_or_else(|| {
+        ApiError::bad_request(format!("batch frame offset overflow while reading {field}"))
+    })?;
+    let bytes: [u8; size_of::<u32>()] = body
+        .get(*offset..end)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("batch frame is truncated while reading {field}"))
+        })?
+        .try_into()
+        .map_err(|_| {
+            ApiError::bad_request(format!("batch frame is truncated while reading {field}"))
+        })?;
+    *offset = end;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn take_binary_file_upsert_batch_range(
+    body: &Bytes,
+    offset: &mut usize,
+    length: usize,
+    field: &str,
+    entry_index: usize,
+) -> Result<std::ops::Range<usize>, ApiError> {
+    let start = *offset;
+    let end = start.checked_add(length).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "batch frame {field} length for entry {entry_index} overflows its offset",
+        ))
+    })?;
+    if end > body.len() {
+        return Err(ApiError::bad_request(format!(
+            "batch frame is truncated while reading {field} for entry {entry_index}",
+        )));
+    }
+    *offset = end;
+    Ok(start..end)
 }
 
 async fn create_branch<S>(
@@ -1727,6 +1888,7 @@ struct HandshakeResponse {
 struct ProtocolCapabilities {
     request_blob_splice: bool,
     binary_file_upsert: bool,
+    binary_file_upsert_batch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2409,6 +2571,52 @@ mod tests {
             .to_string()
     }
 
+    fn binary_file_upsert_batch_body(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            &u32::try_from(entries.len())
+                .expect("test batch entry count should fit the wire format")
+                .to_be_bytes(),
+        );
+        for (path, data) in entries {
+            body.extend_from_slice(
+                &u32::try_from(path.len())
+                    .expect("test batch path should fit the wire format")
+                    .to_be_bytes(),
+            );
+            body.extend_from_slice(
+                &u32::try_from(data.len())
+                    .expect("test batch data should fit the wire format")
+                    .to_be_bytes(),
+            );
+            body.extend_from_slice(path.as_bytes());
+            body.extend_from_slice(data);
+        }
+        body
+    }
+
+    async fn binary_file_upsert_batch_request(
+        app: &Router,
+        session_id: Option<&str>,
+        body: Vec<u8>,
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/lix/v1/file/upsert-batch")
+            .header(axum::http::header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(session_id) = session_id {
+            builder = builder.header(SESSION_ID_HEADER, session_id);
+        }
+        app.clone()
+            .oneshot(
+                builder
+                    .body(Body::from(body))
+                    .expect("binary batch request"),
+            )
+            .await
+            .expect("binary batch response")
+    }
+
     #[tokio::test]
     async fn handshake_issues_and_resumes_a_256_bit_server_session() {
         let app = app().await;
@@ -2416,6 +2624,7 @@ mod tests {
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(first["capabilities"]["requestBlobSplice"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
+        assert_eq!(first["capabilities"]["binaryFileUpsertBatch"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -2647,6 +2856,206 @@ mod tests {
             error_code(invalid_path).await,
             "LIX_ERROR_PATH_MISSING_LEADING_SLASH"
         );
+    }
+
+    #[tokio::test]
+    async fn binary_file_upsert_batch_accepts_raw_frames_and_preserves_execute_response_shape() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let seeded = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "params": [
+                    { "kind": "text", "value": "/batch/updated.bin" },
+                    { "kind": "blob", "base64": "b2xk" }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(seeded.status(), StatusCode::OK);
+
+        let response = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            binary_file_upsert_batch_body(&[
+                ("/batch/updated.bin", b"updated"),
+                ("/batch/created.bin", b"created"),
+                ("/batch/empty.bin", b""),
+            ]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["rowsAffected"], 3);
+        assert_eq!(response["columns"], json!([]));
+        assert_eq!(response["rows"], json!([]));
+
+        for (path, expected) in [
+            ("/batch/updated.bin", &b"updated"[..]),
+            ("/batch/created.bin", &b"created"[..]),
+            ("/batch/empty.bin", &b""[..]),
+        ] {
+            let selected = request(
+                &app.router,
+                "POST",
+                "/lix/v1/execute",
+                Some(&session_id),
+                Some(json!({
+                    "sql": "SELECT data FROM lix_file WHERE path = $1",
+                    "params": [{ "kind": "text", "value": path }]
+                })),
+            )
+            .await;
+            assert_eq!(selected.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(selected).await["rows"][0][0],
+                wire_blob_json(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_file_upsert_batch_requires_a_live_session_and_preserves_engine_path_errors() {
+        let app = app().await;
+        let missing_session = binary_file_upsert_batch_request(
+            &app.router,
+            None,
+            binary_file_upsert_batch_body(&[("/batch/missing-session.bin", b"payload")]),
+        )
+        .await;
+        assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_code(missing_session).await,
+            "LIX_ERROR_PROTOCOL_SESSION_REQUIRED"
+        );
+
+        let (session_id, _) = new_session(&app.router).await;
+        let invalid_path = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            binary_file_upsert_batch_body(&[
+                ("/batch/must-not-write.bin", b"first"),
+                ("relative.bin", b"invalid"),
+            ]),
+        )
+        .await;
+        assert_eq!(invalid_path.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_code(invalid_path).await,
+            "LIX_ERROR_PATH_MISSING_LEADING_SLASH"
+        );
+
+        let selected = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/batch/must-not-write.bin" }]
+            })),
+        )
+        .await;
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert!(
+            response_json(selected).await["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_file_upsert_batch_rejects_malformed_trailing_and_duplicate_frames() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+
+        let malformed = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            vec![0, 0, 0, 1, 0, 0],
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(malformed).await, "LIX_INVALID_ARGUMENT");
+
+        let mut trailing = binary_file_upsert_batch_body(&[("/batch/trailing.bin", b"payload")]);
+        trailing.push(0);
+        let trailing =
+            binary_file_upsert_batch_request(&app.router, Some(&session_id), trailing).await;
+        assert_eq!(trailing.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(trailing).await, "LIX_INVALID_ARGUMENT");
+
+        let duplicate = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            binary_file_upsert_batch_body(&[
+                ("/batch/duplicate.bin", b"first"),
+                ("/batch/duplicate.bin", b"second"),
+            ]),
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(duplicate).await, "LIX_INVALID_ARGUMENT");
+
+        let duplicate_selected = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/batch/duplicate.bin" }]
+            })),
+        )
+        .await;
+        assert_eq!(duplicate_selected.status(), StatusCode::OK);
+        assert!(
+            response_json(duplicate_selected).await["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let empty = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            0_u32.to_be_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(empty).await, "LIX_INVALID_ARGUMENT");
+
+        let over_limit = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            u32::try_from(MAX_BINARY_FILE_UPSERT_BATCH_ENTRIES + 1)
+                .expect("test entry count should fit the wire format")
+                .to_be_bytes()
+                .to_vec(),
+        )
+        .await;
+        assert_eq!(over_limit.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(over_limit).await, "LIX_INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn binary_file_upsert_batch_parser_slices_payload_bytes_without_copying_them() {
+        let path = "/batch/slice.bin";
+        let payload = b"payload";
+        let data_offset = size_of::<u32>() * 3 + path.len();
+        let body = Bytes::from(binary_file_upsert_batch_body(&[(path, payload)]));
+        let expected_data_pointer = body[data_offset..].as_ptr();
+
+        let writes = parse_binary_file_upsert_batch(body).expect("valid batch frame");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, path);
+        assert_eq!(writes[0].1.as_ref(), payload);
+        assert_eq!(writes[0].1.as_bytes().as_ptr(), expected_data_pointer);
     }
 
     #[tokio::test]
@@ -3330,6 +3739,25 @@ mod tests {
             )
             .await
             .expect("oversized binary file upsert response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn configured_body_limit_rejects_oversized_binary_file_upsert_batch() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_request_body_bytes: 1_024,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (session_id, _) = new_session(&app.router).await;
+        let oversized = vec![0_u8; 2_048];
+        let response = binary_file_upsert_batch_request(
+            &app.router,
+            Some(&session_id),
+            binary_file_upsert_batch_body(&[("/batch/oversized.bin", &oversized)]),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }

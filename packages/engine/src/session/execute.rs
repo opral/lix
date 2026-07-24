@@ -404,11 +404,47 @@ enum ExecuteBatchExecution {
     Transaction(Vec<datafusion::sql::parser::Statement>),
 }
 
-// Keep the rare legacy-topology fallback semantically identical to the public
-// `lix_file` upsert. The native route stays on the allocation-light direct
-// path for normal workspaces and only plans SQL when that helper declines.
+// Keep the single-file legacy-topology fallback semantically identical to the
+// public `lix_file` upsert. Batch writes intentionally stay direct-only.
 const NATIVE_FILE_UPSERT_SQL: &str = "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
     ON CONFLICT (path) DO UPDATE SET data = excluded.data";
+
+fn validate_native_file_upsert_batch(writes: &[(String, Blob)]) -> Result<(), LixError> {
+    if writes.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "upsert_file_data_batch requires at least one file",
+        )
+        .with_details(serde_json::json!({
+            "operation": "upsertFileDataBatch",
+            "argument": "writes",
+            "expected": "non-empty array",
+        })));
+    }
+
+    let mut paths = BTreeSet::new();
+    for (path, _) in writes {
+        // Preserve the public filesystem path contract before entering a
+        // write transaction. The lower-level fast helper maps this validation
+        // through DataFusion for SQL callers; this native surface should keep
+        // its specific path errors intact.
+        crate::common::LixPath::try_from_file_path(path)?;
+        if !paths.insert(path.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("upsert_file_data_batch contains duplicate path '{path}'"),
+            )
+            .with_details(serde_json::json!({
+                "operation": "upsertFileDataBatch",
+                "argument": "writes",
+                "path": path,
+                "expected": "unique file paths",
+            })));
+        }
+    }
+
+    Ok(())
+}
 
 impl<StorageImpl> SessionContext<StorageImpl>
 where
@@ -439,10 +475,9 @@ where
     /// Upserts one file's bytes by its full logical path without constructing
     /// a SQL parser or DataFusion plan for normal filesystem layouts.
     ///
-    /// This is the structured file-transfer path. It deliberately delegates
-    /// planning and staging to the existing filesystem fast-write helper, so
-    /// plugin reconciliation, transactional visibility, and commit behavior
-    /// remain identical to the corresponding `lix_file` upsert.
+    /// This stays separate from the batch API so the established one-file
+    /// transfer path does not pay for batch-vector allocation or duplicate
+    /// validation.
     pub async fn upsert_file_data(&self, path: String, data: Blob) -> Result<u64, LixError> {
         self.ensure_open()?;
         // Preserve the public filesystem path contract before entering a
@@ -481,6 +516,45 @@ where
                 )
                 .await
                 .map(|result| result.rows_affected)
+            })
+        })
+        .await
+    }
+
+    /// Upserts a non-empty batch of file bytes in one transaction.
+    ///
+    /// Paths are validated and required to be unique before a transaction is
+    /// opened. This is deliberately a direct filesystem write: if the path
+    /// index cannot route an exceptional layout unambiguously, the batch is
+    /// rejected instead of copying the complete payload into a SQL fallback.
+    pub async fn upsert_file_data_batch(
+        &self,
+        writes: Vec<(String, Blob)>,
+    ) -> Result<u64, LixError> {
+        self.ensure_open()?;
+        validate_native_file_upsert_batch(&writes)?;
+        let write_access = self.begin_session_write_access().await?;
+        self.with_write_transaction_reserved(write_access, |transaction| {
+            Box::pin(async move {
+                sql2::execute_fast_lix_file_path_writes(
+                    transaction,
+                    writes
+                        .into_iter()
+                        .map(|(path, data)| (path, data, None))
+                        .collect(),
+                    sql2::FastLixFilePathWriteConflict::UpdateData,
+                )
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "upsert_file_data_batch requires a filesystem layout that its direct path index can route unambiguously",
+                    )
+                    .with_details(serde_json::json!({
+                        "operation": "upsertFileDataBatch",
+                        "expected": "a filesystem layout that the direct path index can route unambiguously",
+                    }))
+                })
             })
         })
         .await
