@@ -2127,3 +2127,45 @@ or slow fallback. Validation includes golden wire bytes, logical-vs-byte
 ordering, prefix-freedom, malformed codec, multi-level routing, canonical
 rebuild, sparse/deep/height-transition diff oracles, and backend accounting
 coverage.
+
+## 2026-07-24 — Standalone SQLite CRUD control
+
+The tracked CRUD scorecard now includes a deliberately non-versioned,
+standalone SQLite control. It stores the same flattened JSON-pointer workload
+in a normal `WITHOUT ROWID` table keyed by `path`, uses one transaction and one
+prepared statement for bulk writes, and materializes the same selected
+`path`/`value` columns for reads. The file-backed connection uses the same WAL,
+`synchronous=NORMAL`, cache, mmap, and checkpoint settings as Lix's SQLite
+storage adapter.
+
+This is not a semantic-equivalence claim: standalone SQLite does not construct
+changes, commits, tracked roots, or live-state projections. It is the requested
+latency floor for measuring how much headroom remains in Lix + RocksDB's normal
+tracked public-SQL path, following the baseline-driven approach described in
+[How Dolt Got as Fast as MySQL](https://www.dolthub.com/blog/2025-12-12-how-dolt-got-as-fast-as-mysql/).
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches \
+  --bench tracked_state_crud -- raw_sqlite
+```
+
+Fresh current-main point estimates on the same machine:
+
+| Operation | Standalone SQLite 1k | Lix + RocksDB SQL 1k | Ratio | Standalone SQLite 10k | Lix + RocksDB SQL 10k | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| insert all | 1.187 ms | 36.364 ms | 30.6x | 9.600 ms | 265.030 ms | 27.6x |
+| read all | 0.193 ms | 9.697 ms | 50.2x | 1.487 ms | 72.380 ms | 48.7x |
+| read one by PK | 0.031 ms | 2.624 ms | 84.3x | 0.044 ms | 4.846 ms | 109.6x |
+| read 10 by PK | 0.081 ms | 3.010 ms | 37.1x | 0.095 ms | 5.175 ms | 54.4x |
+| update one by PK | 0.026 ms | 7.563 ms | 295.7x | 0.053 ms | 75.691 ms | 1435.6x |
+| delete all | 0.046 ms | 20.500 ms | 444.7x | 0.271 ms | 251.290 ms | 926.9x |
+| delete one by PK | 0.030 ms | 8.919 ms | 301.9x | 0.049 ms | 76.212 ms | 1539.7x |
+
+The tracked transaction layer isolates storage/commit work from SQL planning.
+At 10k rows, its RocksDB point update/delete are 1.470/1.660 ms while public SQL
+is 75.691/76.212 ms. Both public-SQL writes grow about 10x when the table grows
+10x even though the matched identity count stays one. The first follow-up
+profile therefore targets bound public-write candidate selection above the
+tracked transaction and RocksDB layers.
