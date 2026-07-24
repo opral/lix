@@ -8,7 +8,7 @@
     clippy::unnecessary_wraps
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
@@ -991,6 +991,25 @@ where
     where
         I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
     {
+        self.stage_commit_root_with_absence_guards(
+            commit_id,
+            parent_commit_id,
+            deltas,
+            &BTreeSet::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn stage_commit_root_with_absence_guards<'a, I>(
+        &mut self,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        deltas: I,
+        absence_guards: &BTreeSet<TrackedStateKey>,
+    ) -> Result<TrackedStateWriteReport, LixError>
+    where
+        I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
+    {
         let deltas = deltas.into_iter().collect::<Vec<_>>();
         let typed_commit_id =
             CommitId::parse_lix(commit_id, "tracked-state commit root commit_id")?;
@@ -1059,6 +1078,26 @@ where
         };
         let mut mutations = Vec::with_capacity(deltas.len());
         for (delta, parent_value) in deltas.iter().zip(parent_values.iter()) {
+            let key = TrackedStateKey {
+                schema_key: delta.schema_key.to_string(),
+                file_id: delta.file_id.map(str::to_string),
+                entity_pk: delta.entity_pk.clone(),
+            };
+            if parent_value.as_ref().is_some_and(|value| !value.deleted())
+                && absence_guards.contains(&key)
+            {
+                let entity_pk = key
+                    .entity_pk
+                    .as_json_array_text()
+                    .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
+                        key.schema_key
+                    ),
+                ));
+            }
             let parent_created_at = parent_value.as_ref().map(|value| value.created_at());
             let created_at = parent_created_at.unwrap_or(delta.created_at);
             let key = TrackedStateKeyRef {

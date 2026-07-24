@@ -451,7 +451,7 @@ where
         } else {
             load_path_index_revision(&read).await.ok().flatten()
         };
-        let mut writes = match commit::commit_prepared_writes(
+        let (mut writes, materialization_preconditions) = match commit::commit_prepared_writes(
             &transaction.binary_cas,
             transaction.branch_ctx.as_ref(),
             transaction.live_state.index(),
@@ -475,6 +475,9 @@ where
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
         let mut write_options = StorageWriteOptions::default();
+        write_options
+            .preconditions
+            .extend(materialization_preconditions);
         if tracked_state_changed {
             write_options.preconditions.push(
                 StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
@@ -1636,6 +1639,11 @@ where
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
             let branch_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
+            if crate::transaction::validation::tracked_row_local_certificates_cover_validation(
+                &branch_prepared_writes,
+            ) {
+                continue;
+            }
             let read = SharedStorageAdapterRead::new(
                 self.storage
                     .begin_read(StorageReadOptions::default())

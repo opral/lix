@@ -18,11 +18,13 @@ use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
-    LiveStateIndexScanRequest,
+    LiveStateIndexScanRequest, branch_empty_precondition, row_absent_precondition,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
-use crate::transaction::staging::{PreparedStateRowIdentity, PreparedWriteSet};
+use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
+use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef, TrackedStateKey};
+use crate::transaction::staging::{
+    PreparedInsertIdentity, PreparedStateRowIdentity, PreparedWriteSet,
+};
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::Instrument as _;
@@ -43,8 +45,9 @@ pub(crate) async fn commit_prepared_writes(
     runtime_functions: Option<&FunctionContext>,
     read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
-) -> Result<StorageWriteSet, LixError> {
+) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
     let mut writes = StorageWriteSet::new();
+    let mut preconditions = Vec::new();
     let mut json_writer = JsonStoreContext::new().writer();
 
     if !prepared_writes.file_data_writes.is_empty() {
@@ -73,10 +76,7 @@ pub(crate) async fn commit_prepared_writes(
             )
         });
     let mut state_rows = prepared_writes.state_rows;
-    let insert_identities = prepared_writes
-        .insert_identities
-        .into_keys()
-        .collect::<BTreeSet<_>>();
+    let insert_identities = prepared_writes.insert_identities;
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.extra_commit_parents_by_branch,
@@ -113,7 +113,7 @@ pub(crate) async fn commit_prepared_writes(
         && engine_rows.is_empty()
         && writes.is_empty()
     {
-        return Ok(writes);
+        return Ok((writes, preconditions));
     }
 
     let compactable_change_ids = stage_flat_current_rows(
@@ -123,6 +123,7 @@ pub(crate) async fn commit_prepared_writes(
         &state_rows,
         &engine_rows,
         &insert_identities,
+        &mut preconditions,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -154,6 +155,7 @@ pub(crate) async fn commit_prepared_writes(
         row_index.tracked_row_indices_by_commit,
         tracked_roots,
         staged_commits,
+        &insert_identities,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -163,7 +165,7 @@ pub(crate) async fn commit_prepared_writes(
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
     }
-    Ok(writes)
+    Ok((writes, preconditions))
 }
 
 fn retain_untracked_rows_not_superseded_by_engine(
@@ -328,7 +330,7 @@ async fn stage_changelog_commits(
     writer
         .stage_delete_standalone_changes(compact_change_ids)
         .await?;
-    writer.stage_append(append).await?;
+    writer.stage_transaction_append(append)?;
     Ok(staged)
 }
 
@@ -449,7 +451,8 @@ async fn stage_flat_current_rows(
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     engine_rows: &[EngineCurrentRow],
-    insert_identities: &BTreeSet<PreparedStateRowIdentity>,
+    insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
+    preconditions: &mut Vec<StoragePrecondition>,
 ) -> Result<Vec<ChangeId>, LixError> {
     let index_reader = current.reader(read);
     for row in state_rows
@@ -520,12 +523,14 @@ async fn stage_flat_current_rows(
             .collect::<Vec<_>>();
 
         if !new_deltas.is_empty() {
-            let known_absent = state_rows
+            let absence_guards = state_rows
                 .iter()
                 .filter(|row| {
                     row.branch_id == *branch_id
                         && row.snapshot.is_some()
-                        && insert_identities.contains(&PreparedStateRowIdentity::from(*row))
+                        && insert_identities
+                            .get(&PreparedStateRowIdentity::from(*row))
+                            .is_some_and(|insert| !insert.untracked())
                 })
                 .map(|row| LiveStateIndexRowRequest {
                     branch_id: row.branch_id.clone(),
@@ -533,10 +538,28 @@ async fn stage_flat_current_rows(
                     entity_pk: row.entity_pk.clone(),
                     file_id: row.file_id.clone(),
                 })
-                .collect::<Vec<_>>();
-            let superseded = writer
-                .stage_branch_rows_with_known_absent(branch_id, new_deltas, &known_absent)
-                .await?;
+                .collect::<BTreeSet<_>>();
+            let superseded = if absence_guards.is_empty()
+                || !branch_has_local_untracked_rows(&index_reader, branch_id).await?
+            {
+                if !absence_guards.is_empty() {
+                    preconditions.push(branch_empty_precondition(branch_id)?);
+                }
+                let known_absent = absence_guards.iter().cloned().collect::<Vec<_>>();
+                writer
+                    .stage_branch_rows_with_known_absent(branch_id, new_deltas, &known_absent)
+                    .await?
+            } else {
+                preconditions.extend(
+                    absence_guards
+                        .iter()
+                        .map(row_absent_precondition)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                writer
+                    .stage_branch_rows_with_absence_guards(branch_id, new_deltas, &absence_guards)
+                    .await?
+            };
             compactable_change_ids.extend(superseded);
         }
     }
@@ -697,6 +720,7 @@ async fn stage_tracked_roots(
     tracked_row_indices_by_commit: BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: Vec<PendingTrackedRoot>,
     staged_commits: BTreeMap<CommitId, StagedChangelogCommit>,
+    insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
 ) -> Result<(), LixError> {
     let tracked_state = TrackedStateContext::new();
     let mut tracked_writer = tracked_state.writer(read, writes);
@@ -732,13 +756,36 @@ async fn stage_tracked_roots(
                 tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
             }))
             .collect::<Result<Vec<_>, _>>()?;
+        let absence_guards = state_row_indices
+            .iter()
+            .filter_map(|&row_index| {
+                let row = &state_rows[row_index];
+                if row.snapshot.is_none() || row.untracked {
+                    return None;
+                }
+                let insert = insert_identities.get(&PreparedStateRowIdentity::from(row))?;
+                if insert.untracked() {
+                    return None;
+                }
+                Some(TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+            })
+            .collect::<BTreeSet<_>>();
         // Commit facts are canonical in changelog.commit and live-state derives
         // lix_commit rows from the commit graph. Keeping them out of this tree
         // also preserves the one-mutation path for ordinary singleton writes.
         let commit_id_text = root.commit_id.to_string();
         let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
         tracked_writer
-            .stage_commit_root(&commit_id_text, parent_commit_id_text.as_deref(), deltas)
+            .stage_commit_root_with_absence_guards(
+                &commit_id_text,
+                parent_commit_id_text.as_deref(),
+                deltas,
+                &absence_guards,
+            )
             .await?;
     }
     let rooted_commit_ids = tracked_roots
@@ -1026,7 +1073,7 @@ mod tests {
             .expect("read should open");
 
         let state_rows = vec![tracked_global_row("change-1")];
-        let writes = commit_prepared_writes(
+        let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             &LiveStateIndexContext::new(),
@@ -1233,7 +1280,7 @@ mod tests {
             .expect("read should open");
 
         let state_rows = vec![untracked_global_row("change-untracked")];
-        let writes = commit_prepared_writes(
+        let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             &LiveStateIndexContext::new(),
@@ -1312,7 +1359,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let writes = commit_prepared_writes(
+        let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             &LiveStateIndexContext::new(),
@@ -1338,7 +1385,7 @@ mod tests {
             .await
             .expect("read should open");
         let state_rows = vec![tracked_global_row("change-tracked")];
-        let writes = commit_prepared_writes(
+        let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             &LiveStateIndexContext::new(),
@@ -1412,7 +1459,7 @@ mod tests {
                 .expect("setup head read should open");
             let mut setup_row = tracked_global_row("setup-tracked-change");
             setup_row.commit_id = Some(commit_id("setup-commit"));
-            let writes = commit_prepared_writes(
+            let (writes, _) = commit_prepared_writes(
                 &binary_cas,
                 &branch_ctx,
                 &LiveStateIndexContext::new(),
@@ -1446,7 +1493,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("deterministic mode read should open");
-            let writes = commit_prepared_writes(
+            let (writes, _) = commit_prepared_writes(
                 &binary_cas,
                 &branch_ctx,
                 &LiveStateIndexContext::new(),
@@ -1493,7 +1540,7 @@ mod tests {
         let mut untracked_row = untracked_global_row("change-untracked");
         untracked_row.entity_pk = EntityPk::single("entity-2");
 
-        let writes = commit_prepared_writes(
+        let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             &LiveStateIndexContext::new(),
@@ -1621,7 +1668,7 @@ mod tests {
             .await
             .expect("read should open");
         let state_rows = vec![tracked_branch_row("branch-a", "change-branch-a")];
-        let writes = commit_prepared_writes(
+        let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             &LiveStateIndexContext::new(),

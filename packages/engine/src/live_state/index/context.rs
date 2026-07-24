@@ -204,6 +204,37 @@ where
             .iter()
             .map(FlatIdentity::from_request)
             .collect::<BTreeSet<_>>();
+        self.stage_branch_rows_with_constraints(branch_id, deltas, &known_absent, &BTreeSet::new())
+            .await
+    }
+
+    pub(crate) async fn stage_branch_rows_with_absence_guards<'a, I>(
+        &mut self,
+        branch_id: &str,
+        deltas: I,
+        absence_guards: &BTreeSet<LiveStateIndexRowRequest>,
+    ) -> Result<Vec<ChangeId>, LixError>
+    where
+        I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
+    {
+        let guards = absence_guards
+            .iter()
+            .map(FlatIdentity::from_request)
+            .collect::<BTreeSet<_>>();
+        self.stage_branch_rows_with_constraints(branch_id, deltas, &BTreeSet::new(), &guards)
+            .await
+    }
+
+    async fn stage_branch_rows_with_constraints<'a, I>(
+        &mut self,
+        branch_id: &str,
+        deltas: I,
+        known_absent: &BTreeSet<FlatIdentity>,
+        absence_guards: &BTreeSet<FlatIdentity>,
+    ) -> Result<Vec<ChangeId>, LixError>
+    where
+        I: IntoIterator<Item = LiveStateIndexDeltaRef<'a>>,
+    {
         let mut final_deltas = BTreeMap::<FlatIdentity, LiveStateIndexDeltaRef<'a>>::new();
         for delta in deltas {
             final_deltas.insert(
@@ -246,6 +277,15 @@ where
                 .get(&identity)
                 .cloned()
                 .unwrap_or_else(|| prior.remove(&identity).flatten());
+            if previous.is_some() && absence_guards.contains(&identity) {
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "cannot insert tracked row for schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
+                        identity.schema_key, identity.entity_pk
+                    ),
+                ));
+            }
             if let Some(previous) = previous.as_ref() {
                 superseded.insert(previous.change_id);
             }
@@ -259,7 +299,6 @@ where
                 self.staged.insert(identity, None);
                 continue;
             }
-
             let value = FlatValue {
                 change_id: delta.change_id,
                 created_at: previous
@@ -270,7 +309,6 @@ where
             stage_put(self.writes, &identity, &value)?;
             self.staged.insert(identity, Some(value));
         }
-
         Ok(superseded.into_iter().collect())
     }
 }

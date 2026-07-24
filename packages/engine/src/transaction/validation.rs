@@ -345,6 +345,14 @@ fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<
         })
 }
 
+pub(crate) fn tracked_row_local_certificates_cover_validation(
+    staged_writes: &PreparedWriteValidationSet<'_>,
+) -> bool {
+    let staged_rows = staged_writes.rows().collect::<Vec<_>>();
+    row_local_certificates_cover_validation(&staged_rows)
+        && staged_rows.iter().all(|row| !row.untracked())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DirectoryDescriptorScope {
     domain: Domain,

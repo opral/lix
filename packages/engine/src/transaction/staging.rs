@@ -845,6 +845,12 @@ impl PreparedStateRowIdentity {
     }
 }
 
+impl PreparedInsertIdentity {
+    pub(crate) fn untracked(&self) -> bool {
+        self.untracked
+    }
+}
+
 impl From<&PreparedStateRow> for PreparedStateRowIdentity {
     fn from(row: &PreparedStateRow) -> Self {
         Self::from_staged_row(row)

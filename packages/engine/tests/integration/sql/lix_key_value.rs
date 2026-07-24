@@ -77,6 +77,48 @@ simulation_test!(lix_key_value_duplicate_insert_rejects, |sim| async move {
 });
 
 simulation_test!(
+    lix_key_value_insert_after_delete_resurrects_key,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('kv-resurrect', 'first')",
+                &[],
+            )
+            .await
+            .expect("initial insert should succeed");
+        session
+            .execute("DELETE FROM lix_key_value WHERE key = 'kv-resurrect'", &[])
+            .await
+            .expect("delete should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('kv-resurrect', 'second')",
+                &[],
+            )
+            .await
+            .expect("a tombstone should not block reinsertion");
+
+        let result = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'kv-resurrect'",
+                &[],
+            )
+            .await
+            .expect("resurrected key should read");
+        assert_single_text(result, "\"second\"");
+    }
+);
+
+simulation_test!(
     lix_key_value_on_conflict_upserts_active_row,
     |sim| async move {
         let engine = sim.boot_engine().await;

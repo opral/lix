@@ -5,9 +5,9 @@ use crate::changelog::ChangeId;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
-    StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey,
+    StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -271,6 +271,31 @@ pub(super) fn stage_delete(
 
 fn encode_key(identity: &FlatIdentity) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("flat live-state key", &identity.as_ref())
+}
+
+pub(crate) fn branch_empty_precondition(branch_id: &str) -> Result<StoragePrecondition, LixError> {
+    let prefix = storage_codec::encode(
+        "flat live-state branch prefix",
+        &BranchPrefixRef { branch_id },
+    )?;
+    Ok(StoragePrecondition::RangeEmpty {
+        space: LIVE_STATE_INDEX_ROW_SPACE.id,
+        range: StoragePrefix {
+            bytes: Bytes::from(prefix),
+        }
+        .to_range()?,
+    })
+}
+
+pub(crate) fn row_absent_precondition(
+    request: &LiveStateIndexRowRequest,
+) -> Result<StoragePrecondition, LixError> {
+    Ok(StoragePrecondition::KeyAbsent {
+        space: LIVE_STATE_INDEX_ROW_SPACE.id,
+        key: StorageKey(Bytes::from(encode_key(&FlatIdentity::from_request(
+            request,
+        ))?)),
+    })
 }
 
 fn decode_key(bytes: &[u8]) -> Result<FlatIdentity, LixError> {
