@@ -40,6 +40,8 @@ pub(crate) use file::{
     execute_exact_lix_file_batch_read, execute_exact_lix_file_read,
     execute_fast_lix_file_data_update_by_id, execute_fast_lix_file_path_writes,
 };
+#[cfg(test)]
+pub(crate) use filesystem_working_change::filesystem_working_change_schema;
 pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
@@ -654,7 +656,6 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::FileWorkingChangeByBranch
             | PublicSurfaceKind::DirectoryWorkingChange
             | PublicSurfaceKind::DirectoryWorkingChangeByBranch
-            | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
             PublicSurfaceKind::EntityBase { .. }

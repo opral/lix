@@ -1271,8 +1271,7 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         | PublicSurfaceKind::FileWorkingChange
         | PublicSurfaceKind::FileWorkingChangeByBranch
         | PublicSurfaceKind::DirectoryWorkingChange
-        | PublicSurfaceKind::DirectoryWorkingChangeByBranch
-        | PublicSurfaceKind::History => {
+        | PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
             unreachable!("write capability checked before target binding")
         }
     }

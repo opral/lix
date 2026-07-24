@@ -24,7 +24,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_SOURCE_CHANGES,
 };
 #[cfg(test)]
-use crate::sql2::providers::filesystem_working_change::filesystem_working_change_schema;
+use crate::sql2::providers::filesystem_working_change_schema;
 #[cfg(test)]
 use crate::sql2::result_metadata::json_field;
 
@@ -111,10 +111,11 @@ impl PublicCatalog {
             PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
             PublicSurfaceKind::WorkingChange => working_change_schema(false),
             PublicSurfaceKind::WorkingChangeByBranch => working_change_schema(true),
-            PublicSurfaceKind::FileWorkingChange => filesystem_working_change_schema(false),
-            PublicSurfaceKind::FileWorkingChangeByBranch => filesystem_working_change_schema(true),
-            PublicSurfaceKind::DirectoryWorkingChange => filesystem_working_change_schema(false),
-            PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
+            PublicSurfaceKind::FileWorkingChange | PublicSurfaceKind::DirectoryWorkingChange => {
+                filesystem_working_change_schema(false)
+            }
+            PublicSurfaceKind::FileWorkingChangeByBranch
+            | PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
                 filesystem_working_change_schema(true)
             }
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
@@ -390,27 +391,6 @@ impl PublicCatalog {
         self.entity_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
-}
-
-#[cfg(test)]
-fn lix_state_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
-        json_field("entity_pk", false),
-        Field::new("schema_key", DataType::Utf8, false),
-        Field::new("file_id", DataType::Utf8, true),
-        json_field("snapshot_content", true),
-        json_field("metadata", true),
-        Field::new("created_at", DataType::Utf8, true),
-        Field::new("updated_at", DataType::Utf8, true),
-        Field::new("global", DataType::Boolean, true),
-        Field::new("change_id", DataType::Utf8, true),
-        Field::new("commit_id", DataType::Utf8, true),
-        Field::new("untracked", DataType::Boolean, true),
-    ];
-    if by_branch {
-        fields.push(Field::new("branch_id", DataType::Utf8, false));
-    }
-    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]

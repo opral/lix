@@ -8,7 +8,7 @@
     clippy::unnecessary_wraps
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
