@@ -619,15 +619,27 @@ async fn filesystem_namespace_domain_changed(
     // Existing occupants that keep the same kind, identity, parent, and name
     // cannot introduce a namespace collision. Every uncertain case falls back
     // to validating the complete domain below.
-    let mut descriptor_rows = staged_rows.iter().copied().filter(|row| {
-        row.domain() == *domain
-            && (row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
-    });
-    let Some(row) = descriptor_rows.next() else {
+    let descriptor_rows = staged_rows
+        .iter()
+        .copied()
+        .filter(|row| {
+            row.domain() == *domain
+                && (row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                    || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
+        })
+        .collect::<Vec<_>>();
+    let Some(row) = descriptor_rows.first().copied() else {
         return Ok(false);
     };
-    if descriptor_rows.next().is_some() {
+    // Removing namespace occupants cannot introduce a collision. Keep mixed
+    // delete+insert/rename batches on the complete-domain validation below.
+    if descriptor_rows
+        .iter()
+        .all(|row| row.snapshot_json().is_none())
+    {
+        return Ok(false);
+    }
+    if descriptor_rows.len() > 1 {
         return Ok(true);
     }
     if row
@@ -2450,6 +2462,13 @@ async fn validate_committed_unique_constraints(
     >::new();
     let can_skip_unchanged = pending_constraints.unique_values.len() == 1;
     for (key, pending_entity_pk) in &pending_constraints.unique_values {
+        // The fixed descriptor schemas only declare parent/name uniqueness.
+        // Filesystem namespace validation below is strictly stronger: it
+        // rejects same-kind duplicates and file/directory cross-kind clashes.
+        // Avoid scanning the descriptor tree once here and again there.
+        if filesystem_namespace_owns_unique_constraint(key) {
+            continue;
+        }
         let is_insert =
             can_skip_unchanged && pending_unique_owner_is_insert(input, key, pending_entity_pk);
         if can_skip_unchanged
@@ -2523,6 +2542,13 @@ async fn validate_committed_unique_constraints(
         }
     }
     Ok(())
+}
+
+fn filesystem_namespace_owns_unique_constraint(key: &PendingUniqueKey) -> bool {
+    matches!(
+        key.schema_key.as_str(),
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY | FILE_DESCRIPTOR_SCHEMA_KEY
+    )
 }
 
 fn pending_unique_owner_is_insert(
@@ -3414,8 +3440,6 @@ mod tests {
         moved.snapshot = Some(test_stage_json(
             r#"{"id":"file-a","directory_id":"dir-a","name":"file-a"}"#,
         ));
-        let mut deleted = staged_file_descriptor_row("file-a", "branch-a");
-        deleted.snapshot = None;
         let mut untracked = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked);
         let mut renamed_directory = directory_descriptor_row("dir-a", None, "before", "branch-a");
@@ -3427,7 +3451,6 @@ mod tests {
         let cases = vec![
             (vec![renamed], vec![committed_file.clone()], "rename"),
             (vec![moved], vec![committed_file.clone()], "move"),
-            (vec![deleted], vec![committed_file.clone()], "delete"),
             (
                 vec![
                     staged_file_descriptor_row("file-a", "branch-a"),
@@ -3457,6 +3480,35 @@ mod tests {
         for (staged, committed, scenario) in cases {
             assert_filesystem_namespace_domain_changed(staged, committed, true, scenario).await;
         }
+    }
+
+    #[tokio::test]
+    async fn filesystem_namespace_tombstone_only_batches_skip_full_scan() {
+        let mut deleted = staged_file_descriptor_row("file-a", "branch-a");
+        deleted.snapshot = None;
+        let delete_write = PreparedWriteSet {
+            state_rows: vec![deleted.clone()],
+            ..empty_staged_write_set()
+        };
+        assert_eq!(
+            filesystem_namespace_validation_scan_count_for_test(delete_write)
+                .await
+                .expect("descriptor deletion should validate"),
+            0,
+            "removing an occupant cannot create a namespace collision"
+        );
+
+        let mixed_write = PreparedWriteSet {
+            state_rows: vec![deleted, staged_file_descriptor_row("file-new", "branch-a")],
+            ..empty_staged_write_set()
+        };
+        assert_eq!(
+            filesystem_namespace_validation_scan_count_for_test(mixed_write)
+                .await
+                .expect("mixed namespace mutation should validate"),
+            1,
+            "a delete mixed with an insertion must still validate the complete namespace"
+        );
     }
 
     #[tokio::test]
@@ -3492,6 +3544,106 @@ mod tests {
             1,
             "explicit inserts should perform only the complete namespace scan"
         );
+    }
+
+    #[tokio::test]
+    async fn descriptor_committed_unique_scan_defers_to_namespace_validation() {
+        let mut inserted = staged_file_descriptor_row("file-new", "branch-a");
+        inserted.origin = Some(TransactionWriteOrigin {
+            surface: "lix_file".to_string(),
+            operation: TransactionWriteOperation::Insert,
+            primary_key: None,
+        });
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![inserted],
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let row = validation_set
+            .rows()
+            .next()
+            .expect("descriptor fixture should contain one validation row");
+        let snapshot = row
+            .snapshot_json()
+            .expect("inserted descriptor should have a snapshot");
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        pending_constraints
+            .remember_row(
+                row,
+                test_plan_from_schema(file_descriptor_schema()),
+                snapshot,
+            )
+            .expect("descriptor constraints should index");
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])
+        .expect("descriptor catalog should compile");
+        let live_state = CountingStaticLiveStateReader {
+            rows: vec![committed_file_descriptor_row("file-a", "branch-a")],
+            scan_count: AtomicUsize::new(0),
+        };
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+
+        validate_committed_unique_constraints(&input, &pending_constraints)
+            .await
+            .expect("namespace validation owns descriptor parent/name uniqueness");
+
+        assert_eq!(
+            live_state.scan_count.load(Ordering::Relaxed),
+            0,
+            "descriptor unique validation must not rescan committed descriptors"
+        );
+    }
+
+    #[tokio::test]
+    async fn descriptor_namespace_still_rejects_same_kind_and_cross_kind_conflicts() {
+        let mut inserted = staged_file_descriptor_row("file-new", "branch-a");
+        inserted.snapshot = Some(test_stage_json(
+            r#"{"id":"file-new","directory_id":null,"name":"occupied"}"#,
+        ));
+        inserted.origin = Some(TransactionWriteOrigin {
+            surface: "lix_file".to_string(),
+            operation: TransactionWriteOperation::Insert,
+            primary_key: None,
+        });
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![inserted],
+            ..empty_staged_write_set()
+        };
+        let visible_schemas = vec![file_descriptor_schema(), directory_descriptor_schema()];
+        let mut committed_file = committed_file_descriptor_row("file-existing", "branch-a");
+        committed_file.snapshot_content =
+            Some(r#"{"id":"file-existing","directory_id":null,"name":"occupied"}"#.to_string());
+        let committed_directory = MaterializedLiveStateRow::from(directory_descriptor_row(
+            "dir-existing",
+            None,
+            "occupied",
+            "branch-a",
+        ));
+
+        for (committed, scenario) in [
+            (committed_file, "file/file"),
+            (committed_directory, "file/directory"),
+        ] {
+            let live_state = StrictStaticLiveStateReader {
+                rows: vec![committed],
+            };
+            let error = validate_prepared_writes(
+                TransactionValidationInput::from_visible_schemas_for_tests(
+                    &staged_writes,
+                    &visible_schemas,
+                    &live_state,
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, LixError::CODE_UNIQUE, "{scenario}");
+            assert!(
+                error.message.contains("filesystem namespace conflict"),
+                "{scenario}: {error:?}"
+            );
+        }
     }
 
     #[test]
