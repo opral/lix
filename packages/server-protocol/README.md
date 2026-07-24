@@ -70,7 +70,11 @@ base would exceed that budget, the cache declines it and the next edit falls
 back to the protocol's complete-blob retry without affecting correctness.
 Across one execute or atomic batch, reconstructed blob bytes are separately
 bounded by the configured expanded JSON request ceiling (64 MiB by default).
-The client uses the same 16 MiB aggregate base budget.
+The client uses the same 16 MiB aggregate base budget. An admitted complete
+base is SHA-256-verified once; a splice then reconstructs and hashes its
+unavoidable contiguous result once and shares that immutable payload among the
+SQL parameter, validated provenance, and successor cache. Client-provided
+digest and splice fields are never trusted without that proof.
 
 The protocol server owns `/lix/v1`, request validation, wire values, Lix error
 mapping, and multiplexed observations. Host-specific routes such as

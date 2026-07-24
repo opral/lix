@@ -12,6 +12,7 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+autobenches = false
 
 [lints]
 workspace = true
@@ -30,8 +31,14 @@ tower-http = { version = "0.6", features = ["compression-gzip", "decompression-g
 tracing = "0.1"
 
 [dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "4" }
 flate2 = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing-subscriber = "0.3"
+
+[[bench]]
+name = "request_blob_transport"
+path = "benches/request_blob_transport.rs"
+harness = false

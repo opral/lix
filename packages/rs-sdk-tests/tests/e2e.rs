@@ -1,7 +1,7 @@
 use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError, MutationIdentity,
-    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, WasmComponentV2Factory, WasmLimits,
-    WasmRuntime,
+    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, VerifiedRequestBlob,
+    WasmComponentV2Factory, WasmLimits, WasmRuntime,
 };
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
@@ -600,18 +600,23 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
         .expect("materialized JSON should exist");
     assert_eq!(cold_bytes, before);
 
-    let after_blob = after.clone().into();
+    // A full remote request admitted this base before the later splice arrives.
+    // Its one-time full hash is deliberately outside the hot splice timing.
+    let verified_base = VerifiedRequestBlob::verify(cold_bytes.clone().into());
+    let after_sha256 = sha256_lower_hex(&after);
     let warm_request_started = Instant::now();
-    let provenance = RequestBlobSpliceProvenance::new_validated(
-        &cold_bytes,
-        &after_blob,
-        &sha256_lower_hex(&cold_bytes),
-        &sha256_lower_hex(&after),
-        edit_offset,
-        cold_bytes.len() - edit_offset - 1,
-        vec![replacement],
-    )
-    .expect("the one-byte JSON transport splice should validate");
+    let transport_started = Instant::now();
+    let (verified_after, provenance) = verified_base
+        .reconstruct_splice(
+            verified_base.sha256(),
+            &after_sha256,
+            edit_offset,
+            cold_bytes.len() - edit_offset - 1,
+            [replacement].as_slice().into(),
+        )
+        .expect("the one-byte JSON transport splice should validate");
+    let warm_transport_elapsed = transport_started.elapsed();
+    let after_blob = verified_after.blob().clone();
 
     lix.reset_plugin_v2_transition_counters();
     let warm_engine_started = Instant::now();
@@ -683,13 +688,14 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
 
     eprintln!(
         "v2_json_ten_mib bytes={} properties={} cold_ms={:.3} cold_guest_high_water_bytes={} \
-         warm_request_ms={:.3} warm_engine_transition_ms={:.3} warm_boundary_bytes={} \
+         warm_request_ms={:.3} warm_transport_ms={:.3} warm_engine_transition_ms={:.3} warm_boundary_bytes={} \
          warm_guest_high_water_bytes={}",
         JSON_TEN_MIB_BYTES,
         JSON_TEN_MIB_PROPERTY_COUNT,
         cold_elapsed.as_secs_f64() * 1_000.0,
         cold.guest_linear_memory_high_water_bytes,
         warm_request_elapsed.as_secs_f64() * 1_000.0,
+        warm_transport_elapsed.as_secs_f64() * 1_000.0,
         warm_engine_elapsed.as_secs_f64() * 1_000.0,
         warm.component_boundary_bytes,
         warm.guest_linear_memory_high_water_bytes,

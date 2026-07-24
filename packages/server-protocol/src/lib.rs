@@ -14,10 +14,11 @@ use axum::{
 };
 use lix_sdk::{
     CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
-    ExecuteStatementMetadata, Lix, LixError, ObserveEvent, ObserveEvents,
-    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, Value, WireValue,
+    ExecuteStatementMetadata, Lix, LixError, ObserveEvent, ObserveEvents, Storage,
+    SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
@@ -289,7 +290,7 @@ impl RequestBlobCacheBudget {
 }
 
 struct RequestBlobCache {
-    entries: HashMap<String, Arc<[u8]>>,
+    entries: HashMap<String, VerifiedRequestBlob>,
     insertion_order: VecDeque<String>,
     total_bytes: usize,
     budget: Arc<RequestBlobCacheBudget>,
@@ -305,14 +306,14 @@ impl RequestBlobCache {
         }
     }
 
-    fn get(&self, sha256: &str) -> Option<Arc<[u8]>> {
+    fn get(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
         self.entries.get(sha256).cloned()
     }
 
     fn insert(&mut self, candidate: CachedRequestBlob) {
-        let candidate_bytes = candidate.bytes.len();
+        let candidate_bytes = candidate.blob.blob().len();
         if !is_request_blob_cacheable(candidate_bytes)
-            || self.entries.contains_key(&candidate.sha256)
+            || self.entries.contains_key(candidate.blob.sha256())
         {
             return;
         }
@@ -334,7 +335,7 @@ impl RequestBlobCache {
                 .get(oldest)
                 .expect("cache insertion order contains only retained entries");
             projected_entries -= 1;
-            projected_bytes -= removed.len();
+            projected_bytes -= removed.blob().len();
             eviction_count += 1;
         }
 
@@ -351,7 +352,7 @@ impl RequestBlobCache {
                 .entries
                 .get(oldest)
                 .expect("cache insertion order contains only retained entries");
-            projected_bytes -= removed.len();
+            projected_bytes -= removed.blob().len();
             eviction_count += 1;
         }
 
@@ -365,14 +366,15 @@ impl RequestBlobCache {
                 .entries
                 .remove(&oldest)
                 .expect("planned cache eviction has a retained entry");
-            self.total_bytes -= removed.len();
+            self.total_bytes -= removed.blob().len();
         }
         self.total_bytes = self
             .total_bytes
             .checked_add(candidate_bytes)
             .expect("the per-session cache limit bounds retained bytes");
-        self.insertion_order.push_back(candidate.sha256.clone());
-        self.entries.insert(candidate.sha256, candidate.bytes);
+        let sha256 = candidate.blob.sha256().to_owned();
+        self.insertion_order.push_back(sha256.clone());
+        self.entries.insert(sha256, candidate.blob);
         if evicted_bytes > candidate_bytes {
             self.budget.release(evicted_bytes - candidate_bytes);
         }
@@ -386,8 +388,7 @@ impl Drop for RequestBlobCache {
 }
 
 struct CachedRequestBlob {
-    sha256: String,
-    bytes: Arc<[u8]>,
+    blob: VerifiedRequestBlob,
 }
 
 impl<S> SessionRecord<S>
@@ -441,7 +442,7 @@ where
         self.lease_count() == 0 && now.saturating_duration_since(self.last_used()) >= timeout
     }
 
-    fn request_blob(&self, sha256: &str) -> Option<Arc<[u8]>> {
+    fn request_blob(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
         self.request_blobs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1450,7 +1451,7 @@ fn decode_request_params(
     reconstructed_bytes_remaining: &mut usize,
     cache_candidate_bytes_remaining: &mut usize,
     cache_candidates: &mut Vec<CachedRequestBlob>,
-    lookup_blob: impl Fn(&str) -> Option<Arc<[u8]>>,
+    lookup_blob: impl Fn(&str) -> Option<VerifiedRequestBlob>,
 ) -> Result<DecodedRequestParams, ApiError> {
     let mut values = Vec::with_capacity(params.len());
     let mut parameter_blob_splices = Vec::with_capacity(params.len());
@@ -1471,8 +1472,7 @@ fn decode_request_params(
                     && bytes.len() <= *cache_candidate_bytes_remaining
                 {
                     prepare_cache_candidate(
-                        sha256_hex(bytes),
-                        bytes,
+                        VerifiedRequestBlob::verify(bytes.clone()),
                         cache_candidate_bytes_remaining,
                         cache_candidates,
                     );
@@ -1522,9 +1522,9 @@ fn decode_request_params(
                         "blob splice suffixBytes is too large",
                     )
                 })?;
-                if prefix > base.len()
-                    || suffix > base.len()
-                    || prefix.saturating_add(suffix) > base.len()
+                if prefix > base.blob().len()
+                    || suffix > base.blob().len()
+                    || prefix.saturating_add(suffix) > base.blob().len()
                 {
                     return Err(invalid_parameter_error(
                         parameter_index,
@@ -1570,44 +1570,22 @@ fn decode_request_params(
                     ));
                 }
                 *reconstructed_bytes_remaining -= reconstructed_len;
-                let mut reconstructed = Vec::with_capacity(reconstructed_len);
-                reconstructed.extend_from_slice(&base[..prefix]);
-                reconstructed.extend_from_slice(&insert);
-                reconstructed.extend_from_slice(&base[base.len() - suffix..]);
-                let actual_sha256 = sha256_hex(&reconstructed);
-                if actual_sha256 != result_sha256 {
-                    return Err(invalid_parameter_error(
-                        parameter_index,
-                        statement_index,
-                        LixError::CODE_INVALID_PARAM,
-                        "blob splice resultSha256 does not match the reconstructed bytes",
-                    ));
-                }
+                let (reconstructed, provenance) = base
+                    .reconstruct_splice(&base_sha256, &result_sha256, prefix, suffix, insert)
+                    .map_err(|error| {
+                        invalid_parameter_error(
+                            parameter_index,
+                            statement_index,
+                            error.code,
+                            error.message,
+                        )
+                    })?;
                 prepare_cache_candidate(
-                    result_sha256.clone(),
-                    &reconstructed,
+                    reconstructed.clone(),
                     cache_candidate_bytes_remaining,
                     cache_candidates,
                 );
-                let reconstructed = reconstructed.into();
-                let provenance = RequestBlobSpliceProvenance::new_validated(
-                    &base,
-                    &reconstructed,
-                    &base_sha256,
-                    &result_sha256,
-                    prefix,
-                    suffix,
-                    insert.to_vec(),
-                )
-                .map_err(|error| {
-                    invalid_parameter_error(
-                        parameter_index,
-                        statement_index,
-                        error.code,
-                        error.message,
-                    )
-                })?;
-                values.push(Value::Blob(reconstructed));
+                values.push(Value::Blob(reconstructed.blob().clone()));
                 parameter_blob_splices.push(Some(provenance));
             }
         }
@@ -1622,24 +1600,20 @@ fn decode_request_params(
 }
 
 fn prepare_cache_candidate(
-    sha256: String,
-    bytes: &[u8],
+    blob: VerifiedRequestBlob,
     bytes_remaining: &mut usize,
     candidates: &mut Vec<CachedRequestBlob>,
 ) {
-    if !is_request_blob_cacheable(bytes.len())
-        || bytes.len() > *bytes_remaining
+    if !is_request_blob_cacheable(blob.blob().len())
+        || blob.blob().len() > *bytes_remaining
         || candidates
             .iter()
-            .any(|candidate| candidate.sha256 == sha256)
+            .any(|candidate| candidate.blob.sha256() == blob.sha256())
     {
         return;
     }
-    *bytes_remaining -= bytes.len();
-    candidates.push(CachedRequestBlob {
-        sha256,
-        bytes: Arc::from(bytes.to_vec()),
-    });
+    *bytes_remaining -= blob.blob().len();
+    candidates.push(CachedRequestBlob { blob });
 }
 
 fn invalid_parameter_error(
@@ -1678,6 +1652,7 @@ fn is_request_blob_cacheable(length: usize) -> bool {
     (MIN_REQUEST_BLOB_CACHE_BYTES..=MAX_REQUEST_BLOB_CACHE_BYTES).contains(&length)
 }
 
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -2298,8 +2273,9 @@ mod tests {
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix_sdk::{
-        Memory, MemoryRead, MemoryWrite, OpenLixOptions, ReadOptions, StorageError,
-        TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
+        Blob, Memory, MemoryRead, MemoryWrite, OpenLixOptions, ReadOptions,
+        RequestBlobSpliceProvenance, StorageError, TracingTelemetrySink, WriteOptions, open_lix,
+        open_lix_with_telemetry,
     };
     use serde_json::{Value as JsonValue, json};
     use std::{
@@ -2555,7 +2531,9 @@ mod tests {
             &mut reconstructed_bytes_remaining,
             &mut cache_candidate_bytes_remaining,
             &mut cache_candidates,
-            |sha256| (sha256 == base_sha256).then(|| Arc::<[u8]>::from(base.clone())),
+            |sha256| {
+                (sha256 == base_sha256).then(|| VerifiedRequestBlob::verify(base.clone().into()))
+            },
         )
         .expect("splice parameters should decode");
 
@@ -2590,7 +2568,7 @@ mod tests {
             assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
         };
 
-        let base: Arc<[u8]> = Arc::from(vec![b'a'; EXACT_CSV_BYTES]);
+        let base: Blob = vec![b'a'; EXACT_CSV_BYTES].into();
         let mut result = base.to_vec();
         let edit_offset = result.len() / 2;
         result[edit_offset] = b'b';
@@ -2617,7 +2595,7 @@ mod tests {
             &mut reconstructed_bytes_remaining,
             &mut cache_candidate_bytes_remaining,
             &mut cache_candidates,
-            |sha256| (sha256 == base_sha256).then(|| Arc::clone(&base)),
+            |sha256| (sha256 == base_sha256).then(|| VerifiedRequestBlob::verify(base.clone())),
         )
         .expect("the exact 10.68 MB CSV splice should reconstruct");
 
@@ -2644,7 +2622,12 @@ mod tests {
             DEFAULT_MAX_REQUEST_BODY_BYTES - EXACT_CSV_BYTES
         );
         assert_eq!(cache_candidates.len(), 1);
-        assert_eq!(cache_candidates[0].bytes.as_ref(), result.as_slice());
+        assert_eq!(cache_candidates[0].blob.blob().as_ref(), result.as_slice());
+        assert_eq!(
+            cache_candidates[0].blob.blob().as_ptr(),
+            reconstructed.as_ptr(),
+            "SQL, provenance, and the successor cache must share one reconstructed payload"
+        );
     }
 
     #[test]
@@ -2681,7 +2664,10 @@ mod tests {
                 &mut reconstructed_bytes_remaining,
                 &mut cache_candidate_bytes_remaining,
                 &mut cache_candidates,
-                |sha256| (sha256 == base_sha256).then(|| Arc::<[u8]>::from(base.clone())),
+                |sha256| {
+                    (sha256 == base_sha256)
+                        .then(|| VerifiedRequestBlob::verify(base.clone().into()))
+                },
             )
             .expect("batch splice should decode")
         };
@@ -3386,35 +3372,54 @@ mod tests {
         let mut cache = RequestBlobCache::new(Arc::new(RequestBlobCacheBudget::new(
             DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
         )));
+        let mut inserted = Vec::new();
         for index in 0..=MAX_REQUEST_BLOB_CACHE_ENTRIES {
-            cache.insert(CachedRequestBlob {
-                sha256: format!("entry-{index}"),
-                bytes: Arc::from(vec![
+            let blob = VerifiedRequestBlob::verify(
+                vec![
                     u8::try_from(index).expect("test index should fit");
                     MIN_REQUEST_BLOB_CACHE_BYTES
-                ]),
-            });
+                ]
+                .into(),
+            );
+            inserted.push(blob.sha256().to_owned());
+            cache.insert(CachedRequestBlob { blob });
         }
         assert_eq!(cache.entries.len(), MAX_REQUEST_BLOB_CACHE_ENTRIES);
-        assert!(cache.get("entry-0").is_none());
+        assert!(cache.get(&inserted[0]).is_none());
         assert!(
             cache
-                .get(&format!("entry-{MAX_REQUEST_BLOB_CACHE_ENTRIES}"))
+                .get(&inserted[MAX_REQUEST_BLOB_CACHE_ENTRIES])
                 .is_some()
         );
 
-        cache.insert(CachedRequestBlob {
-            sha256: "too-large".to_string(),
-            bytes: Arc::from(vec![0_u8; MAX_REQUEST_BLOB_CACHE_BYTES + 1]),
-        });
-        assert!(cache.get("too-large").is_none());
+        let too_large =
+            VerifiedRequestBlob::verify(vec![0_u8; MAX_REQUEST_BLOB_CACHE_BYTES + 1].into());
+        let too_large_sha256 = too_large.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: too_large });
+        assert!(cache.get(&too_large_sha256).is_none());
         assert!(cache.total_bytes <= MAX_REQUEST_BLOB_CACHE_BYTES);
 
-        cache.insert(CachedRequestBlob {
-            sha256: "too-small".to_string(),
-            bytes: Arc::from(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1]),
-        });
-        assert!(cache.get("too-small").is_none());
+        let too_small =
+            VerifiedRequestBlob::verify(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1].into());
+        let too_small_sha256 = too_small.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: too_small });
+        assert!(cache.get(&too_small_sha256).is_none());
+    }
+
+    #[test]
+    fn request_blob_cache_reuses_verified_full_blob_without_payload_clone() {
+        let source: Blob = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES].into();
+        let source_ptr = source.as_ptr();
+        let verified = VerifiedRequestBlob::verify(source);
+        let sha256 = verified.sha256().to_owned();
+        let mut cache = RequestBlobCache::new(Arc::new(RequestBlobCacheBudget::new(
+            DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
+        )));
+
+        cache.insert(CachedRequestBlob { blob: verified });
+
+        let cached = cache.get(&sha256).expect("full blob should be retained");
+        assert_eq!(cached.blob().as_ptr(), source_ptr);
     }
 
     #[test]
@@ -3428,22 +3433,20 @@ mod tests {
             DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
         )));
 
-        cache.insert(CachedRequestBlob {
-            sha256: "large-base".to_string(),
-            bytes: Arc::from(vec![b'a'; EXACT_CSV_BYTES]),
-        });
+        let base = VerifiedRequestBlob::verify(vec![b'a'; EXACT_CSV_BYTES].into());
+        let base_sha256 = base.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: base });
         assert_eq!(
-            cache.get("large-base").as_deref().map(<[u8]>::len),
+            cache.get(&base_sha256).map(|blob| blob.blob().len()),
             Some(EXACT_CSV_BYTES)
         );
 
-        cache.insert(CachedRequestBlob {
-            sha256: "large-successor".to_string(),
-            bytes: Arc::from(vec![b'b'; EXACT_CSV_BYTES]),
-        });
-        assert!(cache.get("large-base").is_none());
+        let successor = VerifiedRequestBlob::verify(vec![b'b'; EXACT_CSV_BYTES].into());
+        let successor_sha256 = successor.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: successor });
+        assert!(cache.get(&base_sha256).is_none());
         assert_eq!(
-            cache.get("large-successor").as_deref().map(<[u8]>::len),
+            cache.get(&successor_sha256).map(|blob| blob.blob().len()),
             Some(EXACT_CSV_BYTES)
         );
         assert_eq!(cache.total_bytes, EXACT_CSV_BYTES);
@@ -3457,24 +3460,27 @@ mod tests {
         let mut first = RequestBlobCache::new(Arc::clone(&budget));
         let mut second = RequestBlobCache::new(Arc::clone(&budget));
         let mut third = RequestBlobCache::new(Arc::clone(&budget));
-        let bytes = || Arc::from(vec![b'x'; MIN_REQUEST_BLOB_CACHE_BYTES]);
+        let blob = |marker| {
+            let mut bytes = vec![b'x'; MIN_REQUEST_BLOB_CACHE_BYTES];
+            bytes[0] = marker;
+            VerifiedRequestBlob::verify(bytes.into())
+        };
+        let first_blob = blob(b'1');
+        let first_sha256 = first_blob.sha256().to_owned();
+        let second_blob = blob(b'2');
+        let second_sha256 = second_blob.sha256().to_owned();
+        let third_blob = blob(b'3');
+        let third_sha256 = third_blob.sha256().to_owned();
 
-        first.insert(CachedRequestBlob {
-            sha256: "first".to_owned(),
-            bytes: bytes(),
-        });
-        second.insert(CachedRequestBlob {
-            sha256: "second".to_owned(),
-            bytes: bytes(),
-        });
+        first.insert(CachedRequestBlob { blob: first_blob });
+        second.insert(CachedRequestBlob { blob: second_blob });
         third.insert(CachedRequestBlob {
-            sha256: "third".to_owned(),
-            bytes: bytes(),
+            blob: third_blob.clone(),
         });
-        assert!(first.get("first").is_some());
-        assert!(second.get("second").is_some());
+        assert!(first.get(&first_sha256).is_some());
+        assert!(second.get(&second_sha256).is_some());
         assert!(
-            third.get("third").is_none(),
+            third.get(&third_sha256).is_none(),
             "a full workspace budget must decline another session cache admission"
         );
         assert_eq!(
@@ -3482,12 +3488,13 @@ mod tests {
             MIN_REQUEST_BLOB_CACHE_BYTES * 2
         );
 
+        let first_successor = blob(b'4');
+        let first_successor_sha256 = first_successor.sha256().to_owned();
         first.insert(CachedRequestBlob {
-            sha256: "first-successor".to_owned(),
-            bytes: bytes(),
+            blob: first_successor,
         });
-        assert!(first.get("first").is_none());
-        assert!(first.get("first-successor").is_some());
+        assert!(first.get(&first_sha256).is_none());
+        assert!(first.get(&first_successor_sha256).is_some());
         assert_eq!(
             budget.total_bytes.load(Ordering::Acquire),
             MIN_REQUEST_BLOB_CACHE_BYTES * 2,
@@ -3495,12 +3502,9 @@ mod tests {
         );
 
         drop(first);
-        third.insert(CachedRequestBlob {
-            sha256: "third".to_owned(),
-            bytes: bytes(),
-        });
+        third.insert(CachedRequestBlob { blob: third_blob });
         assert!(
-            third.get("third").is_some(),
+            third.get(&third_sha256).is_some(),
             "dropping a session cache must release its workspace budget"
         );
         assert_eq!(
@@ -3510,19 +3514,19 @@ mod tests {
     }
 
     #[test]
-    fn request_cache_candidates_share_one_bounded_clone_budget() {
+    fn request_cache_candidates_share_one_bounded_payload_budget() {
         let mut remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
         let mut candidates = Vec::new();
         let first = vec![b'a'; MAX_REQUEST_BLOB_CACHE_BYTES / 2];
-        prepare_cache_candidate(sha256_hex(&first), &first, &mut remaining, &mut candidates);
+        let first = VerifiedRequestBlob::verify(first.into());
+        prepare_cache_candidate(first.clone(), &mut remaining, &mut candidates);
         let after_first = remaining;
-        prepare_cache_candidate(sha256_hex(&first), &first, &mut remaining, &mut candidates);
+        prepare_cache_candidate(first, &mut remaining, &mut candidates);
         assert_eq!(remaining, after_first, "duplicate should reuse candidate");
 
         let over_remaining = vec![b'b'; after_first + 1];
         prepare_cache_candidate(
-            sha256_hex(&over_remaining),
-            &over_remaining,
+            VerifiedRequestBlob::verify(over_remaining.into()),
             &mut remaining,
             &mut candidates,
         );

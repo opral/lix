@@ -3376,6 +3376,7 @@ version = "0.8.4"
 dependencies = [
  "async-stream",
  "axum",
+ "codspeed-criterion-compat",
  "flate2",
  "futures-core",
  "getrandom 0.3.4",

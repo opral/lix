@@ -30,7 +30,7 @@ pub use lix_engine::telemetry::{
 pub use lix_engine::wasm::v2::*;
 pub use lix_engine::wasm::{WasmLimits, WasmRuntime};
 pub use lix_engine::{
-    CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
+    Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
     CreateBranchReceipt as CreateBranchResult, ExecuteBatchStatement, ExecuteOptions,
     ExecuteResult, ExecuteStatementMetadata, GetManyResult, GetOptions, Key, KeyRange, LixError,
     LixNotice, MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, MergeBranchOptions,
@@ -42,8 +42,8 @@ pub use lix_engine::{
     Storage, StorageConformanceReport, StorageConformanceResult, StorageConformanceStatus,
     StorageConformanceTest, StorageError, StorageFactory, StorageFixture, StorageRead,
     StorageTestConfig, StorageWrite, StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
-    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, Value, WireValue, WriteOptions,
-    WriteStats, parse_sql_script, run_storage_conformance,
+    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, Value, VerifiedRequestBlob, WireValue,
+    WriteOptions, WriteStats, parse_sql_script, run_storage_conformance,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

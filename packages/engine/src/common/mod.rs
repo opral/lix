@@ -10,7 +10,7 @@ pub(crate) mod wire;
 
 pub use error::LixError;
 pub use execution_metadata::{
-    ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance,
+    ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
 };
 pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};

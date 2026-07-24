@@ -72,7 +72,7 @@ pub use init::InitReceipt;
 pub use session::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, MutationIdentity, ObserveEvent, ObserveEvents,
-    RequestBlobSpliceProvenance, Row, RowRef, TryFromValue,
+    RequestBlobSpliceProvenance, Row, RowRef, TryFromValue, VerifiedRequestBlob,
 };
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
