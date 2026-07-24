@@ -67,9 +67,9 @@ const cargoArgs = [
 	"--manifest-path",
 	join(repoRoot, "Cargo.toml"),
 	"-p",
-	"plugin_csv",
+	"plugin_csv_v2",
 	"-p",
-	"plugin_md_v2",
+	"plugin_markdown_incremental_v2",
 	"--target",
 	targetTriple,
 ];
@@ -78,28 +78,37 @@ await run("cargo", cargoArgs);
 
 await mkdir(outDir, { recursive: true });
 await writeBundledPlugin({
-	crateName: "plugin_csv",
-	fileName: "plugin_csv.lixplugin",
+	crateName: "plugin_csv_v2",
+	fileName: "plugin_csv_v2.lixplugin",
 	files: [
-		["manifest.json", join(repoRoot, "plugins", "csv", "manifest.json")],
+		["manifest.json", join(repoRoot, "plugins", "csv-v2", "manifest.json")],
 		[
-			"schema/csv_table.json",
-			join(repoRoot, "plugins", "csv", "schema", "csv_table.json"),
+			"schema/csv_v2_table.json",
+			join(repoRoot, "plugins", "csv-v2", "schema", "csv_v2_table.json"),
 		],
 		[
-			"schema/csv_row.json",
-			join(repoRoot, "plugins", "csv", "schema", "csv_row.json"),
+			"schema/csv_v2_row.json",
+			join(repoRoot, "plugins", "csv-v2", "schema", "csv_v2_row.json"),
 		],
 	],
 });
 await writeBundledPlugin({
-	crateName: "plugin_md_v2",
-	fileName: "plugin_md_v2.lixplugin",
+	crateName: "plugin_markdown_incremental_v2",
+	fileName: "plugin_markdown_incremental_v2.lixplugin",
 	files: [
-		["manifest.json", join(repoRoot, "plugins", "markdown", "manifest.json")],
 		[
-			"schema/markdown_node.json",
-			join(repoRoot, "plugins", "markdown", "schema", "markdown_node.json"),
+			"manifest.json",
+			join(repoRoot, "plugins", "markdown-v2", "manifest.json"),
+		],
+		[
+			"schema/markdown_node_v2.json",
+			join(
+				repoRoot,
+				"plugins",
+				"markdown-v2",
+				"schema",
+				"markdown_node_v2.json",
+			),
 		],
 	],
 });

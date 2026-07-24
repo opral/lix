@@ -1,7 +1,7 @@
 //! Plugin subsystem root.
 //!
 //! Phase 1 establishes `crate::plugin::*` as the owner path for plugin-domain
-//! code under concrete plugin-owned modules instead of legacy ownership-neutral
+//! code under concrete plugin-owned modules instead of ownership-neutral
 //! buckets.
 
 mod actor;
@@ -19,13 +19,8 @@ pub(crate) use actor::{
     DEFAULT_MAX_PLUGIN_FILE_ACTORS, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
     PluginActorKey, PluginActorLease, PluginObservation,
 };
-pub(crate) use archive::{
-    ParsedPluginArchive, load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install,
-};
-pub(crate) use component::{
-    CachedPluginComponent, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginComponentHost, PluginRuntimeHost,
-    load_or_init_plugin_component,
-};
+pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
+pub(crate) use component::{DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost};
 pub(crate) use id_namespace::{
     BoundIdNamespace, is_reservation_key, local_mutation_identity, require_existing_id_authorities,
     reservation_tombstone_row, reserve_namespace_row, validate_host_allocated_changes,
@@ -41,12 +36,7 @@ pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_arch
 pub(crate) use manifest::{
     PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
 };
-pub(crate) use materializer::{
-    PluginDetectedChange, detect_changes_with_component_instance,
-    plugin_state_live_state_projection, render_plugin_state,
-    render_plugin_state_with_component_instance, retain_plugin_state_rows,
-    retain_plugin_state_rows_for_schema_keys,
-};
+pub(crate) use materializer::{PluginDetectedChange, plugin_state_live_state_projection};
 pub(crate) use registry::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
@@ -97,6 +87,7 @@ pub(crate) struct InstalledPlugin {
     pub wasm: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstalledPluginMetadata {
     pub key: String,

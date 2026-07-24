@@ -13,24 +13,18 @@ publish = false
 lix_sdk = { path = "../rs-sdk", version = "0.8.4", default-features = false, features = ["default_wasm_runtime", "local_filesystem", "sqlite"] }
 
 [dev-dependencies]
-plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown_incremental_v2 = { path = "../../plugins/markdown-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw_v2 = { path = "../../plugins/excalidraw-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_json_incremental_v2 = { path = "../../plugins/json-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 
 async-trait = "0.1"
-base64 = "0.22"
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 rand = { version = "0.9", features = ["small_rng"] }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"] }
 zip = { version = "8", default-features = false }
-
-[[bench]]
-name = "e2e"
-path = "benches/e2e.rs"
-harness = false

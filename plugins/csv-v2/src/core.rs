@@ -416,12 +416,12 @@ struct IdentityStore {
     dense_slot_bases: Arc<Vec<Option<u32>>>,
     base_namespace_indices: Arc<Vec<u16>>,
     base_ordinals: Arc<Vec<u64>>,
-    base_legacy_bytes: Arc<Vec<u8>>,
-    base_legacy_ranges: Arc<Vec<IdentityRange>>,
+    base_noncompact_bytes: Arc<Vec<u8>>,
+    base_noncompact_ranges: Arc<Vec<IdentityRange>>,
     /// Immutable import-sized storage. Sparse successors append into small
     /// copy-on-write chunks instead of cloning every imported identity.
     appended: Arc<Vec<Arc<IdentityChunk>>>,
-    /// Compact open-addressed lookup for imported legacy/non-dense IDs.
+    /// Compact open-addressed lookup for imported noncompact/non-dense IDs.
     base_lookup: Arc<IdentityLookup>,
     /// Persistent hash trie for successor-only IDs. Updating it clones one
     /// path, not an import-sized hash map.
@@ -436,7 +436,7 @@ struct IdentityChunk {
 #[derive(Clone, Debug)]
 enum StoredIdentity {
     Generated { namespace_index: u16, ordinal: u64 },
-    Legacy(Arc<str>),
+    NonCompact(Arc<str>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -467,15 +467,15 @@ impl IdentityStore {
             dense_slot_bases: Arc::new(vec![Some(0)]),
             base_namespace_indices: Arc::new(namespace_indices),
             base_ordinals: Arc::new(ordinals),
-            base_legacy_bytes: Arc::new(Vec::new()),
-            base_legacy_ranges: Arc::new(vec![IdentityRange::default(); count]),
+            base_noncompact_bytes: Arc::new(Vec::new()),
+            base_noncompact_ranges: Arc::new(vec![IdentityRange::default(); count]),
             appended: Arc::new(Vec::new()),
             base_lookup: Arc::new(IdentityLookup::default()),
             appended_lookup: None,
         })
     }
 
-    fn from_legacy(bytes: Vec<u8>, ranges: Vec<IdentityRange>) -> Result<Self, String> {
+    fn from_noncompact(bytes: Vec<u8>, ranges: Vec<IdentityRange>) -> Result<Self, String> {
         let count = ranges.len();
         let mut namespaces = Vec::<[u8; 16]>::new();
         let mut namespace_lookup = HashMap::<[u8; 16], u16>::new();
@@ -483,8 +483,8 @@ impl IdentityStore {
         let mut dense_slot_bases = Vec::<Option<u32>>::new();
         let mut namespace_indices = Vec::with_capacity(count);
         let mut ordinals = Vec::with_capacity(count);
-        let mut legacy_bytes = Vec::new();
-        let mut legacy_ranges = Vec::with_capacity(count);
+        let mut noncompact_bytes = Vec::new();
+        let mut noncompact_ranges = Vec::with_capacity(count);
         for (slot, range) in ranges.into_iter().enumerate() {
             let start = usize::try_from(range.start).expect("u32 fits usize");
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
@@ -518,15 +518,15 @@ impl IdentityStore {
                         .map_err(|_| "CSV import has too many ID namespaces".to_owned())?,
                 );
                 ordinals.push(ordinal);
-                legacy_ranges.push(IdentityRange::default());
+                noncompact_ranges.push(IdentityRange::default());
             } else {
-                let legacy_start = u32::try_from(legacy_bytes.len())
-                    .expect("validated legacy identity bytes fit u32");
-                legacy_bytes.extend_from_slice(id);
+                let noncompact_start = u32::try_from(noncompact_bytes.len())
+                    .expect("validated noncompact identity bytes fit u32");
+                noncompact_bytes.extend_from_slice(id);
                 namespace_indices.push(u16::MAX);
                 ordinals.push(0);
-                legacy_ranges.push(IdentityRange {
-                    start: legacy_start,
+                noncompact_ranges.push(IdentityRange {
+                    start: noncompact_start,
                     len: u32::try_from(id.len()).expect("validated identity length fits u32"),
                 });
             }
@@ -536,8 +536,8 @@ impl IdentityStore {
             dense_slot_bases: Arc::new(dense_slot_bases),
             base_namespace_indices: Arc::new(namespace_indices),
             base_ordinals: Arc::new(ordinals),
-            base_legacy_bytes: Arc::new(legacy_bytes),
-            base_legacy_ranges: Arc::new(legacy_ranges),
+            base_noncompact_bytes: Arc::new(noncompact_bytes),
+            base_noncompact_ranges: Arc::new(noncompact_ranges),
             appended: Arc::new(Vec::new()),
             base_lookup: Arc::new(IdentityLookup::default()),
             appended_lookup: None,
@@ -551,12 +551,12 @@ impl IdentityStore {
         if index >= self.base_len() {
             return self.appended_identity(slot).to_string(self);
         }
-        let legacy = self.base_legacy_ranges[index];
-        if legacy.len != 0 {
-            let start = usize::try_from(legacy.start).expect("u32 fits usize");
-            let end = start + usize::try_from(legacy.len).expect("u32 fits usize");
-            return std::str::from_utf8(&self.base_legacy_bytes[start..end])
-                .expect("legacy entity IDs were validated as UTF-8")
+        let noncompact = self.base_noncompact_ranges[index];
+        if noncompact.len != 0 {
+            let start = usize::try_from(noncompact.start).expect("u32 fits usize");
+            let end = start + usize::try_from(noncompact.len).expect("u32 fits usize");
+            return std::str::from_utf8(&self.base_noncompact_bytes[start..end])
+                .expect("noncompact entity IDs were validated as UTF-8")
                 .to_owned();
         }
         let namespace_index = usize::from(self.base_namespace_indices[index]);
@@ -647,7 +647,7 @@ impl IdentityStore {
                 ordinal,
             }
         } else {
-            StoredIdentity::Legacy(Arc::from(id))
+            StoredIdentity::NonCompact(Arc::from(id))
         };
         self.append_identity(identity)?;
         Ok(slot)
@@ -706,11 +706,11 @@ impl IdentityStore {
         if index >= self.base_len() {
             return self.appended_identity(slot).eq_bytes(self, id);
         }
-        let range = self.base_legacy_ranges[index];
+        let range = self.base_noncompact_ranges[index];
         if range.len != 0 {
             let start = usize::try_from(range.start).expect("u32 fits usize");
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
-            return &self.base_legacy_bytes[start..end] == id;
+            return &self.base_noncompact_bytes[start..end] == id;
         }
         decode_generated_id(id).is_some_and(|(namespace, ordinal)| {
             self.namespaces[usize::from(self.base_namespace_indices[index])] == namespace
@@ -723,8 +723,8 @@ impl IdentityStore {
             + self.dense_slot_bases.len() * size_of::<Option<u32>>()
             + self.base_namespace_indices.len() * size_of::<u16>()
             + self.base_ordinals.len() * size_of::<u64>()
-            + self.base_legacy_bytes.len()
-            + self.base_legacy_ranges.len() * size_of::<IdentityRange>()
+            + self.base_noncompact_bytes.len()
+            + self.base_noncompact_ranges.len() * size_of::<IdentityRange>()
             + self.base_lookup.slots.len() * size_of::<u32>()
             + self
                 .appended
@@ -735,7 +735,7 @@ impl IdentityStore {
                             .entries
                             .iter()
                             .map(|identity| match identity {
-                                StoredIdentity::Legacy(value) => value.len(),
+                                StoredIdentity::NonCompact(value) => value.len(),
                                 StoredIdentity::Generated { .. } => 0,
                             })
                             .sum::<usize>()
@@ -751,7 +751,7 @@ impl StoredIdentity {
                 namespace_index,
                 ordinal,
             } => IdNamespace(store.namespaces[usize::from(*namespace_index)]).encode(*ordinal),
-            Self::Legacy(value) => value.to_string(),
+            Self::NonCompact(value) => value.to_string(),
         }
     }
 
@@ -764,7 +764,7 @@ impl StoredIdentity {
                 store.namespaces[usize::from(*namespace_index)] == namespace
                     && *ordinal == candidate
             }),
-            Self::Legacy(value) => value.as_bytes() == id,
+            Self::NonCompact(value) => value.as_bytes() == id,
         }
     }
 }
@@ -773,8 +773,8 @@ impl IdentityLookup {
     fn build(store: &IdentityStore) -> Result<Self, String> {
         let indexed = (0..store.base_len())
             .filter(|index| {
-                let legacy = store.base_legacy_ranges[*index];
-                legacy.len != 0
+                let noncompact = store.base_noncompact_ranges[*index];
+                noncompact.len != 0
                     || store.dense_slot_bases[usize::from(store.base_namespace_indices[*index])]
                         .is_none()
             })
@@ -826,11 +826,11 @@ impl IdentityLookup {
 
 impl IdentityStore {
     fn base_identity_hash(&self, index: usize) -> u64 {
-        let range = self.base_legacy_ranges[index];
+        let range = self.base_noncompact_ranges[index];
         if range.len != 0 {
             let start = usize::try_from(range.start).expect("u32 fits usize");
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
-            identity_hash(&self.base_legacy_bytes[start..end])
+            identity_hash(&self.base_noncompact_bytes[start..end])
         } else {
             generated_identity_hash(
                 self.namespaces[usize::from(self.base_namespace_indices[index])],
@@ -842,14 +842,14 @@ impl IdentityStore {
     fn identities_equal(&self, left: u32, right: u32) -> bool {
         let left_index = usize::try_from(left).expect("u32 fits usize");
         let right_index = usize::try_from(right).expect("u32 fits usize");
-        let left_range = self.base_legacy_ranges[left_index];
-        let right_range = self.base_legacy_ranges[right_index];
+        let left_range = self.base_noncompact_ranges[left_index];
+        let right_range = self.base_noncompact_ranges[right_index];
         if left_range.len != 0 && right_range.len != 0 {
             let left_start = usize::try_from(left_range.start).expect("u32 fits usize");
             let right_start = usize::try_from(right_range.start).expect("u32 fits usize");
-            return self.base_legacy_bytes[left_start
+            return self.base_noncompact_bytes[left_start
                 ..left_start + usize::try_from(left_range.len).expect("u32 fits usize")]
-                == self.base_legacy_bytes[right_start
+                == self.base_noncompact_bytes[right_start
                     ..right_start + usize::try_from(right_range.len).expect("u32 fits usize")];
         }
         if left_range.len == 0 && right_range.len == 0 {
@@ -883,7 +883,7 @@ fn identity_hash_for_stored(store: &IdentityStore, identity: &StoredIdentity) ->
             namespace_index,
             ordinal,
         } => generated_identity_hash(store.namespaces[usize::from(*namespace_index)], *ordinal),
-        StoredIdentity::Legacy(value) => identity_hash(value.as_bytes()),
+        StoredIdentity::NonCompact(value) => identity_hash(value.as_bytes()),
     }
 }
 
@@ -1606,7 +1606,7 @@ impl EntityImportBuilder {
         let mut chunk_start = 0u32;
         let mut field_count = 0u32;
         let mut chunk_key_cursor = 0u32;
-        let mut legacy_ranges = Vec::with_capacity(self.rows.len());
+        let mut noncompact_ranges = Vec::with_capacity(self.rows.len());
         let mut order_overrides = HashMap::new();
         let denominator = u128::try_from(self.rows.len() + 1).expect("usize fits u128");
 
@@ -1661,7 +1661,7 @@ impl EntityImportBuilder {
                 .checked_sub(row_start)
                 .expect("row starts inside rendered bytes");
             let slot = u32::try_from(index).expect("validated row count");
-            legacy_ranges.push(row.id.identity());
+            noncompact_ranges.push(row.id.identity());
             let numerator =
                 u128::try_from(index + 1).expect("usize fits u128") * u128::from(u64::MAX);
             let order_rank = u64::try_from(numerator / denominator).expect("rank fits") | 1;
@@ -1707,7 +1707,7 @@ impl EntityImportBuilder {
         drop(std::mem::take(&mut self.order_key_bytes));
         drop(std::mem::take(&mut self.cell_bytes));
         drop(std::mem::take(&mut self.layout_overrides));
-        let identities = IdentityStore::from_legacy(id_bytes, legacy_ranges)?;
+        let identities = IdentityStore::from_noncompact(id_bytes, noncompact_ranges)?;
         let blob = Arc::new(blob);
         let persistent_blob = PersistentBlob::from_shared(Arc::clone(&blob))?;
         let index =

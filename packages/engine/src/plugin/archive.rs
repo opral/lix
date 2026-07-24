@@ -10,8 +10,8 @@ use crate::binary_cas::BlobHash;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
 #[cfg(test)]
-use super::InstalledPluginMetadata;
-use super::{InstalledPlugin, PluginManifest, PluginRuntime, parse_plugin_manifest_json};
+use super::{InstalledPlugin, InstalledPluginMetadata};
+use super::{PluginManifest, parse_plugin_manifest_json};
 
 /// Fully validated plugin package data needed by the install transaction.
 ///
@@ -129,6 +129,7 @@ pub(crate) fn parse_plugin_archive_for_install(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load_installed_plugin_from_archive_bytes(
     plugin_key: &str,
     archive_path: &str,
@@ -235,9 +236,7 @@ fn load_plugin_archive(
         })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?.schema_key;
-        if validated_manifest.manifest.runtime == PluginRuntime::WasmComponentV2 {
-            validate_v2_number_free_schema(&schema_json, &schema_key)?;
-        }
+        validate_v2_number_free_schema(&schema_json, &schema_key)?;
         if !seen_schema_keys.insert(schema_key.clone()) {
             return Err(invalid_plugin(format!(
                 "Plugin archive declares duplicate schema '{schema_key}'"
@@ -1094,8 +1093,8 @@ mod tests {
 
     const MANIFEST: &[u8] = br#"{
         "key":"plugin_test",
-        "runtime":"wasm-component-v1",
-        "api_version":"0.1.0",
+        "runtime":"wasm-component-v2",
+        "api_version":"2.0.0",
         "match":{"path_glob":"*.test"},
         "entry":"plugin.wasm",
         "schemas":["schema/plugin_test_note.json"]
@@ -1791,8 +1790,8 @@ mod benchmark_probe {
     fn benchmark_archive(wasm_bytes: usize) -> Vec<u8> {
         let manifest = br#"{
             "key":"plugin_bench",
-            "runtime":"wasm-component-v1",
-            "api_version":"0.1.0",
+            "runtime":"wasm-component-v2",
+            "api_version":"2.0.0",
             "match":{"path_glob":"*.bench"},
             "entry":"plugin.wasm",
             "schemas":["schema/plugin_bench_note.json"]

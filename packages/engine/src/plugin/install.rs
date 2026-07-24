@@ -191,8 +191,8 @@ mod tests {
     #[test]
     fn bundled_csv_and_markdown_content_type_manifests_install() {
         let cases = [
-            ("plugin_csv", "*.{csv,tsv}"),
-            ("plugin_md_v2", "*.{md,markdown}"),
+            ("plugin_csv_v2", "*.{csv,tsv}"),
+            ("plugin_markdown_incremental_v2", "*.{md,markdown}"),
         ];
 
         for (plugin_key, path_glob) in cases {
@@ -238,7 +238,7 @@ mod tests {
                 global,
                 untracked,
             )
-            .expect_err("v1 registry entries are tracked and branch-local");
+            .expect_err("plugin registry entries are tracked and branch-local");
 
             assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
             assert!(
@@ -263,8 +263,8 @@ mod tests {
         let manifest = format!(
             r#"{{
                 "key":"{plugin_key}",
-                "runtime":"wasm-component-v1",
-                "api_version":"0.1.0",
+                "runtime":"wasm-component-v2",
+                "api_version":"2.0.0",
                 "match":{{"path_glob":"{path_glob}"{content_type}}},
                 "entry":"plugin.wasm",
                 "schemas":["schema/plugin_test_note.json"]

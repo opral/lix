@@ -38,7 +38,7 @@ interface host {
   }
 
   /// Immutable host bytes. The implementation may be a contiguous blob, rope,
-  /// CAS manifest, or P3 stream adapter. A positive read before EOF returns a
+  /// or CAS manifest. A positive read before EOF returns a
   /// non-empty prefix; every returned byte and non-empty read charges the same
   /// transition's total-byte and page caps, including repeated ranges.
   resource byte-source {
@@ -157,12 +157,10 @@ interface api {
     insert: input-bytes,
   }
 
-  /// One page-local guest table multiplexes lazy output attachments. A P3
-  /// binding can expose each indexed SDK value as `stream<u8>` plus
-  /// completion. Positive reads before EOF make progress and charge the
-  /// originating transition's aggregate page/byte/deadline budget. The host
-  /// validates bounded page metadata and counts every reference before calling
-  /// either method.
+  /// One page-local guest table multiplexes lazy output attachments. Positive
+  /// reads before EOF make progress and charge the originating transition's
+  /// aggregate page/byte/deadline budget. The host validates bounded page
+  /// metadata and counts every reference before calling either method.
   resource byte-outputs {
     len: func(index: u32) -> result<u64, plugin-error>;
     read: func(
@@ -243,7 +241,7 @@ interface api {
 
   record file-update {
     /// Warm transitions require identical plugin key/generation in these two
-    /// descriptors. Reselection is an engine migration/handoff and never enters
+    /// descriptors. Reselection is an engine-managed handoff and never enters
     /// this guest call.
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
@@ -299,8 +297,8 @@ interface api {
   }
 
   /// Cold restart/eviction: durable entities exist and plugin-backed bytes do
-  /// not. Implementations may consume this packet source as a P3 stream. The
-  /// returned `entity-transition.edits` use the empty byte string as their
+  /// not. The returned `entity-transition.edits` use the empty byte string as
+  /// their
   /// accepted base: an empty result has no edits, while a non-empty complete
   /// file is one coalesced splice at offset 0 with delete length 0.
   record open-entities-input {

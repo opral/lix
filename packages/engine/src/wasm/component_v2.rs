@@ -974,7 +974,7 @@ mod tests {
             path: Some("data.csv".to_owned()),
             media_type: Some("text/csv".to_owned()),
             plugin: WasmPluginSelection {
-                plugin_key: "plugin_csv".to_owned(),
+                plugin_key: "plugin_csv_v2".to_owned(),
                 generation: generation.to_owned(),
             },
         }
@@ -1162,7 +1162,7 @@ mod tests {
 
         let page_limits = WasmTransitionLimits {
             max_record_bytes: 30,
-            max_page_bytes: 50,
+            max_page_bytes: 49,
             ..WasmTransitionLimits::default()
         };
         let mut validator = WasmEditDrainValidator::new(1, page_limits).unwrap();
@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn production_wit_is_versioned_and_kept_out_of_the_v1_package_root() {
+    fn production_wit_is_versioned() {
         let wit = include_str!("../../wit/v2/lix-plugin-v2.wit");
         assert!(wit.starts_with("package lix:plugin@2.0.0;"));
         assert!(wit.contains("resource document"));

@@ -1,7 +1,7 @@
 # Incremental CSV plugin (Component API v2)
 
-This crate is the production CSV vertical slice for `wasm-component-v2`. Each
-Wasm instance is a single-file actor. Its `document` resources are immutable,
+This crate is the production CSV/TSV Component plugin. Each Wasm instance is a
+single-file actor. Its `document` resources are immutable,
 cheaply forkable versions backed by one byte blob and a chunked compact index.
 
 The hot paths are incremental:
@@ -22,9 +22,8 @@ The hot paths are incremental:
   retaining every decoded JSON record, and the full cold renderer edit shares
   the accepted document blob. Explicit large-file acceptance tests exercise
   the 220,000-row, 10.68 MB / 10.19 MiB fixture and keep its estimated retained state
-  below 64 MiB. The integrated host keeps the existing v1 default at 64 MiB
-  and defaults to a configurable 128 MiB per v2 actor with at most four warm
-  file actors retained.
+  below 64 MiB. The integrated host defaults to a configurable 128 MiB per v2
+  actor with at most four warm file actors retained.
 
 Cold reopen is byte-exact for accepted CSV lexical form, not merely
 semantically equivalent. The table entity stores the preferred dialect and a
