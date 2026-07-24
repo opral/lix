@@ -1,7 +1,6 @@
 use datafusion::error::DataFusionError;
 
 use crate::LixError;
-use crate::transaction::types::TransactionWriteRow;
 
 pub(crate) fn reject_read_only_entity_surface(
     schema_key: &str,
@@ -24,18 +23,6 @@ pub(crate) fn read_only_entity_surface_hint(schema_key: &str) -> Option<&'static
         );
     }
     read_only_schema_message(schema_key)
-}
-
-pub(crate) fn reject_read_only_stage_rows(
-    rows: &[TransactionWriteRow],
-    action: &str,
-) -> Result<(), DataFusionError> {
-    for row in rows {
-        if let Some(message) = read_only_schema_message(&row.schema_key) {
-            return Err(read_only_error(action, &row.schema_key, message));
-        }
-    }
-    Ok(())
 }
 
 fn read_only_error(action: &str, schema_key: &str, message: &'static str) -> DataFusionError {

@@ -19,8 +19,7 @@ mod entity_history;
 mod file;
 mod file_history;
 mod filesystem_history_path;
-mod history;
-mod lix_state;
+mod history_util;
 mod spec;
 mod upsert;
 mod values;
@@ -290,8 +289,7 @@ where
             && selection.includes(surface)
             && matches!(
                 &surface.kind,
-                PublicSurfaceKind::History
-                    | PublicSurfaceKind::FileHistory
+                PublicSurfaceKind::FileHistory
                     | PublicSurfaceKind::DirectoryHistory
                     | PublicSurfaceKind::EntityHistory { .. }
             )
@@ -321,25 +319,6 @@ where
             continue;
         }
         match &surface.kind {
-            PublicSurfaceKind::LixState => {
-                lix_state::register_lix_state_active_provider(
-                    session,
-                    &surface.name,
-                    ctx.active_branch_id(),
-                    ctx.live_state(),
-                    Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::LixStateByBranch => {
-                lix_state::register_lix_state_by_branch_provider(
-                    session,
-                    &surface.name,
-                    ctx.live_state(),
-                    Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Branch => {
                 branch::register_lix_branch_read_provider(
                     session,
@@ -354,15 +333,6 @@ where
                     session,
                     &surface.name,
                     ctx.changelog_query_source(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::History => {
-                history::register_history_provider(
-                    session,
-                    &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -533,24 +503,6 @@ async fn register_write_from_catalog(
             continue;
         }
         match &surface.kind {
-            PublicSurfaceKind::LixState => {
-                lix_state::register_lix_state_active_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                    Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::LixStateByBranch => {
-                lix_state::register_lix_state_by_branch_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                    Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Branch => {
                 branch::register_write_provider(
                     session,
@@ -599,7 +551,6 @@ async fn register_write_from_catalog(
                 .await?;
             }
             PublicSurfaceKind::Change
-            | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
             PublicSurfaceKind::EntityBase { .. }
@@ -660,32 +611,32 @@ mod tests {
     #[test]
     fn referenced_provider_selection_uses_datafusion_cte_and_set_operation_resolution() {
         let selection = selection_for_sql(&["WITH shadowed AS (\
-                 SELECT entity_pk FROM lix_state \
+                 SELECT id FROM lix_key_value \
                  WHERE EXISTS (SELECT 1 FROM lix_file)\
              ) \
-             SELECT left_side.entity_pk \
+             SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
                  SELECT entity_pk FROM lix_change \
                  UNION ALL \
                  SELECT entity_pk FROM lix_change\
              ) AS right_side \
-               ON left_side.entity_pk = right_side.entity_pk \
+               ON left_side.id = right_side.entity_pk \
              JOIN public.\"lix_directory\" AS directory_a ON true \
              JOIN public.\"lix_directory\" AS directory_b ON true"]);
 
         assert_eq!(
             selection,
-            selected_names(&["lix_change", "lix_directory", "lix_file", "lix_state"])
+            selected_names(&["lix_change", "lix_directory", "lix_file", "lix_key_value"])
         );
     }
 
     #[test]
     fn referenced_provider_selection_excludes_shadowed_and_recursive_cte_names() {
         assert_eq!(
-            selection_for_sql(&["WITH lix_file AS (SELECT entity_pk FROM lix_state) \
+            selection_for_sql(&["WITH lix_file AS (SELECT id FROM lix_key_value) \
                  SELECT * FROM lix_file",]),
-            selected_names(&["lix_state"])
+            selected_names(&["lix_key_value"])
         );
         assert_eq!(
             selection_for_sql(&["WITH RECURSIVE walk(id) AS (\
@@ -704,9 +655,9 @@ mod tests {
         assert_eq!(
             selection_for_sql(&[
                 "SELECT * FROM lix_file",
-                "SELECT * FROM public.lix_state JOIN \"UnknownTable\" ON true",
+                "SELECT * FROM public.lix_key_value JOIN \"UnknownTable\" ON true",
             ]),
-            selected_names(&["UnknownTable", "lix_file", "lix_state"])
+            selected_names(&["UnknownTable", "lix_file", "lix_key_value"])
         );
     }
 

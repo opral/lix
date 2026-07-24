@@ -2563,7 +2563,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_directory_insert_into_lix_state_write_row() {
+    fn decodes_directory_insert_into_transaction_write_row() {
         let rows = lix_directory_write_rows_from_batch(&directory_insert_batch(true, false), None)
             .expect("directory batch should decode");
 
@@ -2723,7 +2723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_insert_sink_stages_decoded_lix_state_rows() {
+    async fn directory_insert_sink_stages_decoded_transaction_rows() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_insert_batch(true, false);

@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn plan_write_contradiction_does_not_drop_bound_params() {
         let plan = plan_sql(
-            "UPDATE lix_state SET metadata = $1 WHERE schema_key IN ('profile') AND schema_key IN ('note') AND entity_pk = $2",
+            "UPDATE lix_file SET name = $1 WHERE id IN ('profile') AND id IN ('note') AND path = $2",
         );
 
         assert_eq!(
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn plan_write_applies_active_branch_scope_to_base_writes() {
-        let plan = plan_sql("DELETE FROM lix_state WHERE schema_key = 'profile'");
+        let plan = plan_sql("DELETE FROM lix_file WHERE id = 'profile'");
 
         assert_eq!(
             plan.bound.branch_scope,
@@ -93,7 +93,8 @@ mod tests {
 
     #[test]
     fn plan_write_keeps_explicit_required_scope_for_by_branch_writes() {
-        let plan = plan_sql("DELETE FROM lix_state_by_branch WHERE branch_id IN ('v1', 'v2')");
+        let plan =
+            plan_sql("DELETE FROM lix_file_by_branch WHERE lixcol_branch_id IN ('v1', 'v2')");
 
         assert_eq!(
             plan.bound.branch_scope,

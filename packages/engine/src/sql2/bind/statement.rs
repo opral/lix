@@ -12,7 +12,6 @@ use datafusion::sql::sqlparser::ast::{
 #[cfg(test)]
 use serde_json::Value as JsonValue;
 
-use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::plan::branch_scope::BranchScope;
@@ -35,8 +34,7 @@ pub(crate) fn bind_statement(
     visible_schemas: &[JsonValue],
     active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
-    let catalog =
-        PublicCatalog::from_visible_schemas_with_internal_state_adapters(visible_schemas)?;
+    let catalog = PublicCatalog::from_visible_schemas(visible_schemas)?;
     bind_statement_with_catalog(statement, &catalog, active_branch_id)
 }
 
@@ -116,8 +114,6 @@ pub(super) fn bind_insert_bound(
             table.surface.kind,
             PublicSurfaceKind::EntityBase { .. }
                 | PublicSurfaceKind::EntityByBranch { .. }
-                | PublicSurfaceKind::LixState
-                | PublicSurfaceKind::LixStateByBranch
                 | PublicSurfaceKind::Branch
                 | PublicSurfaceKind::File
                 | PublicSurfaceKind::FileByBranch
@@ -1233,7 +1229,6 @@ fn require_write_capability(
             PublicSurfaceKind::EntityHistory { .. }
                 | PublicSurfaceKind::FileHistory
                 | PublicSurfaceKind::DirectoryHistory
-                | PublicSurfaceKind::History
         ) {
             error = error.with_hint("History views are query-only.");
         } else if let PublicSurfaceKind::EntityBase { schema_key }
@@ -1248,8 +1243,6 @@ fn require_write_capability(
 
 fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
     match kind {
-        PublicSurfaceKind::LixState => BoundWriteTarget::LixState,
-        PublicSurfaceKind::LixStateByBranch => BoundWriteTarget::LixStateByBranch,
         PublicSurfaceKind::EntityBase { schema_key } => {
             BoundWriteTarget::Entity(EntityWriteSurface::Base {
                 schema_key: schema_key.clone(),
@@ -1270,8 +1263,7 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         PublicSurfaceKind::EntityHistory { .. }
         | PublicSurfaceKind::FileHistory
         | PublicSurfaceKind::DirectoryHistory
-        | PublicSurfaceKind::Change
-        | PublicSurfaceKind::History => {
+        | PublicSurfaceKind::Change => {
             unreachable!("write capability checked before target binding")
         }
     }
@@ -1284,7 +1276,11 @@ fn bind_write_branch_scope(
     active_branch_id: &str,
 ) -> Result<BranchScope, LixError> {
     let Some(branch_column) = by_branch_column_name(kind) else {
-        return bind_base_write_branch_scope(kind, input, predicate, active_branch_id);
+        return Ok(bind_base_write_branch_scope(
+            kind,
+            predicate,
+            active_branch_id,
+        ));
     };
     let branch_selector = match input {
         BoundWriteInput::Values(values) => {
@@ -1302,22 +1298,6 @@ fn bind_write_branch_scope(
             "INSERT ... SELECT by-branch writes are not supported",
         ))?,
     };
-    if matches!(kind, PublicSurfaceKind::LixStateByBranch) {
-        let global_selector = match input {
-            BoundWriteInput::Values(values) => {
-                let mut selector = GlobalSelector::Missing;
-                let global_column_index = values.column_index("global");
-                for row in &values.rows {
-                    selector =
-                        selector.union(insert_row_global_selector(global_column_index, row)?);
-                }
-                selector
-            }
-            BoundWriteInput::None => predicate_global_selector(predicate)?,
-            BoundWriteInput::Query { .. } => GlobalSelector::Missing,
-        };
-        return lix_state_by_branch_scope(input, branch_column, branch_selector, global_selector);
-    }
     by_branch_scope(input, branch_column, branch_selector)
 }
 
@@ -1366,241 +1346,22 @@ fn by_branch_scope(
     }
 }
 
-fn lix_state_by_branch_scope(
-    input: &BoundWriteInput,
-    branch_column: &str,
-    branch_selector: BranchSelector,
-    global_selector: GlobalSelector,
-) -> Result<BranchScope, LixError> {
-    if matches!(global_selector, GlobalSelector::Empty) || branch_selector.is_empty() {
-        return Ok(BranchScope::Empty);
-    }
-
-    match global_selector {
-        GlobalSelector::Static(true) => match branch_selector {
-            BranchSelector::Missing => Ok(BranchScope::Global),
-            BranchSelector::Static(branch_ids)
-                if branch_ids == BTreeSet::from([GLOBAL_BRANCH_ID.to_string()]) =>
-            {
-                Ok(BranchScope::Global)
-            }
-            BranchSelector::Static(_) => Err(super::error::unsupported(
-                "lix_state_by_branch writes cannot combine global = true with non-global branch_id",
-            )),
-            BranchSelector::Dynamic { .. } => {
-                by_branch_scope(input, branch_column, branch_selector)
-            }
-        },
-        GlobalSelector::Static(false) => match &branch_selector {
-            BranchSelector::Static(branch_ids) if branch_ids.contains(GLOBAL_BRANCH_ID) => {
-                Err(super::error::unsupported(
-                    "lix_state_by_branch writes cannot combine global = false with global branch_id",
-                ))
-            }
-            _ => by_branch_scope(input, branch_column, branch_selector),
-        },
-        GlobalSelector::Dynamic => by_branch_scope(input, branch_column, branch_selector),
-        GlobalSelector::Missing => match &branch_selector {
-            BranchSelector::Static(branch_ids)
-                if branch_ids == &BTreeSet::from([GLOBAL_BRANCH_ID.to_string()]) =>
-            {
-                Ok(BranchScope::Global)
-            }
-            BranchSelector::Static(branch_ids) if branch_ids.contains(GLOBAL_BRANCH_ID) => {
-                Err(super::error::unsupported(
-                    "lix_state_by_branch writes cannot mix global and non-global branch scopes",
-                ))
-            }
-            _ => by_branch_scope(input, branch_column, branch_selector),
-        },
-        GlobalSelector::Mixed => Err(super::error::unsupported(
-            "lix_state_by_branch writes cannot mix global and branch-specific rows",
-        )),
-        GlobalSelector::Empty => Ok(BranchScope::Empty),
-    }
-}
-
 fn bind_base_write_branch_scope(
     kind: &PublicSurfaceKind,
-    input: &BoundWriteInput,
     predicate: &BoundPredicate,
     active_branch_id: &str,
-) -> Result<BranchScope, LixError> {
+) -> BranchScope {
     if predicate == &BoundPredicate::False {
-        return Ok(BranchScope::Empty);
+        return BranchScope::Empty;
     }
     if matches!(kind, PublicSurfaceKind::Branch) {
-        return Ok(BranchScope::Global);
+        return BranchScope::Global;
     }
-    if !matches!(kind, PublicSurfaceKind::LixState) {
-        return Ok(active_branch_scope(active_branch_id));
-    }
-    match input {
-        BoundWriteInput::Values(values) => {
-            let mut selector = GlobalSelector::Missing;
-            let global_column_index = values.column_index("global");
-            for row in &values.rows {
-                selector = selector.union(insert_row_global_selector(global_column_index, row)?);
-            }
-            match selector {
-                GlobalSelector::Missing | GlobalSelector::Static(false) => {
-                    Ok(active_branch_scope(active_branch_id))
-                }
-                GlobalSelector::Static(true) => Ok(BranchScope::Global),
-                GlobalSelector::Empty => Ok(BranchScope::Empty),
-                GlobalSelector::Dynamic => Err(super::error::unsupported(
-                    "parameterized lix_state global scope selectors are not supported yet",
-                )),
-                GlobalSelector::Mixed => Err(super::error::unsupported(
-                    "lix_state INSERT cannot mix global and active-branch rows",
-                )),
-            }
-        }
-        BoundWriteInput::None => match predicate_global_selector(predicate)? {
-            GlobalSelector::Static(true) => Ok(BranchScope::Global),
-            GlobalSelector::Static(false) | GlobalSelector::Missing => {
-                Ok(active_branch_scope(active_branch_id))
-            }
-            GlobalSelector::Empty => Ok(BranchScope::Empty),
-            GlobalSelector::Dynamic => Err(super::error::unsupported(
-                "parameterized lix_state global scope selectors are not supported yet",
-            )),
-            GlobalSelector::Mixed => Err(super::error::unsupported(
-                "lix_state global predicates select mixed branch scopes",
-            )),
-        },
-        BoundWriteInput::Query { .. } => Ok(active_branch_scope(active_branch_id)),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GlobalSelector {
-    Missing,
-    Static(bool),
-    Dynamic,
-    Mixed,
-    Empty,
-}
-
-impl GlobalSelector {
-    fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
-            (Self::Dynamic, _) | (_, Self::Dynamic) => Self::Dynamic,
-            (Self::Empty | Self::Missing, selector) | (selector, Self::Empty | Self::Missing) => {
-                selector
-            }
-            (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
-            (Self::Static(_), Self::Static(_)) => Self::Mixed,
-        }
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::Dynamic, Self::Missing) | (Self::Missing, Self::Dynamic) => Self::Dynamic,
-            (Self::Dynamic, selector) | (selector, Self::Dynamic) => selector,
-            (Self::Mixed, Self::Missing) | (Self::Missing, Self::Mixed) => Self::Mixed,
-            (Self::Mixed | Self::Missing, selector) | (selector, Self::Mixed | Self::Missing) => {
-                selector
-            }
-            (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
-            (Self::Static(_), Self::Static(_)) => Self::Empty,
-        }
-    }
-}
-
-fn insert_row_global_selector(
-    column_index: Option<usize>,
-    row: &[BoundExpr],
-) -> Result<GlobalSelector, LixError> {
-    let Some(column_index) = column_index else {
-        return Ok(GlobalSelector::Missing);
-    };
-    global_selector_value(&row[column_index])
-}
-
-fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelector, LixError> {
-    match predicate {
-        BoundPredicate::True
-        | BoundPredicate::Like { .. }
-        | BoundPredicate::IsNull(_)
-        | BoundPredicate::IsNotNull(_) => Ok(GlobalSelector::Missing),
-        BoundPredicate::False => Ok(GlobalSelector::Empty),
-        BoundPredicate::And(predicates) => {
-            let mut result = GlobalSelector::Missing;
-            for predicate in predicates {
-                result = result.intersect(predicate_global_selector(predicate)?);
-            }
-            Ok(result)
-        }
-        BoundPredicate::Or(predicates) => {
-            let mut result = GlobalSelector::Empty;
-            let mut has_missing_branch = false;
-            for predicate in predicates {
-                let selector = predicate_global_selector(predicate)?;
-                if selector == GlobalSelector::Missing {
-                    has_missing_branch = true;
-                    continue;
-                }
-                result = result.union(selector);
-            }
-            if has_missing_branch {
-                if result == GlobalSelector::Empty {
-                    Ok(GlobalSelector::Missing)
-                } else {
-                    Ok(GlobalSelector::Mixed)
-                }
-            } else {
-                Ok(result)
-            }
-        }
-        BoundPredicate::Eq(left, right) => global_value_from_binary_exprs(left, right)
-            .or_else(|| global_value_from_binary_exprs(right, left))
-            .transpose()
-            .map(|selector| selector.unwrap_or(GlobalSelector::Missing)),
-        BoundPredicate::In { expr, values } => {
-            let BoundExpr::Column(column) = expr else {
-                return Ok(GlobalSelector::Missing);
-            };
-            if column.name != "global" {
-                return Ok(GlobalSelector::Missing);
-            }
-            let mut result = GlobalSelector::Missing;
-            for value in values {
-                result = result.union(global_selector_value(value)?);
-            }
-            Ok(result)
-        }
-    }
-}
-
-fn global_value_from_binary_exprs(
-    column_expr: &BoundExpr,
-    value_expr: &BoundExpr,
-) -> Option<Result<GlobalSelector, LixError>> {
-    let BoundExpr::Column(column) = column_expr else {
-        return None;
-    };
-    if column.name != "global" {
-        return None;
-    }
-    Some(global_selector_value(value_expr))
-}
-
-fn global_selector_value(expr: &BoundExpr) -> Result<GlobalSelector, LixError> {
-    match expr {
-        BoundExpr::Literal(BoundLiteral::Bool(value)) => Ok(GlobalSelector::Static(*value)),
-        BoundExpr::Param(_) => Ok(GlobalSelector::Dynamic),
-        _ => Err(super::error::unsupported(
-            "lix_state global predicates require boolean literals",
-        )),
-    }
+    active_branch_scope(active_branch_id)
 }
 
 fn by_branch_column_name(kind: &PublicSurfaceKind) -> Option<&'static str> {
     match kind {
-        PublicSurfaceKind::LixStateByBranch => Some("branch_id"),
         PublicSurfaceKind::EntityByBranch { .. }
         | PublicSurfaceKind::FileByBranch
         | PublicSurfaceKind::DirectoryByBranch => Some("lixcol_branch_id"),
@@ -1946,26 +1707,6 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_duplicate_lix_state_by_branch_insert_columns() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state_by_branch (\
-             entity_pk, schema_key, snapshot_content, branch_id, branch_id\
-             ) VALUES (\
-             '[\"entity1\"]', 'lix_key_value', '{\"key\":\"k\",\"value\":\"v\"}', 'branch1', 'branch2'\
-             )",
-        );
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("duplicate lix_state_by_branch insert columns should be rejected");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            error
-                .message
-                .contains("duplicate write target column 'branch_id'")
-        );
-    }
-
-    #[test]
     fn bind_statement_rejects_duplicate_update_columns() {
         let statement = parse_statement("UPDATE lix_file SET name = 'a', name = 'b'");
         let error = bind_statement(&statement, &[], "branch1")
@@ -2110,9 +1851,25 @@ mod tests {
     #[test]
     fn bind_statement_predecodes_lix_json_literal_values() {
         let statement = parse_statement(
-            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) VALUES (lix_json('[\"e1\"]'), 'app.test', lix_json('{\"id\":\"e1\"}'))",
+            "INSERT INTO app_json (id, payload, metadata) VALUES ('e1', lix_json('{\"id\":\"e1\"}'), lix_json('{\"source\":\"test\"}'))",
         );
-        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
+        let bound = bind_statement(
+            &statement,
+            &[serde_json::json!({
+                "x-lix-key": "app_json",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "payload": { "type": "object" },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            })],
+            "branch1",
+        )
+        .expect("insert should bind");
 
         let write = bound;
         let BoundWriteInput::Values(values) = write.input else {
@@ -2234,7 +1991,7 @@ mod tests {
     fn bind_statement_binds_false_base_predicates_as_empty() {
         for sql in [
             "DELETE FROM lix_file WHERE false",
-            "UPDATE lix_state SET metadata = '{}' WHERE false",
+            "UPDATE lix_file SET name = 'renamed' WHERE false",
             "DELETE FROM lix_branch WHERE false",
         ] {
             let bound = bind_statement(&parse_statement(sql), &[], "branch1")
@@ -2253,151 +2010,6 @@ mod tests {
             bind_statement(&parse_statement(sql), &[], "branch1")
                 .unwrap_or_else(|error| panic!("{sql} should bind, got {error:?}"));
         }
-    }
-
-    #[test]
-    fn bind_statement_binds_global_lix_state_insert_scope() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', true)",
-        );
-        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
-
-        let write = bound;
-        assert_eq!(write.branch_scope, BranchScope::Global);
-    }
-
-    #[test]
-    fn bind_statement_rejects_parameterized_lix_state_global_scope() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
-        );
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("parameterized global scope should fail closed until scope resolution");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("parameterized lix_state global scope selectors")
-        );
-    }
-
-    #[test]
-    fn bind_statement_rejects_lix_state_by_branch_global_true_with_branch_id() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'v1', true)",
-        );
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("global true and branch_id select contradictory scopes");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("cannot combine global = true with non-global branch_id")
-        );
-    }
-
-    #[test]
-    fn bind_statement_binds_lix_state_by_branch_global_true_with_global_branch() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', true)",
-        );
-        let bound = bind_statement(&statement, &[], "branch1").expect("global row should bind");
-
-        let write = bound;
-        assert_eq!(write.branch_scope, BranchScope::Global);
-    }
-
-    #[test]
-    fn bind_statement_rejects_lix_state_by_branch_global_false_with_global_branch() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', false)",
-        );
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("global false cannot target the global branch");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("cannot combine global = false with global branch_id")
-        );
-    }
-
-    #[test]
-    fn bind_statement_binds_parameterized_lix_state_by_branch_branch_id() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
-        );
-        let bound = bind_statement(&statement, &[], "branch1")
-            .expect("parameterized lix_state_by_branch branch_id should bind");
-
-        assert_eq!(
-            bound.branch_scope,
-            BranchScope::ExplicitDynamic {
-                branch_ids: BTreeSet::new(),
-                param_indexes: BTreeSet::from([1])
-            }
-        );
-    }
-
-    #[test]
-    fn bind_statement_binds_parameterized_lix_state_by_branch_global_false_branch_id() {
-        let statement = parse_statement(
-            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1, false)",
-        );
-        let bound = bind_statement(&statement, &[], "branch1")
-            .expect("parameterized lix_state_by_branch non-global row should bind");
-
-        assert_eq!(
-            bound.branch_scope,
-            BranchScope::ExplicitDynamic {
-                branch_ids: BTreeSet::new(),
-                param_indexes: BTreeSet::from([1])
-            }
-        );
-    }
-
-    #[test]
-    fn bind_statement_binds_contradictory_lix_state_global_predicates_as_empty() {
-        let statement = parse_statement(
-            "UPDATE lix_state SET metadata = '{}' WHERE global = true AND global = false",
-        );
-        let bound = bind_statement(&statement, &[], "branch1").expect("no-match scope should bind");
-
-        let write = bound;
-        assert_eq!(write.branch_scope, BranchScope::Empty);
-    }
-
-    #[test]
-    fn bind_statement_rejects_mixed_or_lix_state_global_scope() {
-        let statement = parse_statement(
-            "UPDATE lix_state SET metadata = '{}' WHERE global = true OR schema_key = 'app.test'",
-        );
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("mixed global OR scope should fail closed");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("lix_state global predicates select mixed branch scopes"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn global_selector_mixed_intersect_missing_stays_mixed() {
-        assert_eq!(
-            GlobalSelector::Mixed.intersect(GlobalSelector::Missing),
-            GlobalSelector::Mixed
-        );
-        assert_eq!(
-            GlobalSelector::Missing.intersect(GlobalSelector::Mixed),
-            GlobalSelector::Mixed
-        );
     }
 
     #[test]
@@ -2436,9 +2048,7 @@ mod tests {
 
     #[test]
     fn bind_statement_binds_negative_numeric_literals() {
-        let statement = parse_statement(
-            "UPDATE lix_state SET snapshot_content = -1 WHERE entity_pk = '[\"e1\"]'",
-        );
+        let statement = parse_statement("UPDATE lix_file SET name = -1 WHERE id = 'file1'");
         let bound = bind_statement(&statement, &[], "branch1").expect("update should bind");
 
         let write = bound;
@@ -2588,9 +2198,9 @@ mod tests {
 
     #[test]
     fn bind_statement_rejects_provider_read_only_update_columns() {
-        let statement = parse_statement("UPDATE lix_state SET entity_pk = '[\"next\"]'");
+        let statement = parse_statement("UPDATE lix_file SET id = 'next'");
         let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("lix_state identity columns are insert-only");
+            .expect_err("file identity columns are insert-only");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error.message.contains("is not writable"));

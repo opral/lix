@@ -117,8 +117,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 /// target schema has an `x-lix-primary-key`; transaction normalization applies
 /// schema defaults and derives the final identity. Typed UPDATE providers must
 /// stage full rewritten snapshots after applying column assignments to the
-/// existing row. Raw `lix_state` snapshot updates are replacement writes, not
-/// implicit patches.
+/// existing row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TransactionWriteRow {
     pub(crate) entity_pk: Option<EntityPk>,

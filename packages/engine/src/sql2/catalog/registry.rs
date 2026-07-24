@@ -42,36 +42,6 @@ impl PublicCatalog {
         Ok(catalog)
     }
 
-    /// Builds a catalog that keeps the retired generic-state adapters reachable
-    /// only from their focused unit tests. The public constructors deliberately
-    /// never call this; a later adapter-deletion PR can remove this seam with
-    /// the providers it protects.
-    #[cfg(test)]
-    pub(crate) fn from_visible_schemas_with_internal_state_adapters(
-        schema_definitions: &[JsonValue],
-    ) -> Result<Self, LixError> {
-        let mut catalog = Self::from_visible_schemas(schema_definitions)?;
-        catalog.insert(surface(
-            "lix_state",
-            PublicSurfaceKind::LixState,
-            lix_state_columns(false),
-            SurfaceCapabilities::read_write(),
-        ))?;
-        catalog.insert(surface(
-            "lix_state_by_branch",
-            PublicSurfaceKind::LixStateByBranch,
-            lix_state_columns(true),
-            SurfaceCapabilities::read_write(),
-        ))?;
-        catalog.insert(surface(
-            "lix_state_history",
-            PublicSurfaceKind::History,
-            state_history_columns(),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        Ok(catalog)
-    }
-
     /// Compile-time SQL surfaces whose shape cannot be changed at runtime.
     ///
     /// Alongside the hand-written filesystem surfaces, Lix seeds a fixed set
@@ -125,8 +95,6 @@ impl PublicCatalog {
     pub(crate) fn surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
         let surface = self.surface(table_name)?;
         Some(match &surface.kind {
-            PublicSurfaceKind::LixState => lix_state_schema(false),
-            PublicSurfaceKind::LixStateByBranch => lix_state_schema(true),
             PublicSurfaceKind::File => filesystem_schema(false, true),
             PublicSurfaceKind::FileByBranch => filesystem_schema(true, true),
             PublicSurfaceKind::Directory => filesystem_schema(false, false),
@@ -146,21 +114,6 @@ impl PublicCatalog {
                 Field::new("created_at", DataType::Utf8, false),
                 Field::new("origin_key", DataType::Utf8, true),
                 json_field("snapshot_content", true),
-            ])),
-            PublicSurfaceKind::History => Arc::new(Schema::new(vec![
-                json_field(HISTORY_COL_ENTITY_PK, false),
-                Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
-                Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
-                json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
-                json_field(HISTORY_COL_METADATA, true),
-                Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
-                Field::new(HISTORY_COL_CHANGE_CREATED_AT, DataType::Utf8, false),
-                Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
-                Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
-                Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-                Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
-                Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
-                Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
             ])),
             PublicSurfaceKind::FileHistory => history_filesystem_schema(true),
             PublicSurfaceKind::DirectoryHistory => history_filesystem_schema(false),
@@ -339,27 +292,6 @@ impl PublicCatalog {
 }
 
 #[cfg(test)]
-fn lix_state_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
-        json_field("entity_pk", false),
-        Field::new("schema_key", DataType::Utf8, false),
-        Field::new("file_id", DataType::Utf8, true),
-        json_field("snapshot_content", true),
-        json_field("metadata", true),
-        Field::new("created_at", DataType::Utf8, true),
-        Field::new("updated_at", DataType::Utf8, true),
-        Field::new("global", DataType::Boolean, true),
-        Field::new("change_id", DataType::Utf8, true),
-        Field::new("commit_id", DataType::Utf8, true),
-        Field::new("untracked", DataType::Boolean, true),
-    ];
-    if by_branch {
-        fields.push(Field::new("branch_id", DataType::Utf8, false));
-    }
-    Arc::new(Schema::new(fields))
-}
-
-#[cfg(test)]
 fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
     let mut fields = if include_data {
         vec![
@@ -480,51 +412,6 @@ fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
             }
         })
         .collect()
-}
-
-#[cfg(test)]
-fn lix_state_columns(by_branch: bool) -> Vec<PublicColumn> {
-    let global = if by_branch {
-        PublicColumn::public("global", false).conditional_on_insert()
-    } else {
-        PublicColumn::public("global", false).with_default("FALSE")
-    };
-    let mut columns = vec![
-        PublicColumn::public_insert_only("entity_pk", false),
-        PublicColumn::public_insert_only("schema_key", false),
-        PublicColumn::public_insert_only("file_id", true).optional_on_insert(),
-        PublicColumn::public("snapshot_content", true).optional_on_insert(),
-        PublicColumn::public("metadata", true).optional_on_insert(),
-        PublicColumn::public_read_only("created_at", false),
-        PublicColumn::public_read_only("updated_at", false),
-        global,
-        PublicColumn::public_read_only("change_id", true),
-        PublicColumn::public_read_only("commit_id", true),
-        PublicColumn::public("untracked", false).with_default("FALSE"),
-    ];
-    if by_branch {
-        columns.push(PublicColumn::public_insert_only("branch_id", false).conditional_on_insert());
-    }
-    columns
-}
-
-#[cfg(test)]
-fn state_history_columns() -> Vec<PublicColumn> {
-    public_columns([
-        (HISTORY_COL_ENTITY_PK, false),
-        (HISTORY_COL_SCHEMA_KEY, false),
-        (HISTORY_COL_FILE_ID, true),
-        (HISTORY_COL_SNAPSHOT_CONTENT, true),
-        (HISTORY_COL_METADATA, true),
-        (HISTORY_COL_CHANGE_ID, false),
-        (HISTORY_COL_CHANGE_CREATED_AT, false),
-        (HISTORY_COL_ORIGIN_KEY, true),
-        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
-        (HISTORY_COL_COMMIT_CREATED_AT, false),
-        (HISTORY_COL_AS_OF_COMMIT_ID, false),
-        (HISTORY_COL_DEPTH, false),
-        (HISTORY_COL_IS_DELETED, false),
-    ])
 }
 
 fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
