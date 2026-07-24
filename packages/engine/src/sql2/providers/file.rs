@@ -8996,7 +8996,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_file_insert_into_lix_state_write_row() {
+    fn decodes_file_insert_into_transaction_write_row() {
         let batch = file_insert_batch(true, false);
 
         let rows = lix_file_write_rows_from_batch(&batch, None).expect("decode file insert");
@@ -9776,7 +9776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_insert_sink_stages_decoded_lix_state_rows() {
+    async fn file_insert_sink_stages_decoded_transaction_rows() {
         let batch = file_insert_batch(true, false);
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);

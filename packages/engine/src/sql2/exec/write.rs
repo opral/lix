@@ -9,11 +9,11 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
-use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
+use crate::sql2::bind::write::BoundWriteTarget;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::{GLOBAL_BRANCH_ID, LixError, Value};
+use crate::{LixError, Value};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,50 +179,16 @@ async fn execute_write_logical_plan_with_mode_inner(
         }
     }
 
-    if mode != WriteExecutorModeInner::ForceDataFusion {
-        let fast_plan = crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan)?;
-        if requires_standalone_datafusion_validation(&write_plan, fast_plan.is_some(), mode) {
-            super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan, params)
-                .await?;
-        }
-        if let Some(fast_plan) = fast_plan {
-            let rows_affected =
-                crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
-                    .await?;
-            return Ok((
-                SqlWriteResult::affected(rows_affected),
-                WriteExecutorPath::Fast,
-            ));
-        }
-        if mode == WriteExecutorModeInner::ForceFast {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "SQL write plan is not eligible for fast execution",
-            ));
-        }
+    if mode == WriteExecutorModeInner::ForceFast {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "SQL write plan is not eligible for fast execution",
+        ));
     }
 
     let result =
         super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
     Ok((result, WriteExecutorPath::DataFusion))
-}
-
-/// Fast executors rely on the DataFusion writer to preserve validation
-/// behavior that is outside their deliberately narrow implementations.
-///
-/// A regular DataFusion fallback does not need this separate pass: its
-/// executor performs the same input, session, provider, expression, and
-/// filter validation immediately before execution. Empty scopes and upserts
-/// retain the standalone pass because their execution paths can return early.
-fn requires_standalone_datafusion_validation(
-    plan: &LogicalWritePlan,
-    has_fast_plan: bool,
-    mode: WriteExecutorModeInner,
-) -> bool {
-    has_fast_plan
-        || mode == WriteExecutorModeInner::ForceFast
-        || plan.bound.branch_scope == BranchScope::Empty
-        || plan.bound.conflict.is_some()
 }
 
 fn resolve_parameterized_branch_scope(
@@ -293,13 +259,11 @@ fn resolve_parameterized_branch_scope(
         },
         scope => scope,
     };
-    normalize_lix_state_by_branch_scope(&mut plan, params)?;
     Ok(plan)
 }
 
 fn branch_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
     match target {
-        BoundWriteTarget::LixStateByBranch => Some("branch_id"),
         BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
             ..
         })
@@ -309,100 +273,6 @@ fn branch_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
         }
         _ => None,
     }
-}
-
-fn normalize_lix_state_by_branch_scope(
-    plan: &mut LogicalWritePlan,
-    params: &[Value],
-) -> Result<(), LixError> {
-    if !matches!(plan.bound.target, BoundWriteTarget::LixStateByBranch) {
-        return Ok(());
-    }
-    let (BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids }) =
-        &plan.bound.branch_scope
-    else {
-        return Ok(());
-    };
-    let explicit_global = explicit_lix_state_global_value(&plan.bound.input, params)?.or(
-        predicate_lix_state_global_value(&plan.bound.predicate, params)?,
-    );
-    if branch_ids.len() > 1 {
-        if explicit_global == Some(true) || branch_ids.contains(GLOBAL_BRANCH_ID) {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "lix_state_by_branch writes cannot mix global and branch-specific rows",
-            ));
-        }
-        return Ok(());
-    }
-    let is_global_branch = branch_ids.contains(GLOBAL_BRANCH_ID);
-    if explicit_global == Some(true) && !is_global_branch {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state_by_branch writes cannot combine global = true with non-global branch_id",
-        ));
-    }
-    if !is_global_branch {
-        return Ok(());
-    }
-    match explicit_global {
-        Some(false) => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state_by_branch writes cannot combine global = false with global branch_id",
-        )),
-        Some(true) | None => {
-            plan.bound.branch_scope = BranchScope::Global;
-            Ok(())
-        }
-    }
-}
-
-fn explicit_lix_state_global_value(
-    input: &BoundWriteInput,
-    params: &[Value],
-) -> Result<Option<bool>, LixError> {
-    let BoundWriteInput::Values(values) = input else {
-        return Ok(None);
-    };
-    let Some(global_index) = values.column_index("global") else {
-        return Ok(None);
-    };
-    let mut explicit = None;
-    for row in &values.rows {
-        let value = match &row[global_index] {
-            BoundExpr::Literal(BoundLiteral::Bool(value)) => *value,
-            BoundExpr::Literal(BoundLiteral::Null) => continue,
-            BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
-                Some(Value::Boolean(value)) => *value,
-                Some(_) => {
-                    return Err(LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        "lix_state_by_branch global selectors must be boolean parameters",
-                    ));
-                }
-                None => {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("missing SQL parameter ${}", param.index),
-                    ));
-                }
-            },
-            _ => {
-                return Err(LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "lix_state_by_branch global selectors must be static booleans",
-                ));
-            }
-        };
-        if explicit.is_some_and(|prior| prior != value) {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "lix_state_by_branch writes cannot mix global and branch-specific rows",
-            ));
-        }
-        explicit = Some(value);
-    }
-    Ok(explicit)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -541,149 +411,6 @@ fn resolved_value_branch_selector(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResolvedGlobalSelector {
-    Missing,
-    Empty,
-    Static(bool),
-    Mixed,
-}
-
-impl ResolvedGlobalSelector {
-    fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
-            (Self::Missing | Self::Empty, selector) | (selector, Self::Missing | Self::Empty) => {
-                selector
-            }
-            (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
-            (Self::Static(_), Self::Static(_)) => Self::Mixed,
-        }
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::Missing | Self::Mixed, selector) | (selector, Self::Missing | Self::Mixed) => {
-                selector
-            }
-            (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
-            (Self::Static(_), Self::Static(_)) => Self::Empty,
-        }
-    }
-}
-
-fn predicate_lix_state_global_value(
-    predicate: &BoundPredicate,
-    params: &[Value],
-) -> Result<Option<bool>, LixError> {
-    match resolved_predicate_global_selector(predicate, params)? {
-        ResolvedGlobalSelector::Static(value) => Ok(Some(value)),
-        ResolvedGlobalSelector::Mixed => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state_by_branch writes cannot mix global and branch-specific rows",
-        )),
-        ResolvedGlobalSelector::Missing | ResolvedGlobalSelector::Empty => Ok(None),
-    }
-}
-
-fn resolved_predicate_global_selector(
-    predicate: &BoundPredicate,
-    params: &[Value],
-) -> Result<ResolvedGlobalSelector, LixError> {
-    match predicate {
-        BoundPredicate::True => Ok(ResolvedGlobalSelector::Missing),
-        BoundPredicate::False => Ok(ResolvedGlobalSelector::Empty),
-        BoundPredicate::And(predicates) => {
-            let mut result = ResolvedGlobalSelector::Missing;
-            for predicate in predicates {
-                result = result.intersect(resolved_predicate_global_selector(predicate, params)?);
-            }
-            Ok(result)
-        }
-        BoundPredicate::Or(predicates) => {
-            let mut result = ResolvedGlobalSelector::Empty;
-            let mut has_missing_branch = false;
-            for predicate in predicates {
-                let selector = resolved_predicate_global_selector(predicate, params)?;
-                if selector == ResolvedGlobalSelector::Missing {
-                    has_missing_branch = true;
-                    continue;
-                }
-                result = result.union(selector);
-            }
-            if has_missing_branch {
-                if result == ResolvedGlobalSelector::Empty {
-                    Ok(ResolvedGlobalSelector::Missing)
-                } else {
-                    Ok(ResolvedGlobalSelector::Mixed)
-                }
-            } else {
-                Ok(result)
-            }
-        }
-        BoundPredicate::Eq(left, right) => global_value_from_binary_exprs(left, right)
-            .or_else(|| global_value_from_binary_exprs(right, left))
-            .map(|expr| global_selector_value(expr, params))
-            .transpose()
-            .map(|selector| selector.unwrap_or(ResolvedGlobalSelector::Missing)),
-        BoundPredicate::Like { .. } | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
-            Ok(ResolvedGlobalSelector::Missing)
-        }
-        BoundPredicate::In { expr, values } => {
-            let BoundExpr::Column(column) = expr else {
-                return Ok(ResolvedGlobalSelector::Missing);
-            };
-            if column.name != "global" {
-                return Ok(ResolvedGlobalSelector::Missing);
-            }
-            let mut result = ResolvedGlobalSelector::Missing;
-            for value in values {
-                result = result.union(global_selector_value(value, params)?);
-            }
-            Ok(result)
-        }
-    }
-}
-
-fn global_value_from_binary_exprs<'a>(
-    column_expr: &BoundExpr,
-    value_expr: &'a BoundExpr,
-) -> Option<&'a BoundExpr> {
-    let BoundExpr::Column(column) = column_expr else {
-        return None;
-    };
-    if column.name != "global" {
-        return None;
-    }
-    Some(value_expr)
-}
-
-fn global_selector_value(
-    expr: &BoundExpr,
-    params: &[Value],
-) -> Result<ResolvedGlobalSelector, LixError> {
-    match expr {
-        BoundExpr::Literal(BoundLiteral::Bool(value)) => Ok(ResolvedGlobalSelector::Static(*value)),
-        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
-            Some(Value::Boolean(value)) => Ok(ResolvedGlobalSelector::Static(*value)),
-            Some(Value::Null) => Ok(ResolvedGlobalSelector::Missing),
-            Some(_) => Err(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                "lix_state global predicates require boolean parameters",
-            )),
-            None => Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("missing SQL parameter ${}", param.index),
-            )),
-        },
-        _ => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state global predicates require boolean literals",
-        )),
-    }
-}
-
 fn insert_branch_param_values(
     branch_ids: &mut BTreeSet<String>,
     param_indexes: &BTreeSet<usize>,
@@ -764,74 +491,4 @@ fn validate_write_parameter_count(
             .map(|index| format!("${index}"))
             .collect::<Vec<_>>(),
     })))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn regular_datafusion_fallback_uses_execution_validation() {
-        let plan = plan_sql("UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3");
-        let has_fast_plan = crate::sql2::optimize::simple_write::try_make_fast_write_plan(&plan)
-            .expect("fast-plan eligibility should be computable")
-            .is_some();
-        assert!(!has_fast_plan);
-
-        assert!(!requires_standalone_datafusion_validation(
-            &plan,
-            has_fast_plan,
-            WriteExecutorModeInner::Auto,
-        ));
-    }
-
-    #[test]
-    fn early_or_fast_paths_keep_standalone_datafusion_validation() {
-        let fallback = plan_sql("UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3");
-        assert!(requires_standalone_datafusion_validation(
-            &fallback,
-            false,
-            WriteExecutorModeInner::ForceFast,
-        ));
-
-        let empty_scope = plan_sql(
-            "UPDATE lix_state_by_branch SET metadata = '{}' \
-             WHERE branch_id = 'branch-a' AND branch_id = 'branch-b'",
-        );
-        assert_eq!(empty_scope.bound.branch_scope, BranchScope::Empty);
-        assert!(requires_standalone_datafusion_validation(
-            &empty_scope,
-            false,
-            WriteExecutorModeInner::Auto,
-        ));
-
-        let conflict = plan_sql(
-            "INSERT INTO lix_file (path, data) VALUES ('/readme.md', X'41') \
-             ON CONFLICT (path) DO NOTHING",
-        );
-        assert!(conflict.bound.conflict.is_some());
-        assert!(requires_standalone_datafusion_validation(
-            &conflict,
-            false,
-            WriteExecutorModeInner::Auto,
-        ));
-
-        let fast = plan_sql("DELETE FROM lix_state WHERE false");
-        let has_fast_plan = crate::sql2::optimize::simple_write::try_make_fast_write_plan(&fast)
-            .expect("fast-plan eligibility should be computable")
-            .is_some();
-        assert!(has_fast_plan);
-        assert!(requires_standalone_datafusion_validation(
-            &fast,
-            has_fast_plan,
-            WriteExecutorModeInner::Auto,
-        ));
-    }
-
-    fn plan_sql(sql: &str) -> LogicalWritePlan {
-        let statement = crate::sql2::parse_statement(sql).expect("SQL should parse");
-        let bound =
-            crate::sql2::bind_statement(&statement, &[], "branch-a").expect("SQL should bind");
-        crate::sql2::plan_write(bound).expect("SQL write should plan")
-    }
 }

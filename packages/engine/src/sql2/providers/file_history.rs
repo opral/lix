@@ -48,7 +48,7 @@ use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::history::entity_pk_json_array;
+use super::history_util::entity_pk_json_array;
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";

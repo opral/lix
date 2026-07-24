@@ -1376,8 +1376,8 @@ fn entity_column_array(
     })
 }
 
-/// `lixcol_*` system columns share their accessors with the lix_state
-/// surface: strip the prefix and materialize via [`LIVE_STATE_COLS`].
+/// Materialize `lixcol_*` system columns by stripping the prefix and using the
+/// shared live-state accessors in [`LIVE_STATE_COLS`].
 fn entity_system_column_array(
     column_name: &str,
     rows: &[MaterializedLiveStateRow],

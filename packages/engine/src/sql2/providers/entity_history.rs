@@ -64,8 +64,7 @@ where
 
 /// Schema-specific history surface backed directly by the commit graph.
 ///
-/// The spec does not query `lix_state_history` through SQL. It uses the same
-/// commit graph primitive as the generic history surface, then shapes canonical
+/// The spec uses the commit graph primitive directly, then shapes canonical
 /// changes into the typed entity columns for one registered schema.
 struct EntityHistorySpec<S> {
     surface_name: String,

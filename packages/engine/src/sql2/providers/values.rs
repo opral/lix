@@ -1,6 +1,6 @@
 //! Typed cell extraction from DataFusion record batches, shared by all table
-//! specs. `ctx` is the error-message prefix (e.g. "INSERT lix_branch" or
-//! "INSERT into lix_state") so each surface keeps its exact wording; messages
+//! specs. `ctx` is the error-message prefix (e.g. "INSERT lix_branch") so each
+//! surface keeps its exact wording; messages
 //! are only formatted on the error path.
 
 use datafusion::arrow::record_batch::RecordBatch;
