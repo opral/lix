@@ -564,8 +564,9 @@ where
                 // second allocation or a second transaction.
                 let fast_path = sql2::execute_fast_lix_file_path_writes(
                     transaction,
-                    vec![(path.clone(), data.clone(), None)],
+                    vec![(path.clone(), data.clone(), None, None)],
                     sql2::FastLixFilePathWriteConflict::UpdateData,
+                    None,
                 )
                 .await?;
                 if let Some(count) = fast_path {
@@ -579,10 +580,11 @@ where
                 let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
                 let plan = transaction
                     .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
-                sql2::execute_write_logical_plan_result(
+                sql2::execute_write_logical_plan_result_with_metadata(
                     transaction,
                     plan,
                     &[Value::Text(path), Value::Blob(data)],
+                    &ExecuteStatementMetadata::default(),
                 )
                 .await
                 .map(|result| result.rows_affected)
@@ -610,9 +612,10 @@ where
                     transaction,
                     writes
                         .into_iter()
-                        .map(|(path, data)| (path, data, None))
+                        .map(|(path, data)| (path, data, None, None))
                         .collect(),
                     sql2::FastLixFilePathWriteConflict::UpdateData,
+                    None,
                 )
                 .await?
                 .ok_or_else(|| {

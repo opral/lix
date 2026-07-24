@@ -16,8 +16,7 @@ use axum::{
 use lix_sdk::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, ObserveEvent, ObserveEvents,
-    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, Value, VerifiedRequestBlob,
-    WireValue,
+    Storage, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
