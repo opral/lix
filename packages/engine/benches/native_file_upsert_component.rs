@@ -173,7 +173,7 @@ struct Seed {
     // The source database must outlive every clone. It stays closed after
     // creation, which makes copying RocksDB's WAL/SST set and SlateDB's local
     // object-store tree safe.
-    _root: TempDir,
+    root: TempDir,
     source_path: PathBuf,
     main_branch_id: String,
     source_commit_count: usize,
@@ -211,7 +211,7 @@ impl Seed {
         let source_usage = disk_usage(&source_path).expect("account native component source");
         Self {
             backend,
-            _root: root,
+            root,
             source_path,
             main_branch_id,
             source_commit_count: config.history_commits - 1,
@@ -222,7 +222,7 @@ impl Seed {
 
     async fn fork(&self) -> Fixture {
         let clone_number = self.next_clone.fetch_add(1, Ordering::Relaxed);
-        let clone_dir = tempfile::tempdir_in(self._root.path())
+        let clone_dir = tempfile::tempdir_in(self.root.path())
             .expect("create native component benchmark clone directory");
         let database_path = clone_dir.path().join(format!("database-{clone_number:04}"));
         copy_directory(&self.source_path, &database_path)
@@ -698,18 +698,22 @@ fn paired_speedup(pairs: &[PairResult], value: impl Fn(&Sample) -> u64) -> Paire
     let log_speedups = pairs
         .iter()
         .map(|pair| {
-            let sequential = value(&pair.sequential).max(1) as f64;
-            let batch = value(&pair.batch).max(1) as f64;
+            let sequential = exact_f64_from_u64(value(&pair.sequential).max(1));
+            let batch = exact_f64_from_u64(value(&pair.batch).max(1));
             (sequential / batch).ln()
         })
         .collect::<Vec<_>>();
     let mean_log_speedup = mean(&log_speedups);
     let standard_error =
-        sample_standard_deviation(&log_speedups) / (log_speedups.len() as f64).sqrt();
+        sample_standard_deviation(&log_speedups) / exact_f64_from_usize(log_speedups.len()).sqrt();
     PairedSpeedup {
         geometric_mean: mean_log_speedup.exp(),
-        lower_99: (mean_log_speedup - T_99_TWO_SIDED_DF_29 * standard_error).exp(),
-        upper_99: (mean_log_speedup + T_99_TWO_SIDED_DF_29 * standard_error).exp(),
+        lower_99: T_99_TWO_SIDED_DF_29
+            .mul_add(-standard_error, mean_log_speedup)
+            .exp(),
+        upper_99: T_99_TWO_SIDED_DF_29
+            .mul_add(standard_error, mean_log_speedup)
+            .exp(),
     }
 }
 
@@ -741,8 +745,7 @@ where
     let mut commit_count = count_rows(&session, "SELECT COUNT(*) AS count FROM lix_commit").await;
     assert!(
         commit_count <= target_before_clone_warmup,
-        "history target {target_before_clone_warmup} is too small for {} seed commits",
-        commit_count
+        "history target {target_before_clone_warmup} is too small for {commit_count} seed commits"
     );
 
     while commit_count < target_before_clone_warmup {
@@ -1005,7 +1008,7 @@ fn binary_payload(target_bytes: usize, prefix: &[u8], file_index: usize, version
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        *byte = state as u8;
+        *byte = state.to_le_bytes()[0];
     }
     bytes
 }
@@ -1097,12 +1100,11 @@ fn selected_backends() -> Vec<Backend> {
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    match std::env::var(name) {
-        Ok(value) => value
+    std::env::var(name).map_or(default, |value| {
+        value
             .parse::<usize>()
-            .unwrap_or_else(|error| panic!("parse {name}={value:?} as usize: {error}")),
-        Err(_) => default,
-    }
+            .unwrap_or_else(|error| panic!("parse {name}={value:?} as usize: {error}"))
+    })
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -1130,12 +1132,16 @@ fn median_i64(values: &mut [i64]) -> i64 {
 
 fn mean(values: &[f64]) -> f64 {
     assert!(!values.is_empty(), "benchmark mean requires samples");
-    values.iter().sum::<f64>() / values.len() as f64
+    values.iter().sum::<f64>() / exact_f64_from_usize(values.len())
 }
 
 fn mean_u64(values: &[u64]) -> f64 {
     assert!(!values.is_empty(), "benchmark mean requires samples");
-    values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64
+    values
+        .iter()
+        .map(|value| exact_f64_from_u64(*value))
+        .sum::<f64>()
+        / exact_f64_from_usize(values.len())
 }
 
 fn sample_standard_deviation(values: &[f64]) -> f64 {
@@ -1148,6 +1154,23 @@ fn sample_standard_deviation(values: &[f64]) -> f64 {
         .iter()
         .map(|value| (value - mean).powi(2))
         .sum::<f64>()
-        / (values.len() - 1) as f64;
+        / exact_f64_from_usize(values.len() - 1);
     variance.sqrt()
+}
+
+fn exact_f64_from_usize(value: usize) -> f64 {
+    exact_f64_from_u64(u64::try_from(value).expect("benchmark count must fit u64"))
+}
+
+fn exact_f64_from_u64(value: u64) -> f64 {
+    // All benchmark values must remain exactly representable so confidence
+    // interval math cannot silently lose nanosecond/count precision.
+    assert!(
+        value <= (1_u64 << f64::MANTISSA_DIGITS),
+        "benchmark value {value} exceeds f64's exact integer range"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    {
+        value as f64
+    }
 }
