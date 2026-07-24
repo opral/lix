@@ -560,6 +560,61 @@ where
         .await
     }
 
+    /// Reads one file's bytes by its full logical path without parsing SQL.
+    ///
+    /// This is the structured file-transfer read path. It uses the same
+    /// active-branch file selection, plugin rendering, and session file-view
+    /// acknowledgement as `SELECT data FROM lix_file WHERE path = $1`, while
+    /// avoiding SQL parsing, planning, and a JSON-shaped result envelope.
+    pub async fn read_file_data(&self, path: String) -> Result<Option<Blob>, LixError> {
+        self.ensure_open()?;
+        // Keep the structured API's path contract aligned with native writes.
+        // SQL remains available for callers that intentionally need broader
+        // `lix_file` predicates or legacy path shapes.
+        crate::common::LixPath::try_from_file_path(&path)?;
+
+        let paths = BTreeSet::from([path]);
+        let _operation_guard = self.begin_waitable_session_operation().await?;
+        let read_scope = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
+        let (data, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
+            read_scope,
+            |read_store| async move {
+                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                    Arc::new(self.live_state.reader(read_store.clone()));
+                let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
+                    Arc::new(self.live_state.reader(read_store.clone()));
+                let branch_ref: Arc<dyn BranchRefReader> =
+                    Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
+                    Arc::new(self.binary_cas.reader(read_store));
+                // A raw file download delivers the same bytes as a direct
+                // `lix_file.data` read, so it must acknowledge rendered
+                // plugin state for subsequent collaborative writes.
+                let file_view_collector = sql2::SessionFileViews::default();
+                let result = sql2::execute_exact_lix_file_batch_read(
+                    &active_branch_id,
+                    live_state,
+                    filesystem_path_index,
+                    branch_ref,
+                    blob_reader,
+                    self.plugin_host.clone(),
+                    Some(file_view_collector.clone()),
+                    &paths,
+                )
+                .await?;
+                let data = native_file_data_from_exact_result(result, &paths)?;
+                Ok((data, file_view_collector.plugin_file_mutations()))
+            },
+        )
+        .await?;
+        self.file_views.apply_mutations(file_view_mutations);
+        Ok(data)
+    }
+
     pub(crate) async fn execute_for_observe(
         &self,
         sql: &str,
@@ -1257,6 +1312,54 @@ where
             file_view_mutations,
         ))
     }
+}
+
+fn native_file_data_from_exact_result(
+    result: SqlQueryResult,
+    requested_paths: &BTreeSet<String>,
+) -> Result<Option<Blob>, LixError> {
+    if result.columns.as_slice() != ["path", "data"] {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file read returned an unexpected result schema",
+        ));
+    }
+    let mut rows = result.rows.into_iter();
+    let Some(mut row) = rows.next() else {
+        return Ok(None);
+    };
+    if rows.next().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file read returned more than one path",
+        ));
+    }
+    let [Value::Text(path), data] = row.as_mut_slice() else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file read returned an invalid row",
+        ));
+    };
+    if !requested_paths.contains(path.as_str()) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file read returned an unrequested path",
+        ));
+    }
+    let data = match std::mem::replace(data, Value::Null) {
+        Value::Blob(data) => data,
+        // A path-only `lix_file` row is a present empty file on the public
+        // surface. Preserve that contract even if a storage layout represents
+        // it as SQL NULL internally.
+        Value::Null => Blob::default(),
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "native file read returned a non-binary data value",
+            ));
+        }
+    };
+    Ok(Some(data))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -118,3 +118,21 @@ request stages all entries in one transaction and returns the standard
 or engine error commits none of the entries. Larger client batches should be
 split into frames of at most 1,024 files. The configured request-body ceiling
 is the same as for the rest of the protocol.
+
+## Binary file read
+
+Clients that explicitly want one file's rendered bytes can check for
+`capabilities.binaryFileRead === true` and send a protected request to:
+
+```text
+GET /lix/v1/file?path=<percent-encoded-absolute-file-path>
+Lix-Session-Id: <session-id>
+```
+
+The successful response has `Content-Type: application/octet-stream`,
+`Cache-Control: no-store`, and raw file bytes as its body. It carries
+`Lix-File-Found: true` for a present file (including a present empty file) or
+`Lix-File-Found: false` for a missing file, whose body is empty. This route has
+the same active-branch, plugin rendering, and per-session acknowledgement
+semantics as `SELECT data FROM lix_file WHERE path = $1`; it is not a generic
+SQL read endpoint.
