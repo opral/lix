@@ -20,6 +20,7 @@ mod entity_history;
 mod file;
 mod file_history;
 mod filesystem_history_path;
+mod filesystem_working_change;
 mod history_util;
 mod spec;
 mod upsert;
@@ -374,6 +375,54 @@ where
                 )
                 .await?;
             }
+            PublicSurfaceKind::FileWorkingChange => {
+                filesystem_working_change::register_filesystem_working_change_provider(
+                    session,
+                    &surface.name,
+                    Some(ctx.active_branch_id().to_string()),
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                    filesystem_working_change::FilesystemWorkingChangeKind::File,
+                )
+                .await?;
+            }
+            PublicSurfaceKind::FileWorkingChangeByBranch => {
+                filesystem_working_change::register_filesystem_working_change_provider(
+                    session,
+                    &surface.name,
+                    None,
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                    filesystem_working_change::FilesystemWorkingChangeKind::File,
+                )
+                .await?;
+            }
+            PublicSurfaceKind::DirectoryWorkingChange => {
+                filesystem_working_change::register_filesystem_working_change_provider(
+                    session,
+                    &surface.name,
+                    Some(ctx.active_branch_id().to_string()),
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                    filesystem_working_change::FilesystemWorkingChangeKind::Directory,
+                )
+                .await?;
+            }
+            PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
+                filesystem_working_change::register_filesystem_working_change_provider(
+                    session,
+                    &surface.name,
+                    None,
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                    filesystem_working_change::FilesystemWorkingChangeKind::Directory,
+                )
+                .await?;
+            }
             PublicSurfaceKind::Change => {
                 change::register_lix_change_read_provider(
                     session,
@@ -601,6 +650,10 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::CheckpointByBranch
             | PublicSurfaceKind::WorkingChange
             | PublicSurfaceKind::WorkingChangeByBranch
+            | PublicSurfaceKind::FileWorkingChange
+            | PublicSurfaceKind::FileWorkingChangeByBranch
+            | PublicSurfaceKind::DirectoryWorkingChange
+            | PublicSurfaceKind::DirectoryWorkingChangeByBranch
             | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
@@ -644,8 +697,8 @@ mod tests {
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
-        directory_history, entity, file, file_history, is_write_surface, read_provider_selection,
-        working_change,
+        directory_history, entity, file, file_history, filesystem_working_change, is_write_surface,
+        read_provider_selection, working_change,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -806,7 +859,11 @@ mod tests {
                 "lix_checkpoint",
                 "lix_checkpoint_by_branch",
                 "lix_directory_history",
+                "lix_directory_working_change",
+                "lix_directory_working_change_by_branch",
                 "lix_file_history",
+                "lix_file_working_change",
+                "lix_file_working_change_by_branch",
                 "lix_working_change",
                 "lix_working_change_by_branch",
                 "phase8_entity_history",
@@ -825,10 +882,10 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 22, "previous construction count");
+        assert_eq!(all_read + writable.len(), 26, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            15,
+            19,
             "new construction count"
         );
     }
@@ -859,6 +916,26 @@ mod tests {
             &catalog,
             "lix_file",
             file::lix_file_schema(),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_file_working_change",
+            filesystem_working_change::filesystem_working_change_schema(false),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_file_working_change_by_branch",
+            filesystem_working_change::filesystem_working_change_schema(true),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_directory_working_change",
+            filesystem_working_change::filesystem_working_change_schema(false),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_directory_working_change_by_branch",
+            filesystem_working_change::filesystem_working_change_schema(true),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,

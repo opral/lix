@@ -24,6 +24,8 @@ use crate::sql2::history_route::{
     HISTORY_COL_SOURCE_CHANGES,
 };
 #[cfg(test)]
+use crate::sql2::providers::filesystem_working_change::filesystem_working_change_schema;
+#[cfg(test)]
 use crate::sql2::result_metadata::json_field;
 
 #[derive(Clone, Debug, Default)]
@@ -109,6 +111,12 @@ impl PublicCatalog {
             PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
             PublicSurfaceKind::WorkingChange => working_change_schema(false),
             PublicSurfaceKind::WorkingChangeByBranch => working_change_schema(true),
+            PublicSurfaceKind::FileWorkingChange => filesystem_working_change_schema(false),
+            PublicSurfaceKind::FileWorkingChangeByBranch => filesystem_working_change_schema(true),
+            PublicSurfaceKind::DirectoryWorkingChange => filesystem_working_change_schema(false),
+            PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
+                filesystem_working_change_schema(true)
+            }
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 json_field("entity_pk", false),
@@ -245,6 +253,47 @@ impl PublicCatalog {
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
+        for (name, kind, by_branch) in [
+            (
+                "lix_file_working_change",
+                PublicSurfaceKind::FileWorkingChange,
+                false,
+            ),
+            (
+                "lix_file_working_change_by_branch",
+                PublicSurfaceKind::FileWorkingChangeByBranch,
+                true,
+            ),
+            (
+                "lix_directory_working_change",
+                PublicSurfaceKind::DirectoryWorkingChange,
+                false,
+            ),
+            (
+                "lix_directory_working_change_by_branch",
+                PublicSurfaceKind::DirectoryWorkingChangeByBranch,
+                true,
+            ),
+        ] {
+            let mut columns = vec![
+                ("id", false),
+                ("path", true),
+                ("previous_path", true),
+                ("change_kind", false),
+            ];
+            if by_branch {
+                columns.push(("lixcol_branch_id", false));
+            }
+            self.insert(surface(
+                name,
+                kind,
+                columns
+                    .into_iter()
+                    .map(|(name, nullable)| PublicColumn::public(name, nullable))
+                    .collect(),
+                SurfaceCapabilities::read_only(),
+            ))?;
+        }
         self.insert(surface(
             "lix_file_history",
             PublicSurfaceKind::FileHistory,

@@ -97,12 +97,16 @@ matching raw `Value` variants at every call site.
 
 ## SQL surfaces
 
-Checkpointing has four read-only SQL surfaces:
+Checkpointing has eight read-only SQL surfaces:
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
 | `lix_working_change` | Active branch | `entity_pk`, `schema_key`, `file_id`, `change_kind`, `before_change_id`, `after_change_id` |
 | `lix_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
+| `lix_file_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
+| `lix_file_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
+| `lix_directory_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
+| `lix_directory_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_checkpoint` | Active branch | `commit_id`, `created_at`, `lixcol_depth` |
 | `lix_checkpoint_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 
@@ -115,13 +119,13 @@ current branch head with that branch's newest checkpoint. Creating a checkpoint
 makes the current head the new baseline, so `lix_working_change` is empty until
 another tracked change is committed.
 
-`lix_working_change` reports canonical source changes, like `lix_change`, rather
-than composed filesystem revisions. Group rows by `file_id` to identify files
-whose own descriptor, blob, or plugin state changed. An ancestor-directory
-rename is reported as that directory's source change; it is not expanded into
-one working-change row for every descendant whose composed path changed.
-`lix_file_history` and `lix_directory_history` remain the surfaces for those
-composed historical revisions.
+`lix_working_change` reports canonical source changes, like `lix_change`.
+Use `lix_file_working_change` and `lix_directory_working_change` for composed
+filesystem revisions. They return one row per logical file or directory,
+preserve a deleted entry's old location in `previous_path`, and expand ancestor
+directory moves into descendants whose composed paths changed. This makes them
+the appropriate input for file review and checkpoint summaries; use the raw
+surface when source-schema identities and change IDs matter.
 
 Checkpoint depth is commit distance from the current branch head. A checkpoint
 has `lixcol_depth = 0` only while it is the head; three later auto-commits put
@@ -143,6 +147,6 @@ FROM lix_checkpoint_by_branch
 ORDER BY lixcol_branch_id, lixcol_depth;
 ```
 
-All four relations are read-only. Create checkpoints through
+All eight relations are read-only. Create checkpoints through
 `lix.create_checkpoint().await?`; `INSERT`, `UPDATE`, and `DELETE` against the
 checkpoint or working-change surfaces are rejected.

@@ -356,6 +356,10 @@ simulation_test!(
             "lix_checkpoint_by_branch",
             "lix_working_change",
             "lix_working_change_by_branch",
+            "lix_file_working_change",
+            "lix_file_working_change_by_branch",
+            "lix_directory_working_change",
+            "lix_directory_working_change_by_branch",
         ] {
             assert!(
                 public_table_names.contains(surface_name),

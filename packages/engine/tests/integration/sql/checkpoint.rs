@@ -212,6 +212,8 @@ simulation_test!(
             "UPDATE lix_checkpoint SET created_at = 'fake'",
             "DELETE FROM lix_working_change",
             "UPDATE lix_working_change_by_branch SET change_kind = 'fake'",
+            "DELETE FROM lix_file_working_change",
+            "UPDATE lix_directory_working_change_by_branch SET change_kind = 'fake'",
         ] {
             let error = session
                 .execute(sql, &[])
@@ -219,5 +221,99 @@ simulation_test!(
                 .expect_err("checkpoint SQL surface should be read-only");
             assert_eq!(error.code, LixError::CODE_READ_ONLY);
         }
+    }
+);
+
+simulation_test!(
+    filesystem_working_change_surfaces_compose_paths_and_directory_moves,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('readme', '/docs/readme.md', X'68656C6C6F')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_change ORDER BY id",
+            )
+            .await,
+            vec![vec![
+                Value::Text("readme".to_string()),
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Null,
+                Value::Text("added".to_string()),
+            ]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path, previous_path, change_kind \
+                 FROM lix_directory_working_change",
+            )
+            .await,
+            vec![vec![
+                Value::Text("/docs/".to_string()),
+                Value::Null,
+                Value::Text("added".to_string()),
+            ]]
+        );
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_file_working_change",).await,
+            vec![vec![Value::Integer(0)]]
+        );
+
+        session
+            .execute(
+                "UPDATE lix_directory SET path = '/writing/' WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("directory move should succeed");
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_change",
+            )
+            .await,
+            vec![vec![
+                Value::Text("readme".to_string()),
+                Value::Text("/writing/readme.md".to_string()),
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Text("modified".to_string()),
+            ]],
+            "ancestor directory moves expand to descendant logical files"
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path, previous_path FROM lix_directory_working_change",
+            )
+            .await,
+            vec![vec![
+                Value::Text("/writing/".to_string()),
+                Value::Text("/docs/".to_string()),
+            ]]
+        );
     }
 );

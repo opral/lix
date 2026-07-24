@@ -12,6 +12,8 @@ Lix exposes logical application data through typed SQL relations:
 | Files | `lix_file` | `lix_file_by_branch` | `lix_file_history` |
 | Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history` |
 | Working changes | `lix_working_change` | `lix_working_change_by_branch` | — |
+| File working changes | `lix_file_working_change` | `lix_file_working_change_by_branch` | — |
+| Directory working changes | `lix_directory_working_change` | `lix_directory_working_change_by_branch` | — |
 | Checkpoints | `lix_checkpoint` | `lix_checkpoint_by_branch` | — |
 
 `lix_registered_schema*` provides schema discovery, `lix_key_value*` provides
