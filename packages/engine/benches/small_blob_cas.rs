@@ -186,6 +186,11 @@ where
         let stable_hash = write_binary_cas_for_bench(&storage, &stable_bytes)
             .await
             .expect("seed small blob benchmark");
+        let stored_bytes = read_binary_cas_for_bench(&storage, &stable_hash)
+            .await
+            .expect("validate benchmark blob")
+            .expect("seeded benchmark blob should exist");
+        assert_eq!(stored_bytes, stable_bytes);
         Self {
             storage,
             _temp_dir: temp_dir,
@@ -235,7 +240,6 @@ where
                     .await
                     .expect("read benchmark blob")
                     .expect("benchmark blob should exist");
-                assert_eq!(bytes, self.stable_bytes);
                 bytes.len()
             }
         }
