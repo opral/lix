@@ -312,9 +312,9 @@ where
     ) -> Result<SessionWriteAccess, LixError> {
         let write_lease = self.begin_explicit_session_write_lease()?;
         // Explicit transactions can remain open across arbitrary application
-        // awaits. Serializing them for their entire lifetime would allow one
-        // client to block every engine writer indefinitely. The collaboration
-        // MVP serializes bounded implicit statements and execute batches.
+        // awaits, so the common non-deterministic path only serializes their
+        // commit. Deterministic transactions add the collaboration guard before
+        // taking the runtime guard to preserve the global lock order.
         self.begin_session_write_access_with_lease(write_lease, false)
             .await
     }
@@ -339,7 +339,7 @@ where
         };
         let write_access = SessionWriteAccess {
             _write_lease: write_lease,
-            _collaboration_write_guard: collaboration_write_guard,
+            collaboration_write_guard,
         };
         self.ensure_open()?;
         Ok(write_access)
@@ -470,6 +470,7 @@ where
             &'tx mut Transaction<StorageImpl>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        let planner_validation_is_serialized = write_access.serializes_collaboration_writes();
         let _deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
             Some(self.lock_deterministic_runtime().await)
         } else {
@@ -495,6 +496,9 @@ where
         self.ensure_open()?;
         let mut transaction = opened.transaction;
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
+        if planner_validation_is_serialized {
+            transaction.trust_serialized_filesystem_planner();
+        }
         let runtime_functions = opened.runtime_functions;
 
         match f(&mut transaction)
@@ -546,7 +550,30 @@ where
 
 pub(super) struct SessionWriteAccess {
     _write_lease: SessionWriteLease,
-    _collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl SessionWriteAccess {
+    pub(super) fn serializes_collaboration_writes(&self) -> bool {
+        self.collaboration_write_guard.is_some()
+    }
+
+    pub(super) async fn serialize_collaboration_writes(
+        &mut self,
+        collaboration_write_gate: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        if self.collaboration_write_guard.is_none() {
+            self.collaboration_write_guard = Some(
+                Arc::clone(collaboration_write_gate)
+                    .lock_owned()
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.collaboration_gate_wait"
+                    ))
+                    .await,
+            );
+        }
+    }
 }
 
 pub(super) fn closed_error() -> LixError {
@@ -862,6 +889,38 @@ mod tests {
             .await
             .expect("transaction commit should succeed");
         assert!(!session.commit_in_progress_for_test());
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_commit_waits_for_collaboration_write_gate() {
+        let session = open_session().await;
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('serialized-commit', 'value')",
+                &[],
+            )
+            .await
+            .expect("transaction write should stage");
+
+        let collaboration_guard = std::sync::Arc::clone(&session.collaboration_write_gate)
+            .lock_owned()
+            .await;
+        let mut commit = Box::pin(transaction.commit());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(
+            matches!(commit.as_mut().poll(&mut cx), Poll::Pending),
+            "explicit commit should wait behind a bounded collaboration write"
+        );
+
+        drop(collaboration_guard);
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, commit)
+            .await
+            .expect("commit should resume after collaboration gate release")
+            .expect("explicit transaction commit should succeed");
     }
 
     #[tokio::test]
