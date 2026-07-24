@@ -11,7 +11,7 @@ Lix's DataFusion-backed engine registers a small set of scalar functions for use
 | Function | Returns | Use for |
 | :-- | :-- | :-- |
 | `lix_active_branch_id()` | text | Reading the current SQL session's active branch id. |
-| `lix_active_branch_commit_id()` | text | Scoping `_history` queries to the active branch head. |
+| `lix_active_branch_commit_id()` | text | Reading the active branch head pinned for this SQL statement. |
 | `lix_json(text)` | JSON | Parse a JSON string parameter into a JSON-typed value. |
 | `lix_json_get(json, path...)` | JSON | Project a value out of a JSON column, preserving JSON type. |
 | `lix_json_get_text(json, path...)` | text | Project a value out of a JSON column as plain text. |
@@ -30,7 +30,7 @@ Returns the active branch id of the current SQL session. Branch-pinned clients t
 
 Returns the commit id at the tip of the **currently active** branch, as resolved when the SQL statement was planned.
 
-History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) require a literal or bound-parameter equality on `lixcol_as_of_commit_id`. A correlated subquery against `lix_branch` is rejected by the planner. `lix_active_branch_commit_id()` is the canonical way to scope history to the active branch in a single statement:
+History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) use that same pinned active-branch head by default. No anchor predicate is needed for the common case:
 
 ```sql
 -- Walk one entity's history from the active branch's tip
@@ -38,11 +38,13 @@ SELECT lixcol_depth, lixcol_observed_commit_id, lixcol_snapshot_content
 FROM lix_state_history
 WHERE lixcol_schema_key = 'task'
   AND lix_json_get_text(lixcol_entity_pk, 0) = 't1'
-  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
 ORDER BY lixcol_depth;
 ```
 
-For an arbitrary branch, resolve the commit id with one query and pass it as a parameter:
+For time travel, override the default with exact equality or a non-empty `IN`
+predicate on `lixcol_as_of_commit_id`. Other anchor predicates are rejected
+instead of falling back to the active head. For an arbitrary branch, resolve
+the commit id with one query and pass it as a parameter:
 
 ```ts
 const { rows } = await lix.execute(

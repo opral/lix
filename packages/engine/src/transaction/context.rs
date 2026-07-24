@@ -1866,10 +1866,14 @@ where
         self.functions.clone()
     }
 
-    fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
+    fn history_query_source(
+        &self,
+        default_as_of_commit_id: String,
+    ) -> SqlHistoryQuerySource<Self::ReadStore> {
         HistoryQuerySource {
             store: self.read_store.clone(),
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
+            default_as_of_commit_id,
         }
     }
 

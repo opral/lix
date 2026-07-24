@@ -27,7 +27,7 @@ use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_ident
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_IS_DELETED,
     HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-    parse_history_filter,
+    parse_history_filter, validate_history_anchor_filter,
 };
 use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot,
@@ -87,6 +87,10 @@ where
         Arc::clone(&self.schema)
     }
 
+    fn history_anchor_column(&self) -> Option<&'static str> {
+        Some(HISTORY_COL_AS_OF_COMMIT_ID)
+    }
+
     fn table_type(&self) -> TableType {
         TableType::View
     }
@@ -99,6 +103,10 @@ where
         }
     }
 
+    fn validate_filter_pushdown(&self, filter: &Expr) -> Result<()> {
+        validate_history_anchor_filter(filter).map_err(lix_error_to_datafusion_error)
+    }
+
     async fn plan_scan(
         &self,
         projection: Option<&Vec<usize>>,
@@ -106,7 +114,8 @@ where
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        let route = HistoryRoute::from_filters(filters);
+        let mut route = HistoryRoute::from_filters(filters);
+        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
@@ -166,7 +175,7 @@ where
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
-        query_source.json_reader,
+        query_source,
         route,
         vec![spec.schema_key.clone()],
         metadata_projection,

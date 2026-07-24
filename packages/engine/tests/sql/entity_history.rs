@@ -103,19 +103,17 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    entity_history_requires_lixcol_as_of_commit_id,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
-        session
+    session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
@@ -128,29 +126,40 @@ simulation_test!(
             .await
             .expect("registered schema insert should succeed");
 
-        let error = session
-            .execute("SELECT id FROM engine_history_error_schema_history", &[])
-            .await
-            .expect_err("typed history queries must provide an as-of commit");
+    session
+        .execute(
+            "INSERT INTO engine_history_error_schema \
+                 (lixcol_entity_pk, id, lixcol_untracked) \
+                 VALUES (lix_json('[\"history-default\"]'), 'history-default', false)",
+            &[],
+        )
+        .await
+        .expect("entity insert should succeed");
+    let active_head = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("active head should load")
+        .expect("active head should exist");
 
-        assert_eq!(
-            error.code,
-            lix_engine::LixError::CODE_HISTORY_FILTER_REQUIRED
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("requires a lixcol_as_of_commit_id filter"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error
-                .hint()
-                .is_some_and(|hint| hint.contains("WHERE lixcol_as_of_commit_id")),
-            "unexpected error: {error}"
-        );
-    }
-);
+    let result = session
+        .execute(
+            "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
+                 FROM engine_history_error_schema_history \
+                 WHERE id = 'history-default'",
+            &[],
+        )
+        .await
+        .expect("typed history should default to the active head");
+
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text("history-default".to_string()),
+            Value::Text(active_head),
+            Value::Integer(0),
+        ]],
+    );
+});
 
 simulation_test!(
     entity_history_rejects_retired_anchor_names,

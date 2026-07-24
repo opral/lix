@@ -137,7 +137,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_history_requires_as_of_commit_id,
+    lix_directory_history_defaults_to_active_head,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -148,22 +148,37 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
-            .execute("SELECT id FROM lix_directory_history", &[])
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-default-dir', '/history-default/')",
+                &[],
+            )
             .await
-            .expect_err("directory history queries must provide an as-of commit");
+            .expect("directory insert should succeed");
+        let active_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("active head should load")
+            .expect("active head should exist");
 
-        assert!(
-            error
-                .to_string()
-                .contains("requires a lixcol_as_of_commit_id filter"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error
-                .hint()
-                .is_some_and(|hint| hint.contains("WHERE lixcol_as_of_commit_id")),
-            "unexpected error: {error}"
+        let result = session
+            .execute(
+                "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
+                 FROM lix_directory_history \
+                 WHERE id = 'history-default-dir'",
+                &[],
+            )
+            .await
+            .expect("directory history should default to the active head");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("history-default-dir".to_string()),
+                Value::Text(active_head),
+                Value::Integer(0),
+            ]],
         );
     }
 );

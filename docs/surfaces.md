@@ -42,7 +42,7 @@ Every canonical current row has a `change_id`, including rows written with `lixc
 
 `lix_state_history` uses the same prefixed history vocabulary as every other history surface: `lixcol_entity_pk`, `lixcol_observed_commit_id`, `lixcol_commit_created_at`, `lixcol_as_of_commit_id`, `lixcol_depth`, and `lixcol_is_deleted`. Because it exposes one canonical change per row, it also provides singular provenance through `lixcol_change_id`, `lixcol_change_created_at`, and `lixcol_origin_key`, plus `lixcol_schema_key`, `lixcol_file_id`, `lixcol_snapshot_content`, and `lixcol_metadata`.
 
-> **History queries require a literal filter on `lixcol_as_of_commit_id`.** A correlated subquery against `lix_branch` is rejected by the planner. Use `lix_active_branch_commit_id()` for the active branch, or resolve the commit id with one query and pass it as a parameter. See [`lix_active_branch_commit_id()`](./sql-functions.md#lix_active_branch_commit_id).
+> **History starts at the pinned active branch head by default.** Add exact `lixcol_as_of_commit_id = ...` or non-empty `lixcol_as_of_commit_id IN (...)` only for time travel. Other anchor predicates are rejected instead of silently using the default.
 
 ```sql
 -- Every entity in the active version, raw JSON
@@ -60,7 +60,6 @@ SELECT lixcol_depth, lixcol_observed_commit_id, lixcol_snapshot_content
 FROM lix_state_history
 WHERE lixcol_schema_key = 'task'
   AND lix_json_get_text(lixcol_entity_pk, 0) = 't1'
-  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
 ORDER BY lixcol_depth;
 ```
 
@@ -95,7 +94,6 @@ WHERE id = 't1' AND lixcol_version_id IN ($a, $b);
 SELECT lixcol_depth, title, done
 FROM task_history
 WHERE id = 't1'
-  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
 ORDER BY lixcol_depth;
 ```
 
@@ -137,7 +135,6 @@ WHERE path = '/orders.xlsx' AND lixcol_version_id IN ($a, $b);
 SELECT lixcol_depth, lixcol_observed_commit_id, data
 FROM lix_file_history
 WHERE path = '/orders.xlsx'
-  AND lixcol_as_of_commit_id = lix_active_branch_commit_id()
 ORDER BY lixcol_depth;
 ```
 

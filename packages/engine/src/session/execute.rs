@@ -2616,10 +2616,16 @@ mod tests {
             .rows()[0]
             .get::<String>("commit_id")
             .expect("commit id should be text");
-        let statements: [(&str, &[Value]); 2] = [
+        let statements: [(&str, &[Value]); 3] = [
             ("SELECT 'first' AS label", &[]),
             (
                 "SELECT key, value FROM lix_key_value WHERE key = 'batch-read'",
+                &[],
+            ),
+            (
+                "SELECT DISTINCT lixcol_as_of_commit_id \
+                 FROM lix_key_value_history \
+                 WHERE key = 'batch-read'",
                 &[],
             ),
         ];
@@ -2632,7 +2638,7 @@ mod tests {
         assert_eq!(batch.active_branch_id, active_branch_id);
         assert_eq!(batch.active_branch_commit_id, active_branch_commit_id);
         assert_eq!(batch.storage_mutation_revision, storage_mutation_revision);
-        assert_eq!(batch.results.len(), 2);
+        assert_eq!(batch.results.len(), 3);
         assert_eq!(
             batch.results[0].rows()[0].get::<String>("label").unwrap(),
             "first"
@@ -2642,6 +2648,12 @@ mod tests {
         assert_eq!(
             row.get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("value")
+        );
+        assert_eq!(
+            batch.results[2].rows()[0]
+                .get::<String>("lixcol_as_of_commit_id")
+                .unwrap(),
+            batch.active_branch_commit_id
         );
     }
 
@@ -2724,11 +2736,7 @@ mod tests {
         );
 
         session
-            .execute(
-                "SELECT COUNT(*) AS rows FROM lix_key_value_history \
-                 WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()",
-                &[],
-            )
+            .execute("SELECT COUNT(*) AS rows FROM lix_key_value_history", &[])
             .await
             .expect("fixed history surface should execute");
         assert_eq!(

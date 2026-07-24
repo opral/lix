@@ -30,6 +30,8 @@ use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
 use datafusion::catalog::TableProvider;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::logical_expr::TableSource;
 
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
@@ -38,6 +40,15 @@ pub(crate) use file::{
 };
 pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
+
+pub(crate) fn history_anchor_column(source: &dyn TableSource) -> Option<&'static str> {
+    let source = source.as_any().downcast_ref::<DefaultTableSource>()?;
+    let provider = source
+        .table_provider
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()?;
+    provider.history_anchor_column()
+}
 
 /// Execute an `INSERT ... ON CONFLICT` against a registered table provider.
 /// The four builtin writable surfaces are all [`spec::SpecTableProvider`]s.
@@ -113,6 +124,7 @@ pub(crate) async fn register_read<C>(
     session: &SessionContext,
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
+    active_branch_commit_id: Option<String>,
     selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
@@ -132,6 +144,7 @@ where
         session,
         ctx,
         branch_ref,
+        active_branch_commit_id,
         catalog,
         ReadProviderScope::All,
         selection,
@@ -263,6 +276,7 @@ async fn register_read_from_catalog<C>(
     session: &SessionContext,
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
+    active_branch_commit_id: Option<String>,
     catalog: &PublicCatalog,
     scope: ReadProviderScope,
     selection: &ProviderSelection,
@@ -281,7 +295,18 @@ where
                     | PublicSurfaceKind::EntityHistory { .. }
             )
     });
-    let history_query_source = needs_history_query_source.then(|| ctx.history_query_source());
+    let history_query_source = if needs_history_query_source {
+        let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
+            LixError::branch_not_found(
+                ctx.active_branch_id(),
+                "register SQL history providers",
+                "active branch",
+            )
+        })?;
+        Some(ctx.history_query_source(active_branch_commit_id))
+    } else {
+        None
+    };
     let history_query_source_for_provider = || {
         history_query_source.clone().ok_or_else(|| {
             LixError::new(
@@ -457,6 +482,7 @@ pub(crate) async fn register_transaction<C>(
     session: &SessionContext,
     read_ctx: &C,
     read_branch_ref: Arc<dyn BranchRefReader>,
+    active_branch_commit_id: Option<String>,
     write_ctx: SqlWriteContext,
     write_branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
@@ -473,6 +499,7 @@ where
         session,
         read_ctx,
         read_branch_ref,
+        active_branch_commit_id,
         &catalog,
         ReadProviderScope::ReadOnly,
         selection,
@@ -996,6 +1023,7 @@ mod tests {
         HistoryQuerySource {
             store: read_scope.clone(),
             json_reader: JsonStoreContext::new().reader(read_scope),
+            default_as_of_commit_id: CommitId::for_test_label("history-default").to_string(),
         }
     }
 

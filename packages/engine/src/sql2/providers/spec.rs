@@ -205,6 +205,14 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     fn schema(&self) -> SchemaRef;
 
+    /// Public column that routes a history scan to an explicit commit.
+    ///
+    /// This is provider identity, not a name heuristic: ordinary entity
+    /// schemas may legitimately expose a property with the same name.
+    fn history_anchor_column(&self) -> Option<&'static str> {
+        None
+    }
+
     /// How the surface introspects in `information_schema.tables`.
     fn table_type(&self) -> TableType {
         TableType::Base
@@ -212,6 +220,15 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     fn filter_pushdown(&self, _filter: &Expr) -> TableProviderFilterPushDown {
         TableProviderFilterPushDown::Unsupported
+    }
+
+    /// Rejects filters that would be unsafe to leave as residual expressions.
+    ///
+    /// Most providers accept every well-typed filter and keep the default.
+    /// History providers use this hook to prevent an unrouteable time-travel
+    /// anchor from being mistaken for an anchor-free active-head query.
+    fn validate_filter_pushdown(&self, _filter: &Expr) -> Result<()> {
+        Ok(())
     }
 
     /// `props` are the session's execution properties, for specs that compile
@@ -330,6 +347,10 @@ impl SpecTableProvider {
         }
     }
 
+    pub(super) fn history_anchor_column(&self) -> Option<&'static str> {
+        self.spec.history_anchor_column()
+    }
+
     #[cfg(test)]
     pub(super) fn is_write(&self) -> bool {
         self.write_access.is_write()
@@ -438,10 +459,13 @@ impl TableProvider for SpecTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
+        filters
             .iter()
-            .map(|filter| self.spec.filter_pushdown(filter))
-            .collect())
+            .map(|filter| {
+                self.spec.validate_filter_pushdown(filter)?;
+                Ok(self.spec.filter_pushdown(filter))
+            })
+            .collect()
     }
 
     async fn scan(

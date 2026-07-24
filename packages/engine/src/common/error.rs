@@ -72,9 +72,6 @@ impl LixError {
     /// A SQL write targeted a read-only internal/component surface.
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
-    /// A history table was queried without an explicit commit/branch range.
-    pub const CODE_HISTORY_FILTER_REQUIRED: &'static str = "LIX_HISTORY_FILTER_REQUIRED";
-
     /// SQL syntax is valid, but the feature is intentionally outside the Lix
     /// SQL surface.
     pub const CODE_UNSUPPORTED_SQL: &'static str = "LIX_UNSUPPORTED_SQL";

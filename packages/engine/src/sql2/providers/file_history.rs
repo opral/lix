@@ -38,7 +38,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
-    serialize_history_source_changes,
+    serialize_history_source_changes, validate_history_anchor_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
     HistoryDirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
@@ -106,6 +106,10 @@ where
         lix_file_history_schema()
     }
 
+    fn history_anchor_column(&self) -> Option<&'static str> {
+        Some(HISTORY_COL_AS_OF_COMMIT_ID)
+    }
+
     fn table_type(&self) -> TableType {
         TableType::View
     }
@@ -122,6 +126,10 @@ where
         } else {
             TableProviderFilterPushDown::Unsupported
         }
+    }
+
+    fn validate_filter_pushdown(&self, filter: &Expr) -> Result<()> {
+        validate_history_anchor_filter(filter).map_err(lix_error_to_datafusion_error)
     }
 
     async fn plan_scan(
@@ -142,7 +150,8 @@ where
                     .eq_ignore_ascii_case("data")
             })
         });
-        let route = HistoryRoute::from_filters(filters);
+        let mut route = HistoryRoute::from_filters(filters);
+        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         let lookup_ids = FileHistoryLookupIds::from_public_predicate(&public_predicate);
@@ -1216,7 +1225,7 @@ where
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             commit_graph,
-            query_source.json_reader,
+            query_source,
             route,
             file_history_filesystem_schema_keys(),
             metadata_projection,
@@ -1231,7 +1240,7 @@ where
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
-        query_source.json_reader.clone(),
+        query_source.clone(),
         &descriptor_and_blob_route,
         vec![
             FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -1249,7 +1258,7 @@ where
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
-        query_source.json_reader,
+        query_source,
         route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
         metadata_projection,
@@ -1291,7 +1300,7 @@ where
     let (event_entries, context_entries) =
         load_file_history_entry_sets(&event_route, &context_route, move |route| {
             let commit_graph = Arc::clone(&commit_graph);
-            let json_reader = query_source.json_reader.clone();
+            let query_source = query_source.clone();
             let schema_keys = plugin_schema_keys.clone();
             async move {
                 load_history_entries(
@@ -1300,7 +1309,7 @@ where
                         as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
                     },
                     commit_graph,
-                    json_reader,
+                    query_source,
                     &route,
                     schema_keys,
                     metadata_projection,
@@ -1333,7 +1342,7 @@ where
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
-        query_source.json_reader,
+        query_source,
         &owner_route,
         vec![KEY_VALUE_SCHEMA_KEY.to_string()],
         metadata_projection,
@@ -1528,7 +1537,7 @@ where
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
         commit_graph,
-        query_source.json_reader,
+        query_source,
         &registry_route,
         vec![KEY_VALUE_SCHEMA_KEY.to_string()],
         metadata_projection,

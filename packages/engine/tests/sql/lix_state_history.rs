@@ -2,7 +2,7 @@ use lix_engine::Value;
 use serde_json::json;
 
 simulation_test!(
-    lix_state_history_requires_as_of_commit_id,
+    lix_state_history_defaults_to_pinned_active_head,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -21,25 +21,295 @@ simulation_test!(
             .await
             .expect("tracked write should succeed");
 
-        let error = session
-            .execute("SELECT lixcol_entity_pk FROM lix_state_history", &[])
+        let result = session
+            .execute(
+                "SELECT lixcol_entity_pk, lixcol_as_of_commit_id \
+                 FROM lix_state_history \
+                 WHERE lixcol_entity_pk = lix_json('[\"history-start-required\"]')",
+                &[],
+            )
             .await
-            .expect_err("history queries must provide lixcol_as_of_commit_id");
-
-        assert!(
-            error
-                .to_string()
-                .contains("requires a lixcol_as_of_commit_id filter")
-        );
+            .expect("anchor-free history should use the pinned active head");
+        let active_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("active head should load")
+            .expect("active branch should have a head");
         assert_eq!(
-            error.code,
-            lix_engine::LixError::CODE_HISTORY_FILTER_REQUIRED
+            result
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<Value>("lixcol_entity_pk")
+                            .expect("lixcol_entity_pk"),
+                        row.get::<Value>("lixcol_as_of_commit_id")
+                            .expect("lixcol_as_of_commit_id"),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(
+                Value::Json(json!(["history-start-required"])),
+                Value::Text(active_head),
+            )]
         );
-        assert!(
-            error
-                .hint()
-                .is_some_and(|hint| hint.contains("lix_active_branch_commit_id()")),
-            "expected active-branch-head hint: {error}"
+    }
+);
+
+simulation_test!(
+    lix_state_history_routes_exact_anchor_from_join_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('history-join-anchor', 'one')",
+                &[],
+            )
+            .await
+            .expect("initial tracked write should succeed");
+        let first_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("first head should load")
+            .expect("first head should exist");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'two' WHERE key = 'history-join-anchor'",
+                &[],
+            )
+            .await
+            .expect("second tracked write should succeed");
+
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT h.lixcol_as_of_commit_id \
+                     FROM lix_state_history AS h \
+                     JOIN lix_state AS active \
+                       ON h.lixcol_entity_pk = active.entity_pk \
+                      AND h.lixcol_schema_key = active.schema_key \
+                      AND h.lixcol_as_of_commit_id = '{first_commit_id}' \
+                     WHERE h.lixcol_entity_pk = lix_json('[\"history-join-anchor\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("an exact join anchor should route to the requested history root");
+
+        assert_eq!(
+            result
+                .rows()
+                .iter()
+                .map(|row| row
+                    .get::<Value>("lixcol_as_of_commit_id")
+                    .expect("lixcol_as_of_commit_id"))
+                .collect::<Vec<_>>(),
+            vec![Value::Text(first_commit_id.clone())]
+        );
+
+        let nullable_side = session
+            .execute(
+                &format!(
+                    "SELECT h.lixcol_as_of_commit_id, h.lixcol_snapshot_content \
+                     FROM lix_branch AS b \
+                     LEFT JOIN lix_state_history AS h \
+                       ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
+                      AND h.lixcol_entity_pk = lix_json('[\"history-join-anchor\"]') \
+                     WHERE b.id = 'global'"
+                ),
+                &[],
+            )
+            .await
+            .expect("an exact anchor on the nullable join side should route");
+        assert_eq!(
+            nullable_side
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                Value::Text(first_commit_id.clone()),
+                Value::Json(json!({"key": "history-join-anchor", "value": "one"})),
+            ]]
+        );
+
+        let right_nullable_side = session
+            .execute(
+                &format!(
+                    "SELECT h.lixcol_as_of_commit_id, h.lixcol_snapshot_content \
+                     FROM lix_state_history AS h \
+                     RIGHT JOIN lix_branch AS b \
+                       ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
+                      AND h.lixcol_entity_pk = lix_json('[\"history-join-anchor\"]') \
+                     WHERE b.id = 'global'"
+                ),
+                &[],
+            )
+            .await
+            .expect("an exact anchor on the nullable side of a right join should route");
+        assert_eq!(
+            right_nullable_side
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                Value::Text(first_commit_id.clone()),
+                Value::Json(json!({"key": "history-join-anchor", "value": "one"})),
+            ]]
+        );
+
+        let semi_join = session
+            .execute(
+                &format!(
+                    "SELECT h.lixcol_as_of_commit_id, h.lixcol_snapshot_content \
+                     FROM lix_state_history AS h \
+                     LEFT SEMI JOIN lix_branch AS b \
+                       ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
+                     WHERE h.lixcol_entity_pk = lix_json('[\"history-join-anchor\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("an exact semi-join anchor should route");
+        assert_eq!(
+            semi_join
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                Value::Text(first_commit_id.clone()),
+                Value::Json(json!({"key": "history-join-anchor", "value": "one"})),
+            ]]
+        );
+
+        let projected = session
+            .execute(
+                &format!(
+                    "SELECT projected.anchor AS lixcol_as_of_commit_id \
+                     FROM (\
+                       SELECT lixcol_entity_pk, lixcol_as_of_commit_id AS anchor \
+                       FROM lix_state_history\
+                     ) AS projected \
+                     WHERE projected.anchor = '{first_commit_id}' \
+                       AND projected.lixcol_entity_pk = lix_json('[\"history-join-anchor\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("an exact anchor should route through a direct projection alias");
+        assert_eq!(
+            projected
+                .rows()
+                .iter()
+                .map(|row| row
+                    .get::<Value>("lixcol_as_of_commit_id")
+                    .expect("lixcol_as_of_commit_id"))
+                .collect::<Vec<_>>(),
+            vec![Value::Text(first_commit_id)]
+        );
+    }
+);
+
+simulation_test!(
+    history_surfaces_reject_unrouteable_anchor_predicates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for sql in [
+            "SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+            "SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id NOT IN ('cid_invalid')",
+            "SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id = 'cid_invalid' OR lixcol_schema_key = 'lix_key_value'",
+            "SELECT h.lixcol_entity_pk FROM lix_state_history AS h JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = b.commit_id",
+            "SELECT h.lixcol_entity_pk FROM lix_state_history AS h JOIN lix_branch AS b ON h.lixcol_as_of_commit_id > b.commit_id",
+            "SELECT h.lixcol_entity_pk FROM lix_state_history AS h LEFT JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = 'cid_invalid'",
+            "SELECT h.lixcol_entity_pk FROM lix_branch AS b RIGHT JOIN lix_state_history AS h ON h.lixcol_as_of_commit_id = 'cid_invalid'",
+            "SELECT h.lixcol_entity_pk FROM lix_state_history AS h FULL JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = 'cid_invalid'",
+            "SELECT h.lixcol_entity_pk FROM lix_state_history AS h LEFT ANTI JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = 'cid_invalid'",
+            "SELECT h.lixcol_entity_pk FROM lix_branch AS b RIGHT ANTI JOIN lix_state_history AS h ON h.lixcol_as_of_commit_id = 'cid_invalid'",
+            "SELECT projected.lixcol_entity_pk FROM (SELECT lixcol_entity_pk, lixcol_as_of_commit_id AS anchor FROM lix_state_history) AS projected WHERE projected.anchor > 'cid_invalid'",
+            "SELECT limited.lixcol_entity_pk FROM (SELECT lixcol_entity_pk, lixcol_as_of_commit_id AS anchor FROM lix_state_history LIMIT 1) AS limited WHERE limited.anchor = 'cid_invalid'",
+            "SELECT key FROM lix_key_value_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+            "SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id LIKE 'cid_%'",
+            "SELECT id FROM lix_directory_history WHERE lixcol_as_of_commit_id IS NULL",
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("unrouteable history anchors must not fall back to the active head");
+            assert_eq!(error.code, lix_engine::LixError::CODE_UNSUPPORTED_SQL);
+            assert!(
+                error.to_string().contains("only supports exact equality"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error
+                    .hint()
+                    .is_some_and(|hint| hint.contains("pinned active branch head")),
+                "unexpected hint: {error:?}"
+            );
+        }
+    }
+);
+
+simulation_test!(
+    unrelated_same_named_column_does_not_validate_as_history_anchor,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('collision', 'value')",
+                &[],
+            )
+            .await
+            .expect("history row should insert");
+
+        let result = session
+            .execute(
+                "SELECT ordinary.lixcol_as_of_commit_id \
+                 FROM (SELECT 'ordinary' AS lixcol_as_of_commit_id) AS ordinary \
+                 CROSS JOIN lix_state_history AS history \
+                 WHERE ordinary.lixcol_as_of_commit_id > 'a' \
+                   AND history.lixcol_entity_pk = lix_json('[\"collision\"]') \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("ordinary same-named predicate must not be treated as a history anchor");
+
+        assert_eq!(
+            result
+                .rows()
+                .iter()
+                .map(|row| row
+                    .get::<Value>("lixcol_as_of_commit_id")
+                    .expect("lixcol_as_of_commit_id"))
+                .collect::<Vec<_>>(),
+            vec![Value::Text("ordinary".to_string())]
         );
     }
 );
@@ -253,6 +523,28 @@ simulation_test!(
         );
         assert!(!first_change_created_at.is_empty());
         assert_eq!(first_history[0][7], Value::Boolean(false));
+
+        let reversed_parameter = session
+            .execute(
+                "SELECT lixcol_as_of_commit_id, lixcol_snapshot_content \
+                 FROM lix_state_history \
+                 WHERE $1 = lixcol_as_of_commit_id \
+                   AND lixcol_entity_pk = lix_json('[\"history-explicit\"]')",
+                &[Value::Text(first_commit_id.clone())],
+            )
+            .await
+            .expect("a reversed parameter equality should route the history anchor");
+        assert_eq!(
+            reversed_parameter
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                Value::Text(first_commit_id.clone()),
+                Value::Json(json!({"key": "history-explicit", "value": "one"})),
+            ]]
+        );
 
         let second_history = select_history_rows(
             &session,

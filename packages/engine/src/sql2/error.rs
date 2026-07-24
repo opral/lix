@@ -79,14 +79,6 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
             .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...");
     }
 
-    if lower.contains("requires a lixcol_as_of_commit_id filter")
-        || lower.contains("history filter")
-        || lower.contains("history table")
-    {
-        return LixError::new(LixError::CODE_HISTORY_FILTER_REQUIRED, message)
-            .with_hint("Add a commit/branch range predicate before querying history tables.");
-    }
-
     if lower.contains("table not found")
         || (lower.contains("table") && lower.contains("not found"))
         || lower.contains("no table named")

@@ -61,14 +61,16 @@ export function registerMemoryStorageContract({
 					name: "LixError",
 					code: "LIX_INVALID_PARAM",
 					details: { operation: "execute", parameter_index: 1 },
-				});
-				await expect(
-					lix.execute("SELECT lixcol_entity_pk FROM lix_state_history"),
-				).rejects.toMatchObject({
-					name: "LixError",
-					code: "LIX_HISTORY_FILTER_REQUIRED",
-					hint: expect.stringContaining("lix_active_branch_commit_id()"),
-				});
+					});
+					await expect(
+						lix.execute(
+							"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+						),
+					).rejects.toMatchObject({
+						name: "LixError",
+						code: "LIX_UNSUPPORTED_SQL",
+						hint: expect.stringContaining("pinned active branch head"),
+					});
 			} finally {
 				await lix.close();
 			}
@@ -174,17 +176,19 @@ export function registerMemoryStorageContract({
 							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 							params: ["batch-rolled-back", "before failure"],
 						},
-						{ sql: "SELECT lixcol_entity_pk FROM lix_state_history" },
+						{
+							sql: "SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+						},
 						{
 							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 							params: ["batch-not-run", "after failure"],
 						},
 					]),
-				).rejects.toMatchObject({
-					name: "LixError",
-					code: "LIX_HISTORY_FILTER_REQUIRED",
-					details: { statementIndex: 1 },
-				});
+					).rejects.toMatchObject({
+						name: "LixError",
+						code: "LIX_UNSUPPORTED_SQL",
+						details: { statementIndex: 1 },
+					});
 				const rolledBack = await lix.execute(
 					"SELECT key FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
 					["batch-rolled-back", "batch-not-run"],
