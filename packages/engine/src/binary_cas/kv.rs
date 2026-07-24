@@ -2,8 +2,7 @@
 
 use crate::LixError;
 use crate::binary_cas::chunking::{
-    MAX_BINARY_CAS_CHUNK_BYTES, SINGLE_CHUNK_FAST_PATH_MAX_BYTES,
-    fastcdc_chunk_ranges_with_chunking,
+    INLINE_BINARY_CAS_MAX_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking,
 };
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
@@ -729,7 +728,7 @@ fn prepare_blob_write(
     }
     let (chunk_ranges, layout) = if bytes.is_empty() {
         (Vec::new(), BlobLayout::Empty)
-    } else if bytes.len() <= SINGLE_CHUNK_FAST_PATH_MAX_BYTES {
+    } else if bytes.len() <= INLINE_BINARY_CAS_MAX_BYTES {
         (Vec::new(), BlobLayout::Inline)
     } else {
         let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
@@ -959,7 +958,7 @@ fn metadata_from_manifest(
             codec,
             payload,
         } => {
-            if size_bytes == 0 || size_bytes > SINGLE_CHUNK_FAST_PATH_MAX_BYTES as u64 {
+            if size_bytes == 0 || size_bytes > INLINE_BINARY_CAS_MAX_BYTES as u64 {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -1584,9 +1583,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_layout_stops_at_the_64kib_boundary() {
-        let at_boundary = vec![b'a'; SINGLE_CHUNK_FAST_PATH_MAX_BYTES];
-        let above_boundary = vec![b'a'; SINGLE_CHUNK_FAST_PATH_MAX_BYTES + 1];
+    fn inline_layout_stops_at_the_32kib_boundary() {
+        let at_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES];
+        let above_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES + 1];
 
         let inline = prepare_blob_write(BinaryCasChunking::default(), &at_boundary, None)
             .expect("boundary blob should plan");
@@ -1595,14 +1594,14 @@ mod tests {
 
         assert_eq!(inline.layout, BlobLayout::Inline);
         assert!(inline.chunk_ranges.is_empty());
-        assert!(!matches!(out_of_line.layout, BlobLayout::Inline));
-        assert!(!out_of_line.chunk_ranges.is_empty());
+        assert!(matches!(out_of_line.layout, BlobLayout::SingleChunk { .. }));
+        assert_eq!(out_of_line.chunk_ranges, vec![(0, above_boundary.len())]);
     }
 
     #[test]
     fn inline_manifest_rejects_sizes_outside_the_format_boundary() {
         let hash = BlobHash::from_content(b"invalid inline");
-        for size_bytes in [0, SINGLE_CHUNK_FAST_PATH_MAX_BYTES as u64 + 1] {
+        for size_bytes in [0, INLINE_BINARY_CAS_MAX_BYTES as u64 + 1] {
             let error = metadata_from_manifest(
                 hash,
                 BinaryCasManifest::Inline {
@@ -1671,7 +1670,7 @@ mod tests {
     #[tokio::test]
     async fn public_kv_api_compresses_repetitive_inline_blob() {
         let storage = StorageAdapter::new(Memory::new());
-        let data = b"component-section:function-signature\n".repeat(1024);
+        let data = b"component-section:function-signature\n".repeat(512);
         let blob_hash = BlobHash::from_content(&data);
 
         {
