@@ -312,9 +312,9 @@ where
     ) -> Result<SessionWriteAccess, LixError> {
         let write_lease = self.begin_explicit_session_write_lease()?;
         // Explicit transactions can remain open across arbitrary application
-        // awaits. Serializing them for their entire lifetime would allow one
-        // client to block every engine writer indefinitely. The collaboration
-        // MVP serializes bounded implicit statements and execute batches.
+        // awaits, so the common non-deterministic path only serializes their
+        // commit. Deterministic transactions add the collaboration guard before
+        // taking the runtime guard to preserve the global lock order.
         self.begin_session_write_access_with_lease(write_lease, false)
             .await
     }
@@ -554,8 +554,25 @@ pub(super) struct SessionWriteAccess {
 }
 
 impl SessionWriteAccess {
-    fn serializes_collaboration_writes(&self) -> bool {
+    pub(super) fn serializes_collaboration_writes(&self) -> bool {
         self.collaboration_write_guard.is_some()
+    }
+
+    pub(super) async fn serialize_collaboration_writes(
+        &mut self,
+        collaboration_write_gate: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        if self.collaboration_write_guard.is_none() {
+            self.collaboration_write_guard = Some(
+                Arc::clone(collaboration_write_gate)
+                    .lock_owned()
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.collaboration_gate_wait"
+                    ))
+                    .await,
+            );
+        }
     }
 }
 

@@ -38,8 +38,16 @@ where
 {
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<StorageImpl>, LixError> {
         self.ensure_open()?;
-        let write_access = self.begin_explicit_session_write_access().await?;
+        let mut write_access = self.begin_explicit_session_write_access().await?;
         let deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
+            // Bounded durable-runtime writes take the collaboration gate before
+            // the deterministic-runtime gate. Keep that order for explicit
+            // transactions as well, then retain both guards for their lifetime
+            // so commit cannot deadlock with a bounded writer holding one gate
+            // while waiting for the other.
+            write_access
+                .serialize_collaboration_writes(&self.collaboration_write_gate)
+                .await;
             Some(self.lock_deterministic_runtime().await)
         } else {
             None
@@ -106,9 +114,21 @@ where
         // Explicit transactions may remain open across application awaits, so
         // they do not hold the collaboration gate while planning. Serialize
         // their commit-time revalidation and persistence with bounded writes.
-        let _collaboration_write_guard = Arc::clone(&self.collaboration_write_gate)
-            .lock_owned()
-            .await;
+        // Deterministic transactions already retain this gate to preserve the
+        // global lock order with their deterministic-runtime guard.
+        let _collaboration_write_guard = if self
+            .write_access
+            .as_ref()
+            .is_some_and(SessionWriteAccess::serializes_collaboration_writes)
+        {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.collaboration_write_gate)
+                    .lock_owned()
+                    .await,
+            )
+        };
         let operation_guard = self.begin_session_commit_operation()?;
         let transaction = self
             .transaction
