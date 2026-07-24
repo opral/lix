@@ -2330,6 +2330,7 @@ async fn validate_committed_foreign_keys(
             UnresolvedForeignKeyTarget::Key(target) => {
                 committed_normal_foreign_key_target_exists(
                     input.live_state,
+                    input.schema_catalog,
                     pending_constraints,
                     target,
                 )
@@ -2390,15 +2391,19 @@ fn unresolved_foreign_key_target_description(
 
 async fn committed_normal_foreign_key_target_exists(
     live_state: &dyn LiveStateReader,
+    schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
     target: &PendingForeignKeyTargetKey,
 ) -> Result<bool, LixError> {
+    let entity_pks: Vec<EntityPk> = primary_key_entity_pk_for_target(schema_catalog, target)
+        .into_iter()
+        .collect();
     for domain in target.domain.fk_target_domains() {
         let rows = scan_committed_constraint_rows(
             live_state,
             &domain,
             vec![target.schema_key.clone()],
-            Vec::new(),
+            entity_pks.clone(),
             false,
         )
         .await?;
@@ -2431,6 +2436,23 @@ async fn committed_normal_foreign_key_target_exists(
         }
     }
     Ok(false)
+}
+
+fn primary_key_entity_pk_for_target(
+    schema_catalog: &CatalogSnapshot,
+    target: &PendingForeignKeyTargetKey,
+) -> Option<EntityPk> {
+    let (_, target_plan) = schema_catalog.plan_for_key(&target.schema_key)?;
+    if target_plan.primary_key.as_ref()? != &target.pointer_group {
+        return None;
+    }
+    let parts = target
+        .value
+        .0
+        .iter()
+        .map(|value| serde_json::from_str::<String>(value).ok())
+        .collect::<Option<Vec<_>>>()?;
+    EntityPk::from_parts(parts).ok()
 }
 
 async fn committed_state_surface_foreign_key_target_exists(
@@ -5159,16 +5181,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_allows_foreign_key_target_committed_in_same_branch() {
+    async fn validation_primary_key_fk_point_lookup_ignores_unrelated_rows() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-a",
-            ))],
+            rows: vec![
+                {
+                    let mut unrelated =
+                        MaterializedLiveStateRow::from(fk_parent_row("unrelated", "branch-a"));
+                    unrelated.snapshot_content = Some("{invalid".to_string());
+                    unrelated
+                },
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
+            ],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -5991,6 +6019,30 @@ mod tests {
         assert_eq!(
             target.value,
             UniqueConstraintValue::string_values(["parent-1"])
+        );
+    }
+
+    #[test]
+    fn primary_key_fk_targets_have_exact_entity_pk_filters_but_unique_targets_do_not() {
+        let catalog = CatalogSnapshot::from_visible_schemas(&[unique_schema()])
+            .expect("unique schema catalog should build");
+        let mut target = PendingForeignKeyTargetKey {
+            schema_key: "unique_schema".to_string(),
+            domain: Domain::exact_file("branch-a", false, Some("file-a".to_string())),
+            pointer_group: vec![vec!["id".to_string()]],
+            value: UniqueConstraintValue::string_values(["entity-1"]),
+        };
+
+        assert_eq!(
+            primary_key_entity_pk_for_target(&catalog, &target),
+            Some(EntityPk::single("entity-1"))
+        );
+
+        target.pointer_group = vec![vec!["slug".to_string()]];
+        assert_eq!(
+            primary_key_entity_pk_for_target(&catalog, &target),
+            None,
+            "non-primary unique constraints still require value scans"
         );
     }
 
