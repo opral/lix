@@ -140,7 +140,15 @@ Run the benchmark-scale acceptance lane explicitly:
 cargo test -p plugin_csv_v2 -- --ignored --nocapture
 cargo test -p plugin_json_incremental_v2 -- --ignored --nocapture
 cargo test -p lix_sdk --lib csv_v2_ -- --ignored --nocapture
+cargo test --release -p lix_sdk_tests --test e2e \
+  v2_cold_open_materialized_csv_and_json_benchmark \
+  -- --ignored --exact --nocapture
 ```
+
+The cold-open benchmark seeds durable materialized bytes and entities, then
+opens a fresh engine and Wasm actor for each sample. It reports p50/p95
+latency, Component-boundary traffic, packet/output reads, and guest linear
+memory for the 220,000-row CSV plus flat and nested 10 MiB JSON fixtures.
 
 The component build output is
 `target/wasm32-wasip2/release/plugin_csv_v2.wasm`. A new plugin should add its
