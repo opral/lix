@@ -13,14 +13,24 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 autobenches = false
+autotests = false
 
 [lints]
 workspace = true
 
 [features]
+all-simulations = []
 rocksdb = []
 slatedb = []
 storage-benches = ["rocksdb"]
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[[test]]
+name = "execute_result_allocations"
+path = "tests/execute_result_allocations.rs"
 
 [[bench]]
 name = "storage_v2"

@@ -1,5 +1,4 @@
-mod support;
-
+use crate::support;
 use std::collections::BTreeSet;
 
 use lix_engine::{

@@ -1,3 +1,5 @@
 ## Lix Engine
 
-- testing with sqlite simulation is enough for development. before committing, test the all simulations
+- During development, `cargo test -p lix_engine` runs the fast base simulation.
+- Before committing, run `cargo test -p lix_engine --features all-simulations`
+  to exercise both the base and tracked-state-rebuild simulations.

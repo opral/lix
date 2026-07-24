@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 //! Reproducible current-state plugin registry performance probe.
 //!
 //! This is intentionally ignored in normal test runs. Example:
@@ -9,7 +7,7 @@
 //! LIX_PLUGIN_REGISTRY_PERF_FILES=10000 \
 //! LIX_PLUGIN_REGISTRY_PERF_BATCH_SIZE=100 \
 //! LIX_PLUGIN_REGISTRY_PERF_WASM_BYTES=1048576 \
-//! cargo test -p lix_engine --test plugin_registry_perf --release -- --ignored --nocapture
+//! cargo test -p lix_engine --test integration plugin_registry_perf:: --release -- --ignored --nocapture
 //! ```
 //!
 //! Modes are `p0`, `p1_nonmatch`, `p1_zero_state_write`, `p1_state_write`, and

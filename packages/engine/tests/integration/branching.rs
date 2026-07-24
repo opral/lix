@@ -1,6 +1,4 @@
-#[macro_use]
-mod support;
-
+use crate::support;
 use lix_engine::Value;
 use lix_engine::{
     CreateBranchOptions, Engine, LixError, MergeBranchOptions, MergeBranchOutcome,
