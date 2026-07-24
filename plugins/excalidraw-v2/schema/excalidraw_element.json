@@ -1,0 +1,48 @@
+{
+  "x-lix-key": "excalidraw_element",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "description": "One Excalidraw element keyed by its native stable ID. Numeric geometry stays inside element_json until packet snapshots support numbers directly.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The native Excalidraw element ID."
+    },
+    "order_key": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "A stable fractional key representing array order independently from identity."
+    },
+    "leading_json": {
+      "type": "string",
+      "pattern": "^[\\t\\n\\r ]*$",
+      "description": "Exact whitespace before this array item; commas are supplied by the renderer."
+    },
+    "element_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The element type derived from element_json for convenient queries."
+    },
+    "is_deleted": {
+      "type": "boolean",
+      "description": "The deletion state derived from element_json."
+    },
+    "element_json": {
+      "type": "string",
+      "minLength": 2,
+      "description": "The complete exact JSON object encoded as text, including all numeric geometry and forward-compatible fields."
+    }
+  },
+  "required": [
+    "id",
+    "order_key",
+    "leading_json",
+    "element_type",
+    "is_deleted",
+    "element_json"
+  ],
+  "additionalProperties": false
+}

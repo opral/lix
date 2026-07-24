@@ -65,6 +65,11 @@
             "description": "JSON Pointer (RFC 6901) to a property that participates in the primary key, e.g. `/id` or `/nested/field`."
           }
         },
+        "x-lix-id-allocation": {
+          "type": "string",
+          "const": "host-allocated",
+          "description": "Declares that newly emitted primary-key components are allocated from the mutation-scoped namespace supplied by the Lix plugin host. Existing durable identities remain valid across upgrades and imports."
+        },
         "x-lix-foreign-keys": {
           "type": "array",
           "items": {

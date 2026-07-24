@@ -3336,6 +3336,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -3402,6 +3403,7 @@ dependencies = [
  "lix_sqlite_storage",
  "lru",
  "notify-debouncer-full",
+ "plugin_csv_v2",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -3417,9 +3419,14 @@ name = "lix_sdk_tests"
 version = "0.8.4"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "codspeed-criterion-compat",
  "lix_sdk",
  "plugin_csv",
+ "plugin_csv_v2",
+ "plugin_excalidraw_v2",
+ "plugin_json_incremental_v2",
+ "plugin_markdown_incremental_v2",
  "rand 0.9.2",
  "serde_json",
  "tempfile",
@@ -4220,12 +4227,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_csv_v2"
+version = "0.8.4"
+dependencies = [
+ "base64 0.22.1",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "plugin_excalidraw_v2"
+version = "0.8.4"
+dependencies = [
+ "lix_order_key",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "plugin_json_incremental_v2"
+version = "0.8.4"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "plugin_json_v2"
 version = "0.8.4"
 dependencies = [
  "criterion",
  "serde",
  "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "plugin_markdown_incremental_v2"
+version = "0.8.4"
+dependencies = [
+ "base64 0.22.1",
+ "chardetng 1.0.0",
+ "encoding_rs",
+ "lix_order_key",
+ "markdown",
+ "markdown-syntax",
+ "serde",
+ "serde_json",
+ "uuid",
  "wit-bindgen 0.57.1",
 ]
 

@@ -45,6 +45,7 @@ pub(crate) struct PluginRegistryEntryInput {
     pub(crate) content_type: Option<PluginContentType>,
     pub(crate) entry: String,
     pub(crate) schema_keys: Vec<String>,
+    pub(crate) host_allocated_schema_keys: Vec<String>,
     pub(crate) manifest_json: String,
     pub(crate) archive_file_id: String,
     pub(crate) archive_path: String,
@@ -68,6 +69,7 @@ pub(crate) struct PluginRegistryEntry {
     content_type: Option<PluginContentType>,
     entry: String,
     schema_keys: Vec<String>,
+    host_allocated_schema_keys: Vec<String>,
     manifest_json: String,
     archive_file_id: String,
     archive_path: String,
@@ -94,6 +96,7 @@ impl PluginRegistryEntry {
             content_type: input.content_type,
             entry: input.entry,
             schema_keys: input.schema_keys,
+            host_allocated_schema_keys: input.host_allocated_schema_keys,
             manifest_json: canonicalize_json_text(
                 &input.manifest_json,
                 "plugin registry manifest_json",
@@ -104,6 +107,7 @@ impl PluginRegistryEntry {
             wasm_blob_hash: input.wasm_blob_hash,
         };
         entry.schema_keys.sort();
+        entry.host_allocated_schema_keys.sort();
         // Install-time validation pays the complete JSON-Schema and glob
         // checks once. Durable reads below use the already-validated compact
         // fields and generation integrity, so warm transactions do not
@@ -117,12 +121,20 @@ impl PluginRegistryEntry {
         &self.key
     }
 
+    pub(crate) fn runtime(&self) -> PluginRuntime {
+        self.runtime
+    }
+
     pub(crate) fn content_type(&self) -> Option<PluginContentType> {
         self.content_type
     }
 
     pub(crate) fn schema_keys(&self) -> &[String] {
         &self.schema_keys
+    }
+
+    pub(crate) fn host_allocated_schema_keys(&self) -> &[String] {
+        &self.host_allocated_schema_keys
     }
 
     pub(crate) fn archive_blob_hash(&self) -> &str {
@@ -142,6 +154,39 @@ impl PluginRegistryEntry {
 
     pub(crate) fn wasm_blob_hash(&self) -> &str {
         &self.wasm_blob_hash
+    }
+
+    /// Verifies the durable contract that every existing owner relies on
+    /// before a content-addressed v2 component generation is replaced.
+    ///
+    /// Schema definitions themselves live in `lix_registered_schema` and are
+    /// compared by the lifecycle reconciler. This check covers the registry
+    /// half of that contract, including the exact schema-key set.
+    pub(crate) fn validate_owned_v2_upgrade_contract(
+        &self,
+        replacement: &Self,
+    ) -> Result<(), LixError> {
+        let incompatible = self.key != replacement.key
+            || self.runtime != PluginRuntime::WasmComponentV2
+            || replacement.runtime != PluginRuntime::WasmComponentV2
+            || self.api_version != replacement.api_version
+            || self.path_glob != replacement.path_glob
+            || self.content_type != replacement.content_type
+            || self.schema_keys != replacement.schema_keys
+            || self.host_allocated_schema_keys != replacement.host_allocated_schema_keys;
+        if incompatible {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, content type, schema keys, and ID-allocation contract",
+                    self.key
+                ),
+            )
+            .with_hint(
+                "Move or delete every owned file before changing the plugin contract, then install the replacement archive.",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn to_installed_plugin(&self, wasm: Vec<u8>) -> Result<InstalledPlugin, LixError> {
@@ -627,10 +672,24 @@ impl CompiledPluginCatalog {
         path: &str,
         bytes: &[u8],
     ) -> Option<&PluginRegistryEntry> {
+        self.select_for_bytes_with_classification_work(path, bytes)
+            .0
+    }
+
+    /// Selects a plugin and reports bytes examined by the lazy full-payload
+    /// content classifier. Path-only catalogs therefore report zero even for
+    /// large payloads.
+    pub(crate) fn select_for_bytes_with_classification_work(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> (Option<&PluginRegistryEntry>, u64) {
         let mut classified = None;
-        self.select_with_content_type(path, || {
+        let selected = self.select_with_content_type(path, || {
             Some(*classified.get_or_insert_with(|| PluginContentType::from_bytes(bytes)))
-        })
+        });
+        let classified_bytes = classified.map_or(0, |_| bytes.len() as u64);
+        (selected, classified_bytes)
     }
 
     fn select_with_content_type(
@@ -739,6 +798,28 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
     if entry.schema_keys.iter().any(String::is_empty) {
         return Err(invalid_registry(format!(
             "plugin '{}' has an empty schema key",
+            entry.key
+        )));
+    }
+    if entry
+        .host_allocated_schema_keys
+        .windows(2)
+        .any(|keys| keys[0] >= keys[1])
+        || entry
+            .host_allocated_schema_keys
+            .iter()
+            .any(|key| entry.schema_keys.binary_search(key).is_err())
+    {
+        return Err(invalid_registry(format!(
+            "plugin '{}' host_allocated_schema_keys must be unique, sorted, and owned by the plugin",
+            entry.key
+        )));
+    }
+    if !entry.host_allocated_schema_keys.is_empty()
+        && entry.runtime != PluginRuntime::WasmComponentV2
+    {
+        return Err(invalid_registry(format!(
+            "plugin '{}' may declare host-allocated IDs only for wasm-component-v2",
             entry.key
         )));
     }
@@ -1042,6 +1123,7 @@ mod tests {
             content_type,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![format!("{key}_schema")],
+            host_allocated_schema_keys: Vec::new(),
             manifest_json: manifest_with_content_type(key, path_glob, content_type),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1049,6 +1131,62 @@ mod tests {
             wasm_blob_hash: hash(hash_byte),
         })
         .expect("test registry entry should be valid")
+    }
+
+    fn v2_entry(hash_byte: char) -> PluginRegistryEntry {
+        let key = "plugin_csv_v2";
+        let path_glob = "*.csv";
+        PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: key.to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
+            path_glob: path_glob.to_string(),
+            content_type: Some(PluginContentType::Text),
+            entry: "plugin.wasm".to_string(),
+            schema_keys: vec!["csv_row".to_string()],
+            host_allocated_schema_keys: vec!["csv_row".to_string()],
+            manifest_json: format!(
+                r#"{{"api_version":"2.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
+            ),
+            archive_file_id: plugin_storage_archive_file_id(key),
+            archive_path: plugin_storage_archive_path(key),
+            archive_blob_hash: hash(hash_byte),
+            wasm_blob_hash: hash(hash_byte),
+        })
+        .expect("test v2 registry entry should be valid")
+    }
+
+    #[test]
+    fn owned_v2_upgrade_contract_allows_only_generation_packaging_changes() {
+        let previous = v2_entry('a');
+        let replacement = v2_entry('b');
+        previous
+            .validate_owned_v2_upgrade_contract(&replacement)
+            .expect("content-addressed component replacement should preserve the contract");
+
+        let mut incompatible = Vec::new();
+        let mut value = replacement.clone();
+        value.api_version = "2.1.0".to_string();
+        incompatible.push(value);
+        let mut value = replacement.clone();
+        value.path_glob = "*.tsv".to_string();
+        incompatible.push(value);
+        let mut value = replacement.clone();
+        value.content_type = Some(PluginContentType::Binary);
+        incompatible.push(value);
+        let mut value = replacement.clone();
+        value.schema_keys = vec!["csv_table".to_string()];
+        incompatible.push(value);
+        let mut value = replacement;
+        value.host_allocated_schema_keys.clear();
+        incompatible.push(value);
+
+        for replacement in incompatible {
+            let error = previous
+                .validate_owned_v2_upgrade_contract(&replacement)
+                .expect_err("owned plugin contract mutation must fail closed");
+            assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        }
     }
 
     #[test]
@@ -1204,6 +1342,7 @@ mod tests {
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["plugin_a_schema".to_string()],
+            host_allocated_schema_keys: Vec::new(),
             manifest_json: manifest_with_content_type(
                 "plugin_a",
                 "*.json",
@@ -1353,6 +1492,14 @@ mod tests {
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
         );
+        let (selected, classified_bytes) =
+            catalog.select_for_bytes_with_classification_work("document.data", b"hello");
+        assert_eq!(selected.map(PluginRegistryEntry::key), Some("plugin_text"));
+        assert_eq!(classified_bytes, 5);
+        let (selected, classified_bytes) =
+            catalog.select_for_bytes_with_classification_work("document.other", b"hello");
+        assert!(selected.is_none());
+        assert_eq!(classified_bytes, 0);
         assert!(catalog.matches_plugin("plugin_text", "document.data"));
         assert!(catalog.matches_plugin("plugin_binary", "document.data"));
     }

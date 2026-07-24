@@ -54,10 +54,23 @@ Sessions use a 30-minute idle timeout and a 64-session workspace cap by
 default. JSON requests have an explicit 64 MiB ceiling so base64-encoded blobs
 can carry the engine's 32 MiB maximum plugin archive; multiplex observation
 streams accept at most 32 subscriptions. `ProtocolServerOptions` can override
-the session limits and request ceiling. Expired sessions are
+the session limits, request ceiling, and workspace request-base cache budget.
+Expired sessions are
 removed opportunistically. At capacity, the least-recently-used idle session
 is evicted; if every session is leased by an active HTTP request or SSE stream,
 the new handshake returns `503` instead of closing active work.
+
+Request blob splices use a bounded, per-session FIFO cache: at most eight
+entries and 16 MiB aggregate, with only blobs from 32 KiB through 16 MiB
+eligible. This retains one 10,680,000-byte CSV or 10,000,000-byte JSON base;
+caching its similarly sized successor evicts the predecessor, so repeated
+localized edits rotate one large base instead of accumulating document copies.
+All server-side session caches share a 128 MiB workspace budget. If admitting a
+base would exceed that budget, the cache declines it and the next edit falls
+back to the protocol's complete-blob retry without affecting correctness.
+Across one execute or atomic batch, reconstructed blob bytes are separately
+bounded by the configured expanded JSON request ceiling (64 MiB by default).
+The client uses the same 16 MiB aggregate base budget.
 
 The protocol server owns `/lix/v1`, request validation, wire values, Lix error
 mapping, and multiplexed observations. Host-specific routes such as

@@ -2359,6 +2359,7 @@ mod tests {
                 .iter()
                 .map(|schema_key| (*schema_key).to_string())
                 .collect(),
+            host_allocated_schema_keys: Vec::new(),
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(plugin_key),
             archive_path: plugin_storage_archive_path(plugin_key),

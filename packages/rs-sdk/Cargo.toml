@@ -36,6 +36,7 @@ notify-debouncer-full = { version = "0.7.0", default-features = false, features 
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
+plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }

@@ -100,6 +100,10 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
     }
 
+    fn session_file_views(&self) -> Option<SessionFileViews> {
+        None
+    }
+
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
 
     async fn scan_live_state(
@@ -186,6 +190,10 @@ impl SqlWriteContext {
 
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
         unsafe { self.ptr.0.as_ref().plugin_host() }
+    }
+
+    pub(crate) fn session_file_views(&self) -> Option<SessionFileViews> {
+        unsafe { self.ptr.0.as_ref().session_file_views() }
     }
 
     pub(crate) async fn scan_live_state(

@@ -340,6 +340,56 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 	);
 });
 
+test(
+	"remote execute splices the exact 10.68 MB CSV-size blob",
+	async () => {
+		const bodies: Array<Record<string, unknown>> = [];
+		const lix = await openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/workspace",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					const pathname = new URL(request.url).pathname;
+					if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+					if (request.method === "DELETE") {
+						return new Response(null, { status: 204 });
+					}
+					bodies.push(
+						(await requestJson(request)) as Record<string, unknown>,
+					);
+					return Response.json(emptyExecuteResponse());
+				},
+			},
+		});
+		const byteLength = 10_680_000;
+		const first = new Uint8Array(byteLength).fill(97);
+		const second = new Uint8Array(first);
+		const editOffset = Math.floor(byteLength / 2);
+		second[editOffset] = 98;
+		const sql =
+			"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data";
+
+		await lix.execute(sql, ["/large.csv", first]);
+		await lix.execute(sql, ["/large.csv", second]);
+		await lix.close();
+
+		expect(bodies).toHaveLength(2);
+		expect(bodies[0]?.cacheBlobs).toBe(true);
+		expect((bodies[0]?.params as Array<Record<string, unknown>>)[1]?.kind).toBe(
+			"blob",
+		);
+		expect(bodies[1]?.cacheBlobs).toBe(true);
+		expect((bodies[1]?.params as Array<Record<string, unknown>>)[1]).toMatchObject({
+			kind: "blob-splice",
+			prefixBytes: editOffset,
+			suffixBytes: byteLength - editOffset - 1,
+			insertBase64: "Yg==",
+		});
+	},
+	30_000,
+);
+
 test("remote execute retries a missing blob base once with full bytes", async () => {
 	const bodies: Array<Record<string, unknown>> = [];
 	let rejectedDelta = false;

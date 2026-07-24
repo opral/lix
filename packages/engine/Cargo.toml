@@ -86,6 +86,7 @@ datafusion = { version = "53.0.0", default-features = false, features = [
 musli = { version = "0.0.149", features = ["storage"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
 globset = "0.4"
 jiff = { version = "0.2.27", default-features = false, features = ["std"] }

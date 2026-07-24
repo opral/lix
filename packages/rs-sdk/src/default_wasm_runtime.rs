@@ -14,7 +14,7 @@ use lix_engine::wasm::{
 };
 use lru::LruCache;
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
 };
@@ -25,6 +25,9 @@ mod plugin_bindings {
         world: "plugin",
     });
 }
+
+#[path = "default_wasm_runtime_v2.rs"]
+mod v2_runtime;
 
 const COMPILED_COMPONENT_CACHE_CAPACITY: usize = 16;
 const MAX_PLUGIN_INSTANCES: usize = 64;
@@ -254,7 +257,7 @@ struct WasmtimePluginComponent {
 struct WasiHostState {
     ctx: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: TrackingStoreLimits,
 }
 
 impl WasiHostState {
@@ -262,8 +265,96 @@ impl WasiHostState {
         Self {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
-            limits,
+            limits: TrackingStoreLimits::new(limits),
         }
+    }
+}
+
+/// Delegates Wasmtime's hard resource limits while recording the one guest
+/// linear memory's actual high-water mark. `MAX_PLUGIN_MEMORIES` is one, and
+/// Wasm linear memories do not shrink, so the latest successful desired size
+/// is also the exact lifetime high-water size. A failed grow restores the
+/// pre-request sample before delegating Wasmtime's failure policy.
+struct TrackingStoreLimits {
+    inner: StoreLimits,
+    current_linear_memory_bytes: usize,
+    linear_memory_high_water_bytes: usize,
+    pending_memory_growth: Option<(usize, usize)>,
+}
+
+impl TrackingStoreLimits {
+    fn new(inner: StoreLimits) -> Self {
+        Self {
+            inner,
+            current_linear_memory_bytes: 0,
+            linear_memory_high_water_bytes: 0,
+            pending_memory_growth: None,
+        }
+    }
+
+    fn linear_memory_high_water_bytes(&self) -> u64 {
+        u64::try_from(self.linear_memory_high_water_bytes).unwrap_or(u64::MAX)
+    }
+}
+
+impl ResourceLimiter for TrackingStoreLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        // `current` is authoritative even if a guest previously handled a
+        // failed `memory.grow` and continued executing.
+        self.current_linear_memory_bytes = current;
+        self.linear_memory_high_water_bytes = self.linear_memory_high_water_bytes.max(current);
+        self.pending_memory_growth = None;
+
+        let allowed = self.inner.memory_growing(current, desired, maximum)?;
+        if allowed {
+            self.pending_memory_growth = Some((
+                self.current_linear_memory_bytes,
+                self.linear_memory_high_water_bytes,
+            ));
+            // Wasmtime invokes `memory_grow_failed` synchronously if the
+            // permitted allocation does not actually succeed.
+            self.current_linear_memory_bytes = desired;
+            self.linear_memory_high_water_bytes = self.linear_memory_high_water_bytes.max(desired);
+        }
+        Ok(allowed)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        if let Some((current, high_water)) = self.pending_memory_growth.take() {
+            self.current_linear_memory_bytes = current;
+            self.linear_memory_high_water_bytes = high_water;
+        }
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
     }
 }
 
@@ -309,6 +400,14 @@ impl WasmRuntime for WasmtimePluginRuntime {
             limits,
             _timeout_ticker: timeout_ticker,
         }))
+    }
+
+    async fn compile_component_v2(
+        &self,
+        bytes: Vec<u8>,
+        limits: WasmLimits,
+    ) -> Result<Arc<dyn lix_engine::wasm::v2::WasmComponentV2Factory>, LixError> {
+        v2_runtime::compile_component(self, bytes, limits).await
     }
 }
 
@@ -817,6 +916,68 @@ mod tests {
         instantiate(2 * PAGE_BYTES + 1).expect("one byte above two pages should still fit");
         instantiate(2 * PAGE_BYTES - 1)
             .expect_err("one byte below two pages must reject the initial memory");
+    }
+
+    #[test]
+    fn store_tracks_successful_guest_memory_high_water_without_counting_rejected_growth() {
+        const PAGE_BYTES: usize = 65_536;
+        let inner = StoreLimitsBuilder::new()
+            .memory_size(2 * PAGE_BYTES)
+            .build();
+        let mut limits = TrackingStoreLimits::new(inner);
+
+        assert!(
+            limits
+                .memory_growing(0, PAGE_BYTES, None)
+                .expect("first page should be allowed")
+        );
+        assert_eq!(limits.linear_memory_high_water_bytes(), PAGE_BYTES as u64);
+        assert!(
+            !limits
+                .memory_growing(PAGE_BYTES, 3 * PAGE_BYTES, None)
+                .expect("over-limit growth should be rejected without trapping")
+        );
+        assert_eq!(
+            limits.linear_memory_high_water_bytes(),
+            PAGE_BYTES as u64,
+            "a rejected desired size is not guest memory that existed"
+        );
+
+        assert!(
+            limits
+                .memory_growing(PAGE_BYTES, 2 * PAGE_BYTES, None)
+                .expect("second page should be permitted")
+        );
+        assert_eq!(
+            limits.linear_memory_high_water_bytes(),
+            (2 * PAGE_BYTES) as u64
+        );
+        limits
+            .memory_grow_failed(wasmtime::Error::msg("synthetic allocation failure"))
+            .expect("the default limiter ignores allocation failures");
+        assert_eq!(
+            limits.linear_memory_high_water_bytes(),
+            PAGE_BYTES as u64,
+            "a permitted but failed allocation must be rolled back"
+        );
+    }
+
+    #[test]
+    fn instantiated_component_memory_is_included_in_high_water() {
+        const PAGE_BYTES: u64 = 65_536;
+        let engine = create_engine(false, false).expect("test engine should initialize");
+        let component = Component::new(&engine, component_with_initial_memory(2))
+            .expect("test component should compile");
+        let linker = Linker::<WasiHostState>::new(&engine);
+        let mut store =
+            create_store(&engine, WasmLimits::default()).expect("test Store should initialize");
+        linker
+            .instantiate(&mut store, &component)
+            .expect("test component should instantiate");
+        assert_eq!(
+            store.data().limits.linear_memory_high_water_bytes(),
+            2 * PAGE_BYTES
+        );
     }
 
     #[test]

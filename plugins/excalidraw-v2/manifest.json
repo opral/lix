@@ -1,0 +1,15 @@
+{
+  "key": "plugin_excalidraw_v2",
+  "runtime": "wasm-component-v2",
+  "api_version": "2.0.0",
+  "match": {
+    "path_glob": "*.excalidraw",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/excalidraw_scene.json",
+    "schema/excalidraw_element.json",
+    "schema/excalidraw_file.json"
+  ]
+}

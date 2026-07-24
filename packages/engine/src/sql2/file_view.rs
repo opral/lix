@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::live_state::MaterializedLiveStateRow;
+use crate::plugin::PluginObservation;
 
 /// One session's private view of plugin-owned files.
 ///
@@ -41,6 +42,9 @@ pub(crate) struct SessionPluginFileView {
     /// prevents an old view from becoming valid again after plugin -> raw ->
     /// the same plugin.
     pub(crate) owner_change_id: String,
+    /// Exact v2 authority. V1 retains the acknowledged row vector below;
+    /// v2 stores an O(1) actor/document observation and leaves `rows` empty.
+    pub(crate) observation: Option<PluginObservation>,
     /// Immutable acknowledged rows are shared between deferred delivery and
     /// the session cache. Cloning a view must not deep-clone every entity.
     pub(crate) rows: Arc<[MaterializedLiveStateRow]>,
