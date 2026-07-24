@@ -31,9 +31,9 @@ pub use lix_engine::wasm::{
 pub use lix_engine::{
     Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
     CreateBranchReceipt as CreateBranchResult, ExecuteBatchStatement, ExecuteOptions,
-    ExecuteResult, GetManyResult, GetOptions, Key, KeyRange, LixError, LixNotice,
-    MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, MergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ExecuteResult, ExecutionDisposition, GetManyResult, GetOptions, Key, KeyRange, LixError,
+    LixNotice, MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, MergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeBranchReceipt as MergeBranchResult, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent, ObserveEvents,
     ProjectedValue, PutBatch, ReadEntry, ReadOptions, Row, ScanChunk, ScanOptions, SpaceId,

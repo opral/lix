@@ -14,8 +14,9 @@ use axum::{
     routing::{delete, get, post},
 };
 use lix_sdk::{
-    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Lix, LixError,
-    ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, WireValue,
+    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
+    ExecutionDisposition, Lix, LixError, ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions,
+    Value, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -399,6 +400,108 @@ where
                 format!("join Lix server operation: {error}"),
             )
         })?
+    }
+
+    /// Runs a read whose work can be discarded when the request future is
+    /// dropped. The cancellation sender deliberately lives in the caller
+    /// future: dropping an HTTP timeout's waiter wakes the blocking runtime,
+    /// which drops the session read lock and its operation lease.
+    async fn run_cancellable_read<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Lix<S>>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, LixError>> + 'static,
+    {
+        let runtime = Handle::try_current().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("access Lix server runtime: {error}"),
+            )
+        })?;
+        let lix = Arc::clone(&self.record.lix);
+        let operation_lease = self.clone();
+        let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let result = tokio::task::spawn_blocking(move || {
+            let _operation_lease = operation_lease;
+            tracing::dispatcher::with_default(&dispatch, || {
+                parent.in_scope(|| {
+                    runtime.block_on(async move {
+                        tokio::select! {
+                            result = async {
+                                let lix = lix.read().await;
+                                operation(Arc::clone(&lix)).await
+                            } => result,
+                            _ = &mut cancelled => Err(LixError::new(
+                                LixError::CODE_CLOSED,
+                                "Lix read operation was cancelled",
+                            )),
+                        }
+                    })
+                })
+            })
+        })
+        .await
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("join Lix server operation: {error}"),
+            )
+        })?;
+        drop(cancel_on_drop);
+        result
+    }
+
+    async fn execute(
+        &self,
+        sql: String,
+        params: Vec<Value>,
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
+        let disposition = {
+            let lix = self.record.lix.read().await;
+            lix.execution_disposition(&sql)?
+        };
+        match disposition {
+            ExecutionDisposition::CancellableRead => {
+                self.run_cancellable_read(move |lix| async move {
+                    lix.execute_with_options(&sql, &params, options).await
+                })
+                .await
+            }
+            ExecutionDisposition::Durable => {
+                self.run(move |lix| async move {
+                    lix.execute_with_options(&sql, &params, options).await
+                })
+                .await
+            }
+        }
+    }
+
+    async fn execute_batch(
+        &self,
+        statements: Vec<ExecuteBatchStatement>,
+        options: ExecuteOptions,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let disposition = {
+            let lix = self.record.lix.read().await;
+            lix.execute_batch_disposition(&statements)?
+        };
+        match disposition {
+            ExecutionDisposition::CancellableRead => {
+                self.run_cancellable_read(move |lix| async move {
+                    lix.execute_batch_with_options(&statements, options).await
+                })
+                .await
+            }
+            ExecutionDisposition::Durable => {
+                self.run(move |lix| async move {
+                    lix.execute_batch_with_options(&statements, options).await
+                })
+                .await
+            }
+        }
     }
 
     async fn switch_branch(
@@ -1026,9 +1129,7 @@ where
     )?;
     let options = request.options.into();
     let params = decoded.values;
-    let result = lease
-        .run(move |lix| async move { lix.execute_with_options(&sql, &params, options).await })
-        .await?;
+    let result = lease.execute(sql, params, options).await?;
     lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(ExecuteResponse::try_from(result)?))
 }
@@ -1067,9 +1168,7 @@ where
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     let options = request.options.into();
-    let results = lease
-        .run(move |lix| async move { lix.execute_batch_with_options(&statements, options).await })
-        .await?;
+    let results = lease.execute_batch(statements, options).await?;
     lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(
         results
@@ -2416,6 +2515,80 @@ mod tests {
                 .is_ok()
             {
                 self.first_reads.barrier.wait().await;
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingReadStorage {
+        inner: Memory,
+        gate: Arc<BlockingReadGate>,
+    }
+
+    struct BlockingReadGate {
+        remaining: AtomicUsize,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl BlockingReadStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                gate: Arc::new(BlockingReadGate {
+                    remaining: AtomicUsize::new(0),
+                    entered: Notify::new(),
+                    release: Notify::new(),
+                }),
+            }
+        }
+
+        fn block_next_read(&self) {
+            assert_eq!(
+                self.gate.remaining.swap(1, Ordering::AcqRel),
+                0,
+                "test read gate must be idle before arming"
+            );
+        }
+
+        async fn wait_for_blocked_read(&self) {
+            self.gate.entered.notified().await;
+        }
+
+        fn release_blocked_read(&self) {
+            self.gate.release.notify_one();
+        }
+    }
+
+    impl Storage for BlockingReadStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self
+                .gate
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.gate.entered.notify_one();
+                self.gate.release.notified().await;
             }
             self.inner.begin_read(options).await
         }
@@ -4517,7 +4690,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_http_future_keeps_its_detached_operation_leased() {
+    async fn cancelled_cancellable_read_releases_session_for_close_and_replacement() {
+        let storage = BlockingReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::with_options(
+            root,
+            ProtocolServerOptions {
+                max_sessions: 1,
+                session_idle_timeout: Duration::from_mins(1),
+                ..ProtocolServerOptions::default()
+            },
+        )
+        .expect("protocol server");
+        let router = handler(server.clone());
+        let lease = server.create_session(None).await.expect("session lease");
+        let session_id = lease.session_id.clone();
+        drop(lease);
+
+        storage.block_next_read();
+        let read_router = router.clone();
+        let read_session_id = session_id.clone();
+        let operation = tokio::spawn(async move {
+            request(
+                &read_router,
+                "POST",
+                "/lix/v1/execute",
+                Some(&read_session_id),
+                Some(json!({ "sql": "SELECT 1", "params": [] })),
+            )
+            .await
+        });
+        storage.wait_for_blocked_read().await;
+
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("outer HTTP-equivalent future was cancelled")
+                .is_cancelled()
+        );
+
+        let close =
+            tokio::time::timeout(Duration::from_secs(1), server.delete_session(&session_id)).await;
+        // Keep a failing regression self-cleaning: if cancellation ever stops
+        // reaching storage, release the blocked read before asserting below.
+        storage.release_blocked_read();
+        close
+            .expect("cancelled read must release the session read lock")
+            .expect("close cancelled read session");
+
+        let (replacement, _) = new_session(&router).await;
+        let retry = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&replacement),
+            Some(json!({ "sql": "SELECT 1", "params": [] })),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancelled_durable_operation_keeps_its_detached_operation_leased() {
         let app = app_with_options(ProtocolServerOptions {
             max_sessions: 1,
             session_idle_timeout: Duration::from_mins(1),
@@ -4534,6 +4773,8 @@ mod tests {
         let (finish_sender, finish) = tokio::sync::oneshot::channel();
         let (done_sender, done) = tokio::sync::oneshot::channel();
         let operation = tokio::spawn(async move {
+            // `run` is the durable path used by writes and durable runtime
+            // functions, so caller cancellation must not interrupt it.
             lease
                 .run(move |_lix| async move {
                     started_sender.send(()).expect("signal start");
