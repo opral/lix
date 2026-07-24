@@ -1,7 +1,8 @@
 use lix_sdk::{
-    CallbackTelemetrySink, CompletedTelemetrySpan, CreateBranchOptions, ExecuteBatchStatement, Lix,
-    LixError, Memory, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, Storage,
-    SwitchBranchOptions, TelemetryValue, Value, open_lix, open_lix_with_telemetry,
+    Blob, CallbackTelemetrySink, CompletedTelemetrySpan, CreateBranchOptions,
+    ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions, MergeBranchOutcome,
+    OpenLixOptions, Storage, SwitchBranchOptions, TelemetryValue, Value, open_lix,
+    open_lix_with_telemetry,
 };
 #[cfg(feature = "local_filesystem")]
 use lix_sdk::{LocalFilesystem, LocalFilesystemOpenOptions, open_lix_with_storage};
@@ -85,6 +86,163 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
         .await
         .expect_err("relative native file path should be rejected");
     assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+}
+
+#[tokio::test]
+async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays() {
+    let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
+
+    lix.upsert_file_data("/native/batch/one.bin", b"before".as_slice())
+        .await
+        .expect("seed native file batch update");
+    let fast_batch_parent = active_branch_commit_id(&lix).await;
+    assert_eq!(
+        lix.upsert_file_data_batch(native_file_writes(&[
+            ("/native/batch/one.bin", b"one"),
+            ("/native/batch/two.bin", b"two"),
+            ("/native/batch/empty.bin", b""),
+        ]))
+        .await
+        .expect("create native file batch"),
+        3
+    );
+    assert_active_branch_head_parent(&lix, &fast_batch_parent).await;
+    assert_eq!(
+        read_file(&lix, "/native/batch/one.bin").await.unwrap(),
+        Some(b"one".to_vec())
+    );
+    assert_eq!(
+        read_file(&lix, "/native/batch/two.bin").await.unwrap(),
+        Some(b"two".to_vec())
+    );
+    assert_eq!(
+        read_file(&lix, "/native/batch/empty.bin").await.unwrap(),
+        Some(Vec::new())
+    );
+
+    let fast_batch_update_parent = active_branch_commit_id(&lix).await;
+    assert_eq!(
+        lix.upsert_file_data_batch(native_file_writes(&[
+            ("/native/batch/one.bin", b"updated-one"),
+            ("/native/batch/two.bin", b""),
+            ("/native/batch/empty.bin", b"updated-empty"),
+        ]))
+        .await
+        .expect("update native file batch"),
+        3
+    );
+    assert_active_branch_head_parent(&lix, &fast_batch_update_parent).await;
+    assert_eq!(
+        read_file(&lix, "/native/batch/one.bin").await.unwrap(),
+        Some(b"updated-one".to_vec())
+    );
+    assert_eq!(
+        read_file(&lix, "/native/batch/two.bin").await.unwrap(),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        read_file(&lix, "/native/batch/empty.bin").await.unwrap(),
+        Some(b"updated-empty".to_vec())
+    );
+
+    let head_before_prevalidation_errors = active_branch_commit_id(&lix).await;
+    let empty_error = lix
+        .upsert_file_data_batch(Vec::new())
+        .await
+        .expect_err("empty native file batch should be rejected");
+    assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
+
+    let duplicate_error = lix
+        .upsert_file_data_batch(native_file_writes(&[
+            ("/native/batch/duplicate.bin", b"first"),
+            ("/native/batch/duplicate.bin", b"second"),
+        ]))
+        .await
+        .expect_err("duplicate native file batch path should be rejected");
+    assert_eq!(duplicate_error.code, LixError::CODE_INVALID_PARAM);
+    assert_eq!(
+        read_file(&lix, "/native/batch/duplicate.bin")
+            .await
+            .unwrap(),
+        None
+    );
+
+    let path_error = lix
+        .upsert_file_data_batch(native_file_writes(&[
+            ("/native/batch/must-not-write.bin", b"first"),
+            ("relative.bin", b"invalid"),
+        ]))
+        .await
+        .expect_err("invalid file path should reject the complete batch");
+    assert_eq!(path_error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+    assert_eq!(
+        read_file(&lix, "/native/batch/must-not-write.bin")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        active_branch_commit_id(&lix).await,
+        head_before_prevalidation_errors,
+        "prevalidation failures must not create a partial batch commit"
+    );
+
+    let active_branch_id = lix.active_branch_id().await.expect("resolve active branch");
+    lix.execute(
+        "INSERT INTO lix_file_by_branch \
+         (id, path, data, lixcol_global, lixcol_branch_id) \
+         VALUES ($1, $2, $3, true, 'global')",
+        &[
+            Value::Text("sdk-native-overlap".to_string()),
+            Value::Text("/native/overlap.bin".to_string()),
+            Value::Blob(b"g".to_vec().into()),
+        ],
+    )
+    .await
+    .expect("insert global overlap fixture");
+    lix.execute(
+        "INSERT INTO lix_file_by_branch \
+         (id, path, data, lixcol_branch_id) \
+         VALUES ($1, $2, $3, $4)",
+        &[
+            Value::Text("sdk-native-overlap".to_string()),
+            Value::Text("/native/overlap.bin".to_string()),
+            Value::Blob(b"l".to_vec().into()),
+            Value::Text(active_branch_id.clone()),
+        ],
+    )
+    .await
+    .expect("insert active overlap fixture");
+
+    let overlay_batch_parent = active_branch_commit_id(&lix).await;
+    assert_eq!(
+        lix.upsert_file_data_batch(native_file_writes(&[
+            ("/native/overlap.bin", b"updated"),
+            ("/native/batch/overlay-companion.bin", b"companion"),
+        ]))
+        .await
+        .expect("native file batch should update the active overlay"),
+        2
+    );
+    assert_active_branch_head_parent(&lix, &overlay_batch_parent).await;
+    assert_eq!(
+        read_file_by_branch(&lix, "sdk-native-overlap", &active_branch_id)
+            .await
+            .unwrap(),
+        Some(b"updated".to_vec())
+    );
+    assert_eq!(
+        read_file_by_branch(&lix, "sdk-native-overlap", "global")
+            .await
+            .unwrap(),
+        Some(b"g".to_vec())
+    );
+    assert_eq!(
+        read_file(&lix, "/native/batch/overlay-companion.bin")
+            .await
+            .unwrap(),
+        Some(b"companion".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -780,6 +938,78 @@ where
         .execute(
             "SELECT data FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
+        )
+        .await?;
+    result
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("data"))
+        .transpose()
+}
+
+fn native_file_writes(files: &[(&str, &[u8])]) -> Vec<(String, Blob)> {
+    files
+        .iter()
+        .map(|(path, data)| ((*path).to_string(), (*data).to_vec().into()))
+        .collect()
+}
+
+async fn active_branch_commit_id<StorageImpl>(lix: &Lix<StorageImpl>) -> String
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("read active branch commit id")
+        .rows()
+        .first()
+        .expect("active branch commit id should have one row")
+        .get::<String>("commit_id")
+        .expect("active branch commit id should decode")
+}
+
+async fn assert_active_branch_head_parent<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    expected_parent: &str,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let head = active_branch_commit_id(lix).await;
+    let result = lix
+        .execute(
+            "SELECT parent_id FROM lix_commit_edge WHERE child_id = $1",
+            &[Value::Text(head)],
+        )
+        .await
+        .expect("read active branch commit edge");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "a native file batch should create exactly one single-parent commit"
+    );
+    assert_eq!(
+        result.rows()[0]
+            .get::<String>("parent_id")
+            .expect("active branch parent id should decode"),
+        expected_parent
+    );
+}
+
+async fn read_file_by_branch<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    id: &str,
+    branch_id: &str,
+) -> Result<Option<Vec<u8>>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let result = lix
+        .execute(
+            "SELECT data FROM lix_file_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
+            &[
+                Value::Text(id.to_string()),
+                Value::Text(branch_id.to_string()),
+            ],
         )
         .await?;
     result

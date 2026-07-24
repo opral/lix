@@ -20,7 +20,7 @@ use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::transaction::bench::{
     BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
 };
-use lix_engine::{Engine, SessionContext, Storage, Value};
+use lix_engine::{Blob, Engine, SessionContext, Storage, Value};
 use lix_slatedb_storage::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -58,6 +58,7 @@ fn slatedb_file_api_benches(c: &mut Criterion) {
         .build()
         .expect("create tokio runtime for slatedb_file_api benchmarks");
     maybe_print_write_accounting(&runtime);
+    maybe_print_native_batch_write_accounting(&runtime);
     #[cfg(feature = "storage-benches")]
     maybe_print_singleton_write_accounting(&runtime);
     let mut group = c.benchmark_group("slatedb_file_api_warm_cache");
@@ -394,6 +395,55 @@ fn maybe_print_write_accounting(runtime: &tokio::runtime::Runtime) {
         println!(
             "slatedb-object-write path={path} put_calls={} put_bytes={}",
             path_stats.put_calls, path_stats.put_bytes,
+        );
+    }
+}
+
+fn maybe_print_native_batch_write_accounting(runtime: &tokio::runtime::Runtime) {
+    if std::env::var_os("LIX_SLATEDB_NATIVE_BATCH_ACCOUNTING").is_none() {
+        return;
+    }
+
+    for operation in ["10_native_single_upserts", "1_native_10_entry_batch"] {
+        let fixture = runtime.block_on(UploadBenchFixture::seeded(Duration::ZERO));
+        // Prime the identical direct path outside the accounting interval so
+        // accepted and flush figures describe steady-state writes, not engine
+        // open or first-index population.
+        black_box(
+            runtime.block_on(fixture.native_upsert_one_batch(fixture.next_native_upsert_entries())),
+        );
+        runtime
+            .block_on(fixture.storage.flush())
+            .expect("flush native batch accounting warmup");
+        fixture.object_store.reset_write_stats();
+
+        let entries = fixture.next_native_upsert_entries();
+        let accepted_started = Instant::now();
+        let rows_affected = match operation {
+            "10_native_single_upserts" => {
+                runtime.block_on(fixture.native_upsert_ten_sequential(entries))
+            }
+            "1_native_10_entry_batch" => runtime.block_on(fixture.native_upsert_one_batch(entries)),
+            _ => unreachable!("native batch accounting operation is fixed"),
+        };
+        let accepted = accepted_started.elapsed();
+        let flush_started = Instant::now();
+        runtime
+            .block_on(fixture.storage.flush())
+            .expect("flush native batch accounting write");
+        let flush = flush_started.elapsed();
+        let stats = fixture.object_store.write_stats();
+        let wal = stats.wal_totals();
+        println!(
+            "slatedb-native-batch-accounting operation={operation} seed_files={} seed_batch_size={} rows_affected={rows_affected} accepted_ns={} flush_ns={} put_calls={} put_bytes={} wal_put_calls={} wal_put_bytes={}",
+            seed_file_count(),
+            seed_upload_batch_size(),
+            accepted.as_nanos(),
+            flush.as_nanos(),
+            stats.put_calls,
+            stats.put_bytes,
+            wal.put_calls,
+            wal.put_bytes,
         );
     }
 }
@@ -820,6 +870,43 @@ impl UploadBenchFixture {
             .await
             .expect("overwrite benchmark file batch");
         result.rows_affected()
+    }
+
+    fn next_native_upsert_entries(&self) -> Vec<(String, Blob)> {
+        let version = self.next_upload_version.fetch_add(1, Ordering::Relaxed);
+        self.upload_batch_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let file_version = version
+                    .wrapping_mul(LIXRAY_UPLOAD_BATCH_FILES as u64)
+                    .wrapping_add(index as u64);
+                (path.clone(), Blob::from(upload_file_bytes(file_version)))
+            })
+            .collect()
+    }
+
+    async fn native_upsert_ten_sequential(&self, entries: Vec<(String, Blob)>) -> u64 {
+        let mut rows_affected = 0;
+        for (path, data) in entries {
+            rows_affected += self
+                .session
+                .upsert_file_data(path, data)
+                .await
+                .expect("native sequential file upsert");
+        }
+        assert_eq!(rows_affected, LIXRAY_UPLOAD_BATCH_FILES as u64);
+        rows_affected
+    }
+
+    async fn native_upsert_one_batch(&self, entries: Vec<(String, Blob)>) -> u64 {
+        let rows_affected = self
+            .session
+            .upsert_file_data_batch(entries)
+            .await
+            .expect("native batch file upsert");
+        assert_eq!(rows_affected, LIXRAY_UPLOAD_BATCH_FILES as u64);
+        rows_affected
     }
 
     async fn upload_new_file(&self) -> u64 {
@@ -1449,7 +1536,6 @@ struct ObjectStorePathWriteStats {
 }
 
 impl ObjectStoreWriteStats {
-    #[cfg(feature = "storage-benches")]
     fn wal_totals(&self) -> ObjectStorePathWriteStats {
         self.by_path
             .iter()

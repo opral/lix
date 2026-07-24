@@ -210,6 +210,19 @@ where
             .await
     }
 
+    /// Upserts a non-empty batch of files atomically without parsing SQL for
+    /// normal filesystem layouts.
+    ///
+    /// Each item is a full logical file path and its bytes. Paths must be
+    /// unique within the batch. This direct-only API rejects exceptional
+    /// layouts that its path index cannot route unambiguously.
+    pub async fn upsert_file_data_batch(
+        &self,
+        writes: Vec<(String, Blob)>,
+    ) -> Result<u64, LixError> {
+        self.session.upsert_file_data_batch(writes).await
+    }
+
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.

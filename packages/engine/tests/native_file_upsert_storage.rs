@@ -1,6 +1,6 @@
 //! Storage-backend coverage for the structured native file-write surface.
 
-use lix_engine::{Engine, SessionContext, Storage, Value};
+use lix_engine::{Blob, Engine, LixError, SessionContext, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
 
@@ -68,10 +68,77 @@ where
     );
     assert_file_data(&session, "/native/deep/payload.bin", b"").await;
 
+    let fast_batch_parent = active_branch_commit_id(&session).await;
+    assert_eq!(
+        session
+            .upsert_file_data_batch(file_writes(&[
+                ("/native/deep/payload.bin", b"batch-update"),
+                ("/native/batch/one.bin", b"one"),
+                ("/native/batch/two.bin", b"two"),
+                ("/native/batch/empty.bin", b""),
+            ]))
+            .await
+            .expect("create a native file batch"),
+        4
+    );
+    assert_active_branch_head_parent(&session, &fast_batch_parent).await;
+    assert_file_data(&session, "/native/deep/payload.bin", b"batch-update").await;
+    assert_file_data(&session, "/native/batch/one.bin", b"one").await;
+    assert_file_data(&session, "/native/batch/two.bin", b"two").await;
+    assert_file_data(&session, "/native/batch/empty.bin", b"").await;
+
+    let fast_batch_update_parent = active_branch_commit_id(&session).await;
+    assert_eq!(
+        session
+            .upsert_file_data_batch(file_writes(&[
+                ("/native/batch/one.bin", b"updated-one"),
+                ("/native/batch/two.bin", b""),
+                ("/native/batch/empty.bin", b"updated-empty"),
+            ]))
+            .await
+            .expect("update a native file batch"),
+        3
+    );
+    assert_active_branch_head_parent(&session, &fast_batch_update_parent).await;
+    assert_file_data(&session, "/native/batch/one.bin", b"updated-one").await;
+    assert_file_data(&session, "/native/batch/two.bin", b"").await;
+    assert_file_data(&session, "/native/batch/empty.bin", b"updated-empty").await;
+
+    let head_before_prevalidation_errors = active_branch_commit_id(&session).await;
+    let empty_error = session
+        .upsert_file_data_batch(Vec::new())
+        .await
+        .expect_err("empty native file batches should be rejected");
+    assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
+
+    let duplicate_error = session
+        .upsert_file_data_batch(file_writes(&[
+            ("/native/batch/duplicate.bin", b"first"),
+            ("/native/batch/duplicate.bin", b"second"),
+        ]))
+        .await
+        .expect_err("duplicate paths should be rejected before the batch writes");
+    assert_eq!(duplicate_error.code, LixError::CODE_INVALID_PARAM);
+    assert_file_missing(&session, "/native/batch/duplicate.bin").await;
+
+    let path_error = session
+        .upsert_file_data_batch(file_writes(&[
+            ("/native/batch/must-not-write.bin", b"first"),
+            ("relative.bin", b"invalid"),
+        ]))
+        .await
+        .expect_err("an invalid path should reject the complete batch before it writes");
+    assert_eq!(path_error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+    assert_file_missing(&session, "/native/batch/must-not-write.bin").await;
+    assert_eq!(
+        active_branch_commit_id(&session).await,
+        head_before_prevalidation_errors,
+        "prevalidation failures must not create a partial batch commit"
+    );
+
     // A global file can have a branch-local overlay at the same logical path.
-    // The direct filesystem index deliberately declines that topology so SQL
-    // can select the visible active-branch row. The native surface must make
-    // the same selection instead of rejecting a valid existing workspace.
+    // The exact path index selects the active overlay directly, without a
+    // general SQL fallback.
     let active_branch_id = session
         .active_branch_id()
         .await
@@ -104,18 +171,90 @@ where
         .await
         .expect("active overlap fixture should insert");
 
+    let overlay_batch_parent = active_branch_commit_id(&session).await;
     assert_eq!(
         session
-            .upsert_file_data(
-                "/native/overlap.bin".to_string(),
-                b"updated".to_vec().into()
-            )
+            .upsert_file_data_batch(file_writes(&[
+                ("/native/overlap.bin", b"updated"),
+                ("/native/batch/overlay-companion.bin", b"companion"),
+            ]))
             .await
-            .expect("native upsert should fall back for global/local overlap"),
-        1
+            .expect("direct batch should update the active overlay"),
+        2
     );
+    assert_active_branch_head_parent(&session, &overlay_batch_parent).await;
     assert_file_data_by_branch(&session, "native-overlap", &active_branch_id, b"updated").await;
     assert_file_data_by_branch(&session, "native-overlap", "global", b"g").await;
+    assert_file_data(
+        &session,
+        "/native/batch/overlay-companion.bin",
+        b"companion",
+    )
+    .await;
+}
+
+fn file_writes(files: &[(&str, &[u8])]) -> Vec<(String, Blob)> {
+    files
+        .iter()
+        .map(|(path, data)| ((*path).to_string(), (*data).to_vec().into()))
+        .collect()
+}
+
+async fn active_branch_commit_id<S>(session: &SessionContext<S>) -> String
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("read active branch commit id")
+        .rows()
+        .first()
+        .expect("active branch commit id should have one row")
+        .get::<String>("commit_id")
+        .expect("active branch commit id should decode")
+}
+
+async fn assert_active_branch_head_parent<S>(session: &SessionContext<S>, expected_parent: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let head = active_branch_commit_id(session).await;
+    let result = session
+        .execute(
+            "SELECT parent_id FROM lix_commit_edge WHERE child_id = $1",
+            &[Value::Text(head)],
+        )
+        .await
+        .expect("read active branch commit edge");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "a native file batch should create exactly one single-parent commit"
+    );
+    assert_eq!(
+        result.rows()[0]
+            .get::<String>("parent_id")
+            .expect("active branch parent id should decode"),
+        expected_parent
+    );
+}
+
+async fn assert_file_missing<S>(session: &SessionContext<S>, path: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let result = session
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await
+        .expect("read native file absence");
+    assert!(
+        result.rows().is_empty(),
+        "file '{path}' should not be visible after an atomic batch failure"
+    );
 }
 
 async fn assert_file_data<S>(session: &SessionContext<S>, path: &str, expected: &[u8])

@@ -65,6 +65,12 @@ harness = false
 required-features = ["slatedb"]
 
 [[bench]]
+name = "native_file_upsert_component"
+path = "benches/native_file_upsert_component.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "large_blob_updates"
 path = "benches/large_blob_updates.rs"
 harness = false

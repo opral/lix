@@ -87,3 +87,34 @@ This is intentionally a structured file-transfer operation, not a transparent
 replacement for arbitrary SQL `UPDATE`: callers choose its upsert behavior
 explicitly. The path must be a percent-encoded absolute Lix file path (for
 example, `%2Fassets%2Freport.pdf`).
+
+## Binary file upsert batch
+
+Clients that need one atomic commit for several ordinary file upserts can
+check `capabilities.binaryFileUpsertBatch === true` and send:
+
+```text
+POST /lix/v1/file/upsert-batch
+Lix-Session-Id: <session-id>
+Content-Type: application/octet-stream
+```
+
+The body is a deterministic big-endian frame:
+
+```text
+u32 entry_count
+repeat entry_count times:
+  u32 UTF-8 path byte length
+  u32 raw data byte length
+  path bytes
+  data bytes
+```
+
+`entry_count` must be between 1 and 1,024; paths must be unique, valid UTF-8,
+and consume the complete frame. Empty file data is valid. The server keeps data
+as slices of the request body rather than making a second payload copy. A valid
+request stages all entries in one transaction and returns the standard
+`ExecuteResponse` with `rowsAffected` equal to the entry count; any validation
+or engine error commits none of the entries. Larger client batches should be
+split into frames of at most 1,024 files. The configured request-body ceiling
+is the same as for the rest of the protocol.
