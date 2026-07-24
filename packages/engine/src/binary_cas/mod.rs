@@ -12,5 +12,5 @@ pub(crate) use chunking::BinaryCasChunking;
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use types::{
     BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobPayload,
-    BlobWriteReceipt,
+    BlobWriteReceipt, InlineBlob,
 };

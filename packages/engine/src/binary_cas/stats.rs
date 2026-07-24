@@ -15,6 +15,7 @@ use crate::storage_adapter::{
 pub(crate) struct BinaryCasStorageStats {
     pub manifest_rows: u64,
     pub empty_blob_rows: u64,
+    pub inline_blob_rows: u64,
     pub single_chunk_blob_rows: u64,
     pub chunked_blob_rows: u64,
     pub manifest_chunk_rows: u64,
@@ -47,6 +48,7 @@ where
             stats.logical_blob_bytes += manifest.size_bytes();
             match manifest {
                 BinaryCasManifest::Empty { .. } => stats.empty_blob_rows += 1,
+                BinaryCasManifest::Inline { .. } => stats.inline_blob_rows += 1,
                 BinaryCasManifest::SingleChunk { .. } => {
                     stats.single_chunk_blob_rows += 1;
                     stats.total_chunk_refs += 1;
@@ -139,6 +141,18 @@ mod tests {
             &BinaryCasManifest::Empty { size_bytes: 0 },
         );
 
+        let inline = b"inline";
+        let inline_hash = BlobHash::from_content(inline);
+        stage_manifest(
+            &mut writes,
+            inline_hash,
+            &BinaryCasManifest::Inline {
+                size_bytes: inline.len() as u64,
+                codec: BinaryChunkCodec::Raw,
+                payload: inline.to_vec(),
+            },
+        );
+
         let single_hash = BlobHash::from_content(b"single blob");
         let single_chunk_hash = BlobHash::from_content(b"single");
         stage_manifest(
@@ -204,15 +218,16 @@ mod tests {
         assert_eq!(
             stats,
             BinaryCasStorageStats {
-                manifest_rows: 3,
+                manifest_rows: 4,
                 empty_blob_rows: 1,
+                inline_blob_rows: 1,
                 single_chunk_blob_rows: 1,
                 chunked_blob_rows: 1,
                 manifest_chunk_rows: 2,
                 chunk_presence_rows: 3,
                 chunk_rows: 3,
                 total_chunk_refs: 3,
-                logical_blob_bytes: 14,
+                logical_blob_bytes: 20,
             }
         );
     }

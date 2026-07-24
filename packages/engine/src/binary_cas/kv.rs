@@ -1,16 +1,18 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::{MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking};
+use crate::binary_cas::chunking::{
+    INLINE_BINARY_CAS_MAX_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking,
+};
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
-    encode_binary_cas_manifest_chunk,
+    encode_binary_cas_manifest_chunk, encode_inline_binary_cas_manifest,
 };
 use crate::binary_cas::compression::{decode_zstd_chunk, encode_chunk_payload};
 use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
-    BlobWriteReceipt,
+    BlobWriteReceipt, InlineBlob,
 };
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
@@ -352,7 +354,7 @@ pub(crate) async fn load_bytes_many(
             continue;
         };
         match &metadata.layout {
-            BlobLayout::Empty => {}
+            BlobLayout::Empty | BlobLayout::Inline => {}
             BlobLayout::SingleChunk { chunk_hash } => {
                 if seen_chunks.insert(*chunk_hash) {
                     requested_chunks.push(*chunk_hash);
@@ -392,10 +394,11 @@ pub(crate) async fn load_bytes_many(
         .map(|metadata| {
             metadata
                 .map(|metadata| {
+                    let hash = metadata.hash;
                     assemble_blob_bytes(
-                        &metadata,
+                        metadata,
                         &chunk_rows_by_hash,
-                        chunked_manifests_by_hash.get(&metadata.hash),
+                        chunked_manifests_by_hash.get(&hash),
                     )
                 })
                 .transpose()
@@ -456,7 +459,7 @@ fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
 }
 
 fn assemble_blob_bytes(
-    metadata: &BlobMetadata,
+    mut metadata: BlobMetadata,
     chunk_rows_by_hash: &HashMap<BlobHash, Option<Bytes>>,
     chunked_manifest: Option<&Vec<KvBlobManifestChunk>>,
 ) -> Result<Vec<u8>, LixError> {
@@ -473,6 +476,26 @@ fn assemble_blob_bytes(
                 ));
             }
             Vec::new()
+        }
+        BlobLayout::Inline => {
+            let inline_blob = metadata.inline_blob.take().ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS inline blob '{}' is missing its encoded bytes",
+                        metadata.hash.to_hex()
+                    ),
+                )
+            })?;
+            decode_and_verify_payload(
+                inline_blob.codec,
+                metadata.size_bytes,
+                Cow::Owned(inline_blob.payload),
+                expected_blob_size,
+                metadata.hash,
+                metadata.hash,
+            )?
+            .into_owned()
         }
         BlobLayout::SingleChunk { chunk_hash } => {
             let chunk = decode_chunk_from_map(
@@ -581,6 +604,24 @@ fn decode_and_verify_chunk(
     chunk_hash: BlobHash,
 ) -> Result<Cow<'_, [u8]>, LixError> {
     let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
+    decode_and_verify_payload(
+        codec,
+        uncompressed_len,
+        Cow::Borrowed(chunk_payload),
+        expected_chunk_size,
+        blob_hash,
+        chunk_hash,
+    )
+}
+
+fn decode_and_verify_payload(
+    codec: BinaryChunkCodec,
+    uncompressed_len: u64,
+    chunk_payload: Cow<'_, [u8]>,
+    expected_chunk_size: usize,
+    blob_hash: BlobHash,
+    chunk_hash: BlobHash,
+) -> Result<Cow<'_, [u8]>, LixError> {
     if expected_chunk_size > MAX_BINARY_CAS_CHUNK_BYTES
         || uncompressed_len > MAX_BINARY_CAS_CHUNK_BYTES as u64
     {
@@ -607,10 +648,10 @@ fn decode_and_verify_chunk(
         ));
     }
     let decoded = match codec {
-        BinaryChunkCodec::Raw => Cow::Borrowed(chunk_payload),
+        BinaryChunkCodec::Raw => chunk_payload,
         BinaryChunkCodec::Zstd => Cow::Owned(decode_zstd_chunk(
             chunk_hash,
-            chunk_payload,
+            &chunk_payload,
             expected_chunk_size,
         )?),
     };
@@ -684,24 +725,31 @@ fn prepare_blob_write(
             "binary CAS blob hash does not match blob contents".to_string(),
         ));
     }
-    let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
-    let layout = match chunk_ranges.as_slice() {
-        [] => BlobLayout::Empty,
-        [(start, end)] => BlobLayout::SingleChunk {
-            chunk_hash: if *start == 0 && *end == bytes.len() {
-                blob_hash
-            } else {
-                BlobHash::from_content(&bytes[*start..*end])
+    let (chunk_ranges, layout) = if bytes.is_empty() {
+        (Vec::new(), BlobLayout::Empty)
+    } else if bytes.len() <= INLINE_BINARY_CAS_MAX_BYTES {
+        (Vec::new(), BlobLayout::Inline)
+    } else {
+        let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
+        let layout = match chunk_ranges.as_slice() {
+            [] => unreachable!("non-empty blobs always have at least one chunk"),
+            [(start, end)] => BlobLayout::SingleChunk {
+                chunk_hash: if *start == 0 && *end == bytes.len() {
+                    blob_hash
+                } else {
+                    BlobHash::from_content(&bytes[*start..*end])
+                },
             },
-        },
-        _ => BlobLayout::Chunked {
-            chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "binary CAS blob has too many chunks for manifest".to_string(),
-                )
-            })?,
-        },
+            _ => BlobLayout::Chunked {
+                chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "binary CAS blob has too many chunks for manifest".to_string(),
+                    )
+                })?,
+            },
+        };
+        (chunk_ranges, layout)
     };
     let receipt = BlobWriteReceipt {
         hash: blob_hash,
@@ -749,6 +797,18 @@ fn stage_prepared_blob_write(
                 writes,
                 plan.blob_hash,
                 &BinaryCasManifest::Empty { size_bytes: 0 },
+            );
+        }
+        BlobLayout::Inline => {
+            let encoded = encode_chunk_payload(plan.blob_hash, bytes)?;
+            writes.put(
+                BINARY_CAS_MANIFEST_SPACE,
+                key(manifest_key(plan.blob_hash)),
+                value(encode_inline_binary_cas_manifest(
+                    bytes.len() as u64,
+                    encoded.codec,
+                    &encoded.data,
+                )),
             );
         }
         BlobLayout::SingleChunk { chunk_hash } => {
@@ -805,7 +865,7 @@ async fn missing_chunk_hashes(
 ) -> Result<HashSet<BlobHash>, LixError> {
     let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
     match &plan.layout {
-        BlobLayout::Empty => {}
+        BlobLayout::Empty | BlobLayout::Inline => {}
         BlobLayout::SingleChunk { chunk_hash } => {
             collect_chunk_lookup_candidate(*chunk_hash, transaction_chunk_keys, &mut candidates);
         }
@@ -878,7 +938,7 @@ fn metadata_from_manifest(
     manifest: BinaryCasManifest,
 ) -> Result<BlobMetadata, LixError> {
     let size_bytes = manifest.size_bytes();
-    let layout = match manifest {
+    let (layout, inline_blob) = match manifest {
         BinaryCasManifest::Empty { size_bytes } => {
             if size_bytes != 0 {
                 return Err(LixError::new(
@@ -889,17 +949,39 @@ fn metadata_from_manifest(
                     ),
                 ));
             }
-            BlobLayout::Empty
+            (BlobLayout::Empty, None)
         }
-        BinaryCasManifest::SingleChunk { chunk_hash, .. } => BlobLayout::SingleChunk {
-            chunk_hash: BlobHash::from_bytes(chunk_hash),
-        },
-        BinaryCasManifest::Chunked { chunk_count, .. } => BlobLayout::Chunked { chunk_count },
+        BinaryCasManifest::Inline {
+            size_bytes,
+            codec,
+            payload,
+        } => {
+            if size_bytes == 0 || size_bytes > INLINE_BINARY_CAS_MAX_BYTES as u64 {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS inline blob '{}' has invalid size {size_bytes}",
+                        hash.to_hex()
+                    ),
+                ));
+            }
+            (BlobLayout::Inline, Some(InlineBlob { codec, payload }))
+        }
+        BinaryCasManifest::SingleChunk { chunk_hash, .. } => (
+            BlobLayout::SingleChunk {
+                chunk_hash: BlobHash::from_bytes(chunk_hash),
+            },
+            None,
+        ),
+        BinaryCasManifest::Chunked { chunk_count, .. } => {
+            (BlobLayout::Chunked { chunk_count }, None)
+        }
     };
     Ok(BlobMetadata {
         hash,
         size_bytes,
         layout,
+        inline_blob,
     })
 }
 
@@ -974,6 +1056,7 @@ mod tests {
         max_active_manifest_scans: AtomicUsize,
         manifest_scan_calls: AtomicUsize,
         chunk_get_many_calls: AtomicUsize,
+        presence_get_many_calls: AtomicUsize,
         chunk_keys_requested: AtomicUsize,
         completed_manifest_hashes: Mutex<Vec<BlobHash>>,
     }
@@ -989,6 +1072,7 @@ mod tests {
                 max_active_manifest_scans: AtomicUsize::new(0),
                 manifest_scan_calls: AtomicUsize::new(0),
                 chunk_get_many_calls: AtomicUsize::new(0),
+                presence_get_many_calls: AtomicUsize::new(0),
                 chunk_keys_requested: AtomicUsize::new(0),
                 completed_manifest_hashes: Mutex::new(Vec::new()),
             }
@@ -1018,6 +1102,9 @@ mod tests {
                 self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
                 self.chunk_keys_requested
                     .fetch_add(keys.len(), Ordering::Relaxed);
+            }
+            if space == BINARY_CAS_CHUNK_PRESENCE_SPACE.id {
+                self.presence_get_many_calls.fetch_add(1, Ordering::Relaxed);
             }
             self.inner.get_many(space, keys, opts).await
         }
@@ -1493,6 +1580,39 @@ mod tests {
         assert!(second < later);
     }
 
+    #[test]
+    fn inline_layout_stops_at_the_32kib_boundary() {
+        let at_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES];
+        let above_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES + 1];
+
+        let inline = prepare_blob_write(BinaryCasChunking::default(), &at_boundary, None)
+            .expect("boundary blob should plan");
+        let out_of_line = prepare_blob_write(BinaryCasChunking::default(), &above_boundary, None)
+            .expect("above-boundary blob should plan");
+
+        assert_eq!(inline.layout, BlobLayout::Inline);
+        assert!(inline.chunk_ranges.is_empty());
+        assert!(matches!(out_of_line.layout, BlobLayout::SingleChunk { .. }));
+        assert_eq!(out_of_line.chunk_ranges, vec![(0, above_boundary.len())]);
+    }
+
+    #[test]
+    fn inline_manifest_rejects_sizes_outside_the_format_boundary() {
+        let hash = BlobHash::from_content(b"invalid inline");
+        for size_bytes in [0, INLINE_BINARY_CAS_MAX_BYTES as u64 + 1] {
+            let error = metadata_from_manifest(
+                hash,
+                BinaryCasManifest::Inline {
+                    size_bytes,
+                    codec: BinaryChunkCodec::Raw,
+                    payload: Vec::new(),
+                },
+            )
+            .expect_err("invalid inline size should be rejected");
+            assert!(error.message.contains("invalid size"));
+        }
+    }
+
     #[tokio::test]
     async fn public_kv_api_roundtrips_blob_bytes() {
         let storage = StorageAdapter::new(Memory::new());
@@ -1527,9 +1647,10 @@ mod tests {
             load_manifest(&store, blob_hash)
                 .await
                 .expect("manifest should load"),
-            Some(BinaryCasManifest::SingleChunk {
+            Some(BinaryCasManifest::Inline {
                 size_bytes: data.len() as u64,
-                chunk_hash: BlobHash::from_content(data).into_bytes(),
+                codec: BinaryChunkCodec::Raw,
+                payload: data.to_vec(),
             })
         );
         let store = storage
@@ -1539,15 +1660,15 @@ mod tests {
         assert_eq!(
             scan_manifest_chunks(&store, blob_hash)
                 .await
-                .expect("single-chunk blob should not spill manifest chunks"),
+                .expect("inline blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
         );
     }
 
     #[tokio::test]
-    async fn public_kv_api_compresses_repetitive_single_chunk_blob() {
+    async fn public_kv_api_compresses_repetitive_inline_blob() {
         let storage = StorageAdapter::new(Memory::new());
-        let data = b"component-section:function-signature\n".repeat(1024);
+        let data = b"component-section:function-signature\n".repeat(512);
         let blob_hash = BlobHash::from_content(&data);
 
         {
@@ -1563,13 +1684,21 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let stored = load_chunk(&store, blob_hash)
+        let stored = load_manifest(&store, blob_hash)
             .await
-            .expect("chunk should load")
-            .expect("chunk should exist");
-        assert_eq!(stored.codec, BinaryChunkCodec::Zstd);
-        assert_eq!(stored.uncompressed_len, data.len() as u64);
-        assert!(stored.data.len() < data.len() / 4);
+            .expect("manifest should load")
+            .expect("manifest should exist");
+        let BinaryCasManifest::Inline {
+            size_bytes,
+            codec,
+            payload,
+        } = stored
+        else {
+            panic!("small blob should be inline");
+        };
+        assert_eq!(codec, BinaryChunkCodec::Zstd);
+        assert_eq!(size_bytes, data.len() as u64);
+        assert!(payload.len() < data.len() / 4);
 
         assert_eq!(
             load_bytes_many(&store, &[blob_hash])
@@ -1581,7 +1710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_kv_api_keeps_high_entropy_single_chunk_raw() {
+    async fn public_kv_api_keeps_high_entropy_inline_blob_raw() {
         let storage = StorageAdapter::new(Memory::new());
         let data = deterministic_high_entropy_bytes(32 * 1024);
         let blob_hash = BlobHash::from_content(&data);
@@ -1599,17 +1728,22 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let stored = load_chunk(&store, blob_hash)
+        let stored = load_manifest(&store, blob_hash)
             .await
-            .expect("chunk should load")
-            .expect("chunk should exist");
-        assert_eq!(stored.codec, BinaryChunkCodec::Raw);
-        assert_eq!(stored.uncompressed_len, data.len() as u64);
-        assert_eq!(stored.data, data);
+            .expect("manifest should load")
+            .expect("manifest should exist");
+        assert_eq!(
+            stored,
+            BinaryCasManifest::Inline {
+                size_bytes: data.len() as u64,
+                codec: BinaryChunkCodec::Raw,
+                payload: data,
+            }
+        );
     }
 
     #[tokio::test]
-    async fn existing_chunk_aware_writer_skips_persisted_chunk_payloads() {
+    async fn inline_writer_stages_one_row_without_chunk_presence_reads() {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"hello chunked kv cas";
         let payload = BlobPayload::from_bytes(data.to_vec());
@@ -1618,7 +1752,7 @@ mod tests {
         {
             let mut writes = storage.new_write_set();
             stage_test_payload(&storage, &mut writes, &payload).await;
-            assert_eq!(writes.stats().staged_puts, 3);
+            assert_eq!(writes.stats().staged_puts, 1);
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
@@ -1637,11 +1771,22 @@ mod tests {
             )
             .await
             .expect("chunk presence marker should load"),
-            Some(Vec::new())
+            None
         );
+        assert_eq!(
+            get_one(
+                &store,
+                BINARY_CAS_CHUNK_SPACE,
+                chunk_key(BlobHash::from_content(data)),
+            )
+            .await
+            .expect("chunk row lookup should succeed"),
+            None
+        );
+        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
         let mut writes = storage.new_write_set();
         let mut writer =
-            BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
+            BinaryCasContext::new().writer_skipping_existing_chunks(&counted, &mut writes);
         writer
             .stage_payload(&payload)
             .await
@@ -1650,7 +1795,12 @@ mod tests {
         assert_eq!(
             writes.stats().staged_puts,
             1,
-            "a persisted marker should make the repeat write stage only its manifest"
+            "an inline repeat write should deterministically replace one manifest"
+        );
+        assert_eq!(
+            counted.presence_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "inline blobs must not probe the out-of-line chunk presence space"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -1661,12 +1811,18 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
         assert_eq!(
-            load_bytes_many(&store, &[blob_hash])
+            load_bytes_many(&counted, &[blob_hash])
                 .await
                 .expect("blob should load")
                 .into_vec(),
             vec![Some(data.to_vec())]
+        );
+        assert_eq!(
+            counted.chunk_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "inline blob reads must finish from the manifest point read"
         );
     }
 
@@ -1812,9 +1968,10 @@ mod tests {
             load_manifest(&store, blob_hash)
                 .await
                 .expect("manifest should load"),
-            Some(BinaryCasManifest::SingleChunk {
+            Some(BinaryCasManifest::Inline {
                 size_bytes: data.len() as u64,
-                chunk_hash: blob_hash.into_bytes(),
+                codec: BinaryChunkCodec::Raw,
+                payload: data.to_vec(),
             })
         );
     }
@@ -1838,18 +1995,18 @@ mod tests {
         {
             let mut writes = storage.new_write_set();
             writes.put(
-                BINARY_CAS_CHUNK_SPACE,
-                key(chunk_key(blob_hash)),
-                value(encode_binary_cas_chunk(
-                    BinaryChunkCodec::Raw,
+                BINARY_CAS_MANIFEST_SPACE,
+                key(manifest_key(blob_hash)),
+                value(encode_inline_binary_cas_manifest(
                     corrupted.len() as u64,
+                    BinaryChunkCodec::Raw,
                     corrupted,
                 )),
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
-                .expect("corrupt chunk should overwrite");
+                .expect("corrupt manifest should overwrite");
         }
 
         let store = storage
@@ -1867,9 +2024,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_rejects_truncated_zstd_chunk() {
+    async fn read_rejects_truncated_zstd_inline_payload() {
         let storage = StorageAdapter::new(Memory::new());
-        let data = b"compressible binary CAS bytes".repeat(4096);
+        let data = b"compressible binary CAS bytes".repeat(1024);
         let blob_hash = BlobHash::from_content(&data);
 
         {
@@ -1888,18 +2045,18 @@ mod tests {
         {
             let mut writes = storage.new_write_set();
             writes.put(
-                BINARY_CAS_CHUNK_SPACE,
-                key(chunk_key(blob_hash)),
-                value(encode_binary_cas_chunk(
-                    BinaryChunkCodec::Zstd,
+                BINARY_CAS_MANIFEST_SPACE,
+                key(manifest_key(blob_hash)),
+                value(encode_inline_binary_cas_manifest(
                     data.len() as u64,
+                    BinaryChunkCodec::Zstd,
                     &corrupted,
                 )),
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
-                .expect("corrupt chunk should overwrite");
+                .expect("corrupt inline manifest should overwrite");
         }
 
         let store = storage

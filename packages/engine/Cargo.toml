@@ -70,6 +70,12 @@ path = "benches/large_blob_updates.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 
+[[bench]]
+name = "small_blob_cas"
+path = "benches/small_blob_cas.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"

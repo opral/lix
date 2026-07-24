@@ -7,6 +7,7 @@ use crate::storage_adapter::{
     ScanPlan, StorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageProjectedValue,
     StorageScanOptions, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
 };
+use crate::{ReadOptions, WriteOptions};
 
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +40,48 @@ pub fn binary_cas_write_accounting() -> BinaryCasWriteAccounting {
         chunk_lookup_elapsed_ns: metrics.chunk_lookup_elapsed_ns,
         transaction_duplicate_chunk_count: metrics.transaction_duplicate_chunk_count,
     }
+}
+
+/// Writes one payload through the production binary CAS and commits the
+/// resulting canonical write set. This is intentionally available only to
+/// storage benchmarks so they can isolate CAS layout costs from SQL planning,
+/// validation, tracked state, and changelog work.
+pub async fn write_binary_cas_for_bench<StorageImpl>(
+    storage: &crate::storage_adapter::StorageAdapter<StorageImpl>,
+    bytes: &[u8],
+) -> Result<String, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let mut writes = storage.new_write_set();
+    let receipt = crate::binary_cas::BinaryCasContext::new()
+        .writer_skipping_existing_chunks(&read, &mut writes)
+        .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(bytes.to_vec()))
+        .await?;
+    storage
+        .commit_write_set(writes, WriteOptions::default())
+        .await?;
+    Ok(receipt.hash.to_hex())
+}
+
+/// Reads one payload through the production binary CAS. See
+/// [`write_binary_cas_for_bench`] for why this feature-gated helper exists.
+pub async fn read_binary_cas_for_bench<StorageImpl>(
+    storage: &crate::storage_adapter::StorageAdapter<StorageImpl>,
+    hash_hex: &str,
+) -> Result<Option<Vec<u8>>, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let hash = crate::binary_cas::BlobHash::from_hex(hash_hex)?;
+    let mut entries = crate::binary_cas::BinaryCasContext::new()
+        .reader(read)
+        .load_bytes_many(&[hash])
+        .await?
+        .into_vec();
+    Ok(entries.pop().flatten())
 }
 
 pub(crate) fn record_transaction_rows_staged(count: usize) {
