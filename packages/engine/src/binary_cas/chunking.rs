@@ -1,6 +1,7 @@
 pub(super) const INLINE_BINARY_CAS_MAX_BYTES: usize = 32 * 1024;
 pub(super) const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BINARY_CAS_CHUNK_BYTES: usize = 4096 * 1024;
+const FASTCDC_WRITE_MAX_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BinaryCasChunking {
@@ -11,11 +12,11 @@ pub(crate) struct BinaryCasChunking {
 }
 
 impl BinaryCasChunking {
-    pub(crate) const fn fastcdc_1m_v1() -> Self {
+    pub(crate) const fn fastcdc_1m_v2() -> Self {
         Self {
             min_chunk_bytes: 256 * 1024,
             avg_chunk_bytes: 1024 * 1024,
-            max_chunk_bytes: MAX_BINARY_CAS_CHUNK_BYTES,
+            max_chunk_bytes: FASTCDC_WRITE_MAX_CHUNK_BYTES,
             single_chunk_fast_path_max_bytes: SINGLE_CHUNK_FAST_PATH_MAX_BYTES,
         }
     }
@@ -23,7 +24,7 @@ impl BinaryCasChunking {
 
 impl Default for BinaryCasChunking {
     fn default() -> Self {
-        Self::fastcdc_1m_v1()
+        Self::fastcdc_1m_v2()
     }
 }
 
@@ -68,7 +69,7 @@ mod tests {
 
         assert_eq!(chunking.min_chunk_bytes, 256 * 1024);
         assert_eq!(chunking.avg_chunk_bytes, 1024 * 1024);
-        assert_eq!(chunking.max_chunk_bytes, MAX_BINARY_CAS_CHUNK_BYTES);
+        assert_eq!(chunking.max_chunk_bytes, FASTCDC_WRITE_MAX_CHUNK_BYTES);
         assert_eq!(chunking.single_chunk_fast_path_max_bytes, 64 * 1024);
     }
 
@@ -94,6 +95,19 @@ mod tests {
         assert_ne!(
             fastcdc_chunk_ranges_with_chunking(&above_boundary, chunking),
             vec![(0, above_boundary.len())]
+        );
+    }
+
+    #[test]
+    fn multi_megabyte_payloads_cannot_collapse_to_one_rewritten_chunk() {
+        let payload = vec![b'a'; 3_500_000];
+        let ranges = fastcdc_chunk_ranges(&payload);
+
+        assert!(ranges.len() >= 4);
+        assert!(
+            ranges
+                .iter()
+                .all(|(start, end)| end - start <= FASTCDC_WRITE_MAX_CHUNK_BYTES)
         );
     }
 }
