@@ -42,7 +42,7 @@ debug = true
 inherits = "dev"
 debug = false
 debug-assertions = true
-opt-level = 1
+opt-level = 0
 
 [profile.test.build-override]
 inherits = "dev"
@@ -54,6 +54,7 @@ overflow-checks = true
 [profile.test.package."*"]
 debug = false
 debug-assertions = false
+opt-level = 1
 overflow-checks = false
 [profile.test.package."log"]
 debug-assertions = true
