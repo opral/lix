@@ -89,6 +89,7 @@ cargo test -p lix_sdk_tests --test e2e \
 
 The second command builds and installs the real Wasm component, imports an
 exact 10 MiB / 39,870-property fixture through the host and Canonical ABI, then
-applies one provenance-backed byte edit. It gates exact materialized bytes,
-one semantic change, zero warm full-blob scans or source reads, a sub-64 KiB
-warm boundary payload, and the production 128 MiB guest-memory ceiling.
+applies one verified-cache-backed provenance byte edit. It gates exact
+materialized bytes, one semantic change, zero warm full-blob scans or source
+reads, a sub-64 KiB warm boundary payload, and the production 128 MiB
+guest-memory ceiling.

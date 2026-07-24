@@ -209,11 +209,20 @@ an exact 10 MiB flat fixture with 39,870 properties and one byte changed in one
 property. It installs the production Wasm component, verifies the materialized
 bytes and affected semantic member, and requires one sparse semantic change,
 zero warm source reads, and less than 64 KiB across the warm component
-boundary. One recorded gate execution reported 2,412.528 ms cold hydration,
-26,673,152 bytes (25.4375 MiB) guest high-water, 18.993 ms for the warm engine
-transition, and 418 warm boundary bytes. These are single-run acceptance
-measurements, not end-to-end request latency or latency percentiles; provenance
-validation is intentionally measured separately from the transition.
+boundary.
+
+The remote blob-splice transport keeps a complete cache base as an opaque
+SHA-256-verified immutable blob. It reconstructs and hashes a successor once,
+then shares that payload with SQL, splice provenance, and the successor cache;
+it never accepts caller-supplied digest or splice metadata without this proof.
+An isolated 10 MiB JSON / one-byte-edit release benchmark measured the prior
+reconstruct + rehash + validation + cache-copy path at 32.250 ms median and
+the verified shared-payload path at 7.494 ms median (4.30× faster). It excludes
+network, client-side splice discovery, SQL, and CAS persistence. A later real
+Wasm gate execution measured 2,339.552 ms cold hydration, 7.543 ms verified
+transport reconstruction, 18.252 ms warm engine transition, 25.796 ms total
+warm request work, 26,673,152-byte guest high-water, and 418 warm boundary
+bytes. These are single-run acceptance measurements, not latency percentiles.
 
 An N=10 authorship evaluation of the immediately preceding WIT surface
 completed successfully for every participant, with median final score 76 (p25

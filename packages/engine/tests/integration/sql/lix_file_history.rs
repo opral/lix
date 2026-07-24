@@ -1385,20 +1385,11 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_file_history_requires_as_of_commit_id,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        let error = session
-            .execute("SELECT id FROM lix_file_history", &[])
+simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
             .expect("main session should open"),
         &engine,
