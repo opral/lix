@@ -1,0 +1,739 @@
+//! End-to-end Markdown comparison using the same deterministic corpus, edit
+//! offsets, commit count, and unrelated-branch topology for Lix and Git.
+//! Git is reported both before and after explicit GC; Lix is measured after a
+//! clean close with its normal automatic storage maintenance.
+
+use lix_sdk::{
+    CreateBranchOptions, Lix, LixError, LocalFilesystem, MergeBranchOptions,
+    MergeBranchPreviewOptions, Storage, SwitchBranchOptions, Value, open_lix_with_storage,
+};
+use std::fs;
+use std::io::{Cursor, Write};
+use std::path::Path;
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+
+const DEFAULT_TARGET_BYTES: usize = 7 * 1024 * 1024 / 2;
+const DEFAULT_EDIT_SAMPLES: usize = 20;
+const DEFAULT_MERGE_SAMPLES: usize = 7;
+const DEFAULT_COLD_SAMPLES: usize = 5;
+const PARAGRAPH_BODY_BYTES: usize = 496;
+
+#[derive(Debug)]
+struct Corpus {
+    bytes: Vec<u8>,
+    edit_offsets: Vec<usize>,
+    texts: Vec<String>,
+}
+
+#[derive(Debug)]
+struct MarkdownNode {
+    id: String,
+    payload_json: String,
+}
+
+#[derive(Debug)]
+struct RepoSizes {
+    total_bytes: u64,
+    metadata_bytes: u64,
+}
+
+#[derive(Debug)]
+struct GitFixture {
+    root: tempfile::TempDir,
+}
+
+#[tokio::test]
+#[ignore = "manual Git versus Lix Markdown benchmark"]
+async fn markdown_git_semantic_entities_benchmark() {
+    let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
+    let edit_samples = env_usize("LIX_MARKDOWN_GIT_BENCH_EDIT_SAMPLES", DEFAULT_EDIT_SAMPLES);
+    let merge_samples = env_usize(
+        "LIX_MARKDOWN_GIT_BENCH_MERGE_SAMPLES",
+        DEFAULT_MERGE_SAMPLES,
+    );
+    let cold_samples = env_usize("LIX_MARKDOWN_GIT_BENCH_COLD_SAMPLES", DEFAULT_COLD_SAMPLES);
+    assert!(edit_samples > 0 && merge_samples > 0 && cold_samples > 0);
+
+    let corpus = markdown_corpus(target_bytes);
+    assert!(
+        corpus.texts.len() > edit_samples + merge_samples * 4,
+        "benchmark corpus must contain enough unrelated paragraphs"
+    );
+    let archive = build_markdown_v2_plugin_archive();
+
+    let lix_root = tempfile::tempdir().expect("create semantic Lix benchmark directory");
+    let baseline_lix = open_lix_with_filesystem(lix_root.path()).await;
+    install_plugin(&baseline_lix, "plugin_markdown_incremental_v2", &archive).await;
+    baseline_lix.close().await.expect("close baseline Lix");
+    let lix_fixed = lix_repo_sizes(lix_root.path());
+
+    let lix = open_lix_with_filesystem(lix_root.path()).await;
+    let lix_import_started = Instant::now();
+    write_file(&lix, "/benchmark.md", corpus.bytes.clone()).await;
+    let lix_import = lix_import_started.elapsed();
+    let file_id = file_id_at_path(&lix, "/benchmark.md").await;
+    let initial_nodes = markdown_paragraph_nodes(&lix, &file_id).await;
+    assert_eq!(initial_nodes.len(), corpus.texts.len());
+
+    let mut lix_semantic_edits = Vec::with_capacity(edit_samples);
+    let mut lix_main_state = corpus.bytes.clone();
+    for sample in 0..edit_samples {
+        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+        let replacement = edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
+        let payload = payload_with_replacement(
+            &initial_nodes[index].payload_json,
+            &corpus.texts[index],
+            replacement,
+        );
+        let started = Instant::now();
+        update_markdown_node(&lix, &file_id, &initial_nodes[index].id, payload).await;
+        lix_semantic_edits.push(started.elapsed());
+        lix_main_state[corpus.edit_offsets[index]] = replacement;
+    }
+    assert_same_bytes(
+        "Lix semantic edit trace",
+        &read_file(&lix, "/benchmark.md").await,
+        &lix_main_state,
+    );
+    let premerge_state = lix_main_state.clone();
+    lix.close().await.expect("close Lix history fixture");
+    let lix_history = lix_repo_sizes(lix_root.path());
+
+    let lix = open_lix_with_filesystem(lix_root.path()).await;
+    let mut lix_rejected_merges = Vec::with_capacity(merge_samples);
+    let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
+    for sample in 0..merge_samples {
+        let source = lix
+            .create_branch(CreateBranchOptions {
+                id: Some(format!("markdown-merge-source-{sample}")),
+                name: format!("Markdown merge source {sample}"),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create Lix merge source branch");
+        let target_index = corpus.texts.len() / 2 + sample * 2;
+        let source_index = corpus.texts.len() - 1 - sample * 2;
+        let target_payload = payload_with_replacement(
+            &initial_nodes[target_index].payload_json,
+            &corpus.texts[target_index],
+            edit_replacement(
+                corpus.bytes[corpus.edit_offsets[target_index]],
+                100 + sample,
+            ),
+        );
+        update_markdown_node(
+            &lix,
+            &file_id,
+            &initial_nodes[target_index].id,
+            target_payload,
+        )
+        .await;
+        lix_main_state[corpus.edit_offsets[target_index]] = edit_replacement(
+            corpus.bytes[corpus.edit_offsets[target_index]],
+            100 + sample,
+        );
+
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: source.id.clone(),
+        })
+        .await
+        .expect("switch to Lix merge source");
+        let source_payload = payload_with_replacement(
+            &initial_nodes[source_index].payload_json,
+            &corpus.texts[source_index],
+            edit_replacement(
+                corpus.bytes[corpus.edit_offsets[source_index]],
+                200 + sample,
+            ),
+        );
+        update_markdown_node(
+            &lix,
+            &file_id,
+            &initial_nodes[source_index].id,
+            source_payload,
+        )
+        .await;
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id.clone(),
+        })
+        .await
+        .expect("switch to Lix merge target");
+
+        let preview = lix
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: source.id.clone(),
+            })
+            .await
+            .expect("preview unrelated Lix Markdown entity merge");
+        assert_eq!(preview.conflicts.len(), 1);
+        assert_eq!(
+            preview.conflicts[0].schema_key, "lix_binary_blob_ref",
+            "only the derived materialized blob should conflict"
+        );
+        let started = Instant::now();
+        let error = lix
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: source.id,
+            })
+            .await
+            .expect_err("the current derived blob conflict must reject the merge");
+        lix_rejected_merges.push(started.elapsed());
+        assert_eq!(
+            error.code,
+            LixError::CODE_MERGE_CONFLICT,
+            "unexpected Lix merge rejection: {error:?}"
+        );
+    }
+    let lix_final = read_file(&lix, "/benchmark.md").await;
+    assert_same_bytes(
+        "failed merges must leave the Lix target branch unchanged",
+        &lix_final,
+        &lix_main_state,
+    );
+    lix.close().await.expect("close semantic Lix benchmark");
+    let lix_live = lix_repo_sizes(lix_root.path());
+
+    let byte_root = tempfile::tempdir().expect("create byte-path Lix benchmark directory");
+    let byte_lix = open_lix_with_filesystem(byte_root.path()).await;
+    install_plugin(&byte_lix, "plugin_markdown_incremental_v2", &archive).await;
+    write_file(&byte_lix, "/benchmark.md", corpus.bytes.clone()).await;
+    let mut byte_state = corpus.bytes.clone();
+    let mut lix_byte_edits = Vec::with_capacity(edit_samples);
+    for sample in 0..edit_samples {
+        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+        byte_state[corpus.edit_offsets[index]] =
+            edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
+        let started = Instant::now();
+        write_file(&byte_lix, "/benchmark.md", byte_state.clone()).await;
+        lix_byte_edits.push(started.elapsed());
+    }
+    assert_same_bytes(
+        "Lix byte path must retain the exact edited Markdown",
+        &read_file(&byte_lix, "/benchmark.md").await,
+        &byte_state,
+    );
+    byte_lix.close().await.expect("close byte-path Lix");
+
+    let mut git = GitFixture::new();
+    let git_fixed = git.repo_sizes();
+    let git_import_started = Instant::now();
+    git.write_worktree(&corpus.bytes);
+    git.commit_all("initial Markdown corpus");
+    let git_import = git_import_started.elapsed();
+
+    let mut git_state = corpus.bytes.clone();
+    let mut git_edits = Vec::with_capacity(edit_samples);
+    for sample in 0..edit_samples {
+        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+        git_state[corpus.edit_offsets[index]] =
+            edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
+        let started = Instant::now();
+        git.write_worktree(&git_state);
+        git.commit_all(&format!("edit paragraph {index}"));
+        git_edits.push(started.elapsed());
+    }
+    assert_same_bytes(
+        "Git and Lix must match after the identical pre-merge edit trace",
+        &git_state,
+        &premerge_state,
+    );
+    let git_history_live = git.repo_sizes();
+    let git_gc_started = Instant::now();
+    git.run(["gc", "--prune=now"]);
+    let git_gc = git_gc_started.elapsed();
+    let git_history_packed = git.repo_sizes();
+
+    let mut git_merges = Vec::with_capacity(merge_samples);
+    for sample in 0..merge_samples {
+        let branch = format!("markdown-merge-source-{sample}");
+        git.run(["branch", branch.as_str()]);
+        let target_index = corpus.texts.len() / 2 + sample * 2;
+        let source_index = corpus.texts.len() - 1 - sample * 2;
+
+        git_state[corpus.edit_offsets[target_index]] = edit_replacement(
+            corpus.bytes[corpus.edit_offsets[target_index]],
+            100 + sample,
+        );
+        git.write_worktree(&git_state);
+        git.commit_all(&format!("target edit {sample}"));
+
+        git.run(["switch", "--quiet", branch.as_str()]);
+        let mut source_state = git.read_worktree();
+        source_state[corpus.edit_offsets[source_index]] = edit_replacement(
+            corpus.bytes[corpus.edit_offsets[source_index]],
+            200 + sample,
+        );
+        git.write_worktree(&source_state);
+        git.commit_all(&format!("source edit {sample}"));
+        git.run(["switch", "--quiet", "main"]);
+
+        let started = Instant::now();
+        git.run([
+            "merge",
+            "--quiet",
+            "--no-ff",
+            branch.as_str(),
+            "-m",
+            &format!("merge unrelated paragraph {sample}"),
+        ]);
+        git_merges.push(started.elapsed());
+        git_state[corpus.edit_offsets[source_index]] = edit_replacement(
+            corpus.bytes[corpus.edit_offsets[source_index]],
+            200 + sample,
+        );
+        assert_same_bytes(
+            "Git merge must contain both unrelated paragraph edits",
+            &git.read_worktree(),
+            &git_state,
+        );
+    }
+
+    let git_live = git.repo_sizes();
+
+    let lix_cold = cold_lix_reads(lix_root.path(), &lix_main_state, cold_samples).await;
+    let git_cold = git.cold_object_reads(&git_state, cold_samples);
+
+    print_duration_metric("initial_import", "lix-semantic", &[lix_import]);
+    print_duration_metric("initial_import", "git", &[git_import]);
+    print_duration_metric("sparse_edit_commit", "lix-byte", &lix_byte_edits);
+    print_duration_metric("sparse_edit_commit", "lix-semantic", &lix_semantic_edits);
+    print_duration_metric("sparse_edit_commit", "git", &git_edits);
+    print_duration_metric(
+        "unrelated_entity_merge_rejected",
+        "lix-semantic",
+        &lix_rejected_merges,
+    );
+    print_duration_metric("unrelated_entity_merge", "git", &git_merges);
+    print_duration_metric("cold_open_read", "lix-semantic", &lix_cold);
+    print_duration_metric("cold_object_read", "git", &git_cold);
+    print_duration_metric("maintenance_gc", "git", &[git_gc]);
+
+    print_storage_metric("fixed", "lix", &lix_fixed);
+    print_storage_metric("history-live", "lix", &lix_history);
+    print_storage_metric("post-rejected-merges", "lix", &lix_live);
+    print_storage_metric("fixed", "git", &git_fixed);
+    print_storage_metric("history-live", "git", &git_history_live);
+    print_storage_metric("history-packed", "git", &git_history_packed);
+    print_storage_metric("post-successful-merges", "git", &git_live);
+    eprintln!(
+        "markdown_git_bench corpus_bytes={} paragraphs={} edit_samples={} merge_samples={} \
+         lix_incremental_total_bytes={} lix_incremental_metadata_bytes={} \
+         git_live_incremental_total_bytes={} git_live_incremental_metadata_bytes={} \
+         git_packed_incremental_total_bytes={} git_packed_incremental_metadata_bytes={}",
+        corpus.bytes.len(),
+        corpus.texts.len(),
+        edit_samples,
+        merge_samples,
+        lix_history
+            .total_bytes
+            .saturating_sub(lix_fixed.total_bytes),
+        lix_history
+            .metadata_bytes
+            .saturating_sub(lix_fixed.metadata_bytes),
+        git_history_live
+            .total_bytes
+            .saturating_sub(git_fixed.total_bytes),
+        git_history_live
+            .metadata_bytes
+            .saturating_sub(git_fixed.metadata_bytes),
+        git_history_packed
+            .total_bytes
+            .saturating_sub(git_fixed.total_bytes),
+        git_history_packed
+            .metadata_bytes
+            .saturating_sub(git_fixed.metadata_bytes),
+    );
+}
+
+impl GitFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create Git benchmark directory");
+        let fixture = Self { root };
+        fixture.run(["init", "--quiet", "--initial-branch=main"]);
+        for (key, value) in [
+            ("user.name", "Lix benchmark"),
+            ("user.email", "benchmark@lix.dev"),
+            ("commit.gpgSign", "false"),
+            ("gc.auto", "0"),
+            ("core.autocrlf", "false"),
+            ("core.fsync", "none"),
+        ] {
+            fixture.run(["config", key, value]);
+        }
+        fixture
+    }
+
+    fn run<const N: usize>(&self, args: [&str; N]) -> Output {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(self.root.path())
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .output()
+            .expect("run Git command");
+        assert!(
+            output.status.success(),
+            "Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn write_worktree(&self, bytes: &[u8]) {
+        fs::write(self.root.path().join("benchmark.md"), bytes).expect("write Git worktree file");
+    }
+
+    fn read_worktree(&self) -> Vec<u8> {
+        fs::read(self.root.path().join("benchmark.md")).expect("read Git worktree file")
+    }
+
+    fn commit_all(&mut self, message: &str) {
+        self.run(["add", "--", "benchmark.md"]);
+        self.run(["commit", "--quiet", "-m", message]);
+    }
+
+    fn repo_sizes(&self) -> RepoSizes {
+        RepoSizes {
+            total_bytes: directory_bytes(self.root.path()),
+            metadata_bytes: directory_bytes(&self.root.path().join(".git")),
+        }
+    }
+
+    fn cold_object_reads(&self, expected: &[u8], samples: usize) -> Vec<Duration> {
+        let mut durations = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = Instant::now();
+            let output = self.run(["show", "HEAD:benchmark.md"]);
+            durations.push(started.elapsed());
+            assert_same_bytes("Git cold object read", &output.stdout, expected);
+        }
+        durations
+    }
+}
+
+async fn cold_lix_reads(root: &Path, expected: &[u8], samples: usize) -> Vec<Duration> {
+    let mut durations = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        let lix = open_lix_with_filesystem(root).await;
+        let actual = read_file(&lix, "/benchmark.md").await;
+        durations.push(started.elapsed());
+        assert_same_bytes("Lix cold read", &actual, expected);
+        lix.close().await.expect("close cold Lix sample");
+    }
+    durations
+}
+
+fn markdown_corpus(target_bytes: usize) -> Corpus {
+    let mut bytes = Vec::with_capacity(target_bytes + 512);
+    let mut edit_offsets = Vec::new();
+    let mut texts = Vec::new();
+    let paragraph_bytes = 8 + PARAGRAPH_BODY_BYTES + 2;
+    let paragraph_count = target_bytes.div_ceil(paragraph_bytes);
+    for index in 0..paragraph_count {
+        let mut text = format!("P{index:06} ");
+        text.push_str(&paragraph_body(index));
+        let offset = bytes.len() + 8;
+        edit_offsets.push(offset);
+        texts.push(text.clone());
+        bytes.extend_from_slice(text.as_bytes());
+        if index + 1 == paragraph_count {
+            bytes.push(b'\n');
+        } else {
+            bytes.extend_from_slice(b"\n\n");
+        }
+    }
+    Corpus {
+        bytes,
+        edit_offsets,
+        texts,
+    }
+}
+
+fn spread_index(sample: usize, samples: usize, upper: usize) -> usize {
+    ((sample + 1) * upper / (samples + 1)).max(1)
+}
+
+fn paragraph_body(index: usize) -> String {
+    const WORDS: &[&str] = &[
+        "amber", "branch", "canvas", "delta", "ember", "forest", "gentle", "harbor", "island",
+        "jungle", "kernel", "lantern", "meadow", "native", "orbit", "paper", "quiet", "river",
+        "silver", "timber", "update", "violet", "window", "yellow",
+    ];
+    let mut body = String::with_capacity(PARAGRAPH_BODY_BYTES);
+    let mut cursor = index.wrapping_mul(17);
+    while body.len() < PARAGRAPH_BODY_BYTES {
+        if !body.is_empty() {
+            body.push(' ');
+        }
+        body.push_str(WORDS[cursor % WORDS.len()]);
+        cursor = cursor.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+    }
+    body.truncate(PARAGRAPH_BODY_BYTES);
+    if body.ends_with(' ') {
+        body.pop();
+        body.push('x');
+    }
+    body
+}
+
+fn edit_replacement(original: u8, sample: usize) -> u8 {
+    assert!(original.is_ascii_lowercase());
+    b'a' + ((original - b'a' + 1 + u8::try_from(sample % 25).expect("bounded replacement")) % 26)
+}
+
+fn payload_with_replacement(payload: &str, original_text: &str, replacement: u8) -> String {
+    let mut expected = original_text.as_bytes().to_vec();
+    expected[8] = replacement;
+    let replacement_text = String::from_utf8(expected).expect("replacement remains UTF-8");
+    let mut value: serde_json::Value =
+        serde_json::from_str(payload).expect("Markdown payload should be JSON");
+    assert!(
+        replace_first_text_value(&mut value, &replacement_text),
+        "Markdown paragraph payload must contain a text inline"
+    );
+    serde_json::to_string(&value).expect("serialize updated Markdown payload")
+}
+
+fn replace_first_text_value(value: &mut serde_json::Value, replacement: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                && object
+                    .get("value")
+                    .is_some_and(serde_json::Value::is_string)
+            {
+                object.insert(
+                    "value".to_owned(),
+                    serde_json::Value::String(replacement.to_owned()),
+                );
+                return true;
+            }
+            object
+                .values_mut()
+                .any(|child| replace_first_text_value(child, replacement))
+        }
+        serde_json::Value::Array(array) => array
+            .iter_mut()
+            .any(|child| replace_first_text_value(child, replacement)),
+        _ => false,
+    }
+}
+
+async fn markdown_paragraph_nodes<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    file_id: &str,
+) -> Vec<MarkdownNode>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "SELECT id, payload_json FROM markdown_node_v2 \
+         WHERE kind = 'paragraph' AND lixcol_file_id = $1 ORDER BY order_key, id",
+        &[Value::Text(file_id.to_owned())],
+    )
+    .await
+    .expect("query Markdown paragraph entities")
+    .rows()
+    .iter()
+    .map(|row| MarkdownNode {
+        id: row.get::<String>("id").expect("Markdown ID should be text"),
+        payload_json: row
+            .get::<String>("payload_json")
+            .expect("Markdown payload should be text"),
+    })
+    .collect()
+}
+
+async fn update_markdown_node<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    file_id: &str,
+    id: &str,
+    payload_json: String,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let result = lix
+        .execute(
+            "UPDATE markdown_node_v2 SET payload_json = $1 \
+             WHERE id = $2 AND lixcol_file_id = $3",
+            &[
+                Value::Text(payload_json),
+                Value::Text(id.to_owned()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await
+        .expect("update Markdown semantic entity");
+    assert_eq!(result.rows_affected(), 1);
+}
+
+async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {
+    let storage = LocalFilesystem::open(path)
+        .await
+        .expect("open Lix filesystem");
+    open_lix_with_storage(storage)
+        .await
+        .expect("open Lix workspace")
+}
+
+async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive: &[u8])
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    write_file(
+        lix,
+        &format!("/.lix/plugins/{key}.lixplugin"),
+        archive.to_vec(),
+    )
+    .await;
+}
+
+async fn write_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, data: Vec<u8>)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[Value::Text(path.to_owned()), Value::Blob(data.into())],
+    )
+    .await
+    .expect("write benchmark file");
+}
+
+async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "SELECT data FROM lix_file WHERE path = $1",
+        &[Value::Text(path.to_owned())],
+    )
+    .await
+    .expect("read benchmark file")
+    .rows()[0]
+        .get::<Vec<u8>>("data")
+        .expect("benchmark file should be bytes")
+}
+
+async fn file_id_at_path<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> String
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "SELECT id FROM lix_file WHERE path = $1",
+        &[Value::Text(path.to_owned())],
+    )
+    .await
+    .expect("query benchmark file ID")
+    .rows()[0]
+        .get::<String>("id")
+        .expect("benchmark file ID should be text")
+}
+
+fn build_markdown_v2_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!(
+        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
+    ));
+    let wasm = fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read Markdown v2 component at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/markdown-v2/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/markdown_node_v2.json",
+            include_str!("../../../plugins/markdown-v2/schema/markdown_node_v2.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer
+            .start_file(path, options)
+            .expect("start plugin entry");
+        writer.write_all(bytes).expect("write plugin entry");
+    }
+    writer
+        .finish()
+        .expect("finish Markdown plugin archive")
+        .into_inner()
+}
+
+fn lix_repo_sizes(root: &Path) -> RepoSizes {
+    RepoSizes {
+        total_bytes: directory_bytes(root),
+        metadata_bytes: directory_bytes(&root.join(".lix")),
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    fs::read_dir(path)
+        .expect("read benchmark directory")
+        .map(|entry| directory_bytes(&entry.expect("read benchmark entry").path()))
+        .sum()
+}
+
+fn print_duration_metric(operation: &str, system: &str, samples: &[Duration]) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    eprintln!(
+        "markdown_git_bench duration operation={operation} system={system} samples={} \
+         p50_ms={:.3} p95_ms={:.3}",
+        sorted.len(),
+        percentile(&sorted, 50).as_secs_f64() * 1_000.0,
+        percentile(&sorted, 95).as_secs_f64() * 1_000.0,
+    );
+}
+
+fn print_storage_metric(state: &str, system: &str, sizes: &RepoSizes) {
+    eprintln!(
+        "markdown_git_bench storage state={state} system={system} total_bytes={} metadata_bytes={}",
+        sizes.total_bytes, sizes.metadata_bytes,
+    );
+}
+
+fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
+    let index = ((sorted.len() * percentile).div_ceil(100)).saturating_sub(1);
+    sorted[index]
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn assert_same_bytes(label: &str, actual: &[u8], expected: &[u8]) {
+    let mismatch = actual
+        .iter()
+        .zip(expected)
+        .position(|(actual, expected)| actual != expected);
+    assert!(
+        mismatch.is_none() && actual.len() == expected.len(),
+        "{label}: first_mismatch={mismatch:?} actual_len={} expected_len={} \
+         actual_byte={:?} expected_byte={:?}",
+        actual.len(),
+        expected.len(),
+        mismatch.and_then(|index| actual.get(index)),
+        mismatch.and_then(|index| expected.get(index)),
+    );
+}

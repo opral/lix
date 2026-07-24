@@ -1,4 +1,4 @@
-use crate::markdown_file::{ParsedMarkdown, parse_file, render_tree};
+use crate::markdown_file::{ParsedMarkdown, parse_file, parse_markdown_source, render_tree};
 use crate::model::{
     InlineNode, NodeKind, NodeSnapshot, NodeTree, Projection, parse_inline_payload,
     replace_column_ids, semantic_payload,
@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) const PARSED_ROOT_ID: &str = "parsed-markdown-root";
@@ -1448,6 +1449,7 @@ pub struct ByteEdit {
 pub struct Document {
     state: Arc<Vec<EntityState>>,
     bytes: Arc<Vec<u8>>,
+    top_level_ranges: Arc<Vec<Range<usize>>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1649,6 +1651,37 @@ fn minimal_byte_edit(before: &[u8], after: Vec<u8>) -> Vec<ByteEdit> {
     }]
 }
 
+fn simple_top_level_ranges(root: &NodeTree, bytes: &[u8]) -> Vec<Range<usize>> {
+    if root.node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let separator = bytes[start..]
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|relative| start + relative);
+        let mut end = separator.unwrap_or(bytes.len());
+        if separator.is_none() && end > start && bytes[end - 1] == b'\n' {
+            end -= 1;
+        }
+        if end == start {
+            return Vec::new();
+        }
+        ranges.push(start..end);
+        let Some(separator) = separator else {
+            break;
+        };
+        start = separator + 2;
+    }
+    if ranges.len() != root.children.len() {
+        return Vec::new();
+    }
+    ranges
+}
+
 impl Document {
     pub fn open_file(
         bytes: Vec<u8>,
@@ -1659,7 +1692,10 @@ impl Document {
             filename: path.map(ToOwned::to_owned),
             data: bytes.clone(),
         };
-        let detected = MarkdownPlugin::detect_changes_with_namespace(Vec::new(), file, namespace)?;
+        let mut parsed = parse_file(&file)?;
+        retain_noncanonical_source(&mut parsed, &file.data)?;
+        let top_level_ranges = parsed.top_level_ranges.clone();
+        let detected = detect_changes_for_markdown(&Projection::default(), parsed, namespace)?;
         let state = apply_detected_changes(&[], &detected);
         let changes = detected
             .into_iter()
@@ -1669,6 +1705,7 @@ impl Document {
             Self {
                 state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                top_level_ranges: Arc::new(top_level_ranges),
             },
             changes,
         ))
@@ -1692,7 +1729,10 @@ impl Document {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bytes = MarkdownPlugin::render(state.clone())?;
+        let projection = Projection::from_entity_state(state.iter().cloned())?;
+        let root = projection.to_tree()?;
+        let bytes = render_tree_with_lexical_fallback(&root)?;
+        let top_level_ranges = simple_top_level_ranges(&root, &bytes);
         let edits = if bytes.is_empty() {
             Vec::new()
         } else {
@@ -1706,6 +1746,7 @@ impl Document {
             Self {
                 state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                top_level_ranges: Arc::new(top_level_ranges),
             },
             edits,
         ))
@@ -1721,14 +1762,24 @@ impl Document {
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
         let bytes = apply_input_splices(&self.bytes, splices)?;
-        let detected = MarkdownPlugin::detect_changes_with_namespace(
-            self.state.as_ref().clone(),
-            File {
+        let (detected, top_level_ranges) = if let Some(incremental) =
+            self.try_paragraph_replacement(splices, &bytes, namespace)?
+        {
+            incremental
+        } else {
+            let file = File {
                 filename: None,
                 data: bytes.clone(),
-            },
-            namespace,
-        )?;
+            };
+            let before = Projection::from_entity_state(self.state.iter().cloned())?;
+            let mut parsed = parse_file(&file)?;
+            retain_noncanonical_source(&mut parsed, &file.data)?;
+            let top_level_ranges = parsed.top_level_ranges.clone();
+            (
+                detect_changes_for_markdown(&before, parsed, namespace)?,
+                top_level_ranges,
+            )
+        };
         let state = apply_detected_changes(&self.state, &detected);
         let changes = detected
             .into_iter()
@@ -1738,6 +1789,7 @@ impl Document {
             Self {
                 state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                top_level_ranges: Arc::new(top_level_ranges),
             },
             changes,
         ))
@@ -1752,15 +1804,204 @@ impl Document {
             .map(entity_change_to_detected)
             .collect::<Result<Vec<_>, _>>()?;
         let state = apply_detected_changes(&self.state, &detected);
-        let bytes = MarkdownPlugin::render(state.clone())?;
+        if let Some((bytes, top_level_ranges, edits)) =
+            self.try_paragraph_entity_change(&detected)?
+        {
+            return Ok((
+                Self {
+                    state: Arc::new(state),
+                    bytes: Arc::new(bytes),
+                    top_level_ranges: Arc::new(top_level_ranges),
+                },
+                edits,
+            ));
+        }
+        let projection = Projection::from_entity_state(state.iter().cloned())?;
+        let root = projection.to_tree()?;
+        let bytes = render_tree_with_lexical_fallback(&root)?;
+        let top_level_ranges = simple_top_level_ranges(&root, &bytes);
         let edits = minimal_byte_edit(&self.bytes, bytes.clone());
         Ok((
             Self {
                 state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                top_level_ranges: Arc::new(top_level_ranges),
             },
             edits,
         ))
+    }
+
+    fn try_paragraph_entity_change(
+        &self,
+        changes: &[DetectedChange],
+    ) -> Result<Option<(Vec<u8>, Vec<Range<usize>>, Vec<ByteEdit>)>, PluginError> {
+        let [change] = changes else {
+            return Ok(None);
+        };
+        let Some(snapshot_content) = &change.snapshot_content else {
+            return Ok(None);
+        };
+        let projection = Projection::from_entity_state(self.state.iter().cloned())?;
+        let root = projection.to_tree()?;
+        if root.node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
+            return Ok(None);
+        }
+        let Some((block_index, old)) = root
+            .children
+            .iter()
+            .enumerate()
+            .find(|(_, child)| change.entity_pk == [child.node.id.clone()])
+        else {
+            return Ok(None);
+        };
+        let Some(range) = self.top_level_ranges.get(block_index) else {
+            return Ok(None);
+        };
+        let new: NodeSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
+            PluginError::InvalidInput(format!(
+                "invalid Markdown paragraph snapshot for incremental rendering: {error}"
+            ))
+        })?;
+        if old.node.kind != NodeKind::Paragraph
+            || new.kind != NodeKind::Paragraph
+            || new.id != old.node.id
+            || new.parent_id != old.node.parent_id
+            || new.order_key != old.node.order_key
+        {
+            return Ok(None);
+        }
+
+        let mut fragment_root = root.node.clone();
+        let format = fragment_root.format.as_object_mut().ok_or_else(|| {
+            PluginError::Internal("Markdown document format must be an object".into())
+        })?;
+        format.insert("final_newline".to_owned(), serde_json::Value::Bool(false));
+        let fragment = render_tree(&NodeTree {
+            node: fragment_root,
+            children: vec![NodeTree {
+                node: new,
+                children: Vec::new(),
+            }],
+        })?;
+        let mut bytes =
+            Vec::with_capacity(self.bytes.len() - (range.end - range.start) + fragment.len());
+        bytes.extend_from_slice(&self.bytes[..range.start]);
+        bytes.extend_from_slice(&fragment);
+        bytes.extend_from_slice(&self.bytes[range.end..]);
+
+        let delta = isize::try_from(fragment.len()).expect("usize fits isize")
+            - isize::try_from(range.end - range.start).expect("usize fits isize");
+        let mut top_level_ranges = self.top_level_ranges.as_ref().clone();
+        top_level_ranges[block_index].end = top_level_ranges[block_index].start + fragment.len();
+        if delta != 0 {
+            for following in &mut top_level_ranges[block_index + 1..] {
+                following.start = following.start.checked_add_signed(delta).ok_or_else(|| {
+                    PluginError::Internal("Markdown block range shift overflow".into())
+                })?;
+                following.end = following.end.checked_add_signed(delta).ok_or_else(|| {
+                    PluginError::Internal("Markdown block range shift overflow".into())
+                })?;
+            }
+        }
+        let edits = vec![ByteEdit {
+            offset: u64::try_from(range.start).expect("usize fits u64"),
+            delete_len: u64::try_from(range.end - range.start).expect("usize fits u64"),
+            insert: Arc::new(fragment),
+        }];
+        Ok(Some((bytes, top_level_ranges, edits)))
+    }
+
+    fn try_paragraph_replacement(
+        &self,
+        splices: &[InputSplice<'_>],
+        bytes: &[u8],
+        namespace: IdNamespace,
+    ) -> Result<Option<(Vec<DetectedChange>, Vec<Range<usize>>)>, PluginError> {
+        let [splice] = splices else {
+            return Ok(None);
+        };
+        if splice.delete_len != 1
+            || splice.insert.len() != 1
+            || !splice.insert[0].is_ascii_alphanumeric()
+        {
+            return Ok(None);
+        }
+        let offset = usize::try_from(splice.offset)
+            .map_err(|_| PluginError::InvalidInput("Markdown splice offset is too large".into()))?;
+        if !self
+            .bytes
+            .get(offset)
+            .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return Ok(None);
+        }
+        let Some((block_index, range)) = self
+            .top_level_ranges
+            .iter()
+            .enumerate()
+            .find(|(_, range)| range.start <= offset && offset + 1 <= range.end)
+        else {
+            return Ok(None);
+        };
+
+        let before = Projection::from_entity_state(self.state.iter().cloned())?;
+        let before_root = before.to_tree()?;
+        if before_root
+            .node
+            .format
+            .get(LEXICAL_FALLBACK_FIELD)
+            .is_some()
+            || before_root
+                .children
+                .get(block_index)
+                .is_none_or(|child| child.node.kind != NodeKind::Paragraph)
+        {
+            return Ok(None);
+        }
+
+        let fragment = std::str::from_utf8(&bytes[range.clone()]).map_err(|error| {
+            PluginError::InvalidInput(format!(
+                "file.data must be valid UTF-8 for an incremental Markdown edit: {error}"
+            ))
+        })?;
+        let mut replacement = parse_markdown_source(fragment)?;
+        if replacement.root.children.len() != 1
+            || replacement.root.children[0].node.kind != NodeKind::Paragraph
+            || render_tree(&replacement.root)? != fragment.as_bytes()
+        {
+            return Ok(None);
+        }
+
+        let old = &before_root.children[block_index];
+        let mut new = replacement.root.children.remove(0);
+        let generated_ids = collect_generated_ids(&new);
+        let generated_node_id = new.node.id.clone();
+        new.node.id.clone_from(&old.node.id);
+        new.node.parent_id.clone_from(&old.node.parent_id);
+        new.node.order_key.clone_from(&old.node.order_key);
+        reconcile_inline_payload(old, &mut new)?;
+
+        let mut replacements = BTreeMap::from([(generated_node_id, new.node.id.clone())]);
+        let mut allocator = IdAllocator::new(namespace);
+        allocate_generated_ids(&mut new, &generated_ids, &mut allocator, &mut replacements);
+        replace_column_ids(&mut new.node.payload, &replacements);
+        let detected = if old.node == new.node {
+            Vec::new()
+        } else {
+            let snapshot_content = serde_json::to_string(&new.node).map_err(|error| {
+                PluginError::Internal(format!(
+                    "failed to serialize Markdown node '{}': {error}",
+                    new.node.id
+                ))
+            })?;
+            vec![DetectedChange {
+                entity_pk: vec![new.node.id.clone()],
+                schema_key: NODE_SCHEMA_KEY.to_owned(),
+                snapshot_content: Some(snapshot_content),
+                metadata: change_metadata(Some(&old.node), &new.node),
+            }]
+        };
+        Ok(Some((detected, self.top_level_ranges.as_ref().clone())))
     }
 
     #[cfg(test)]

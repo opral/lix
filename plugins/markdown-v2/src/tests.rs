@@ -170,6 +170,46 @@ fn localized_text_edit_emits_one_sparse_complete_entity_upsert() {
 }
 
 #[test]
+fn incremental_paragraph_edit_preserves_unrelated_entities_after_cold_reopen() {
+    let source = b"# Title\n\nAlpha paragraph\n\nBravo paragraph\n\nCharlie paragraph\n".to_vec();
+    let (_, initial) = Document::open_file(
+        source.clone(),
+        Some("incremental.md"),
+        IdNamespace::from_halves(1, 2),
+    )
+    .unwrap();
+    let initial_records = records(&initial);
+    let initial_ids = initial_records
+        .iter()
+        .map(|record| record.entity_pk.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let (document, _) = Document::open_entities(initial_records).unwrap();
+    let offset = source
+        .windows(b"Bravo".len())
+        .position(|window| window == b"Bravo")
+        .unwrap();
+
+    let (after, changes) = document
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(offset).unwrap(),
+                delete_len: 1,
+                insert: b"G",
+            }],
+            IdNamespace::from_halves(3, 4),
+        )
+        .unwrap();
+
+    assert_eq!(
+        after.accepted_bytes(),
+        b"# Title\n\nAlpha paragraph\n\nGravo paragraph\n\nCharlie paragraph\n"
+    );
+    assert_eq!(changes.len(), 1, "{changes:#?}");
+    assert!(changes[0].snapshot.is_some());
+    assert!(initial_ids.contains(&changes[0].entity_pk));
+}
+
+#[test]
 fn entity_edit_returns_a_minimal_file_splice_and_preserves_old_fork() {
     let source = b"Before\n\nUntouched\n".to_vec();
     let (document, initial) =
