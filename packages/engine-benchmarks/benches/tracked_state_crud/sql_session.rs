@@ -24,16 +24,22 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     update_all_sql_rows: Vec<String>,
     delete_all_sql: String,
     delete_one_by_pk_sql: String,
+    // Keep the storage path alive until after the session/storage is dropped.
+    _dir: tempfile::TempDir,
 }
 
 pub(crate) async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
     match profile.storage() {
-        ProfileStorage::SQLite(storage) => {
-            SqlFixture::SQLite(fixture_for_session(prepare_session(storage).await, rows))
-        }
-        ProfileStorage::RocksDB(storage) => {
-            SqlFixture::RocksDB(fixture_for_session(prepare_session(storage).await, rows))
-        }
+        ProfileStorage::SQLite { storage, _dir: dir } => SqlFixture::SQLite(fixture_for_session(
+            prepare_session(storage).await,
+            rows,
+            dir,
+        )),
+        ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
+            prepare_session(storage).await,
+            rows,
+            dir,
+        )),
     }
 }
 
@@ -176,6 +182,7 @@ where
 fn fixture_for_session<StorageImpl>(
     session: SessionContext<StorageImpl>,
     rows: &[WorkloadRow],
+    dir: tempfile::TempDir,
 ) -> GenericSqlFixture<StorageImpl>
 where
     StorageImpl: Storage,
@@ -195,6 +202,7 @@ where
             "DELETE FROM json_pointer WHERE path = '{}'",
             sql_string(rows[mid].path.as_str())
         ),
+        _dir: dir,
     }
 }
 

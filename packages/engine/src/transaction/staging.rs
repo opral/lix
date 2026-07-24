@@ -8,6 +8,7 @@
     clippy::unused_self
 )]
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -568,8 +569,11 @@ impl TransactionWriteBuffer {
         };
         let functions = self.functions.clone();
         let (rows, file_data_writes) = self.state_rows_from_stage_write(write);
-        reject_mixed_durability_rows_in_batch(&rows)?;
-        reject_duplicate_present_rows_in_batch(&rows)?;
+        let identities = rows
+            .iter()
+            .map(PreparedStateRowIdentity::from)
+            .collect::<Vec<_>>();
+        validate_batch_row_identities(&rows, &identities)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -595,15 +599,14 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged insert identity lock",
             )
         })?;
-        for row in &rows {
+        for (row, identity) in rows.iter().zip(&identities) {
             if row.global && row.branch_id != GLOBAL_BRANCH_ID {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     "global staged rows must use the global branch id",
                 ));
             }
-            let identity = PreparedStateRowIdentity::from(row);
-            let Some(RowSlot::State(index)) = by_identity_guard.get(&identity).copied() else {
+            let Some(RowSlot::State(index)) = by_identity_guard.get(identity).copied() else {
                 continue;
             };
             let Some(previous) = guard.get(index).and_then(Option::as_ref) else {
@@ -613,8 +616,7 @@ impl TransactionWriteBuffer {
                 return Err(mixed_durability_error(row));
             }
         }
-        for mut row in rows {
-            let identity = PreparedStateRowIdentity::from(&row);
+        for (mut row, identity) in rows.into_iter().zip(identities) {
             let is_insert = row_is_insert(mode, &row);
             if is_insert && by_identity_guard.contains_key(&identity) {
                 return Err(duplicate_insert_identity_error(&row));
@@ -933,15 +935,30 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
     }
 }
 
-fn reject_mixed_durability_rows_in_batch(rows: &[PreparedStateRow]) -> Result<(), LixError> {
-    let mut durability_by_identity = BTreeMap::<PreparedStateRowIdentity, bool>::new();
-    for row in rows {
-        let identity = PreparedStateRowIdentity::from(row);
-        if durability_by_identity
-            .insert(identity, row.untracked)
-            .is_some_and(|untracked| untracked != row.untracked)
-        {
-            return Err(mixed_durability_error(row));
+fn validate_batch_row_identities(
+    rows: &[PreparedStateRow],
+    identities: &[PreparedStateRowIdentity],
+) -> Result<(), LixError> {
+    debug_assert_eq!(rows.len(), identities.len());
+    let mut rows_by_identity =
+        BTreeMap::<&PreparedStateRowIdentity, (bool, Option<&PreparedStateRow>)>::new();
+
+    for (row, identity) in rows.iter().zip(identities) {
+        match rows_by_identity.entry(identity) {
+            Entry::Vacant(entry) => {
+                entry.insert((row.untracked, row.snapshot.as_ref().map(|_| row)));
+            }
+            Entry::Occupied(mut entry) => {
+                let (untracked, pending_present) = entry.get_mut();
+                if *untracked != row.untracked {
+                    return Err(mixed_durability_error(row));
+                }
+                if row.snapshot.is_none() {
+                    *pending_present = None;
+                } else if let Some(previous) = pending_present.replace(row) {
+                    return Err(duplicate_staged_present_row_error(row, previous));
+                }
+            }
         }
     }
     Ok(())
@@ -959,21 +976,6 @@ fn mixed_durability_error(row: &PreparedStateRow) -> LixError {
             row.schema_key, entity_pk, row.branch_id
         ),
     )
-}
-
-fn reject_duplicate_present_rows_in_batch(rows: &[PreparedStateRow]) -> Result<(), LixError> {
-    let mut pending_present_rows = BTreeMap::<PreparedStateRowIdentity, &PreparedStateRow>::new();
-    for row in rows {
-        let identity = PreparedStateRowIdentity::from(row);
-        if row.snapshot.is_none() {
-            pending_present_rows.remove(&identity);
-            continue;
-        }
-        if let Some(previous) = pending_present_rows.insert(identity, row) {
-            return Err(duplicate_staged_present_row_error(row, previous));
-        }
-    }
-    Ok(())
 }
 
 fn duplicate_staged_present_row_error(

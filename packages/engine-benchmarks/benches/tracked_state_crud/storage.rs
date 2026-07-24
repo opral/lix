@@ -21,8 +21,8 @@ impl StorageProfile {
 }
 
 pub(crate) enum ProfileStorage {
-    SQLite(SQLite),
-    RocksDB(RocksDB),
+    SQLite { storage: SQLite, _dir: TempDir },
+    RocksDB { storage: RocksDB, _dir: TempDir },
 }
 
 impl StorageProfile {
@@ -30,17 +30,15 @@ impl StorageProfile {
         match self {
             Self::SQLite => {
                 let dir = TempDir::new().expect("create sqlite bench tempdir");
-                ProfileStorage::SQLite(
-                    SQLite::open(dir.keep().join("bench.sqlite"))
-                        .expect("open sqlite bench storage"),
-                )
+                let storage = SQLite::open(dir.path().join("bench.sqlite"))
+                    .expect("open sqlite bench storage");
+                ProfileStorage::SQLite { storage, _dir: dir }
             }
             Self::RocksDB => {
                 let dir = TempDir::new().expect("create rocksdb bench tempdir");
-                ProfileStorage::RocksDB(
-                    RocksDB::open(dir.keep().join("bench.rocksdb"))
-                        .expect("open rocksdb bench storage"),
-                )
+                let storage = RocksDB::open(dir.path().join("bench.rocksdb"))
+                    .expect("open rocksdb bench storage");
+                ProfileStorage::RocksDB { storage, _dir: dir }
             }
         }
     }

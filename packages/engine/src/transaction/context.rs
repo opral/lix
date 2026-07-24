@@ -1578,6 +1578,21 @@ where
                 .await?,
         );
         let live_state = self.live_state.reader(&read);
+        if let Some(domain) = homogeneous_row_normalization_domain(&rows) {
+            let functions = self.functions.clone();
+            let catalog = self
+                .schema_resolver
+                .catalog_for_row_normalization(&live_state, &staged, &domain)
+                .await?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    let normalized =
+                        normalize_transaction_write_row(row, catalog, functions.clone())?;
+                    prepare_state_row(normalized, &functions, self.origin_key.clone())
+                })
+                .collect();
+        }
         let mut rows_by_scope = BTreeMap::<Domain, Vec<(usize, TransactionWriteRow)>>::new();
         for (index, row) in rows.into_iter().enumerate() {
             rows_by_scope
@@ -2270,6 +2285,27 @@ fn prepare_state_row(
         untracked: row.untracked,
         branch_id: row.branch_id,
     })
+}
+
+/// Returns the sole schema-catalog scope for a straightforward statement
+/// batch. The SQL path normally reaches this with one entity schema and one
+/// durability, so it can normalize rows in input order without allocating the
+/// generic scope/reordering maps. Schema registration stays on the generic
+/// path because registrations can change the catalog for later rows.
+fn homogeneous_row_normalization_domain(rows: &[TransactionWriteRow]) -> Option<Domain> {
+    let first = rows.first()?;
+    if first.schema_key == REGISTERED_SCHEMA_KEY {
+        return None;
+    }
+    let branch_id = first.schema_scope_branch_id();
+    let untracked = first.untracked;
+    rows.iter()
+        .all(|row| {
+            row.schema_key != REGISTERED_SCHEMA_KEY
+                && row.untracked == untracked
+                && row.schema_scope_branch_id() == branch_id
+        })
+        .then(|| Domain::schema_catalog(branch_id.to_string(), untracked))
 }
 
 fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestamp, LixError> {
