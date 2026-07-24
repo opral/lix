@@ -308,16 +308,22 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) async fn ensure_opening_snapshot_is_current(&self) -> Result<(), LixError> {
-        let current = self.storage.load_tracked_mutation_revision().await?;
-        if current == self.opening_tracked_mutation_revision {
-            return Ok(());
+    pub(crate) fn ensure_opening_snapshot_is_current(
+        &self,
+    ) -> impl Future<Output = Result<(), LixError>> + Send + 'static {
+        let storage = self.storage.clone();
+        let opening_revision = self.opening_tracked_mutation_revision.clone();
+        async move {
+            let current = storage.load_tracked_mutation_revision().await?;
+            if current == opening_revision {
+                return Ok(());
+            }
+            Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "transaction snapshot is stale because tracked state changed after it opened",
+            )
+            .with_hint("Retry the transaction against the latest committed state."))
         }
-        Err(LixError::new(
-            LixError::CODE_TRANSACTION_CONFLICT,
-            "transaction snapshot is stale because tracked state changed after it opened",
-        )
-        .with_hint("Retry the transaction against the latest committed state."))
     }
 
     /// Opens an execution-scoped staging area for SQL/provider hooks.

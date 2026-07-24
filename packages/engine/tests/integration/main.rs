@@ -14,7 +14,6 @@ mod fs_api;
 mod json_pointer_crud_storage;
 mod observe;
 mod observe_mutation_revision;
-mod plugin_registry_perf;
 mod sql;
 mod storage_accounting;
 mod transaction;
