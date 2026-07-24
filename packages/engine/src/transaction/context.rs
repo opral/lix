@@ -860,11 +860,11 @@ where
                     ),
                 )
             })?;
-        let mut cold_install: PluginActorColdInstall =
-            match cache.prepare_cold_open(actor_key, &semantic_root).await? {
-                PluginActorColdOpen::Ready(observation) => return Ok(observation),
-                PluginActorColdOpen::Build(cold_install) => cold_install,
-            };
+        let cold_open = cache.prepare_cold_open(actor_key, &semantic_root).await?;
+        let mut cold_install: PluginActorColdInstall = match cold_open {
+            PluginActorColdOpen::Ready(observation) => return Ok(observation),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
         let store_permit = cache.admit_cold_store(&mut cold_install)?;
         let snapshot = blob_row.snapshot_content.as_deref().ok_or_else(|| {
             LixError::new(
@@ -2814,7 +2814,6 @@ where
                 .insert(file_key.clone(), materialization_version);
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
-            continue;
         }
 
         for (file_key, group) in semantic_groups {

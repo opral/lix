@@ -1121,7 +1121,8 @@ mod tests {
         };
 
         let record_limits = WasmTransitionLimits {
-            max_record_bytes: EDIT_SPLICE_METADATA_BYTES as u32,
+            max_record_bytes: u32::try_from(EDIT_SPLICE_METADATA_BYTES)
+                .expect("edit splice metadata size should fit u32"),
             ..WasmTransitionLimits::default()
         };
         let mut validator = WasmEditDrainValidator::new(0, record_limits).unwrap();
@@ -1137,7 +1138,8 @@ mod tests {
         );
 
         let output_limits = WasmTransitionLimits {
-            max_record_bytes: (EDIT_SPLICE_METADATA_BYTES - 1) as u32,
+            max_record_bytes: u32::try_from(EDIT_SPLICE_METADATA_BYTES - 1)
+                .expect("edit splice metadata size should fit u32"),
             ..WasmTransitionLimits::default()
         };
         let mut validator = WasmEditDrainValidator::new(0, output_limits).unwrap();

@@ -687,14 +687,14 @@ where
     let mut output = Vec::with_capacity(prepared.len());
     for prepared_row in prepared {
         let data = if needs_data && prepared_row.descriptor.name.is_some() {
-            match prepared_row.blob_hash.as_deref() {
-                Some(blob_hash) => blob_bytes.get(blob_hash).cloned().flatten(),
+            prepared_row.blob_hash.as_deref().map_or_else(
                 // V2 plugin files persist their materialized bytes. A missing
                 // blob therefore has the same empty-file representation as a
                 // non-plugin file; history never invokes a semantic renderer
                 // while replaying durable materialized bytes.
-                None => Some(Vec::new()),
-            }
+                || Some(Vec::new()),
+                |blob_hash| blob_bytes.get(blob_hash).cloned().flatten(),
+            )
         } else {
             None
         };

@@ -1912,19 +1912,25 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     assert_eq!(unselected.rows_affected(), 1);
     assert_eq!(read_file(&lix, after_path).await.unwrap(), None);
     assert_eq!(read_file(&lix, raw_path).await.unwrap(), Some(edited));
-    let active_plugin_rows = lix
+    let active_table_rows = lix
         .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key IN ('csv_v2_table', 'csv_v2_row')",
+            "SELECT lixcol_file_id FROM csv_v2_table WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.clone())],
         )
         .await
         .unwrap();
-    assert_eq!(active_plugin_rows.len(), 0);
+    let active_row_rows = lix
+        .execute(
+            "SELECT lixcol_file_id FROM csv_v2_row WHERE lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_table_rows.len() + active_row_rows.len(), 0);
     let active_owner_rows = lix
         .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key = 'lix_key_value'",
+            "SELECT key FROM lix_key_value \
+             WHERE lixcol_file_id = $1 AND key = 'lix_plugin_owner_v2'",
             &[Value::Text(file_id)],
         )
         .await
@@ -2047,8 +2053,8 @@ where
 {
     let rows = lix
         .execute(
-            "SELECT entity_pk, snapshot_content FROM lix_state \
-             WHERE file_id = $1 AND schema_key = 'csv_v2_row'",
+            "SELECT lixcol_entity_pk, id, order_key, cells FROM csv_v2_row \
+             WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_string())],
         )
         .await
@@ -2058,17 +2064,12 @@ where
         .iter()
         .map(|row| {
             let entity_pk = row
-                .get::<serde_json::Value>("entity_pk")
+                .get::<serde_json::Value>("lixcol_entity_pk")
                 .unwrap()
                 .as_array()
                 .cloned()
                 .expect("csv_v2_row entity_pk must be an array");
-            let snapshot = row.get::<serde_json::Value>("snapshot_content").unwrap();
-            let id = snapshot
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .expect("csv_v2_row snapshot must have a string id")
-                .to_string();
+            let id = row.get::<String>("id").unwrap();
             assert_eq!(
                 entity_pk,
                 vec![serde_json::Value::String(id.clone())],
@@ -2076,14 +2077,11 @@ where
             );
             CsvV2Row {
                 id,
-                order_key: snapshot
-                    .get("order_key")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("csv_v2_row snapshot must have a string order_key")
-                    .to_string(),
-                cells: snapshot
-                    .get("cells")
-                    .and_then(serde_json::Value::as_array)
+                order_key: row.get::<String>("order_key").unwrap(),
+                cells: row
+                    .get::<serde_json::Value>("cells")
+                    .unwrap()
+                    .as_array()
                     .expect("csv_v2_row snapshot must have cells")
                     .iter()
                     .map(|cell| {
@@ -2128,8 +2126,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT entity_pk FROM lix_state \
-         WHERE file_id = $1 AND schema_key = 'lix_key_value'",
+        "SELECT key FROM lix_key_value WHERE lixcol_file_id = $1",
         &[Value::Text(file_id.to_string())],
     )
     .await
@@ -2137,11 +2134,8 @@ where
     .rows()
     .iter()
     .filter(|row| {
-        row.get::<serde_json::Value>("entity_pk")
+        row.get::<String>("key")
             .ok()
-            .and_then(|value| value.as_array().cloned())
-            .and_then(|parts| parts.into_iter().next())
-            .and_then(|part| part.as_str().map(str::to_string))
             .is_some_and(|key| key.starts_with("lix_plugin_id_namespace_v2:"))
     })
     .count()

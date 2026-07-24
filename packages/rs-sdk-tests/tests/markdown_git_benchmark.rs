@@ -39,6 +39,14 @@ struct RepoSizes {
 }
 
 #[derive(Debug)]
+struct ColdLixDurations {
+    total: Vec<Duration>,
+    storage_open: Vec<Duration>,
+    engine_open: Vec<Duration>,
+    materialized_read: Vec<Duration>,
+}
+
+#[derive(Debug)]
 struct GitFixture {
     root: tempfile::TempDir,
 }
@@ -300,7 +308,14 @@ async fn markdown_git_semantic_entities_benchmark() {
     print_duration_metric("sparse_edit_commit", "git", &git_edits);
     print_duration_metric("unrelated_entity_merge", "lix-semantic", &lix_merges);
     print_duration_metric("unrelated_entity_merge", "git", &git_merges);
-    print_duration_metric("cold_open_read", "lix-semantic", &lix_cold);
+    print_duration_metric("cold_open_read", "lix-semantic", &lix_cold.total);
+    print_duration_metric("cold_storage_open", "lix-semantic", &lix_cold.storage_open);
+    print_duration_metric("cold_engine_open", "lix-semantic", &lix_cold.engine_open);
+    print_duration_metric(
+        "cold_materialized_read",
+        "lix-semantic",
+        &lix_cold.materialized_read,
+    );
     print_duration_metric("cold_object_read", "git", &git_cold);
     print_duration_metric("maintenance_gc", "git", &[git_gc]);
     print_storage_metric("fixed", "lix", &lix_fixed);
@@ -377,14 +392,13 @@ impl GitFixture {
     }
 
     fn try_run<const N: usize>(&self, args: [&str; N]) -> Output {
-        let output = Command::new("git")
+        Command::new("git")
             .args(args)
             .current_dir(self.root.path())
             .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
             .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
             .output()
-            .expect("run Git command");
-        output
+            .expect("run Git command")
     }
 
     fn write_worktree(&self, bytes: &[u8]) {
@@ -419,17 +433,36 @@ impl GitFixture {
     }
 }
 
-async fn cold_lix_reads(root: &Path, expected: &[u8], samples: usize) -> Vec<Duration> {
-    let mut durations = Vec::with_capacity(samples);
+async fn cold_lix_reads(root: &Path, expected: &[u8], samples: usize) -> ColdLixDurations {
+    let mut total = Vec::with_capacity(samples);
+    let mut storage_open = Vec::with_capacity(samples);
+    let mut engine_open = Vec::with_capacity(samples);
+    let mut materialized_read = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        let lix = open_lix_with_filesystem(root).await;
+        let storage_started = Instant::now();
+        let storage = LocalFilesystem::open(root)
+            .await
+            .expect("open cold Lix filesystem");
+        storage_open.push(storage_started.elapsed());
+        let engine_started = Instant::now();
+        let lix = open_lix_with_storage(storage)
+            .await
+            .expect("open cold Lix workspace");
+        engine_open.push(engine_started.elapsed());
+        let read_started = Instant::now();
         let actual = read_file(&lix, "/benchmark.md").await;
-        durations.push(started.elapsed());
+        materialized_read.push(read_started.elapsed());
+        total.push(started.elapsed());
         assert_same_bytes("Lix cold read", &actual, expected);
         lix.close().await.expect("close cold Lix sample");
     }
-    durations
+    ColdLixDurations {
+        total,
+        storage_open,
+        engine_open,
+        materialized_read,
+    }
 }
 
 async fn semantic_table_merge_quality(archive: &[u8]) {

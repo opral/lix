@@ -1,8 +1,6 @@
 #![cfg(feature = "sqlite")]
 use lix_engine::run_storage_conformance;
-use lix_sdk::{
-    SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, Value, open_lix, open_lix_with_storage,
-};
+use lix_sdk::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, Value, open_lix_with_storage};
 use rusqlite::Connection;
 
 #[tokio::test]

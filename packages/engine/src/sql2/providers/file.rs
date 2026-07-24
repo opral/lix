@@ -4329,11 +4329,11 @@ async fn cold_open_materialized_v2_actor(
     // Another reader may have populated this actor while we waited. Recheck
     // under the shared cold gate before scanning full semantic state or
     // instantiating another Store.
-    let mut cold_install: PluginActorColdInstall =
-        match cache.prepare_cold_open(actor_key, semantic_root).await? {
-            PluginActorColdOpen::Ready(observation) => return Ok(observation),
-            PluginActorColdOpen::Build(cold_install) => cold_install,
-        };
+    let cold_open = cache.prepare_cold_open(actor_key, semantic_root).await?;
+    let mut cold_install: PluginActorColdInstall = match cold_open {
+        PluginActorColdOpen::Ready(observation) => return Ok(observation),
+        PluginActorColdOpen::Build(cold_install) => cold_install,
+    };
     let store_permit = cache.admit_cold_store(&mut cold_install)?;
     let limits = WasmTransitionLimits::default();
     let factory = resolve_v2_factory(&plugin_render.host, blob_reader, plugin).await?;
@@ -4626,7 +4626,8 @@ async fn plugin_render_context_with_branches(
         });
     let mut owners_by_file = BTreeMap::new();
     let mut owner_change_ids_by_file = BTreeMap::new();
-    for (branch_id, file_ids, rows) in try_join_all(owner_reads).await? {
+    let owner_rows = try_join_all(owner_reads).await?;
+    for (branch_id, file_ids, rows) in owner_rows {
         for row in rows {
             let Some(file_id) = row.file_id.as_deref() else {
                 continue;

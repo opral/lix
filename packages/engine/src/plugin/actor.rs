@@ -199,7 +199,8 @@ impl PluginActorCache {
     /// commit point, so waiting could deadlock the transaction against itself.
     pub(crate) fn admit_store(&self) -> Result<PluginActorStorePermit, LixError> {
         loop {
-            if let Some(permit) = self.try_acquire_store()? {
+            let permit = self.try_acquire_store()?;
+            if let Some(permit) = permit {
                 return Ok(permit);
             }
             if !self.evict_one_idle_slot() {
@@ -216,10 +217,11 @@ impl PluginActorCache {
         &self,
         cold_install: &mut PluginActorColdInstall,
     ) -> Result<PluginActorStorePermit, LixError> {
-        if let Some(permit) = self.try_acquire_store()? {
+        let permit = self.try_acquire_store()?;
+        if let Some(permit) = permit {
             return Ok(permit);
         }
-        if self.drop_detached_retired_cold_predecessor(cold_install) {
+        if Self::drop_detached_retired_cold_predecessor(cold_install) {
             return self.admit_store();
         }
         if self.evict_idle_cold_predecessor(cold_install) {
@@ -606,13 +608,11 @@ impl PluginActorCache {
                 .map(|(key, _)| key.clone());
             evicted_key.and_then(|key| state.actors.remove(&key))
         };
-        if let Some(slot) = evicted {
+        evicted.is_some_and(|slot| {
             slot.retire();
             drop(slot);
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// A cold-install token is normally a second reference to its stale
@@ -645,10 +645,7 @@ impl PluginActorCache {
     /// A concurrent trap can retire and unlink the captured predecessor before
     /// this cold builder asks for admission. Once its token is the final owner,
     /// discard it so a no-longer-reachable Store cannot strand capacity.
-    fn drop_detached_retired_cold_predecessor(
-        &self,
-        cold_install: &mut PluginActorColdInstall,
-    ) -> bool {
+    fn drop_detached_retired_cold_predecessor(cold_install: &mut PluginActorColdInstall) -> bool {
         let Some(expected) = cold_install.expected_stale.as_ref() else {
             return false;
         };
@@ -1761,9 +1758,8 @@ mod tests {
         let observation = install(&cache, key, 1, b"before", "root-1");
         let lease = cache.lease(&observation).await.unwrap();
 
-        let error = match cache.admit_store() {
-            Ok(_) => panic!("a live lease must keep its Store admitted"),
-            Err(error) => error,
+        let Err(error) = cache.admit_store() else {
+            panic!("a live lease must keep its Store admitted");
         };
         assert_eq!(error.code, LixError::CODE_PLUGIN_RESOURCE_LIMIT);
         assert_eq!(cache.live_store_count(), 1);
@@ -1861,9 +1857,8 @@ mod tests {
         };
         let lease = cache.lease(&stale).await.unwrap();
 
-        let error = match cache.admit_cold_store(&mut cold_install) {
-            Ok(_) => panic!("a leased stale Store must not be overcommitted"),
-            Err(error) => error,
+        let Err(error) = cache.admit_cold_store(&mut cold_install) else {
+            panic!("a leased stale Store must not be overcommitted");
         };
         assert_eq!(error.code, LixError::CODE_PLUGIN_RESOURCE_LIMIT);
         assert_eq!(cache.len(), 1);

@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(namespace[8..], ids.low.to_be_bytes());
         assert_eq!(ordinal, 42);
         assert!(decode_compact_id(&(value.clone() + "=")).is_none());
-        let mut standard_base64 = value.clone();
+        let mut standard_base64 = value;
         standard_base64.replace_range(0..1, "+");
         assert!(decode_compact_id(&standard_base64).is_none());
         assert!(decode_compact_id("short").is_none());

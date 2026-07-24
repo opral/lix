@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn verified_request_blob_reconstructs_once_and_shares_result_with_provenance() {
         let base: Blob = b"alpha,beta,omega".as_slice().into();
-        let verified = VerifiedRequestBlob::verify(base.clone());
+        let verified = VerifiedRequestBlob::verify(base);
         let insert: Blob = b"BETA".as_slice().into();
         let insert_ptr = insert.as_ptr();
         let expected: Blob = b"alpha,BETA,omega".as_slice().into();

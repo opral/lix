@@ -510,8 +510,7 @@ where
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
+        Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
 
     pub async fn execute_with_options(
@@ -520,12 +519,12 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options_and_metadata(
+        Box::pin(self.execute_with_options_and_metadata(
             sql,
             params,
             options,
             ExecuteStatementMetadata::default(),
-        )
+        ))
         .await
     }
 
@@ -538,8 +537,7 @@ where
         metadata: ExecuteStatementMetadata,
     ) -> Result<ExecuteResult, LixError> {
         validate_execute_statement_metadata(params.len(), &metadata, None)?;
-        self.execute_with_kind(sql, params, options, metadata, "execute")
-            .await
+        Box::pin(self.execute_with_kind(sql, params, options, metadata, "execute")).await
     }
 
     /// Upserts one file's bytes by its full logical path without constructing
