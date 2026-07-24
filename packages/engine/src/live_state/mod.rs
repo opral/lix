@@ -11,6 +11,7 @@ pub(crate) use index::{
     LIVE_STATE_INDEX_ROW_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
     LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
     LiveStateIndexStoreReader, LiveStateIndexWriter, MaterializedLiveStateIndexRow,
+    branch_empty_precondition, row_absent_precondition,
 };
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;

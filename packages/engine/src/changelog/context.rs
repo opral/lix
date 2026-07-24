@@ -332,7 +332,63 @@ where
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         self.ensure_changelog_mutation_is_allowed()?;
         let stage_commit_change_id_index_format = self.validate_append(&append).await?;
+        self.stage_append_records(append, stage_commit_change_id_index_format)
+    }
 
+    async fn stage_delete_standalone_changes(
+        &mut self,
+        change_ids: &[ChangeId],
+    ) -> Result<(), LixError> {
+        self.ensure_changelog_mutation_is_allowed()?;
+        let change_ids = change_ids.iter().copied().collect::<HashSet<_>>();
+        for change_id in &change_ids {
+            if self.staged_changes.contains_key(change_id) {
+                return Err(LixError::unknown(format!(
+                    "cannot delete changelog change '{change_id}' because it was staged in the same transaction"
+                )));
+            }
+        }
+        for change_id in change_ids {
+            if self.staged_change_deletes.insert(change_id) {
+                self.writes.delete(CHANGE_SPACE, change_key(change_id));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Activated by the checkpoint GC integration.
+    async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
+        self.ensure_gc_has_no_staged_mutations()?;
+        let plan = plan_gc_from_store(self.store, roots).await?;
+        stage_gc_sweep(self.writes, &plan);
+        self.writes.seal_changelog_gc();
+        Ok(plan)
+    }
+}
+
+impl<S> ChangelogStoreWriter<'_, S>
+where
+    S: ChangelogStorageRead + Send + ?Sized,
+{
+    /// Stages an append assembled from already-prepared transaction rows.
+    ///
+    /// The transaction owns ID generation, parent selection, and change-ref
+    /// construction. Re-reading all generated UUID keys and rebuilding the
+    /// same relationship indexes here would only revalidate trusted engine
+    /// output. Direct changelog callers continue to use `stage_append`.
+    pub(crate) fn stage_transaction_append(
+        &mut self,
+        append: ChangelogAppend,
+    ) -> Result<(), LixError> {
+        self.ensure_changelog_mutation_is_allowed()?;
+        self.stage_append_records(append, false)
+    }
+
+    fn stage_append_records(
+        &mut self,
+        append: ChangelogAppend,
+        stage_commit_change_id_index_format: bool,
+    ) -> Result<(), LixError> {
         if stage_commit_change_id_index_format {
             self.writes.put(
                 COMMIT_CHANGE_ID_SPACE,
@@ -393,42 +449,6 @@ where
 
         Ok(())
     }
-
-    async fn stage_delete_standalone_changes(
-        &mut self,
-        change_ids: &[ChangeId],
-    ) -> Result<(), LixError> {
-        self.ensure_changelog_mutation_is_allowed()?;
-        let change_ids = change_ids.iter().copied().collect::<HashSet<_>>();
-        for change_id in &change_ids {
-            if self.staged_changes.contains_key(change_id) {
-                return Err(LixError::unknown(format!(
-                    "cannot delete changelog change '{change_id}' because it was staged in the same transaction"
-                )));
-            }
-        }
-        for change_id in change_ids {
-            if self.staged_change_deletes.insert(change_id) {
-                self.writes.delete(CHANGE_SPACE, change_key(change_id));
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
-    async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
-        self.ensure_gc_has_no_staged_mutations()?;
-        let plan = plan_gc_from_store(self.store, roots).await?;
-        stage_gc_sweep(self.writes, &plan);
-        self.writes.seal_changelog_gc();
-        Ok(plan)
-    }
-}
-
-impl<S> ChangelogStoreWriter<'_, S>
-where
-    S: ChangelogStorageRead + Send + ?Sized,
-{
     fn ensure_changelog_mutation_is_allowed(&self) -> Result<(), LixError> {
         if !self.writes.changelog_gc_is_sealed() {
             return Ok(());

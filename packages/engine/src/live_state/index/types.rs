@@ -64,7 +64,7 @@ pub(crate) struct LiveStateIndexScanRequest {
     pub(crate) limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LiveStateIndexRowRequest {
     pub(crate) branch_id: String,
     pub(crate) schema_key: String,

@@ -66,6 +66,10 @@ impl TrackedStateIndexValue {
     pub(crate) fn updated_at(&self) -> LixTimestamp {
         self.updated_at
     }
+
+    pub(crate) fn deleted(&self) -> bool {
+        self.deleted
+    }
 }
 
 /// Zero-copy view of a tracked-state commit-root value.
