@@ -11,11 +11,13 @@ use markdown_syntax::ast as md;
 use markdown_syntax::{LineEnding, SerializeOptions, Span, SyntaxOptions};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedMarkdown {
     pub(crate) root: NodeTree,
+    pub(crate) top_level_ranges: Vec<Range<usize>>,
 }
 
 pub(crate) fn parse_file(file: &File) -> Result<ParsedMarkdown, PluginError> {
@@ -73,6 +75,18 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
     }
 
     repair_definition_adjacency(&mut output.document, source);
+    let top_level_ranges = output
+        .document
+        .children
+        .iter()
+        .map(block_span)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            PluginError::Internal("Markdown parser omitted a top-level block span".to_owned())
+        })?
+        .into_iter()
+        .map(|span| span.start..span.end)
+        .collect();
     let children = output
         .document
         .children
@@ -94,7 +108,10 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
         children,
     };
 
-    Ok(ParsedMarkdown { root })
+    Ok(ParsedMarkdown {
+        root,
+        top_level_ranges,
+    })
 }
 
 fn repair_definition_adjacency(document: &mut md::Document, source: &str) {
