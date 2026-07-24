@@ -107,6 +107,8 @@ async fn run_case(
     let accounting = binary_cas_write_accounting();
     let layout = fixture.layout().await;
     timings.sort_unstable();
+    let sample_count = u32::try_from(samples).expect("benchmark sample count should fit in u32");
+    let mean = timings.iter().sum::<Duration>() / sample_count;
 
     println!(
         "small_blob_cas,backend={backend},operation={operation},size_bytes={size},\
@@ -118,10 +120,10 @@ async fn run_case(
          payload_value_bytes={},presence_rows={}",
         percentile(&timings, 50, 100).as_nanos(),
         percentile(&timings, 95, 100).as_nanos(),
-        (timings.iter().sum::<Duration>() / samples as u32).as_nanos(),
+        mean.as_nanos(),
         duration_us(percentile(&timings, 50, 100)),
         duration_us(percentile(&timings, 95, 100)),
-        duration_us(timings.iter().sum::<Duration>() / samples as u32),
+        duration_us(mean),
         accounting.chunk_lookup_count,
         accounting.chunk_lookup_batch_count,
         accounting.chunk_lookup_hit_count,

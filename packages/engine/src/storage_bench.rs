@@ -7,6 +7,7 @@ use crate::storage_adapter::{
     ScanPlan, StorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageProjectedValue,
     StorageScanOptions, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
 };
+use crate::{ReadOptions, WriteOptions};
 
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -52,13 +53,15 @@ pub async fn write_binary_cas_for_bench<StorageImpl>(
 where
     StorageImpl: Storage,
 {
-    let read = storage.begin_read(Default::default()).await?;
+    let read = storage.begin_read(ReadOptions::default()).await?;
     let mut writes = storage.new_write_set();
     let receipt = crate::binary_cas::BinaryCasContext::new()
         .writer_skipping_existing_chunks(&read, &mut writes)
         .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(bytes.to_vec()))
         .await?;
-    storage.commit_write_set(writes, Default::default()).await?;
+    storage
+        .commit_write_set(writes, WriteOptions::default())
+        .await?;
     Ok(receipt.hash.to_hex())
 }
 
@@ -71,7 +74,7 @@ pub async fn read_binary_cas_for_bench<StorageImpl>(
 where
     StorageImpl: Storage,
 {
-    let read = storage.begin_read(Default::default()).await?;
+    let read = storage.begin_read(ReadOptions::default()).await?;
     let hash = crate::binary_cas::BlobHash::from_hex(hash_hex)?;
     let mut entries = crate::binary_cas::BinaryCasContext::new()
         .reader(read)

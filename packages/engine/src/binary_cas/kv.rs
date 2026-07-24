@@ -354,8 +354,7 @@ pub(crate) async fn load_bytes_many(
             continue;
         };
         match &metadata.layout {
-            BlobLayout::Empty => {}
-            BlobLayout::Inline => {}
+            BlobLayout::Empty | BlobLayout::Inline => {}
             BlobLayout::SingleChunk { chunk_hash } => {
                 if seen_chunks.insert(*chunk_hash) {
                     requested_chunks.push(*chunk_hash);
@@ -866,8 +865,7 @@ async fn missing_chunk_hashes(
 ) -> Result<HashSet<BlobHash>, LixError> {
     let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
     match &plan.layout {
-        BlobLayout::Empty => {}
-        BlobLayout::Inline => {}
+        BlobLayout::Empty | BlobLayout::Inline => {}
         BlobLayout::SingleChunk { chunk_hash } => {
             collect_chunk_lookup_candidate(*chunk_hash, transaction_chunk_keys, &mut candidates);
         }
