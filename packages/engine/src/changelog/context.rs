@@ -8,7 +8,7 @@
     clippy::unused_self
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use async_trait::async_trait;
@@ -31,9 +31,8 @@ use crate::changelog::{
     CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
     CommitScanBatch, CommitScanRequest,
 };
-#[cfg(feature = "storage-benches")]
 use crate::changelog::{GcPlan, GcRoot};
-use crate::json_store::JsonSlot;
+use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection,
@@ -175,9 +174,8 @@ impl<S> ChangelogReader for ChangelogStoreReader<S>
 where
     S: ChangelogStorageRead + Send,
 {
-    #[cfg(feature = "storage-benches")]
     async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
-        Ok(empty_gc_plan(roots))
+        plan_gc_from_store(&mut self.store, roots).await
     }
 
     async fn load_commits(
@@ -214,9 +212,9 @@ impl<S> ChangelogReader for ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
-    #[cfg(feature = "storage-benches")]
     async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
-        Ok(empty_gc_plan(roots))
+        self.ensure_gc_has_no_staged_mutations()?;
+        plan_gc_from_store(self.store, roots).await
     }
 
     async fn load_commits(
@@ -332,6 +330,7 @@ where
     S: ChangelogStorageRead + Send + ?Sized,
 {
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
+        self.ensure_changelog_mutation_is_allowed()?;
         let stage_commit_change_id_index_format = self.validate_append(&append).await?;
 
         if stage_commit_change_id_index_format {
@@ -399,6 +398,7 @@ where
         &mut self,
         change_ids: &[ChangeId],
     ) -> Result<(), LixError> {
+        self.ensure_changelog_mutation_is_allowed()?;
         let change_ids = change_ids.iter().copied().collect::<HashSet<_>>();
         for change_id in &change_ids {
             if self.staged_changes.contains_key(change_id) {
@@ -415,9 +415,13 @@ where
         Ok(())
     }
 
-    #[cfg(feature = "storage-benches")]
+    #[allow(dead_code)] // Activated by the checkpoint GC integration.
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
-        Ok(empty_gc_plan(roots))
+        self.ensure_gc_has_no_staged_mutations()?;
+        let plan = plan_gc_from_store(self.store, roots).await?;
+        stage_gc_sweep(self.writes, &plan);
+        self.writes.seal_changelog_gc();
+        Ok(plan)
     }
 }
 
@@ -425,6 +429,42 @@ impl<S> ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
+    fn ensure_changelog_mutation_is_allowed(&self) -> Result<(), LixError> {
+        if !self.writes.changelog_gc_is_sealed() {
+            return Ok(());
+        }
+        Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "cannot stage changelog mutations after garbage collection in the same transaction",
+        ))
+    }
+
+    fn ensure_gc_has_no_staged_mutations(&self) -> Result<(), LixError> {
+        if self.writes.changelog_gc_is_sealed() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "changelog garbage collection may run only once per transaction",
+            ));
+        }
+        let has_staged_changelog_mutations = !self.staged_commits.is_empty()
+            || !self.staged_changes.is_empty()
+            || !self.staged_change_deletes.is_empty()
+            || !self.staged_commit_change_ref_chunks.is_empty()
+            || self.writes.has_mutations_in_space(COMMIT_SPACE)
+            || self.writes.has_mutations_in_space(COMMIT_CHANGE_ID_SPACE)
+            || self.writes.has_mutations_in_space(CHANGE_SPACE)
+            || self
+                .writes
+                .has_mutations_in_space(COMMIT_CHANGE_REF_CHUNK_SPACE);
+        if !has_staged_changelog_mutations {
+            return Ok(());
+        }
+        Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "changelog garbage collection must run in a transaction with a fresh changelog write set",
+        ))
+    }
+
     async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<bool, LixError> {
         validate_unique(
             append.commits.iter().map(|commit| commit.commit_id),
@@ -992,12 +1032,297 @@ where
     Ok(())
 }
 
-#[cfg(feature = "storage-benches")]
-fn empty_gc_plan(roots: &[GcRoot]) -> GcPlan {
-    GcPlan {
-        roots: roots.to_vec(),
-        ..GcPlan::default()
+async fn plan_gc_from_store(
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+    roots: &[GcRoot],
+) -> Result<GcPlan, LixError> {
+    let commits = scan_all_commits_for_gc(store).await?;
+    let changes = scan_all_changes_for_gc(store).await?;
+
+    let mut live_commits = BTreeSet::new();
+    let mut live_changes = roots
+        .iter()
+        .filter_map(|root| match root {
+            GcRoot::StandaloneChange(change_id) => Some(*change_id),
+            GcRoot::BranchHead(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut pending = roots
+        .iter()
+        .filter_map(|root| match root {
+            GcRoot::BranchHead(commit_id) => Some(*commit_id),
+            GcRoot::StandaloneChange(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    while let Some(commit_id) = pending.pop() {
+        if !live_commits.insert(commit_id) {
+            continue;
+        }
+        let Some((record, chunks)) = commits.get(&commit_id) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("garbage-collection root references missing commit '{commit_id}'"),
+            ));
+        };
+        pending.extend(record.parent_commit_ids.iter().copied());
+        live_changes.extend(
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.entries.iter().copied()),
+        );
     }
+
+    let mut live_payloads = BTreeSet::<[u8; 32]>::new();
+    for change_id in &live_changes {
+        let Some(change) = changes.get(change_id) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("garbage collection found live reference to missing change '{change_id}'"),
+            ));
+        };
+        for slot in [&change.snapshot, &change.metadata] {
+            if let JsonSlot::Ref(json_ref) = slot {
+                live_payloads.insert(*json_ref.as_hash_array());
+            }
+        }
+    }
+
+    let sweep_commits = commits
+        .keys()
+        .filter(|commit_id| !live_commits.contains(commit_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let sweep_commit_change_ids = sweep_commits
+        .iter()
+        .map(|commit_id| {
+            commits
+                .get(commit_id)
+                .expect("sweep commit id came from the commit map")
+                .0
+                .change_id
+        })
+        .collect::<Vec<_>>();
+    let sweep_commit_change_ref_chunks = sweep_commits
+        .iter()
+        .flat_map(|commit_id| {
+            commits
+                .get(commit_id)
+                .into_iter()
+                .flat_map(|(_, chunks)| (0..chunks.len()).map(|chunk_no| (*commit_id, chunk_no)))
+        })
+        .map(|(commit_id, chunk_no)| {
+            u32::try_from(chunk_no)
+                .map(|chunk_no| (commit_id, chunk_no))
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "commit '{commit_id}' has more change-ref chunks than GC can address"
+                        ),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sweep_changes = changes
+        .keys()
+        .filter(|change_id| !live_changes.contains(change_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let garbage_payloads = sweep_changes
+        .iter()
+        .flat_map(|change_id| {
+            let change = changes
+                .get(change_id)
+                .expect("sweep change id came from the change map");
+            [&change.snapshot, &change.metadata]
+                .into_iter()
+                .filter_map(|slot| match slot {
+                    JsonSlot::Ref(json_ref) => Some(*json_ref.as_hash_array()),
+                    JsonSlot::None | JsonSlot::Inline(_) => None,
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    // This collector reclaims payloads made unreachable by the changes it is
+    // sweeping. A repository-wide JSON inventory is both
+    // unnecessary for that proof and prohibitively expensive on remote LSM
+    // stores. Never-referenced legacy/orphan payloads are deliberately left
+    // to an explicit offline repair pass.
+    let sweep_json_payloads = garbage_payloads
+        .difference(&live_payloads)
+        .copied()
+        .map(JsonRef::from_hash_bytes)
+        .collect::<Vec<_>>();
+
+    Ok(GcPlan {
+        roots: roots.to_vec(),
+        live: crate::changelog::GcLiveSet {
+            commits: live_commits.into_iter().collect(),
+            changes: live_changes.into_iter().collect(),
+            payloads: live_payloads
+                .into_iter()
+                .map(JsonRef::from_hash_bytes)
+                .collect(),
+        },
+        sweep: crate::changelog::GcSweepSet {
+            commits: sweep_commits,
+            commit_change_ids: sweep_commit_change_ids,
+            changes: sweep_changes,
+            commit_change_ref_chunks: sweep_commit_change_ref_chunks,
+            json_payloads: sweep_json_payloads,
+        },
+        repair: crate::changelog::GcRepairSet::default(),
+    })
+}
+
+async fn scan_all_commits_for_gc(
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+) -> Result<BTreeMap<CommitId, (CommitRecord, Vec<CommitChangeRefChunk>)>, LixError> {
+    let mut commits = BTreeMap::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .changelog_scan(
+                COMMIT_SPACE,
+                Vec::new(),
+                after,
+                SCAN_PAGE_LIMIT,
+                StorageCoreProjection::FullValue,
+            )
+            .await?;
+        for (key, value) in page.keys.iter().zip(page.values.iter()) {
+            let record: CommitRecord = storage_codec::decode("commit record", value)?;
+            if key.as_slice() != commit_key(record.commit_id).as_slice() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "GC commit scan key does not match decoded commit_id '{}'",
+                        record.commit_id
+                    ),
+                ));
+            }
+            let commit_id = record.commit_id;
+            if commits.insert(commit_id, (record, Vec::new())).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("GC commit scan returned duplicate commit '{commit_id}'"),
+                ));
+            }
+        }
+        let Some(resume_after) = page.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
+    }
+
+    // Change-ref chunks are globally ordered by (commit_id, chunk_no). Scan
+    // the space once and group in memory instead of reopening a prefix scan
+    // for every commit. This keeps backend calls O(pages), not O(commits).
+    let mut after = None;
+    loop {
+        let page = store
+            .changelog_scan(
+                COMMIT_CHANGE_REF_CHUNK_SPACE,
+                Vec::new(),
+                after,
+                SCAN_PAGE_LIMIT,
+                StorageCoreProjection::FullValue,
+            )
+            .await?;
+        for (key, value) in page.keys.iter().zip(page.values.iter()) {
+            if key.len() != 20 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "GC found a commit change-ref chunk with a non-20-byte key",
+                ));
+            }
+            let commit_id = commit_id_from_key(&key[..16])?;
+            let chunk_no = u32::from_be_bytes(
+                key[16..]
+                    .try_into()
+                    .expect("commit change-ref chunk suffix length checked"),
+            );
+            let Some((_, chunks)) = commits.get_mut(&commit_id) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("GC found change-ref chunk for missing commit '{commit_id}'"),
+                ));
+            };
+            let expected_chunk_no = u32::try_from(chunks.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has too many change-ref chunks"),
+                )
+            })?;
+            if chunk_no != expected_chunk_no {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "commit '{commit_id}' change-ref chunks are not contiguous: expected {expected_chunk_no}, found {chunk_no}"
+                    ),
+                ));
+            }
+            chunks.push(decode_commit_change_ref_chunk(value, commit_id)?);
+        }
+        let Some(resume_after) = page.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
+    }
+    if let Some((commit_id, _)) = commits.iter().find(|(_, (_, chunks))| chunks.is_empty()) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("commit '{commit_id}' has no change-ref chunk"),
+        ));
+    }
+    Ok(commits)
+}
+
+async fn scan_all_changes_for_gc(
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+) -> Result<BTreeMap<ChangeId, ChangeRecord>, LixError> {
+    let mut changes = BTreeMap::new();
+    let mut start_after = None::<String>;
+    loop {
+        let batch = scan_changes_from_store(
+            store,
+            ChangeScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(SCAN_PAGE_LIMIT),
+            },
+        )
+        .await?;
+        for change in batch.entries {
+            changes.insert(change.change_id, change);
+        }
+        let Some(next) = batch.next_start_after else {
+            break;
+        };
+        start_after = Some(next.to_string());
+    }
+    Ok(changes)
+}
+
+#[allow(dead_code)] // Activated by the checkpoint GC integration.
+fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) {
+    for (commit_id, chunk_no) in &plan.sweep.commit_change_ref_chunks {
+        writes.delete(
+            COMMIT_CHANGE_REF_CHUNK_SPACE,
+            commit_change_ref_chunk_key(*commit_id, *chunk_no),
+        );
+    }
+    for commit_id in &plan.sweep.commits {
+        writes.delete(COMMIT_SPACE, commit_key(*commit_id));
+    }
+    for change_id in &plan.sweep.commit_change_ids {
+        writes.delete(COMMIT_CHANGE_ID_SPACE, commit_change_id_key(*change_id));
+    }
+    for change_id in &plan.sweep.changes {
+        writes.delete(CHANGE_SPACE, change_key(*change_id));
+    }
+    JsonStoreContext::new()
+        .writer()
+        .stage_delete_refs(writes, plan.sweep.json_payloads.iter().copied());
 }
 
 async fn get_many(
@@ -1084,13 +1409,16 @@ where
 mod tests {
     use async_trait::async_trait;
 
-    use crate::changelog::test_support::{changelog_test_context, test_append, test_change_record};
+    use crate::changelog::test_support::{
+        changelog_test_context, test_append, test_change_record, test_commit_record,
+    };
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogAppend,
-        ChangelogReader, ChangelogWriter, CommitId, CommitLoadEntry, CommitLoadRequest,
-        CommitProjection, CommitRecord, CommitScanRequest,
+        ChangelogReader, ChangelogWriter, CommitChangeRefSet, CommitId, CommitLoadEntry,
+        CommitLoadRequest, CommitProjection, CommitRecord, CommitScanRequest,
     };
     use crate::entity_pk::EntityPk;
+    use crate::json_store::JsonRef;
 
     use super::*;
 
@@ -1181,6 +1509,40 @@ mod tests {
                 .changelog_scan(space, prefix, after, limit, projection)
                 .await
         }
+    }
+
+    fn gc_append(
+        commit_label: &str,
+        parent_label: Option<&str>,
+        snapshot: JsonSlot,
+    ) -> (ChangelogAppend, CommitId, ChangeId) {
+        let commit_id = CommitId::for_test_label(commit_label);
+        let change_id = ChangeId::for_test_label(&format!("{commit_label}-change"));
+        let mut commit = test_commit_record();
+        commit.commit_id = commit_id;
+        commit.change_id = ChangeId::for_test_label(&format!("{commit_label}-row-change"));
+        commit.parent_commit_ids = parent_label
+            .into_iter()
+            .map(CommitId::for_test_label)
+            .collect();
+
+        let mut change = test_change_record();
+        change.change_id = change_id;
+        change.entity_pk = EntityPk::single(format!("{commit_label}-entity"));
+        change.snapshot = snapshot;
+
+        (
+            ChangelogAppend {
+                commits: vec![commit],
+                changes: vec![change],
+                commit_change_refs: vec![CommitChangeRefSet {
+                    commit_id,
+                    entries: vec![change_id],
+                }],
+            },
+            commit_id,
+            change_id,
+        )
     }
 
     #[test]
@@ -1294,6 +1656,264 @@ mod tests {
             .unwrap();
         assert_eq!(changes.entries[0].as_ref().unwrap().schema_key, "message");
         assert!(changes.entries[1].is_none());
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_marks_parents_and_standalone_changes_then_sweeps_dead_records() {
+        let (context, storage) = changelog_test_context();
+        let shared_payload = JsonRef::for_content(b"shared payload");
+        let dead_payload = JsonRef::for_content(b"dead payload");
+        let (first, first_commit, first_change) =
+            gc_append("gc-first", None, JsonSlot::Ref(shared_payload));
+        let (head, head_commit, head_change) =
+            gc_append("gc-head", Some("gc-first"), JsonSlot::Ref(shared_payload));
+        let (dead, dead_commit, dead_change) =
+            gc_append("gc-dead", None, JsonSlot::Ref(dead_payload));
+        let standalone_change = ChangeId::for_test_label("gc-standalone");
+        let standalone = ChangeRecord {
+            change_id: standalone_change,
+            entity_pk: EntityPk::single("gc-standalone-entity"),
+            ..test_change_record()
+        };
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_append(first).await.unwrap();
+            writer.stage_append(head).await.unwrap();
+            writer.stage_append(dead).await.unwrap();
+            writer
+                .stage_append(ChangelogAppend {
+                    changes: vec![standalone],
+                    ..ChangelogAppend::default()
+                })
+                .await
+                .unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let roots = [
+            GcRoot::BranchHead(head_commit),
+            GcRoot::StandaloneChange(standalone_change),
+        ];
+        let mut read = storage.begin_read_transaction().await.unwrap();
+        let plan = context.reader(&mut *read).plan_gc(&roots).await.unwrap();
+        assert!(plan.live.commits.contains(&first_commit));
+        assert!(plan.live.commits.contains(&head_commit));
+        assert!(plan.live.changes.contains(&first_change));
+        assert!(plan.live.changes.contains(&head_change));
+        assert!(plan.live.changes.contains(&standalone_change));
+        assert_eq!(plan.sweep.commits, vec![dead_commit]);
+        assert_eq!(
+            plan.sweep.commit_change_ids,
+            vec![ChangeId::for_test_label("gc-dead-row-change")]
+        );
+        assert_eq!(plan.sweep.changes, vec![dead_change]);
+        assert_eq!(plan.sweep.json_payloads, vec![dead_payload]);
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let collected = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.collect_garbage(&roots).await.unwrap()
+        };
+        assert_eq!(collected, plan);
+        let stats = writes.apply(&mut *transaction).await.unwrap();
+        assert_eq!(stats.staged_deletes, 5);
+        transaction.commit().await.unwrap();
+
+        let mut read = storage.begin_read_transaction().await.unwrap();
+        assert_eq!(
+            get_many(
+                &mut *read,
+                COMMIT_CHANGE_ID_SPACE,
+                vec![commit_change_id_key(ChangeId::for_test_label(
+                    "gc-dead-row-change"
+                ))],
+            )
+            .await
+            .unwrap(),
+            vec![None]
+        );
+        let mut reader = context.reader(&mut *read);
+        let commits = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[first_commit, head_commit, dead_commit],
+                projection: CommitProjection::Record,
+            })
+            .await
+            .unwrap();
+        assert!(commits.entries[0].is_some());
+        assert!(commits.entries[1].is_some());
+        assert!(commits.entries[2].is_none());
+        let changes = reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &[first_change, head_change, dead_change, standalone_change],
+            })
+            .await
+            .unwrap();
+        assert!(changes.entries[0].is_some());
+        assert!(changes.entries[1].is_some());
+        assert!(changes.entries[2].is_none());
+        assert!(changes.entries[3].is_some());
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_keeps_empty_root_commits_addressable() {
+        let (context, storage) = changelog_test_context();
+        let commit_id = CommitId::for_test_label("gc-empty");
+        let mut commit = test_commit_record();
+        commit.commit_id = commit_id;
+        commit.change_id = ChangeId::for_test_label("gc-empty-row-change");
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .stage_append(ChangelogAppend {
+                    commits: vec![commit],
+                    changes: Vec::new(),
+                    commit_change_refs: vec![CommitChangeRefSet {
+                        commit_id,
+                        entries: Vec::new(),
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut read = storage.begin_read_transaction().await.unwrap();
+        let plan = context
+            .reader(&mut *read)
+            .plan_gc(&[GcRoot::BranchHead(commit_id)])
+            .await
+            .unwrap();
+        assert_eq!(plan.live.commits, vec![commit_id]);
+        assert!(plan.live.changes.is_empty());
+        assert!(plan.sweep.commits.is_empty());
+        assert!(plan.sweep.commit_change_ref_chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_scans_commit_change_and_chunk_page_boundaries() {
+        let (context, storage) = changelog_test_context();
+        let count = SCAN_PAGE_LIMIT + 1;
+        let mut append = ChangelogAppend::default();
+        let mut parent = None;
+        for index in 0..count {
+            let commit_id = CommitId::for_test_label(&format!("gc-page-commit-{index:05}"));
+            let change_id = ChangeId::for_test_label(&format!("gc-page-change-{index:05}"));
+            let mut commit = test_commit_record();
+            commit.commit_id = commit_id;
+            commit.change_id = ChangeId::for_test_label(&format!("gc-page-row-{index:05}"));
+            commit.parent_commit_ids = parent.into_iter().collect();
+            append.commits.push(commit);
+
+            let mut change = test_change_record();
+            change.change_id = change_id;
+            change.entity_pk = EntityPk::single(format!("gc-page-entity-{index:05}"));
+            append.changes.push(change);
+            append.commit_change_refs.push(CommitChangeRefSet {
+                commit_id,
+                entries: vec![change_id],
+            });
+            parent = Some(commit_id);
+        }
+        let head = parent.expect("page-boundary fixture must have a head");
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_append(append).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut read = storage.begin_read_transaction().await.unwrap();
+        let plan = context
+            .reader(&mut *read)
+            .plan_gc(&[GcRoot::BranchHead(head)])
+            .await
+            .unwrap();
+        assert_eq!(plan.live.commits.len(), count);
+        assert_eq!(plan.live.changes.len(), count);
+        assert!(plan.sweep.commits.is_empty());
+        assert!(plan.sweep.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_requires_a_fresh_changelog_lane_and_seals_it_afterward() {
+        let (context, storage) = changelog_test_context();
+        let (root, root_commit, _) = gc_append("gc-sealed-root", None, JsonSlot::None);
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_append(root).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let (child, _, _) = gc_append("gc-sealed-child", Some("gc-sealed-root"), JsonSlot::None);
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .collect_garbage(&[GcRoot::BranchHead(root_commit)])
+                .await
+                .unwrap();
+        }
+        let error = {
+            let mut second_writer = context.writer(&mut *transaction, &mut writes);
+            second_writer.stage_append(child).await.unwrap_err()
+        };
+        assert!(
+            error.message.contains("after garbage collection"),
+            "{error:?}"
+        );
+
+        let (carried_child, _, _) = gc_append(
+            "gc-sealed-carried-child",
+            Some("gc-sealed-root"),
+            JsonSlot::None,
+        );
+        let mut combined_writes = StorageWriteSet::new();
+        combined_writes.extend(writes);
+        let error = {
+            let mut second_writer = context.writer(&mut *transaction, &mut combined_writes);
+            second_writer.stage_append(carried_child).await.unwrap_err()
+        };
+        assert!(
+            error.message.contains("after garbage collection"),
+            "{error:?}"
+        );
+
+        let (child, _, _) = gc_append("gc-fresh-child", Some("gc-sealed-root"), JsonSlot::None);
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_append(child).await.unwrap();
+        }
+        let error = {
+            let mut second_writer = context.writer(&mut *transaction, &mut writes);
+            second_writer
+                .collect_garbage(&[GcRoot::BranchHead(root_commit)])
+                .await
+                .unwrap_err()
+        };
+        assert!(
+            error.message.contains("fresh changelog write set"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

@@ -117,4 +117,19 @@ impl JsonStoreWriter {
 
         Ok(order)
     }
+
+    #[allow(dead_code)] // Activated by the checkpoint GC integration.
+    #[expect(clippy::unused_self)]
+    pub(crate) fn stage_delete_refs(
+        &self,
+        writes: &mut StorageWriteSet,
+        refs: impl IntoIterator<Item = JsonRef>,
+    ) {
+        for json_ref in refs {
+            writes.delete(
+                store::JSON_SPACE,
+                StorageKey(Bytes::copy_from_slice(json_ref.as_hash_bytes())),
+            );
+        }
+    }
 }
