@@ -10,5 +10,5 @@ pub(crate) use schema::{
     StateForeignKeyPlan,
 };
 pub(crate) use snapshot::{
-    CatalogFingerprint, CatalogSnapshot, StateDeleteReferencePlan, TransactionCatalog,
+    CatalogFingerprint, CatalogSnapshot, DefaultPlan, StateDeleteReferencePlan, TransactionCatalog,
 };

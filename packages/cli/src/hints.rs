@@ -21,7 +21,7 @@ impl CommandOutput {
 pub fn hint_after_init() -> Vec<String> {
     vec![
         "Try inserting data with: lix sql execute \"INSERT INTO lix_key_value (key, value) VALUES ('hello', '\"world\"')\"".into(),
-        "Store files with: lix sql execute \"INSERT INTO lix_file (path, data) VALUES ('/readme.txt', CAST('hello' AS BINARY))\"".into(),
+        "Store files with: lix sql execute \"INSERT INTO lix_file (path, data) VALUES ('/readme.txt', CAST('hello' AS BYTEA))\"".into(),
     ]
 }
 

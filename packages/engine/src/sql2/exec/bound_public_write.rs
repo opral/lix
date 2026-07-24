@@ -1,3 +1,5 @@
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
 
 use crate::changelog::CommitId;
@@ -5,7 +7,7 @@ use crate::common::validate_row_metadata;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::sql2::SqlWriteExecutionContext;
-use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
+use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
     BoundWriteOp, BoundWriteTarget, EntityWriteSurface, FileWriteSurface,
@@ -16,6 +18,7 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
+use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
@@ -541,6 +544,7 @@ fn entity_insert_rows(
         write_rows.push(entity_insert_row(
             ctx,
             plan,
+            spec,
             &layout,
             row,
             params,
@@ -589,7 +593,13 @@ async fn entity_update(
                 )?;
                 visible_assignments.push((
                     column.name.clone(),
-                    entity_json_value(value, column.column_type)?,
+                    entity_json_value(
+                        &assignment.value,
+                        value,
+                        column.column_type,
+                        &spec.schema_key,
+                        &column.name,
+                    )?,
                 ));
             } else if assignment.column.name == "lixcol_metadata" {
                 // handled below from the assignment list
@@ -760,9 +770,27 @@ fn entity_returning_value(
     if bound_expr_is_json(expr, spec) {
         return Ok(match value {
             EntityEvalValue::SqlNull => Value::Null,
+            EntityEvalValue::Json(JsonValue::Null)
+                if visible_entity_column(expr, spec)
+                    .is_some_and(|column| column.column_type == EntityColumnType::Json) =>
+            {
+                Value::Null
+            }
             EntityEvalValue::SqlText(value) => Value::Text(value),
             EntityEvalValue::Json(value) => Value::Json(value),
         });
+    }
+    if let Some(column) = visible_entity_column(expr, spec) {
+        if column.column_type == EntityColumnType::Integer {
+            let value = value.into_json();
+            return json_bigint_value(Some(&value), &spec.schema_key, &column.name)
+                .map(|value| value.map_or(Value::Null, Value::Integer));
+        }
+        if column.column_type == EntityColumnType::Number {
+            let value = value.into_json();
+            return json_double_value(Some(&value), &spec.schema_key, &column.name)
+                .map(|value| value.map_or(Value::Null, Value::Real));
+        }
     }
     Ok(match value {
         EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null) => Value::Null,
@@ -779,6 +807,16 @@ fn entity_returning_value(
             Value::Json(value)
         }
     })
+}
+
+fn visible_entity_column<'a>(
+    expr: &BoundExpr,
+    spec: &'a EntitySurfaceSpec,
+) -> Option<&'a EntitySurfaceColumn> {
+    let (BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)) = expr else {
+        return None;
+    };
+    spec.visible_column(&column.name)
 }
 
 fn entity_conflict_update_row(
@@ -817,7 +855,13 @@ fn entity_conflict_update_row(
             )?;
             visible_assignments.push((
                 column.name.clone(),
-                entity_json_value(value, column.column_type)?,
+                entity_json_value(
+                    &assignment.value,
+                    value,
+                    column.column_type,
+                    &spec.schema_key,
+                    &column.name,
+                )?,
             ));
         } else if assignment.column.name == "lixcol_metadata" {
             // handled by entity_replace_row_from_live from the assignment list
@@ -1030,6 +1074,7 @@ enum InsertColumnTarget {
     Visible {
         name: String,
         column_type: EntityColumnType,
+        read_nullable: bool,
     },
     EntityPk,
     FileId,
@@ -1058,6 +1103,7 @@ impl InsertRowLayout {
                     return Ok(InsertColumnTarget::Visible {
                         name: surface_column.name.clone(),
                         column_type: surface_column.column_type,
+                        read_nullable: surface_column.read_nullable,
                     });
                 }
                 Ok(match column.name.as_str() {
@@ -1092,6 +1138,7 @@ impl InsertRowLayout {
 fn entity_insert_row(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
     row: &[BoundExpr],
     params: &[Value],
@@ -1118,6 +1165,24 @@ fn entity_insert_row(
             reject_direct_blob_json_value(expr, *column_type, params)?;
         }
         let eval_value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
+        if matches!(
+            target,
+            InsertColumnTarget::Global | InsertColumnTarget::Untracked
+        ) && entity_eval_value_is_null(&eval_value)
+        {
+            let column_name = match target {
+                InsertColumnTarget::Global => "lixcol_global",
+                InsertColumnTarget::Untracked => "lixcol_untracked",
+                _ => unreachable!("matched defaulted boolean system column"),
+            };
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!(
+                    "INSERT into {} column '{column_name}' may be omitted to use its default, but explicit NULL is not allowed",
+                    layout.schema_key
+                ),
+            ));
+        }
         if matches!(target, InsertColumnTarget::Metadata) {
             metadata = optional_metadata_from_eval_value(
                 eval_value,
@@ -1126,8 +1191,25 @@ fn entity_insert_row(
             )?;
             continue;
         }
-        if let InsertColumnTarget::Visible { name, column_type } = target {
-            snapshot.insert(name.clone(), entity_json_value(eval_value, *column_type)?);
+        if let InsertColumnTarget::Visible {
+            name,
+            column_type,
+            read_nullable,
+        } = target
+        {
+            if !read_nullable && entity_eval_value_is_null(&eval_value) {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "INSERT into {} column '{name}' does not allow explicit NULL",
+                        layout.schema_key
+                    ),
+                ));
+            }
+            snapshot.insert(
+                name.clone(),
+                entity_json_value(expr, eval_value, *column_type, &layout.schema_key, name)?,
+            );
             continue;
         }
         let value = eval_value.into_json();
@@ -1154,7 +1236,36 @@ fn entity_insert_row(
         }
     }
 
+    spec.defaults
+        .apply(&mut snapshot, ctx.functions(), &layout.schema_key)?;
     let snapshot = JsonValue::Object(snapshot);
+    if !spec.primary_key_paths.is_empty() {
+        let derived_entity_pk =
+            EntityPk::from_primary_key_paths(&snapshot, &spec.primary_key_paths).map_err(
+                |error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!(
+                            "INSERT failed to derive entity primary key for schema '{}': {error}",
+                            layout.schema_key
+                        ),
+                    )
+                },
+            )?;
+        if entity_pk
+            .as_ref()
+            .is_some_and(|explicit_entity_pk| explicit_entity_pk != &derived_entity_pk)
+        {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "INSERT into {} has lixcol_entity_pk that does not match its public primary-key columns",
+                    layout.schema_key
+                ),
+            ));
+        }
+        entity_pk = Some(derived_entity_pk);
+    }
     let global = global.unwrap_or(false);
     let branch_id = entity_row_branch_id(plan, explicit_branch_id, global)?;
     Ok(TransactionWriteRow {
@@ -1338,6 +1449,100 @@ impl EntityEvalValue {
     }
 }
 
+fn entity_eval_value_is_null(value: &EntityEvalValue) -> bool {
+    matches!(
+        value,
+        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null)
+    )
+}
+
+fn cast_entity_eval_value(
+    value: EntityEvalValue,
+    cast_type: BoundCastType,
+) -> Result<EntityEvalValue, LixError> {
+    if cast_type == BoundCastType::Binary {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "BYTEA casts require a binary SQL column",
+        )
+        .with_hint(
+            "Use BYTEA for lix_file.data; registered entity schemas expose no binary column type.",
+        ));
+    }
+
+    let target_type = match cast_type {
+        BoundCastType::Text => DataType::Utf8,
+        BoundCastType::BigInt => DataType::Int64,
+        BoundCastType::Double => DataType::Float64,
+        BoundCastType::Boolean => DataType::Boolean,
+        BoundCastType::Binary => unreachable!("binary entity casts rejected above"),
+    };
+    let scalar = scalar_from_entity_eval_value(value);
+    let casted = scalar.cast_to(&target_type).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("CAST AS {} failed: {error}", cast_type.canonical_sql_name()),
+        )
+    })?;
+    entity_eval_value_from_cast_scalar(casted, cast_type)
+}
+
+fn scalar_from_entity_eval_value(value: EntityEvalValue) -> ScalarValue {
+    match value {
+        EntityEvalValue::SqlNull | EntityEvalValue::Json(JsonValue::Null) => ScalarValue::Null,
+        EntityEvalValue::SqlText(value) | EntityEvalValue::Json(JsonValue::String(value)) => {
+            ScalarValue::Utf8(Some(value))
+        }
+        EntityEvalValue::Json(JsonValue::Bool(value)) => ScalarValue::Boolean(Some(value)),
+        EntityEvalValue::Json(JsonValue::Number(value)) => value.as_i64().map_or_else(
+            || {
+                value.as_u64().map_or_else(
+                    || ScalarValue::Float64(value.as_f64()),
+                    |value| ScalarValue::UInt64(Some(value)),
+                )
+            },
+            |value| ScalarValue::Int64(Some(value)),
+        ),
+        EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
+            ScalarValue::Utf8(Some(value.to_string()))
+        }
+    }
+}
+
+fn entity_eval_value_from_cast_scalar(
+    value: ScalarValue,
+    cast_type: BoundCastType,
+) -> Result<EntityEvalValue, LixError> {
+    if value.is_null() {
+        return Ok(EntityEvalValue::SqlNull);
+    }
+    match value {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Ok(EntityEvalValue::SqlText(value)),
+        ScalarValue::Int64(Some(value)) => {
+            Ok(EntityEvalValue::Json(JsonValue::Number(value.into())))
+        }
+        ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .map(EntityEvalValue::Json)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "DOUBLE PRECISION cast produced a non-finite number",
+                )
+            }),
+        ScalarValue::Boolean(Some(value)) => Ok(EntityEvalValue::Json(JsonValue::Bool(value))),
+        other => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "CAST AS {} produced unexpected scalar {other:?}",
+                cast_type.canonical_sql_name()
+            ),
+        )),
+    }
+}
+
 fn eval_expr(
     expr: &BoundExpr,
     context: &EntityEvalContext<'_>,
@@ -1373,10 +1578,10 @@ fn eval_expr_value(
             }),
         BoundExpr::Column(column) => column_eval_value(context, &column.name),
         BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
-        BoundExpr::Cast { .. } => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity writes do not support CAST expressions yet",
-        )),
+        BoundExpr::Cast { expr, data_type } => {
+            let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
+            cast_entity_eval_value(value, *data_type)
+        }
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
             let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let raw = match raw {
@@ -1502,16 +1707,9 @@ fn predicate_matches(
             Ok(false)
         }
         BoundPredicate::Eq(left, right) => {
-            let (left, right) = eval_comparison_operands(
-                left,
-                right,
-                context,
-                spec,
-                ctx,
-                params,
-                active_branch_commit_id,
-            )?;
-            Ok(!left.is_null() && !right.is_null() && left == right)
+            let left_value = eval_expr(left, context, ctx, params, active_branch_commit_id)?;
+            let right_value = eval_expr(right, context, ctx, params, active_branch_commit_id)?;
+            comparison_values_equal(left, left_value, right, right_value, spec)
         }
         BoundPredicate::Like { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -1532,14 +1730,7 @@ fn predicate_matches(
             }
             for value_expr in values {
                 let value = eval_expr(value_expr, context, ctx, params, active_branch_commit_id)?;
-                let (candidate, value) = normalize_comparison_operands(
-                    expr,
-                    candidate.clone(),
-                    value_expr,
-                    value,
-                    spec,
-                )?;
-                if !value.is_null() && candidate == value {
+                if comparison_values_equal(expr, candidate.clone(), value_expr, value, spec)? {
                     return Ok(true);
                 }
             }
@@ -1548,18 +1739,116 @@ fn predicate_matches(
     }
 }
 
-fn eval_comparison_operands(
-    left: &BoundExpr,
-    right: &BoundExpr,
-    context: &EntityEvalContext<'_>,
+#[derive(Clone, Copy, Debug)]
+enum NumericComparisonValue {
+    Signed(i64),
+    Unsigned(u64),
+    Double(f64),
+}
+
+fn comparison_values_equal(
+    left_expr: &BoundExpr,
+    mut left_value: JsonValue,
+    right_expr: &BoundExpr,
+    mut right_value: JsonValue,
     spec: &EntitySurfaceSpec,
-    ctx: &mut dyn SqlWriteExecutionContext,
-    params: &[Value],
-    active_branch_commit_id: Option<&CommitId>,
-) -> Result<(JsonValue, JsonValue), LixError> {
-    let left_value = eval_expr(left, context, ctx, params, active_branch_commit_id)?;
-    let right_value = eval_expr(right, context, ctx, params, active_branch_commit_id)?;
-    normalize_comparison_operands(left, left_value, right, right_value, spec)
+) -> Result<bool, LixError> {
+    normalize_bigint_comparison_literal(left_expr, right_expr, &mut right_value, spec)?;
+    normalize_bigint_comparison_literal(right_expr, left_expr, &mut left_value, spec)?;
+    let (left_value, right_value) =
+        normalize_comparison_operands(left_expr, left_value, right_expr, right_value, spec)?;
+    if left_value.is_null() || right_value.is_null() {
+        return Ok(false);
+    }
+
+    let left_numeric = numeric_comparison_value(left_expr, &left_value, spec)?;
+    let right_numeric = numeric_comparison_value(right_expr, &right_value, spec)?;
+    match (left_numeric, right_numeric) {
+        (Some(left), Some(right)) => Ok(numeric_values_equal(left, right)),
+        _ => Ok(left_value == right_value),
+    }
+}
+
+fn normalize_bigint_comparison_literal(
+    column_expr: &BoundExpr,
+    value_expr: &BoundExpr,
+    value: &mut JsonValue,
+    spec: &EntitySurfaceSpec,
+) -> Result<(), LixError> {
+    let Some(column) = visible_entity_column(column_expr, spec) else {
+        return Ok(());
+    };
+    if column.column_type != EntityColumnType::Integer {
+        return Ok(());
+    }
+    if let Some(exact) = bigint_number_literal(value_expr, &spec.schema_key, &column.name)? {
+        *value = JsonValue::from(exact);
+    }
+    Ok(())
+}
+
+fn numeric_comparison_value(
+    expr: &BoundExpr,
+    value: &JsonValue,
+    spec: &EntitySurfaceSpec,
+) -> Result<Option<NumericComparisonValue>, LixError> {
+    if let Some(column) = visible_entity_column(expr, spec) {
+        return match column.column_type {
+            EntityColumnType::Integer => {
+                json_bigint_value(Some(value), &spec.schema_key, &column.name)
+                    .map(|value| value.map(NumericComparisonValue::Signed))
+            }
+            EntityColumnType::Number => {
+                json_double_value(Some(value), &spec.schema_key, &column.name)
+                    .map(|value| value.map(NumericComparisonValue::Double))
+            }
+            EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {
+                Ok(None)
+            }
+        };
+    }
+
+    let JsonValue::Number(number) = value else {
+        return Ok(None);
+    };
+    if let Some(value) = number.as_i64() {
+        return Ok(Some(NumericComparisonValue::Signed(value)));
+    }
+    if let Some(value) = number.as_u64() {
+        return Ok(Some(NumericComparisonValue::Unsigned(value)));
+    }
+    Ok(number.as_f64().map(NumericComparisonValue::Double))
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::float_cmp,
+    reason = "SQL numeric equality coerces mixed BIGINT/DOUBLE operands to DOUBLE PRECISION"
+)]
+fn numeric_values_equal(left: NumericComparisonValue, right: NumericComparisonValue) -> bool {
+    match (left, right) {
+        (NumericComparisonValue::Signed(left), NumericComparisonValue::Signed(right)) => {
+            left == right
+        }
+        (NumericComparisonValue::Unsigned(left), NumericComparisonValue::Unsigned(right)) => {
+            left == right
+        }
+        (NumericComparisonValue::Signed(left), NumericComparisonValue::Unsigned(right))
+        | (NumericComparisonValue::Unsigned(right), NumericComparisonValue::Signed(left)) => {
+            u64::try_from(left).is_ok_and(|left| left == right)
+        }
+        (NumericComparisonValue::Double(left), NumericComparisonValue::Double(right)) => {
+            left == right
+        }
+        (NumericComparisonValue::Double(left), NumericComparisonValue::Signed(right))
+        | (NumericComparisonValue::Signed(right), NumericComparisonValue::Double(left)) => {
+            left == right as f64
+        }
+        (NumericComparisonValue::Double(left), NumericComparisonValue::Unsigned(right))
+        | (NumericComparisonValue::Unsigned(right), NumericComparisonValue::Double(left)) => {
+            left == right as f64
+        }
+    }
 }
 
 fn normalize_comparison_operands(
@@ -1641,6 +1930,20 @@ fn validate_bound_write_supported(
         for item in &returning.items {
             validate_expr_supported(&item.expr)?;
         }
+    }
+    if plan.bound.returning.is_some() && plan.bound.op != BoundWriteOp::Delete {
+        let action = match plan.bound.op {
+            BoundWriteOp::Insert => "INSERT",
+            BoundWriteOp::Update => "UPDATE",
+            BoundWriteOp::Delete => unreachable!("DELETE RETURNING is supported"),
+        };
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!("{action} RETURNING is not supported for registered entity surfaces"),
+        )
+        .with_hint(format!(
+            "Run the {action} without RETURNING, then SELECT the row explicitly."
+        )));
     }
     Ok(())
 }
@@ -1827,10 +2130,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => Ok(()),
-        BoundExpr::Cast { .. } => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity writes do not support CAST expressions yet",
-        )),
+        BoundExpr::Cast { expr, .. } => validate_expr_supported(expr),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}
@@ -1871,29 +2171,189 @@ fn candidate_snapshot(
         .transpose()
 }
 
-#[expect(clippy::unnecessary_wraps)]
 fn entity_json_value(
+    expr: &BoundExpr,
     value: EntityEvalValue,
     column_type: EntityColumnType,
+    schema_key: &str,
+    column_name: &str,
 ) -> Result<JsonValue, LixError> {
-    Ok(match (value, column_type) {
-        (EntityEvalValue::SqlNull, _) => JsonValue::Null,
-        (EntityEvalValue::SqlText(value), EntityColumnType::Json) => {
-            serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
+    let exact_bigint_literal = if column_type == EntityColumnType::Integer {
+        bigint_number_literal(expr, schema_key, column_name)?
+    } else {
+        None
+    };
+    let value = exact_bigint_literal.map_or_else(
+        || match (value, column_type) {
+            (EntityEvalValue::SqlNull, _) => JsonValue::Null,
+            (EntityEvalValue::SqlText(value), EntityColumnType::Json) => {
+                serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
+            }
+            (EntityEvalValue::SqlText(value), _) => JsonValue::String(value),
+            (EntityEvalValue::Json(JsonValue::String(value)), EntityColumnType::String) => {
+                JsonValue::String(value)
+            }
+            (
+                EntityEvalValue::Json(JsonValue::Number(value)),
+                EntityColumnType::Number | EntityColumnType::Integer,
+            ) => JsonValue::Number(value),
+            (EntityEvalValue::Json(JsonValue::Bool(value)), EntityColumnType::Boolean) => {
+                JsonValue::Bool(value)
+            }
+            (EntityEvalValue::Json(value), _) => value,
+        },
+        JsonValue::from,
+    );
+    match column_type {
+        EntityColumnType::Integer => {
+            json_bigint_value(Some(&value), schema_key, column_name)?;
         }
-        (EntityEvalValue::SqlText(value), _) => JsonValue::String(value),
-        (EntityEvalValue::Json(JsonValue::String(value)), EntityColumnType::String) => {
-            JsonValue::String(value)
+        EntityColumnType::Number => {
+            json_double_value(Some(&value), schema_key, column_name)?;
         }
-        (
-            EntityEvalValue::Json(JsonValue::Number(value)),
-            EntityColumnType::Number | EntityColumnType::Integer,
-        ) => JsonValue::Number(value),
-        (EntityEvalValue::Json(JsonValue::Bool(value)), EntityColumnType::Boolean) => {
-            JsonValue::Bool(value)
+        EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {}
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BigintNumberLiteral {
+    Exact(i64),
+    NonIntegral,
+}
+
+fn bigint_number_literal(
+    expr: &BoundExpr,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<i64>, LixError> {
+    let raw = match expr {
+        BoundExpr::Literal(BoundLiteral::Number { raw, .. }) => raw,
+        BoundExpr::Cast {
+            expr,
+            data_type: BoundCastType::BigInt,
+        } => return bigint_number_literal(expr, schema_key, column_name),
+        _ => return Ok(None),
+    };
+    let Some(BigintNumberLiteral::Exact(value)) = classify_bigint_literal(raw) else {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!(
+                "typed SQL surface '{schema_key}' column '{column_name}' cannot represent SQL numeric literal {raw} as BIGINT"
+            ),
+        )
+        .with_hint(
+            "Use an exact integer between -9223372036854775808 and 9223372036854775807.",
+        ));
+    };
+    Ok(Some(value))
+}
+
+fn classify_bigint_literal(raw: &str) -> Option<BigintNumberLiteral> {
+    let (negative, unsigned) = raw.strip_prefix('-').map_or_else(
+        || (false, raw.strip_prefix('+').unwrap_or(raw)),
+        |unsigned| (true, unsigned),
+    );
+    let (mantissa, exponent) = if let Some((mantissa, exponent)) = unsigned.split_once(['e', 'E']) {
+        if exponent.contains(['e', 'E']) {
+            return None;
         }
-        (EntityEvalValue::Json(value), _) => value,
-    })
+        (mantissa, exponent.parse::<i64>().ok()?)
+    } else {
+        (unsigned, 0)
+    };
+    let (integer_digits, fractional_digits) =
+        if let Some((integer_digits, fractional_digits)) = mantissa.split_once('.') {
+            if fractional_digits.contains('.') {
+                return None;
+            }
+            (integer_digits, fractional_digits)
+        } else {
+            (mantissa, "")
+        };
+    if integer_digits.is_empty() && fractional_digits.is_empty() {
+        return None;
+    }
+    if !integer_digits.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional_digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let mut digits = String::with_capacity(integer_digits.len() + fractional_digits.len());
+    digits.push_str(integer_digits);
+    digits.push_str(fractional_digits);
+    if digits.bytes().all(|byte| byte == b'0') {
+        return Some(BigintNumberLiteral::Exact(0));
+    }
+
+    let fractional_len = i64::try_from(fractional_digits.len()).ok()?;
+    let decimal_shift = exponent.checked_sub(fractional_len)?;
+    if decimal_shift >= 0 {
+        let significant = digits.trim_start_matches('0');
+        let trailing_zeros = usize::try_from(decimal_shift).ok()?;
+        if significant.len().checked_add(trailing_zeros)? > 19 {
+            return None;
+        }
+        let mut magnitude = String::with_capacity(significant.len() + trailing_zeros);
+        magnitude.push_str(significant);
+        magnitude.extend(std::iter::repeat_n('0', trailing_zeros));
+        return signed_bigint_magnitude(&magnitude, negative).map(BigintNumberLiteral::Exact);
+    }
+
+    let removed_digits = usize::try_from(decimal_shift.unsigned_abs()).ok()?;
+    if removed_digits > digits.len() {
+        return Some(BigintNumberLiteral::NonIntegral);
+    }
+    let split = digits.len() - removed_digits;
+    let integer_magnitude = digits[..split].trim_start_matches('0');
+    let fractional_is_zero = digits[split..].bytes().all(|byte| byte == b'0');
+    if fractional_is_zero {
+        let integer_magnitude = if integer_magnitude.is_empty() {
+            "0"
+        } else {
+            integer_magnitude
+        };
+        return signed_bigint_magnitude(integer_magnitude, negative)
+            .map(BigintNumberLiteral::Exact);
+    }
+    if non_integral_magnitude_is_in_bigint_range(integer_magnitude, negative) {
+        Some(BigintNumberLiteral::NonIntegral)
+    } else {
+        None
+    }
+}
+
+fn signed_bigint_magnitude(magnitude: &str, negative: bool) -> Option<i64> {
+    let maximum = if negative {
+        "9223372036854775808"
+    } else {
+        "9223372036854775807"
+    };
+    if magnitude.len() > maximum.len() || (magnitude.len() == maximum.len() && magnitude > maximum)
+    {
+        return None;
+    }
+    let magnitude = magnitude.parse::<u64>().ok()?;
+    if negative {
+        if magnitude == 9_223_372_036_854_775_808_u64 {
+            Some(i64::MIN)
+        } else {
+            i64::try_from(magnitude).ok().map(|value| -value)
+        }
+    } else {
+        i64::try_from(magnitude).ok()
+    }
+}
+
+fn non_integral_magnitude_is_in_bigint_range(magnitude: &str, negative: bool) -> bool {
+    let maximum_integer_part = if negative {
+        "9223372036854775807"
+    } else {
+        "9223372036854775806"
+    };
+    magnitude.len() < maximum_integer_part.len()
+        || (magnitude.len() == maximum_integer_part.len() && magnitude <= maximum_integer_part)
 }
 
 fn reject_direct_blob_json_value(
@@ -1925,6 +2385,7 @@ fn literal_json(literal: &BoundLiteral) -> JsonValue {
         BoundLiteral::Null => JsonValue::Null,
         BoundLiteral::Bool(value) => JsonValue::Bool(*value),
         BoundLiteral::Integer(value) => JsonValue::from(*value),
+        BoundLiteral::Number { value, .. } => JsonValue::Number(value.clone()),
         BoundLiteral::Text(value) => JsonValue::String(value.clone()),
         BoundLiteral::Json(value) => value.clone(),
         BoundLiteral::Blob(value) => {

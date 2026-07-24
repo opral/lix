@@ -1159,21 +1159,41 @@ async fn insert_values_input_plan(
             "sql2 DataFusion reference writer cannot execute empty INSERT",
         ));
     }
-    let nullable_schema = std::sync::Arc::new(Schema::new(
-        schema
-            .fields()
-            .iter()
-            .map(|field| Field::new(field.name(), field.data_type().clone(), true))
-            .collect::<Vec<_>>(),
-    ));
-    let df_schema = std::sync::Arc::new(
-        DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
-    );
     let field_source_indexes = schema
         .fields()
         .iter()
         .map(|field| values.column_index(field.name()))
         .collect::<Vec<_>>();
+    // Keep omission intent on the VALUES input fields as well as the output
+    // aliases below. DataFusion can eliminate the identity projection while
+    // optimizing an INSERT, but it preserves the VALUES schema at the table
+    // provider boundary.
+    let nullable_schema = std::sync::Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .zip(field_source_indexes.iter())
+            .map(|(field, source_index)| {
+                let field = Field::new(field.name(), field.data_type().clone(), true);
+                if source_index.is_none() && !insert_field_is_derived_from_scope(plan, field.name())
+                {
+                    field.with_metadata(
+                        [(
+                            LIX_INSERT_COLUMN_OMITTED_METADATA_KEY.to_string(),
+                            "true".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                } else {
+                    field
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let df_schema = std::sync::Arc::new(
+        DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
+    );
     let rows = values
         .rows
         .iter()
@@ -1202,7 +1222,9 @@ async fn insert_values_input_plan(
         .zip(field_source_indexes.iter())
         .enumerate()
         .map(|(index, (field, source_index))| {
-            let metadata = if source_index.is_none() {
+            let metadata = if source_index.is_none()
+                && !insert_field_is_derived_from_scope(plan, field.name())
+            {
                 Some(FieldMetadata::new(BTreeMap::from([(
                     LIX_INSERT_COLUMN_OMITTED_METADATA_KEY.to_string(),
                     "true".to_string(),
@@ -1310,6 +1332,31 @@ fn insert_column_is_omitted(values: &BoundInsertValues, field_name: &str) -> boo
 }
 
 fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Result<(), LixError> {
+    if plan.bound.op == BoundWriteOp::Insert
+        && matches!(
+            plan.bound.target,
+            BoundWriteTarget::File(_) | BoundWriteTarget::Directory(_)
+        )
+        && let BoundWriteInput::Values(values) = &plan.bound.input
+        && let Some(id_index) = values.column_index("id")
+    {
+        for row in &values.rows {
+            let explicit_null = match &row[id_index] {
+                BoundExpr::Literal(BoundLiteral::Null) => true,
+                BoundExpr::Param(param) => params
+                    .get(param.index.saturating_sub(1))
+                    .is_some_and(|value| matches!(value, Value::Null)),
+                _ => false,
+            };
+            if explicit_null {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "defaulted filesystem id may be omitted, but explicit NULL is not allowed",
+                ));
+            }
+        }
+    }
+
     if !matches!(
         plan.bound.target,
         BoundWriteTarget::File(FileWriteSurface::Base | FileWriteSurface::ByBranch)
@@ -1379,8 +1426,28 @@ fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
             omitted_insert_columns.insert("data".to_string());
         }
     }
+    let explicit_insert_columns = match &plan.bound.input {
+        BoundWriteInput::Values(values) => {
+            let mut columns = values
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<BTreeSet<_>>();
+            for field_name in ["branch_id", "global"] {
+                if insert_field_is_derived_from_scope(plan, field_name) {
+                    columns.insert(field_name.to_string());
+                }
+            }
+            Some(columns)
+        }
+        BoundWriteInput::Query { columns, .. } => {
+            Some(columns.iter().map(|column| column.name.clone()).collect())
+        }
+        BoundWriteInput::None => None,
+    };
     SqlWriteSessionOptions {
         omitted_insert_columns,
+        explicit_insert_columns,
     }
 }
 
@@ -1474,6 +1541,12 @@ fn sql_write_empty_returning_result(
     ))
 }
 
+fn insert_field_is_derived_from_scope(plan: &LogicalWritePlan, field_name: &str) -> bool {
+    matches!(plan.bound.target, BoundWriteTarget::LixStateByBranch)
+        && plan.bound.branch_scope == BranchScope::Global
+        && matches!(field_name, "branch_id" | "global")
+}
+
 fn insert_field_expr(
     session: &SessionContext,
     row: &[BoundExpr],
@@ -1483,11 +1556,15 @@ fn insert_field_expr(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Expr, LixError> {
-    if plan.bound.branch_scope == BranchScope::Global && field_name == "global" {
-        let has_explicit_global = source_index.is_some();
-        if !has_explicit_global {
-            return Ok(Expr::Literal(ScalarValue::Boolean(Some(true)), None));
-        }
+    if source_index.is_none() && insert_field_is_derived_from_scope(plan, field_name) {
+        return Ok(Expr::Literal(
+            match field_name {
+                "branch_id" => ScalarValue::Utf8(Some(GLOBAL_BRANCH_ID.to_string())),
+                "global" => ScalarValue::Boolean(Some(true)),
+                _ => unreachable!("scope-derived fields are branch_id or global"),
+            },
+            None,
+        ));
     }
 
     source_index
@@ -1811,7 +1888,11 @@ fn datafusion_expr_from_bound_expr(
         }
         BoundExpr::Cast { expr, data_type } => {
             let data_type = match data_type {
+                BoundCastType::Text => DataType::Utf8,
                 BoundCastType::Binary => DataType::Binary,
+                BoundCastType::BigInt => DataType::Int64,
+                BoundCastType::Double => DataType::Float64,
+                BoundCastType::Boolean => DataType::Boolean,
             };
             Ok(Expr::Cast(Cast::new(
                 Box::new(datafusion_expr_from_bound_expr(session, expr, params)?),
@@ -1834,6 +1915,10 @@ fn scalar_from_bound_literal(literal: &BoundLiteral) -> Result<ScalarValue, LixE
         BoundLiteral::Null => ScalarValue::Null,
         BoundLiteral::Bool(value) => ScalarValue::Boolean(Some(*value)),
         BoundLiteral::Integer(value) => ScalarValue::Int64(Some(*value)),
+        BoundLiteral::Number { value, .. } => value.as_u64().map_or_else(
+            || ScalarValue::Float64(value.as_f64()),
+            |value| ScalarValue::UInt64(Some(value)),
+        ),
         BoundLiteral::Text(value) => ScalarValue::Utf8(Some(value.clone())),
         BoundLiteral::Json(value) => ScalarValue::Utf8(Some(value.to_string())),
         BoundLiteral::Blob(value) => ScalarValue::LargeBinary(Some(value.clone())),

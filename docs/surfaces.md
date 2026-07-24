@@ -6,6 +6,48 @@ description: The SQL surfaces in Lix at a glance. State surfaces are JSON-shaped
 
 Lix exposes the same underlying state through several SQL surfaces so you can query it the way that fits the question you're asking.
 
+The SQL engine is backed by DataFusion. Query
+`information_schema.columns` for the executable public contract instead of
+inferring types from Arrow or JSON Schema names. Lix reports the canonical SQL
+types `TEXT`, `BYTEA`, `BIGINT`, `DOUBLE PRECISION`, and `BOOLEAN`.
+JSON-backed columns remain SQL `TEXT` and are marked with
+`lix_value_kind = 'JSON'`. `is_nullable` describes values returned by reads;
+`column_default` and `lix_insert_policy` separately describe whether a write
+may omit a column. In particular, a defaulted id is non-null when read, may be
+omitted on insert, and rejects an explicit `NULL`.
+
+The reported scalar type name is executable as an explicit `CAST` in
+`SELECT`, `INSERT`, and `UPDATE`. Bound Lix writes use those canonical names;
+read expressions retain DataFusion's wider cast dialect. `BINARY` is retired
+in favor of `BYTEA`.
+
+`lix_insert_policy` describes omission on `INSERT`:
+
+| Policy | Meaning |
+| --- | --- |
+| `READ_ONLY` | The column cannot be supplied on insert. |
+| `REQUIRED` | Every inserted row must supply the column. |
+| `OPTIONAL` | The column may be omitted without generating a value. |
+| `DEFAULT` | Omission evaluates the expression in `column_default`. |
+| `CONDITIONAL` | Whether the column is required depends on the row's other inputs. |
+
+`CONDITIONAL` covers deliberate alternative forms: filesystem rows can use
+`path` or descriptor fields, typed entities derive `lixcol_entity_pk` from
+their public primary-key columns (while schemas without `x-lix-primary-key`
+require `lixcol_entity_pk`), and raw `_by_branch` global rows can omit a branch
+id.
+These policies describe omission only; `is_nullable` still describes values
+returned by reads. Defaulted filesystem and typed-entity ids reject explicit
+`NULL`.
+
+```sql
+SELECT column_name, data_type, is_nullable, column_default,
+       lix_value_kind, lix_insert_policy
+FROM information_schema.columns
+WHERE table_name = 'lix_file'
+ORDER BY ordinal_position;
+```
+
 Two ergonomic axes:
 
 - **Grain.** Typed columns for one schema vs. raw JSON across all schemas vs. file bytes.

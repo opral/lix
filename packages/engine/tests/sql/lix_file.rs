@@ -1077,7 +1077,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('cast-binary-file', $1, CAST($2 AS BINARY))",
+                 VALUES ('cast-binary-file', $1, CAST($2 AS BYTEA))",
                 &[
                     Value::Text("/cast-binary.txt".to_string()),
                     Value::Text("inserted".to_string()),
@@ -1088,7 +1088,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_file SET data = CAST($1 AS BINARY) \
+                "UPDATE lix_file SET data = CAST($1 AS BYTEA) \
                  WHERE id = 'cast-binary-file'",
                 &[Value::Text("updated".to_string())],
             )
@@ -2707,7 +2707,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_global) \
-                 VALUES ('global-shared-file', '/shared/a.txt', CAST('a' AS BINARY), true)",
+                 VALUES ('global-shared-file', '/shared/a.txt', CAST('a' AS BYTEA), true)",
                 &[],
             )
             .await
@@ -2748,7 +2748,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-readme', '/scratch/readme.md', CAST('hello' AS BINARY))",
+                 VALUES ('file-readme', '/scratch/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -2815,7 +2815,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
-                 VALUES ('file-draft', '/docs/draft.md', CAST('draft' AS BINARY), true)",
+                 VALUES ('file-draft', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
                 &[],
             )
             .await

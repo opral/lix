@@ -149,7 +149,8 @@ where
         ReadProviderScope::All,
         selection,
     )
-    .await
+    .await?;
+    crate::sql2::information_schema::register(session, catalog)
 }
 
 /// Snapshot-local providers needed to plan already-bound SQL.
@@ -475,7 +476,9 @@ pub(crate) async fn register_write(
     selection: &ProviderSelection,
 ) -> Result<(), LixError> {
     let catalog = write_ctx.public_catalog()?;
-    register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection).await
+    register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
+        .await?;
+    crate::sql2::information_schema::register(session, &catalog)
 }
 
 pub(crate) async fn register_transaction<C>(
@@ -513,7 +516,8 @@ where
         &catalog,
         selection,
     )
-    .await
+    .await?;
+    crate::sql2::information_schema::register(session, &catalog)
 }
 
 async fn register_write_from_catalog(

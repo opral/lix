@@ -33,6 +33,9 @@ pub(crate) enum EntityColumnType {
 pub(crate) struct EntitySurfaceColumn {
     pub(crate) name: String,
     pub(crate) column_type: EntityColumnType,
+    pub(crate) read_nullable: bool,
+    pub(crate) insert_required: bool,
+    pub(crate) default_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,7 @@ pub(crate) struct EntitySurfaceSpec {
     pub(crate) schema_key: String,
     pub(crate) primary_key_paths: Vec<Vec<String>>,
     pub(crate) columns: Vec<EntitySurfaceColumn>,
+    pub(crate) defaults: crate::catalog::DefaultPlan,
 }
 
 impl EntitySurfaceSpec {
@@ -77,6 +81,18 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
                 format!("schema '{schema_key}' must define object properties"),
             )
         })?;
+    let required = schema
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .collect::<BTreeSet<_>>();
+    let primary_key_paths = parse_primary_key_paths(schema)?;
+    let primary_key_roots = primary_key_paths
+        .iter()
+        .filter_map(|path| path.first())
+        .collect::<BTreeSet<_>>();
 
     let mut columns = properties
         .iter()
@@ -94,17 +110,28 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
             Ok(EntitySurfaceColumn {
                 name: key.clone(),
                 column_type,
+                read_nullable: !primary_key_roots.contains(key)
+                    && (!required.contains(key.as_str())
+                        || entity_schema_allows_null(property_schema)),
+                insert_required: required.contains(key.as_str()),
+                default_expression: property_schema
+                    .get("x-lix-default")
+                    .map(lix_default_expression)
+                    .or_else(|| {
+                        property_schema
+                            .get("default")
+                            .map(json_schema_default_expression)
+                    }),
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     columns.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let primary_key_paths = parse_primary_key_paths(schema)?;
-
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         primary_key_paths,
         columns,
+        defaults: crate::catalog::DefaultPlan::from_schema(schema),
     })
 }
 
@@ -133,10 +160,15 @@ pub(crate) fn entity_surface_schema(
         .columns
         .iter()
         .map(|column| {
+            let read_nullable = if shape == EntitySurfaceShape::History {
+                !history_identity_roots.contains(&column.name)
+            } else {
+                column.read_nullable
+            };
             let field = Field::new(
                 &column.name,
                 arrow_data_type_for_entity_column_type(column.column_type),
-                !history_identity_roots.contains(&column.name),
+                read_nullable,
             );
             if column.column_type == EntityColumnType::Json {
                 mark_json_field(field)
@@ -277,6 +309,31 @@ fn entity_column_type_from_schema(schema: &JsonValue) -> Option<EntityColumnType
     Some(EntityColumnType::Json)
 }
 
+fn entity_schema_allows_null(schema: &JsonValue) -> bool {
+    let mut kinds = BTreeSet::new();
+    collect_entity_type_kinds(schema, &mut kinds);
+    kinds.contains("null")
+}
+
+fn lix_default_expression(default: &JsonValue) -> String {
+    match default {
+        JsonValue::String(value) => value.clone(),
+        value => value.to_string(),
+    }
+}
+
+fn json_schema_default_expression(default: &JsonValue) -> String {
+    match default {
+        JsonValue::Null => "NULL".to_string(),
+        JsonValue::Bool(value) => value.to_string().to_ascii_uppercase(),
+        JsonValue::Number(value) => value.to_string(),
+        JsonValue::String(value) => format!("'{}'", value.replace('\'', "''")),
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            format!("lix_json('{}')", default.to_string().replace('\'', "''"))
+        }
+    }
+}
+
 fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> DataType {
     match column_type {
         EntityColumnType::String | EntityColumnType::Json => DataType::Utf8,
@@ -360,11 +417,11 @@ mod tests {
 
         let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(
-            active
+            !active
                 .field_with_name("identity")
                 .expect("active identity input")
                 .is_nullable(),
-            "write surfaces keep omission/default input semantics"
+            "read nullability is independent from omission/default input semantics"
         );
     }
 }

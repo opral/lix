@@ -98,6 +98,7 @@ mod sql {
     mod entity_view;
     mod errors;
     mod history_conformance;
+    mod information_schema;
     mod lix_branch;
     mod lix_change;
     mod lix_commit;

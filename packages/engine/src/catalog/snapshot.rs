@@ -445,7 +445,7 @@ enum DefaultValuePlan {
 }
 
 impl DefaultPlan {
-    fn from_schema(schema: &JsonValue) -> Self {
+    pub(crate) fn from_schema(schema: &JsonValue) -> Self {
         let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
             return Self::default();
         };

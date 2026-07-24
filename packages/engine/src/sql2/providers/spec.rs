@@ -40,6 +40,7 @@ use futures_util::{TryStreamExt, stream};
 
 use crate::LixError;
 use crate::sql2::dml::{InsertExec, InsertSink};
+use crate::sql2::write_normalization::{InsertColumnIntents, mark_omitted_insert_columns};
 use crate::sql2::{SqlWriteContext, WriteAccess};
 
 use super::upsert;
@@ -500,15 +501,28 @@ impl TableProvider for SpecTableProvider {
             .require_write(&format!("INSERT into {table}"))?;
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
+        let omitted_insert_columns = write_ctx.explicit_insert_columns().map_or_else(
+            || InsertColumnIntents::from_input(&input).omitted_columns(self.schema.as_ref()),
+            |explicit_columns| {
+                self.schema
+                    .fields()
+                    .iter()
+                    .filter(|field| !explicit_columns.contains(field.name().as_str()))
+                    .map(|field| field.name().clone())
+                    .collect()
+            },
+        );
         let sink: Arc<dyn InsertSink> =
             match self.spec.plan_insert(write_ctx.clone(), &input).await? {
                 Some(apply) => Arc::new(PlannedInsertSink {
                     table: table.into(),
                     apply,
+                    omitted_insert_columns,
                 }),
                 None => Arc::new(SpecInsertSink {
                     spec: Arc::clone(&self.spec),
                     write_ctx,
+                    omitted_insert_columns,
                 }),
             };
         Ok(Arc::new(InsertExec::new(input, sink)))
@@ -577,6 +591,7 @@ fn physical_filters(
 struct SpecInsertSink {
     spec: Arc<dyn TableSpec>,
     write_ctx: SqlWriteContext,
+    omitted_insert_columns: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for SpecInsertSink {
@@ -600,6 +615,10 @@ impl InsertSink for SpecInsertSink {
         batches: Vec<RecordBatch>,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        let batches = batches
+            .into_iter()
+            .map(|batch| mark_omitted_insert_columns(batch, &self.omitted_insert_columns))
+            .collect::<Result<Vec<_>>>()?;
         self.spec.stage_insert(&self.write_ctx, batches).await
     }
 }
@@ -608,6 +627,7 @@ impl InsertSink for SpecInsertSink {
 struct PlannedInsertSink {
     table: Arc<str>,
     apply: InsertApply,
+    omitted_insert_columns: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for PlannedInsertSink {
@@ -631,6 +651,10 @@ impl InsertSink for PlannedInsertSink {
         batches: Vec<RecordBatch>,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        let batches = batches
+            .into_iter()
+            .map(|batch| mark_omitted_insert_columns(batch, &self.omitted_insert_columns))
+            .collect::<Result<Vec<_>>>()?;
         (self.apply)(batches).await
     }
 }

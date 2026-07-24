@@ -7,17 +7,23 @@ pub(crate) fn reject_read_only_entity_surface(
     schema_key: &str,
     action: &str,
 ) -> Result<(), DataFusionError> {
-    if schema_key == "lix_directory_descriptor" {
-        return Err(read_only_error(
-            action,
-            schema_key,
-            "Use the writable lix_directory surface to create, update, or delete directories.",
-        ));
-    }
-    if let Some(message) = read_only_schema_message(schema_key) {
+    if let Some(message) = read_only_entity_surface_hint(schema_key) {
         return Err(read_only_error(action, schema_key, message));
     }
     Ok(())
+}
+
+pub(crate) fn is_read_only_entity_surface(schema_key: &str) -> bool {
+    read_only_entity_surface_hint(schema_key).is_some()
+}
+
+pub(crate) fn read_only_entity_surface_hint(schema_key: &str) -> Option<&'static str> {
+    if schema_key == "lix_directory_descriptor" {
+        return Some(
+            "Use the writable lix_directory surface to create, update, or delete directories.",
+        );
+    }
+    read_only_schema_message(schema_key)
 }
 
 pub(crate) fn reject_read_only_stage_rows(
