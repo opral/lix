@@ -3,7 +3,6 @@ use super::types::{
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitScanBatch,
     CommitScanRequest,
 };
-#[cfg(feature = "storage-benches")]
 use super::types::{GcPlan, GcRoot};
 use crate::common::LixError;
 use crate::storage_adapter::{StorageSpace, StorageSpaceId};
@@ -92,7 +91,7 @@ fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
 
 #[async_trait]
 pub(crate) trait ChangelogReader {
-    #[cfg(feature = "storage-benches")]
+    #[allow(dead_code)] // Exercised directly by the storage-bench feature.
     async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 
     async fn load_commits(
@@ -131,7 +130,7 @@ pub(crate) trait ChangelogWriter {
         change_ids: &[ChangeId],
     ) -> Result<(), LixError>;
 
-    #[cfg(feature = "storage-benches")]
+    #[allow(dead_code)] // Activated by the checkpoint GC integration.
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 }
 

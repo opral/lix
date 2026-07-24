@@ -461,13 +461,13 @@ pub(crate) struct RebuildIndexStats {
     pub(crate) unchanged: usize,
 }
 
-#[cfg(feature = "storage-benches")]
+#[allow(dead_code)] // Activated by the checkpoint GC integration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GcRoot {
     BranchHead(CommitId),
+    StandaloneChange(ChangeId),
 }
 
-#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcLiveSet {
     pub(crate) commits: Vec<CommitId>,
@@ -475,20 +475,18 @@ pub(crate) struct GcLiveSet {
     pub(crate) payloads: Vec<JsonRef>,
 }
 
-#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcSweepSet {
     pub(crate) commits: Vec<CommitId>,
+    pub(crate) commit_change_ids: Vec<ChangeId>,
     pub(crate) changes: Vec<ChangeId>,
     pub(crate) commit_change_ref_chunks: Vec<(CommitId, u32)>,
     pub(crate) json_payloads: Vec<JsonRef>,
 }
 
-#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcRepairSet {}
 
-#[cfg(feature = "storage-benches")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcPlan {
     pub(crate) roots: Vec<GcRoot>,

@@ -74,6 +74,11 @@ pub struct StorageWriteSet {
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
     stats: StorageWriteSetStats,
+    // Domain stores can seal a write lane after planning a destructive sweep.
+    // The flag carries no storage representation; it only prevents a later
+    // domain writer sharing this canonical write set from invalidating the
+    // sweep's reachability proof before commit.
+    changelog_gc_sealed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +121,7 @@ impl StorageWriteSet {
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
             stats: StorageWriteSetStats::default(),
+            changelog_gc_sealed: false,
         }
     }
 
@@ -216,6 +222,7 @@ impl StorageWriteSet {
     }
 
     pub fn extend(&mut self, other: Self) {
+        self.changelog_gc_sealed |= other.changelog_gc_sealed;
         for group in other.groups {
             let space = group.space;
             let conflicting_declarations = group.conflicting_declarations;
@@ -235,6 +242,22 @@ impl StorageWriteSet {
 
     pub fn stats(&self) -> StorageWriteSetStats {
         self.stats
+    }
+
+    pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
+        self.group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
+    }
+
+    pub(crate) fn changelog_gc_is_sealed(&self) -> bool {
+        self.changelog_gc_sealed
+    }
+
+    #[allow(dead_code)] // Activated by the checkpoint GC integration.
+    pub(crate) fn seal_changelog_gc(&mut self) {
+        self.changelog_gc_sealed = true;
     }
 
     /// Validates the canonical write-set contract.
@@ -431,6 +454,7 @@ impl Default for StorageWriteSet {
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
             stats: StorageWriteSetStats::default(),
+            changelog_gc_sealed: false,
         }
     }
 }

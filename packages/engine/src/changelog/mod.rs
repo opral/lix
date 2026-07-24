@@ -25,11 +25,12 @@ pub(crate) use store::{
     CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key,
 };
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
+#[cfg(feature = "storage-benches")]
+pub(crate) use types::RebuildIndexStats;
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
     ChangeScanRequest, ChangelogAppend, CommitChangeRefChunk, CommitChangeRefSet, CommitId,
     CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
     CommitScanBatch, CommitScanRequest, commit_row_snapshot_json,
 };
-#[cfg(feature = "storage-benches")]
-pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats};
+pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
