@@ -73,7 +73,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     write_file(&lix, "/benchmark.md", corpus.bytes.clone()).await;
     let lix_import = lix_import_started.elapsed();
     let file_id = file_id_at_path(&lix, "/benchmark.md").await;
-    let initial_nodes = markdown_paragraph_nodes(&lix, &file_id).await;
+    let initial_nodes = markdown_nodes_by_kind(&lix, &file_id, "paragraph").await;
     assert_eq!(initial_nodes.len(), corpus.texts.len());
 
     let mut lix_semantic_edits = Vec::with_capacity(edit_samples);
@@ -291,6 +291,7 @@ async fn markdown_git_semantic_entities_benchmark() {
 
     let lix_cold = cold_lix_reads(lix_root.path(), &lix_main_state, cold_samples).await;
     let git_cold = git.cold_object_reads(&git_state, cold_samples);
+    semantic_table_merge_quality(&archive).await;
 
     print_duration_metric("initial_import", "lix-semantic", &[lix_import]);
     print_duration_metric("initial_import", "git", &[git_import]);
@@ -309,6 +310,14 @@ async fn markdown_git_semantic_entities_benchmark() {
     print_storage_metric("history-live", "git", &git_history_live);
     print_storage_metric("history-packed", "git", &git_history_packed);
     print_storage_metric("post-successful-merges", "git", &git_live);
+    eprintln!(
+        "markdown_git_bench merge_quality scenario=distinct_table_cells_same_line \
+         system=lix clean_merges=1 conflicts=0 preserved_edits=2"
+    );
+    eprintln!(
+        "markdown_git_bench merge_quality scenario=distinct_table_cells_same_line \
+         system=git clean_merges=0 conflicts=1 preserved_edits=0"
+    );
     eprintln!(
         "markdown_git_bench corpus_bytes={} paragraphs={} edit_samples={} merge_samples={} \
          lix_incremental_total_bytes={} lix_incremental_metadata_bytes={} \
@@ -358,6 +367,16 @@ impl GitFixture {
     }
 
     fn run<const N: usize>(&self, args: [&str; N]) -> Output {
+        let output = self.try_run(args);
+        assert!(
+            output.status.success(),
+            "Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn try_run<const N: usize>(&self, args: [&str; N]) -> Output {
         let output = Command::new("git")
             .args(args)
             .current_dir(self.root.path())
@@ -365,11 +384,6 @@ impl GitFixture {
             .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
             .output()
             .expect("run Git command");
-        assert!(
-            output.status.success(),
-            "Git command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         output
     }
 
@@ -416,6 +430,103 @@ async fn cold_lix_reads(root: &Path, expected: &[u8], samples: usize) -> Vec<Dur
         lix.close().await.expect("close cold Lix sample");
     }
     durations
+}
+
+async fn semantic_table_merge_quality(archive: &[u8]) {
+    const TABLE: &[u8] = b"| left | right |\n| --- | --- |\n| alpha | beta |\n";
+
+    let root = tempfile::tempdir().expect("create Lix semantic quality directory");
+    let lix = open_lix_with_filesystem(root.path()).await;
+    install_plugin(&lix, "plugin_markdown_incremental_v2", archive).await;
+    write_file(&lix, "/quality.md", TABLE.to_vec()).await;
+    let file_id = file_id_at_path(&lix, "/quality.md").await;
+    let cells = markdown_nodes_by_kind(&lix, &file_id, "table_cell").await;
+    let alpha = cells
+        .iter()
+        .find(|node| payload_contains_text(&node.payload_json, "alpha"))
+        .expect("Markdown table should expose alpha as a cell entity");
+    let beta = cells
+        .iter()
+        .find(|node| payload_contains_text(&node.payload_json, "beta"))
+        .expect("Markdown table should expose beta as a cell entity");
+    assert_ne!(alpha.id, beta.id, "table cells must be distinct entities");
+
+    let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("markdown-table-source".to_string()),
+            name: "Markdown table source".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create Lix table-cell source branch");
+    update_markdown_node(
+        &lix,
+        &file_id,
+        &alpha.id,
+        payload_with_text(&alpha.payload_json, "ALPHA"),
+    )
+    .await;
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .expect("switch to Lix table-cell source");
+    update_markdown_node(
+        &lix,
+        &file_id,
+        &beta.id,
+        payload_with_text(&beta.payload_json, "BETA"),
+    )
+    .await;
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: main_branch_id,
+    })
+    .await
+    .expect("switch to Lix table-cell target");
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("distinct table-cell entities should merge in Lix");
+    let rendered = String::from_utf8(read_file(&lix, "/quality.md").await)
+        .expect("rendered Markdown table should be UTF-8");
+    assert!(
+        rendered.contains("ALPHA") && rendered.contains("BETA"),
+        "Lix semantic table merge must preserve both cell edits: {rendered:?}"
+    );
+    lix.close().await.expect("close Lix table quality fixture");
+
+    let mut git = GitFixture::new();
+    git.write_worktree(TABLE);
+    git.commit_all("initial Markdown table");
+    git.run(["branch", "markdown-table-source"]);
+    git.write_worktree(
+        &String::from_utf8_lossy(TABLE)
+            .replace("alpha", "ALPHA")
+            .into_bytes(),
+    );
+    git.commit_all("edit left table cell");
+    git.run(["switch", "--quiet", "markdown-table-source"]);
+    git.write_worktree(
+        &String::from_utf8_lossy(TABLE)
+            .replace("beta", "BETA")
+            .into_bytes(),
+    );
+    git.commit_all("edit right table cell");
+    git.run(["switch", "--quiet", "main"]);
+    let merge = git.try_run([
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "markdown-table-source",
+        "-m",
+        "merge distinct table cells",
+    ]);
+    assert!(
+        !merge.status.success(),
+        "Git should report a same-line conflict for distinct table-cell edits"
+    );
 }
 
 fn markdown_corpus(target_bytes: usize) -> Corpus {
@@ -489,6 +600,33 @@ fn payload_with_replacement(payload: &str, original_text: &str, replacement: u8)
     serde_json::to_string(&value).expect("serialize updated Markdown payload")
 }
 
+fn payload_with_text(payload: &str, replacement: &str) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(payload).expect("Markdown payload should be JSON");
+    assert!(
+        replace_first_text_value(&mut value, replacement),
+        "Markdown payload must contain a text inline"
+    );
+    serde_json::to_string(&value).expect("serialize updated Markdown payload")
+}
+
+fn payload_contains_text(payload: &str, expected: &str) -> bool {
+    fn contains(value: &serde_json::Value, expected: &str) -> bool {
+        match value {
+            serde_json::Value::String(value) => value == expected,
+            serde_json::Value::Array(values) => {
+                values.iter().any(|value| contains(value, expected))
+            }
+            serde_json::Value::Object(object) => {
+                object.values().any(|value| contains(value, expected))
+            }
+            _ => false,
+        }
+    }
+
+    serde_json::from_str(payload).is_ok_and(|value| contains(&value, expected))
+}
+
 fn replace_first_text_value(value: &mut serde_json::Value, replacement: &str) -> bool {
     match value {
         serde_json::Value::Object(object) => {
@@ -514,20 +652,24 @@ fn replace_first_text_value(value: &mut serde_json::Value, replacement: &str) ->
     }
 }
 
-async fn markdown_paragraph_nodes<StorageImpl>(
+async fn markdown_nodes_by_kind<StorageImpl>(
     lix: &Lix<StorageImpl>,
     file_id: &str,
+    kind: &str,
 ) -> Vec<MarkdownNode>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "SELECT id, payload_json FROM markdown_node_v2 \
-         WHERE kind = 'paragraph' AND lixcol_file_id = $1 ORDER BY order_key, id",
-        &[Value::Text(file_id.to_owned())],
+         WHERE kind = $1 AND lixcol_file_id = $2 ORDER BY order_key, id",
+        &[
+            Value::Text(kind.to_owned()),
+            Value::Text(file_id.to_owned()),
+        ],
     )
     .await
-    .expect("query Markdown paragraph entities")
+    .expect("query Markdown entities by kind")
     .rows()
     .iter()
     .map(|row| MarkdownNode {
