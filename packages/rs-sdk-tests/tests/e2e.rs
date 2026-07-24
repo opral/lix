@@ -539,6 +539,213 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
 }
 
 #[tokio::test]
+async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_nodes() {
+    let archive = build_json_v2_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/json-lifecycle.json";
+    let initial = b"{\"left\":\"one\",\"right\":\"two\",\"gone\":\"three\"}".to_vec();
+    write_file(&lix, path, initial.clone()).await.unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+
+    // Different scalar changes from the same observed document compose.
+    let left_writer = lix.open_workspace_session().await.unwrap();
+    let right_writer = lix.open_workspace_session().await.unwrap();
+    assert_eq!(
+        read_file(&left_writer, path).await.unwrap(),
+        Some(initial.clone())
+    );
+    assert_eq!(read_file(&right_writer, path).await.unwrap(), Some(initial));
+    left_writer
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
+            &[
+                Value::Text(r#""ONE-A""#.to_owned()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    right_writer
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
+            &[
+                Value::Text(r#""TWO-B""#.to_owned()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    let composed = b"{\"left\":\"ONE-A\",\"right\":\"TWO-B\",\"gone\":\"three\"}".to_vec();
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(composed.clone()));
+
+    // Commit order is the deterministic LWW tiebreaker for the same scalar.
+    let first_lww = lix.open_workspace_session().await.unwrap();
+    let second_lww = lix.open_workspace_session().await.unwrap();
+    assert_eq!(
+        read_file(&first_lww, path).await.unwrap(),
+        Some(composed.clone())
+    );
+    assert_eq!(read_file(&second_lww, path).await.unwrap(), Some(composed));
+    first_lww
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
+            &[
+                Value::Text(r#""LWW-A""#.to_owned()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    second_lww
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
+            &[
+                Value::Text(r#""LWW-B""#.to_owned()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    let lww = b"{\"left\":\"LWW-B\",\"right\":\"TWO-B\",\"gone\":\"three\"}".to_vec();
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww.clone()));
+
+    // Structure is not a direct semantic SQL operation. Its rejection must
+    // roll back the staged row and leave the actor usable for a later scalar.
+    let direct_structure_error = lix
+        .execute(
+            "DELETE FROM json_object_member \
+             WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect_err("direct JSON semantic deletion must use an authoritative byte write");
+    assert_eq!(direct_structure_error.code, LixError::CODE_INVALID_PARAM);
+    assert!(
+        direct_structure_error
+            .message
+            .contains("one existing scalar value only")
+    );
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww));
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
+        &[
+            Value::Text(r#""AFTER-DIRECT-REJECT""#.to_owned()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    let scalar_after_direct_reject =
+        b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DIRECT-REJECT\",\"gone\":\"three\"}".to_vec();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(scalar_after_direct_reject.clone())
+    );
+    let direct_batch_error = lix
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND lixcol_file_id = $2",
+            &[
+                Value::Text(r#""BULK""#.to_owned()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect_err("a direct JSON semantic transition must contain one scalar change");
+    assert_eq!(direct_batch_error.code, LixError::CODE_INVALID_PARAM);
+    assert!(
+        direct_batch_error
+            .message
+            .contains("one existing scalar value only")
+    );
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(scalar_after_direct_reject.clone())
+    );
+
+    // Structure is byte-owned. A stale scalar delta is not allowed to
+    // recreate an entity after another writer removes its containing slot.
+    let stale_writer = lix.open_workspace_session().await.unwrap();
+    let structure_writer = lix.open_workspace_session().await.unwrap();
+    assert_eq!(
+        read_file(&stale_writer, path).await.unwrap(),
+        Some(scalar_after_direct_reject.clone())
+    );
+    assert_eq!(
+        read_file(&structure_writer, path).await.unwrap(),
+        Some(scalar_after_direct_reject)
+    );
+    let without_gone = b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DIRECT-REJECT\"}".to_vec();
+    write_file(&structure_writer, path, without_gone.clone())
+        .await
+        .unwrap();
+    let error = write_file(
+        &stale_writer,
+        path,
+        b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DIRECT-REJECT\",\"gone\":\"STALE\"}".to_vec(),
+    )
+    .await
+    .expect_err("a stale scalar must not resurrect a byte-deleted JSON node");
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    assert!(error.message.contains("one existing scalar value only"));
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(without_gone.clone())
+    );
+    let gone = lix
+        .execute(
+            "SELECT key FROM json_object_member \
+             WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert!(gone.is_empty(), "the deleted node must not be resurrected");
+
+    // A clean semantic scalar write still works after the rejected replay;
+    // returned invalid-input errors discard only the prospective transition.
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
+        &[
+            Value::Text(r#""AFTER-FENCE""#.to_owned()),
+            Value::Text(file_id),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"{\"left\":\"AFTER-FENCE\",\"right\":\"AFTER-DIRECT-REJECT\"}".to_vec())
+    );
+
+    for session in [
+        left_writer,
+        right_writer,
+        first_lww,
+        second_lww,
+        stale_writer,
+        structure_writer,
+    ] {
+        session.close().await.unwrap();
+    }
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "10 MiB end-to-end Wasm acceptance gate"]
 async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     let archive = build_json_v2_plugin_archive();

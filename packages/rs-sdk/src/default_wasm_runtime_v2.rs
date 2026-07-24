@@ -1398,16 +1398,27 @@ impl WasmtimeV2Actor {
         error: bindings::exports::lix::plugin::api::PluginError,
     ) -> LixError {
         use bindings::exports::lix::plugin::api::PluginError;
-        let (kind, message) = match error {
-            PluginError::InvalidInput(message) => ("invalid-input", message),
+        let (code, kind, message) = match error {
+            // This is the guest's declared rejection of caller-provided
+            // bytes or a format-specific semantic operation. It is not a
+            // malformed Component or an invalid plugin packet.
+            PluginError::InvalidInput(message) => {
+                (LixError::CODE_INVALID_PARAM, "invalid-input", message)
+            }
             PluginError::RecordTooLarge(size) => {
                 return v2_record_too_large(size);
             }
-            PluginError::LimitExceeded(message) => ("limit-exceeded", message),
-            PluginError::DeadlineExceeded => ("deadline-exceeded", String::new()),
-            PluginError::Internal(message) => ("internal", message),
+            PluginError::LimitExceeded(message) => {
+                (LixError::CODE_INVALID_PLUGIN, "limit-exceeded", message)
+            }
+            PluginError::DeadlineExceeded => (
+                LixError::CODE_INVALID_PLUGIN,
+                "deadline-exceeded",
+                String::new(),
+            ),
+            PluginError::Internal(message) => (LixError::CODE_INVALID_PLUGIN, "internal", message),
         };
-        v2_invalid_plugin(format!("{context} returned {kind}: {message}"))
+        LixError::new(code, format!("{context} returned {kind}: {message}"))
     }
 
     /// A guest-returned error has deterministic completion semantics. Unless
@@ -1962,6 +1973,7 @@ mod tests {
                 .message
                 .contains("file-changed returned invalid-input")
         );
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert_document_was_discarded(actor.as_mut(), invalid_file_fork).await;
         assert_actor_is_reusable(actor.as_mut(), accepted).await;
 
@@ -1999,6 +2011,7 @@ mod tests {
                 .message
                 .contains("entities-changed returned invalid-input")
         );
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert_document_was_discarded(actor.as_mut(), invalid_entity_fork).await;
         assert_actor_is_reusable(actor.as_mut(), accepted).await;
         actor

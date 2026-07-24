@@ -703,6 +703,31 @@ fn ax_07_committed_leaf_change_renders_exact_semantic_json() {
 }
 
 #[test]
+fn semantic_scalar_kind_change_stays_sparse() {
+    let before = br#"{"value":"one","other":true}"#;
+    let expected = br#"{"value":7,"other":true}"#;
+    let document = open(before);
+    let records = initial_records(&document);
+    let value = object_member(&records, ROOT_ID, "value");
+    let mut value_snapshot = record_snapshot(value);
+    value_snapshot["kind"] = json!("number");
+    value_snapshot["scalar_json"] = json!("7");
+
+    let (after, edits) = document
+        .entities_changed(&[EntityChange {
+            schema_key: value.schema_key.clone(),
+            entity_pk: value.entity_pk.clone(),
+            snapshot: Some(serde_json::to_vec(&value_snapshot).expect("serialize scalar")),
+            effect: ChangeEffect::Content,
+        }])
+        .expect("scalar kind changes remain direct semantic value changes");
+
+    assert_eq!(after.bytes(), expected);
+    assert_eq!(apply_edits(before, &edits), expected);
+    assert_eq!(edits.len(), 1);
+}
+
+#[test]
 fn ax_08_failed_or_discarded_transition_keeps_accepted_base() {
     let before = br#"{"a":0}"#;
     let document = open(before);
@@ -791,9 +816,8 @@ fn length_changing_scalar_then_later_array_edit_keeps_spans_and_ids_correct() {
 }
 
 #[test]
-fn scalar_array_entity_order_change_renders_a_move() {
+fn semantic_array_order_change_is_rejected_and_leaves_bytes_unchanged() {
     let before = br#"{"rows":[1,2]}"#;
-    let expected = br#"{"rows":[2,1]}"#;
     let document = open(before);
     let records = initial_records(&document);
     let rows_id = child_container_id(&records, ROOT_ID, "rows");
@@ -809,7 +833,7 @@ fn scalar_array_entity_order_change_renders_a_move() {
     let mut moved_snapshot = record_snapshot(first);
     moved_snapshot["order_key"] = json!("ffffffffffffffff");
 
-    let (after, edits) = document
+    let error = document
         .entities_changed(&[EntityChange {
             schema_key: first.schema_key.clone(),
             entity_pk: first.entity_pk.clone(),
@@ -818,16 +842,67 @@ fn scalar_array_entity_order_change_renders_a_move() {
             ),
             effect: ChangeEffect::Content,
         }])
-        .expect("apply an order-only scalar array change");
-    let after_records = initial_records(&after);
-    let after_rows_id = child_container_id(&after_records, ROOT_ID, "rows");
+        .expect_err("direct semantic moves must use an authoritative byte write");
 
-    assert_eq!(after.bytes(), expected);
-    assert_eq!(apply_edits(before, &edits), expected);
+    assert!(error.contains("one existing scalar value only"));
+    assert_eq!(document.bytes(), before);
     assert_eq!(
-        array_item_ids(&after_records, &after_rows_id),
-        [accepted_ids[1].clone(), accepted_ids[0].clone()]
+        array_item_ids(&initial_records(&document), &rows_id),
+        accepted_ids
     );
+}
+
+#[test]
+fn semantic_structural_changes_and_stale_scalar_replays_are_rejected() {
+    let before = br#"{"gone":1,"keep":2,"container":{"child":3}}"#;
+    let document = open(before);
+    let records = initial_records(&document);
+    let gone = object_member(&records, ROOT_ID, "gone");
+    let container = object_member(&records, ROOT_ID, "container");
+
+    let delete_error = document
+        .entities_changed(&[EntityChange {
+            schema_key: gone.schema_key.clone(),
+            entity_pk: gone.entity_pk.clone(),
+            snapshot: None,
+            effect: ChangeEffect::Content,
+        }])
+        .expect_err("direct semantic deletes must use an authoritative byte write");
+    assert!(delete_error.contains("one existing scalar value only"));
+
+    let container_error = document
+        .entities_changed(&[EntityChange {
+            schema_key: container.schema_key.clone(),
+            entity_pk: container.entity_pk.clone(),
+            snapshot: Some(container.snapshot.clone()),
+            effect: ChangeEffect::Content,
+        }])
+        .expect_err("direct container changes must use an authoritative byte write");
+    assert!(container_error.contains("one existing scalar value only"));
+
+    let after_bytes = br#"{"keep":2,"container":{"child":3}}"#;
+    let (after, _) = document
+        .file_changed(
+            &[InputSplice {
+                offset: 0,
+                delete_len: u64::try_from(before.len()).expect("fixture length fits u64"),
+                insert: after_bytes,
+            }],
+            namespace_from(41, 42),
+        )
+        .expect("a file write owns structural deletion");
+    let mut stale_gone = record_snapshot(gone);
+    stale_gone["scalar_json"] = json!("7");
+    let stale_error = after
+        .entities_changed(&[EntityChange {
+            schema_key: gone.schema_key.clone(),
+            entity_pk: gone.entity_pk.clone(),
+            snapshot: Some(serde_json::to_vec(&stale_gone).expect("serialize stale scalar")),
+            effect: ChangeEffect::Content,
+        }])
+        .expect_err("a stale scalar must not resurrect a byte-deleted node");
+    assert!(stale_error.contains("one existing scalar value only"));
+    assert_eq!(after.bytes(), after_bytes);
 }
 
 #[test]
