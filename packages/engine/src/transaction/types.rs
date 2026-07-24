@@ -426,7 +426,13 @@ pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_change_id: ChangeId,
     pub(crate) branch_ref_change_id: ChangeId,
     pub(crate) created_at: LixTimestamp,
-    pub(crate) change_ids: BTreeSet<ChangeId>,
+    /// Normal prepared rows are already the authoritative commit-membership
+    /// sequence. Keeping every fresh row change id in another BTreeSet only
+    /// duplicates 10k+ UUIDs on bulk commits, so staging tracks their count.
+    pub(crate) tracked_change_count: usize,
+    /// Selected historical refs are a distinct, irregular path and need
+    /// change-id deduplication before they are appended beside row changes.
+    selected_change_ids: BTreeSet<ChangeId>,
     pub(crate) selected_change_refs: Vec<StagedCommitChangeRef>,
     pub(crate) allow_empty: bool,
 }
@@ -438,7 +444,8 @@ impl Default for StagedCommitChangeRefs {
             commit_change_id: ChangeId::default(),
             branch_ref_change_id: ChangeId::default(),
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
-            change_ids: BTreeSet::new(),
+            tracked_change_count: 0,
+            selected_change_ids: BTreeSet::new(),
             selected_change_refs: Vec::new(),
             allow_empty: false,
         }
@@ -468,28 +475,36 @@ impl StagedCommitChangeRefs {
             commit_change_id,
             branch_ref_change_id,
             created_at,
-            change_ids: BTreeSet::new(),
+            tracked_change_count: 0,
+            selected_change_ids: BTreeSet::new(),
             selected_change_refs: Vec::new(),
             allow_empty: false,
         }
     }
 
-    pub(crate) fn add_change_id(&mut self, change_id: ChangeId) {
-        self.change_ids.insert(change_id);
+    pub(crate) fn add_change_id(&mut self, _change_id: ChangeId) {
+        self.tracked_change_count += 1;
+    }
+
+    pub(crate) fn add_change_count(&mut self, count: usize) {
+        self.tracked_change_count += count;
     }
 
     pub(crate) fn add_selected_change_ref(&mut self, change_ref: StagedCommitChangeRef) {
-        if self.change_ids.insert(change_ref.change_id) {
+        if self.selected_change_ids.insert(change_ref.change_id) {
             self.selected_change_refs.push(change_ref);
         }
     }
 
-    pub(crate) fn remove_change_id(&mut self, change_id: &ChangeId) {
-        self.change_ids.remove(change_id);
+    pub(crate) fn remove_change_id(&mut self, _change_id: &ChangeId) {
+        self.tracked_change_count = self
+            .tracked_change_count
+            .checked_sub(1)
+            .expect("staged tracked change count must not underflow");
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.change_ids.is_empty()
+        self.tracked_change_count == 0 && self.selected_change_refs.is_empty()
     }
 
     pub(crate) fn allow_empty(&mut self) {

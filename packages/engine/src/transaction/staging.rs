@@ -46,8 +46,7 @@ use crate::{LixError, NullableKeyFilter};
 /// `PreparedStateRowOverlay` from those rows, and commit drains the same rows.
 pub(crate) struct TransactionWriteBuffer {
     functions: FunctionProviderHandle,
-    rows: Mutex<Vec<Option<PreparedStateRow>>>,
-    by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
+    rows: Mutex<StagedPreparedRows>,
     insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>>,
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
     first_commit_parent_override_by_branch: Mutex<BTreeMap<String, CommitId>>,
@@ -59,6 +58,54 @@ pub(crate) struct TransactionWriteBuffer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowSlot {
     State(usize),
+}
+
+/// The normal write path is an ordered journal. It becomes an indexed overlay
+/// only if a later write overlaps it or a transaction-local read actually
+/// needs read-your-writes semantics.
+enum StagedPreparedRows {
+    AppendOnly {
+        rows: Vec<PreparedStateRow>,
+        last_key: Option<TrackedStateKey>,
+    },
+    Indexed {
+        rows: Vec<Option<PreparedStateRow>>,
+        by_identity: HashMap<PreparedStateRowIdentity, RowSlot>,
+    },
+}
+
+impl Default for StagedPreparedRows {
+    fn default() -> Self {
+        Self::AppendOnly {
+            rows: Vec::new(),
+            last_key: None,
+        }
+    }
+}
+
+enum AppendOnlyStage {
+    Staged,
+    Fallback(Vec<PreparedStateRow>),
+}
+
+/// The ordering used by the tracked-state tree. This deliberately differs
+/// from [`PreparedStateRowIdentity`], whose entity-first order is for exact
+/// lookup rather than bulk root construction.
+#[derive(Clone)]
+struct TrackedStateKey {
+    schema_key: String,
+    file_id: Option<String>,
+    entity_pk: EntityPk,
+}
+
+impl TrackedStateKey {
+    fn from_row(row: &PreparedStateRow) -> Self {
+        Self {
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            entity_pk: row.entity_pk.clone(),
+        }
+    }
 }
 
 /// Drained prepared transaction writes ready for commit.
@@ -312,8 +359,7 @@ impl TransactionWriteBuffer {
     pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
             functions,
-            rows: Mutex::new(Vec::new()),
-            by_identity: Mutex::new(HashMap::new()),
+            rows: Mutex::new(StagedPreparedRows::default()),
             insert_identities: Mutex::new(BTreeMap::new()),
             commit_change_refs_by_branch: Mutex::new(BTreeMap::new()),
             first_commit_parent_override_by_branch: Mutex::new(BTreeMap::new()),
@@ -323,18 +369,139 @@ impl TransactionWriteBuffer {
         }
     }
 
+    /// Promotes the compact ordered journal into the existing identity overlay
+    /// only when a read or an irregular write needs read-your-writes lookup.
+    fn ensure_identity_index(&self, materialize_empty: bool) -> Result<(), LixError> {
+        let mut guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::AppendOnly { rows, .. } = &mut *guard else {
+            return Ok(());
+        };
+        // Schema normalization consults an empty transaction overlay before
+        // its first normal write. Keeping that read in journal mode lets the
+        // upcoming sorted batch take the append-only lane.
+        if rows.is_empty() && !materialize_empty {
+            return Ok(());
+        }
+        let append_only_rows = std::mem::take(rows);
+        let mut rows = Vec::with_capacity(append_only_rows.len());
+        let mut by_identity = HashMap::with_capacity(append_only_rows.len());
+        for row in append_only_rows {
+            let identity = PreparedStateRowIdentity::from(&row);
+            let index = rows.len();
+            rows.push(Some(row));
+            let previous = by_identity.insert(identity, RowSlot::State(index));
+            debug_assert!(previous.is_none(), "append-only rows must be unique");
+        }
+        *guard = StagedPreparedRows::Indexed { rows, by_identity };
+        Ok(())
+    }
+
+    /// Takes the normal tracked write lane directly into the transaction
+    /// journal. Any duplicate, cross-scope, untracked, global, or otherwise
+    /// irregular batch falls back to the indexed overlay.
+    fn stage_append_only_if_possible(
+        &self,
+        mode: Option<TransactionWriteMode>,
+        mut rows: Vec<PreparedStateRow>,
+    ) -> Result<AppendOnlyStage, LixError> {
+        let inserts = mode == Some(TransactionWriteMode::Insert);
+        if !matches!(
+            mode,
+            Some(TransactionWriteMode::Replace | TransactionWriteMode::Insert)
+        ) || (inserts
+            && !rows
+                .iter()
+                .all(|row| row_is_insert(mode, row) && row.snapshot.is_some()))
+        {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+        let mut staged_rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::AppendOnly {
+            rows: existing_rows,
+            last_key,
+        } = &mut *staged_rows
+        else {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        };
+        if !rows_are_append_only_tracked(rows.as_slice(), last_key.as_ref()) {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+
+        let mut commit_change_refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        let mut insert_identities = if inserts {
+            Some(self.insert_identities.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged insert identity lock",
+                )
+            })?)
+        } else {
+            None
+        };
+        if let Some(insert_identities) = &insert_identities
+            && rows
+                .iter()
+                .any(|row| insert_identities.contains_key(&PreparedStateRowIdentity::from(row)))
+        {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+        if let Some(first_row) = rows.first() {
+            let change_refs = commit_change_refs
+                .entry(first_row.branch_id.clone())
+                .or_insert_with(|| {
+                    let timestamp = self.functions.call_timestamp();
+                    StagedCommitChangeRefs::new(
+                        CommitId::from(self.functions.call_uuid_v7()),
+                        ChangeId::from(self.functions.call_uuid_v7()),
+                        ChangeId::from(self.functions.call_uuid_v7()),
+                        timestamp,
+                    )
+                });
+            let commit_id = change_refs.commit_id;
+            change_refs.add_change_count(rows.len());
+            for row in &mut rows {
+                row.commit_id = Some(commit_id);
+            }
+        }
+        if let Some(insert_identities) = &mut insert_identities {
+            for row in &rows {
+                insert_identities.insert(
+                    PreparedStateRowIdentity::from(row),
+                    PreparedInsertIdentity {
+                        untracked: row.untracked,
+                        origin: row.origin.clone(),
+                    },
+                );
+            }
+        }
+        if let Some(row) = rows.last() {
+            *last_key = Some(TrackedStateKey::from_row(row));
+        }
+        existing_rows.append(&mut rows);
+        Ok(AppendOnlyStage::Staged)
+    }
+
     /// Drains staged writes for commit.
     pub(crate) fn drain(&self) -> Result<PreparedWriteSet, LixError> {
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
-            )
-        })?;
-        let mut by_identity_guard = self.by_identity.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged identity index lock",
             )
         })?;
         let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
@@ -378,11 +545,12 @@ impl TransactionWriteBuffer {
                     "failed to acquire transaction staged checkpoint publications lock",
                 )
             })?;
+        let state_rows = match std::mem::take(&mut *rows_guard) {
+            StagedPreparedRows::AppendOnly { rows, .. } => rows,
+            StagedPreparedRows::Indexed { rows, .. } => rows.into_iter().flatten().collect(),
+        };
         let result = Ok(PreparedWriteSet {
-            state_rows: std::mem::take(&mut *rows_guard)
-                .into_iter()
-                .flatten()
-                .collect(),
+            state_rows,
             insert_identities: std::mem::take(&mut *insert_identities_guard),
             commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
             first_commit_parent_override_by_branch: std::mem::take(
@@ -392,7 +560,6 @@ impl TransactionWriteBuffer {
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         });
-        by_identity_guard.clear();
         result
     }
 
@@ -493,6 +660,17 @@ impl TransactionWriteBuffer {
         })
     }
 
+    #[cfg(test)]
+    fn uses_identity_index_for_tests(&self) -> bool {
+        matches!(
+            &*self
+                .rows
+                .lock()
+                .expect("staged rows lock should not be poisoned"),
+            StagedPreparedRows::Indexed { .. }
+        )
+    }
+
     /// Returns transaction-local file bytes addressed by their eventual CAS hash.
     ///
     /// File data is flushed into the binary CAS only during commit, while SQL reads
@@ -567,25 +745,46 @@ impl TransactionWriteBuffer {
             PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
             PreparedTransactionWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
         };
-        let functions = self.functions.clone();
-        let (rows, file_data_writes) = self.state_rows_from_stage_write(write);
+        let (mut rows, file_data_writes) = self.state_rows_from_stage_write(write);
+        if rows.is_empty() {
+            if !file_data_writes.is_empty() {
+                self.file_data_writes
+                    .lock()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            "failed to acquire transaction staged file data lock",
+                        )
+                    })?
+                    .extend(file_data_writes);
+            }
+            return Ok(TransactionWriteOutcome { count });
+        }
+        if file_data_writes.is_empty() {
+            match self.stage_append_only_if_possible(mode, rows)? {
+                AppendOnlyStage::Staged => return Ok(TransactionWriteOutcome { count }),
+                AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
+            }
+        }
         let identities = rows
             .iter()
             .map(PreparedStateRowIdentity::from)
             .collect::<Vec<_>>();
         validate_batch_row_identities(&rows, &identities)?;
+        self.ensure_identity_index(true)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let mut by_identity_guard = self.by_identity.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged identity index lock",
-            )
-        })?;
+        let StagedPreparedRows::Indexed {
+            rows: staged_rows,
+            by_identity,
+        } = &mut *guard
+        else {
+            unreachable!("generic staging must promote the identity index");
+        };
         let mut commit_change_refs_guard =
             self.commit_change_refs_by_branch.lock().map_err(|_| {
                 LixError::new(
@@ -606,10 +805,10 @@ impl TransactionWriteBuffer {
                     "global staged rows must use the global branch id",
                 ));
             }
-            let Some(RowSlot::State(index)) = by_identity_guard.get(identity).copied() else {
+            let Some(RowSlot::State(index)) = by_identity.get(identity).copied() else {
                 continue;
             };
-            let Some(previous) = guard.get(index).and_then(Option::as_ref) else {
+            let Some(previous) = staged_rows.get(index).and_then(Option::as_ref) else {
                 continue;
             };
             if previous.untracked != row.untracked {
@@ -618,16 +817,16 @@ impl TransactionWriteBuffer {
         }
         for (mut row, identity) in rows.into_iter().zip(identities) {
             let is_insert = row_is_insert(mode, &row);
-            if is_insert && by_identity_guard.contains_key(&identity) {
+            if is_insert && by_identity.contains_key(&identity) {
                 return Err(duplicate_insert_identity_error(&row));
             }
-            let existing_slot = by_identity_guard.get(&identity).copied();
+            let existing_slot = by_identity.get(&identity).copied();
             if let Some(RowSlot::State(index)) = existing_slot {
-                if let Some(previous) = guard.get_mut(index).and_then(Option::take) {
+                if let Some(previous) = staged_rows.get_mut(index).and_then(Option::take) {
                     remove_row_from_commit_change_refs(&mut commit_change_refs_guard, &previous);
                 }
             }
-            add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &functions);
+            add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &self.functions);
             let identity = PreparedStateRowIdentity::from(&row);
             if is_insert {
                 insert_identities_guard.insert(
@@ -640,16 +839,16 @@ impl TransactionWriteBuffer {
             }
             let slot = match existing_slot {
                 Some(RowSlot::State(index)) => {
-                    guard[index] = Some(row);
+                    staged_rows[index] = Some(row);
                     RowSlot::State(index)
                 }
                 None => {
-                    let index = guard.len();
-                    guard.push(Some(row));
+                    let index = staged_rows.len();
+                    staged_rows.push(Some(row));
                     RowSlot::State(index)
                 }
             };
-            by_identity_guard.insert(identity, slot);
+            by_identity.insert(identity, slot);
         }
         if !file_data_writes.is_empty() {
             self.file_data_writes
@@ -692,6 +891,53 @@ fn row_is_insert(mode: Option<TransactionWriteMode>, row: &PreparedStateRow) -> 
             .origin
             .as_ref()
             .is_some_and(|origin| origin.operation == TransactionWriteOperation::Update)
+}
+
+fn rows_are_append_only_tracked(
+    rows: &[PreparedStateRow],
+    previous_last: Option<&TrackedStateKey>,
+) -> bool {
+    let Some(first) = rows.first() else {
+        return true;
+    };
+    if !is_normal_tracked_append_row(first)
+        || previous_last.is_some_and(|previous| {
+            compare_tracked_key_to_row(previous, first) != std::cmp::Ordering::Less
+        })
+        || rows
+            .iter()
+            .any(|row| !is_normal_tracked_append_row(row) || row.branch_id != first.branch_id)
+    {
+        return false;
+    }
+    rows.windows(2).all(|pair| {
+        is_normal_tracked_append_row(&pair[1])
+            && compare_rows_by_tracked_key(&pair[0], &pair[1]) == std::cmp::Ordering::Less
+    })
+}
+
+fn is_normal_tracked_append_row(row: &PreparedStateRow) -> bool {
+    !row.untracked && !row.global && row.change_id.is_some()
+}
+
+fn compare_rows_by_tracked_key(
+    left: &PreparedStateRow,
+    right: &PreparedStateRow,
+) -> std::cmp::Ordering {
+    left.schema_key
+        .cmp(&right.schema_key)
+        .then_with(|| left.file_id.cmp(&right.file_id))
+        .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+}
+
+fn compare_tracked_key_to_row(
+    left: &TrackedStateKey,
+    right: &PreparedStateRow,
+) -> std::cmp::Ordering {
+    left.schema_key
+        .cmp(&right.schema_key)
+        .then_with(|| left.file_id.cmp(&right.file_id))
+        .then_with(|| left.entity_pk.cmp(&right.entity_pk))
 }
 
 /// Read overlay derived from staged transaction writes.
@@ -739,24 +985,26 @@ impl PreparedStateRowOverlay {
             return Ok(StagedScanParts { rows: Vec::new() });
         }
 
+        self.staged_writes.ensure_identity_index(false)?;
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let by_identity_guard = self.staged_writes.by_identity.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged identity index lock",
-            )
-        })?;
+        let (staged_rows, by_identity) = match &*rows_guard {
+            StagedPreparedRows::Indexed { rows, by_identity } => (rows, by_identity),
+            StagedPreparedRows::AppendOnly { rows, .. } => {
+                debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
+                return Ok(StagedScanParts { rows: Vec::new() });
+            }
+        };
 
         let mut rows = Vec::new();
-        for slot in by_identity_guard.values() {
+        for slot in by_identity.values() {
             match *slot {
                 RowSlot::State(index) => {
-                    let Some(row) = rows_guard.get(index).and_then(Option::as_ref) else {
+                    let Some(row) = staged_rows.get(index).and_then(Option::as_ref) else {
                         continue;
                     };
                     if !staged_row_identity_matches_scan(row, request) {
@@ -785,12 +1033,15 @@ impl PreparedStateRowOverlay {
 
     #[cfg(test)]
     fn load_state_slot(&self, identity: &PreparedStateRowIdentity) -> Option<PreparedStateRow> {
+        self.staged_writes.ensure_identity_index(false).ok()?;
         let rows_guard = self.staged_writes.rows.lock().ok()?;
-        let by_identity_guard = self.staged_writes.by_identity.lock().ok()?;
-        let Some(RowSlot::State(index)) = by_identity_guard.get(identity).copied() else {
+        let StagedPreparedRows::Indexed { rows, by_identity } = &*rows_guard else {
             return None;
         };
-        rows_guard.get(index)?.as_ref().cloned()
+        let Some(RowSlot::State(index)) = by_identity.get(identity).copied() else {
+            return None;
+        };
+        rows.get(index)?.as_ref().cloned()
     }
 }
 
@@ -806,27 +1057,32 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        if request.rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.staged_writes.ensure_identity_index(false)?;
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let by_identity_guard = self.staged_writes.by_identity.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged identity index lock",
-            )
-        })?;
+        let (staged_rows, by_identity) = match &*rows_guard {
+            StagedPreparedRows::Indexed { rows, by_identity } => (rows, by_identity),
+            StagedPreparedRows::AppendOnly { rows, .. } => {
+                debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
+                return Ok(vec![None; request.rows.len()]);
+            }
+        };
         Ok(request
             .rows
             .iter()
             .map(|request_row| {
                 let identity = PreparedStateRowIdentity::from_exact_request(request_row);
-                let Some(RowSlot::State(index)) = by_identity_guard.get(&identity).copied() else {
+                let Some(RowSlot::State(index)) = by_identity.get(&identity).copied() else {
                     return None;
                 };
-                let row = rows_guard.get(index)?.as_ref()?;
+                let row = staged_rows.get(index)?.as_ref()?;
                 if request
                     .untracked
                     .is_some_and(|untracked| row.untracked != untracked)
@@ -1172,6 +1428,249 @@ mod tests {
         LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateRowRequest,
         StagedLiveStateRows,
     };
+
+    #[test]
+    fn ordered_tracked_batches_stay_append_only_until_a_read() {
+        let staged_writes = test_staged_writes();
+        for rows in [
+            vec![
+                tracked_append_row("entity-a", "first"),
+                tracked_append_row("entity-b", "second"),
+            ],
+            vec![
+                tracked_append_row("entity-c", "third"),
+                tracked_append_row("entity-d", "fourth"),
+            ],
+        ] {
+            staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows,
+                })
+                .expect("ordered tracked batch should stage in the journal");
+        }
+
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "SQL-shaped repeated sorted batches should not build an identity index"
+        );
+        let drained = staged_writes.drain().expect("journal should drain");
+        assert_eq!(drained.state_rows.len(), 4);
+        let refs = drained
+            .commit_change_refs_by_branch
+            .get("branch-a")
+            .expect("tracked branch should have commit refs");
+        assert_eq!(refs.tracked_change_count, 4);
+        assert!(
+            drained
+                .state_rows
+                .iter()
+                .all(|row| row.commit_id == Some(refs.commit_id))
+        );
+    }
+
+    #[test]
+    fn ordered_tracked_insert_batches_stay_append_only_with_absence_guards() {
+        let staged_writes = test_staged_writes();
+        for rows in [
+            vec![
+                tracked_append_row("entity-a", "first"),
+                tracked_append_row("entity-b", "second"),
+            ],
+            vec![
+                tracked_append_row("entity-c", "third"),
+                tracked_append_row("entity-d", "fourth"),
+            ],
+        ] {
+            staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
+                    rows,
+                })
+                .expect("ordered tracked inserts should stage in the journal");
+        }
+
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "ordered SQL INSERT batches should not build an identity index"
+        );
+        let drained = staged_writes.drain().expect("journal should drain");
+        assert_eq!(drained.state_rows.len(), 4);
+        assert_eq!(
+            drained.insert_identities.len(),
+            4,
+            "the terminal root still needs INSERT absence guards"
+        );
+        assert_eq!(
+            drained
+                .commit_change_refs_by_branch
+                .get("branch-a")
+                .expect("tracked branch should have commit refs")
+                .tracked_change_count,
+            4
+        );
+    }
+
+    #[test]
+    fn overlapping_tracked_insert_promotes_and_rejects_the_duplicate() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![
+                    tracked_append_row("entity-a", "first"),
+                    tracked_append_row("entity-b", "second"),
+                ],
+            })
+            .expect("initial ordered insert batch should use the journal");
+
+        let error = staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![
+                    tracked_append_row("entity-a", "duplicate")
+                        .with_change_id("duplicate-entity-a"),
+                ],
+            })
+            .expect_err("a later INSERT must reject a journaled identity");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            staged_writes.uses_identity_index_for_tests(),
+            "an overlap must promote before generic INSERT validation"
+        );
+
+        let drained = staged_writes
+            .drain()
+            .expect("first batch should remain intact");
+        assert_eq!(drained.state_rows.len(), 2);
+        assert_eq!(drained.insert_identities.len(), 2);
+    }
+
+    #[test]
+    fn empty_overlay_scan_does_not_disable_first_tracked_append_batch() {
+        let staged_writes = test_staged_writes();
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("empty overlay should build");
+        assert!(
+            overlay
+                .scan_parts(&scan_request_for_key("schema-probe", false))
+                .expect("empty overlay scan should succeed")
+                .rows
+                .is_empty()
+        );
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "schema normalization's empty overlay lookup must retain journal mode"
+        );
+
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("entity-a", "first"),
+                    tracked_append_row("entity-b", "second"),
+                ],
+            })
+            .expect("first tracked batch should still use the journal");
+        assert!(!staged_writes.uses_identity_index_for_tests());
+    }
+
+    #[test]
+    fn transaction_read_lazily_promotes_the_append_journal_once() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("entity-a", "first"),
+                    tracked_append_row("entity-b", "second"),
+                ],
+            })
+            .expect("tracked batch should stage");
+        assert!(!staged_writes.uses_identity_index_for_tests());
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build lazily");
+        let row = overlay
+            .load_exact(&exact_request_for_branch_key("branch-a", "entity-b"))
+            .expect("staged row should answer the exact read");
+        assert!(matches!(row, StagedExactRow::Row(_)));
+        assert!(staged_writes.uses_identity_index_for_tests());
+
+        assert!(
+            overlay
+                .load_exact(&exact_request_for_branch_key("branch-a", "entity-a"))
+                .is_some()
+        );
+        assert!(
+            staged_writes.uses_identity_index_for_tests(),
+            "reads keep the single materialized index rather than rebuilding it"
+        );
+    }
+
+    #[test]
+    fn overlapping_tracked_batch_promotes_and_keeps_last_write() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("entity-a", "first"),
+                    tracked_append_row("entity-b", "before"),
+                ],
+            })
+            .expect("initial tracked batch should stage");
+        assert!(!staged_writes.uses_identity_index_for_tests());
+
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("entity-b", "after").with_change_id("entity-b-after"),
+                ],
+            })
+            .expect("overlapping write should use the indexed fallback");
+        assert!(staged_writes.uses_identity_index_for_tests());
+
+        let drained = staged_writes.drain().expect("writes should drain");
+        assert_eq!(drained.state_rows.len(), 2);
+        assert!(drained.state_rows.iter().any(|row| {
+            row.entity_pk == EntityPk::single("entity-b")
+                && row
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.normalized.as_ref())
+                    == Some("{\"key\":\"entity-b\",\"value\":\"after\"}")
+        }));
+        assert_eq!(
+            drained
+                .commit_change_refs_by_branch
+                .get("branch-a")
+                .expect("branch commit refs should remain")
+                .tracked_change_count,
+            2
+        );
+    }
+
+    #[test]
+    fn tracked_append_order_uses_file_before_entity() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("entity-z", "first").with_file_id("file-a"),
+                    tracked_append_row("entity-a", "second").with_file_id("file-b"),
+                ],
+            })
+            .expect("tracked-tree order should accept file-before-entity rows");
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "the journal must use tracked-tree order, not exact-lookup identity order"
+        );
+    }
 
     #[tokio::test]
     async fn update_origin_rows_replace_staged_identity_under_outer_insert_mode() {
@@ -1562,10 +2061,7 @@ mod tests {
             .commit_change_refs_by_branch
             .get("global")
             .expect("global commit change_refs should exist");
-        assert_eq!(
-            change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec![labeled_change_id("test-change-id")]
-        );
+        assert_eq!(change_refs.tracked_change_count, 1);
     }
 
     #[tokio::test]
@@ -1613,10 +2109,7 @@ mod tests {
             .commit_change_refs_by_branch
             .get("global")
             .expect("global commit change_refs should exist");
-        assert_eq!(
-            change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec![labeled_change_id("change-second")]
-        );
+        assert_eq!(change_refs.tracked_change_count, 1);
     }
 
     #[tokio::test]
@@ -1737,10 +2230,7 @@ mod tests {
             .commit_change_refs_by_branch
             .get("branch-a")
             .expect("active-branch commit change_refs should exist");
-        assert_eq!(
-            change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec![labeled_change_id("test-change-id")]
-        );
+        assert_eq!(change_refs.tracked_change_count, 1);
     }
 
     #[tokio::test]
@@ -1905,10 +2395,6 @@ mod tests {
         ChangeId::parse(&test_uuid(index)).expect("test uuid should parse as change id")
     }
 
-    fn labeled_change_id(label: &str) -> ChangeId {
-        ChangeId::for_test_label(label)
-    }
-
     fn state_row(key: &str, value: &str) -> PreparedStateRow {
         let snapshot = stage_json_from_value(
             TransactionJson::from_value_for_test(serde_json::json!({ "key": key, "value": value })),
@@ -1954,6 +2440,22 @@ mod tests {
             entity_pk: EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
+    }
+
+    fn exact_request_for_branch_key(branch_id: &str, key: &str) -> LiveStateRowRequest {
+        LiveStateRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            branch_id: branch_id.to_string(),
+            entity_pk: EntityPk::single(key),
+            file_id: NullableKeyFilter::Null,
+        }
+    }
+
+    fn tracked_append_row(key: &str, value: &str) -> PreparedStateRow {
+        state_row(key, value)
+            .with_tracked()
+            .with_branch("branch-a")
+            .with_change_id(&format!("append-{key}"))
     }
 
     fn scan_request_for_key(key: &str, include_tombstones: bool) -> LiveStateScanRequest {
