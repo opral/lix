@@ -1,0 +1,24 @@
+[package]
+name = "lix_plugin_abi_bench"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "45", default-features = false, features = ["p2"] }
+lix_plugin_abi_bench_rich_guest = { path = "../../plugins/abi-bench-rich", artifact = "cdylib", target = "wasm32-wasip2" }
+lix_plugin_abi_bench_packed_guest = { path = "../../plugins/abi-bench-packed", artifact = "cdylib", target = "wasm32-wasip2" }

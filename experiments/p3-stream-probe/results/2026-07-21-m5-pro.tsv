@@ -1,0 +1,21 @@
+config	wasmtime=45.0.3	warmups=8	samples=40	guest_component_bytes=86768	machine=Apple-M5-Pro-18-core	memory_gib=64
+result	bytes=1048576	work=count	transport=list-u8	p50_ms=0.016	p95_ms=0.018	min_ms=0.015	max_ms=0.019	guest_peak_mib=2.062
+result	bytes=1048576	work=count	transport=stream-u8-vec-64k	p50_ms=0.019	p95_ms=0.020	min_ms=0.018	max_ms=0.020	guest_peak_mib=1.125
+result	bytes=1048576	work=count	transport=stream-u8-bytes-8k	p50_ms=0.031	p95_ms=0.034	min_ms=0.030	max_ms=0.036	guest_peak_mib=1.062
+result	bytes=1048576	work=count	transport=stream-u8-bytes-64k	p50_ms=0.019	p95_ms=0.049	min_ms=0.017	max_ms=0.106	guest_peak_mib=1.125
+result	bytes=1048576	work=count	transport=stream-u8-bytes-1m	p50_ms=0.013	p95_ms=0.014	min_ms=0.013	max_ms=0.015	guest_peak_mib=2.062
+result	bytes=1048576	work=checksum	transport=list-u8	p50_ms=0.271	p95_ms=0.474	min_ms=0.265	max_ms=0.485	guest_peak_mib=2.062
+result	bytes=1048576	work=checksum	transport=stream-u8-vec-64k	p50_ms=0.276	p95_ms=0.293	min_ms=0.260	max_ms=0.347	guest_peak_mib=1.125
+result	bytes=1048576	work=checksum	transport=stream-u8-bytes-8k	p50_ms=0.284	p95_ms=0.289	min_ms=0.277	max_ms=0.296	guest_peak_mib=1.062
+result	bytes=1048576	work=checksum	transport=stream-u8-bytes-64k	p50_ms=0.276	p95_ms=0.281	min_ms=0.254	max_ms=0.290	guest_peak_mib=1.125
+result	bytes=1048576	work=checksum	transport=stream-u8-bytes-1m	p50_ms=0.266	p95_ms=0.272	min_ms=0.264	max_ms=0.301	guest_peak_mib=2.062
+result	bytes=10485760	work=count	transport=list-u8	p50_ms=0.150	p95_ms=0.164	min_ms=0.144	max_ms=0.174	guest_peak_mib=11.062
+result	bytes=10485760	work=count	transport=stream-u8-vec-64k	p50_ms=0.201	p95_ms=0.389	min_ms=0.173	max_ms=1.018	guest_peak_mib=1.125
+result	bytes=10485760	work=count	transport=stream-u8-bytes-8k	p50_ms=0.486	p95_ms=0.860	min_ms=0.361	max_ms=1.547	guest_peak_mib=1.062
+result	bytes=10485760	work=count	transport=stream-u8-bytes-64k	p50_ms=0.175	p95_ms=0.236	min_ms=0.171	max_ms=0.288	guest_peak_mib=1.125
+result	bytes=10485760	work=count	transport=stream-u8-bytes-1m	p50_ms=0.142	p95_ms=0.163	min_ms=0.138	max_ms=0.166	guest_peak_mib=2.062
+result	bytes=10485760	work=checksum	transport=list-u8	p50_ms=2.692	p95_ms=2.765	min_ms=2.645	max_ms=2.871	guest_peak_mib=11.062
+result	bytes=10485760	work=checksum	transport=stream-u8-vec-64k	p50_ms=2.717	p95_ms=2.802	min_ms=2.661	max_ms=2.903	guest_peak_mib=1.125
+result	bytes=10485760	work=checksum	transport=stream-u8-bytes-8k	p50_ms=2.813	p95_ms=2.894	min_ms=2.784	max_ms=2.962	guest_peak_mib=1.062
+result	bytes=10485760	work=checksum	transport=stream-u8-bytes-64k	p50_ms=2.718	p95_ms=2.804	min_ms=2.688	max_ms=2.852	guest_peak_mib=1.125
+result	bytes=10485760	work=checksum	transport=stream-u8-bytes-1m	p50_ms=2.686	p95_ms=2.820	min_ms=2.654	max_ms=3.060	guest_peak_mib=2.062

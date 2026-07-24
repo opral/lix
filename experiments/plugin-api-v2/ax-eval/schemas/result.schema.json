@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentskills.io/ax-eval/result.schema.json",
+  "title": "ax-eval result",
+  "description": "One round of ax-eval results for a single tool. Written verbatim to ~/.ax-eval/{tool-slug}/{ts}_{round}/result.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "tool", "task", "round", "ts", "config", "agents", "summary"],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "const": 1
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug", "name", "version", "install"],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$",
+          "description": "Lowercase, non-[a-z0-9-] replaced with '-'."
+        },
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "install": { "type": "string", "description": "Install command, e.g. 'npm i resend'." }
+      }
+    },
+    "task": { "type": "string" },
+    "round": { "type": "string", "description": "Slugified round name, e.g. 'baseline'." },
+    "ts": { "type": "string", "format": "date-time" },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_model", "agent_count", "temperature", "tools",
+        "mcp_servers", "system_prompt", "max_turns",
+        "prompt_template", "docs_included", "overrides"
+      ],
+      "properties": {
+        "agent_model": { "type": "string" },
+        "agent_count": { "type": "integer", "minimum": 1 },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "tools": { "type": "array", "items": { "type": "string" } },
+        "mcp_servers": { "type": "array", "items": { "type": "string" } },
+        "system_prompt": { "type": ["string", "null"] },
+        "max_turns": { "type": "integer", "minimum": 1 },
+        "prompt_template": { "type": "string" },
+        "docs_included": { "type": "boolean" },
+        "overrides": {
+          "type": "object",
+          "description": "Map of pinned-config-field → overridden value. Empty when no overrides."
+        }
+      }
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "success", "duration_sec", "tool_calls",
+          "interruptions", "interruption_details", "errors",
+          "scores", "first_3_commands"
+        ],
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "success": { "type": "boolean" },
+          "success_reason": { "type": "string", "description": "One-sentence citation from the judge subagent." },
+          "duration_sec": { "type": "number", "minimum": 0 },
+          "tool_calls": { "type": "integer", "minimum": 0 },
+          "interruptions": {
+            "type": "number",
+            "minimum": 0,
+            "description": "oauth device flow = 0.5, manual cred input = 1.0"
+          },
+          "interruption_details": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "errors": { "type": "integer", "minimum": 0 },
+          "scores": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["friction", "speed", "efficiency", "errorRecovery", "final"],
+            "properties": {
+              "friction": { "type": "number", "minimum": 0, "maximum": 100 },
+              "speed": { "type": "number", "minimum": 0, "maximum": 100 },
+              "efficiency": { "type": "number", "minimum": 0, "maximum": 100 },
+              "errorRecovery": { "type": "number", "minimum": 0, "maximum": 100 },
+              "final": { "type": "number", "minimum": 0, "maximum": 100 }
+            }
+          },
+          "first_3_commands": {
+            "type": "array",
+            "items": { "type": "string" },
+            "maxItems": 3
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["success_rate", "median_final", "p25_final", "p75_final", "common_first_command"],
+      "properties": {
+        "success_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "median_final": { "type": "number", "minimum": 0, "maximum": 100 },
+        "p25_final": { "type": "number", "minimum": 0, "maximum": 100 },
+        "p75_final": { "type": "number", "minimum": 0, "maximum": 100 },
+        "common_first_command": {
+          "type": "string",
+          "description": "Mode of first_3_commands[0], formatted '{cmd} ({count}/{N})'."
+        }
+      }
+    }
+  }
+}

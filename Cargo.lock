@@ -3379,6 +3379,30 @@ name = "lix_order_key"
 version = "0.8.4"
 
 [[package]]
+name = "lix_plugin_abi_bench"
+version = "0.8.4"
+dependencies = [
+ "lix_plugin_abi_bench_packed_guest",
+ "lix_plugin_abi_bench_rich_guest",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
+name = "lix_plugin_abi_bench_packed_guest"
+version = "0.8.4"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "lix_plugin_abi_bench_rich_guest"
+version = "0.8.4"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "lix_rocksdb_storage"
 version = "0.8.4"
 dependencies = [
@@ -3399,9 +3423,13 @@ dependencies = [
  "codspeed-criterion-compat",
  "lix_engine",
  "lix_local_filesystem",
+ "lix_rocksdb_storage",
+ "lix_slatedb_storage",
  "lix_sqlite_storage",
  "lru",
  "notify-debouncer-full",
+ "object_store 0.14.0",
+ "plugin_csv",
  "rusqlite",
  "serde_json",
  "tempfile",

@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "tool": {
+    "slug": "lix-plugin-api-b-final-aligned",
+    "name": "Lix plugin API candidate B final-aligned paging contract",
+    "version": "research-2026-07-22-132b4d48",
+    "install": "frozen source snapshot in the isolated evaluation workspace"
+  },
+  "task": "Implement and test the final-aligned 200,000-row paging, stateful-source, global-validation, pre-call-cap, rename, and reselection task",
+  "round": "candidate-b-final-aligned",
+  "ts": "2026-07-22T18:23:30Z",
+  "config": {
+    "agent_model": "gpt-5.6-sol",
+    "agent_count": 1,
+    "temperature": 0,
+    "tools": [
+      "Codex functions.exec",
+      "Codex collaboration.send_message"
+    ],
+    "mcp_servers": [],
+    "system_prompt": null,
+    "max_turns": 40,
+    "prompt_template": "Implement and test the task at {task_path} in {isolated_workspace} using the frozen API and WIT at {candidate_api_path}",
+    "docs_included": false,
+    "overrides": {
+      "agent_model": "claude-opus-4-7 was unavailable; used gpt-5.6-sol",
+      "reasoning_effort": "low",
+      "temperature": "Codex collaboration agents do not expose temperature; 0 records the requested nominal setting, not a verified provider setting",
+      "tools": "Codex functions.exec and collaboration.send_message replaced the pinned Claude Code tool list; apply_patch and shell execution were nested under functions.exec",
+      "mcp_servers": "Codex does not expose per-agent MCP stripping; no MCP calls were observed in the scored transcript",
+      "system_prompt": "Codex collaboration agents use the Codex system/developer instructions and cannot run with no system prompt",
+      "mode": "Codex workspace-write sandbox policy replaced bypassPermissions",
+      "max_turns": "Codex collaboration agents do not expose a hard turn cap; 40 records the requested nominal limit",
+      "fork_turns": "none",
+      "cohort_size": "Targeted N=1 signature-alignment check; not an ergonomics cohort and not statistically comparable to N=9 candidate results",
+      "frozen_contract": "candidate_b_refined.rs sha256 132b4d483c538834112f21878c7fdbbfd18e0584ee36ddb508ebbfd0ca8af0ea; lix-plugin-v2.wit sha256 685dcdf248b83ae21d5c937b43dfeb84d0f76427ed8a67a084911890179ada33",
+      "checked_in_facade": "Post-evaluation rustfmt changed only one assertion's line wrapping; checked-in sha256 23aa66d71c4d2626d8ee9798771488a3c3124fd24a62d996afd28cc725ea9783 is token-equivalent to the frozen facade",
+      "excluded_runs": "Earlier runs against superseded signatures or blocked before edits were excluded; only the explicitly authorized fresh v3 rollout is scored",
+      "metric_parser": "Codex rollout JSONL was adapted deterministically: custom_tool_call plus function_call count as tool calls; task_complete timestamps provide duration; tool transport errors and post-end-turn user messages provide errors/interruptions"
+    }
+  },
+  "agents": [
+    {
+      "id": 1,
+      "success": true,
+      "success_reason": "The log shows implementation changes confined to the task workspace and a final cargo fmt --check and cargo test run with all 5 acceptance-focused tests passing.",
+      "duration_sec": 193.4,
+      "tool_calls": 13,
+      "interruptions": 0,
+      "interruption_details": [],
+      "errors": 0,
+      "scores": {
+        "friction": 100,
+        "speed": 71,
+        "efficiency": 69,
+        "errorRecovery": 100,
+        "final": 87
+      },
+      "first_3_commands": [
+        "sed -n '1,240p' TASK.md && find .. -name AGENTS.md -print && rg --files | head -80",
+        "pwd; ls -la; rg --files -g 'AGENTS.md' -g '!target' .; rg --files -g '!target' | sed -n '1,160p'; git status --short",
+        "cat Cargo.toml; sed -n '1,260p' src/lib.rs; find /private/tmp/lix-final-aligned-api-v3 -maxdepth 3 -type f -print"
+      ]
+    }
+  ],
+  "summary": {
+    "success_rate": 1,
+    "median_final": 87,
+    "p25_final": 87,
+    "p75_final": 87,
+    "common_first_command": "sed -n '1,240p' TASK.md && find .. -name AGENTS.md -print && rg --files | head -80 (1/1)"
+  }
+}

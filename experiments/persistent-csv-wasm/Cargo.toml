@@ -1,0 +1,20 @@
+[workspace]
+members = ["guest"]
+resolver = "3"
+
+[package]
+name = "persistent-csv-wasm-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -44,5 +44,17 @@ pub use lix_engine::{
     TryFromValue, Value, WireValue, WriteOptions, WriteStats, parse_sql_script,
     run_storage_conformance,
 };
+
+/// Returns the SDK's Wasmtime runtime for the large-file profiling harness.
+///
+/// This deliberately exists only behind the non-default internal
+/// `__profile_wasm_memory`
+/// feature. The harness wraps it to sweep diagnostic memory ceilings without
+/// changing the production 64 MiB policy.
+#[cfg(all(feature = "default_wasm_runtime", feature = "__profile_wasm_memory"))]
+#[doc(hidden)]
+pub fn profiling_default_wasm_runtime() -> Result<std::sync::Arc<dyn WasmRuntime>, LixError> {
+    default_wasm_runtime::runtime()
+}
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};
