@@ -340,9 +340,16 @@ pub(crate) fn stage_json_from_value(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PreparedRowFacts {
-    /// Placeholder for the next cut: row-derived constraint facts will be
-    /// computed once during normalization and consumed by validation.
-    pub(crate) _sealed: (),
+    /// Row-local schema, metadata, and primary-key validation completed
+    /// against `schema_plan_id` during semantic normalization.
+    ///
+    /// Commit validation still owns transaction-wide and committed-state
+    /// constraints. Keeping this certificate on the prepared row prevents the
+    /// immutable JSON payload from being validated a second time at commit.
+    pub(crate) row_content_validated: bool,
+    /// This prepared operation participates in a cross-row constraint that
+    /// requires transaction-wide or committed-state validation.
+    pub(crate) requires_transaction_validation: bool,
 }
 
 /// Prepared state row owned by the transaction write buffer.

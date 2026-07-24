@@ -3551,7 +3551,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_transaction_path_index_cache_observes_other_session_commits,
+    lix_file_transaction_path_index_cache_rejects_stale_other_session_snapshot,
     options = crate::support::simulation_test::engine::SimulationOptions {
         deterministic: false,
     },
@@ -3603,13 +3603,31 @@ simulation_test!(
             .await
             .expect("other session file should commit");
 
-        let visible_after_commit = transaction
+        let error = transaction
             .execute(
                 "SELECT id, path FROM lix_file WHERE path = '/other-session.md'",
                 &[],
             )
             .await
-            .expect("transaction lookup should observe the newer committed path revision");
+            .expect_err("stale transaction lookup should reject the newer committed revision");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+        transaction
+            .rollback()
+            .await
+            .expect("stale transaction rollback should succeed");
+
+        let mut retry = session
+            .begin_transaction()
+            .await
+            .expect("retry transaction should begin");
+        let visible_after_commit = retry
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/other-session.md'",
+                &[],
+            )
+            .await
+            .expect("retry should observe the newer committed path revision");
         assert_rows_eq(
             visible_after_commit,
             vec![vec![
@@ -3618,15 +3636,15 @@ simulation_test!(
             ]],
         );
 
-        transaction
+        retry
             .rollback()
             .await
-            .expect("transaction rollback should succeed");
+            .expect("retry transaction rollback should succeed");
     }
 );
 
 simulation_test!(
-    lix_file_transaction_path_index_cache_observes_merge_reachability_changes,
+    lix_file_transaction_path_index_cache_rejects_stale_merge_snapshot,
     options = crate::support::simulation_test::engine::SimulationOptions {
         deterministic: false,
     },
@@ -3703,13 +3721,31 @@ simulation_test!(
             .expect("merge should succeed");
         assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
 
-        let visible_after_merge = transaction
+        let error = transaction
             .execute(
                 "SELECT id, path FROM lix_file WHERE path = '/merged.md'",
                 &[],
             )
             .await
-            .expect("transaction lookup should observe merged reachable descriptors");
+            .expect_err("stale transaction lookup should reject merged reachable descriptors");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+        transaction
+            .rollback()
+            .await
+            .expect("stale transaction rollback should succeed");
+
+        let mut retry = transaction_session
+            .begin_transaction()
+            .await
+            .expect("retry transaction should begin");
+        let visible_after_merge = retry
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/merged.md'",
+                &[],
+            )
+            .await
+            .expect("retry should observe merged reachable descriptors");
         assert_rows_eq(
             visible_after_merge,
             vec![vec![
@@ -3718,9 +3754,9 @@ simulation_test!(
             ]],
         );
 
-        transaction
+        retry
             .rollback()
             .await
-            .expect("transaction rollback should succeed");
+            .expect("retry transaction rollback should succeed");
     }
 );

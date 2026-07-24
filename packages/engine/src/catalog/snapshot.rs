@@ -388,6 +388,7 @@ pub(crate) struct SchemaPlan {
     pub(crate) key: SchemaCatalogKey,
     pub(crate) schema: Arc<JsonValue>,
     pub(crate) compiled_schema: JSONSchema,
+    fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
     pub(crate) primary_key: Option<PointerGroup>,
     pub(crate) uniques: Vec<PointerGroup>,
@@ -396,6 +397,12 @@ pub(crate) struct SchemaPlan {
 }
 
 impl SchemaPlan {
+    pub(crate) fn accepts_row_content_fast(&self, value: &JsonValue) -> bool {
+        self.fast_object_validation
+            .as_ref()
+            .is_some_and(|plan| plan.accepts(value))
+    }
+
     fn compile(
         key: SchemaCatalogKey,
         schema: JsonValue,
@@ -403,6 +410,7 @@ impl SchemaPlan {
         schema_index: &BTreeMap<SchemaCatalogKey, &JsonValue>,
     ) -> Result<Self, LixError> {
         let compiled_schema = compile_lix_schema(&schema)?;
+        let fast_object_validation = FastObjectValidationPlan::compile(&schema);
         let defaults = DefaultPlan::from_schema(&schema);
         let primary_key = primary_key_paths(&schema)?;
         let uniques = pointer_groups(&schema, "x-lix-unique")?;
@@ -418,12 +426,174 @@ impl SchemaPlan {
             key,
             schema: Arc::new(schema),
             compiled_schema,
+            fast_object_validation,
             defaults,
             primary_key,
             uniques,
             foreign_keys,
             state_foreign_keys,
         })
+    }
+}
+
+#[derive(Debug)]
+struct FastObjectValidationPlan {
+    properties: BTreeMap<String, FastJsonTypes>,
+    required: Vec<String>,
+    additional_properties: bool,
+}
+
+impl FastObjectValidationPlan {
+    fn compile(schema: &JsonValue) -> Option<Self> {
+        let schema = schema.as_object()?;
+        if schema.get("type")?.as_str()? != "object" {
+            return None;
+        }
+        if schema.keys().any(|key| !fast_object_root_keyword(key)) {
+            return None;
+        }
+        let mut properties = BTreeMap::new();
+        if let Some(property_schemas) = schema.get("properties") {
+            for (name, schema) in property_schemas.as_object()? {
+                properties.insert(name.clone(), FastJsonTypes::compile_property(schema)?);
+            }
+        }
+        let required = if let Some(required) = schema.get("required") {
+            required
+                .as_array()?
+                .iter()
+                .map(|name| name.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let additional_properties = if let Some(value) = schema.get("additionalProperties") {
+            value.as_bool()?
+        } else {
+            true
+        };
+        Some(Self {
+            properties,
+            required,
+            additional_properties,
+        })
+    }
+
+    fn accepts(&self, value: &JsonValue) -> bool {
+        let Some(value) = value.as_object() else {
+            return false;
+        };
+        if self
+            .required
+            .iter()
+            .any(|required| !value.contains_key(required))
+        {
+            return false;
+        }
+        value.iter().all(|(name, value)| {
+            self.properties
+                .get(name)
+                .map_or(self.additional_properties, |types| types.accepts(value))
+        })
+    }
+}
+
+fn fast_object_root_keyword(key: &str) -> bool {
+    matches!(
+        key,
+        "type"
+            | "properties"
+            | "required"
+            | "additionalProperties"
+            | "description"
+            | "examples"
+            | "$schema"
+    ) || key.starts_with("x-lix-")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FastJsonTypes(u16);
+
+impl FastJsonTypes {
+    const NULL: u16 = 1 << 0;
+    const BOOLEAN: u16 = 1 << 1;
+    const NUMBER: u16 = 1 << 2;
+    const INTEGER: u16 = 1 << 3;
+    const STRING: u16 = 1 << 4;
+    const ARRAY: u16 = 1 << 5;
+    const OBJECT: u16 = 1 << 6;
+    const ANY: Self = Self(
+        Self::NULL
+            | Self::BOOLEAN
+            | Self::NUMBER
+            | Self::INTEGER
+            | Self::STRING
+            | Self::ARRAY
+            | Self::OBJECT,
+    );
+
+    fn compile_property(schema: &JsonValue) -> Option<Self> {
+        let schema = schema.as_object()?;
+        if schema.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "type" | "anyOf" | "description" | "examples" | "default" | "x-lix-default"
+            )
+        }) {
+            return None;
+        }
+        match (schema.get("type"), schema.get("anyOf")) {
+            (Some(types), None) => Self::compile_types(types),
+            (None, Some(options)) => {
+                let mut mask = 0;
+                for option in options.as_array()? {
+                    mask |= Self::compile_property(option)?.0;
+                }
+                Some(Self(mask))
+            }
+            (None, None) => Some(Self::ANY),
+            (Some(_), Some(_)) => None,
+        }
+    }
+
+    fn compile_types(types: &JsonValue) -> Option<Self> {
+        let mut mask = 0;
+        if let Some(value) = types.as_str() {
+            mask |= Self::type_bit(value)?;
+        } else {
+            for value in types.as_array()? {
+                mask |= Self::type_bit(value.as_str()?)?;
+            }
+        }
+        Some(Self(mask))
+    }
+
+    fn type_bit(value: &str) -> Option<u16> {
+        Some(match value {
+            "null" => Self::NULL,
+            "boolean" => Self::BOOLEAN,
+            "number" => Self::NUMBER,
+            "integer" => Self::INTEGER,
+            "string" => Self::STRING,
+            "array" => Self::ARRAY,
+            "object" => Self::OBJECT,
+            _ => return None,
+        })
+    }
+
+    fn accepts(self, value: &JsonValue) -> bool {
+        let bit = match value {
+            JsonValue::Null => Self::NULL,
+            JsonValue::Bool(_) => Self::BOOLEAN,
+            JsonValue::Number(number) if number.is_i64() || number.is_u64() => {
+                Self::NUMBER | Self::INTEGER
+            }
+            JsonValue::Number(_) => Self::NUMBER,
+            JsonValue::String(_) => Self::STRING,
+            JsonValue::Array(_) => Self::ARRAY,
+            JsonValue::Object(_) => Self::OBJECT,
+        };
+        self.0 & bit != 0
     }
 }
 
@@ -1022,6 +1192,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn fast_object_validation_accepts_key_value_rows_and_rejects_invalid_shapes() {
+        let schema = crate::schema::seed_schema_definition("lix_key_value")
+            .expect("key-value schema should exist");
+        let plan = SchemaPlan::compile(
+            SchemaCatalogKey {
+                schema_key: "lix_key_value".to_string(),
+            },
+            schema.clone(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("key-value schema should compile");
+
+        for value in [
+            json!({"key": "a", "value": null}),
+            json!({"key": "a", "value": {"nested": true}}),
+            json!({"key": "a", "value": [1, 2, 3]}),
+        ] {
+            assert!(plan.accepts_row_content_fast(&value));
+            assert!(plan.compiled_schema.is_valid(&value));
+        }
+        for value in [
+            json!({"key": "a"}),
+            json!({"key": 1, "value": null}),
+            json!({"key": "a", "value": null, "extra": true}),
+        ] {
+            assert!(!plan.accepts_row_content_fast(&value));
+            assert!(!plan.compiled_schema.is_valid(&value));
+        }
+    }
+
+    #[test]
+    fn fast_object_validation_declines_unsupported_keywords() {
+        let schema = json!({
+            "x-lix-key": "patterned",
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "pattern": "^[a-z]+$"}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        assert!(FastObjectValidationPlan::compile(&schema).is_none());
+    }
 
     #[test]
     fn catalog_rejects_same_schema_key_from_multiple_domains() {

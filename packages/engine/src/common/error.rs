@@ -83,6 +83,9 @@ impl LixError {
     /// Storage I/O failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
+    /// Optimistic transaction publication lost a race with a newer commit.
+    pub const CODE_TRANSACTION_CONFLICT: &'static str = "LIX_TRANSACTION_CONFLICT";
+
     /// An internal engine invariant failed.
     pub const CODE_INTERNAL_ERROR: &'static str = "LIX_INTERNAL_ERROR";
 
@@ -291,13 +294,24 @@ impl LixError {
 
 impl From<crate::storage_adapter::StorageError> for LixError {
     fn from(error: crate::storage_adapter::StorageError) -> Self {
-        Self::new(Self::CODE_STORAGE_ERROR, error.to_string())
+        match error {
+            crate::storage_adapter::StorageError::WriteConflict
+            | crate::storage_adapter::StorageError::PreconditionFailed(_) => Self::new(
+                Self::CODE_TRANSACTION_CONFLICT,
+                "transaction snapshot is stale because tracked state changed before commit",
+            )
+            .with_hint("Retry the transaction against the latest committed state."),
+            error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
+        }
     }
 }
 
 impl From<crate::storage_adapter::StorageWriteSetError> for LixError {
     fn from(error: crate::storage_adapter::StorageWriteSetError) -> Self {
-        Self::new(Self::CODE_STORAGE_ERROR, error.to_string())
+        match error {
+            crate::storage_adapter::StorageWriteSetError::Storage(error) => error.into(),
+            error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
+        }
     }
 }
 

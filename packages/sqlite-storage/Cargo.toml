@@ -20,5 +20,6 @@ workspace = true
 lix_engine = { workspace = true }
 
 bytes = "1"
+blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"

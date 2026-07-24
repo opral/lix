@@ -6,9 +6,10 @@ use bytes::Bytes;
 
 use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use crate::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
@@ -81,6 +82,7 @@ pub struct MemoryRead {
 pub struct MemoryWrite {
     parent: Arc<Mutex<Arc<EntriesState>>>,
     base: Arc<EntriesState>,
+    preconditions: Vec<Precondition>,
     overlay: EntriesOverlay,
     stats: WriteStats,
 }
@@ -310,10 +312,11 @@ impl Storage for Memory {
         })
     }
 
-    async fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         Ok(MemoryWrite {
             parent: Arc::clone(&self.entries),
             base: self.snapshot()?,
+            preconditions: opts.preconditions,
             overlay: EntriesOverlay::default(),
             stats: WriteStats::default(),
         })
@@ -432,6 +435,7 @@ impl StorageWrite for MemoryWrite {
             .parent
             .lock()
             .map_err(|_| StorageError::Io("in-memory storage lock poisoned".to_string()))?;
+        check_preconditions(&parent, &self.preconditions)?;
         let base = if Arc::ptr_eq(&parent, &self.base) {
             self.base
         } else {
@@ -458,6 +462,54 @@ impl StorageWrite for MemoryWrite {
 
     async fn rollback(self) -> Result<(), StorageError> {
         Ok(())
+    }
+}
+
+fn check_preconditions(
+    entries: &EntriesState,
+    preconditions: &[Precondition],
+) -> Result<(), StorageError> {
+    let failures = preconditions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, precondition)| {
+            let matches = match precondition {
+                Precondition::KeyAbsent { space, key } => {
+                    entries.get(&physical_key(*space, key)).is_none()
+                }
+                Precondition::KeyPresent { space, key } => {
+                    entries.get(&physical_key(*space, key)).is_some()
+                }
+                Precondition::KeyValueHashEquals { space, key, hash } => entries
+                    .get(&physical_key(*space, key))
+                    .is_some_and(|value| blake3::hash(value).as_bytes() == hash),
+                Precondition::KeyValueEquals {
+                    space,
+                    key,
+                    expected,
+                } => entries
+                    .get(&physical_key(*space, key))
+                    .is_some_and(|value| value == expected),
+                Precondition::RangeEmpty { space, range } => collect_range_chunk(
+                    entries,
+                    physical_range(*space, range.clone()),
+                    &ScanOptions {
+                        limit_rows: 1,
+                        projection: CoreProjection::KeyOnly,
+                        resume_after: None,
+                    },
+                )
+                .entries
+                .is_empty(),
+                Precondition::BranchEquals { .. } => false,
+            };
+            (!matches).then_some(PreconditionFailure { index })
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::PreconditionFailed(failures))
     }
 }
 

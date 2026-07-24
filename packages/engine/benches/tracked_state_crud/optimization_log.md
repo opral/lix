@@ -2212,3 +2212,58 @@ the 10k point-operation gaps fall from 1358.0x to 76.0x for UPDATE and from
 1316.5x to 94.0x for DELETE. The remaining fixed cost is primarily tracked
 commit construction and persistence rather than surface-size-dependent SQL
 candidate selection.
+
+## 2026-07-24 — Validate once and publish tracked snapshots conditionally
+
+The 10k INSERT profile after primary-key routing still placed most of the timed
+path above RocksDB. Row content was validated while staging and then validated
+again at commit; transaction publication also had no atomic condition tying the
+materialized commit to the tracked state observed when the transaction opened.
+
+The design follows the common transaction architecture rather than adding a
+Lix-specific cache:
+
+- [SQLite WAL mode](https://www.sqlite.org/isolation.html) gives readers a
+  stable snapshot and serializes writers.
+- [DuckDB](https://duckdb.org/docs/current/connect/concurrency) and
+  [Turso](https://docs.turso.tech/tursodb/concurrent-writes) use MVCC with
+  optimistic conflict detection for concurrent writes.
+- [Dolt](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree/)
+  publishes immutable, content-addressed versioned state through a transaction
+  boundary.
+
+Lix now applies the same split. Transaction open captures a revision of the
+normal tracked path. Explicit reads verify it both before and after execution,
+staging verifies it before accepting writes, and commit publishes the new
+tracked revision with a storage-level compare-and-write precondition. The
+precondition is evaluated under each backend's existing writer serialization
+boundary: the Memory commit lock, RocksDB writer gate, SQLite
+`BEGIN IMMEDIATE`, or SlateDB writer gate. A stale transaction therefore cannot
+publish over a newer tracked commit. Untracked writes remain a sidecar: they do
+not advance the tracked revision and do not cause tracked transaction
+conflicts.
+
+Normalization now produces a row-local validation certificate after metadata,
+JSON Schema, and derived-primary-key checks. Commit reuses that certificate and
+only runs transaction-wide validation when the schema has cross-row constraints
+or the row participates in filesystem, branch-ref, or schema-catalog
+invariants. Simple object schemas also receive a conservative compiled accept
+plan for their common required/property/type checks. Unsupported JSON Schema
+keywords fall back to the full validator, and rejected rows always use the full
+validator so public diagnostics are unchanged.
+
+The exact final 10k RocksDB SQL INSERT estimate was 264.89 ms (95% CI
+248.74–284.06 ms), down 5.3% from the 279.780 ms benchmark baseline. Standalone
+SQLite remains 9.600 ms, so the gap moves from 29.1x to 27.6x. The earlier
+fast-plan run measured 258.17 ms; Criterion found no statistically significant
+change between that run and the exact final build (`p = 0.54`). The measured
+point update (4.417 ms), delete-all (286.23 ms), and point delete (4.372 ms)
+changes were also not statistically significant.
+
+The optimized 1 kHz profile contained 9,664 main-thread samples. Inclusive
+samples still concentrate in transaction commit/materialization (2,997,
+31.0%), commit-time validation (1,591, 16.5%), and SQL write staging (about
+1,280–1,660, 13–17%). Within validation, committed insert-identity probing
+accounts for about 1,160 samples (12.0%). RocksDB leaf work is present but is
+not the dominant gap. The next data-driven target is therefore commit/change
+materialization and insert-identity lookup, not a different storage backend.
