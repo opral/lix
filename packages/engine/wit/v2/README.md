@@ -88,6 +88,12 @@ the accepted actor changes only at commit, and rollback discards the chain.
 Mixing blob and semantic writes for the same file in one transaction is
 rejected.
 
+Use `plugin-error.invalid-input` when caller-provided bytes or a
+format-specific semantic operation is unsupported. The host reports it as
+`LIX_INVALID_PARAM`, discards only that prospective transition, and keeps the
+accepted document and Store reusable. A malformed packet, trap, or
+`plugin-error.internal` remains an invalid-plugin failure.
+
 ## Stable IDs
 
 For a schema marked `x-lix-id-allocation: "host-allocated"`, preserve every

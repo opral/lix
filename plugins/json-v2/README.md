@@ -1,10 +1,8 @@
 # Incremental JSON plugin (Component API v2)
 
-This crate is an opt-in experimental recursive JSON reference for the
-production `wasm-component-v2` API. It is not a
-bundled or production-default replacement while the ownership/reachability
-rollout gate below remains open. It models the document as stable semantic
-nodes rather than using a full RFC 6901 JSON Pointer as entity identity:
+This crate is the recursive JSON reference for the production
+`wasm-component-v2` API. It models the document as stable semantic nodes
+rather than using a full RFC 6901 JSON Pointer as entity identity:
 
 - `json_root` is the single stable document root.
 - `json_object_member` identifies an object slot by its stable parent
@@ -48,17 +46,30 @@ length-changing edits copy its compact chunk directory, shift later chunk
 bases, and copy only the chunks containing the scalar or its ancestors. They
 do not parse or materialize the complete document. The 10 MB flat object
 fixture therefore retains the same one-property fast path even though the
-semantic model also supports nested objects and arrays. Structural edits
-reconcile object members by decoded key and array items by stable identity,
-using the exact full-document fallback when a bounded local reconciliation is
-not possible.
+semantic model also supports nested objects and arrays.
 
-File-originated container deletion currently emits explicit descendant
-tombstones. Making this generation the default also requires the RFC's
-schema-declared ownership/reachability support in the host so concurrent
-entity-side detach and reactivation are enforced durably rather than only by a
-warm plugin document. That host capability is a rollout gate, not a WIT API
-change.
+## JSON lifecycle policy
+
+Byte writes own JSON structure and lossless layout: additions, deletions,
+container conversions, moves, ordering, and whitespace/escaping changes all
+go through `file-changed`. The plugin reconciles a byte-side structural change
+by decoded object key and stable array identity; deleting a container emits
+explicit tombstones for its descendants.
+
+Semantic SQL writes intentionally cover the 80% path only: one existing scalar
+value per transition. A scalar may change JSON kind when `kind` and
+`scalar_json` agree, but it cannot be added, deleted, moved, reparented,
+reordered, converted into a container, or reformatted through
+`entities-changed`. Those requests return `LIX_INVALID_PARAM` and must be
+expressed as an authoritative byte write instead.
+
+Actor transitions serialize direct scalar writes, so two writes to the same
+scalar use durable commit order as deterministic last-write-wins; edits to
+different scalars compose. A structural byte change fences a stale scalar or
+multi-entity rebase rather than resurrecting or partially recreating removed
+nodes. The caller rereads the file and retries from the new structure. There
+are no first-class JSON conflict records in this version, so this stale-rebase
+fence also reports `LIX_INVALID_PARAM` with a retry-oriented message.
 
 The plugin contract and transient packet encoding are defined by:
 

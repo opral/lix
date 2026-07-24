@@ -97,6 +97,14 @@ Plugins choose their own semantic granularity. For example:
 The API does not require one entity per top-level property or one universal
 syntax tree.
 
+The JSON reference deliberately narrows direct semantic mutation to one
+existing scalar value. JSON byte writes remain authoritative for structure and
+lossless layout. This is a format policy, not a limitation of the V2 WIT
+contract: it retains the sparse scalar hot path, gives direct scalar writes
+commit-order last-write-wins behavior, and fails stale structural rebases
+closed instead of recreating detached JSON nodes. First-class JSON conflict
+objects are deferred.
+
 ## Identity
 
 Schemas that declare `x-lix-id-allocation: "host-allocated"` receive a

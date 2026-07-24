@@ -12,6 +12,7 @@ pub const ARRAY_ITEM_SCHEMA_KEY: &str = "json_array_item";
 const ROOT_ID: &str = "root";
 const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container-v2\0";
 const NODES_PER_SPAN_CHUNK: usize = 512;
+const SCALAR_ONLY_SEMANTIC_WRITE: &str = "JSON semantic writes support one existing scalar value only; use a file byte write for additions, deletions, containers, moves, ordering, or layout changes";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdNamespace(pub [u8; 16]);
@@ -1329,45 +1330,11 @@ impl Document {
         if changes.is_empty() {
             return Ok((self.clone(), Vec::new()));
         }
-        if changes.len() == 1
-            && let Some(result) = self.single_scalar_entity_changed(&changes[0])?
-        {
-            return Ok(result);
+        if changes.len() != 1 {
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
-
-        let mut entities = self
-            .initial_changes()
-            .map(|change| {
-                let change = change?;
-                let record = EntityRecord {
-                    schema_key: change.schema_key,
-                    entity_pk: change.entity_pk,
-                    snapshot: change.snapshot.expect("initial changes are upserts"),
-                };
-                Ok((
-                    (record.schema_key.clone(), record.entity_pk.clone()),
-                    record,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, String>>()?;
-        for change in changes {
-            let key = (change.schema_key.clone(), change.entity_pk.clone());
-            if let Some(snapshot) = &change.snapshot {
-                entities.insert(
-                    key,
-                    EntityRecord {
-                        schema_key: change.schema_key.clone(),
-                        entity_pk: change.entity_pk.clone(),
-                        snapshot: snapshot.clone(),
-                    },
-                );
-            } else {
-                entities.remove(&key);
-            }
-        }
-        let (document, mut edit) = Self::open_entities(entities.into_values().collect())?;
-        edit.delete_len = u64::try_from(self.0.blob.len()).expect("usize fits u64");
-        Ok((document, vec![edit]))
+        self.single_scalar_entity_changed(&changes[0])?
+            .ok_or_else(|| SCALAR_ONLY_SEMANTIC_WRITE.to_owned())
     }
 
     fn single_scalar_entity_changed(
