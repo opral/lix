@@ -1963,7 +1963,7 @@ impl Document {
             .top_level_ranges
             .iter()
             .enumerate()
-            .find(|(_, range)| range.start <= offset && offset + 1 <= range.end)
+            .find(|(_, range)| range.start <= offset && offset < range.end)
         else {
             return Ok(None);
         };
