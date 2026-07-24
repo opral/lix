@@ -1,0 +1,38 @@
+{
+  "x-lix-key": "excalidraw_scene",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "description": "The stable root of an Excalidraw scene. The exact source layout outside elements and files is retained as an opaque string so durable snapshots remain number-free.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "const": "scene"
+    },
+    "template_json": {
+      "type": "string",
+      "description": "Exact UTF-8 source with reserved internal markers in place of the elements and files container contents."
+    },
+    "elements_tail_json": {
+      "type": "string",
+      "description": "Exact whitespace between the last element and the closing array bracket."
+    },
+    "files_tail_json": {
+      "type": "string",
+      "description": "Exact whitespace between the last file and the closing object brace."
+    },
+    "files_present": {
+      "type": "boolean",
+      "description": "Whether the source contains a top-level files object."
+    }
+  },
+  "required": [
+    "id",
+    "template_json",
+    "elements_tail_json",
+    "files_tail_json",
+    "files_present"
+  ],
+  "additionalProperties": false
+}

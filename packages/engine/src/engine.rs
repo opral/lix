@@ -12,7 +12,9 @@ use crate::live_state::LiveStateIndexContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::PluginRuntimeHost;
+use crate::plugin::{
+    DEFAULT_MAX_PLUGIN_FILE_ACTORS, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost,
+};
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
@@ -20,6 +22,7 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, Stora
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
+use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
@@ -41,11 +44,23 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
     telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
-#[derive(Default)]
 #[expect(missing_debug_implementations)]
 pub struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    plugin_v2_max_memory_bytes: u64,
+    plugin_v2_max_cached_file_actors: usize,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            wasm_runtime: None,
+            telemetry: None,
+            plugin_v2_max_memory_bytes: DEFAULT_PLUGIN_V2_MEMORY_BYTES,
+            plugin_v2_max_cached_file_actors: DEFAULT_MAX_PLUGIN_FILE_ACTORS,
+        }
+    }
 }
 
 impl EngineOptions {
@@ -60,6 +75,22 @@ impl EngineOptions {
 
     pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Sets the per-actor Wasm linear-memory ceiling and the maximum number of
+    /// idle/warm v2 file actors retained by this engine. Defaults are 128 MiB
+    /// and four actors, bounding the cached guest capacity to 512 MiB before
+    /// host-side document state. Actors held by live transactions and
+    /// cold-open candidates remain individually capped but are not a
+    /// workspace-wide concurrency limit.
+    pub fn with_plugin_v2_resource_limits(
+        mut self,
+        max_memory_bytes: u64,
+        max_cached_file_actors: usize,
+    ) -> Self {
+        self.plugin_v2_max_memory_bytes = max_memory_bytes;
+        self.plugin_v2_max_cached_file_actors = max_cached_file_actors;
         self
     }
 }
@@ -116,6 +147,11 @@ where
         let wasm_runtime = options
             .wasm_runtime
             .unwrap_or_else(|| Arc::new(UnsupportedWasmRuntime));
+        let plugin_host = PluginRuntimeHost::new_with_v2_limits(
+            wasm_runtime,
+            options.plugin_v2_max_memory_bytes,
+            options.plugin_v2_max_cached_file_actors,
+        )?;
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_index = LiveStateIndexContext::new();
@@ -144,7 +180,7 @@ where
             collaboration_write_gate: Arc::new(tokio::sync::Mutex::new(())),
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
             observe_invalidation: Arc::new(ObserveInvalidation::new()),
-            plugin_host: PluginRuntimeHost::new(wasm_runtime),
+            plugin_host,
             telemetry: options.telemetry,
         })
     }
@@ -216,6 +252,20 @@ where
             self.telemetry.clone(),
         )
         .await
+    }
+
+    /// Returns process-local work accumulated by completed v2 transitions on
+    /// this engine. The snapshot is shared by every session cloned from it.
+    #[doc(hidden)]
+    pub fn plugin_v2_transition_counters(&self) -> WasmTransitionCounters {
+        self.plugin_host.v2_transition_counters()
+    }
+
+    /// Resets the process-local v2 transition aggregate used by profiling and
+    /// invariant tests. This does not mutate durable workspace state.
+    #[doc(hidden)]
+    pub fn reset_plugin_v2_transition_counters(&self) {
+        self.plugin_host.reset_v2_transition_counters();
     }
 
     /// Rebuilds the tracked serving commit root for one branch from changelog.

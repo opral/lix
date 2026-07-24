@@ -1,4 +1,5 @@
 pub(crate) mod error;
+mod execution_metadata;
 pub(crate) mod identity;
 pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
@@ -8,6 +9,9 @@ pub(crate) mod types;
 pub(crate) mod wire;
 
 pub use error::LixError;
+pub use execution_metadata::{
+    ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance,
+};
 pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
 pub(crate) use json_pointer::{format_json_pointer, parse_json_pointer, top_level_property_name};

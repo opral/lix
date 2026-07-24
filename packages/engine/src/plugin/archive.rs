@@ -11,7 +11,7 @@ use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
 #[cfg(test)]
 use super::InstalledPluginMetadata;
-use super::{InstalledPlugin, PluginManifest, parse_plugin_manifest_json};
+use super::{InstalledPlugin, PluginManifest, PluginRuntime, parse_plugin_manifest_json};
 
 /// Fully validated plugin package data needed by the install transaction.
 ///
@@ -24,6 +24,7 @@ pub(crate) struct ParsedPluginArchive {
     pub normalized_manifest_json: String,
     pub schemas: Vec<JsonValue>,
     pub schema_keys: Vec<String>,
+    pub host_allocated_schema_keys: Vec<String>,
     pub wasm_bytes: Vec<u8>,
     pub wasm_hash: BlobHash,
 }
@@ -60,6 +61,7 @@ struct LoadedPluginArchive {
     normalized_manifest_json: String,
     schemas: Vec<JsonValue>,
     schema_keys: Vec<String>,
+    host_allocated_schema_keys: Vec<String>,
     wasm: Option<Vec<u8>>,
 }
 
@@ -121,6 +123,7 @@ pub(crate) fn parse_plugin_archive_for_install(
         normalized_manifest_json: loaded.normalized_manifest_json,
         schemas: loaded.schemas,
         schema_keys: loaded.schema_keys,
+        host_allocated_schema_keys: loaded.host_allocated_schema_keys,
         wasm_bytes,
         wasm_hash,
     })
@@ -215,6 +218,7 @@ fn load_plugin_archive(
 
     let mut schemas = Vec::with_capacity(validated_manifest.manifest.schemas.len());
     let mut schema_keys = Vec::with_capacity(validated_manifest.manifest.schemas.len());
+    let mut host_allocated_schema_keys = Vec::new();
     let mut seen_schema_keys = BTreeSet::<String>::new();
     for schema_path in &validated_manifest.manifest.schemas {
         let schema_entry_path = parse_plugin_archive_path_with_limit(
@@ -231,10 +235,20 @@ fn load_plugin_archive(
         })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?.schema_key;
+        if validated_manifest.manifest.runtime == PluginRuntime::WasmComponentV2 {
+            validate_v2_number_free_schema(&schema_json, &schema_key)?;
+        }
         if !seen_schema_keys.insert(schema_key.clone()) {
             return Err(invalid_plugin(format!(
                 "Plugin archive declares duplicate schema '{schema_key}'"
             )));
+        }
+        if schema_json
+            .get("x-lix-id-allocation")
+            .and_then(JsonValue::as_str)
+            == Some("host-allocated")
+        {
+            host_allocated_schema_keys.push(schema_key.clone());
         }
         schema_keys.push(schema_key);
         schemas.push(schema_json);
@@ -245,8 +259,243 @@ fn load_plugin_archive(
         normalized_manifest_json: validated_manifest.normalized_json,
         schemas,
         schema_keys,
+        host_allocated_schema_keys,
         wasm,
     })
+}
+
+/// Production v2 snapshots currently use a durable JSON representation that
+/// cannot preserve arbitrary-precision JSON numbers. Reject any schema path
+/// that can admit a numeric node before installing the plugin.
+fn validate_v2_number_free_schema(schema: &JsonValue, schema_key: &str) -> Result<(), LixError> {
+    if schema_may_accept_number(schema, schema, &mut BTreeSet::new())? {
+        return Err(v2_numeric_schema_error(schema_key));
+    }
+    let mut visited_refs = BTreeSet::new();
+    validate_v2_number_free_child_positions(schema, schema, schema_key, &mut visited_refs)
+}
+
+fn validate_v2_number_free_child_positions(
+    schema: &JsonValue,
+    root: &JsonValue,
+    schema_key: &str,
+    visited_refs: &mut BTreeSet<String>,
+) -> Result<(), LixError> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    let implicit_object_values = schema_may_accept_kind(
+        schema,
+        root,
+        SchemaInstanceKind::Object,
+        &mut BTreeSet::new(),
+    )? && !object.contains_key("additionalProperties")
+        && !object.contains_key("unevaluatedProperties")
+        && object.get("maxProperties").and_then(JsonValue::as_u64) != Some(0);
+    let implicit_array_values = schema_may_accept_kind(
+        schema,
+        root,
+        SchemaInstanceKind::Array,
+        &mut BTreeSet::new(),
+    )? && !object.contains_key("items")
+        && !object.contains_key("unevaluatedItems")
+        && object.get("maxItems").and_then(JsonValue::as_u64) != Some(0);
+    if implicit_object_values || implicit_array_values {
+        return Err(v2_numeric_schema_error(schema_key));
+    }
+
+    for keyword in ["properties", "patternProperties", "dependentSchemas"] {
+        if let Some(children) = object.get(keyword).and_then(JsonValue::as_object) {
+            for child in children.values() {
+                validate_v2_number_free_value_schema(child, root, schema_key, visited_refs)?;
+            }
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "items",
+        "contains",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = object.get(keyword) {
+            validate_v2_number_free_value_schema(child, root, schema_key, visited_refs)?;
+        }
+    }
+    if let Some(children) = object.get("prefixItems").and_then(JsonValue::as_array) {
+        for child in children {
+            validate_v2_number_free_value_schema(child, root, schema_key, visited_refs)?;
+        }
+    }
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = object.get(keyword).and_then(JsonValue::as_array) {
+            for branch in branches {
+                validate_v2_number_free_child_positions(branch, root, schema_key, visited_refs)?;
+            }
+        }
+    }
+    for keyword in ["not", "if", "then", "else"] {
+        if let Some(branch) = object.get(keyword) {
+            validate_v2_number_free_child_positions(branch, root, schema_key, visited_refs)?;
+        }
+    }
+    if let Some(reference) = object.get("$ref").and_then(JsonValue::as_str)
+        && visited_refs.insert(reference.to_string())
+    {
+        let target = resolve_local_schema_ref(root, reference)?;
+        validate_v2_number_free_child_positions(target, root, schema_key, visited_refs)?;
+    }
+    Ok(())
+}
+
+fn validate_v2_number_free_value_schema(
+    schema: &JsonValue,
+    root: &JsonValue,
+    schema_key: &str,
+    visited_refs: &mut BTreeSet<String>,
+) -> Result<(), LixError> {
+    if schema_may_accept_number(schema, root, &mut BTreeSet::new())? {
+        return Err(v2_numeric_schema_error(schema_key));
+    }
+    validate_v2_number_free_child_positions(schema, root, schema_key, visited_refs)
+}
+
+fn schema_may_accept_number(
+    schema: &JsonValue,
+    root: &JsonValue,
+    resolving_refs: &mut BTreeSet<String>,
+) -> Result<bool, LixError> {
+    schema_may_accept_kind(schema, root, SchemaInstanceKind::Number, resolving_refs)
+}
+
+#[derive(Clone, Copy)]
+enum SchemaInstanceKind {
+    Number,
+    Object,
+    Array,
+}
+
+fn schema_may_accept_kind(
+    schema: &JsonValue,
+    root: &JsonValue,
+    target: SchemaInstanceKind,
+    resolving_refs: &mut BTreeSet<String>,
+) -> Result<bool, LixError> {
+    let Some(object) = schema.as_object() else {
+        return Ok(schema.as_bool().unwrap_or(true));
+    };
+
+    let mut may_accept = match object.get("type") {
+        Some(JsonValue::String(kind)) => schema_type_matches_kind(kind, target),
+        Some(JsonValue::Array(kinds)) => kinds
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .any(|kind| schema_type_matches_kind(kind, target)),
+        Some(_) | None => true,
+    };
+    if let Some(constant) = object.get("const") {
+        may_accept &= json_value_matches_kind(constant, target);
+    }
+    if let Some(values) = object.get("enum").and_then(JsonValue::as_array) {
+        may_accept &= values
+            .iter()
+            .any(|value| json_value_matches_kind(value, target));
+    }
+    if !may_accept {
+        return Ok(false);
+    }
+
+    if let Some(reference) = object.get("$ref").and_then(JsonValue::as_str) {
+        if !resolving_refs.insert(reference.to_string()) {
+            // Cyclic references are valid, but without a fixed-point schema
+            // solver the safe production answer is that a number may remain
+            // reachable through the cycle.
+            return Ok(true);
+        }
+        let target_schema = resolve_local_schema_ref(root, reference)?;
+        may_accept &= schema_may_accept_kind(target_schema, root, target, resolving_refs)?;
+        resolving_refs.remove(reference);
+    }
+    if let Some(branches) = object.get("allOf").and_then(JsonValue::as_array) {
+        for branch in branches {
+            may_accept &= schema_may_accept_kind(branch, root, target, resolving_refs)?;
+            if !may_accept {
+                return Ok(false);
+            }
+        }
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = object.get(keyword).and_then(JsonValue::as_array) {
+            let mut branch_may_accept = false;
+            for branch in branches {
+                branch_may_accept |= schema_may_accept_kind(branch, root, target, resolving_refs)?;
+            }
+            may_accept &= branch_may_accept;
+        }
+    }
+    if object.contains_key("if") {
+        let then_may = object
+            .get("then")
+            .map(|branch| schema_may_accept_kind(branch, root, target, resolving_refs))
+            .transpose()?
+            .unwrap_or(true);
+        let else_may = object
+            .get("else")
+            .map(|branch| schema_may_accept_kind(branch, root, target, resolving_refs))
+            .transpose()?
+            .unwrap_or(true);
+        may_accept &= then_may || else_may;
+    }
+    Ok(may_accept)
+}
+
+fn schema_type_matches_kind(schema_type: &str, target: SchemaInstanceKind) -> bool {
+    match target {
+        SchemaInstanceKind::Number => matches!(schema_type, "number" | "integer"),
+        SchemaInstanceKind::Object => schema_type == "object",
+        SchemaInstanceKind::Array => schema_type == "array",
+    }
+}
+
+fn json_value_matches_kind(value: &JsonValue, target: SchemaInstanceKind) -> bool {
+    match target {
+        SchemaInstanceKind::Number => value.is_number(),
+        SchemaInstanceKind::Object => value.is_object(),
+        SchemaInstanceKind::Array => value.is_array(),
+    }
+}
+
+fn resolve_local_schema_ref<'a>(
+    root: &'a JsonValue,
+    reference: &str,
+) -> Result<&'a JsonValue, LixError> {
+    if reference == "#" {
+        return Ok(root);
+    }
+    let pointer = reference
+        .strip_prefix('#')
+        .filter(|value| value.starts_with('/'));
+    pointer.and_then(|pointer| root.pointer(pointer)).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "wasm-component-v2 schemas require resolvable local JSON Pointer references; unsupported or missing '$ref': '{reference}'"
+            ),
+        )
+    })
+}
+
+fn v2_numeric_schema_error(schema_key: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_SCHEMA_DEFINITION,
+        format!(
+            "wasm-component-v2 schema '{schema_key}' admits reachable JSON number or integer values"
+        ),
+    )
+    .with_hint(
+        "Encode exact number-bearing payloads as validated JSON strings until the durable arbitrary-precision number representation is available.",
+    )
 }
 
 impl<'a> BoundedPluginArchive<'a> {
@@ -828,6 +1077,7 @@ fn is_symlink_mode(mode: Option<u32>) -> bool {
 mod tests {
     use std::io::{Cursor, Write};
 
+    use serde_json::{Value as JsonValue, json};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -859,6 +1109,40 @@ mod tests {
         "additionalProperties":false
     }"#;
     const WASM: &[u8] = b"\0asm\x01\0\0\0";
+
+    fn v2_archive_with_schema(schema: &JsonValue) -> Vec<u8> {
+        let manifest = br#"{
+            "key":"plugin_test",
+            "runtime":"wasm-component-v2",
+            "api_version":"2.0.0",
+            "match":{"path_glob":"*.test"},
+            "entry":"plugin.wasm",
+            "schemas":["schema/plugin_test_note.json"]
+        }"#;
+        let schema = serde_json::to_vec(schema).expect("test schema should serialize");
+        zip_entries(
+            &[
+                ("manifest.json", manifest),
+                ("schema/plugin_test_note.json", schema.as_slice()),
+                ("plugin.wasm", WASM),
+            ],
+            CompressionMethod::Stored,
+        )
+    }
+
+    fn v2_schema(payload: JsonValue) -> JsonValue {
+        json!({
+            "x-lix-key": "plugin_test_note",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "payload": payload
+            },
+            "required": ["id", "payload"],
+            "additionalProperties": false
+        })
+    }
 
     #[test]
     fn archive_path_parsing_is_slash_based() {
@@ -932,6 +1216,72 @@ mod tests {
         let error = parse_plugin_archive_for_install(&archive)
             .expect_err("malformed embedded schema JSON must fail");
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+    }
+
+    #[test]
+    fn v2_install_rejects_reachable_numeric_schema_nodes() {
+        for payload in [
+            json!({ "type": "number" }),
+            json!({ "type": ["string", "integer"] }),
+            json!({
+                "type": "array",
+                "items": { "type": "integer" }
+            }),
+            json!({
+                "type": "object",
+                "properties": { "nested": { "type": "number" } },
+                "required": ["nested"],
+                "additionalProperties": false
+            }),
+        ] {
+            let error =
+                parse_plugin_archive_for_install(&v2_archive_with_schema(&v2_schema(payload)))
+                    .expect_err("v2 numeric snapshots must be rejected at install");
+            assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+            assert!(
+                error.message.contains("JSON number or integer"),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_install_follows_local_refs_but_ignores_unreachable_defs() {
+        let mut referenced = v2_schema(json!({
+            "type": "object",
+            "properties": {
+                "count": { "$ref": "#/$defs/count" }
+            },
+            "required": ["count"],
+            "additionalProperties": false
+        }));
+        referenced["$defs"] = json!({
+            "count": { "type": "integer" }
+        });
+        let error = parse_plugin_archive_for_install(&v2_archive_with_schema(&referenced))
+            .expect_err("referenced numeric definitions are reachable");
+        assert!(
+            error.message.contains("JSON number or integer"),
+            "{error:?}"
+        );
+
+        let mut unreachable = v2_schema(json!({ "type": "string" }));
+        unreachable["$defs"] = json!({
+            "unused_number": { "type": "number" }
+        });
+        parse_plugin_archive_for_install(&v2_archive_with_schema(&unreachable))
+            .expect("an unreachable numeric definition cannot produce snapshot number nodes");
+    }
+
+    #[test]
+    fn v2_install_allows_number_bearing_json_encoded_as_a_string() {
+        let schema = v2_schema(json!({
+            "type": "string",
+            "description": "Exact JSON text such as {\"n\":1}",
+            "examples": ["{\"n\":1}", "220000"]
+        }));
+        parse_plugin_archive_for_install(&v2_archive_with_schema(&schema))
+            .expect("validated JSON-in-string remains number-free Snapshot JSON");
     }
 
     #[test]

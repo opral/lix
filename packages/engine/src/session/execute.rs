@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 
 use crate::branch::BranchRefReader;
+use crate::common::ExecuteStatementMetadata;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
@@ -519,7 +520,25 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_kind(sql, params, options, "execute")
+        self.execute_with_options_and_metadata(
+            sql,
+            params,
+            options,
+            ExecuteStatementMetadata::default(),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_with_options_and_metadata(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+    ) -> Result<ExecuteResult, LixError> {
+        validate_execute_statement_metadata(params.len(), &metadata, None)?;
+        self.execute_with_kind(sql, params, options, metadata, "execute")
             .await
     }
 
@@ -671,8 +690,14 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_kind(sql, params, ExecuteOptions::default(), "observe")
-            .await
+        self.execute_with_kind(
+            sql,
+            params,
+            ExecuteOptions::default(),
+            ExecuteStatementMetadata::default(),
+            "observe",
+        )
+        .await
     }
 
     async fn execute_with_kind(
@@ -680,12 +705,18 @@ where
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
         execution_kind: &'static str,
     ) -> Result<ExecuteResult, LixError> {
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, execution_kind, None);
-        let operation =
-            self.execute_with_options_inner(sql, params, options, execution_kind == "observe");
+        let operation = self.execute_with_options_inner(
+            sql,
+            params,
+            options,
+            metadata,
+            execution_kind == "observe",
+        );
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
             None => operation.await,
@@ -701,6 +732,7 @@ where
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
         defer_file_view_acknowledgement: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
@@ -718,10 +750,11 @@ where
                         let result = async {
                             let tx_plan = transaction
                                 .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                            let result = sql2::execute_write_logical_plan_result(
+                            let result = sql2::execute_write_logical_plan_result_with_metadata(
                                 transaction,
                                 tx_plan,
                                 &params,
+                                &metadata,
                             )
                             .await?;
                             Ok(ExecuteResult::from_sql_write_result(result))
@@ -835,12 +868,28 @@ where
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
     ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.execute_batch_with_options_and_metadata(
+            statements,
+            options,
+            vec![ExecuteStatementMetadata::default(); statements.len()],
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_batch_with_options_and_metadata(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
             TelemetrySpanKind::SqlBatch,
             statements.len(),
         );
-        let operation = self.execute_batch_with_options_inner(statements, options);
+        let operation =
+            self.execute_batch_with_options_inner(statements, options, statement_metadata);
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
             None => operation.await,
@@ -855,6 +904,7 @@ where
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
         if statements.is_empty() {
@@ -868,6 +918,26 @@ where
                 "expected": "non-empty array",
             })));
         }
+        if statement_metadata.len() != statements.len() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute batch statement metadata must align with statements",
+            )
+            .with_details(serde_json::json!({
+                "operation": "executeBatch",
+                "statementCount": statements.len(),
+                "metadataCount": statement_metadata.len(),
+            })));
+        }
+        for (statement_index, (statement, metadata)) in
+            statements.iter().zip(&statement_metadata).enumerate()
+        {
+            validate_execute_statement_metadata(
+                statement.params.len(),
+                metadata,
+                Some(statement_index),
+            )?;
+        }
 
         let statements = statements.to_vec();
         match classify_execute_batch(&statements, &self.sql_planning_cache)? {
@@ -879,8 +949,11 @@ where
                 self.with_write_transaction(move |transaction| {
                     Box::pin(async move {
                         let mut results = Vec::with_capacity(statements.len());
-                        for (statement_index, (statement, parsed)) in
-                            statements.iter().zip(parsed).enumerate()
+                        for (statement_index, ((statement, parsed), metadata)) in statements
+                            .iter()
+                            .zip(parsed)
+                            .zip(statement_metadata)
+                            .enumerate()
                         {
                             let telemetry = SqlStatementTelemetry::start(
                                 telemetry_sink.as_ref(),
@@ -895,6 +968,7 @@ where
                                     parsed,
                                     &statement.params,
                                     options.clone(),
+                                    metadata,
                                 )
                                 .await
                                 .map_err(|error| {
@@ -1413,6 +1487,30 @@ fn native_file_data_from_exact_result(
     Ok(Some(data))
 }
 
+fn validate_execute_statement_metadata(
+    parameter_count: usize,
+    metadata: &ExecuteStatementMetadata,
+    statement_index: Option<usize>,
+) -> Result<(), LixError> {
+    let metadata_count = metadata.parameter_blob_splices.len();
+    if metadata_count == 0 || metadata_count == parameter_count {
+        return Ok(());
+    }
+    let mut details = serde_json::json!({
+        "operation": if statement_index.is_some() { "executeBatch" } else { "execute" },
+        "parameterCount": parameter_count,
+        "metadataCount": metadata_count,
+    });
+    if let Some(statement_index) = statement_index {
+        details["statementIndex"] = statement_index.into();
+    }
+    Err(LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "execute statement metadata must align with SQL parameters",
+    )
+    .with_details(details))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_lix_file_data_result(
     active_branch_id: &str,
@@ -1572,10 +1670,16 @@ where
             if is_read {
                 transaction.ensure_opening_snapshot_is_current().await?;
             }
-            let result =
-                execute_transaction_statement(transaction, sql, statement, params, options)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+            let result = execute_transaction_statement(
+                transaction,
+                sql,
+                statement,
+                params,
+                options,
+                ExecuteStatementMetadata::default(),
+            )
+            .await
+            .map_err(|error| normalize_sql_surface_error(error, sql))?;
             if is_read {
                 // The query opens its own coherent storage read. Checking on both sides
                 // ensures a concurrent tracked commit cannot leak a newer snapshot
@@ -1661,6 +1765,7 @@ async fn execute_transaction_write_auto<StorageImpl>(
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     options: ExecuteOptions,
+    metadata: ExecuteStatementMetadata,
 ) -> Result<ExecuteResult, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1668,7 +1773,13 @@ where
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
         let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
-        let result = sql2::execute_write_logical_plan_result(transaction, tx_plan, params).await?;
+        let result = sql2::execute_write_logical_plan_result_with_metadata(
+            transaction,
+            tx_plan,
+            params,
+            &metadata,
+        )
+        .await?;
         Ok(ExecuteResult::from_sql_write_result(result))
     }
     .await;
@@ -2379,13 +2490,15 @@ async fn execute_transaction_statement<StorageImpl>(
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     options: ExecuteOptions,
+    metadata: ExecuteStatementMetadata,
 ) -> Result<ExecuteResult, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match sql2::bind_statement_route(&statement)? {
         sql2::BoundStatementRoute::Write => {
-            execute_transaction_write_auto(transaction, sql, statement, params, options).await
+            execute_transaction_write_auto(transaction, sql, statement, params, options, metadata)
+                .await
         }
         sql2::BoundStatementRoute::Read => transaction
             .execute_read_sql_statement(sql, statement, params)

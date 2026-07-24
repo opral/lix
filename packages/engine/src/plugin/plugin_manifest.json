@@ -10,6 +10,25 @@
     "entry",
     "schemas"
   ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "const": "wasm-component-v2"
+          }
+        },
+        "required": ["runtime"]
+      },
+      "then": {
+        "properties": {
+          "api_version": {
+            "const": "2.0.0"
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "key": {
       "type": "string",
@@ -20,7 +39,8 @@
     "runtime": {
       "type": "string",
       "enum": [
-        "wasm-component-v1"
+        "wasm-component-v1",
+        "wasm-component-v2"
       ]
     },
     "api_version": {

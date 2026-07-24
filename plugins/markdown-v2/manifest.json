@@ -1,0 +1,13 @@
+{
+  "key": "plugin_markdown_incremental_v2",
+  "runtime": "wasm-component-v2",
+  "api_version": "2.0.0",
+  "match": {
+    "path_glob": "*.{md,markdown}",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/markdown_node_v2.json"
+  ]
+}
