@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rocksdb::Snapshot;
@@ -153,10 +154,11 @@ impl Storage for RocksDB {
 
     fn begin_write(
         &self,
-        _opts: WriteOptions,
+        opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             let writer_permit = self.inner.write_gate.acquire().await;
+            check_preconditions(&self.inner.db, &opts.preconditions)?;
             Ok(RocksDBWrite {
                 inner: Arc::clone(&self.inner),
                 _writer_permit: writer_permit,
@@ -165,6 +167,62 @@ impl Storage for RocksDB {
                 stats: WriteStats::default(),
             })
         }
+    }
+}
+
+fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), StorageError> {
+    let mut failures = Vec::new();
+    for (index, precondition) in preconditions.iter().enumerate() {
+        let matches = match precondition {
+            Precondition::KeyAbsent { space, key } => db
+                .get(physical_key(*space, key).0)
+                .map_err(rocksdb_error)?
+                .is_none(),
+            Precondition::KeyPresent { space, key } => db
+                .get(physical_key(*space, key).0)
+                .map_err(rocksdb_error)?
+                .is_some(),
+            Precondition::KeyValueHashEquals { space, key, hash } => db
+                .get(physical_key(*space, key).0)
+                .map_err(rocksdb_error)?
+                .is_some_and(|value| blake3::hash(&value).as_bytes() == hash),
+            Precondition::KeyValueEquals {
+                space,
+                key,
+                expected,
+            } => db
+                .get(physical_key(*space, key).0)
+                .map_err(rocksdb_error)?
+                .is_some_and(|value| value.as_slice() == expected.as_ref()),
+            Precondition::RangeEmpty { space, range } => {
+                let bounds = EncodedBounds::new(physical_range(*space, range.clone()), None);
+                let mut empty = true;
+                for item in db.iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
+                {
+                    let (key, _) = item.map_err(rocksdb_error)?;
+                    if !bounds.after_lower(&key) {
+                        continue;
+                    }
+                    if bounds.before_upper(&key) {
+                        empty = false;
+                    }
+                    break;
+                }
+                empty
+            }
+            Precondition::BranchEquals { ref_key, expected } => db
+                .get(ref_key.0.as_ref())
+                .map_err(rocksdb_error)?
+                .is_some_and(|value| value.as_slice() == expected.as_ref()),
+        };
+        if !matches {
+            failures.push(PreconditionFailure { index });
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::PreconditionFailed(failures))
     }
 }
 

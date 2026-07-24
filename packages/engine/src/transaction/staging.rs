@@ -136,6 +136,18 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
+    pub(crate) fn row_content_validated(self) -> bool {
+        match self {
+            Self::State(row) => row.facts.row_content_validated,
+        }
+    }
+
+    pub(crate) fn requires_transaction_validation(self) -> bool {
+        match self {
+            Self::State(row) => row.facts.requires_transaction_validation,
+        }
+    }
+
     pub(crate) fn origin(&self) -> Option<&TransactionWriteOrigin> {
         match self {
             Self::State(row) => row.origin.as_ref(),

@@ -2127,3 +2127,143 @@ or slow fallback. Validation includes golden wire bytes, logical-vs-byte
 ordering, prefix-freedom, malformed codec, multi-level routing, canonical
 rebuild, sparse/deep/height-transition diff oracles, and backend accounting
 coverage.
+
+## 2026-07-24 — Standalone SQLite CRUD control
+
+The tracked CRUD scorecard now includes a deliberately non-versioned,
+standalone SQLite control. It stores the same flattened JSON-pointer workload
+in a normal `WITHOUT ROWID` table keyed by `path`, uses one transaction and one
+prepared statement for bulk writes, and materializes the same selected
+`path`/`value` columns for reads. The file-backed connection uses the same WAL,
+`synchronous=NORMAL`, cache, mmap, and checkpoint settings as Lix's SQLite
+storage adapter. The Lix SQL fixture likewise runs all chunked bulk INSERT or
+UPDATE statements through one explicit `SessionTransaction`; transaction
+boundaries therefore match the standalone control instead of measuring one
+version commit per SQL chunk.
+
+This is not a semantic-equivalence claim: standalone SQLite does not construct
+changes, commits, tracked roots, or live-state projections. It is the requested
+latency floor for measuring how much headroom remains in Lix + RocksDB's normal
+tracked public-SQL path, following the baseline-driven approach described in
+[How Dolt Got as Fast as MySQL](https://www.dolthub.com/blog/2025-12-12-how-dolt-got-as-fast-as-mysql/).
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches \
+  --bench tracked_state_crud -- raw_sqlite
+```
+
+Fresh current-main point estimates on the same machine:
+
+| Operation | Standalone SQLite 1k | Lix + RocksDB SQL 1k | Ratio | Standalone SQLite 10k | Lix + RocksDB SQL 10k | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| insert all | 1.187 ms | 31.543 ms | 26.6x | 9.600 ms | 279.780 ms | 29.1x |
+| read all | 0.193 ms | 11.080 ms | 57.3x | 1.487 ms | 64.506 ms | 43.4x |
+| read one by PK | 0.031 ms | 2.961 ms | 95.1x | 0.044 ms | 5.386 ms | 121.8x |
+| read 10 by PK | 0.081 ms | 3.461 ms | 42.6x | 0.095 ms | 6.153 ms | 64.7x |
+| update one by PK | 0.026 ms | 7.812 ms | 305.4x | 0.053 ms | 71.596 ms | 1358.0x |
+| delete all | 0.046 ms | 18.885 ms | 409.7x | 0.271 ms | 268.760 ms | 991.3x |
+| delete one by PK | 0.030 ms | 7.982 ms | 270.2x | 0.049 ms | 65.166 ms | 1316.5x |
+
+The tracked transaction layer isolates storage/commit work from SQL planning.
+At 10k rows, its RocksDB point update/delete are 1.470/1.660 ms while public SQL
+is 71.596/65.166 ms. Both public-SQL writes still grow about 9x when the table
+grows 10x even though the matched identity count stays one. The first follow-up
+profile therefore targets bound public-write candidate selection above the
+tracked transaction and RocksDB layers.
+
+The corrected transaction boundary also exposed a separate bulk-write lead:
+10k INSERT is 279.780 ms in one explicit Lix transaction. Its 1 kHz profile
+places 59.3% of whole-process samples under transaction commit, split between
+prepared-write validation (27.4%) and commit construction/persistence (26.6%);
+SQL parsing is 7.6%. This is a real single-transaction path, not twenty version
+commits hidden in the harness.
+
+## 2026-07-24 — Route bound writes by primary key
+
+A 1 kHz Samply profile of the 10k public-SQL point-update benchmark showed
+`scan_entity_candidates` requesting every live row for the entity schema and
+branch. `overlay_scan_rows` then materialized the full surface before the bound
+predicate discarded 9,999 rows. This explains both the gap over the 1.470 ms
+tracked-transaction control and the approximately linear growth from 1k to 10k.
+
+Bound entity UPDATE and DELETE now extract exact string primary keys from safe
+predicate shapes and pass them to `LiveStateScanRequest::filter.entity_pks`.
+Equality, `IN`, complete `OR` branches, guaranteed `AND` conjuncts, parameters,
+and composite primary keys are supported. Partial disjunctions, non-string
+identity columns, nested identity paths, and other uncertain shapes retain the
+existing full scan. Contradictory identity predicates route to an empty scan.
+Candidate rows still pass through the original predicate evaluator, so this is
+candidate pruning rather than a semantic shortcut.
+
+Criterion point estimates:
+
+| Operation | Main 1k | Routed 1k | Change | Main 10k | Routed 10k | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| update one by PK | 7.812 ms | 1.349 ms | -82.7% | 71.596 ms | 4.008 ms | -94.4% |
+| delete one by PK | 7.982 ms | 1.299 ms | -83.7% | 65.166 ms | 4.654 ms | -92.9% |
+
+The routed 10k profile reduced inclusive samples in
+`scan_entity_candidates`/`overlay_scan_rows` from about 17% to 0.75% of the
+whole profiled process, which includes fixture construction. Transaction commit
+is now the dominant remaining path at about 58.9%. Against standalone SQLite,
+the 10k point-operation gaps fall from 1358.0x to 76.0x for UPDATE and from
+1316.5x to 94.0x for DELETE. The remaining fixed cost is primarily tracked
+commit construction and persistence rather than surface-size-dependent SQL
+candidate selection.
+
+## 2026-07-24 — Validate once and publish tracked snapshots conditionally
+
+The 10k INSERT profile after primary-key routing still placed most of the timed
+path above RocksDB. Row content was validated while staging and then validated
+again at commit; transaction publication also had no atomic condition tying the
+materialized commit to the tracked state observed when the transaction opened.
+
+The design follows the common transaction architecture rather than adding a
+Lix-specific cache:
+
+- [SQLite WAL mode](https://www.sqlite.org/isolation.html) gives readers a
+  stable snapshot and serializes writers.
+- [DuckDB](https://duckdb.org/docs/current/connect/concurrency) and
+  [Turso](https://docs.turso.tech/tursodb/concurrent-writes) use MVCC with
+  optimistic conflict detection for concurrent writes.
+- [Dolt](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree/)
+  publishes immutable, content-addressed versioned state through a transaction
+  boundary.
+
+Lix now applies the same split. Transaction open captures a revision of the
+normal tracked path. Explicit reads verify it both before and after execution,
+staging verifies it before accepting writes, and commit publishes the new
+tracked revision with a storage-level compare-and-write precondition. The
+precondition is evaluated under each backend's existing writer serialization
+boundary: the Memory commit lock, RocksDB writer gate, SQLite
+`BEGIN IMMEDIATE`, or SlateDB writer gate. A stale transaction therefore cannot
+publish over a newer tracked commit. Untracked writes remain a sidecar: they do
+not advance the tracked revision and do not cause tracked transaction
+conflicts.
+
+Normalization now produces a row-local validation certificate after metadata,
+JSON Schema, and derived-primary-key checks. Commit reuses that certificate and
+only runs transaction-wide validation when the schema has cross-row constraints
+or the row participates in filesystem, branch-ref, or schema-catalog
+invariants. Simple object schemas also receive a conservative compiled accept
+plan for their common required/property/type checks. Unsupported JSON Schema
+keywords fall back to the full validator, and rejected rows always use the full
+validator so public diagnostics are unchanged.
+
+The exact final 10k RocksDB SQL INSERT estimate was 264.89 ms (95% CI
+248.74–284.06 ms), down 5.3% from the 279.780 ms benchmark baseline. Standalone
+SQLite remains 9.600 ms, so the gap moves from 29.1x to 27.6x. The earlier
+fast-plan run measured 258.17 ms; Criterion found no statistically significant
+change between that run and the exact final build (`p = 0.54`). The measured
+point update (4.417 ms), delete-all (286.23 ms), and point delete (4.372 ms)
+changes were also not statistically significant.
+
+The optimized 1 kHz profile contained 9,664 main-thread samples. Inclusive
+samples still concentrate in transaction commit/materialization (2,997,
+31.0%), commit-time validation (1,591, 16.5%), and SQL write staging (about
+1,280–1,660, 13–17%). Within validation, committed insert-identity probing
+accounts for about 1,160 samples (12.0%). RocksDB leaf work is present but is
+not the dominant gap. The next data-driven target is therefore commit/change
+materialization and insert-identity lookup, not a different storage backend.

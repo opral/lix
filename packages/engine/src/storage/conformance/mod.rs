@@ -59,6 +59,7 @@ mod tests {
                 "baseline::scan_cursor_drains_multi_chunk_limits",
                 "baseline::scan_range_empty_range_returns_empty_chunk",
                 "baseline::commit_is_atomic",
+                "baseline::write_precondition_rejects_stale_value",
                 "baseline::rollback_discards_staged_mutations",
                 "baseline::rollback_discards_overwrite_and_delete",
                 "baseline::begin_read_pins_coherent_view",

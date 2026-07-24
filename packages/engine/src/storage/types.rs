@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::storage::StorageError;
+use crate::storage::{Precondition, StorageError};
 
 /// Maximum number of owned rows returned by one storage scan page.
 pub const MAX_SCAN_PAGE_ROWS: usize = 1024;
@@ -102,6 +102,9 @@ pub enum ReadConsistency {
 pub struct WriteOptions {
     pub base_snapshot: Option<SnapshotRef>,
     pub idempotency_key: Option<Bytes>,
+    /// Conditions evaluated atomically against the state immediately before
+    /// this write becomes visible.
+    pub preconditions: Vec<Precondition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

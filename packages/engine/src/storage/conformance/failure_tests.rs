@@ -13,9 +13,10 @@ use super::{
     ConformanceStatus, StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
 use crate::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -69,6 +70,7 @@ struct BrokenWrite {
     mode: BrokenMode,
     parent: Arc<Mutex<BrokenMap>>,
     commit_count: Arc<Mutex<u64>>,
+    preconditions: Vec<Precondition>,
     staged: BrokenMap,
 }
 
@@ -285,13 +287,14 @@ impl Storage for BrokenStorage {
 
     fn begin_write(
         &self,
-        _opts: WriteOptions,
+        opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             Ok(BrokenWrite {
                 mode: self.mode,
                 parent: Arc::clone(&self.entries),
                 commit_count: Arc::clone(&self.commit_count),
+                preconditions: opts.preconditions,
                 staged: self.snapshot()?,
             })
         }
@@ -461,11 +464,32 @@ impl StorageWrite for BrokenWrite {
 
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
-            *self
+            let mut parent = self
                 .parent
                 .lock()
-                .map_err(|_| StorageError::Io("broken storage lock poisoned".to_string()))? =
-                self.staged;
+                .map_err(|_| StorageError::Io("broken storage lock poisoned".to_string()))?;
+            let failures = self
+                .preconditions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, precondition)| {
+                    let matches = match precondition {
+                        Precondition::KeyValueEquals {
+                            space,
+                            key,
+                            expected,
+                        } => parent
+                            .get(&broken_physical_key(*space, key))
+                            .is_some_and(|value| value == expected),
+                        _ => false,
+                    };
+                    (!matches).then_some(PreconditionFailure { index })
+                })
+                .collect::<Vec<_>>();
+            if !failures.is_empty() {
+                return Err(StorageError::PreconditionFailed(failures));
+            }
+            *parent = self.staged;
             *self.commit_count.lock().map_err(|_| {
                 StorageError::Io("broken storage commit lock poisoned".to_string())
             })? += 1;

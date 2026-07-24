@@ -6,6 +6,8 @@ use crate::storage::{Key, KeyRange, SpaceId, StorageError};
 
 pub(crate) const MUTATION_REVISION_SPACE: StorageSpace =
     StorageSpace::new(SpaceId(0x0007_0001), "observe.mutation_revision");
+pub(crate) const TRACKED_MUTATION_REVISION_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0007_0004), "transaction.tracked_revision");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageSpace {
