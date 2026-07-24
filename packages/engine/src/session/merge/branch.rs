@@ -1,8 +1,17 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
+use crate::changelog::ChangeRecordProjection;
+use crate::entity_pk::EntityPk;
+use crate::plugin::{PLUGIN_OWNER_KEY, PluginFileOwner};
 use crate::storage_adapter::Storage;
+use crate::tracked_state::{TrackedStateKey, TrackedStateStoreReader};
+use crate::transaction::types::{
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
+};
 
 use super::analysis::{MergeCommits, MergeOutcome, analyze};
 use super::conflicts::{
@@ -156,11 +165,16 @@ where
                     )
                     .await?
                 };
+                let derived_blob_files = {
+                    let mut reader = transaction.tracked_state_reader().await;
+                    derived_plugin_blob_conflicts(&mut reader, &analysis).await?
+                };
 
                 Ok(preview_from_analysis(
                     &active_branch_id,
                     &source_branch_id,
                     &analysis,
+                    &derived_blob_files,
                 ))
             })
         })
@@ -211,7 +225,6 @@ where
                     reader.merge_base(&target_head, &source_head).await?
                 };
                 let base_commit_id = merge_base.commit_id;
-
                 let analysis = {
                     let mut reader = transaction.tracked_state_reader().await;
                     analyze(
@@ -223,6 +236,10 @@ where
                         },
                     )
                     .await?
+                };
+                let derived_blob_files = {
+                    let mut reader = transaction.tracked_state_reader().await;
+                    derived_plugin_blob_conflicts(&mut reader, &analysis).await?
                 };
 
                 if analysis.outcome == MergeOutcome::AlreadyUpToDate {
@@ -261,19 +278,42 @@ where
                     .merge_plan()
                     .expect("merge analysis should include a plan for mergeCommitted");
 
-                if !analysis.conflicts.is_empty() {
+                let effective_conflicts = analysis
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| !is_derived_blob_conflict(conflict, &derived_blob_files))
+                    .collect::<Vec<_>>();
+                if !effective_conflicts.is_empty() {
                     return Err(merge_conflict_error(
-                        &analysis
-                            .conflicts
-                            .iter()
+                        &effective_conflicts
+                            .into_iter()
                             .map(merge_conflict_from_analysis)
                             .collect::<Vec<_>>(),
                     )?);
                 }
 
+                let semantic_rows = {
+                    let mut reader = transaction.tracked_state_reader().await;
+                    materialized_plugin_merge_rows(
+                        &mut reader,
+                        &analysis,
+                        &derived_blob_files,
+                        &active_branch_id,
+                    )
+                    .await?
+                };
+                if !semantic_rows.is_empty() {
+                    transaction
+                        .stage_write(TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Replace,
+                            rows: semantic_rows,
+                        })
+                        .await?;
+                }
                 let selected_changes = merge_plan
                     .picks
                     .iter()
+                    .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
                     .map(selected_change_from_merge_pick)
                     .collect::<Vec<_>>();
                 let created_merge_commit_id = transaction.stage_merge_commit(
@@ -310,10 +350,194 @@ fn selected_change_from_merge_pick(pick: &TrackedStateMergePick) -> StagedCommit
     }
 }
 
+const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+
+async fn derived_plugin_blob_conflicts<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    analysis: &super::analysis::MergeAnalysis,
+) -> Result<BTreeMap<String, PluginFileOwner>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
+{
+    let file_ids = analysis
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.schema_key == BLOB_REF_SCHEMA_KEY)
+        .filter_map(|conflict| conflict.file_id.clone())
+        .collect::<BTreeSet<_>>();
+    if file_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let keys = file_ids
+        .iter()
+        .map(|file_id| TrackedStateKey {
+            schema_key: "lix_key_value".to_owned(),
+            file_id: Some(file_id.clone()),
+            entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+        })
+        .collect::<Vec<_>>();
+    let target_rows = reader
+        .load_projected_rows_at_commit(
+            &analysis.commits.target_commit_id.to_string(),
+            &keys,
+            &ChangeRecordProjection::full(),
+        )
+        .await?;
+    let source_rows = reader
+        .load_projected_rows_at_commit(
+            &analysis.commits.source_commit_id.to_string(),
+            &keys,
+            &ChangeRecordProjection::full(),
+        )
+        .await?;
+    let mut derived = BTreeMap::new();
+    for ((file_id, target), source) in file_ids.into_iter().zip(target_rows).zip(source_rows) {
+        let (Some(target), Some(source)) = (target, source) else {
+            continue;
+        };
+        let (Some(target_owner), Some(source_owner)) = (
+            PluginFileOwner::from_tracked_state_row(&target)?,
+            PluginFileOwner::from_tracked_state_row(&source)?,
+        ) else {
+            continue;
+        };
+        if target_owner.plugin_key() == source_owner.plugin_key()
+            && target_owner.schema_keys() == source_owner.schema_keys()
+        {
+            derived.insert(file_id, target_owner);
+        }
+    }
+    Ok(derived)
+}
+
+fn is_derived_blob_conflict(
+    conflict: &AnalysisMergeConflict,
+    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+) -> bool {
+    conflict.schema_key == BLOB_REF_SCHEMA_KEY
+        && conflict
+            .file_id
+            .as_ref()
+            .is_some_and(|file_id| derived_blob_files.contains_key(file_id))
+}
+
+fn pick_is_derived_plugin_state(
+    pick: &TrackedStateMergePick,
+    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+) -> bool {
+    let Some(file_id) = pick.selected_row.file_id.as_ref() else {
+        return false;
+    };
+    let Some(owner) = derived_blob_files.get(file_id) else {
+        return false;
+    };
+    pick.selected_row.schema_key == BLOB_REF_SCHEMA_KEY
+        || owner
+            .schema_keys()
+            .iter()
+            .any(|schema_key| schema_key == &pick.selected_row.schema_key)
+}
+
+async fn materialized_plugin_merge_rows<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    analysis: &super::analysis::MergeAnalysis,
+    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+    target_branch_id: &str,
+) -> Result<Vec<TransactionWriteRow>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
+{
+    let merge_plan = analysis
+        .merge_plan()
+        .expect("materialized merge rows require a merge plan");
+    let semantic_picks = merge_plan
+        .picks
+        .iter()
+        .filter(|pick| {
+            let Some(file_id) = pick.selected_row.file_id.as_ref() else {
+                return false;
+            };
+            derived_blob_files.get(file_id).is_some_and(|owner| {
+                owner
+                    .schema_keys()
+                    .iter()
+                    .any(|schema_key| schema_key == &pick.selected_row.schema_key)
+            })
+        })
+        .collect::<Vec<_>>();
+    if semantic_picks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = semantic_picks
+        .iter()
+        .map(|pick| TrackedStateKey {
+            schema_key: pick.selected_row.schema_key.clone(),
+            file_id: pick.selected_row.file_id.clone(),
+            entity_pk: pick.selected_row.entity_pk.clone(),
+        })
+        .collect::<Vec<_>>();
+    let rows = reader
+        .load_projected_rows_at_commit(
+            &analysis.commits.source_commit_id.to_string(),
+            &keys,
+            &ChangeRecordProjection::full(),
+        )
+        .await?;
+    rows.into_iter()
+        .zip(keys)
+        .map(|(row, key)| {
+            let row = row.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "source merge root omitted selected plugin row '{}' for file '{}'",
+                        key.schema_key,
+                        key.file_id.as_deref().unwrap_or_default()
+                    ),
+                )
+            })?;
+            let snapshot = row
+                .snapshot_content
+                .map(|snapshot| transaction_json(&snapshot, "merge snapshot"))
+                .transpose()?;
+            let metadata = row
+                .metadata
+                .map(|metadata| transaction_json(&metadata, "merge metadata"))
+                .transpose()?;
+            Ok(TransactionWriteRow {
+                entity_pk: Some(row.entity_pk),
+                schema_key: row.schema_key,
+                file_id: row.file_id,
+                snapshot,
+                metadata,
+                origin: None,
+                created_at: None,
+                updated_at: None,
+                global: false,
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                branch_id: target_branch_id.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn transaction_json(value: &str, context: &str) -> Result<TransactionJson, LixError> {
+    let parsed = serde_json::from_str(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("{context} is invalid JSON: {error}"),
+        )
+    })?;
+    TransactionJson::from_value(parsed, context)
+}
+
 fn preview_from_analysis(
     target_branch_id: &str,
     source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
+    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
 ) -> MergeBranchPreview {
     MergeBranchPreview {
         outcome: merge_branch_outcome_from_analysis(analysis.outcome),
@@ -326,6 +550,7 @@ fn preview_from_analysis(
         conflicts: analysis
             .conflicts
             .iter()
+            .filter(|conflict| !is_derived_blob_conflict(conflict, derived_blob_files))
             .map(merge_conflict_from_analysis)
             .collect(),
     }

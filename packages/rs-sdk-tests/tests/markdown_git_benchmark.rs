@@ -4,8 +4,8 @@
 //! clean close with its normal automatic storage maintenance.
 
 use lix_sdk::{
-    CreateBranchOptions, Lix, LixError, LocalFilesystem, MergeBranchOptions,
-    MergeBranchPreviewOptions, Storage, SwitchBranchOptions, Value, open_lix_with_storage,
+    CreateBranchOptions, Lix, LocalFilesystem, MergeBranchOptions, MergeBranchPreviewOptions,
+    Storage, SwitchBranchOptions, Value, open_lix_with_storage,
 };
 use std::fs;
 use std::io::{Cursor, Write};
@@ -101,7 +101,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     let lix_history = lix_repo_sizes(lix_root.path());
 
     let lix = open_lix_with_filesystem(lix_root.path()).await;
-    let mut lix_rejected_merges = Vec::with_capacity(merge_samples);
+    let mut lix_merges = Vec::with_capacity(merge_samples);
     let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
     for sample in 0..merge_samples {
         let source = lix
@@ -166,28 +166,26 @@ async fn markdown_git_semantic_entities_benchmark() {
             })
             .await
             .expect("preview unrelated Lix Markdown entity merge");
-        assert_eq!(preview.conflicts.len(), 1);
-        assert_eq!(
-            preview.conflicts[0].schema_key, "lix_binary_blob_ref",
-            "only the derived materialized blob should conflict"
+        assert!(
+            preview.conflicts.is_empty(),
+            "derived materialized blobs must not conflict: {:?}",
+            preview.conflicts
         );
         let started = Instant::now();
-        let error = lix
-            .merge_branch(MergeBranchOptions {
-                source_branch_id: source.id,
-            })
-            .await
-            .expect_err("the current derived blob conflict must reject the merge");
-        lix_rejected_merges.push(started.elapsed());
-        assert_eq!(
-            error.code,
-            LixError::CODE_MERGE_CONFLICT,
-            "unexpected Lix merge rejection: {error:?}"
+        lix.merge_branch(MergeBranchOptions {
+            source_branch_id: source.id,
+        })
+        .await
+        .expect("unrelated Markdown entities should merge");
+        lix_merges.push(started.elapsed());
+        lix_main_state[corpus.edit_offsets[source_index]] = edit_replacement(
+            corpus.bytes[corpus.edit_offsets[source_index]],
+            200 + sample,
         );
     }
     let lix_final = read_file(&lix, "/benchmark.md").await;
     assert_same_bytes(
-        "failed merges must leave the Lix target branch unchanged",
+        "semantic merge must materialize both unrelated edits",
         &lix_final,
         &lix_main_state,
     );
@@ -299,19 +297,14 @@ async fn markdown_git_semantic_entities_benchmark() {
     print_duration_metric("sparse_edit_commit", "lix-byte", &lix_byte_edits);
     print_duration_metric("sparse_edit_commit", "lix-semantic", &lix_semantic_edits);
     print_duration_metric("sparse_edit_commit", "git", &git_edits);
-    print_duration_metric(
-        "unrelated_entity_merge_rejected",
-        "lix-semantic",
-        &lix_rejected_merges,
-    );
+    print_duration_metric("unrelated_entity_merge", "lix-semantic", &lix_merges);
     print_duration_metric("unrelated_entity_merge", "git", &git_merges);
     print_duration_metric("cold_open_read", "lix-semantic", &lix_cold);
     print_duration_metric("cold_object_read", "git", &git_cold);
     print_duration_metric("maintenance_gc", "git", &[git_gc]);
-
     print_storage_metric("fixed", "lix", &lix_fixed);
     print_storage_metric("history-live", "lix", &lix_history);
-    print_storage_metric("post-rejected-merges", "lix", &lix_live);
+    print_storage_metric("post-successful-merges", "lix", &lix_live);
     print_storage_metric("fixed", "git", &git_fixed);
     print_storage_metric("history-live", "git", &git_history_live);
     print_storage_metric("history-packed", "git", &git_history_packed);

@@ -1,7 +1,8 @@
 use lix_sdk::{
-    CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError, MutationIdentity,
-    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, VerifiedRequestBlob,
-    WasmComponentV2Factory, WasmLimits, WasmRuntime, WasmTransitionCounters,
+    CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError,
+    MergeBranchOptions, MergeBranchPreviewOptions, MutationIdentity, RequestBlobSpliceProvenance,
+    Storage, SwitchBranchOptions, VerifiedRequestBlob, WasmComponentV2Factory, WasmLimits,
+    WasmRuntime, WasmTransitionCounters,
 };
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
@@ -468,6 +469,115 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
     assert_eq!(
         read_file(&lix, path).await.unwrap().as_deref(),
         Some(b"# Heading\n\nEdited paragraph.\n".as_slice())
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
+    let archive = build_markdown_v2_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown_incremental_v2",
+        &archive,
+        &["markdown_node_v2"],
+    )
+    .await;
+
+    let path = "/merge-v2.md";
+    write_file(
+        &lix,
+        path,
+        b"First paragraph.\n\nSecond paragraph.\n".to_vec(),
+    )
+    .await
+    .unwrap();
+    let paragraphs = lix
+        .execute(
+            "SELECT id, payload_json FROM markdown_node_v2 WHERE kind = 'paragraph'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let paragraph_id = |needle: &str| {
+        paragraphs
+            .rows()
+            .iter()
+            .find(|row| {
+                row.get::<String>("payload_json")
+                    .is_ok_and(|payload| payload.contains(needle))
+            })
+            .and_then(|row| row.get::<String>("id").ok())
+            .unwrap_or_else(|| panic!("paragraph containing '{needle}' should exist"))
+    };
+    let first_id = paragraph_id("First paragraph.");
+    let second_id = paragraph_id("Second paragraph.");
+    let main_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("markdown-derived-blob-source".to_owned()),
+            name: "Markdown derived blob source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    lix.execute(
+        "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2",
+        &[
+            Value::Text(
+                serde_json::json!({"inline":[{"type":"text","value":"First from target."}]})
+                    .to_string(),
+            ),
+            Value::Text(first_id),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2",
+        &[
+            Value::Text(
+                serde_json::json!({"inline":[{"type":"text","value":"Second from source."}]})
+                    .to_string(),
+            ),
+            Value::Text(second_id),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: main_branch_id,
+    })
+    .await
+    .unwrap();
+
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        preview.conflicts.is_empty(),
+        "the materialized blob is derived plugin state: {:?}",
+        preview.conflicts
+    );
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap().as_deref(),
+        Some(b"First from target.\n\nSecond from source.\n".as_slice())
     );
 
     lix.close().await.unwrap();
