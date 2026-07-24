@@ -46,8 +46,8 @@ use crate::live_state::{
 };
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
-    PluginActorColdOpen, PluginActorKey, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
+    PluginActorColdOpen, PluginActorKey, PluginActorStore, PluginFileOwner, PluginRegistry,
+    PluginRegistryEntry, PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
     plugin_key_from_archive_file_id, plugin_key_from_archive_path,
     plugin_state_live_state_projection, plugin_storage_archive_file_id,
@@ -4261,11 +4261,12 @@ async fn cold_open_materialized_v2_actor(
     // Another reader may have populated this actor while we waited. Recheck
     // under the shared cold gate before scanning full semantic state or
     // instantiating another Store.
-    let cold_install: PluginActorColdInstall =
+    let mut cold_install: PluginActorColdInstall =
         match cache.prepare_cold_open(actor_key, semantic_root).await? {
             PluginActorColdOpen::Ready(observation) => return Ok(observation),
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
+    let store_permit = cache.admit_cold_store(&mut cold_install)?;
     let limits = WasmTransitionLimits::default();
     let factory = resolve_v2_factory(&plugin_render.host, blob_reader, plugin).await?;
     let mut rows = plugin_render
@@ -4352,7 +4353,7 @@ async fn cold_open_materialized_v2_actor(
         .install_cold_if_absent(
             cold_install,
             actor_key.clone(),
-            actor,
+            PluginActorStore::new(actor, store_permit),
             validated.document,
             materialized_bytes.clone(),
             validated.bytes_sha256,

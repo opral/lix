@@ -42,8 +42,8 @@ use crate::live_state::{overlay_load_exact_rows, overlay_scan_rows};
 use crate::plugin::{
     ArcByteSource, BoundIdNamespace, CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
     PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
-    PluginActorLease, PluginArchiveInstallPlan, PluginContentType, PluginDetectedChange,
-    PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
+    PluginActorLease, PluginActorStore, PluginArchiveInstallPlan, PluginContentType,
+    PluginDetectedChange, PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
     PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, VecEntityChangeSource,
     VecEntitySource, build_file_update_splices, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
@@ -732,11 +732,12 @@ where
                     ),
                 )
             })?;
-        let cold_install: PluginActorColdInstall =
+        let mut cold_install: PluginActorColdInstall =
             match cache.prepare_cold_open(actor_key, &semantic_root).await? {
                 PluginActorColdOpen::Ready(observation) => return Ok(observation),
                 PluginActorColdOpen::Build(cold_install) => cold_install,
             };
+        let store_permit = cache.admit_cold_store(&mut cold_install)?;
         let snapshot = blob_row.snapshot_content.as_deref().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
@@ -857,7 +858,7 @@ where
             .install_cold_if_absent(
                 cold_install,
                 actor_key.clone(),
-                actor,
+                PluginActorStore::new(actor, store_permit),
                 validated.document,
                 materialized_bytes,
                 validated.bytes_sha256,
@@ -2592,6 +2593,7 @@ where
                     materialized_bytes,
                 )
             } else {
+                let store_permit = self.plugin_host.actor_cache().admit_store()?;
                 let mut actor = factory.instantiate_actor().await?;
                 let source = ArcByteSource::new(submitted_bytes.clone());
                 let transition = actor
@@ -2622,7 +2624,7 @@ where
                     PendingPluginActorPublication::New {
                         cache: self.plugin_host.actor_cache(),
                         key: actor_key,
-                        actor,
+                        store: PluginActorStore::new(actor, store_permit),
                         document: validated.document,
                         bytes: submitted_bytes.clone(),
                         semantic_root: Arc::from(materialization_version.clone()),
@@ -4267,7 +4269,7 @@ enum PendingPluginActorPublication {
     New {
         cache: PluginActorCache,
         key: PluginActorKey,
-        actor: Box<dyn WasmComponentV2Actor>,
+        store: PluginActorStore,
         document: WasmDocumentHandle,
         bytes: crate::Blob,
         semantic_root: Arc<str>,
@@ -4282,12 +4284,12 @@ impl PendingPluginActorPublication {
                 let _ = lease.discard_successor().await;
             }
             Self::New {
-                mut actor,
+                mut store,
                 document,
                 ..
             } => {
-                let _ = actor.drop_document(document).await;
-                let _ = actor.retire().await;
+                let _ = store.actor_mut().drop_document(document).await;
+                let _ = store.actor_mut().retire().await;
             }
         }
     }
@@ -4302,13 +4304,13 @@ impl PendingPluginActorPublication {
             Self::New {
                 cache,
                 key,
-                actor,
+                store,
                 document,
                 bytes,
                 semantic_root,
                 view,
             } => (
-                cache.install(key, actor, document, bytes, semantic_root),
+                cache.install(key, store, document, bytes, semantic_root),
                 view,
             ),
         };
@@ -4867,12 +4869,17 @@ async fn preflight_owned_v2_generation_upgrades(
                 state_by_file.remove(owner.file_id()).unwrap_or_default(),
                 limits,
             )?;
-            let mut actor = factory
+            let store_permit = host
+                .actor_cache()
+                .admit_store()
+                .map_err(|error| plugin_upgrade_error(upgrade, owner.file_id(), error))?;
+            let actor = factory
                 .instantiate_actor()
                 .await
                 .map_err(|error| plugin_upgrade_error(upgrade, owner.file_id(), error))?;
+            let mut store = PluginActorStore::new(actor, store_permit);
             let verified = preflight_rendered_v2_file(
-                actor.as_mut(),
+                store.actor_mut(),
                 WasmFileDescriptor {
                     path: Some(entry.path.clone()),
                     media_type: inferred_media_type_for_path(Some(&entry.path)).map(str::to_owned),
@@ -4886,7 +4893,7 @@ async fn preflight_owned_v2_generation_upgrades(
                 limits,
             )
             .await;
-            let retire_result = actor.retire().await;
+            let retire_result = store.actor_mut().retire().await;
             if let Err(error) = verified.and(retire_result) {
                 return Err(plugin_upgrade_error(upgrade, owner.file_id(), error));
             }

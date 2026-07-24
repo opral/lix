@@ -16,8 +16,8 @@ mod registry;
 mod storage;
 
 pub(crate) use actor::{
-    DEFAULT_MAX_PLUGIN_FILE_ACTORS, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
-    PluginActorKey, PluginActorLease, PluginObservation,
+    DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS, PluginActorCache, PluginActorColdInstall,
+    PluginActorColdOpen, PluginActorKey, PluginActorLease, PluginActorStore, PluginObservation,
 };
 pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
 pub(crate) use component::{DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost};

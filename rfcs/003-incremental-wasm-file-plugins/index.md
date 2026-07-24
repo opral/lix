@@ -155,14 +155,17 @@ helpers are stable.
 
 ## Limits
 
-The runtime enforces a configurable linear-memory ceiling. The integrated host
-defaults each v2 actor to 128 MiB and retains at most four idle/warm v2 file
-actors, bounding cached guest capacity to 512 MiB per workspace before
-host-side document state. Actors held by live transactions and cold-open
-candidates remain individually capped but are not covered by a workspace-wide
-concurrency limit. Both values are configurable through `EngineOptions`; they
-are deployment policy, not protocol guarantees. Correct plugins must also obey
-per-transition record, page, attachment, byte, fuel, and time budgets.
+The runtime enforces a configurable linear-memory ceiling and a hard
+workspace-wide live-Store admission limit. The integrated host defaults each
+v2 actor to 128 MiB and permits at most four live Stores, bounding guest linear
+memory to 512 MiB before host-side document state. Cached actors, active
+transaction leases, pending publications, cold-open candidates, and upgrade
+preflight all consume that same budget. When it is full, an idle LRU actor may
+be evicted; otherwise the request fails deterministically and can be retried
+after commit or with a higher deployment limit. Both values are configurable
+through `EngineOptions`; they are deployment policy, not protocol guarantees.
+Correct plugins must also obey per-transition record, page, attachment, byte,
+fuel, and time budgets.
 
 Malformed or globally coupled syntax may require a larger invalidation region
 or a bounded full reparse. API v2 optimizes the common localized path; it does

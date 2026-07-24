@@ -10,13 +10,15 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError,
+};
 
 use super::incremental::FileBytesSha256;
 use crate::wasm::{WasmComponentV2Actor, WasmDocumentHandle};
 use crate::{Blob, LixError};
 
-pub(crate) const DEFAULT_MAX_PLUGIN_FILE_ACTORS: usize = 4;
+pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS: usize = 4;
 // One predecessor is enough for the required two-reader serialization while
 // keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
@@ -61,12 +63,38 @@ impl PluginObservation {
 }
 
 struct PluginActorAcceptedState {
-    actor: Box<dyn WasmComponentV2Actor>,
+    store: PluginActorStore,
     document: WasmDocumentHandle,
     bytes: Blob,
     bytes_sha256: FileBytesSha256,
     semantic_root: Arc<str>,
     history: VecDeque<PluginActorHistoricalState>,
+}
+
+/// One instantiated Component Store together with the admission token that
+/// keeps it within the workspace-wide live-Store bound.
+///
+/// Field order is deliberate: Rust drops fields in declaration order, so the
+/// actor (and its Wasmtime Store) is destroyed before the permit is returned.
+pub(crate) struct PluginActorStore {
+    actor: Box<dyn WasmComponentV2Actor>,
+    _store_permit: PluginActorStorePermit,
+}
+
+impl PluginActorStore {
+    pub(crate) fn new(
+        actor: Box<dyn WasmComponentV2Actor>,
+        store_permit: PluginActorStorePermit,
+    ) -> Self {
+        Self {
+            actor,
+            _store_permit: store_permit,
+        }
+    }
+
+    pub(crate) fn actor_mut(&mut self) -> &mut dyn WasmComponentV2Actor {
+        self.actor.as_mut()
+    }
 }
 
 struct PluginActorHistoricalState {
@@ -97,12 +125,22 @@ struct PluginActorCacheState {
     next_nonce: u64,
 }
 
-/// Workspace-local bounded cache of per-file actors.
+/// Workspace-local index and hard admission bound for per-file actors.
 #[derive(Clone)]
 pub(crate) struct PluginActorCache {
     capacity: NonZeroUsize,
+    store_admission: Arc<Semaphore>,
     state: Arc<Mutex<PluginActorCacheState>>,
     cold_open_gate: Arc<AsyncMutex<()>>,
+}
+
+/// RAII admission for exactly one live Component Store.
+///
+/// The token starts before instantiation and moves into either a pending
+/// publication or an installed actor slot. It releases only after the Store
+/// itself is dropped, including when a lease outlives cache eviction.
+pub(crate) struct PluginActorStorePermit {
+    _permit: OwnedSemaphorePermit,
 }
 
 pub(crate) enum PluginActorColdOpen {
@@ -123,7 +161,7 @@ struct PluginActorExpectedStale {
 
 impl Default for PluginActorCache {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_PLUGIN_FILE_ACTORS)
+        Self::new(DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS)
             .expect("the default plugin actor capacity is nonzero")
     }
 }
@@ -138,6 +176,7 @@ impl PluginActorCache {
         })?;
         Ok(Self {
             capacity,
+            store_admission: Arc::new(Semaphore::new(capacity.get())),
             state: Arc::new(Mutex::new(PluginActorCacheState {
                 actors: BTreeMap::new(),
                 clock: 0,
@@ -152,6 +191,41 @@ impl PluginActorCache {
     /// multiple full semantic snapshots plus Wasm Stores concurrently.
     pub(crate) async fn cold_open_guard(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.cold_open_gate).lock_owned().await
+    }
+
+    /// Reserves one workspace-wide live Store slot before a Component actor is
+    /// instantiated. This intentionally fails fast instead of waiting: a
+    /// transaction may already retain a pending actor through its durable
+    /// commit point, so waiting could deadlock the transaction against itself.
+    pub(crate) fn admit_store(&self) -> Result<PluginActorStorePermit, LixError> {
+        loop {
+            if let Some(permit) = self.try_acquire_store()? {
+                return Ok(permit);
+            }
+            if !self.evict_one_idle_slot() {
+                return Err(plugin_store_resource_limit(self.capacity));
+            }
+        }
+    }
+
+    /// Cold replacement additionally knows the exact stale slot it may
+    /// supersede. At capacity, release an idle captured predecessor before
+    /// building the candidate; a leased predecessor remains live and causes a
+    /// deterministic resource-limit error instead of a temporary overcommit.
+    pub(crate) fn admit_cold_store(
+        &self,
+        cold_install: &mut PluginActorColdInstall,
+    ) -> Result<PluginActorStorePermit, LixError> {
+        if let Some(permit) = self.try_acquire_store()? {
+            return Ok(permit);
+        }
+        if self.drop_detached_retired_cold_predecessor(cold_install) {
+            return self.admit_store();
+        }
+        if self.evict_idle_cold_predecessor(cold_install) {
+            return self.admit_store();
+        }
+        self.admit_store()
     }
 
     /// Captures the exact same-key slot that a cold open is allowed to replace.
@@ -210,7 +284,7 @@ impl PluginActorCache {
     pub(crate) fn install(
         &self,
         key: PluginActorKey,
-        actor: Box<dyn WasmComponentV2Actor>,
+        store: PluginActorStore,
         document: WasmDocumentHandle,
         bytes: Blob,
         semantic_root: impl Into<Arc<str>>,
@@ -228,7 +302,7 @@ impl PluginActorCache {
             last_used: AtomicU64::new(last_used),
             retired: AtomicBool::new(false),
             state: Arc::new(AsyncMutex::new(PluginActorAcceptedState {
-                actor,
+                store,
                 document,
                 bytes,
                 bytes_sha256,
@@ -238,17 +312,6 @@ impl PluginActorCache {
         });
         if let Some(previous) = state.actors.insert(key.clone(), Arc::clone(&slot)) {
             previous.retire();
-        }
-        while state.actors.len() > self.capacity.get() {
-            let evicted_key = state
-                .actors
-                .iter()
-                .min_by_key(|(_, actor)| actor.last_used.load(Ordering::Relaxed))
-                .map(|(key, _)| key.clone())
-                .expect("an over-capacity actor cache is nonempty");
-            if let Some(evicted) = state.actors.remove(&evicted_key) {
-                evicted.retire();
-            }
         }
         PluginObservation {
             key,
@@ -269,7 +332,7 @@ impl PluginActorCache {
         &self,
         cold_install: PluginActorColdInstall,
         key: PluginActorKey,
-        actor: Box<dyn WasmComponentV2Actor>,
+        store: PluginActorStore,
         document: WasmDocumentHandle,
         bytes: Blob,
         bytes_sha256: FileBytesSha256,
@@ -277,15 +340,15 @@ impl PluginActorCache {
     ) -> Result<PluginObservation, LixError> {
         let semantic_root = semantic_root.into();
         if cold_install.key != key {
-            let mut actor = actor;
-            let _ = actor.drop_document(document).await;
-            let _ = actor.retire().await;
+            let mut store = store;
+            let _ = store.actor.drop_document(document).await;
+            let _ = store.actor.retire().await;
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "cold plugin actor install token belongs to a different key",
             ));
         }
-        let mut candidate = Some((actor, document, bytes, bytes_sha256));
+        let mut candidate = Some((store, document, bytes, bytes_sha256));
         let expected_guard = match &cold_install.expected_stale {
             Some(expected) => Some(Arc::clone(&expected.slot.state).lock_owned().await),
             None => None,
@@ -317,7 +380,7 @@ impl PluginActorCache {
             if !may_install {
                 None
             } else {
-                let (actor, document, bytes, bytes_sha256) = candidate
+                let (store, document, bytes, bytes_sha256) = candidate
                     .take()
                     .expect("vacant cold install retains its candidate");
                 state.clock = state.clock.wrapping_add(1);
@@ -330,7 +393,7 @@ impl PluginActorCache {
                     last_used: AtomicU64::new(last_used),
                     retired: AtomicBool::new(false),
                     state: Arc::new(AsyncMutex::new(PluginActorAcceptedState {
-                        actor,
+                        store,
                         document,
                         bytes,
                         bytes_sha256,
@@ -340,17 +403,6 @@ impl PluginActorCache {
                 });
                 if let Some(replaced) = state.actors.insert(key.clone(), slot) {
                     replaced.retire();
-                }
-                while state.actors.len() > self.capacity.get() {
-                    let evicted_key = state
-                        .actors
-                        .iter()
-                        .min_by_key(|(_, actor)| actor.last_used.load(Ordering::Relaxed))
-                        .map(|(key, _)| key.clone())
-                        .expect("an over-capacity actor cache is nonempty");
-                    if let Some(evicted) = state.actors.remove(&evicted_key) {
-                        evicted.retire();
-                    }
                 }
                 Some(PluginObservation {
                     key: key.clone(),
@@ -366,10 +418,10 @@ impl PluginActorCache {
             return Ok(observation);
         }
 
-        let (mut actor, document, _, _) =
+        let (mut store, document, _, _) =
             candidate.expect("occupied cold install retains its candidate");
-        let _ = actor.drop_document(document).await;
-        let _ = actor.retire().await;
+        let _ = store.actor.drop_document(document).await;
+        let _ = store.actor.retire().await;
         self.observe(&key, &semantic_root).await
     }
 
@@ -522,6 +574,92 @@ impl PluginActorCache {
         self.lock().actors.len()
     }
 
+    #[cfg(test)]
+    fn live_store_count(&self) -> usize {
+        self.capacity
+            .get()
+            .saturating_sub(self.store_admission.available_permits())
+    }
+
+    fn try_acquire_store(&self) -> Result<Option<PluginActorStorePermit>, LixError> {
+        match Arc::clone(&self.store_admission).try_acquire_owned() {
+            Ok(permit) => Ok(Some(PluginActorStorePermit { _permit: permit })),
+            Err(TryAcquireError::NoPermits) => Ok(None),
+            Err(TryAcquireError::Closed) => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin Store admission semaphore was unexpectedly closed",
+            )),
+        }
+    }
+
+    /// Removes the least-recently-used cache slot only when the cache is its
+    /// sole owner. A lease, pending publication, or cold-install token keeps a
+    /// second strong reference and therefore keeps its Store admitted.
+    fn evict_one_idle_slot(&self) -> bool {
+        let evicted = {
+            let mut state = self.lock();
+            let evicted_key = state
+                .actors
+                .iter()
+                .filter(|(_, slot)| Arc::strong_count(slot) == 1)
+                .min_by_key(|(_, slot)| slot.last_used.load(Ordering::Relaxed))
+                .map(|(key, _)| key.clone());
+            evicted_key.and_then(|key| state.actors.remove(&key))
+        };
+        if let Some(slot) = evicted {
+            slot.retire();
+            drop(slot);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A cold-install token is normally a second reference to its stale
+    /// predecessor. At the hard limit, only an otherwise-idle predecessor can
+    /// be removed, then the token becomes a vacant-key token so installing the
+    /// already admitted candidate cannot revive the retired Store.
+    fn evict_idle_cold_predecessor(&self, cold_install: &mut PluginActorColdInstall) -> bool {
+        let Some(expected) = cold_install.expected_stale.as_ref() else {
+            return false;
+        };
+        let evicted = {
+            let mut state = self.lock();
+            let Some(current) = state.actors.get(&cold_install.key) else {
+                return false;
+            };
+            if !Arc::ptr_eq(current, &expected.slot) || Arc::strong_count(current) != 2 {
+                return false;
+            }
+            state.actors.remove(&cold_install.key)
+        };
+        let Some(slot) = evicted else {
+            return false;
+        };
+        slot.retire();
+        drop(slot);
+        cold_install.expected_stale = None;
+        true
+    }
+
+    /// A concurrent trap can retire and unlink the captured predecessor before
+    /// this cold builder asks for admission. Once its token is the final owner,
+    /// discard it so a no-longer-reachable Store cannot strand capacity.
+    fn drop_detached_retired_cold_predecessor(
+        &self,
+        cold_install: &mut PluginActorColdInstall,
+    ) -> bool {
+        let Some(expected) = cold_install.expected_stale.as_ref() else {
+            return false;
+        };
+        if !expected.slot.retired.load(Ordering::Acquire) || Arc::strong_count(&expected.slot) != 1
+        {
+            return false;
+        }
+        cold_install.expected_stale = None;
+        true
+    }
+
     fn lookup_slot(&self, key: &PluginActorKey) -> Result<Arc<PluginActorSlot>, LixError> {
         let mut state = self.lock();
         let Some(slot) = state.actors.get(key).cloned() else {
@@ -555,6 +693,19 @@ impl PluginActorCache {
             .lock()
             .expect("plugin actor cache mutex should not poison")
     }
+}
+
+fn plugin_store_resource_limit(capacity: NonZeroUsize) -> LixError {
+    LixError::new(
+        LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+        format!(
+            "plugin live Store limit of {} is exhausted for this engine",
+            capacity.get()
+        ),
+    )
+    .with_hint(
+        "commit or split transactions retaining plugin actors, or raise EngineOptions::with_plugin_v2_resource_limits",
+    )
 }
 
 struct PluginActorSuccessor {
@@ -607,6 +758,7 @@ impl PluginActorLease {
         self.guard
             .as_deref_mut()
             .expect("actor lease guard exists")
+            .store
             .actor
             .as_mut()
     }
@@ -721,6 +873,7 @@ impl PluginActorLease {
                 .guard
                 .as_deref()
                 .expect("actor lease guard exists")
+                .store
                 .actor
                 .is_retired();
         if runtime_retired {
@@ -799,6 +952,7 @@ impl PluginActorLease {
                 .guard
                 .as_deref()
                 .expect("actor lease guard exists")
+                .store
                 .actor
                 .is_retired();
         if runtime_retired {
@@ -954,6 +1108,19 @@ mod tests {
         retired: bool,
         retirement_probe: Option<Arc<AtomicBool>>,
         dropped_documents: Option<Arc<Mutex<Vec<WasmDocumentHandle>>>>,
+        _drop_probe: Option<TestActorDropProbe>,
+    }
+
+    struct TestActorDropProbe {
+        admission: Arc<Semaphore>,
+        observed_permits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for TestActorDropProbe {
+        fn drop(&mut self) {
+            self.observed_permits
+                .store(self.admission.available_permits(), Ordering::Release);
+        }
     }
 
     fn unused() -> LixError {
@@ -1099,7 +1266,12 @@ mod tests {
     ) -> PluginObservation {
         cache.install(
             key,
-            Box::new(TestActor::default()),
+            PluginActorStore::new(
+                Box::new(TestActor::default()),
+                cache
+                    .admit_store()
+                    .expect("test actor should receive Store admission"),
+            ),
             WasmDocumentHandle(document),
             bytes.into(),
             Arc::<str>::from(root),
@@ -1147,10 +1319,15 @@ mod tests {
         let dropped_documents = Arc::new(Mutex::new(Vec::new()));
         let observation = cache.install(
             key,
-            Box::new(TestActor {
-                dropped_documents: Some(Arc::clone(&dropped_documents)),
-                ..TestActor::default()
-            }),
+            PluginActorStore::new(
+                Box::new(TestActor {
+                    dropped_documents: Some(Arc::clone(&dropped_documents)),
+                    ..TestActor::default()
+                }),
+                cache
+                    .admit_store()
+                    .expect("test actor should receive Store admission"),
+            ),
             WasmDocumentHandle(1),
             b"before".as_slice().into(),
             Arc::<str>::from("root-1"),
@@ -1212,10 +1389,15 @@ mod tests {
         let dropped_documents = Arc::new(Mutex::new(Vec::new()));
         let observation = cache.install(
             key,
-            Box::new(TestActor {
-                dropped_documents: Some(Arc::clone(&dropped_documents)),
-                ..TestActor::default()
-            }),
+            PluginActorStore::new(
+                Box::new(TestActor {
+                    dropped_documents: Some(Arc::clone(&dropped_documents)),
+                    ..TestActor::default()
+                }),
+                cache
+                    .admit_store()
+                    .expect("test actor should receive Store admission"),
+            ),
             WasmDocumentHandle(1),
             b"before".as_slice().into(),
             Arc::<str>::from("root-1"),
@@ -1573,6 +1755,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_store_admission_never_evicts_a_leased_actor() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let observation = install(&cache, key, 1, b"before", "root-1");
+        let lease = cache.lease(&observation).await.unwrap();
+
+        let error = match cache.admit_store() {
+            Ok(_) => panic!("a live lease must keep its Store admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_PLUGIN_RESOURCE_LIMIT);
+        assert_eq!(cache.live_store_count(), 1);
+        assert_eq!(cache.len(), 1);
+
+        drop(lease);
+        let pending = cache
+            .admit_store()
+            .expect("idle cached Store should be evicted for a new admission");
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.live_store_count(), 1);
+        drop(pending);
+        assert_eq!(cache.live_store_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn store_permit_outlives_an_evicted_slot_held_by_a_lease() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let permits_seen_during_actor_drop =
+            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let observation = cache.install(
+            key.clone(),
+            PluginActorStore::new(
+                Box::new(TestActor {
+                    _drop_probe: Some(TestActorDropProbe {
+                        admission: Arc::clone(&cache.store_admission),
+                        observed_permits: Arc::clone(&permits_seen_during_actor_drop),
+                    }),
+                    ..TestActor::default()
+                }),
+                cache
+                    .admit_store()
+                    .expect("test actor should receive Store admission"),
+            ),
+            WasmDocumentHandle(1),
+            b"before".as_slice().into(),
+            Arc::<str>::from("root-1"),
+        );
+        let lease = cache.lease(&observation).await.unwrap();
+        cache.remove_if_same(&key, &lease.slot);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.live_store_count(), 1);
+
+        drop(lease);
+        assert_eq!(
+            permits_seen_during_actor_drop.load(Ordering::Acquire),
+            0,
+            "the actor must be destroyed before its Store admission is released"
+        );
+        assert_eq!(cache.live_store_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_admission_reclaims_only_an_idle_captured_predecessor() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let stale = install(&cache, key.clone(), 1, b"old", "root-old");
+        let mut cold_install = match cache.prepare_cold_open(&key, "root-new").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("different root must need a cold candidate"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+
+        let store_permit = cache
+            .admit_cold_store(&mut cold_install)
+            .expect("idle stale Store should be replaced before cold construction");
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.live_store_count(), 1);
+
+        let replacement = cache
+            .install_cold_if_absent(
+                cold_install,
+                key.clone(),
+                PluginActorStore::new(Box::new(TestActor::default()), store_permit),
+                WasmDocumentHandle(2),
+                b"new".as_slice().into(),
+                FileBytesSha256::compute(b"new"),
+                Arc::<str>::from("root-new"),
+            )
+            .await
+            .expect("vacant cold candidate should install");
+        assert!(cache.lease(&stale).await.is_err());
+        assert_eq!(cache.observe(&key, "root-new").await.unwrap(), replacement);
+        assert_eq!(cache.live_store_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_admission_refuses_a_leased_predecessor_then_recovers() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let stale = install(&cache, key.clone(), 1, b"old", "root-old");
+        let mut cold_install = match cache.prepare_cold_open(&key, "root-new").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("different root must need a cold candidate"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+        let lease = cache.lease(&stale).await.unwrap();
+
+        let error = match cache.admit_cold_store(&mut cold_install) {
+            Ok(_) => panic!("a leased stale Store must not be overcommitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_PLUGIN_RESOURCE_LIMIT);
+        assert_eq!(cache.len(), 1);
+
+        drop(lease);
+        let store_permit = cache
+            .admit_cold_store(&mut cold_install)
+            .expect("released stale Store should make the cold candidate admissible");
+        let replacement = cache
+            .install_cold_if_absent(
+                cold_install,
+                key.clone(),
+                PluginActorStore::new(Box::new(TestActor::default()), store_permit),
+                WasmDocumentHandle(2),
+                b"new".as_slice().into(),
+                FileBytesSha256::compute(b"new"),
+                Arc::<str>::from("root-new"),
+            )
+            .await
+            .expect("released stale candidate should install");
+        assert!(cache.lease(&stale).await.is_err());
+        assert_eq!(cache.observe(&key, "root-new").await.unwrap(), replacement);
+    }
+
+    #[tokio::test]
+    async fn cold_admission_releases_a_detached_retired_predecessor() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let stale = install(&cache, key.clone(), 1, b"old", "root-old");
+        let mut cold_install = match cache.prepare_cold_open(&key, "root-new").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("different root must need a cold candidate"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+        let expected = Arc::clone(
+            &cold_install
+                .expected_stale
+                .as_ref()
+                .expect("cold token should capture its predecessor")
+                .slot,
+        );
+        cache.remove_if_same(&key, &expected);
+        drop(expected);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.live_store_count(), 1);
+
+        let pending = cache
+            .admit_cold_store(&mut cold_install)
+            .expect("detached retired predecessor should not strand capacity");
+        assert_eq!(cache.live_store_count(), 1);
+        drop(pending);
+        drop(cold_install);
+        assert_eq!(cache.live_store_count(), 0);
+        assert!(cache.lease(&stale).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn losing_cold_candidate_releases_its_store_admission() {
+        let cache = PluginActorCache::new(2).unwrap();
+        let key = key("main", "/data.csv", "g1");
+        let cold_install = match cache.prepare_cold_open(&key, "root-stale").await.unwrap() {
+            PluginActorColdOpen::Ready(_) => panic!("vacant key cannot already be ready"),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+        let store_permit = cache
+            .admit_store()
+            .expect("candidate should consume one Store admission");
+        let committed = install(&cache, key.clone(), 2, b"new", "root-new");
+        let retirement_probe = Arc::new(AtomicBool::new(false));
+
+        let error = cache
+            .install_cold_if_absent(
+                cold_install,
+                key.clone(),
+                PluginActorStore::new(
+                    Box::new(TestActor {
+                        retirement_probe: Some(Arc::clone(&retirement_probe)),
+                        ..TestActor::default()
+                    }),
+                    store_permit,
+                ),
+                WasmDocumentHandle(1),
+                b"stale".as_slice().into(),
+                FileBytesSha256::compute(b"stale"),
+                Arc::<str>::from("root-stale"),
+            )
+            .await
+            .expect_err("a committed actor must win over a stale cold candidate");
+        assert_eq!(error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
+        assert!(retirement_probe.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 1);
+        let pending = cache
+            .admit_store()
+            .expect("losing candidate must release its Store admission");
+        assert_eq!(cache.live_store_count(), 2);
+        drop(pending);
+        assert_eq!(cache.observe(&key, "root-new").await.unwrap(), committed);
+    }
+
+    #[tokio::test]
     async fn stale_cold_install_never_replaces_a_committed_actor() {
         let cache = PluginActorCache::new(2).unwrap();
         let key = key("main", "/data.csv", "g1");
@@ -1586,10 +1976,15 @@ mod tests {
             .install_cold_if_absent(
                 cold_install,
                 key.clone(),
-                Box::new(TestActor {
-                    retirement_probe: Some(Arc::clone(&retirement_probe)),
-                    ..TestActor::default()
-                }),
+                PluginActorStore::new(
+                    Box::new(TestActor {
+                        retirement_probe: Some(Arc::clone(&retirement_probe)),
+                        ..TestActor::default()
+                    }),
+                    cache
+                        .admit_store()
+                        .expect("cold candidate should receive Store admission"),
+                ),
                 WasmDocumentHandle(1),
                 b"stale".as_slice().into(),
                 FileBytesSha256::compute(b"stale"),
@@ -1608,16 +2003,19 @@ mod tests {
         let cache = PluginActorCache::new(2).unwrap();
         let key = key("main", "/data.csv", "g1");
         let stale = install(&cache, key.clone(), 1, b"old", "root-old");
-        let cold_install = match cache.prepare_cold_open(&key, "root-new").await.unwrap() {
+        let mut cold_install = match cache.prepare_cold_open(&key, "root-new").await.unwrap() {
             PluginActorColdOpen::Ready(_) => panic!("stale root cannot already be ready"),
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
+        let store_permit = cache
+            .admit_cold_store(&mut cold_install)
+            .expect("cold candidate should receive Store admission");
 
         let replacement = cache
             .install_cold_if_absent(
                 cold_install,
                 key.clone(),
-                Box::new(TestActor::default()),
+                PluginActorStore::new(Box::new(TestActor::default()), store_permit),
                 WasmDocumentHandle(2),
                 b"new".as_slice().into(),
                 FileBytesSha256::compute(b"new"),
@@ -1657,7 +2055,12 @@ mod tests {
             .install_cold_if_absent(
                 cold_install,
                 key.clone(),
-                Box::new(TestActor::default()),
+                PluginActorStore::new(
+                    Box::new(TestActor::default()),
+                    cache
+                        .admit_store()
+                        .expect("cold candidate should receive Store admission"),
+                ),
                 WasmDocumentHandle(3),
                 b"cold".as_slice().into(),
                 FileBytesSha256::compute(b"cold"),
