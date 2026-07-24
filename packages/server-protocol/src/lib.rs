@@ -53,10 +53,10 @@ pub const SESSION_ID_HEADER: &str = "lix-session-id";
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
-/// Default JSON request ceiling. Base64 expands blobs by roughly one third,
-/// so 64 MiB carries the engine's 32 MiB maximum plugin archive with room for
-/// the SQL envelope and also covers ordinary larger document blobs.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Default post-decompression JSON request ceiling. 128 MiB accommodates a
+/// 5,000-file ordinary batch (about 71.4 MiB expanded) while retaining a
+/// bounded request and reconstruction payload.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
 const MIN_COMPRESSION_BODY_BYTES: u16 = 32 * 1024;
 /// Maximum number of queries multiplexed onto one observation stream.
 pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
@@ -2231,6 +2231,15 @@ mod tests {
 
     async fn app() -> TestApp {
         app_with_options(ProtocolServerOptions::default()).await
+    }
+
+    #[test]
+    fn default_request_body_limit_is_128_mib() {
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 128 * 1024 * 1024);
+        assert_eq!(
+            ProtocolServerOptions::default().max_request_body_bytes,
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
     }
 
     async fn app_with_options(options: ProtocolServerOptions) -> TestApp {
