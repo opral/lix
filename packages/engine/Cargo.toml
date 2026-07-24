@@ -76,6 +76,12 @@ path = "benches/small_blob_cas.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 
+[[bench]]
+name = "changelog_history_append"
+path = "benches/changelog_history_append.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"

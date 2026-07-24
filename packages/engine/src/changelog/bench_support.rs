@@ -2,6 +2,8 @@
 //!
 //! The fixtures build direct commit/change/change-ref append batches.
 
+use std::time::{Duration, Instant};
+
 use super::context::ChangelogContext;
 use super::store::{ChangelogReader, ChangelogWriter};
 use super::types::{
@@ -128,6 +130,13 @@ pub struct BenchWriteStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BenchAppendTiming {
+    pub stage_elapsed: Duration,
+    pub commit_elapsed: Duration,
+    pub write: BenchWriteStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BenchRebuildStats {
     pub expected: usize,
     pub put: usize,
@@ -224,6 +233,23 @@ pub fn append_100c_1000ch_reused_keys_across_commits() -> Result<BenchAppend, Li
 
 pub fn append_change_ref_fanout(fanout: usize) -> Result<BenchAppend, LixError> {
     direct_append_with_shape("bench-fanout", fanout.max(1), fanout.max(1))
+}
+
+pub fn append_with_shape(
+    name: &str,
+    commit_count: usize,
+    change_count: usize,
+) -> Result<BenchAppend, LixError> {
+    direct_append_with_shape(name, commit_count, change_count)
+}
+
+pub fn append_1c_with_commit_change_id(
+    name: &str,
+    commit_change_id: &str,
+) -> Result<BenchAppend, LixError> {
+    let mut append = direct_append_with_shape(name, 1, 1)?;
+    append.append.commits[0].change_id = ChangeId::for_test_label(commit_change_id);
+    Ok(append)
 }
 
 pub fn corpus_100append_100c_1000ch() -> Result<BenchCorpus, LixError> {
@@ -370,7 +396,40 @@ where
     StorageImpl: BenchStorage + Sync,
 {
     let store = BenchStore::new(storage);
-    stage_append_in_store(&store, &append.append).await
+    stage_append_to_store(&store, append).await
+}
+
+pub async fn stage_append_to_store<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
+    append: &BenchAppend,
+) -> Result<BenchWriteStats, LixError>
+where
+    StorageImpl: BenchStorage + Sync,
+{
+    Ok(stage_append_timed_to_store(store, append).await?.write)
+}
+
+pub async fn stage_append_timed_to_store<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
+    append: &BenchAppend,
+) -> Result<BenchAppendTiming, LixError>
+where
+    StorageImpl: BenchStorage + Sync,
+{
+    stage_append_timed_in_store(store, &append.append).await
+}
+
+pub async fn layout_accounting<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
+) -> Result<Vec<crate::storage_bench::StorageLayoutAccounting>, LixError>
+where
+    StorageImpl: BenchStorage + Sync,
+{
+    let read = store
+        .storage
+        .begin_read(StorageReadOptions::default())
+        .await?;
+    Ok(crate::storage_bench::layout_accounting(&read).await)
 }
 
 pub async fn stage_corpus_once<StorageImpl>(
@@ -674,15 +733,33 @@ async fn stage_append_in_store<StorageImpl>(
 where
     StorageImpl: BenchStorage + Sync,
 {
+    Ok(stage_append_timed_in_store(store, append).await?.write)
+}
+
+async fn stage_append_timed_in_store<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
+    append: &ChangelogAppend,
+) -> Result<BenchAppendTiming, LixError>
+where
+    StorageImpl: BenchStorage + Sync,
+{
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = crate::storage_adapter::StorageWriteSet::new();
+    let append = append.clone();
+    let stage_started = Instant::now();
     {
         let mut writer = store.context.writer(&mut *transaction, &mut writes);
-        writer.stage_append(append.clone()).await?;
+        writer.stage_append(append).await?;
     }
+    let stage_elapsed = stage_started.elapsed();
+    let commit_started = Instant::now();
     let stats = writes.apply(&mut *transaction).await?;
     transaction.commit().await?;
-    Ok(stats.into())
+    Ok(BenchAppendTiming {
+        stage_elapsed,
+        commit_elapsed: commit_started.elapsed(),
+        write: stats.into(),
+    })
 }
 
 async fn load_commits_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
