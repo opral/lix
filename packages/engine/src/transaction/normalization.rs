@@ -6,7 +6,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::LixError;
 use crate::catalog::{SchemaPlan, SchemaPlanId, TransactionCatalog};
-use crate::common::format_json_pointer;
+use crate::common::{format_json_pointer, validate_row_metadata};
 use crate::domain::Domain;
 use crate::entity_pk::{EntityPk, EntityPkError};
 use crate::functions::FunctionProviderHandle;
@@ -85,6 +85,18 @@ pub(crate) fn normalize_transaction_write_row(
         None
     };
 
+    validate_normalized_row_content(&row, normalized_snapshot.as_ref(), schema_plan)?;
+    let requires_transaction_validation = if normalized_snapshot.is_some() {
+        !schema_plan.uniques.is_empty()
+            || !schema_plan.foreign_keys.is_empty()
+            || !schema_plan.state_foreign_keys.is_empty()
+    } else {
+        schema_catalog
+            .snapshot()
+            .delete_plan_for_key(&row.schema_key)
+            .has_committed_checks()
+    };
+
     if row.schema_key == REGISTERED_SCHEMA_KEY {
         if row.file_id.is_some() {
             return Err(LixError::new(
@@ -106,8 +118,41 @@ pub(crate) fn normalize_transaction_write_row(
         row,
         snapshot: normalized_snapshot,
         schema_plan_id,
-        facts: PreparedRowFacts::default(),
+        facts: PreparedRowFacts {
+            row_content_validated: true,
+            requires_transaction_validation,
+        },
     })
+}
+
+fn validate_normalized_row_content(
+    row: &TransactionWriteRow,
+    snapshot: Option<&TransactionJson>,
+    schema_plan: &SchemaPlan,
+) -> Result<(), LixError> {
+    if let Some(metadata) = row.metadata.as_ref() {
+        validate_row_metadata(
+            metadata.value(),
+            format!("metadata for schema '{}'", row.schema_key),
+        )?;
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    if schema_plan.accepts_row_content_fast(snapshot.value()) {
+        return Ok(());
+    }
+    if let Err(errors) = schema_plan.compiled_schema.validate(snapshot.value()) {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "snapshot_content validation failed for schema '{}': {}",
+                row.schema_key,
+                crate::schema::format_lix_schema_validation_errors(errors)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_transaction_write_row_schema_identity(
@@ -666,20 +711,19 @@ mod tests {
             global: false,
             ..base_stage_row()
         };
-        let dotdot = normalize_transaction_write_row(dotdot, &mut catalog, functions())
-            .expect("normalize dotdot file");
-        let dotdot_snapshot = normalized_snapshot(&dotdot);
-        assert_eq!(dotdot_snapshot["name"], "..");
+        let error = normalize_transaction_write_row(dotdot, &mut catalog, functions())
+            .expect_err("schema validation should reject a parent-directory segment");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
 
     #[test]
-    fn normalization_leaves_structural_filesystem_descriptor_validation_to_schema() {
+    fn normalization_applies_structural_filesystem_descriptor_schema() {
         let mut catalog = catalog_with(vec![
             builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
             builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
         ]);
 
-        let row = normalize_transaction_write_row(
+        let error = normalize_transaction_write_row(
             TransactionWriteRow {
                 entity_pk: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -694,9 +738,8 @@ mod tests {
             &mut catalog,
             functions(),
         )
-        .expect("normalization should preserve descriptor names without path validation");
-        let snapshot = normalized_snapshot(&row);
-        assert_eq!(snapshot["name"], "nested/name");
+        .expect_err("schema validation should reject a path in a descriptor name");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
 
     #[test]

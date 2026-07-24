@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 use crate::changelog::CommitId;
 use crate::common::validate_row_metadata;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
+use crate::live_state::{LiveStateFilter, LiveStateRowFilter, LiveStateScanRequest};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -561,7 +561,7 @@ async fn entity_update(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
-    let candidates = scan_entity_candidates(ctx, plan, spec).await?;
+    let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = Vec::new();
     for candidate in candidates {
         let Some(snapshot) = candidate_snapshot(&candidate)? else {
@@ -636,7 +636,7 @@ async fn entity_delete(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
-    let candidates = scan_entity_candidates(ctx, plan, spec).await?;
+    let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = Vec::new();
     let mut returning_rows = plan.bound.returning.as_ref().map(|_| Vec::new());
     for candidate in candidates {
@@ -1047,9 +1047,10 @@ async fn scan_entity_candidates(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
+    params: &[Value],
 ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
     let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
-    let request = LiveStateScanRequest {
+    let mut request = LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             branch_ids,
@@ -1058,7 +1059,215 @@ async fn scan_entity_candidates(
         },
         ..LiveStateScanRequest::default()
     };
+    if let Some(entity_pks) =
+        bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params)
+    {
+        if entity_pks.is_empty() {
+            request.filter.rows = LiveStateRowFilter::None;
+        }
+        request.filter.entity_pks = entity_pks;
+    }
     ctx.scan_live_state(&request).await
+}
+
+fn bound_entity_pks_from_primary_key_predicate(
+    spec: &EntitySurfaceSpec,
+    predicate: &BoundPredicate,
+    params: &[Value],
+) -> Option<Vec<EntityPk>> {
+    let primary_key_columns = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| {
+            let [column_name] = path.as_slice() else {
+                return None;
+            };
+            spec.visible_column(column_name)
+                .filter(|column| column.column_type == EntityColumnType::String)
+                .map(|column| column.name.as_str())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if primary_key_columns.is_empty() {
+        return None;
+    }
+    let analyzer = BoundPrimaryKeyAnalyzer {
+        primary_key_columns,
+        params,
+    };
+    analyzer
+        .analyze_conjunctive_constraint(predicate)?
+        .into_entity_pks(&analyzer.primary_key_columns)
+        .map(|entity_pks| entity_pks.into_iter().collect())
+}
+
+struct BoundPrimaryKeyAnalyzer<'a> {
+    primary_key_columns: Vec<&'a str>,
+    params: &'a [Value],
+}
+
+#[derive(Clone)]
+enum BoundPrimaryKeyConstraint {
+    Full(std::collections::BTreeSet<EntityPk>),
+    Parts(std::collections::BTreeMap<String, std::collections::BTreeSet<String>>),
+}
+
+impl BoundPrimaryKeyAnalyzer<'_> {
+    /// Extracts identity constraints that are guaranteed conjuncts. A partial
+    /// disjunction is never routed because doing so could omit matching rows.
+    fn analyze_conjunctive_constraint(
+        &self,
+        predicate: &BoundPredicate,
+    ) -> Option<BoundPrimaryKeyConstraint> {
+        match predicate {
+            BoundPredicate::And(predicates) => {
+                let mut constraint: Option<BoundPrimaryKeyConstraint> = None;
+                for predicate in predicates {
+                    let Some(next) = self.analyze_conjunctive_constraint(predicate) else {
+                        continue;
+                    };
+                    constraint = Some(match constraint {
+                        Some(current) => current.intersect(next, &self.primary_key_columns),
+                        None => next,
+                    });
+                }
+                constraint
+            }
+            BoundPredicate::Or(predicates) => {
+                let mut entity_pks = std::collections::BTreeSet::new();
+                for predicate in predicates {
+                    entity_pks.extend(
+                        self.analyze_conjunctive_constraint(predicate)?
+                            .into_entity_pks(&self.primary_key_columns)?,
+                    );
+                }
+                Some(BoundPrimaryKeyConstraint::Full(entity_pks))
+            }
+            BoundPredicate::Eq(left, right) => self
+                .column_value_constraint(left, right)
+                .or_else(|| self.column_value_constraint(right, left)),
+            BoundPredicate::In { expr, values } => {
+                let BoundExpr::Column(column) = expr else {
+                    return None;
+                };
+                if !self.primary_key_columns.contains(&column.name.as_str()) {
+                    return None;
+                }
+                let values = values
+                    .iter()
+                    .map(|value| bound_primary_key_string(value, self.params))
+                    .collect::<Option<std::collections::BTreeSet<_>>>()?;
+                if values.is_empty() {
+                    return None;
+                }
+                Some(BoundPrimaryKeyConstraint::Parts(
+                    std::collections::BTreeMap::from([(column.name.clone(), values)]),
+                ))
+            }
+            BoundPredicate::True
+            | BoundPredicate::False
+            | BoundPredicate::Like { .. }
+            | BoundPredicate::IsNull(_)
+            | BoundPredicate::IsNotNull(_) => None,
+        }
+    }
+
+    fn column_value_constraint(
+        &self,
+        column_expr: &BoundExpr,
+        value_expr: &BoundExpr,
+    ) -> Option<BoundPrimaryKeyConstraint> {
+        let BoundExpr::Column(column) = column_expr else {
+            return None;
+        };
+        if !self.primary_key_columns.contains(&column.name.as_str()) {
+            return None;
+        }
+        let value = bound_primary_key_string(value_expr, self.params)?;
+        Some(BoundPrimaryKeyConstraint::Parts(
+            std::collections::BTreeMap::from([(
+                column.name.clone(),
+                std::collections::BTreeSet::from([value]),
+            )]),
+        ))
+    }
+}
+
+impl BoundPrimaryKeyConstraint {
+    fn intersect(self, other: Self, primary_key_columns: &[&str]) -> Self {
+        match (self, other) {
+            (Self::Full(left), Self::Full(right)) => {
+                Self::Full(left.intersection(&right).cloned().collect())
+            }
+            (Self::Full(ids), Self::Parts(parts)) | (Self::Parts(parts), Self::Full(ids)) => {
+                Self::Full(
+                    ids.into_iter()
+                        .filter(|identity| {
+                            identity.parts.len() == primary_key_columns.len()
+                                && primary_key_columns
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(index, column)| {
+                                        parts.get(*column).is_none_or(|values| {
+                                            values.contains(&identity.parts[index])
+                                        })
+                                    })
+                        })
+                        .collect(),
+                )
+            }
+            (Self::Parts(mut left), Self::Parts(right)) => {
+                for (column, right_values) in right {
+                    left.entry(column)
+                        .and_modify(|left_values| {
+                            *left_values =
+                                left_values.intersection(&right_values).cloned().collect();
+                        })
+                        .or_insert(right_values);
+                }
+                Self::Parts(left)
+            }
+        }
+    }
+
+    fn into_entity_pks(
+        self,
+        primary_key_columns: &[&str],
+    ) -> Option<std::collections::BTreeSet<EntityPk>> {
+        match self {
+            Self::Full(entity_pks) => Some(entity_pks),
+            Self::Parts(parts) => {
+                let mut combinations = vec![Vec::new()];
+                for column in primary_key_columns {
+                    let values = parts.get(*column)?;
+                    let mut next = Vec::with_capacity(combinations.len() * values.len());
+                    for prefix in &combinations {
+                        for value in values {
+                            let mut combination = prefix.clone();
+                            combination.push(value.clone());
+                            next.push(combination);
+                        }
+                    }
+                    combinations = next;
+                }
+                combinations
+                    .into_iter()
+                    .map(EntityPk::from_parts)
+                    .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                    .ok()
+            }
+        }
+    }
+}
+
+fn bound_primary_key_string(expr: &BoundExpr, params: &[Value]) -> Option<String> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Text(value)) => Some(value.clone()),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 struct InsertRowLayout {
@@ -2797,5 +3006,132 @@ fn entity_action(op: &BoundWriteOp) -> &'static str {
         BoundWriteOp::Insert => "INSERT into entity surface",
         BoundWriteOp::Update => "UPDATE entity surface",
         BoundWriteOp::Delete => "DELETE from entity surface",
+    }
+}
+
+#[cfg(test)]
+mod primary_key_route_tests {
+    use super::*;
+    use crate::sql2::bind::expr::{BoundColumnRef, BoundParamRef};
+
+    #[test]
+    fn routes_literal_and_parameter_primary_keys() {
+        let analyzer = BoundPrimaryKeyAnalyzer {
+            primary_key_columns: vec!["id"],
+            params: &[Value::Text("from-param".to_string())],
+        };
+        let predicate = BoundPredicate::Or(vec![
+            equals(column("id"), text("literal")),
+            equals(column("id"), BoundExpr::Param(BoundParamRef { index: 1 })),
+        ]);
+
+        assert_eq!(
+            analyzer
+                .analyze_conjunctive_constraint(&predicate)
+                .expect("identity predicate should route")
+                .into_entity_pks(&analyzer.primary_key_columns)
+                .expect("identity predicate should be complete"),
+            std::collections::BTreeSet::from([
+                EntityPk::single("from-param"),
+                EntityPk::single("literal"),
+            ])
+        );
+    }
+
+    #[test]
+    fn routes_guaranteed_conjunct_but_not_partial_disjunction() {
+        let analyzer = BoundPrimaryKeyAnalyzer {
+            primary_key_columns: vec!["id"],
+            params: &[],
+        };
+        let conjunct = BoundPredicate::And(vec![
+            equals(column("id"), text("entity-a")),
+            equals(column("kind"), text("note")),
+        ]);
+        assert_eq!(
+            analyzer
+                .analyze_conjunctive_constraint(&conjunct)
+                .expect("guaranteed identity conjunct should route")
+                .into_entity_pks(&analyzer.primary_key_columns)
+                .expect("identity conjunct should be complete"),
+            std::collections::BTreeSet::from([EntityPk::single("entity-a")])
+        );
+
+        let disjunction = BoundPredicate::Or(vec![
+            equals(column("id"), text("entity-a")),
+            equals(column("kind"), text("note")),
+        ]);
+        assert!(
+            analyzer
+                .analyze_conjunctive_constraint(&disjunction)
+                .is_none(),
+            "a partially routable disjunction must retain the full scan"
+        );
+    }
+
+    #[test]
+    fn routes_composite_primary_key_in_declared_order() {
+        let analyzer = BoundPrimaryKeyAnalyzer {
+            primary_key_columns: vec!["namespace", "id"],
+            params: &[],
+        };
+        let predicate = BoundPredicate::And(vec![
+            BoundPredicate::In {
+                expr: column("id"),
+                values: vec![text("one"), text("two")],
+            },
+            equals(column("namespace"), text("docs")),
+        ]);
+
+        assert_eq!(
+            analyzer
+                .analyze_conjunctive_constraint(&predicate)
+                .expect("composite predicate should route")
+                .into_entity_pks(&analyzer.primary_key_columns)
+                .expect("composite predicate should be complete"),
+            std::collections::BTreeSet::from([
+                EntityPk::from_parts(vec!["docs".to_string(), "one".to_string()])
+                    .expect("valid entity pk"),
+                EntityPk::from_parts(vec!["docs".to_string(), "two".to_string()])
+                    .expect("valid entity pk"),
+            ])
+        );
+    }
+
+    #[test]
+    fn contradictory_primary_key_conjunct_routes_empty() {
+        let analyzer = BoundPrimaryKeyAnalyzer {
+            primary_key_columns: vec!["id"],
+            params: &[],
+        };
+        let predicate = BoundPredicate::And(vec![
+            equals(column("id"), text("one")),
+            equals(column("id"), text("two")),
+        ]);
+
+        assert!(
+            analyzer
+                .analyze_conjunctive_constraint(&predicate)
+                .expect("contradictory identity should still route")
+                .into_entity_pks(&analyzer.primary_key_columns)
+                .expect("identity predicate should be complete")
+                .is_empty()
+        );
+    }
+
+    fn equals(left: BoundExpr, right: BoundExpr) -> BoundPredicate {
+        BoundPredicate::Eq(left, right)
+    }
+
+    fn column(name: &str) -> BoundExpr {
+        BoundExpr::Column(BoundColumnRef {
+            table: "entity".to_string(),
+            column_id: 0,
+            name: name.to_string(),
+        })
+    }
+
+    fn text(value: &str) -> BoundExpr {
+        BoundExpr::Literal(BoundLiteral::Text(value.to_string()))
     }
 }

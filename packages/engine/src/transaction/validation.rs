@@ -217,6 +217,15 @@ pub(crate) async fn validate_prepared_writes(
             "lix.perf.validation.registered_schema_identity"
         ))
         .await?;
+    if row_local_certificates_cover_validation(&staged_rows) {
+        validate_committed_insert_identities(&input, None)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.validation.insert_identities"
+            ))
+            .await?;
+        return Ok(());
+    }
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
@@ -234,8 +243,10 @@ pub(crate) async fn validate_prepared_writes(
     }
     for row in &staged_rows {
         let row = *row;
-        validate_staged_row_shape(row)?;
-        validate_staged_row_metadata(row)?;
+        if !row.row_content_validated() {
+            validate_staged_row_shape(row)?;
+            validate_staged_row_metadata(row)?;
+        }
         let validated = validated_constraint_rows
             .get(&row.domain_row_identity())
             .copied()
@@ -253,7 +264,9 @@ pub(crate) async fn validate_prepared_writes(
                     "lix.perf.validation.file_owner"
                 ))
                 .await?;
-            validate_primary_key_identity(row, schema_plan, snapshot)?;
+            if !row.row_content_validated() {
+                validate_primary_key_identity(row, schema_plan, snapshot)?;
+            }
             pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
             staged_snapshots.push((row, schema_plan, snapshot));
         } else {
@@ -289,7 +302,7 @@ pub(crate) async fn validate_prepared_writes(
             "lix.perf.validation.branch_ref_delete_restrictions"
         ))
         .await?;
-    validate_committed_insert_identities(&input, &pending_constraints)
+    validate_committed_insert_identities(&input, Some(&pending_constraints))
         .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.validation.insert_identities"
@@ -314,6 +327,22 @@ pub(crate) async fn validate_prepared_writes(
         ))
         .await?;
     Ok(())
+}
+
+fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<'_>]) -> bool {
+    !staged_rows.is_empty()
+        && staged_rows.iter().all(|row| {
+            row.row_content_validated()
+                && !row.requires_transaction_validation()
+                && row.file_id().is_none()
+                && !matches!(
+                    row.schema_key(),
+                    REGISTERED_SCHEMA_KEY
+                        | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                        | FILE_DESCRIPTOR_SCHEMA_KEY
+                        | BRANCH_REF_SCHEMA_KEY
+                )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1033,13 +1062,15 @@ fn directory_parent_depth_error(scope: &DirectoryDescriptorScope, start_id: &str
 
 async fn validate_committed_insert_identities(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: Option<&PendingConstraintIndexes>,
 ) -> Result<(), LixError> {
-    let pending_identity_targets = pending_constraints
-        .identity_targets
-        .iter()
-        .map(|target| target.identity.clone())
-        .collect::<BTreeSet<_>>();
+    let pending_identity_targets = pending_constraints.map(|pending_constraints| {
+        pending_constraints
+            .identity_targets
+            .iter()
+            .map(|target| target.identity.clone())
+            .collect::<BTreeSet<_>>()
+    });
     let mut checks_by_domain_schema =
         BTreeMap::<(Domain, String), Vec<(EntityPk, Option<TransactionWriteOrigin>)>>::new();
     for (identity, untracked, origin) in input.staged_writes.insert_identities() {
@@ -1048,7 +1079,10 @@ async fn validate_committed_insert_identities(
             identity.schema_key().to_string(),
             identity.entity_pk().clone(),
         );
-        if !pending_identity_targets.contains(&pending_identity) {
+        if pending_identity_targets
+            .as_ref()
+            .is_some_and(|targets| !targets.contains(&pending_identity))
+        {
             continue;
         }
         checks_by_domain_schema
@@ -1070,7 +1104,12 @@ async fn validate_committed_insert_identities(
                 .await?;
         let committed_rows_by_entity_pk = committed_rows
             .into_iter()
-            .filter(|row| !row.deleted && !pending_constraints.tombstones_identity(row))
+            .filter(|row| {
+                !row.deleted
+                    && !pending_constraints.is_some_and(|pending_constraints| {
+                        pending_constraints.tombstones_identity(row)
+                    })
+            })
             .map(|row| (row.entity_pk.clone(), row))
             .collect::<BTreeMap<_, _>>();
         for (entity_pk, origin) in checks {
@@ -1421,7 +1460,11 @@ fn validate_row_content<'a>(
 ) -> Result<ValidatedRowContent<'a>, LixError> {
     let schema_plan = schema_plan_for_row(schema_catalog, pending_schema_domains, row)?;
     validate_schema_matches_row(row, schema_plan)?;
-    let snapshot = validate_snapshot_content(row, schema_plan)?;
+    let snapshot = if row.row_content_validated() {
+        row.snapshot_json()
+    } else {
+        validate_snapshot_content(row, schema_plan)?
+    };
     Ok(ValidatedRowContent {
         schema_plan,
         snapshot,

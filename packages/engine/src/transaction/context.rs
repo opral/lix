@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
@@ -150,6 +151,10 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     filesystem_path_index_epoch: Arc<AtomicUsize>,
     storage: StorageAdapter<StorageImpl>,
     functions: FunctionProviderHandle,
+    /// Tracked-state revision observed by the coherent transaction-open read.
+    /// Durable tracked publication must still be based on this revision;
+    /// untracked sidecar writes do not invalidate the snapshot.
+    opening_tracked_mutation_revision: Option<Bytes>,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<String>,
@@ -280,6 +285,18 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) async fn ensure_opening_snapshot_is_current(&self) -> Result<(), LixError> {
+        let current = self.storage.load_tracked_mutation_revision().await?;
+        if current == self.opening_tracked_mutation_revision {
+            return Ok(());
+        }
+        Err(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "transaction snapshot is stale because tracked state changed after it opened",
+        )
+        .with_hint("Retry the transaction against the latest committed state."))
+    }
+
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open(
         mode: &SessionMode,
@@ -315,15 +332,25 @@ where
                     )
                     .await?
             };
+            let opening_tracked_mutation_revision =
+                StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
+                    .await?;
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
                 functions,
                 schema_catalog,
+                opening_tracked_mutation_revision,
             ))
         }
         .await;
-        let (active_branch_id, runtime_functions, functions, schema_catalog) = match setup_result {
+        let (
+            active_branch_id,
+            runtime_functions,
+            functions,
+            schema_catalog,
+            opening_tracked_mutation_revision,
+        ) = match setup_result {
             Ok(result) => result,
             Err(error) => {
                 return Err(error);
@@ -352,6 +379,7 @@ where
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
                 storage,
                 functions,
+                opening_tracked_mutation_revision,
                 commit_boundary: None,
                 trust_filesystem_planner: false,
                 origin_key: None,
@@ -379,6 +407,9 @@ where
                 return Err(error);
             }
         };
+        let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
+            || !prepared_writes.commit_change_refs_by_branch.is_empty()
+            || !prepared_writes.extra_commit_parents_by_branch.is_empty();
         let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         check_commit_boundary(commit_boundary.as_ref())?;
@@ -440,9 +471,20 @@ where
         if catalog_revision_changed {
             stage_catalog_revision(&mut writes);
         }
+        if tracked_state_changed {
+            StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
+        }
+        let mut write_options = StorageWriteOptions::default();
+        if tracked_state_changed {
+            write_options.preconditions.push(
+                StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
+                    transaction.opening_tracked_mutation_revision.clone(),
+                ),
+            );
+        }
         let prepared_commit = transaction
             .storage
-            .prepare_write_set(writes, StorageWriteOptions::default())
+            .prepare_write_set(writes, write_options)
             .await?;
         let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || async move {
             let (_commit, stats) = prepared_commit.commit().await?;
@@ -498,6 +540,7 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.ensure_opening_snapshot_is_current().await?;
         require_valid_transaction_write_storage_scopes(&write)?;
         #[cfg(feature = "storage-benches")]
         {
@@ -3248,7 +3291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_validates_staged_rows_before_persistence() {
+    async fn stage_rows_validates_row_content_before_persistence() {
         let storage = Memory::new();
         let storage = StorageAdapter::new(storage.clone());
         let live_state = Arc::new(live_state_context());
@@ -3273,21 +3316,15 @@ mod tests {
         .await
         .expect("transaction should open");
         let mut transaction = opened.transaction;
-        let runtime_functions = opened.runtime_functions;
 
         let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
         invalid_row.snapshot = Some(TransactionJson::from_value_for_test(
             json!({"key": "invalid-programmatic"}),
         ));
-        transaction
+        let error = transaction
             .stage_rows(vec![invalid_row])
             .await
-            .expect("invalid row should still reach commit validation");
-
-        let error = transaction
-            .commit(&runtime_functions)
-            .await
-            .expect_err("validation should reject before persistence");
+            .expect_err("row-local validation should reject while staging");
         assert!(
             error.message.contains("snapshot_content validation failed"),
             "validation error should explain the rejected schema data: {error:?}"
@@ -3311,23 +3348,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rejects_non_object_metadata_without_sql() {
+    async fn stage_rows_rejects_non_object_metadata_without_sql() {
         let storage = Memory::new();
-        let (live_state, _binary_cas, branch_ref, runtime_functions, mut transaction) =
+        let (live_state, _binary_cas, branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
         let storage = StorageAdapter::new(storage);
 
         let mut row = key_value_stage_row("invalid-metadata", "value", false);
         row.metadata = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
-        transaction
+        let error = transaction
             .stage_rows(vec![row])
             .await
-            .expect("row should stage before metadata validation");
-
-        let error = transaction
-            .commit(&runtime_functions)
-            .await
-            .expect_err("non-object metadata should fail commit validation");
+            .expect_err("non-object metadata should fail statement validation");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
@@ -3434,9 +3466,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
+    async fn stage_rows_rejects_snapshot_that_violates_json_schema_without_sql() {
         let storage = Memory::new();
-        let (live_state, _binary_cas, branch_ref, runtime_functions, mut transaction) =
+        let (live_state, _binary_cas, branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
         let storage = StorageAdapter::new(storage);
 
@@ -3444,15 +3476,10 @@ mod tests {
         row.snapshot = Some(TransactionJson::from_value_for_test(
             json!({"key": "schema-mismatch"}),
         ));
-        transaction
+        let error = transaction
             .stage_rows(vec![row])
             .await
-            .expect("row should stage before JSON Schema validation");
-
-        let error = transaction
-            .commit(&runtime_functions)
-            .await
-            .expect_err("JSON Schema mismatch should fail commit validation");
+            .expect_err("JSON Schema mismatch should fail statement validation");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(

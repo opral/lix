@@ -14,9 +14,9 @@ use crate::storage::conformance::{
     open_storage,
 };
 use crate::storage::{
-    CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-    WriteOptions,
+    CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition, ProjectedValue,
+    ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
+    StorageWrite, WriteOptions,
 };
 
 pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -106,6 +106,10 @@ where
     );
     run!("baseline::commit_is_atomic", commit_is_atomic);
     run!(
+        "baseline::write_precondition_rejects_stale_value",
+        write_precondition_rejects_stale_value
+    );
+    run!(
         "baseline::rollback_discards_staged_mutations",
         rollback_discards_staged_mutations
     );
@@ -125,6 +129,94 @@ where
         "baseline::full_value_preserves_opaque_bytes",
         full_value_preserves_opaque_bytes
     );
+}
+
+async fn write_precondition_rejects_stale_value<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let test_space = TEST_SPACE;
+    let target = key("target");
+    seed_full_values(&storage, test_space, [("target", "base")]).await?;
+
+    let mut conditional = storage
+        .begin_write(WriteOptions {
+            preconditions: vec![Precondition::KeyValueEquals {
+                space: test_space,
+                key: target.clone(),
+                expected: Bytes::from_static(b"base"),
+            }],
+            ..WriteOptions::default()
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    conditional
+        .put_many(
+            test_space,
+            put_batch([full_put(target.clone(), Bytes::from_static(b"conditional"))]),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    conditional
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let stale_options = WriteOptions {
+        preconditions: vec![Precondition::KeyValueEquals {
+            space: test_space,
+            key: target.clone(),
+            expected: Bytes::from_static(b"conditional"),
+        }],
+        ..WriteOptions::default()
+    };
+    seed_full_values(&storage, test_space, [("target", "winner")]).await?;
+
+    match storage.begin_write(stale_options).await {
+        Err(StorageError::PreconditionFailed(failures)) => {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 0);
+        }
+        Err(error) => return Err(error.to_string()),
+        Ok(mut stale) => {
+            stale
+                .put_many(
+                    test_space,
+                    put_batch([full_put(target.clone(), Bytes::from_static(b"stale"))]),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            match stale.commit().await {
+                Err(StorageError::PreconditionFailed(failures)) => {
+                    assert_eq!(failures.len(), 1);
+                    assert_eq!(failures[0].index, 0);
+                }
+                Err(error) => return Err(error.to_string()),
+                Ok(_) => panic!("stale conditional write unexpectedly committed"),
+            }
+        }
+    }
+
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| error.to_string())?;
+    let value = read
+        .get_many(
+            test_space,
+            std::slice::from_ref(&target),
+            GetOptions::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        value.values,
+        vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+            b"winner"
+        )))]
+    );
+    Ok(())
 }
 
 async fn get_many_returns_requested_slots<F>(factory: &F) -> ConformanceResult

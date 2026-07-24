@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
-    StorageError, StorageRead, StorageWrite, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, WriteOptions,
+    WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rusqlite::types::ValueRef as SqlValueRef;
@@ -199,7 +200,7 @@ impl Storage for SQLite {
 
     fn begin_write(
         &self,
-        _opts: WriteOptions,
+        opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             let conn = self
@@ -210,6 +211,10 @@ impl Storage for SQLite {
                 .map(Ok)
                 .unwrap_or_else(|| self.connect())?;
             execute_cached(&conn, "BEGIN IMMEDIATE TRANSACTION")?;
+            if let Err(error) = check_preconditions(&conn, &opts.preconditions) {
+                let _ = execute_cached(&conn, "ROLLBACK");
+                return Err(error);
+            }
             Ok(SQLiteWrite {
                 conn: Some(conn),
                 write_pool: Arc::clone(&self.write_pool),
@@ -217,6 +222,91 @@ impl Storage for SQLite {
             })
         }
     }
+}
+
+fn check_preconditions(
+    conn: &Connection,
+    preconditions: &[Precondition],
+) -> Result<(), StorageError> {
+    let mut failures = Vec::new();
+    for (index, precondition) in preconditions.iter().enumerate() {
+        let matches = match precondition {
+            Precondition::KeyAbsent { space, key } => {
+                precondition_value(conn, *space, key)?.is_none()
+            }
+            Precondition::KeyPresent { space, key } => {
+                precondition_value(conn, *space, key)?.is_some()
+            }
+            Precondition::KeyValueHashEquals { space, key, hash } => {
+                precondition_value(conn, *space, key)?
+                    .is_some_and(|value| blake3::hash(&value).as_bytes() == hash)
+            }
+            Precondition::KeyValueEquals {
+                space,
+                key,
+                expected,
+            } => precondition_value(conn, *space, key)?
+                .is_some_and(|value| value.as_slice() == expected.as_ref()),
+            Precondition::RangeEmpty { space, range } => {
+                precondition_range_is_empty(conn, *space, range)?
+            }
+            Precondition::BranchEquals { .. } => false,
+        };
+        if !matches {
+            failures.push(PreconditionFailure { index });
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::PreconditionFailed(failures))
+    }
+}
+
+fn precondition_value(
+    conn: &Connection,
+    space: SpaceId,
+    key: &Key,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    if !space_table_exists(conn, space)? {
+        return Ok(None);
+    }
+    let sql = format!("SELECT value FROM {} WHERE key = ?1", space_table(space));
+    let mut statement = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+    let mut rows = statement
+        .query(params![key.0.as_ref()])
+        .map_err(sqlite_error)?;
+    let Some(row) = rows.next().map_err(sqlite_error)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        blob_ref(row.get_ref(0).map_err(sqlite_error)?, "value")?.to_vec(),
+    ))
+}
+
+fn precondition_range_is_empty(
+    conn: &Connection,
+    space: SpaceId,
+    range: &KeyRange,
+) -> Result<bool, StorageError> {
+    if !space_table_exists(conn, space)? {
+        return Ok(true);
+    }
+    let mut sql = format!("SELECT 1 FROM {} WHERE 1 = 1", space_table(space));
+    let mut binds: Vec<&[u8]> = Vec::with_capacity(2);
+    push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
+    sql.push_str(" LIMIT 1");
+    let mut statement = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+    for (index, bytes) in binds.iter().enumerate() {
+        statement
+            .raw_bind_parameter(index + 1, *bytes)
+            .map_err(sqlite_error)?;
+    }
+    Ok(statement
+        .raw_query()
+        .next()
+        .map_err(sqlite_error)?
+        .is_none())
 }
 
 impl StorageRead for SQLiteRead {

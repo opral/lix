@@ -129,9 +129,8 @@ pub(super) fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) ->
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }
 
-/// Column table over materialized live-state rows: the full `lix_state` /
-/// `lix_state_by_branch` surface. Entity specs reuse the same accessors for
-/// their `lixcol_*` system columns (they strip the prefix before lookup).
+/// Column table over materialized live-state rows. Entity specs reuse these
+/// accessors for their `lixcol_*` system columns after stripping the prefix.
 pub(super) static LIVE_STATE_COLS: ColumnTable<MaterializedLiveStateRow> = ColumnTable {
     columns: &[
         (

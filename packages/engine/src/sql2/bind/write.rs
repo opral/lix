@@ -34,8 +34,6 @@ pub(crate) struct BoundReturningItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundWriteTarget {
-    LixState,
-    LixStateByBranch,
     Entity(EntityWriteSurface),
     File(FileWriteSurface),
     Directory(DirectoryWriteSurface),

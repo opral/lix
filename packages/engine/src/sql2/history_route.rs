@@ -321,7 +321,7 @@ pub(crate) fn commit_graph_history_request(
 /// Loads reachability-aware commit-graph history once for all SQL history providers.
 ///
 /// Providers pass the schema keys they know how to shape. An empty list means
-/// "do not constrain by provider schema"; this is what `lix_state_history` uses.
+/// "do not constrain by provider schema".
 pub(crate) async fn load_history_entries<S>(
     descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,

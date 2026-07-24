@@ -11,7 +11,6 @@ mod file_view;
 mod history_projection;
 mod history_route;
 mod information_schema;
-mod optimize;
 mod parse;
 mod plan;
 mod planning_cache;

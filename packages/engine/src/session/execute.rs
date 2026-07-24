@@ -1550,8 +1550,7 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
+        Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
 
     pub async fn execute_with_options(
@@ -1566,9 +1565,24 @@ where
             let _operation_guard = self.begin_session_operation()?;
             let statement = self.sql_planning_cache.parse_statement(sql)?;
             let transaction = self.transaction_mut()?;
-            execute_transaction_statement(transaction, sql, statement, params, options)
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, sql))
+            let is_read = matches!(
+                sql2::bind_statement_route(&statement)?,
+                sql2::BoundStatementRoute::Read
+            );
+            if is_read {
+                transaction.ensure_opening_snapshot_is_current().await?;
+            }
+            let result =
+                execute_transaction_statement(transaction, sql, statement, params, options)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+            if is_read {
+                // The query opens its own coherent storage read. Checking on both sides
+                // ensures a concurrent tracked commit cannot leak a newer snapshot
+                // through an older explicit transaction.
+                transaction.ensure_opening_snapshot_is_current().await?;
+            }
+            Ok(result)
         };
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,

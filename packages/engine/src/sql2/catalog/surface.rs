@@ -23,12 +23,7 @@ impl PublicSurfaceContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-// The state variants keep the existing adapters compilable until their
-// implementation-only cleanup lands after this public contract change.
-#[allow(dead_code)]
 pub(crate) enum PublicSurfaceKind {
-    LixState,
-    LixStateByBranch,
     EntityBase { schema_key: String },
     EntityByBranch { schema_key: String },
     EntityHistory { schema_key: String },
@@ -40,5 +35,4 @@ pub(crate) enum PublicSurfaceKind {
     DirectoryHistory,
     Branch,
     Change,
-    History,
 }

@@ -12,6 +12,124 @@ use lix_engine::storage::{
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[tokio::test]
+async fn stale_transaction_cannot_publish_over_newer_commit() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
+        .await
+        .expect("initialized storage should create an engine");
+    let stale_session = engine
+        .open_workspace_session()
+        .await
+        .expect("stale session should open");
+    let winner_session = engine
+        .open_workspace_session()
+        .await
+        .expect("winner session should open");
+
+    let mut stale = stale_session
+        .begin_transaction()
+        .await
+        .expect("stale transaction should begin");
+    stale
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('stale-key', 'stale')",
+            &[],
+        )
+        .await
+        .expect("stale transaction should stage its write");
+
+    winner_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('winner-key', 'winner')",
+            &[],
+        )
+        .await
+        .expect("newer transaction should commit");
+
+    let read_error = stale
+        .execute("SELECT key FROM lix_key_value", &[])
+        .await
+        .expect_err("stale transaction must not observe a newer snapshot");
+    assert_eq!(read_error.code, "LIX_TRANSACTION_CONFLICT");
+
+    let error = stale
+        .commit()
+        .await
+        .expect_err("stale transaction must not publish");
+    assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
+
+    let result = winner_session
+        .execute(
+            "SELECT key FROM lix_key_value \
+             WHERE key IN ('stale-key', 'winner-key') ORDER BY key",
+            &[],
+        )
+        .await
+        .expect("committed state should remain readable");
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0].get::<String>("key").unwrap(), "winner-key");
+}
+
+#[tokio::test]
+async fn untracked_sidecar_write_does_not_invalidate_tracked_transaction() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
+        .await
+        .expect("initialized storage should create an engine");
+    let tracked_session = engine
+        .open_workspace_session()
+        .await
+        .expect("tracked session should open");
+    let sidecar_session = engine
+        .open_workspace_session()
+        .await
+        .expect("sidecar session should open");
+
+    let mut tracked = tracked_session
+        .begin_transaction()
+        .await
+        .expect("tracked transaction should begin");
+    tracked
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('tracked-key', 'tracked')",
+            &[],
+        )
+        .await
+        .expect("tracked transaction should stage");
+
+    sidecar_session
+        .execute(
+            "INSERT INTO lix_key_value \
+             (key, value, lixcol_global, lixcol_untracked) \
+             VALUES ('sidecar-key', 'sidecar', true, true)",
+            &[],
+        )
+        .await
+        .expect("untracked sidecar write should commit");
+
+    tracked
+        .commit()
+        .await
+        .expect("sidecar mutation must not invalidate tracked publication");
+
+    let result = tracked_session
+        .execute(
+            "SELECT key FROM lix_key_value \
+             WHERE key IN ('tracked-key', 'sidecar-key') ORDER BY key",
+            &[],
+        )
+        .await
+        .expect("both durability lanes should remain readable");
+    assert_eq!(result.rows().len(), 2);
+}
+
 fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     while !condition() {

@@ -15,9 +15,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use object_store::ObjectStore;
@@ -214,10 +215,11 @@ impl Storage for SlateDB {
 
     fn begin_write(
         &self,
-        _opts: WriteOptions,
+        opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             let writer_permit = self.write_gate.acquire().await;
+            check_preconditions(&self.worker, &opts.preconditions).await?;
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 _writer_permit: writer_permit,
@@ -227,6 +229,77 @@ impl Storage for SlateDB {
             })
         }
     }
+}
+
+async fn check_preconditions(
+    worker: &SlateDBWorker,
+    preconditions: &[Precondition],
+) -> Result<(), StorageError> {
+    if preconditions.is_empty() {
+        return Ok(());
+    }
+    let snapshot = worker
+        .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
+        .await?;
+    let mut failures = Vec::new();
+    for (index, precondition) in preconditions.iter().enumerate() {
+        let matches = match precondition {
+            Precondition::KeyAbsent { space, key } => {
+                snapshot_value(worker, Arc::clone(&snapshot), *space, key)
+                    .await?
+                    .is_none()
+            }
+            Precondition::KeyPresent { space, key } => {
+                snapshot_value(worker, Arc::clone(&snapshot), *space, key)
+                    .await?
+                    .is_some()
+            }
+            Precondition::KeyValueHashEquals { space, key, hash } => {
+                snapshot_value(worker, Arc::clone(&snapshot), *space, key)
+                    .await?
+                    .is_some_and(|value| blake3::hash(&value).as_bytes() == hash)
+            }
+            Precondition::KeyValueEquals {
+                space,
+                key,
+                expected,
+            } => snapshot_value(worker, Arc::clone(&snapshot), *space, key)
+                .await?
+                .is_some_and(|value| value == *expected),
+            Precondition::RangeEmpty { space, range } => {
+                let bounds = EncodedBounds::new(physical_range(*space, range.clone())?, None);
+                let snapshot = Arc::clone(&snapshot);
+                worker
+                    .call_read(move |_db| collect_snapshot_keys(snapshot, bounds))
+                    .await?
+                    .is_empty()
+            }
+            Precondition::BranchEquals { .. } => false,
+        };
+        if !matches {
+            failures.push(PreconditionFailure { index });
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::PreconditionFailed(failures))
+    }
+}
+
+async fn snapshot_value(
+    worker: &SlateDBWorker,
+    snapshot: Arc<DbSnapshot>,
+    space: SpaceId,
+    key: &Key,
+) -> Result<Option<Bytes>, StorageError> {
+    let key = physical_key(space, key)?;
+    Ok(worker
+        .call_read(move |_db| get_snapshot_values(snapshot, vec![key]))
+        .await?
+        .into_iter()
+        .next()
+        .flatten())
 }
 
 impl StorageRead for SlateDBRead {

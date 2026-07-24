@@ -3399,6 +3399,7 @@ version = "0.8.4"
 name = "lix_rocksdb_storage"
 version = "0.8.4"
 dependencies = [
+ "blake3",
  "bytes",
  "lix_engine",
  "rocksdb",
@@ -3472,6 +3473,7 @@ name = "lix_slatedb_storage"
 version = "0.8.4"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "futures-util",
  "lix_engine",
@@ -3485,6 +3487,7 @@ dependencies = [
 name = "lix_sqlite_storage"
 version = "0.8.4"
 dependencies = [
+ "blake3",
  "bytes",
  "lix_engine",
  "rusqlite",

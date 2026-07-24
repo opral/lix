@@ -45,6 +45,11 @@ pub enum Precondition {
         key: Key,
         hash: [u8; 32],
     },
+    KeyValueEquals {
+        space: SpaceId,
+        key: Key,
+        expected: Bytes,
+    },
     RangeEmpty {
         space: SpaceId,
         range: KeyRange,

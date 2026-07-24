@@ -197,11 +197,7 @@ pub(super) struct PlannedDml {
 /// INSERT input plan before execution (lix_file, entity).
 #[async_trait]
 pub(super) trait TableSpec: Send + Sync + 'static {
-    /// Name used in error messages and plan display. The builtin tables
-    /// deliberately return their base name (e.g. "lix_state") for both the
-    /// active and `_by_branch` surfaces — that is what the pre-framework
-    /// providers hardcoded into their messages — while entity surfaces
-    /// return the full catalog surface name.
+    /// Name used in error messages and plan display.
     fn table_name(&self) -> &str;
 
     fn schema(&self) -> SchemaRef;
