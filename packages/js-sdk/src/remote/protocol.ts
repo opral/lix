@@ -107,6 +107,10 @@ export type RemoteCreateBranchResponse = {
 	commitId: string;
 };
 
+export type RemoteCreateCheckpointResponse = {
+	commitId: string;
+};
+
 export type RemoteSwitchBranchRequest = { branchId: string };
 export type RemoteSwitchBranchResponse = { branchId: string };
 

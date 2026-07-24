@@ -563,6 +563,47 @@ test("remote branches preserve local Lix branch semantics", async () => {
 	await lix.close();
 });
 
+test("remote createCheckpoint posts no body and decodes the receipt", async () => {
+	const requests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (pathname.endsWith("/checkpoint/create")) {
+					return Response.json({ commitId: "checkpoint-commit-id" });
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			}) as typeof fetch,
+		},
+	});
+
+	await expect(lix.createCheckpoint()).resolves.toEqual({
+		commitId: "checkpoint-commit-id",
+	});
+	const request = requests.find((candidate) =>
+		new URL(candidate.url).pathname.endsWith("/checkpoint/create"),
+	);
+	expect(request?.method).toBe("POST");
+	expect(request?.headers.get("lix-session-id")).toBe("session-1");
+	expect(await request?.text()).toBe("");
+
+	await lix.close();
+});
+
 test("a failed remote branch switch leaves the active branch unchanged", async () => {
 	let handshakeCalls = 0;
 	const lix = await openLix({

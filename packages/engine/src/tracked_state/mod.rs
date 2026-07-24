@@ -21,6 +21,7 @@ pub(crate) use merge::{
 };
 pub(crate) use row_materialization::materialize_rows_from_index_entries;
 pub(crate) use storage::load_root;
+pub(crate) use storage::stage_delete_commit_root;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE};
 pub(crate) use types::TrackedStateKey;

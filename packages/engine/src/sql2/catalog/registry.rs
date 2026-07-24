@@ -137,6 +137,10 @@ impl PublicCatalog {
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
+            PublicSurfaceKind::Checkpoint => checkpoint_schema(false),
+            PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
+            PublicSurfaceKind::WorkingChange => working_change_schema(false),
+            PublicSurfaceKind::WorkingChangeByBranch => working_change_schema(true),
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 json_field("entity_pk", false),
@@ -237,6 +241,54 @@ impl PublicCatalog {
                 ("created_at", false),
                 ("origin_key", true),
                 ("snapshot_content", true),
+            ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_checkpoint",
+            PublicSurfaceKind::Checkpoint,
+            public_columns([
+                ("commit_id", false),
+                ("created_at", false),
+                ("lixcol_depth", false),
+            ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_checkpoint_by_branch",
+            PublicSurfaceKind::CheckpointByBranch,
+            public_columns([
+                ("commit_id", false),
+                ("created_at", false),
+                ("lixcol_branch_id", false),
+                ("lixcol_depth", false),
+            ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_working_change",
+            PublicSurfaceKind::WorkingChange,
+            public_columns([
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("change_kind", false),
+                ("before_change_id", true),
+                ("after_change_id", true),
+            ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_working_change_by_branch",
+            PublicSurfaceKind::WorkingChangeByBranch,
+            public_columns([
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("change_kind", false),
+                ("before_change_id", true),
+                ("after_change_id", true),
+                ("lixcol_branch_id", false),
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
@@ -355,6 +407,35 @@ fn lix_state_schema(by_branch: bool) -> SchemaRef {
     ];
     if by_branch {
         fields.push(Field::new("branch_id", DataType::Utf8, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+fn checkpoint_schema(by_branch: bool) -> SchemaRef {
+    let mut fields = vec![
+        Field::new("commit_id", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+    ];
+    if by_branch {
+        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
+    }
+    fields.push(Field::new("lixcol_depth", DataType::Int64, false));
+    Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+fn working_change_schema(by_branch: bool) -> SchemaRef {
+    let mut fields = vec![
+        json_field("entity_pk", false),
+        Field::new("schema_key", DataType::Utf8, false),
+        Field::new("file_id", DataType::Utf8, true),
+        Field::new("change_kind", DataType::Utf8, false),
+        Field::new("before_change_id", DataType::Utf8, true),
+        Field::new("after_change_id", DataType::Utf8, true),
+    ];
+    if by_branch {
+        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     }
     Arc::new(Schema::new(fields))
 }

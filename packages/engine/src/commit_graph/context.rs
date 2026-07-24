@@ -16,7 +16,8 @@ use crate::changelog::{
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
-    CommitGraphCommit, CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
+    CommitGraphCommit, CommitGraphCommitRecord, CommitGraphEdge, CommitGraphReader,
+    ReachableCommitGraphCommit,
 };
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
@@ -285,6 +286,33 @@ where
         }
     }
 
+    async fn load_changelog_commit_record(
+        &mut self,
+        commit_id: &CommitId,
+    ) -> Result<Option<CommitGraphCommitRecord>, LixError> {
+        let mut reader = ChangelogContext::new().reader(&self.store);
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: std::slice::from_ref(commit_id),
+                projection: CommitProjection::Record,
+            })
+            .await?;
+        let Some(entry) = batch.entries.into_iter().next().flatten() else {
+            return Ok(None);
+        };
+        match entry {
+            CommitLoadEntry::Record(record) => Ok(Some(CommitGraphCommitRecord {
+                commit_id: record.commit_id,
+                parent_commit_ids: record.parent_commit_ids,
+                created_at: record.created_at,
+            })),
+            CommitLoadEntry::Full { .. } => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "changelog record commit projection returned full entry",
+            )),
+        }
+    }
+
     async fn load_canonical_changes(
         &mut self,
         change_ids: &[ChangeId],
@@ -343,6 +371,13 @@ where
         commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
         Self::load_commit(self, commit_id).await
+    }
+
+    async fn load_commit_record(
+        &mut self,
+        commit_id: &CommitId,
+    ) -> Result<Option<CommitGraphCommitRecord>, LixError> {
+        self.load_changelog_commit_record(commit_id).await
     }
 
     async fn reachable_commits(

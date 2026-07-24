@@ -65,6 +65,7 @@ simulation_test!(
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",
+            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",

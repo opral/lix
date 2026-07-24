@@ -11,10 +11,16 @@ Lix exposes logical application data through typed SQL relations:
 | Registered application entity `X` | `<schema>` | `<schema>_by_branch` | `<schema>_history` |
 | Files | `lix_file` | `lix_file_by_branch` | `lix_file_history` |
 | Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history` |
+| Working changes | `lix_working_change` | `lix_working_change_by_branch` | — |
+| Checkpoints | `lix_checkpoint` | `lix_checkpoint_by_branch` | — |
 
 `lix_registered_schema*` provides schema discovery, `lix_key_value*` provides
 shared workspace metadata, and `lix_change` provides workspace-wide activity.
 There is no generic `lix_state*` SQL family.
+
+The checkpoint and working-change surfaces are read-only. See
+[Checkpoints](./checkpoints.md) for their columns, branch scoping, and Rust SDK
+workflow.
 
 ## The executable column contract
 

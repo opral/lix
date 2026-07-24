@@ -6258,6 +6258,8 @@ mod tests {
             state_rows: Vec::new(),
             insert_identities: BTreeMap::new(),
             commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             file_data_writes: Vec::new(),
         }

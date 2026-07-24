@@ -156,6 +156,21 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 	).rejects.toThrow(/closed/);
 });
 
+test("createCheckpoint returns the new active head through the local worker", async () => {
+	const lix = await openLix();
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["checkpoint-test", "working"],
+	);
+	const before = await activeHeadCommitId(lix);
+
+	const checkpoint = await lix.createCheckpoint();
+
+	expect(checkpoint.commitId).not.toBe(before);
+	expect(checkpoint.commitId).toBe(await activeHeadCommitId(lix));
+	await lix.close();
+});
+
 test("committed writes survive close and reopen", async () => {
 	const path = tempLixPath();
 	const first = await openLix({ storage: new SQLite({ path }) });

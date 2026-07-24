@@ -247,6 +247,18 @@ impl WasmLix {
         })
     }
 
+    #[wasm_bindgen(js_name = createCheckpoint)]
+    pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
+        let receipt = self
+            .inner
+            .create_checkpoint()
+            .await
+            .map_err(lix_error_to_js)?;
+        to_js(&CreateCheckpointReceiptDto {
+            commit_id: receipt.commit_id,
+        })
+    }
+
     #[wasm_bindgen(js_name = switchBranch)]
     pub async fn switch_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: SwitchBranchOptionsDto = from_js(options)?;
@@ -441,6 +453,12 @@ struct CreateBranchReceiptDto {
     id: String,
     name: String,
     hidden: bool,
+    commit_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateCheckpointReceiptDto {
     commit_id: String,
 }
 

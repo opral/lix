@@ -1,8 +1,9 @@
 use lix_engine::storage::Memory;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InitReceipt,
-    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, ExecuteResult,
+    InitReceipt, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, SessionContext, SessionTransaction, SwitchBranchOptions,
+    SwitchBranchReceipt,
 };
 use lix_engine::{LixError, Value};
 
@@ -172,6 +173,14 @@ impl SimSession {
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
         let result = self.session.create_branch(options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
+        let result = self.session.create_checkpoint().await;
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }

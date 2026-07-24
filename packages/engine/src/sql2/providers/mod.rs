@@ -11,6 +11,7 @@ use crate::branch::BranchRefReader;
 
 mod branch;
 mod change;
+mod checkpoint;
 mod columns;
 mod directory;
 mod directory_history;
@@ -24,6 +25,7 @@ mod lix_state;
 mod spec;
 mod upsert;
 mod values;
+mod working_change;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -349,6 +351,50 @@ where
                 )
                 .await?;
             }
+            PublicSurfaceKind::Checkpoint => {
+                checkpoint::register_checkpoint_provider(
+                    session,
+                    &surface.name,
+                    Some(ctx.active_branch_id().to_string()),
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::CheckpointByBranch => {
+                checkpoint::register_checkpoint_provider(
+                    session,
+                    &surface.name,
+                    None,
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::WorkingChange => {
+                working_change::register_working_change_provider(
+                    session,
+                    &surface.name,
+                    Some(ctx.active_branch_id().to_string()),
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::WorkingChangeByBranch => {
+                working_change::register_working_change_provider(
+                    session,
+                    &surface.name,
+                    None,
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                )
+                .await?;
+            }
             PublicSurfaceKind::Change => {
                 change::register_lix_change_read_provider(
                     session,
@@ -599,6 +645,10 @@ async fn register_write_from_catalog(
                 .await?;
             }
             PublicSurfaceKind::Change
+            | PublicSurfaceKind::Checkpoint
+            | PublicSurfaceKind::CheckpointByBranch
+            | PublicSurfaceKind::WorkingChange
+            | PublicSurfaceKind::WorkingChangeByBranch
             | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
@@ -641,8 +691,9 @@ mod tests {
     };
 
     use super::{
-        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
-        file, file_history, is_write_surface, read_provider_selection,
+        ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
+        directory_history, entity, file, file_history, is_write_surface, read_provider_selection,
+        working_change,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -800,8 +851,12 @@ mod tests {
             read_only,
             vec![
                 "lix_change",
+                "lix_checkpoint",
+                "lix_checkpoint_by_branch",
                 "lix_directory_history",
                 "lix_file_history",
+                "lix_working_change",
+                "lix_working_change_by_branch",
                 "phase8_entity_history",
             ]
         );
@@ -818,10 +873,10 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 18, "previous construction count");
+        assert_eq!(all_read + writable.len(), 22, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            11,
+            15,
             "new construction count"
         );
     }
@@ -877,6 +932,26 @@ mod tests {
             &catalog,
             "lix_change",
             change::lix_change_schema(),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_checkpoint",
+            checkpoint::checkpoint_schema(false),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_checkpoint_by_branch",
+            checkpoint::checkpoint_schema(true),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_working_change",
+            working_change::working_change_schema(false),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_working_change_by_branch",
+            working_change::working_change_schema(true),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,

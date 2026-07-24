@@ -19,6 +19,8 @@ workspace = true
 [dependencies]
 lix_engine = { workspace = true }
 lix_local_filesystem = { workspace = true, optional = true }
+lix_rocksdb_storage = { workspace = true, optional = true }
+lix_slatedb_storage = { workspace = true, optional = true }
 lix_sqlite_storage = { workspace = true, optional = true }
 
 async-trait = "0.1"
@@ -28,6 +30,8 @@ lru = { version = "0.18", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde_json = "1"
 tempfile = { version = "3", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
@@ -44,6 +48,12 @@ zip = { version = "8", default-features = false }
 
 [features]
 default = ["default_wasm_runtime"]
+checkpoint_backends = [
+  "dep:lix_rocksdb_storage",
+  "dep:lix_slatedb_storage",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+]
 default_wasm_runtime = ["dep:blake3", "dep:lru", "dep:wasmtime", "dep:wasmtime-wasi"]
 local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
@@ -68,6 +78,12 @@ name = "profile_merge_10k"
 path = "benches/profile_merge_10k.rs"
 harness = false
 required-features = ["sqlite"]
+
+[[bench]]
+name = "profile_checkpoint_scale"
+path = "benches/profile_checkpoint_scale.rs"
+harness = false
+required-features = ["checkpoint_backends"]
 
 [[example]]
 name = "profile_fs_open"

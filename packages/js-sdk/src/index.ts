@@ -16,6 +16,7 @@ export type { LixClientState } from "./client-state.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
+	CreateCheckpointReceipt,
 	ExecuteOptions,
 	ExecuteResult,
 	LixBatchOptions,

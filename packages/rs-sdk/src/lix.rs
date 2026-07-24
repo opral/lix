@@ -1,10 +1,10 @@
 use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Blob, CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
-    ExecuteOptions, ExecuteResult, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
-    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition, LixError, Memory,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ObserveEvents, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -293,6 +293,10 @@ where
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
         self.session.create_branch(options).await
+    }
+
+    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
+        self.session.create_checkpoint().await
     }
 
     pub async fn switch_branch(

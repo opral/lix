@@ -7,6 +7,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
     CommitId, CommitRecord,
 };
+use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
@@ -120,6 +121,13 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
         timestamp,
     );
+    let initial_checkpoint_change = canonical_change(
+        functions.call_uuid_v7(),
+        EntityPk::single(&main_branch_id),
+        CHECKPOINT_MARKER_SCHEMA_KEY,
+        checkpoint_marker_snapshot(&main_branch_id)?,
+        timestamp,
+    );
 
     let initial_commit = InitSeedCommit {
         id: initial_commit_id,
@@ -158,6 +166,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
                 global_branch_descriptor_change,
                 main_branch_descriptor_change,
                 kv_lix_id_change,
+                initial_checkpoint_change,
             ])
             .collect(),
         untracked_rows: vec![
@@ -401,6 +410,12 @@ fn key_value_snapshot(key: &str, value: &str) -> Result<String, LixError> {
     }))
 }
 
+fn checkpoint_marker_snapshot(branch_id: &str) -> Result<String, LixError> {
+    encode_snapshot(json!({
+        "branch_id": branch_id,
+    }))
+}
+
 fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixError> {
     encode_snapshot(json!({
         "value": schema,
@@ -438,7 +453,7 @@ mod tests {
     fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 3);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 4);
         assert_eq!(plan.untracked_rows.len(), 3);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
@@ -453,7 +468,7 @@ mod tests {
         assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
         assert_eq!(
             plan.commit.change_id.to_string(),
-            test_uuid(seed_schema_definitions().len() + 7)
+            test_uuid(seed_schema_definitions().len() + 8)
         );
         assert!(plan.commit.parent_ids.is_empty());
         assert!(plan.commit.author_account_ids.is_empty());
@@ -467,7 +482,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 3);
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 4);
         let first_seed_change_id = test_uuid(4);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
@@ -598,7 +613,7 @@ mod tests {
             .iter()
             .flat_map(|chunk| chunk.entries.iter())
             .collect::<Vec<_>>();
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 3);
+        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 4);
         assert!(
             !change_refs
                 .iter()
