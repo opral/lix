@@ -13,7 +13,7 @@ use crate::live_state::LiveStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{
-    DEFAULT_MAX_PLUGIN_FILE_ACTORS, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost,
+    DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost,
 };
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
@@ -49,7 +49,7 @@ pub struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     plugin_v2_max_memory_bytes: u64,
-    plugin_v2_max_cached_file_actors: usize,
+    plugin_v2_max_live_file_actors: usize,
 }
 
 impl Default for EngineOptions {
@@ -58,7 +58,7 @@ impl Default for EngineOptions {
             wasm_runtime: None,
             telemetry: None,
             plugin_v2_max_memory_bytes: DEFAULT_PLUGIN_V2_MEMORY_BYTES,
-            plugin_v2_max_cached_file_actors: DEFAULT_MAX_PLUGIN_FILE_ACTORS,
+            plugin_v2_max_live_file_actors: DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS,
         }
     }
 }
@@ -78,19 +78,19 @@ impl EngineOptions {
         self
     }
 
-    /// Sets the per-actor Wasm linear-memory ceiling and the maximum number of
-    /// idle/warm v2 file actors retained by this engine. Defaults are 128 MiB
-    /// and four actors, bounding the cached guest capacity to 512 MiB before
-    /// host-side document state. Actors held by live transactions and
-    /// cold-open candidates remain individually capped but are not a
-    /// workspace-wide concurrency limit.
+    /// Sets the per-actor Wasm linear-memory ceiling and the hard maximum
+    /// number of live v2 plugin Stores for this engine. Defaults are 128 MiB
+    /// and four Stores, bounding guest linear memory to 512 MiB before
+    /// host-side document state. Cached actors, active transaction leases,
+    /// pending publications, cold-open candidates, and upgrade preflight
+    /// Stores all consume the same workspace-wide admission budget.
     pub fn with_plugin_v2_resource_limits(
         mut self,
         max_memory_bytes: u64,
-        max_cached_file_actors: usize,
+        max_live_file_actors: usize,
     ) -> Self {
         self.plugin_v2_max_memory_bytes = max_memory_bytes;
-        self.plugin_v2_max_cached_file_actors = max_cached_file_actors;
+        self.plugin_v2_max_live_file_actors = max_live_file_actors;
         self
     }
 }
@@ -150,7 +150,7 @@ where
         let plugin_host = PluginRuntimeHost::new_with_v2_limits(
             wasm_runtime,
             options.plugin_v2_max_memory_bytes,
-            options.plugin_v2_max_cached_file_actors,
+            options.plugin_v2_max_live_file_actors,
         )?;
 
         let tracked_state = Arc::new(TrackedStateContext::new());

@@ -23,7 +23,8 @@ The hot paths are incremental:
   the accepted document blob. Explicit large-file acceptance tests exercise
   the 220,000-row, 10.68 MB / 10.19 MiB fixture and keep its estimated retained state
   below 64 MiB. The integrated host defaults to a configurable 128 MiB per v2
-  actor with at most four warm file actors retained.
+  actor and at most four live Component Stores across one engine, including
+  cold candidates and active transaction leases.
 
 Cold reopen is byte-exact for accepted CSV lexical form, not merely
 semantically equivalent. The table entity stores the preferred dialect and a

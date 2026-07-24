@@ -103,6 +103,10 @@ impl LixError {
     /// engine never guesses identity authority from equal byte hashes.
     pub const CODE_PLUGIN_OBSERVATION_STALE: &'static str = "LIX_ERROR_PLUGIN_OBSERVATION_STALE";
 
+    /// Creating another live plugin Store would exceed the workspace-wide
+    /// runtime admission limit configured for this Engine.
+    pub const CODE_PLUGIN_RESOURCE_LIMIT: &'static str = "LIX_ERROR_PLUGIN_RESOURCE_LIMIT";
+
     /// Write-time failure where user data did not conform to a registered
     /// schema (type mismatch, missing required field, pattern violation,
     /// additionalProperties, etc.). Raised from the JSON-Schema validator
