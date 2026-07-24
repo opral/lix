@@ -431,78 +431,6 @@ mod tests {
 
     fn probe_query(probe: &DifferentialProbe, active_branch_id: &str) -> ProbeQuery {
         match probe {
-            DifferentialProbe::LixStateActive {
-                schema_key,
-                entity_pks,
-            } => {
-                let mut params = Vec::with_capacity(entity_pks.len() + 1);
-                params.push(Value::Text((*schema_key).to_string()));
-                let placeholders = entity_pks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, entity_pk)| {
-                        params.push(Value::Json(serde_json::json!([*entity_pk])));
-                        format!("${}", index + 2)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ProbeQuery {
-                    name: format!("lix_state:{schema_key}:{entity_pks:?}"),
-                    sql: format!(
-                        "SELECT entity_pk, schema_key, file_id, snapshot_content, metadata, global, untracked \
-                         FROM lix_state \
-                         WHERE schema_key = $1 AND entity_pk IN ({placeholders}) \
-                         ORDER BY schema_key, entity_pk, file_id"
-                    ),
-                    params,
-                    branch_column_indexes: &[],
-                }
-            }
-            DifferentialProbe::LixStateByBranch {
-                schema_key,
-                entity_pks,
-                branch_ids,
-            } => {
-                let mut params = Vec::with_capacity(entity_pks.len() + branch_ids.len() + 1);
-                params.push(Value::Text((*schema_key).to_string()));
-                let entity_placeholders = entity_pks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, entity_pk)| {
-                        params.push(Value::Json(serde_json::json!([*entity_pk])));
-                        format!("${}", index + 2)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let branch_offset = params.len();
-                let branch_placeholders = branch_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(index, branch_id)| {
-                        params.push(Value::Text(resolve_probe_branch_id(
-                            branch_id,
-                            active_branch_id,
-                        )));
-                        format!("${}", branch_offset + index + 1)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ProbeQuery {
-                    name: format!(
-                        "lix_state_by_branch:{schema_key}:{entity_pks:?}:{branch_ids:?}"
-                    ),
-                    sql: format!(
-                        "SELECT entity_pk, schema_key, file_id, branch_id, snapshot_content, metadata, global, untracked \
-                         FROM lix_state_by_branch \
-                         WHERE schema_key = $1 \
-                           AND entity_pk IN ({entity_placeholders}) \
-                           AND branch_id IN ({branch_placeholders}) \
-                         ORDER BY schema_key, entity_pk, file_id, branch_id"
-                    ),
-                    params,
-                    branch_column_indexes: &[3],
-                }
-            }
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
                 name: "lix_registered_schema".to_string(),
                 sql: "SELECT lixcol_entity_pk, value, lixcol_metadata, lixcol_global, lixcol_untracked \
@@ -570,26 +498,6 @@ mod tests {
         active_branch_id: &str,
     ) -> Option<ProbeSnapshot> {
         match probe {
-            DifferentialProbe::LixStateByBranch {
-                schema_key,
-                entity_pks,
-                branch_ids,
-            } => {
-                let rows = scan_transaction_live_state(
-                    transaction,
-                    schema_key,
-                    entity_pks,
-                    branch_ids,
-                    active_branch_id,
-                )
-                .await;
-                Some(ProbeSnapshot {
-                    name: format!(
-                        "lix_state_by_branch_staged:{schema_key}:{entity_pks:?}:{branch_ids:?}"
-                    ),
-                    rows: lix_state_by_branch_rows(rows, active_branch_id),
-                })
-            }
             DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
                 let rows = scan_transaction_live_state(
                     transaction,
@@ -639,42 +547,6 @@ mod tests {
         })
     }
 
-    fn lix_state_by_branch_rows(
-        mut rows: Vec<MaterializedLiveStateRow>,
-        active_branch_id: &str,
-    ) -> Vec<Vec<Value>> {
-        rows.sort_by_key(|row| {
-            (
-                row.schema_key.clone(),
-                row.entity_pk.clone(),
-                row.file_id.clone(),
-                row.branch_id.clone(),
-            )
-        });
-        rows.iter()
-            .map(|row| {
-                canonical_probe_values(
-                    &[
-                        entity_pk_value(row),
-                        Value::Text(row.schema_key.clone()),
-                        optional_text_value(row.file_id.clone()),
-                        Value::Text(row.branch_id.clone()),
-                        optional_text_value(row.snapshot_content.clone()),
-                        row.metadata
-                            .as_deref()
-                            .map(serialize_row_metadata)
-                            .map(Value::Text)
-                            .unwrap_or(Value::Null),
-                        Value::Boolean(row.global),
-                        Value::Boolean(row.untracked),
-                    ],
-                    active_branch_id,
-                    &[3],
-                )
-            })
-            .collect()
-    }
-
     fn registered_schema_by_branch_rows(
         mut rows: Vec<MaterializedLiveStateRow>,
         active_branch_id: &str,
@@ -717,10 +589,6 @@ mod tests {
                 .as_json_array_text()
                 .expect("materialized entity pk should encode"),
         )
-    }
-
-    fn optional_text_value(value: Option<String>) -> Value {
-        value.map(Value::Text).unwrap_or(Value::Null)
     }
 
     fn resolve_probe_branch_id(branch_id: &str, active_branch_id: &str) -> String {

@@ -2042,10 +2042,8 @@ simulation_test!(
             .expect("file insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content) \
-                 VALUES (lix_json('[\"ordinary-sidecar\"]'), 'lix_key_value', \
-                         'ordinary-history-file', \
-                         lix_json('{\"key\":\"ordinary-sidecar\",\"value\":\"noise\"}'))",
+                "INSERT INTO lix_key_value (key, value, lixcol_file_id) \
+                 VALUES ('ordinary-sidecar', 'noise', 'ordinary-history-file')",
                 &[],
             )
             .await

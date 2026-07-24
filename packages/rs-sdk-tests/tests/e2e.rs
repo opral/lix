@@ -366,24 +366,25 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         renamed_files.rows()[0].values(),
         &[Value::Blob(sql_rename_csv.clone().into())]
     );
-    let active_plugin_rows_after_rename = lix
+    let renamed_file = lix
         .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
+            "SELECT path, data FROM lix_file WHERE id = $1",
             &[Value::Text(sql_rename_file_id.clone())],
         )
         .await
         .unwrap();
-    assert_eq!(active_plugin_rows_after_rename.len(), 0);
-    let active_blob_rows_after_rename = lix
-        .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key = 'lix_binary_blob_ref'",
-            &[Value::Text(sql_rename_file_id)],
-        )
-        .await
-        .unwrap();
-    assert_eq!(active_blob_rows_after_rename.len(), 1);
+    assert_eq!(renamed_file.len(), 1);
+    assert_eq!(
+        renamed_file.rows()[0].values(),
+        &[
+            Value::Text("/sql-rename.txt".to_string()),
+            Value::Blob(sql_rename_csv.into())
+        ]
+    );
+    assert_eq!(
+        active_csv_plugin_row_counts(&lix, &sql_rename_file_id).await,
+        (0, 0)
+    );
 
     let sql_changes_before_delete =
         sql_changes_before_predicate_update + sql_predicate_update_changes.len();
@@ -414,15 +415,18 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
             .count()
             >= 2
     );
-    let active_plugin_rows_after_delete = lix
+    assert_eq!(
+        active_csv_plugin_row_counts(&lix, &sql_file_id).await,
+        (0, 0)
+    );
+    let deleted_file = lix
         .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
-            &[Value::Text(sql_file_id.clone())],
+            "SELECT id FROM lix_file WHERE id = $1",
+            &[Value::Text(sql_file_id)],
         )
         .await
         .unwrap();
-    assert_eq!(active_plugin_rows_after_delete.len(), 0);
+    assert_eq!(deleted_file.len(), 0);
 
     lix.close().await.unwrap();
 }
@@ -537,6 +541,32 @@ async fn file_changes(lix: &Lix, file_id: &str) -> Vec<FileChange> {
             }
         })
         .collect()
+}
+
+async fn active_csv_plugin_row_counts(lix: &Lix, file_id: &str) -> (i64, i64) {
+    let params = [Value::Text(file_id.to_string())];
+    let table_rows = lix
+        .execute(
+            "SELECT COUNT(*) AS row_count \
+             FROM csv_table \
+             WHERE lixcol_file_id = $1",
+            &params,
+        )
+        .await
+        .unwrap();
+    let row_rows = lix
+        .execute(
+            "SELECT COUNT(*) AS row_count \
+             FROM csv_row \
+             WHERE lixcol_file_id = $1",
+            &params,
+        )
+        .await
+        .unwrap();
+    (
+        table_rows.rows()[0].get::<i64>("row_count").unwrap(),
+        row_rows.rows()[0].get::<i64>("row_count").unwrap(),
+    )
 }
 
 async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {

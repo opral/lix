@@ -402,7 +402,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
 	const fileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_as_of_commit_id = $2",
+			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_as_of_commit_id = $2 AND lixcol_depth = 0",
 			[fileId, insertedHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -410,15 +410,6 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(fileHistorySources.map((source) => source.origin_key)).toContain(
 		"test-origin",
 	);
-	expect(
-		get(
-			await lix.execute(
-				"SELECT lixcol_origin_key FROM lix_state_history WHERE lixcol_change_id = $1 AND lixcol_as_of_commit_id = $2",
-				[get(inserted, "lixcol_change_id"), insertedHeadCommitId],
-			),
-			"lixcol_origin_key",
-		),
-	).toBe("test-origin");
 
 	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
 		new TextEncoder().encode("two\n"),
@@ -438,15 +429,16 @@ test("execute originKey is exposed on change and history surfaces without metada
 	const txStamped = await currentFileChange(lix, fileId);
 	const txHeadCommitId = await activeHeadCommitId(lix);
 	expect(get(txStamped, "origin_key")).toBe("tx-origin");
-	expect(
-		get(
-			await lix.execute(
-				"SELECT lixcol_origin_key FROM lix_state_history WHERE lixcol_change_id = $1 AND lixcol_as_of_commit_id = $2",
-				[get(txStamped, "lixcol_change_id"), txHeadCommitId],
-			),
-			"lixcol_origin_key",
+	const txFileHistorySources = get(
+		await lix.execute(
+			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_as_of_commit_id = $2 AND lixcol_depth = 0",
+			[fileId, txHeadCommitId],
 		),
-	).toBe("tx-origin");
+		"lixcol_source_changes",
+	) as Array<{ origin_key: string | null }>;
+	expect(txFileHistorySources.map((source) => source.origin_key)).toContain(
+		"tx-origin",
+	);
 	expect(get(txStamped, "lixcol_metadata")).toEqual(metadata);
 
 	await lix.close();
@@ -1223,7 +1215,7 @@ test("beginTransaction preserves handle after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+			"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
 		),
 	).rejects.toMatchObject({
 		code: "LIX_UNSUPPORTED_SQL",
@@ -1254,7 +1246,7 @@ test("beginTransaction can continue after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+			"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
 		),
 	).rejects.toMatchObject({
 		code: "LIX_UNSUPPORTED_SQL",
@@ -1389,7 +1381,7 @@ test("engine errors cross the native boundary", async () => {
 
 	try {
 		await lix.execute(
-			"SELECT lixcol_entity_pk FROM lix_state_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+			"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
 		);
 		throw new Error("expected history query to fail");
 	} catch (error) {
@@ -1804,7 +1796,7 @@ test("execute rejects extra SQL parameters", async () => {
 	await lix.close();
 });
 
-test("lix_state_history snapshot_content preserves JSON null for binary file rows", async () => {
+test("lix_directory_history snapshot_content preserves JSON null after binary file writes", async () => {
 	const lix = await openLix();
 
 	await lix.execute(
@@ -1822,14 +1814,22 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	);
 
 	const result = await lix.execute(
-		"SELECT lixcol_schema_key, lixcol_snapshot_content \
-		 FROM lix_state_history \
-		 WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()",
+		"SELECT lixcol_source_changes \
+		 FROM lix_directory_history \
+		 WHERE id = $1 \
+		   AND lixcol_as_of_commit_id = lix_active_branch_commit_id() \
+		 ORDER BY lixcol_depth \
+		 LIMIT 1",
+		["history-binary-dir"],
 	);
-	const directoryRow = result.rows.find(
-		(row) => row.get("lixcol_schema_key") === "lix_directory_descriptor",
+	const sourceChanges = get(result, "lixcol_source_changes") as Array<{
+		schema_key: string;
+		snapshot_content: { parent_id: string | null } | null;
+	}>;
+	const directoryDescriptor = sourceChanges.find(
+		(source) => source.schema_key === "lix_directory_descriptor",
 	);
-	expect(directoryRow?.get("lixcol_snapshot_content")).toMatchObject({
+	expect(directoryDescriptor?.snapshot_content).toMatchObject({
 		parent_id: null,
 	});
 

@@ -23,6 +23,9 @@ impl PublicSurfaceContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// The state variants keep the existing adapters compilable until their
+// implementation-only cleanup lands after this public contract change.
+#[allow(dead_code)]
 pub(crate) enum PublicSurfaceKind {
     LixState,
     LixStateByBranch,

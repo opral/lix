@@ -35,7 +35,8 @@ pub(crate) fn bind_statement(
     visible_schemas: &[JsonValue],
     active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
-    let catalog = PublicCatalog::from_visible_schemas(visible_schemas)?;
+    let catalog =
+        PublicCatalog::from_visible_schemas_with_internal_state_adapters(visible_schemas)?;
     bind_statement_with_catalog(statement, &catalog, active_branch_id)
 }
 

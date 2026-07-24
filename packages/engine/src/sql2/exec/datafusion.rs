@@ -2145,7 +2145,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "recursive CTEs are not supported by Lix SQL",
             )
             .with_hint(
-                "Use explicit commit graph surfaces such as lix_commit, lix_commit_edge, and lix_state_history instead of WITH RECURSIVE.",
+                "Use explicit commit graph surfaces such as lix_commit and lix_commit_edge, or a typed <schema>_history surface, instead of WITH RECURSIVE.",
             ));
         }
         _ => {}
@@ -2308,9 +2308,9 @@ mod tests {
         ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
     };
     use crate::sql2::{
-        WriteExecutorMode, WriteExecutorPath, bind_statement, create_write_logical_plan,
-        execute_write_logical_plan, execute_write_logical_plan_with_mode_and_trace,
-        parse_statement, plan_write,
+        PublicCatalog, WriteExecutorMode, WriteExecutorPath, bind_statement,
+        create_write_logical_plan, execute_write_logical_plan,
+        execute_write_logical_plan_with_mode_and_trace, parse_statement, plan_write,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope,
@@ -2539,6 +2539,14 @@ mod tests {
             Ok(self.schema_definitions.clone())
         }
 
+        fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
+            Ok(Arc::new(
+                PublicCatalog::from_visible_schemas_with_internal_state_adapters(
+                    &self.schema_definitions,
+                )?,
+            ))
+        }
+
         async fn load_bytes_many(
             &mut self,
             hashes: &[crate::binary_cas::BlobHash],
@@ -2598,6 +2606,10 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             self.inner.list_visible_schemas()
+        }
+
+        fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
+            self.inner.public_catalog()
         }
 
         async fn load_bytes_many(
@@ -3330,14 +3342,14 @@ mod tests {
 
         let information_schema_result = execute_sql(
             &ctx,
-            "SELECT table_name FROM information_schema.tables WHERE table_name = 'lix_state'",
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'lix_file'",
             &[],
         )
         .await
         .expect("information_schema.tables should be enabled");
         assert_eq!(
             information_schema_result.rows,
-            vec![vec![Value::Text("lix_state".to_string())]]
+            vec![vec![Value::Text("lix_file".to_string())]]
         );
 
         let tables_result = execute_sql(
@@ -3348,6 +3360,10 @@ mod tests {
         .await
         .expect("information_schema.tables should list registered tables");
         assert!(tables_result.rows.iter().any(|row| {
+            row.iter()
+                .any(|value| matches!(value, Value::Text(value) if value == "lix_file"))
+        }));
+        assert!(!tables_result.rows.iter().any(|row| {
             row.iter()
                 .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
         }));
@@ -3517,45 +3533,6 @@ mod tests {
                 .map(|row| row.values().to_vec())
                 .collect(),
         )
-    }
-
-    #[tokio::test]
-    async fn execute_sql_reads_lix_state_history_from_history_context() {
-        let (session, head_commit_id) = setup_engine_history_fixture()
-            .await
-            .expect("history fixture should initialize");
-        let result = session
-            .execute(
-                &format!(
-                    "SELECT lixcol_entity_pk, lixcol_snapshot_content, lixcol_metadata, lixcol_depth, lixcol_as_of_commit_id \
-	             FROM lix_state_history \
-	             WHERE lixcol_schema_key = 'test_state_schema' \
-	               AND lixcol_entity_pk = lix_json('[\"entity-history\"]') \
-	               AND lixcol_as_of_commit_id = '{head_commit_id}' \
-	               AND lixcol_depth >= 0"
-                ),
-                &[],
-            )
-            .await
-            .expect("sql2 execute should read lix_state_history through real engine context");
-        let (columns, rows) = rows_from_execute_result(result);
-
-        assert_eq!(
-            columns,
-            vec![
-                "lixcol_entity_pk",
-                "lixcol_snapshot_content",
-                "lixcol_metadata",
-                "lixcol_depth",
-                "lixcol_as_of_commit_id"
-            ]
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::Json(json!(["entity-history"])));
-        assert_eq!(rows[0][1], Value::Json(json!({"count": 7, "value": "A"})));
-        assert_eq!(rows[0][2], Value::Json(json!({"source": "history"})));
-        assert!(matches!(rows[0][3], Value::Integer(_)));
-        assert_eq!(rows[0][4], Value::Text(head_commit_id.clone()));
     }
 
     #[tokio::test]
@@ -7407,98 +7384,6 @@ mod tests {
             .expect("test thread should spawn")
             .join()
             .expect("test thread should join");
-    }
-
-    #[test]
-    fn execute_sql_reads_lix_state_by_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
-
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT entity_pk, branch_id, snapshot_content, commit_id \
-                     FROM lix_state_by_branch \
-                     WHERE branch_id = 'branch-b' AND schema_key = 'test_state_schema'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read lix_state_by_branch");
-
-                assert_eq!(
-                    result.columns,
-                    vec!["entity_pk", "branch_id", "snapshot_content", "commit_id"]
-                );
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Json(json!(["entity-b"])));
-                assert_eq!(result.rows[0][1], Value::Text("branch-b".to_string()));
-                assert_eq!(result.rows[0][2], Value::Json(json!({"value": "B"})));
-                match &result.rows[0][3] {
-                    Value::Text(commit_id) => assert!(!commit_id.is_empty()),
-                    other => panic!("expected non-null commit_id text, got {other:?}"),
-                }
-            })
-        });
-    }
-
-    #[test]
-    fn execute_sql_supports_broad_lix_state_by_branch_reads() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
-
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT entity_pk FROM lix_state_by_branch WHERE schema_key = 'test_state_schema'",
-                    &[],
-                )
-                .await
-                .expect("broad by-branch read should succeed");
-
-                assert!(
-                    result
-                        .rows
-                        .iter()
-                        .any(|row| row[0] == Value::Json(json!(["entity-a"])))
-                        && result
-                            .rows
-                            .iter()
-                            .any(|row| row[0] == Value::Json(json!(["entity-b"]))),
-                    "expected broad by-branch read to include rows from multiple visible branches: {:?}",
-                    result.rows
-                );
-            })
-        });
-    }
-
-    #[test]
-    fn execute_sql_reads_lix_state_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
-                let ctx = setup_sql2_state_fixture()
-                    .await
-                    .expect("fixture should initialize");
-
-                let result = execute_sql(
-                    &ctx,
-                    "SELECT entity_pk, snapshot_content \
-                     FROM lix_state \
-                     WHERE schema_key = 'test_state_schema'",
-                    &[],
-                )
-                .await
-                .expect("sql2 execute should read lix_state");
-
-                assert_eq!(result.columns, vec!["entity_pk", "snapshot_content"]);
-                assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Json(json!(["entity-a"])));
-                assert_eq!(result.rows[0][1], Value::Json(json!({"value": "A"})));
-            })
-        });
     }
 
     #[test]

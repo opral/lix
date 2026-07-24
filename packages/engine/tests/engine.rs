@@ -35,10 +35,9 @@ simulation_test!(
 
         let branch_result = session
             .execute(
-                "SELECT entity_pk, snapshot_content \
-             FROM lix_state \
-             WHERE schema_key = 'lix_branch_descriptor' \
-             ORDER BY entity_pk",
+                "SELECT id, name, hidden \
+             FROM lix_branch_descriptor \
+             ORDER BY id",
                 &[],
             )
             .await
@@ -51,12 +50,14 @@ simulation_test!(
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert!(branch_values.contains(&vec![
-            Value::Json(json!(["global"])),
-            Value::Json(json!({"hidden": true, "id": "global", "name": "global"})),
+            Value::Text("global".to_string()),
+            Value::Text("global".to_string()),
+            Value::Boolean(true),
         ]));
         assert!(branch_values.contains(&vec![
-            Value::Json(json!([sim.main_branch_id()])),
-            Value::Json(json!({"hidden": false, "id": sim.main_branch_id(), "name": "main"})),
+            Value::Text(sim.main_branch_id().to_string()),
+            Value::Text("main".to_string()),
+            Value::Boolean(false),
         ]));
 
         let lix_id_result = session
@@ -67,10 +68,9 @@ simulation_test!(
 
         let refs_result = session
             .execute(
-                "SELECT entity_pk, snapshot_content, untracked \
-             FROM lix_state \
-             WHERE schema_key = 'lix_branch_ref' \
-             ORDER BY entity_pk",
+                "SELECT id, commit_id, lixcol_untracked \
+             FROM lix_branch_ref \
+             ORDER BY id",
                 &[],
             )
             .await
@@ -83,13 +83,13 @@ simulation_test!(
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert!(ref_values.contains(&vec![
-            Value::Json(json!(["global"])),
-            Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": "global"})),
+            Value::Text("global".to_string()),
+            Value::Text(sim.initial_commit_id().to_string()),
             Value::Boolean(true),
         ]));
         assert!(ref_values.contains(&vec![
-            Value::Json(json!([sim.main_branch_id()])),
-            Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": sim.main_branch_id()})),
+            Value::Text(sim.main_branch_id().to_string()),
+            Value::Text(sim.initial_commit_id().to_string()),
             Value::Boolean(true),
         ]));
 
@@ -354,14 +354,11 @@ simulation_test!(
             "01920000-0000-7000-8000-000000000002",
         );
         let write_result = second_session
-			.execute(
-					"INSERT INTO lix_state (\
-					 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-					 ) VALUES (\
-					 lix_json('[\"det-write\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), false, false\
-					 )",
-					&[],
-				)
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+					 VALUES ('det-write', 'ok')",
+                &[],
+            )
             .await
             .expect("deterministic write should succeed");
         assert_eq!(write_result, ExecuteResult::from_rows_affected(1));

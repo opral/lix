@@ -30,14 +30,15 @@ Returns the active branch id of the current SQL session. Branch-pinned clients t
 
 Returns the commit id at the tip of the **currently active** branch, as resolved when the SQL statement was planned.
 
-History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `lix_directory_history`) use that same pinned active-branch head by default. No anchor predicate is needed for the common case:
+History surfaces (`<schema>_history`, `lix_file_history`, and
+`lix_directory_history`) use that same pinned active-branch head by default.
+No anchor predicate is needed for the common case:
 
 ```sql
 -- Walk one entity's history from the active branch's tip
-SELECT lixcol_depth, lixcol_observed_commit_id, lixcol_snapshot_content
-FROM lix_state_history
-WHERE lixcol_schema_key = 'task'
-  AND lix_json_get_text(lixcol_entity_pk, 0) = 't1'
+SELECT lixcol_depth, lixcol_observed_commit_id, title
+FROM acme_task_history
+WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
@@ -54,13 +55,12 @@ const { rows } = await lix.execute(
 const commitId = rows[0].value("commit_id").asText();
 
 await lix.execute(
-  `SELECT lixcol_depth, lixcol_snapshot_content
-     FROM lix_state_history
+  `SELECT lixcol_depth, title
+     FROM acme_task_history
     WHERE lixcol_as_of_commit_id = $1
-      AND lixcol_schema_key = $2
-      AND lix_json_get_text(lixcol_entity_pk, 0) = $3
+      AND id = $2
     ORDER BY lixcol_depth`,
-  [commitId, "task", "t1"],
+  [commitId, "t1"],
 );
 ```
 
@@ -82,8 +82,10 @@ await lix.execute(
 Returns the value at a JSON path, **preserving JSON type** (objects, arrays, numbers, booleans, strings stay as JSON). Variadic path: pass each segment as a separate argument.
 
 ```sql
-SELECT lix_json_get(snapshot_content, 'tags') FROM lix_state WHERE schema_key = 'task';
--- returns ["urgent","draft"] as JSON
+SELECT lix_json_get(value, 'x-lix-primary-key')
+FROM lix_registered_schema
+WHERE lix_json_get_text(value, 'x-lix-key') = 'acme_task';
+-- returns ["/id"] as JSON
 ```
 
 ### `lix_json_get_text(json, path...)`
@@ -91,10 +93,9 @@ SELECT lix_json_get(snapshot_content, 'tags') FROM lix_state WHERE schema_key = 
 Same as `lix_json_get` but returns the value as plain text. Useful for filtering or display:
 
 ```sql
-SELECT entity_pk
-FROM lix_state
-WHERE schema_key = 'task'
-  AND lix_json_get_text(snapshot_content, 'priority') = 'high';
+SELECT lix_json_get_text(value, 'x-lix-key') AS schema_key
+FROM lix_registered_schema
+WHERE lix_json_get_text(value, 'type') = 'object';
 ```
 
 Both return `NULL` if the path is missing or the underlying value is `null`.

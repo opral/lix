@@ -104,36 +104,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    branch_descriptor_delete_via_lix_state_is_rejected_when_ref_exists,
-    |sim| async move {
-        let (engine, main, _draft) = create_draft_from_main(&sim).await;
-
-        let error = main
-		.execute(
-			"DELETE FROM lix_state \
-	             WHERE schema_key = 'lix_branch_descriptor' AND entity_pk = lix_json('[\"draft-branch\"]')",
-			&[],
-		)
-            .await
-            .expect_err("descriptor delete through lix_state should fail");
-        assert_branch_pair_delete_restricted(&error);
-
-        assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
-        assert_eq!(count_branch_refs(&main, "draft-branch").await, 1);
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id("draft-branch")
-                .await
-                .expect("branch ref head should still load"),
-            Some(sim.initial_commit_id().to_string())
-        );
-
-        drop(main);
-        drop(engine);
-    }
-);
-
-simulation_test!(
     branch_ref_delete_via_entity_surface_is_rejected_when_descriptor_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
@@ -142,36 +112,6 @@ simulation_test!(
             .execute("DELETE FROM lix_branch_ref WHERE id = 'draft-branch'", &[])
             .await
             .expect_err("ref delete through entity surface should fail");
-        assert_branch_pair_delete_restricted(&error);
-
-        assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
-        assert_eq!(count_branch_refs(&main, "draft-branch").await, 1);
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id("draft-branch")
-                .await
-                .expect("branch ref head should still load"),
-            Some(sim.initial_commit_id().to_string())
-        );
-
-        drop(main);
-        drop(engine);
-    }
-);
-
-simulation_test!(
-    branch_ref_delete_via_lix_state_is_rejected_when_descriptor_exists,
-    |sim| async move {
-        let (engine, main, _draft) = create_draft_from_main(&sim).await;
-
-        let error = main
-		.execute(
-			"DELETE FROM lix_state \
-	                 WHERE schema_key = 'lix_branch_ref' AND entity_pk = lix_json('[\"draft-branch\"]')",
-			&[],
-		)
-            .await
-            .expect_err("ref delete through lix_state should fail");
         assert_branch_pair_delete_restricted(&error);
 
         assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
@@ -949,10 +889,10 @@ simulation_test!(
 
         let history = main
             .execute(
-                "SELECT lixcol_snapshot_content \
-	             FROM lix_state_history \
+                "SELECT value \
+	             FROM lix_key_value_history \
 	             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-	               AND lixcol_entity_pk = lix_json('[\"merge-select-change\"]') \
+	               AND key = 'merge-select-change' \
 	             ORDER BY lixcol_depth",
                 &[],
             )
@@ -1629,10 +1569,7 @@ async fn count_branch_refs(
 ) -> i64 {
     select_single_integer(
         session,
-        &format!(
-            "SELECT COUNT(*) FROM lix_state \
-	         WHERE schema_key = 'lix_branch_ref' AND entity_pk = lix_json('[\"{branch_id}\"]')"
-        ),
+        &format!("SELECT COUNT(*) FROM lix_branch_ref WHERE id = '{branch_id}'"),
     )
     .await
 }

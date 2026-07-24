@@ -4,7 +4,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    delete_returning_uses_predelete_rows_across_builtin_surfaces,
+    delete_returning_uses_predelete_rows_across_filesystem_and_branch_surfaces,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -13,35 +13,6 @@ simulation_test!(
                 .await
                 .expect("workspace session should open"),
             &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content, global, untracked) \
-                 VALUES (lix_json('[\"returning-state\"]'), 'lix_key_value', NULL, \
-                 lix_json('{\"key\":\"returning-state\",\"value\":\"before\"}'), false, false)",
-                &[],
-            )
-            .await
-            .expect("state fixture insert should succeed");
-        let deleted_state = session
-            .execute(
-                "DELETE FROM lix_state \
-                 WHERE entity_pk = lix_json('[\"returning-state\"]') \
-                   AND schema_key = 'lix_key_value' \
-                 RETURNING schema_key, snapshot_content AS before_snapshot",
-                &[],
-            )
-            .await
-            .expect("state DELETE RETURNING should succeed");
-        assert_eq!(deleted_state.rows_affected(), 1);
-        assert_eq!(deleted_state.columns(), ["schema_key", "before_snapshot"]);
-        assert_rows_eq(
-            deleted_state,
-            vec![vec![
-                Value::Text("lix_key_value".to_string()),
-                Value::Json(json!({"key": "returning-state", "value": "before"})),
-            ]],
         );
 
         session

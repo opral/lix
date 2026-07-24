@@ -1481,7 +1481,8 @@ mod tests {
     use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
         EntityColumnType, EntitySurfaceShape, derive_entity_surface_spec_from_schema,
-        entity_surface_schema, schema_exposed_as_entity_surface,
+        entity_surface_schema, schema_exposed_as_entity_history_surface,
+        schema_exposed_as_entity_surface,
     };
 
     struct EmptyLiveStateReader;
@@ -1697,7 +1698,16 @@ mod tests {
 
     #[test]
     fn excludes_non_entity_builtin_session_surfaces() {
-        assert!(!schema_exposed_as_entity_surface("lix_active_account"));
+        for schema_key in [
+            "lix_active_account",
+            "lix_binary_blob_ref",
+            "lix_change",
+            "lix_directory_descriptor",
+            "lix_file_descriptor",
+        ] {
+            assert!(!schema_exposed_as_entity_surface(schema_key));
+            assert!(!schema_exposed_as_entity_history_surface(schema_key));
+        }
         assert!(schema_exposed_as_entity_surface("project_message"));
     }
 

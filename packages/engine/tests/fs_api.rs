@@ -55,56 +55,28 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    sql_path_only_file_reads_as_empty_without_blob_ref,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        session
-            .execute("INSERT INTO lix_file (path) VALUES ('/empty.txt')", &[])
+simulation_test!(sql_path_only_file_reads_as_empty, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect("path-only file insert should succeed");
+            .expect("workspace session should open"),
+        &engine,
+    );
 
-        assert_eq!(
-            read_file(&session, "/empty.txt")
-                .await
-                .expect("file read should succeed"),
-            Some(Vec::new())
-        );
+    session
+        .execute("INSERT INTO lix_file (path) VALUES ('/empty.txt')", &[])
+        .await
+        .expect("path-only file insert should succeed");
 
-        let file_result = session
-            .execute("SELECT id FROM lix_file WHERE path = '/empty.txt'", &[])
+    assert_eq!(
+        read_file(&session, "/empty.txt")
             .await
-            .expect("file id read should succeed");
-        let [Value::Text(file_id)] = file_result.rows()[0].values() else {
-            panic!(
-                "expected file id row, got {:?}",
-                file_result.rows()[0].values()
-            );
-        };
-
-        let blob_ref_result = session
-            .execute(
-                &format!(
-                    "SELECT entity_pk \
-                     FROM lix_state \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND entity_pk = lix_json('[\"{file_id}\"]')"
-                ),
-                &[],
-            )
-            .await
-            .expect("blob ref state read should succeed");
-        assert_eq!(blob_ref_result.len(), 0);
-    }
-);
+            .expect("file read should succeed"),
+        Some(Vec::new())
+    );
+});
 
 simulation_test!(
     exact_lix_file_point_reads_match_generic_sql_across_visible_lanes,
@@ -961,31 +933,16 @@ async fn non_empty_plugin_overwrite_does_not_stage_blob_ref_tombstone() {
     let [Value::Text(file_id)] = file.rows()[0].values() else {
         panic!("expected plugin file id");
     };
-    assert_eq!(blob_ref_count(&session, file_id).await, 0);
+    let blob_ref_changes_before = blob_ref_change_count(&session, file_id).await;
 
     write_file(&session, "/owned.sentinel", b"second".to_vec())
         .await
         .expect("plugin file overwrite should succeed");
-    let commit_id = engine
-        .load_branch_head_commit_id(&receipt.main_branch_id)
-        .await
-        .expect("branch head should load")
-        .expect("branch head should exist");
-    let blob_ref_history = session
-        .execute(
-            &format!(
-                "SELECT lixcol_entity_pk FROM lix_state_history \
-                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                   AND lixcol_schema_key = 'lix_binary_blob_ref' \
-                   AND lixcol_entity_pk = lix_json('[\"{file_id}\"]')"
-            ),
-            &[],
-        )
-        .await
-        .expect("blob ref history should load");
-
-    assert_eq!(blob_ref_history.len(), 0);
-    assert_eq!(blob_ref_count(&session, file_id).await, 0);
+    assert_eq!(
+        blob_ref_change_count(&session, file_id).await,
+        blob_ref_changes_before,
+        "plugin overwrite must not add a binary-blob-ref tombstone"
+    );
     session.close().await.expect("session should close");
 }
 
@@ -1649,7 +1606,6 @@ async fn durable_owner_drives_raw_plugin_raw_path_transitions() {
     );
     assert_eq!(plugin_owner_count(&session, &file_id).await, 1);
     assert_eq!(plugin_state_count(&session, &file_id).await, 1);
-    assert_eq!(blob_ref_count(&session, &file_id).await, 0);
 
     session
         .execute(
@@ -1667,7 +1623,6 @@ async fn durable_owner_drives_raw_plugin_raw_path_transitions() {
     );
     assert_eq!(plugin_owner_count(&session, &file_id).await, 0);
     assert_eq!(plugin_state_count(&session, &file_id).await, 0);
-    assert_eq!(blob_ref_count(&session, &file_id).await, 1);
 
     session.close().await.expect("session should close");
 }
@@ -1826,19 +1781,7 @@ async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
         );
     };
 
-    let plugin_rows = session
-        .execute(
-            &format!(
-                "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'plugin_note' \
-                   AND file_id = '{file_id}'"
-            ),
-            &[],
-        )
-        .await
-        .expect("plugin state read should succeed");
-    assert_eq!(plugin_rows.len(), 1);
+    assert_eq!(plugin_state_count(&session, file_id).await, 1);
 
     write_file(&session, "/owned.binary-sentinel", Vec::new())
         .await
@@ -1851,19 +1794,7 @@ async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
         Some(b"plugin-rendered".to_vec())
     );
 
-    let plugin_rows = session
-        .execute(
-            &format!(
-                "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'plugin_note' \
-                   AND file_id = '{file_id}'"
-            ),
-            &[],
-        )
-        .await
-        .expect("plugin state read should succeed");
-    assert_eq!(plugin_rows.len(), 0);
+    assert_eq!(plugin_state_count(&session, file_id).await, 0);
 
     session.close().await.expect("session should close");
 }
@@ -1941,23 +1872,6 @@ simulation_test!(sql_write_file_upserts_existing_data, |sim| async move {
             .expect("read should succeed"),
         Some(Vec::new())
     );
-
-    let [Value::Text(file_id)] = rows.rows()[0].values() else {
-        panic!("expected file id row, got {:?}", rows.rows()[0].values());
-    };
-    let blob_ref_rows = session
-        .execute(
-            &format!(
-                "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"{file_id}\"]')"
-            ),
-            &[],
-        )
-        .await
-        .expect("blob ref query should succeed");
-    assert_eq!(blob_ref_rows.len(), 0);
 });
 
 simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
@@ -2199,13 +2113,10 @@ where
 {
     session
         .execute_sql(
-            &format!(
-                "SELECT entity_pk FROM lix_state \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"lix_plugin_owner_v1\"]') \
-                   AND file_id = '{file_id}'"
-            ),
-            &[],
+            "SELECT key FROM lix_key_value \
+             WHERE key = 'lix_plugin_owner_v1' \
+               AND lixcol_file_id = $1",
+            &[Value::Text(file_id.to_string())],
         )
         .await
         .expect("plugin owner lookup should succeed")
@@ -2218,32 +2129,27 @@ where
 {
     session
         .execute_sql(
-            &format!(
-                "SELECT entity_pk FROM lix_state \
-                 WHERE schema_key = 'plugin_note' AND file_id = '{file_id}'"
-            ),
-            &[],
+            "SELECT id FROM plugin_note WHERE lixcol_file_id = $1",
+            &[Value::Text(file_id.to_string())],
         )
         .await
         .expect("plugin state lookup should succeed")
         .len()
 }
 
-async fn blob_ref_count<S>(session: &S, file_id: &str) -> usize
+async fn blob_ref_change_count<S>(session: &S, file_id: &str) -> usize
 where
     S: TestSession + Sync + ?Sized,
 {
     session
         .execute_sql(
-            &format!(
-                "SELECT entity_pk FROM lix_state \
-                 WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"{file_id}\"]')"
-            ),
-            &[],
+            "SELECT id FROM lix_change \
+             WHERE schema_key = 'lix_binary_blob_ref' \
+               AND lix_json_get_text(entity_pk, 0) = $1",
+            &[Value::Text(file_id.to_string())],
         )
         .await
-        .expect("blob ref lookup should succeed")
+        .expect("blob ref change lookup should succeed")
         .len()
 }
 

@@ -669,21 +669,21 @@ simulation_test!(
             ]
         );
 
-        let staged_state_result = session
+        let component_changes = session
             .execute(
-                "SELECT entity_pk, schema_key \
-             FROM lix_state \
+                "SELECT schema_key \
+             FROM lix_change \
              WHERE entity_pk = lix_json('[\"file-readme\"]') \
-             ORDER BY schema_key, entity_pk",
+               AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
+             ORDER BY schema_key",
                 &[],
             )
             .await
-            .expect("filesystem state read should succeed");
-        let staged_state_rows = staged_state_result;
+            .expect("filesystem component changes should remain inspectable");
         assert_eq!(
-            staged_state_rows.len(),
+            component_changes.len(),
             2,
-            "file path insert should stage one file descriptor and one blob ref for the file"
+            "file path insert should emit one file descriptor and one blob ref change"
         );
 
         let directory_result = session
@@ -1205,17 +1205,17 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
 
-    let blob_ref_result = session
+    let blob_ref_changes = session
         .execute(
-            "SELECT entity_pk \
-             FROM lix_state \
+            "SELECT id \
+             FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
                AND entity_pk = lix_json('[\"empty-data-file\"]')",
             &[],
         )
         .await
-        .expect("blob ref state read should succeed");
-    assert_eq!(blob_ref_result.len(), 0);
+        .expect("blob ref changes should read");
+    assert_eq!(blob_ref_changes.len(), 0);
 });
 
 simulation_test!(
@@ -1787,23 +1787,6 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         ]
     );
 
-    let state_result = session
-        .execute(
-            "SELECT entity_pk, schema_key \
-             FROM lix_state \
-             WHERE entity_pk = lix_json('[\"file-readme\"]') \
-             ORDER BY schema_key, entity_pk",
-            &[],
-        )
-        .await
-        .expect("filesystem state read after path update should succeed");
-    let state_rows = state_result;
-    assert_eq!(
-        state_rows.len(),
-        2,
-        "path update should update one file descriptor and preserve one blob ref"
-    );
-
     let directory_result = session
         .execute(
             "SELECT path \
@@ -2356,18 +2339,6 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
         .expect("file read should succeed");
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
-
-    let blob_ref_result = session
-        .execute(
-            "SELECT entity_pk \
-             FROM lix_state \
-             WHERE schema_key = 'lix_binary_blob_ref' \
-               AND entity_pk = lix_json('[\"empty-update-file\"]')",
-            &[],
-        )
-        .await
-        .expect("blob ref state read should succeed");
-    assert_eq!(blob_ref_result.len(), 0);
 });
 
 simulation_test!(
@@ -2426,7 +2397,6 @@ simulation_test!(
             .await
             .expect("branch head should load")
             .expect("branch head should exist");
-
         let current = session
             .execute(
                 "SELECT data, lixcol_metadata \
@@ -2566,20 +2536,36 @@ async fn file_descriptor_event_count(
     commit_id: &str,
     file_id: &str,
 ) -> usize {
-    session
+    let result = session
         .execute(
             &format!(
-                "SELECT lixcol_entity_pk FROM lix_state_history \
+                "SELECT lixcol_source_changes FROM lix_file_history \
                  WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND lixcol_depth = 0 \
-                   AND lixcol_schema_key = 'lix_file_descriptor' \
-                   AND lixcol_entity_pk = lix_json('[\"{file_id}\"]')"
+                   AND id = '{file_id}'"
             ),
             &[],
         )
         .await
-        .expect("descriptor history should load")
-        .len()
+        .expect("file history should load");
+    let Some(row) = result.rows().first() else {
+        return 0;
+    };
+    let Value::Json(source_changes) = row
+        .get::<Value>("lixcol_source_changes")
+        .expect("file history source changes should decode")
+    else {
+        panic!("file history source changes should be JSON");
+    };
+    source_changes
+        .as_array()
+        .expect("file history source changes should be an array")
+        .iter()
+        .filter(|source| {
+            source["schema_key"] == json!("lix_file_descriptor")
+                && source["entity_pk"] == json!([file_id])
+        })
+        .count()
 }
 
 simulation_test!(
@@ -2610,26 +2596,17 @@ simulation_test!(
             )
             .await
             .expect("empty data update should succeed");
-        let commit_id = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("branch head should load")
-            .expect("branch head should exist");
-
-        let blob_ref_history = session
+        let blob_ref_changes = session
             .execute(
-                &format!(
-                    "SELECT lixcol_entity_pk \
-                     FROM lix_state_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND lixcol_schema_key = 'lix_binary_blob_ref' \
-                       AND lixcol_entity_pk = lix_json('[\"already-empty-file\"]')"
-                ),
+                "SELECT id \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_binary_blob_ref' \
+                   AND entity_pk = lix_json('[\"already-empty-file\"]')",
                 &[],
             )
             .await
-            .expect("blob ref history read should succeed");
-        assert_eq!(blob_ref_history.len(), 0);
+            .expect("blob ref changes should read");
+        assert_eq!(blob_ref_changes.len(), 0);
     }
 );
 
@@ -3097,18 +3074,6 @@ simulation_test!(
             .await
             .expect("file count read should succeed");
         assert_eq!(files.len(), 1);
-
-        let blob_refs = session
-            .execute(
-                "SELECT entity_pk \
-                 FROM lix_state \
-                 WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"file-path-upsert\"]')",
-                &[],
-            )
-            .await
-            .expect("blob ref read should succeed");
-        assert_eq!(blob_refs.len(), 1);
     }
 );
 

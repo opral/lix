@@ -126,6 +126,10 @@ impl LixError {
     /// meta-schema validation failure.
     pub const CODE_SCHEMA_DEFINITION: &'static str = "LIX_ERROR_SCHEMA_DEFINITION";
 
+    /// A public runtime schema registration attempted to use the `lix_*`
+    /// namespace reserved for schemas owned and bootstrapped by Lix.
+    pub const CODE_RESERVED_SCHEMA_NAMESPACE: &'static str = "LIX_RESERVED_SCHEMA_NAMESPACE";
+
     /// The logical Lix handle/session has been closed and cannot run further
     /// operations. Close is a resource-release lifecycle boundary, not a
     /// durability boundary.

@@ -57,18 +57,22 @@ No daemon, no protocol, no remote.
 
 ## The change-first model
 
-Lix stores changes as data, not snapshots. One immutable journal across every entity, every version:
+Lix stores changes as data, not snapshots. Typed history reconstructs the
+states reachable from a branch, while the global journal records workspace
+activity:
 
 ```sql
--- What does this version see right now?
-SELECT lixcol_entity_pk, lixcol_schema_key, lixcol_snapshot_content
-FROM lix_state_history
-WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()
-  AND lixcol_depth = 0
-ORDER BY lixcol_schema_key, lixcol_entity_pk;
+-- Which revisions of this task are reachable from the active branch?
+SELECT id, title, lixcol_depth, lixcol_is_deleted
+FROM acme_task_history
+WHERE id = 't1'
+ORDER BY lixcol_depth;
 ```
 
-Whether the entity is a spreadsheet cell, a document clause, a CAD part, or an application row, the surface is the same. Diffs, undo, audit, blame, and attribution are all SQL. See [Change History](./history.md).
+Whether the entity is a spreadsheet cell, a document clause, a CAD part, or an
+application row, its registered schema supplies the typed SQL surface. Diffs,
+undo, audit, blame, and attribution are all SQL. See
+[Change History](./history.md).
 
 ## Examples of what Lix versions
 
