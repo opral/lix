@@ -203,6 +203,18 @@ impl StorageWriteSet {
         group.deletes.reserve(expected_deletes);
     }
 
+    /// Returns whether this write set already stages a put for an exact
+    /// `(space, key)` pair.
+    ///
+    /// Domain writers use this only for transaction-scoped format markers;
+    /// normal data rows must remain unique and are validated by [`Self::validate`].
+    pub(crate) fn contains_put(&self, space: StorageSpace, key: &[u8]) -> bool {
+        self.group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .is_some_and(|group| group.puts.iter().any(|put| put.key.0.as_ref() == key))
+    }
+
     pub fn extend(&mut self, other: Self) {
         for group in other.groups {
             let space = group.space;

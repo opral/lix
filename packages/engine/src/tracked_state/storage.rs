@@ -322,7 +322,9 @@ mod tests {
         BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
         BINARY_CAS_MANIFEST_SPACE,
     };
-    use crate::changelog::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId};
+    use crate::changelog::{
+        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId,
+    };
     use crate::json_store::store::JSON_SPACE;
     use crate::live_state::LIVE_STATE_INDEX_ROW_SPACE;
     use crate::tracked_state::types::{
@@ -348,6 +350,7 @@ mod tests {
             COMMIT_SPACE,
             CHANGE_SPACE,
             COMMIT_CHANGE_REF_CHUNK_SPACE,
+            COMMIT_CHANGE_ID_SPACE,
         ];
         let mut seen = BTreeMap::new();
         for space in spaces {

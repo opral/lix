@@ -21,7 +21,9 @@ pub(crate) use materialization::{
     ChangeRecordProjection, MaterializedChangeIdentity, MaterializedChangePayload,
     load_change_records, materialize_change_payloads,
 };
-pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key};
+pub(crate) use store::{
+    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key,
+};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
