@@ -1,0 +1,151 @@
+package lix:plugin-p3-candidate@0.1.0;
+
+interface host {
+  type bytes = list<u8>;
+
+  variant source-error {
+    invalid-range,
+    limit-exceeded(string),
+    cancelled,
+    unavailable(string),
+  }
+
+  /// The terminal future is authoritative even when the byte stream reaches
+  /// EOF or the receiver drops it early.
+  record source-byte-stream {
+    data: stream<u8>,
+    done: future<result<_, source-error>>,
+  }
+
+  /// Immutable bytes owned and metered by the host. Random access remains
+  /// synchronous for localized warm edits; large sequential reads use P3.
+  resource byte-source {
+    fork: func() -> own<byte-source>;
+    len: func() -> u64;
+    read: func(offset: u64, length: u32) -> result<bytes, source-error>;
+    /// Benchmark-only ready-async counterpart to `read`.
+    read-async: async func(
+      offset: u64,
+      length: u32,
+    ) -> result<bytes, source-error>;
+    read-stream: func(
+      offset: u64,
+      length: u64,
+    ) -> result<source-byte-stream, source-error>;
+  }
+}
+
+interface api {
+  use host.{byte-source};
+
+  type bytes = list<u8>;
+
+  variant plugin-error {
+    invalid-input(string),
+    limit-exceeded(string),
+    cancelled,
+    internal(string),
+  }
+
+  record input-splice {
+    offset: u64,
+    delete-len: u64,
+    insert: bytes,
+  }
+
+  /// A compact typed stand-in for an initial entity record. The experiment
+  /// intentionally exercises typed P3 stream lowering without freezing Lix's
+  /// durable entity schema.
+  record entity-summary {
+    entity-id: u64,
+    start: u64,
+    length: u32,
+    hash: u64,
+  }
+
+  record entity-change {
+    entity-id: u64,
+    snapshot: bytes,
+  }
+
+  record entity-summary-stream {
+    count: u64,
+    items: stream<entity-summary>,
+    done: future<result<_, plugin-error>>,
+  }
+
+  record document-stats {
+    byte-length: u64,
+    entity-count: u64,
+    revision: u64,
+  }
+
+  record open-result {
+    document: own<document>,
+    entities: entity-summary-stream,
+  }
+
+  record file-transition {
+    document: own<document>,
+    changes: list<entity-change>,
+  }
+
+  record entity-change-stream {
+    count: u64,
+    items: stream<entity-change>,
+    done: future<result<_, plugin-error>>,
+  }
+
+  record streamed-file-transition {
+    document: own<document>,
+    changes: entity-change-stream,
+  }
+
+  resource document {
+    /// Constant-time immutable alias.
+    fork: func() -> own<document>;
+    stats: func() -> document-stats;
+
+    /// The hot path deliberately remains synchronous and returns one small
+    /// inline list. P3 is not imposed on localized edits.
+    file-changed: func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<file-transition, plugin-error>;
+
+    /// Benchmark arm: identical reads and inline output through an async ABI.
+    file-changed-async-inline: async func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<file-transition, plugin-error>;
+
+    /// Benchmark arm: async export plus ready async random-read imports.
+    file-changed-async-read-inline: async func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<file-transition, plugin-error>;
+
+    /// Benchmark arm: identical edit work with changes crossing a P3 stream.
+    file-changed-async-stream: async func(
+      before: own<byte-source>,
+      after: own<byte-source>,
+      edits: list<input-splice>,
+    ) -> result<streamed-file-transition, plugin-error>;
+  }
+
+  /// Control arm: the complete file crosses the Canonical ABI as one list.
+  open-list: async func(file: bytes) -> result<open-result, plugin-error>;
+
+  /// Candidate arm: the guest incrementally scans a host-backed P3 byte stream.
+  open-stream: async func(
+    file: own<byte-source>,
+  ) -> result<open-result, plugin-error>;
+}
+
+world plugin {
+  import host;
+  export api;
+}

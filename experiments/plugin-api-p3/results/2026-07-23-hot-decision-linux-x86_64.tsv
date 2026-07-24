@@ -1,0 +1,383 @@
+config	wasmtime=47.0.2	fixture=json-top-level-object	bytes=10485811	entities=39870	changed_entity=19935	changed_member_bytes=262	guest_per_linear_memory_limit_mib=64	max_entity_summaries=1000000	cold_warmups=3	cold_samples=20	warm_warmups=10	warm_samples=100	hot_warmups=2400	hot_samples=24000	hot_print_raw=false	guest_component_bytes=224501	guest_sha256=cc3ffcd1fae32e4152295ea9c76787e7918450886e8196d0adf560a6dd19b79d	benchmark_source_parent=0ae69bfa	wasm_tools=1.254.0	machine=AMD-EPYC-Milan-4-core-8-thread	memory_gib=30	cpu_affinity=0
+check	name=fail-closed-short-stream	status=ok	advertised_bytes=10485811	emitted_bytes=10485810	elapsed_ms=119.318
+check	name=fail-closed-terminal-error	status=ok	emitted_bytes=10485811	elapsed_ms=118.635
+check	name=output-cancellation-terminal	status=ok	elapsed_ms=123.073
+check	name=host-entity-output-limit	status=ok	declared=39870	limit=39869	elapsed_ms=122.549
+sample	phase=cold-open	transport=list-u8	index=0	elapsed_ms=109.724476
+sample	phase=cold-open	transport=list-u8	index=1	elapsed_ms=114.536115
+sample	phase=cold-open	transport=list-u8	index=2	elapsed_ms=110.072713
+sample	phase=cold-open	transport=list-u8	index=3	elapsed_ms=111.427880
+sample	phase=cold-open	transport=list-u8	index=4	elapsed_ms=116.102712
+sample	phase=cold-open	transport=list-u8	index=5	elapsed_ms=109.582209
+sample	phase=cold-open	transport=list-u8	index=6	elapsed_ms=109.353870
+sample	phase=cold-open	transport=list-u8	index=7	elapsed_ms=110.411430
+sample	phase=cold-open	transport=list-u8	index=8	elapsed_ms=110.277888
+sample	phase=cold-open	transport=list-u8	index=9	elapsed_ms=110.496990
+sample	phase=cold-open	transport=list-u8	index=10	elapsed_ms=110.059537
+sample	phase=cold-open	transport=list-u8	index=11	elapsed_ms=109.749353
+sample	phase=cold-open	transport=list-u8	index=12	elapsed_ms=110.852249
+sample	phase=cold-open	transport=list-u8	index=13	elapsed_ms=110.842381
+sample	phase=cold-open	transport=list-u8	index=14	elapsed_ms=109.551591
+sample	phase=cold-open	transport=list-u8	index=15	elapsed_ms=108.936305
+sample	phase=cold-open	transport=list-u8	index=16	elapsed_ms=109.202054
+sample	phase=cold-open	transport=list-u8	index=17	elapsed_ms=109.402943
+sample	phase=cold-open	transport=list-u8	index=18	elapsed_ms=109.226912
+sample	phase=cold-open	transport=list-u8	index=19	elapsed_ms=109.017797
+result	phase=cold-open	transport=list-u8	samples=20	p50_ms=109.749353	p95_ms=114.536115	min_ms=108.936305	max_ms=116.102712	guest_linear_high_water_mib=15.625	source_forks=0	source_lens=0	source_reads=0	source_read_bytes=0	source_streams=0	source_stream_bytes=0	source_stream_emitted_bytes=0	source_drops=0
+sample	phase=cold-open	transport=bytes-stream-u8	index=0	elapsed_ms=108.837920
+sample	phase=cold-open	transport=bytes-stream-u8	index=1	elapsed_ms=108.944020
+sample	phase=cold-open	transport=bytes-stream-u8	index=2	elapsed_ms=108.965209
+sample	phase=cold-open	transport=bytes-stream-u8	index=3	elapsed_ms=109.031224
+sample	phase=cold-open	transport=bytes-stream-u8	index=4	elapsed_ms=109.198938
+sample	phase=cold-open	transport=bytes-stream-u8	index=5	elapsed_ms=108.898383
+sample	phase=cold-open	transport=bytes-stream-u8	index=6	elapsed_ms=109.024500
+sample	phase=cold-open	transport=bytes-stream-u8	index=7	elapsed_ms=109.930545
+sample	phase=cold-open	transport=bytes-stream-u8	index=8	elapsed_ms=108.975708
+sample	phase=cold-open	transport=bytes-stream-u8	index=9	elapsed_ms=109.546523
+sample	phase=cold-open	transport=bytes-stream-u8	index=10	elapsed_ms=109.799620
+sample	phase=cold-open	transport=bytes-stream-u8	index=11	elapsed_ms=109.182248
+sample	phase=cold-open	transport=bytes-stream-u8	index=12	elapsed_ms=109.170885
+sample	phase=cold-open	transport=bytes-stream-u8	index=13	elapsed_ms=109.145828
+sample	phase=cold-open	transport=bytes-stream-u8	index=14	elapsed_ms=109.147613
+sample	phase=cold-open	transport=bytes-stream-u8	index=15	elapsed_ms=109.280283
+sample	phase=cold-open	transport=bytes-stream-u8	index=16	elapsed_ms=108.881372
+sample	phase=cold-open	transport=bytes-stream-u8	index=17	elapsed_ms=109.645879
+sample	phase=cold-open	transport=bytes-stream-u8	index=18	elapsed_ms=108.883025
+sample	phase=cold-open	transport=bytes-stream-u8	index=19	elapsed_ms=109.270414
+result	phase=cold-open	transport=bytes-stream-u8	samples=20	p50_ms=109.145828	p95_ms=109.799620	min_ms=108.837920	max_ms=109.930545	guest_linear_high_water_mib=6.625	source_forks=0	source_lens=20	source_reads=0	source_read_bytes=0	source_streams=20	source_stream_bytes=209716220	source_stream_emitted_bytes=209716220	source_drops=20
+comparison	name=cold-list-over-bytes-stream	p50_speedup=1.006	p95_speedup=1.043
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=0	elapsed_ms=109.440503
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=1	elapsed_ms=109.356394
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=2	elapsed_ms=109.040250
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=3	elapsed_ms=109.988122
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=4	elapsed_ms=109.275202
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=5	elapsed_ms=109.684142
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=6	elapsed_ms=109.346647
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=7	elapsed_ms=109.081578
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=8	elapsed_ms=109.178391
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=9	elapsed_ms=109.483875
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=10	elapsed_ms=109.308336
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=11	elapsed_ms=109.766526
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=12	elapsed_ms=109.806330
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=13	elapsed_ms=109.936075
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=14	elapsed_ms=109.513399
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=15	elapsed_ms=108.868567
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=16	elapsed_ms=110.148675
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=17	elapsed_ms=109.839112
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=18	elapsed_ms=109.860893
+sample	phase=warm-update-stateless-full	transport=open-list-u8	index=19	elapsed_ms=109.307795
+result	phase=warm-update-stateless-full	transport=open-list-u8	samples=20	p50_ms=109.440503	p95_ms=109.988122	min_ms=108.868567	max_ms=110.148675	guest_linear_high_water_mib=15.625	source_forks=0	source_lens=0	source_reads=0	source_read_bytes=0	source_streams=0	source_stream_bytes=0	source_stream_emitted_bytes=0	source_drops=0
+check	name=immutable-fork-successor	status=ok	transport=list-u8
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=0	elapsed_ms=0.009678
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=1	elapsed_ms=0.009607
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=2	elapsed_ms=0.009378
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=3	elapsed_ms=0.009247
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=4	elapsed_ms=0.009879
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=5	elapsed_ms=0.010549
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=6	elapsed_ms=0.009418
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=7	elapsed_ms=0.009759
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=8	elapsed_ms=0.009318
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=9	elapsed_ms=0.009107
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=10	elapsed_ms=0.009127
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=11	elapsed_ms=0.009287
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=12	elapsed_ms=0.009589
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=13	elapsed_ms=0.009378
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=14	elapsed_ms=0.009778
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=15	elapsed_ms=0.010200
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=16	elapsed_ms=0.009718
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=17	elapsed_ms=0.009577
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=18	elapsed_ms=0.009248
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=19	elapsed_ms=0.009738
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=20	elapsed_ms=0.009268
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=21	elapsed_ms=0.009477
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=22	elapsed_ms=0.009738
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=23	elapsed_ms=0.009558
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=24	elapsed_ms=0.009538
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=25	elapsed_ms=0.009578
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=26	elapsed_ms=0.010098
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=27	elapsed_ms=0.009688
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=28	elapsed_ms=0.010400
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=29	elapsed_ms=0.010370
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=30	elapsed_ms=0.010669
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=31	elapsed_ms=0.010941
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=32	elapsed_ms=0.007966
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=33	elapsed_ms=0.006111
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=34	elapsed_ms=0.005990
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=35	elapsed_ms=0.006051
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=36	elapsed_ms=0.005891
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=37	elapsed_ms=0.005971
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=38	elapsed_ms=0.006041
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=39	elapsed_ms=0.006001
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=40	elapsed_ms=0.005941
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=41	elapsed_ms=0.006022
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=42	elapsed_ms=0.005991
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=43	elapsed_ms=0.005971
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=44	elapsed_ms=0.006041
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=45	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=46	elapsed_ms=0.006002
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=47	elapsed_ms=0.006001
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=48	elapsed_ms=0.005992
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=49	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=50	elapsed_ms=0.006031
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=51	elapsed_ms=0.005931
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=52	elapsed_ms=0.005941
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=53	elapsed_ms=0.005990
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=54	elapsed_ms=0.006041
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=55	elapsed_ms=0.006001
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=56	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=57	elapsed_ms=0.005962
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=58	elapsed_ms=0.006001
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=59	elapsed_ms=0.005950
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=60	elapsed_ms=0.005932
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=61	elapsed_ms=0.005911
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=62	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=63	elapsed_ms=0.006111
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=64	elapsed_ms=0.005971
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=65	elapsed_ms=0.006092
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=66	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=67	elapsed_ms=0.005891
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=68	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=69	elapsed_ms=0.006011
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=70	elapsed_ms=0.006012
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=71	elapsed_ms=0.006071
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=72	elapsed_ms=0.006002
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=73	elapsed_ms=0.005971
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=74	elapsed_ms=0.006102
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=75	elapsed_ms=0.019697
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=76	elapsed_ms=0.006261
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=77	elapsed_ms=0.006061
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=78	elapsed_ms=0.006061
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=79	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=80	elapsed_ms=0.005891
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=81	elapsed_ms=0.005992
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=82	elapsed_ms=0.005993
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=83	elapsed_ms=0.006022
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=84	elapsed_ms=0.006052
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=85	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=86	elapsed_ms=0.005992
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=87	elapsed_ms=0.005991
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=88	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=89	elapsed_ms=0.006021
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=90	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=91	elapsed_ms=0.005941
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=92	elapsed_ms=0.005971
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=93	elapsed_ms=0.006031
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=94	elapsed_ms=0.006042
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=95	elapsed_ms=0.005972
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=96	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=97	elapsed_ms=0.005961
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=98	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	index=99	elapsed_ms=0.005962
+result	phase=warm-update-persistent-sparse-sequential	transport=document-opened-list	samples=100	p50_ms=0.006031	p95_ms=0.010370	min_ms=0.005891	max_ms=0.019697	guest_linear_high_water_mib=15.625	source_forks=0	source_lens=200	source_reads=200	source_read_bytes=52400	source_streams=0	source_stream_bytes=0	source_stream_emitted_bytes=0	source_drops=200
+check	name=immutable-fork-successor	status=ok	transport=bytes-stream-u8
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=0	elapsed_ms=0.010150
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=1	elapsed_ms=0.009457
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=2	elapsed_ms=0.009408
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=3	elapsed_ms=0.010360
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=4	elapsed_ms=0.008997
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=5	elapsed_ms=0.006342
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=6	elapsed_ms=0.006141
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=7	elapsed_ms=0.006132
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=8	elapsed_ms=0.006292
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=9	elapsed_ms=0.005891
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=10	elapsed_ms=0.006042
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=11	elapsed_ms=0.006122
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=12	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=13	elapsed_ms=0.006111
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=14	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=15	elapsed_ms=0.006102
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=16	elapsed_ms=0.005990
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=17	elapsed_ms=0.006012
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=18	elapsed_ms=0.006122
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=19	elapsed_ms=0.006141
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=20	elapsed_ms=0.006001
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=21	elapsed_ms=0.006231
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=22	elapsed_ms=0.006021
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=23	elapsed_ms=0.006031
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=24	elapsed_ms=0.006002
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=25	elapsed_ms=0.007855
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=26	elapsed_ms=0.010671
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=27	elapsed_ms=0.009819
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=28	elapsed_ms=0.011071
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=29	elapsed_ms=0.009539
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=30	elapsed_ms=0.009818
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=31	elapsed_ms=0.011181
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=32	elapsed_ms=0.006422
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=33	elapsed_ms=0.006111
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=34	elapsed_ms=0.006112
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=35	elapsed_ms=0.006032
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=36	elapsed_ms=0.006040
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=37	elapsed_ms=0.006001
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=38	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=39	elapsed_ms=0.006091
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=40	elapsed_ms=0.006040
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=41	elapsed_ms=0.006092
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=42	elapsed_ms=0.006182
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=43	elapsed_ms=0.006041
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=44	elapsed_ms=0.006132
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=45	elapsed_ms=0.006081
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=46	elapsed_ms=0.006112
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=47	elapsed_ms=0.006021
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=48	elapsed_ms=0.005992
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=49	elapsed_ms=0.005991
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=50	elapsed_ms=0.006021
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=51	elapsed_ms=0.006011
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=52	elapsed_ms=0.006022
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=53	elapsed_ms=0.006184
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=54	elapsed_ms=0.006061
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=55	elapsed_ms=0.006171
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=56	elapsed_ms=0.006061
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=57	elapsed_ms=0.006041
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=58	elapsed_ms=0.006030
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=59	elapsed_ms=0.006052
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=60	elapsed_ms=0.006112
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=61	elapsed_ms=0.006142
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=62	elapsed_ms=0.006131
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=63	elapsed_ms=0.006141
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=64	elapsed_ms=0.005992
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=65	elapsed_ms=0.006071
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=66	elapsed_ms=0.006182
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=67	elapsed_ms=0.006162
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=68	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=69	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=70	elapsed_ms=0.005960
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=71	elapsed_ms=0.005990
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=72	elapsed_ms=0.006091
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=73	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=74	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=75	elapsed_ms=0.006051
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=76	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=77	elapsed_ms=0.006041
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=78	elapsed_ms=0.005982
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=79	elapsed_ms=0.005981
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=80	elapsed_ms=0.006042
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=81	elapsed_ms=0.006152
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=82	elapsed_ms=0.006031
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=83	elapsed_ms=0.006101
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=84	elapsed_ms=0.006072
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=85	elapsed_ms=0.006052
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=86	elapsed_ms=0.006102
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=87	elapsed_ms=0.006092
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=88	elapsed_ms=0.006132
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=89	elapsed_ms=0.006092
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=90	elapsed_ms=0.006021
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=91	elapsed_ms=0.022172
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=92	elapsed_ms=0.006212
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=93	elapsed_ms=0.006081
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=94	elapsed_ms=0.006081
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=95	elapsed_ms=0.006171
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=96	elapsed_ms=0.006152
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=97	elapsed_ms=0.006111
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=98	elapsed_ms=0.006082
+sample	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	index=99	elapsed_ms=0.006071
+result	phase=warm-update-persistent-sparse-sequential	transport=document-opened-bytes-stream	samples=100	p50_ms=0.006082	p95_ms=0.010150	min_ms=0.005891	max_ms=0.022172	guest_linear_high_water_mib=6.625	source_forks=0	source_lens=200	source_reads=200	source_read_bytes=52400	source_streams=0	source_stream_bytes=0	source_stream_emitted_bytes=0	source_drops=200
+comparison	name=stateless-full-over-persistent-list-opened	p50_speedup=18146.328	p95_speedup=10606.376
+comparison	name=stateless-full-over-persistent-stream-opened	p50_speedup=17994.164	p95_speedup=10836.268
+hot-result	variant=sync-export-sync-read-inline	samples=24000	p50_ns=6662	p95_ns=10960	min_ns=6111	max_ns=80110
+hot-result	variant=async-export-sync-read-inline	samples=24000	p50_ns=7153	p95_ns=11782	min_ns=6583	max_ns=128501
+hot-result	variant=async-export-async-read-inline	samples=24000	p50_ns=7955	p95_ns=13164	min_ns=6983	max_ns=140374
+hot-result	variant=async-export-sync-read-stream	samples=24000	p50_ns=13404	p95_ns=24908	min_ns=12453	max_ns=129855
+hot-block	index=0	start=0	end=240	sync_p50_ns=6603	async_inline_p50_ns=7064	async_read_p50_ns=7864	async_stream_p50_ns=13284	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=800	stream_minus_async_p50_ns=6220
+hot-block	index=1	start=240	end=480	sync_p50_ns=6603	async_inline_p50_ns=7094	async_read_p50_ns=7876	async_stream_p50_ns=13305	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=782	stream_minus_async_p50_ns=6211
+hot-block	index=2	start=480	end=720	sync_p50_ns=6602	async_inline_p50_ns=7094	async_read_p50_ns=7874	async_stream_p50_ns=13266	async_minus_sync_p50_ns=492	async_read_minus_async_p50_ns=780	stream_minus_async_p50_ns=6172
+hot-block	index=3	start=720	end=960	sync_p50_ns=6613	async_inline_p50_ns=7094	async_read_p50_ns=7865	async_stream_p50_ns=13295	async_minus_sync_p50_ns=481	async_read_minus_async_p50_ns=771	stream_minus_async_p50_ns=6201
+hot-block	index=4	start=960	end=1200	sync_p50_ns=6613	async_inline_p50_ns=7073	async_read_p50_ns=7835	async_stream_p50_ns=13265	async_minus_sync_p50_ns=460	async_read_minus_async_p50_ns=762	stream_minus_async_p50_ns=6192
+hot-block	index=5	start=1200	end=1440	sync_p50_ns=6612	async_inline_p50_ns=7073	async_read_p50_ns=7865	async_stream_p50_ns=13345	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=792	stream_minus_async_p50_ns=6272
+hot-block	index=6	start=1440	end=1680	sync_p50_ns=6592	async_inline_p50_ns=7093	async_read_p50_ns=7824	async_stream_p50_ns=13286	async_minus_sync_p50_ns=501	async_read_minus_async_p50_ns=731	stream_minus_async_p50_ns=6193
+hot-block	index=7	start=1680	end=1920	sync_p50_ns=6592	async_inline_p50_ns=7073	async_read_p50_ns=7824	async_stream_p50_ns=13296	async_minus_sync_p50_ns=481	async_read_minus_async_p50_ns=751	stream_minus_async_p50_ns=6223
+hot-block	index=8	start=1920	end=2160	sync_p50_ns=6603	async_inline_p50_ns=7043	async_read_p50_ns=7794	async_stream_p50_ns=13285	async_minus_sync_p50_ns=440	async_read_minus_async_p50_ns=751	stream_minus_async_p50_ns=6242
+hot-block	index=9	start=2160	end=2400	sync_p50_ns=6583	async_inline_p50_ns=7083	async_read_p50_ns=7824	async_stream_p50_ns=13294	async_minus_sync_p50_ns=500	async_read_minus_async_p50_ns=741	stream_minus_async_p50_ns=6211
+hot-block	index=10	start=2400	end=2640	sync_p50_ns=6592	async_inline_p50_ns=7093	async_read_p50_ns=7835	async_stream_p50_ns=13226	async_minus_sync_p50_ns=501	async_read_minus_async_p50_ns=742	stream_minus_async_p50_ns=6133
+hot-block	index=11	start=2640	end=2880	sync_p50_ns=6582	async_inline_p50_ns=7053	async_read_p50_ns=7825	async_stream_p50_ns=13235	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=772	stream_minus_async_p50_ns=6182
+hot-block	index=12	start=2880	end=3120	sync_p50_ns=6601	async_inline_p50_ns=7073	async_read_p50_ns=7855	async_stream_p50_ns=13325	async_minus_sync_p50_ns=472	async_read_minus_async_p50_ns=782	stream_minus_async_p50_ns=6252
+hot-block	index=13	start=3120	end=3360	sync_p50_ns=6583	async_inline_p50_ns=7033	async_read_p50_ns=7845	async_stream_p50_ns=13246	async_minus_sync_p50_ns=450	async_read_minus_async_p50_ns=812	stream_minus_async_p50_ns=6213
+hot-block	index=14	start=3360	end=3600	sync_p50_ns=6583	async_inline_p50_ns=7073	async_read_p50_ns=7825	async_stream_p50_ns=13276	async_minus_sync_p50_ns=490	async_read_minus_async_p50_ns=752	stream_minus_async_p50_ns=6203
+hot-block	index=15	start=3600	end=3840	sync_p50_ns=6592	async_inline_p50_ns=7072	async_read_p50_ns=7836	async_stream_p50_ns=13255	async_minus_sync_p50_ns=480	async_read_minus_async_p50_ns=764	stream_minus_async_p50_ns=6183
+hot-block	index=16	start=3840	end=4080	sync_p50_ns=6582	async_inline_p50_ns=7073	async_read_p50_ns=7816	async_stream_p50_ns=13285	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=743	stream_minus_async_p50_ns=6212
+hot-block	index=17	start=4080	end=4320	sync_p50_ns=6593	async_inline_p50_ns=7093	async_read_p50_ns=7834	async_stream_p50_ns=13295	async_minus_sync_p50_ns=500	async_read_minus_async_p50_ns=741	stream_minus_async_p50_ns=6202
+hot-block	index=18	start=4320	end=4560	sync_p50_ns=6582	async_inline_p50_ns=7074	async_read_p50_ns=7824	async_stream_p50_ns=13284	async_minus_sync_p50_ns=492	async_read_minus_async_p50_ns=750	stream_minus_async_p50_ns=6210
+hot-block	index=19	start=4560	end=4800	sync_p50_ns=6622	async_inline_p50_ns=7134	async_read_p50_ns=7875	async_stream_p50_ns=13395	async_minus_sync_p50_ns=512	async_read_minus_async_p50_ns=741	stream_minus_async_p50_ns=6261
+hot-block	index=20	start=4800	end=5040	sync_p50_ns=6583	async_inline_p50_ns=7104	async_read_p50_ns=7874	async_stream_p50_ns=13315	async_minus_sync_p50_ns=521	async_read_minus_async_p50_ns=770	stream_minus_async_p50_ns=6211
+hot-block	index=21	start=5040	end=5280	sync_p50_ns=6653	async_inline_p50_ns=7112	async_read_p50_ns=7845	async_stream_p50_ns=13277	async_minus_sync_p50_ns=459	async_read_minus_async_p50_ns=733	stream_minus_async_p50_ns=6165
+hot-block	index=22	start=5280	end=5520	sync_p50_ns=6613	async_inline_p50_ns=7073	async_read_p50_ns=7895	async_stream_p50_ns=13265	async_minus_sync_p50_ns=460	async_read_minus_async_p50_ns=822	stream_minus_async_p50_ns=6192
+hot-block	index=23	start=5520	end=5760	sync_p50_ns=6613	async_inline_p50_ns=7073	async_read_p50_ns=7844	async_stream_p50_ns=13305	async_minus_sync_p50_ns=460	async_read_minus_async_p50_ns=771	stream_minus_async_p50_ns=6232
+hot-block	index=24	start=5760	end=6000	sync_p50_ns=6603	async_inline_p50_ns=7113	async_read_p50_ns=7864	async_stream_p50_ns=13265	async_minus_sync_p50_ns=510	async_read_minus_async_p50_ns=751	stream_minus_async_p50_ns=6152
+hot-block	index=25	start=6000	end=6240	sync_p50_ns=6612	async_inline_p50_ns=7063	async_read_p50_ns=7876	async_stream_p50_ns=13275	async_minus_sync_p50_ns=451	async_read_minus_async_p50_ns=813	stream_minus_async_p50_ns=6212
+hot-block	index=26	start=6240	end=6480	sync_p50_ns=6582	async_inline_p50_ns=7053	async_read_p50_ns=7825	async_stream_p50_ns=13275	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=772	stream_minus_async_p50_ns=6222
+hot-block	index=27	start=6480	end=6720	sync_p50_ns=6592	async_inline_p50_ns=7073	async_read_p50_ns=7834	async_stream_p50_ns=13265	async_minus_sync_p50_ns=481	async_read_minus_async_p50_ns=761	stream_minus_async_p50_ns=6192
+hot-block	index=28	start=6720	end=6960	sync_p50_ns=6593	async_inline_p50_ns=7063	async_read_p50_ns=7834	async_stream_p50_ns=13255	async_minus_sync_p50_ns=470	async_read_minus_async_p50_ns=771	stream_minus_async_p50_ns=6192
+hot-block	index=29	start=6960	end=7200	sync_p50_ns=6633	async_inline_p50_ns=7093	async_read_p50_ns=7824	async_stream_p50_ns=13355	async_minus_sync_p50_ns=460	async_read_minus_async_p50_ns=731	stream_minus_async_p50_ns=6262
+hot-block	index=30	start=7200	end=7440	sync_p50_ns=6583	async_inline_p50_ns=7083	async_read_p50_ns=7875	async_stream_p50_ns=13335	async_minus_sync_p50_ns=500	async_read_minus_async_p50_ns=792	stream_minus_async_p50_ns=6252
+hot-block	index=31	start=7440	end=7680	sync_p50_ns=6603	async_inline_p50_ns=7083	async_read_p50_ns=7845	async_stream_p50_ns=13345	async_minus_sync_p50_ns=480	async_read_minus_async_p50_ns=762	stream_minus_async_p50_ns=6262
+hot-block	index=32	start=7680	end=7920	sync_p50_ns=6592	async_inline_p50_ns=7054	async_read_p50_ns=7845	async_stream_p50_ns=13315	async_minus_sync_p50_ns=462	async_read_minus_async_p50_ns=791	stream_minus_async_p50_ns=6261
+hot-block	index=33	start=7920	end=8160	sync_p50_ns=6573	async_inline_p50_ns=7064	async_read_p50_ns=7834	async_stream_p50_ns=13284	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=770	stream_minus_async_p50_ns=6220
+hot-block	index=34	start=8160	end=8400	sync_p50_ns=6592	async_inline_p50_ns=7063	async_read_p50_ns=7855	async_stream_p50_ns=13305	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=792	stream_minus_async_p50_ns=6242
+hot-block	index=35	start=8400	end=8640	sync_p50_ns=6582	async_inline_p50_ns=7074	async_read_p50_ns=7855	async_stream_p50_ns=13326	async_minus_sync_p50_ns=492	async_read_minus_async_p50_ns=781	stream_minus_async_p50_ns=6252
+hot-block	index=36	start=8640	end=8880	sync_p50_ns=6582	async_inline_p50_ns=7103	async_read_p50_ns=7845	async_stream_p50_ns=13315	async_minus_sync_p50_ns=521	async_read_minus_async_p50_ns=742	stream_minus_async_p50_ns=6212
+hot-block	index=37	start=8880	end=9120	sync_p50_ns=6582	async_inline_p50_ns=7093	async_read_p50_ns=7844	async_stream_p50_ns=13296	async_minus_sync_p50_ns=511	async_read_minus_async_p50_ns=751	stream_minus_async_p50_ns=6203
+hot-block	index=38	start=9120	end=9360	sync_p50_ns=6582	async_inline_p50_ns=7093	async_read_p50_ns=7834	async_stream_p50_ns=13276	async_minus_sync_p50_ns=511	async_read_minus_async_p50_ns=741	stream_minus_async_p50_ns=6183
+hot-block	index=39	start=9360	end=9600	sync_p50_ns=6592	async_inline_p50_ns=7084	async_read_p50_ns=7864	async_stream_p50_ns=13275	async_minus_sync_p50_ns=492	async_read_minus_async_p50_ns=780	stream_minus_async_p50_ns=6191
+hot-block	index=40	start=9600	end=9840	sync_p50_ns=6593	async_inline_p50_ns=7084	async_read_p50_ns=7845	async_stream_p50_ns=13336	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=761	stream_minus_async_p50_ns=6252
+hot-block	index=41	start=9840	end=10080	sync_p50_ns=6592	async_inline_p50_ns=7053	async_read_p50_ns=7824	async_stream_p50_ns=13244	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=771	stream_minus_async_p50_ns=6191
+hot-block	index=42	start=10080	end=10320	sync_p50_ns=6634	async_inline_p50_ns=7054	async_read_p50_ns=7845	async_stream_p50_ns=13295	async_minus_sync_p50_ns=420	async_read_minus_async_p50_ns=791	stream_minus_async_p50_ns=6241
+hot-block	index=43	start=10320	end=10560	sync_p50_ns=6592	async_inline_p50_ns=7053	async_read_p50_ns=7855	async_stream_p50_ns=13285	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=802	stream_minus_async_p50_ns=6232
+hot-block	index=44	start=10560	end=10800	sync_p50_ns=6593	async_inline_p50_ns=7053	async_read_p50_ns=7885	async_stream_p50_ns=13305	async_minus_sync_p50_ns=460	async_read_minus_async_p50_ns=832	stream_minus_async_p50_ns=6252
+hot-block	index=45	start=10800	end=11040	sync_p50_ns=6603	async_inline_p50_ns=7043	async_read_p50_ns=7905	async_stream_p50_ns=13294	async_minus_sync_p50_ns=440	async_read_minus_async_p50_ns=862	stream_minus_async_p50_ns=6251
+hot-block	index=46	start=11040	end=11280	sync_p50_ns=6603	async_inline_p50_ns=7064	async_read_p50_ns=7845	async_stream_p50_ns=13275	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=781	stream_minus_async_p50_ns=6211
+hot-block	index=47	start=11280	end=11520	sync_p50_ns=6641	async_inline_p50_ns=7124	async_read_p50_ns=7895	async_stream_p50_ns=13366	async_minus_sync_p50_ns=483	async_read_minus_async_p50_ns=771	stream_minus_async_p50_ns=6242
+hot-block	index=48	start=11520	end=11760	sync_p50_ns=6613	async_inline_p50_ns=7063	async_read_p50_ns=7855	async_stream_p50_ns=13245	async_minus_sync_p50_ns=450	async_read_minus_async_p50_ns=792	stream_minus_async_p50_ns=6182
+hot-block	index=49	start=11760	end=12000	sync_p50_ns=6602	async_inline_p50_ns=7053	async_read_p50_ns=7815	async_stream_p50_ns=13325	async_minus_sync_p50_ns=451	async_read_minus_async_p50_ns=762	stream_minus_async_p50_ns=6272
+hot-block	index=50	start=12000	end=12240	sync_p50_ns=6583	async_inline_p50_ns=7063	async_read_p50_ns=7775	async_stream_p50_ns=13294	async_minus_sync_p50_ns=480	async_read_minus_async_p50_ns=712	stream_minus_async_p50_ns=6231
+hot-block	index=51	start=12240	end=12480	sync_p50_ns=6622	async_inline_p50_ns=7054	async_read_p50_ns=7795	async_stream_p50_ns=13245	async_minus_sync_p50_ns=432	async_read_minus_async_p50_ns=741	stream_minus_async_p50_ns=6191
+hot-block	index=52	start=12480	end=12720	sync_p50_ns=6582	async_inline_p50_ns=7043	async_read_p50_ns=7784	async_stream_p50_ns=13285	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=741	stream_minus_async_p50_ns=6242
+hot-block	index=53	start=12720	end=12960	sync_p50_ns=6603	async_inline_p50_ns=7103	async_read_p50_ns=7845	async_stream_p50_ns=13285	async_minus_sync_p50_ns=500	async_read_minus_async_p50_ns=742	stream_minus_async_p50_ns=6182
+hot-block	index=54	start=12960	end=13200	sync_p50_ns=6602	async_inline_p50_ns=7083	async_read_p50_ns=7825	async_stream_p50_ns=13264	async_minus_sync_p50_ns=481	async_read_minus_async_p50_ns=742	stream_minus_async_p50_ns=6181
+hot-block	index=55	start=13200	end=13440	sync_p50_ns=6612	async_inline_p50_ns=7053	async_read_p50_ns=7834	async_stream_p50_ns=13276	async_minus_sync_p50_ns=441	async_read_minus_async_p50_ns=781	stream_minus_async_p50_ns=6223
+hot-block	index=56	start=13440	end=13680	sync_p50_ns=6612	async_inline_p50_ns=7043	async_read_p50_ns=7884	async_stream_p50_ns=13335	async_minus_sync_p50_ns=431	async_read_minus_async_p50_ns=841	stream_minus_async_p50_ns=6292
+hot-block	index=57	start=13680	end=13920	sync_p50_ns=6592	async_inline_p50_ns=7063	async_read_p50_ns=7845	async_stream_p50_ns=13296	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=782	stream_minus_async_p50_ns=6233
+hot-block	index=58	start=13920	end=14160	sync_p50_ns=6612	async_inline_p50_ns=7103	async_read_p50_ns=7845	async_stream_p50_ns=13286	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=742	stream_minus_async_p50_ns=6183
+hot-block	index=59	start=14160	end=14400	sync_p50_ns=6593	async_inline_p50_ns=7083	async_read_p50_ns=7795	async_stream_p50_ns=13265	async_minus_sync_p50_ns=490	async_read_minus_async_p50_ns=712	stream_minus_async_p50_ns=6182
+hot-block	index=60	start=14400	end=14640	sync_p50_ns=6582	async_inline_p50_ns=7063	async_read_p50_ns=7794	async_stream_p50_ns=13285	async_minus_sync_p50_ns=481	async_read_minus_async_p50_ns=731	stream_minus_async_p50_ns=6222
+hot-block	index=61	start=14640	end=14880	sync_p50_ns=6583	async_inline_p50_ns=7044	async_read_p50_ns=7784	async_stream_p50_ns=13225	async_minus_sync_p50_ns=461	async_read_minus_async_p50_ns=740	stream_minus_async_p50_ns=6181
+hot-block	index=62	start=14880	end=15120	sync_p50_ns=6592	async_inline_p50_ns=7073	async_read_p50_ns=7835	async_stream_p50_ns=13244	async_minus_sync_p50_ns=481	async_read_minus_async_p50_ns=762	stream_minus_async_p50_ns=6171
+hot-block	index=63	start=15120	end=15360	sync_p50_ns=6602	async_inline_p50_ns=7103	async_read_p50_ns=7855	async_stream_p50_ns=13246	async_minus_sync_p50_ns=501	async_read_minus_async_p50_ns=752	stream_minus_async_p50_ns=6143
+hot-block	index=64	start=15360	end=15600	sync_p50_ns=6582	async_inline_p50_ns=7074	async_read_p50_ns=7825	async_stream_p50_ns=13284	async_minus_sync_p50_ns=492	async_read_minus_async_p50_ns=751	stream_minus_async_p50_ns=6210
+hot-block	index=65	start=15600	end=15840	sync_p50_ns=6602	async_inline_p50_ns=7073	async_read_p50_ns=7824	async_stream_p50_ns=13244	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=751	stream_minus_async_p50_ns=6171
+hot-block	index=66	start=15840	end=16080	sync_p50_ns=6592	async_inline_p50_ns=7103	async_read_p50_ns=7826	async_stream_p50_ns=13215	async_minus_sync_p50_ns=511	async_read_minus_async_p50_ns=723	stream_minus_async_p50_ns=6112
+hot-block	index=67	start=16080	end=16320	sync_p50_ns=6602	async_inline_p50_ns=7073	async_read_p50_ns=7865	async_stream_p50_ns=13245	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=792	stream_minus_async_p50_ns=6172
+hot-block	index=68	start=16320	end=16560	sync_p50_ns=6603	async_inline_p50_ns=7094	async_read_p50_ns=7824	async_stream_p50_ns=13275	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=730	stream_minus_async_p50_ns=6181
+hot-block	index=69	start=16560	end=16800	sync_p50_ns=6592	async_inline_p50_ns=7083	async_read_p50_ns=7794	async_stream_p50_ns=13255	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=711	stream_minus_async_p50_ns=6172
+hot-block	index=70	start=16800	end=17040	sync_p50_ns=6612	async_inline_p50_ns=7113	async_read_p50_ns=7845	async_stream_p50_ns=13324	async_minus_sync_p50_ns=501	async_read_minus_async_p50_ns=732	stream_minus_async_p50_ns=6211
+hot-block	index=71	start=17040	end=17280	sync_p50_ns=6602	async_inline_p50_ns=7073	async_read_p50_ns=7845	async_stream_p50_ns=13294	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=772	stream_minus_async_p50_ns=6221
+hot-block	index=72	start=17280	end=17520	sync_p50_ns=6613	async_inline_p50_ns=7084	async_read_p50_ns=7885	async_stream_p50_ns=13315	async_minus_sync_p50_ns=471	async_read_minus_async_p50_ns=801	stream_minus_async_p50_ns=6231
+hot-block	index=73	start=17520	end=17760	sync_p50_ns=6612	async_inline_p50_ns=7084	async_read_p50_ns=7836	async_stream_p50_ns=13315	async_minus_sync_p50_ns=472	async_read_minus_async_p50_ns=752	stream_minus_async_p50_ns=6231
+hot-block	index=74	start=17760	end=18000	sync_p50_ns=6613	async_inline_p50_ns=7064	async_read_p50_ns=7845	async_stream_p50_ns=13256	async_minus_sync_p50_ns=451	async_read_minus_async_p50_ns=781	stream_minus_async_p50_ns=6192
+hot-block	index=75	start=18000	end=18240	sync_p50_ns=6593	async_inline_p50_ns=7053	async_read_p50_ns=7805	async_stream_p50_ns=13274	async_minus_sync_p50_ns=460	async_read_minus_async_p50_ns=752	stream_minus_async_p50_ns=6221
+hot-block	index=76	start=18240	end=18480	sync_p50_ns=6623	async_inline_p50_ns=7114	async_read_p50_ns=7885	async_stream_p50_ns=13285	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=771	stream_minus_async_p50_ns=6171
+hot-block	index=77	start=18480	end=18720	sync_p50_ns=7894	async_inline_p50_ns=8385	async_read_p50_ns=9758	async_stream_p50_ns=16712	async_minus_sync_p50_ns=491	async_read_minus_async_p50_ns=1373	stream_minus_async_p50_ns=8327
+hot-block	index=78	start=18720	end=18960	sync_p50_ns=10750	async_inline_p50_ns=11552	async_read_p50_ns=12694	async_stream_p50_ns=22081	async_minus_sync_p50_ns=802	async_read_minus_async_p50_ns=1142	stream_minus_async_p50_ns=10529
+hot-block	index=79	start=18960	end=19200	sync_p50_ns=10881	async_inline_p50_ns=11562	async_read_p50_ns=12914	async_stream_p50_ns=22352	async_minus_sync_p50_ns=681	async_read_minus_async_p50_ns=1352	stream_minus_async_p50_ns=10790
+hot-block	index=80	start=19200	end=19440	sync_p50_ns=10940	async_inline_p50_ns=11643	async_read_p50_ns=13104	async_stream_p50_ns=22744	async_minus_sync_p50_ns=703	async_read_minus_async_p50_ns=1461	stream_minus_async_p50_ns=11101
+hot-block	index=81	start=19440	end=19680	sync_p50_ns=11241	async_inline_p50_ns=12013	async_read_p50_ns=13515	async_stream_p50_ns=23674	async_minus_sync_p50_ns=772	async_read_minus_async_p50_ns=1502	stream_minus_async_p50_ns=11661
+hot-block	index=82	start=19680	end=19920	sync_p50_ns=11652	async_inline_p50_ns=12343	async_read_p50_ns=14147	async_stream_p50_ns=24957	async_minus_sync_p50_ns=691	async_read_minus_async_p50_ns=1804	stream_minus_async_p50_ns=12614
+hot-block	index=83	start=19920	end=20160	sync_p50_ns=7243	async_inline_p50_ns=7815	async_read_p50_ns=9308	async_stream_p50_ns=15268	async_minus_sync_p50_ns=572	async_read_minus_async_p50_ns=1493	stream_minus_async_p50_ns=7453
+hot-block	index=84	start=20160	end=20400	sync_p50_ns=6753	async_inline_p50_ns=7313	async_read_p50_ns=8456	async_stream_p50_ns=14967	async_minus_sync_p50_ns=560	async_read_minus_async_p50_ns=1143	stream_minus_async_p50_ns=7654
+hot-block	index=85	start=20400	end=20640	sync_p50_ns=6723	async_inline_p50_ns=7344	async_read_p50_ns=8456	async_stream_p50_ns=14888	async_minus_sync_p50_ns=621	async_read_minus_async_p50_ns=1112	stream_minus_async_p50_ns=7544
+hot-block	index=86	start=20640	end=20880	sync_p50_ns=6853	async_inline_p50_ns=7353	async_read_p50_ns=8556	async_stream_p50_ns=14757	async_minus_sync_p50_ns=500	async_read_minus_async_p50_ns=1203	stream_minus_async_p50_ns=7404
+hot-block	index=87	start=20880	end=21120	sync_p50_ns=6843	async_inline_p50_ns=7443	async_read_p50_ns=8486	async_stream_p50_ns=14728	async_minus_sync_p50_ns=600	async_read_minus_async_p50_ns=1043	stream_minus_async_p50_ns=7285
+hot-block	index=88	start=21120	end=21360	sync_p50_ns=6872	async_inline_p50_ns=7555	async_read_p50_ns=8456	async_stream_p50_ns=14878	async_minus_sync_p50_ns=683	async_read_minus_async_p50_ns=901	stream_minus_async_p50_ns=7323
+hot-block	index=89	start=21360	end=21600	sync_p50_ns=6773	async_inline_p50_ns=7524	async_read_p50_ns=8486	async_stream_p50_ns=14798	async_minus_sync_p50_ns=751	async_read_minus_async_p50_ns=962	stream_minus_async_p50_ns=7274
+hot-block	index=90	start=21600	end=21840	sync_p50_ns=6772	async_inline_p50_ns=7433	async_read_p50_ns=8477	async_stream_p50_ns=14808	async_minus_sync_p50_ns=661	async_read_minus_async_p50_ns=1044	stream_minus_async_p50_ns=7375
+hot-block	index=91	start=21840	end=22080	sync_p50_ns=6832	async_inline_p50_ns=7475	async_read_p50_ns=8508	async_stream_p50_ns=15029	async_minus_sync_p50_ns=643	async_read_minus_async_p50_ns=1033	stream_minus_async_p50_ns=7554
+hot-block	index=92	start=22080	end=22320	sync_p50_ns=6802	async_inline_p50_ns=7504	async_read_p50_ns=8466	async_stream_p50_ns=14919	async_minus_sync_p50_ns=702	async_read_minus_async_p50_ns=962	stream_minus_async_p50_ns=7415
+hot-block	index=93	start=22320	end=22560	sync_p50_ns=6834	async_inline_p50_ns=7334	async_read_p50_ns=8496	async_stream_p50_ns=15048	async_minus_sync_p50_ns=500	async_read_minus_async_p50_ns=1162	stream_minus_async_p50_ns=7714
+hot-block	index=94	start=22560	end=22800	sync_p50_ns=6883	async_inline_p50_ns=7494	async_read_p50_ns=8546	async_stream_p50_ns=15098	async_minus_sync_p50_ns=611	async_read_minus_async_p50_ns=1052	stream_minus_async_p50_ns=7604
+hot-block	index=95	start=22800	end=23040	sync_p50_ns=6863	async_inline_p50_ns=7374	async_read_p50_ns=8626	async_stream_p50_ns=14889	async_minus_sync_p50_ns=511	async_read_minus_async_p50_ns=1252	stream_minus_async_p50_ns=7515
+hot-block	index=96	start=23040	end=23280	sync_p50_ns=6843	async_inline_p50_ns=7454	async_read_p50_ns=8406	async_stream_p50_ns=14999	async_minus_sync_p50_ns=611	async_read_minus_async_p50_ns=952	stream_minus_async_p50_ns=7545
+hot-block	index=97	start=23280	end=23520	sync_p50_ns=6883	async_inline_p50_ns=7524	async_read_p50_ns=8556	async_stream_p50_ns=15007	async_minus_sync_p50_ns=641	async_read_minus_async_p50_ns=1032	stream_minus_async_p50_ns=7483
+hot-block	index=98	start=23520	end=23760	sync_p50_ns=6912	async_inline_p50_ns=7364	async_read_p50_ns=8516	async_stream_p50_ns=14928	async_minus_sync_p50_ns=452	async_read_minus_async_p50_ns=1152	stream_minus_async_p50_ns=7564
+hot-block	index=99	start=23760	end=24000	sync_p50_ns=6914	async_inline_p50_ns=7556	async_read_p50_ns=8437	async_stream_p50_ns=14998	async_minus_sync_p50_ns=642	async_read_minus_async_p50_ns=881	stream_minus_async_p50_ns=7442
+hot-comparison	name=async-export-over-sync-export	p50_delta_ns=491	p95_delta_ns=822	p50_slowdown_percent=7.370	p95_slowdown_percent=7.500	paired_p50_delta_ns=471	paired_p95_delta_ns=2004	paired_mean_delta_ns=579.020	iid_paired_mean_ci95_low_ns=529.993	iid_paired_mean_ci95_high_ns=628.047	candidate_slower_percent=85.037	p50_margin_ns=500.000	p95_margin_ns=1000.000	point_gate_pass=true	iid_ci_guard_pass=false	conservative_gate_pass=false
+hot-comparison	name=async-read-over-sync-read	p50_delta_ns=802	p95_delta_ns=1382	p50_slowdown_percent=11.212	p95_slowdown_percent=11.730	paired_p50_delta_ns=693	paired_p95_delta_ns=2676	paired_mean_delta_ns=788.014	iid_paired_mean_ci95_low_ns=735.084	iid_paired_mean_ci95_high_ns=840.943	candidate_slower_percent=90.592	p50_margin_ns=500.000	p95_margin_ns=1000.000	point_gate_pass=false	iid_ci_guard_pass=false	conservative_gate_pass=false
+hot-comparison	name=async-stream-over-inline-output	p50_delta_ns=6251	p95_delta_ns=13126	p50_slowdown_percent=87.390	p95_slowdown_percent=111.407	paired_p50_delta_ns=6322	paired_p95_delta_ns=13075	paired_mean_delta_ns=7124.391	iid_paired_mean_ci95_low_ns=7059.724	iid_paired_mean_ci95_high_ns=7189.059	candidate_slower_percent=98.121	p50_margin_ns=500.000	p95_margin_ns=1000.000	point_gate_pass=false	iid_ci_guard_pass=false	conservative_gate_pass=false
+hot-decision	scope=ready-262-byte-random-reads-one-change	async_export_conservative_gate_pass=false	async_read_conservative_gate_pass=false	async_stream_conservative_gate_pass=false	stream_payload_bytes=262	stream_memory_comparison=not-measured

@@ -1,5 +1,5 @@
 [toolchain]
-channel = "nightly-2026-05-21" # also Cargo.toml and /.vscode/settings.json
+channel = "nightly-2026-07-23" # also /.vscode/settings.json
 components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]
 targets = ["wasm32-unknown-unknown", "wasm32-wasip2"]
 profile = "minimal"

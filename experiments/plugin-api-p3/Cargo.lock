@@ -837,24 +837,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "p3-stream-probe-guest"
-version = "0.1.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
-name = "p3-stream-probe-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "tokio",
- "wasmtime",
- "wasmtime-wasi",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -865,6 +847,24 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "plugin-api-p3-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "plugin-api-p3-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "tokio",
+ "wasmtime",
+ "wasmtime-wasi",
+]
 
 [[package]]
 name = "postcard"
@@ -1791,6 +1791,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a301904d6657d6364c758d869e5389d05d393b16d5b65db60b4f03cbe71bb80d"
 dependencies = [
  "bitflags",
+ "futures",
  "wit-bindgen-rust-macro",
 ]
 
