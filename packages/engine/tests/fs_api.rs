@@ -1531,6 +1531,46 @@ async fn plugin_data_used_by_aggregate_does_not_acknowledge_remote_entities() {
 }
 
 #[tokio::test]
+async fn native_file_read_acknowledges_rendered_plugin_entities() {
+    let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
+    write_file(&session_a, "/shared.keyed", b"root=0\n".to_vec())
+        .await
+        .expect("seed file should write");
+
+    assert_eq!(
+        session_b
+            .read_file_data("/shared.keyed".to_string())
+            .await
+            .expect("initial native plugin file read")
+            .map(|data| data.to_vec()),
+        Some(b"root=0\n".to_vec())
+    );
+
+    write_file(&session_a, "/shared.keyed", b"remote=R\nroot=0\n".to_vec())
+        .await
+        .expect("remote entity should write");
+    assert_eq!(
+        session_b
+            .read_file_data("/shared.keyed".to_string())
+            .await
+            .expect("updated native plugin file read")
+            .map(|data| data.to_vec()),
+        Some(b"remote=R\nroot=0\n".to_vec())
+    );
+
+    // The second native read delivered the remote entity, so a later client
+    // omission intentionally removes it instead of treating it as unseen
+    // concurrent state that must be preserved.
+    write_file(&session_b, "/shared.keyed", b"root=B\n".to_vec())
+        .await
+        .expect("acknowledged client edit should write");
+    assert_eq!(
+        keyed_entity_values(&session_a, "/shared.keyed").await,
+        BTreeMap::from([("root".to_string(), "B".to_string())])
+    );
+}
+
+#[tokio::test]
 async fn plugin_point_read_filtered_by_null_does_not_acknowledge_remote_entities() {
     let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
     write_file(&session_a, "/shared.keyed", b"root=0\n".to_vec())

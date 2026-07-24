@@ -246,6 +246,36 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
 }
 
 #[tokio::test]
+async fn rs_sdk_native_file_read_distinguishes_missing_and_empty_files() {
+    let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
+
+    assert_eq!(
+        lix.read_file_data("/native/missing.bin")
+            .await
+            .expect("read missing native file")
+            .map(|data| data.to_vec()),
+        None
+    );
+
+    lix.upsert_file_data("/native/empty.bin", Vec::<u8>::new())
+        .await
+        .expect("create empty native file");
+    assert_eq!(
+        lix.read_file_data("/native/empty.bin")
+            .await
+            .expect("read empty native file")
+            .map(|data| data.to_vec()),
+        Some(Vec::new())
+    );
+
+    let error = lix
+        .read_file_data("relative.bin")
+        .await
+        .expect_err("relative native file path should be rejected");
+    assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+}
+
+#[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     let main_branch_id = lix.active_branch_id().await.unwrap();

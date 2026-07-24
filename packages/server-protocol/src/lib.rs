@@ -5,7 +5,7 @@ use axum::{
     Extension, Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Query, Request, State},
-    http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
+    http::{HeaderMap, HeaderName, StatusCode, header::CACHE_CONTROL},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -51,6 +51,9 @@ pub const PROTOCOL_PATH: &str = "/lix/v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
+/// Header distinguishing a missing file from a present empty file on the raw
+/// binary file-read endpoint.
+pub const FILE_FOUND_HEADER: &str = "lix-file-found";
 /// Default maximum number of live remote sessions for one workspace.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
@@ -695,6 +698,7 @@ where
         let protected = Router::new()
             .route("/lix/v1/execute", post(execute::<S>))
             .route("/lix/v1/execute-batch", post(execute_batch::<S>))
+            .route("/lix/v1/file", get(read_file_data::<S>))
             .route("/lix/v1/file/upsert", post(upsert_file_data::<S>))
             .route(
                 "/lix/v1/file/upsert-batch",
@@ -1090,6 +1094,7 @@ where
                 request_blob_splice: true,
                 binary_file_upsert: true,
                 binary_file_upsert_batch: true,
+                binary_file_read: true,
             },
         }),
     ))
@@ -1348,6 +1353,44 @@ fn take_binary_file_upsert_batch_range(
     }
     *offset = end;
     Ok(start..end)
+}
+
+/// Reads one file as a raw octet stream.
+///
+/// `Lix-File-Found: true` distinguishes a present empty file from a missing
+/// file (`false`), whose body is also empty. The response is explicitly
+/// non-cacheable because the session's rendered plugin view is part of the
+/// collaboration protocol.
+async fn read_file_data<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+    Query(request): Query<BinaryFileReadRequest>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = required_non_empty(request.path, "path")?;
+    let data = lease
+        .run(move |lix| async move { lix.read_file_data(path).await })
+        .await?;
+    let (found, body) = data.map_or_else(
+        || ("false", Bytes::new()),
+        |data| ("true", data.into_bytes()),
+    );
+    let mut response = Response::new(axum::body::Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        HeaderName::from_static(FILE_FOUND_HEADER),
+        axum::http::HeaderValue::from_static(found),
+    );
+    Ok(response)
 }
 
 async fn create_branch<S>(
@@ -1984,10 +2027,14 @@ struct HandshakeResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+// These are independently negotiated wire capabilities; grouping them would
+// change the flat handshake response without reducing protocol complexity.
+#[allow(clippy::struct_excessive_bools)]
 struct ProtocolCapabilities {
     request_blob_splice: bool,
     binary_file_upsert: bool,
     binary_file_upsert_batch: bool,
+    binary_file_read: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2004,6 +2051,11 @@ struct ExecuteRequest {
 
 #[derive(Debug, Deserialize)]
 struct BinaryFileUpdateRequest {
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinaryFileReadRequest {
     path: Option<String>,
 }
 
@@ -2798,6 +2850,7 @@ mod tests {
         assert_eq!(first["capabilities"]["requestBlobSplice"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsertBatch"], true);
+        assert_eq!(first["capabilities"]["binaryFileRead"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -2984,6 +3037,172 @@ mod tests {
         assert_eq!(
             response_json(created_selected).await["rows"][0][0],
             wire_blob_json(&created_payload)
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_file_read_returns_raw_bytes_and_distinguishes_empty_and_missing() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let payload = vec![0, 1, 2, 3, 255];
+        let inserted = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(payload.clone()))
+                    .expect("binary file seed request"),
+            )
+            .await
+            .expect("binary file seed response");
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .expect("binary file read request"),
+            )
+            .await
+            .expect("binary file read response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static(
+                "application/octet-stream"
+            ))
+        );
+        assert_eq!(
+            response.headers().get(FILE_FOUND_HEADER),
+            Some(&axum::http::HeaderValue::from_static("true"))
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("read body")
+                .to_bytes()
+                .as_ref(),
+            payload.as_slice()
+        );
+
+        let emptied = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::empty())
+                    .expect("empty binary file update request"),
+            )
+            .await
+            .expect("empty binary file update response");
+        assert_eq!(emptied.status(), StatusCode::OK);
+
+        let empty = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .expect("empty binary file read request"),
+            )
+            .await
+            .expect("empty binary file read response");
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(
+            empty.headers().get(FILE_FOUND_HEADER),
+            Some(&axum::http::HeaderValue::from_static("true"))
+        );
+        assert!(
+            empty
+                .into_body()
+                .collect()
+                .await
+                .expect("empty read body")
+                .to_bytes()
+                .is_empty()
+        );
+
+        let missing = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fmissing.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .expect("missing binary file read request"),
+            )
+            .await
+            .expect("missing binary file read response");
+        assert_eq!(missing.status(), StatusCode::OK);
+        assert_eq!(
+            missing.headers().get(FILE_FOUND_HEADER),
+            Some(&axum::http::HeaderValue::from_static("false"))
+        );
+        assert!(
+            missing
+                .into_body()
+                .collect()
+                .await
+                .expect("missing read body")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_file_read_requires_a_live_session_and_valid_path() {
+        let app = app().await;
+        let missing_session = request(
+            &app.router,
+            "GET",
+            "/lix/v1/file?path=%2Fpayload.bin",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_code(missing_session).await,
+            "LIX_ERROR_PROTOCOL_SESSION_REQUIRED"
+        );
+
+        let (session_id, _) = new_session(&app.router).await;
+        let invalid_path = request(
+            &app.router,
+            "GET",
+            "/lix/v1/file?path=relative.bin",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(invalid_path.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_code(invalid_path).await,
+            "LIX_ERROR_PATH_MISSING_LEADING_SLASH"
         );
     }
 

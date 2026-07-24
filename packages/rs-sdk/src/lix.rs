@@ -233,6 +233,14 @@ where
         self.session.upsert_file_data_batch(writes).await
     }
 
+    /// Reads one file's bytes by full logical path without parsing SQL.
+    ///
+    /// The returned `None` means the file is absent; `Some` with an empty
+    /// [`Blob`] means a present empty file.
+    pub async fn read_file_data(&self, path: impl Into<String>) -> Result<Option<Blob>, LixError> {
+        self.session.read_file_data(path.into()).await
+    }
+
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.
