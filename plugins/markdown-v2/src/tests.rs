@@ -73,11 +73,26 @@ fn cold_entity_open_roundtrips_the_complete_gfm_document() {
     let source = b"---\ntitle: Test\n---\n\n| A | B |\n| --- | --- |\n| *x* | `y` |\n".to_vec();
     let (_, changes) =
         Document::open_file(source, Some("table.md"), IdNamespace::from_halves(9, 10)).unwrap();
-    let (document, edits) = Document::open_entities(records(&changes)).unwrap();
+    let (document, edits) = Document::open_entities(records(&changes), None).unwrap();
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].offset, 0);
     assert_eq!(edits[0].delete_len, 0);
     assert_eq!(document.accepted_bytes(), edits[0].insert.as_slice());
+}
+
+#[test]
+fn cold_entity_open_reuses_host_verified_materialized_bytes() {
+    let source = b"Alpha\n\nBeta\n".to_vec();
+    let (_, changes) = Document::open_file(
+        source.clone(),
+        Some("accepted.md"),
+        IdNamespace::from_halves(9, 10),
+    )
+    .unwrap();
+    let (document, edits) =
+        Document::open_entities(records(&changes), Some(source.clone())).unwrap();
+    assert!(edits.is_empty());
+    assert_eq!(document.accepted_bytes(), source);
 }
 
 #[test]
@@ -98,7 +113,7 @@ fn cold_entity_open_preserves_accepted_noncanonical_source_bytes() {
             IdNamespace::from_halves(9, 10),
         )
         .unwrap_or_else(|error| panic!("{name}: open file failed: {error:?}"));
-        let (cold, edits) = Document::open_entities(records(&changes))
+        let (cold, edits) = Document::open_entities(records(&changes), None)
             .unwrap_or_else(|error| panic!("{name}: cold open failed: {error:?}"));
         assert_eq!(cold.accepted_bytes(), source, "{name}");
         assert_eq!(edits.len(), 1, "{name}");
@@ -134,7 +149,7 @@ fn cold_entity_open_ignores_stale_raw_fallback_after_direct_entity_edit() {
     wire["payload_json"] = serde_json::to_string(&payload).unwrap().into();
     paragraph.snapshot = serde_json::to_vec(&wire).unwrap();
 
-    let (cold, edits) = Document::open_entities(records).unwrap();
+    let (cold, edits) = Document::open_entities(records, None).unwrap();
     assert_eq!(cold.accepted_bytes(), b"After\n\nUntouched");
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].insert.as_slice(), b"After\n\nUntouched");
@@ -183,7 +198,7 @@ fn incremental_paragraph_edit_preserves_unrelated_entities_after_cold_reopen() {
         .iter()
         .map(|record| record.entity_pk.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let (document, _) = Document::open_entities(initial_records).unwrap();
+    let (document, _) = Document::open_entities(initial_records, None).unwrap();
     let offset = source
         .windows(b"Bravo".len())
         .position(|window| window == b"Bravo")

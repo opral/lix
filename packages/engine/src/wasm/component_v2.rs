@@ -447,6 +447,7 @@ impl fmt::Debug for WasmOpenFileInput {
 pub struct WasmOpenEntitiesInput {
     pub descriptor: WasmFileDescriptor,
     pub entities: Box<dyn WasmEntitySource>,
+    pub accepted: Option<Arc<dyn WasmByteSource>>,
 }
 
 impl fmt::Debug for WasmOpenEntitiesInput {
@@ -454,6 +455,10 @@ impl fmt::Debug for WasmOpenEntitiesInput {
         formatter
             .debug_struct("WasmOpenEntitiesInput")
             .field("descriptor", &self.descriptor)
+            .field(
+                "accepted_len",
+                &self.accepted.as_ref().map(|source| source.len()),
+            )
             .finish_non_exhaustive()
     }
 }

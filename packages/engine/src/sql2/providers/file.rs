@@ -45,12 +45,9 @@ use crate::live_state::{
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
-    PluginActorColdOpen, PluginActorKey, PluginActorStore, PluginFileOwner, PluginRegistry,
-    PluginRegistryEntry, PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
-    host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
-    plugin_key_from_archive_file_id, plugin_key_from_archive_path,
-    plugin_state_live_state_projection, plugin_storage_archive_file_id,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
+    PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
+    plugin_key_from_archive_file_id, plugin_key_from_archive_path, plugin_storage_archive_file_id,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -67,10 +64,10 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::wasm::{
-    WasmComponentV2Factory, WasmFileDescriptor, WasmHostEntity, WasmOpenEntitiesInput,
-    WasmPluginSelection, WasmTransitionLimits,
-};
+#[cfg(test)]
+use crate::plugin::host_entity_with_lazy_snapshot;
+#[cfg(test)]
+use crate::wasm::{WasmHostEntity, WasmTransitionLimits};
 use crate::{
     GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
     serialize_row_metadata,
@@ -508,8 +505,9 @@ impl LixFileSpec {
 
 /// Executes the narrow active-branch point-read shape without constructing a
 /// DataFusion catalog and plan. Row selection, branch visibility, blob
-/// loading, plugin rendering, and session acknowledgement all stay on the
-/// regular `lix_file` provider helpers below.
+/// loading and plugin rendering stay on the regular `lix_file` provider
+/// helpers below. Durable materialized reads do not hydrate a Wasm actor;
+/// mutation state is opened lazily by the first write.
 pub(crate) async fn execute_exact_lix_file_read(
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
@@ -925,25 +923,27 @@ impl TableSpec for LixFileSpec {
                             "sql2 lix_file row preparation failed: {error}"
                         ))
                     })?;
-                    let plugin_render = if prepared.needs_plugin_render(needs_data) {
-                        plugin_render_context_for_lix_file_scan(
-                            Arc::clone(&live_state),
-                            &request,
-                            plugin_host,
-                            &prepared,
-                            false,
-                        )
-                        .await
-                        .map_err(|error| {
-                            DataFusionError::Context(
-                                "sql2 lix_file plugin discovery failed".to_string(),
-                                Box::new(lix_error_to_datafusion_error(error)),
+                    let acknowledge_plugin_data = needs_data && session_file_views.is_some();
+                    let plugin_render =
+                        if prepared.needs_plugin_render(needs_data) || acknowledge_plugin_data {
+                            plugin_render_context_for_lix_file_scan(
+                                Arc::clone(&live_state),
+                                &request,
+                                plugin_host,
+                                &prepared,
+                                acknowledge_plugin_data,
                             )
-                        })?
-                        .map(|context| context.with_session_file_views(session_file_views))
-                    } else {
-                        None
-                    };
+                            .await
+                            .map_err(|error| {
+                                DataFusionError::Context(
+                                    "sql2 lix_file plugin discovery failed".to_string(),
+                                    Box::new(lix_error_to_datafusion_error(error)),
+                                )
+                            })?
+                            .map(|context| context.with_session_file_views(session_file_views))
+                        } else {
+                            None
+                        };
                     let batch = lix_file_record_batch_from_prepared(
                         &batch_schema,
                         &blob_reader,
@@ -1841,7 +1841,6 @@ impl FileDescriptorRecord {
 
 #[derive(Clone)]
 struct PluginRenderContext {
-    live_state: Arc<dyn LiveStateReader>,
     host: PluginRuntimeHost,
     branches: BTreeMap<String, BranchPluginRenderContext>,
     owners_by_file: BTreeMap<FilesystemDescriptorKey, PluginFileOwner>,
@@ -4235,15 +4234,15 @@ async fn render_plugin_files_for_sql(
         )
         .await?;
     }
-    // Plugin data is durably materialized before SQL reads. Raw blob loading
-    // remains in the caller; this function only restores a cold actor for a
-    // later sparse transition when a session view is requested.
+    // Plugin data is durably materialized before SQL reads. A warm actor
+    // contributes an exact observation; a cold read records only identity and
+    // lets the first mutation restore the actor.
     Ok(BTreeMap::new())
 }
 
 async fn acknowledge_materialized_v2_file(
     plugin_render: &PluginRenderContext,
-    blob_reader: &Arc<dyn BlobDataReader>,
+    _blob_reader: &Arc<dyn BlobDataReader>,
     file_key: &FilesystemDescriptorKey,
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
@@ -4286,19 +4285,8 @@ async fn acknowledge_materialized_v2_file(
     };
     let cache = plugin_render.host.actor_cache();
     let observation = match cache.observe(&actor_key, &semantic_root).await {
-        Ok(observation) => observation,
-        Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
-            cold_open_materialized_v2_actor(
-                plugin_render,
-                blob_reader,
-                plugin,
-                &actor_key,
-                path,
-                blob,
-                &semantic_root,
-            )
-            .await?
-        }
+        Ok(observation) => Some(observation),
+        Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => None,
         Err(error) => return Err(error),
     };
     if let Some(session_file_views) = &plugin_render.session_file_views {
@@ -4308,128 +4296,14 @@ async fn acknowledge_materialized_v2_file(
                 plugin_key: plugin.key().to_string(),
                 plugin_generation: plugin.archive_blob_hash().to_string(),
                 owner_change_id: owner_change_id.to_string(),
-                observation: Some(observation),
+                observation,
             },
         );
     }
     Ok(())
 }
 
-async fn cold_open_materialized_v2_actor(
-    plugin_render: &PluginRenderContext,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    plugin: &PluginRegistryEntry,
-    actor_key: &PluginActorKey,
-    path: &str,
-    blob: &BlobRefRecord,
-    semantic_root: &str,
-) -> Result<crate::plugin::PluginObservation, LixError> {
-    let cache = plugin_render.host.actor_cache();
-    let _cold_open_guard = cache.cold_open_guard().await;
-    // Another reader may have populated this actor while we waited. Recheck
-    // under the shared cold gate before scanning full semantic state or
-    // instantiating another Store.
-    let cold_open = cache.prepare_cold_open(actor_key, semantic_root).await?;
-    let mut cold_install: PluginActorColdInstall = match cold_open {
-        PluginActorColdOpen::Ready(observation) => return Ok(observation),
-        PluginActorColdOpen::Build(cold_install) => cold_install,
-    };
-    let store_permit = cache.admit_cold_store(&mut cold_install)?;
-    let limits = WasmTransitionLimits::default();
-    let factory = resolve_v2_factory(&plugin_render.host, blob_reader, plugin).await?;
-    let mut rows = plugin_render
-        .live_state
-        .scan_tracked_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: plugin.schema_keys().to_vec(),
-                branch_ids: vec![actor_key.branch_id.clone()],
-                file_ids: vec![crate::NullableKeyFilter::Value(actor_key.file_id.clone())],
-                untracked: Some(false),
-                ..LiveStateFilter::default()
-            },
-            projection: plugin_state_live_state_projection(),
-            limit: None,
-        })
-        .await?;
-    rows.retain(|row| {
-        row.branch_id == actor_key.branch_id
-            && row.file_id.as_deref() == Some(actor_key.file_id.as_str())
-            && !row.global
-            && !row.untracked
-            && row.snapshot_content.is_some()
-            && plugin.schema_keys().binary_search(&row.schema_key).is_ok()
-    });
-    let entities = v2_read_host_entities(rows, limits)?;
-    let entity_count = entities.len();
-    let source = VecEntitySource::new(entities, limits)?;
-    let materialized_hash = BlobHash::from_hex(&blob.blob_hash)?;
-    let values = blob_reader
-        .load_bytes_many(&[materialized_hash])
-        .await?
-        .into_vec();
-    let materialized_bytes: crate::Blob = values
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or_else(|| {
-            invalid_plugin_read_state(format!(
-                "materialized v2 blob '{}' is missing",
-                blob.blob_hash
-            ))
-        })?
-        .into();
-    let mut actor = factory.instantiate_actor().await?;
-    let transition = match actor
-        .open_entities(
-            limits,
-            WasmOpenEntitiesInput {
-                descriptor: v2_read_descriptor(path, plugin),
-                entities: Box::new(source),
-            },
-        )
-        .await
-    {
-        Ok(transition) => transition,
-        Err(error) => {
-            let _ = actor.retire().await;
-            return Err(error);
-        }
-    };
-    let validated = match drain_entity_transition_edits(
-        actor.as_mut(),
-        transition,
-        &[],
-        Some(materialized_bytes.clone()),
-        None,
-        limits,
-    )
-    .await
-    {
-        Ok(validated) => validated,
-        Err(error) => {
-            let _ = actor.retire().await;
-            return Err(error);
-        }
-    };
-    let mut counters = validated.counters;
-    counters.full_state_semantic_rows_materialized =
-        u64::try_from(entity_count).unwrap_or(u64::MAX);
-    counters.full_document_reparses = 1;
-    counters.full_renderer_invocations = 1;
-    plugin_render.host.record_v2_transition_counters(counters);
-    cache
-        .install_cold_if_absent(
-            cold_install,
-            actor_key.clone(),
-            PluginActorStore::new(actor, store_permit),
-            validated.document,
-            materialized_bytes.clone(),
-            validated.bytes_sha256,
-            Arc::<str>::from(semantic_root),
-        )
-        .await
-}
-
+#[cfg(test)]
 fn v2_read_host_entities(
     rows: Vec<MaterializedLiveStateRow>,
     limits: WasmTransitionLimits,
@@ -4451,43 +4325,6 @@ fn v2_read_host_entities(
         .collect::<Result<Vec<_>, _>>()?;
     entities.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(entities)
-}
-
-async fn resolve_v2_factory(
-    host: &PluginRuntimeHost,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    plugin: &PluginRegistryEntry,
-) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
-    let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
-    if let Some(factory) = host.cached_plugin_v2_factory(plugin.key(), wasm_hash)? {
-        return Ok(factory);
-    }
-    let wasm = blob_reader
-        .load_bytes_many(&[wasm_hash])
-        .await?
-        .into_vec()
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or_else(|| {
-            invalid_plugin_read_state(format!(
-                "plugin registry references missing WASM blob '{}'",
-                plugin.wasm_blob_hash()
-            ))
-        })?;
-    host.load_or_compile_v2_factory(&plugin.to_installed_plugin(wasm)?)
-        .await
-}
-
-fn v2_read_descriptor(path: &str, plugin: &PluginRegistryEntry) -> WasmFileDescriptor {
-    WasmFileDescriptor {
-        path: Some(path.to_string()),
-        media_type: inferred_media_type_for_path(Some(path)).map(str::to_owned),
-        plugin: WasmPluginSelection {
-            plugin_key: plugin.key().to_string(),
-            generation: plugin.archive_blob_hash().to_string(),
-        },
-    }
 }
 
 async fn plugin_render_context_for_lix_file_scan(
@@ -4675,7 +4512,6 @@ async fn plugin_render_context_with_branches(
     }
 
     Ok(Some(PluginRenderContext {
-        live_state,
         host,
         branches,
         owners_by_file,

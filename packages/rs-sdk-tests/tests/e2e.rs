@@ -230,18 +230,9 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let deleted = b"first,ONE\nthird,THREE-B\n".to_vec();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(deleted.clone()));
 
-    // A session that never received the file has no omission authority. V2
-    // fails that blind replacement closed and leaves durable bytes untouched.
+    // Conflict objects are not modeled yet. A session that never received the
+    // file therefore applies its complete submitted document as last-write-wins.
     let blind = lix.open_workspace_session().await.unwrap();
-    let error = write_file(&blind, path, b"first,ONE\n".to_vec())
-        .await
-        .expect_err("blind v2 overwrite must require an exact observation");
-    assert_eq!(error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(deleted.clone()));
-
-    // Once the session receives the complete blob, omitting the row is an
-    // acknowledged deletion.
-    assert_eq!(read_file(&blind, path).await.unwrap(), Some(deleted));
     write_file(&blind, path, b"first,ONE\n".to_vec())
         .await
         .unwrap();
