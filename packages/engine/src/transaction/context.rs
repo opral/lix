@@ -35,7 +35,10 @@ use crate::filesystem::{
     load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::gc::CheckpointRecoveryRef;
+use crate::gc::{
+    CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_gc_state,
+    load_recovery_ref,
+};
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection,
     LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -1795,6 +1798,8 @@ where
         branch_id: String,
         previous_checkpoint_commit_id: CommitId,
         recovered_head_commit_id: CommitId,
+        interval_has_commits: bool,
+        gc_state: CheckpointGcState,
         selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
     ) -> Result<String, LixError> {
         let commit_id = self
@@ -1804,12 +1809,31 @@ where
         self.staged_writes
             .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
         self.staged_writes
-            .add_checkpoint_recovery_ref(CheckpointRecoveryRef {
-                branch_id,
-                recovered_head_commit_id,
-                checkpoint_commit_id,
+            .add_checkpoint_publication(CheckpointPublication {
+                recovery_ref: CheckpointRecoveryRef {
+                    branch_id,
+                    recovered_head_commit_id,
+                    checkpoint_commit_id,
+                    interval_has_commits,
+                },
+                gc_state,
             })?;
         Ok(commit_id)
+    }
+
+    /// Loads the branch-local recovery root and repository-global maintenance
+    /// state from one storage snapshot.
+    pub(crate) async fn checkpoint_publication_state(
+        &self,
+        branch_id: &str,
+    ) -> Result<(Option<CheckpointRecoveryRef>, CheckpointGcState), LixError> {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
+        let recovery_ref = load_recovery_ref(&read, branch_id).await?;
+        let gc_state = load_checkpoint_gc_state(&read).await?;
+        Ok((recovery_ref, gc_state))
     }
 
     /// Creates a branch-ref reader scoped to this write transaction.

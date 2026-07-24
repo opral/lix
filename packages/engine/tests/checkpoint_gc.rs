@@ -3,6 +3,9 @@ mod support;
 
 use lix_engine::{CreateBranchOptions, Value};
 use serde_json::json;
+use tokio::time::{Duration, Instant};
+
+const CHECKPOINT_GC_INTERVAL: u64 = 64;
 
 simulation_test!(
     checkpoint_gc_keeps_one_recovery_interval_then_sweeps_it,
@@ -37,6 +40,9 @@ simulation_test!(
             .expect("second checkpoint should succeed");
         assert_commits(&session, &[&interval_one_first, &interval_one_second], true).await;
 
+        advance_to_next_gc(&session, 1).await;
+        assert_commits(&session, &[&interval_one_first, &interval_one_second], true).await;
+
         session
             .execute(
                 "UPDATE lix_key_value SET value = 'interval-two' WHERE key = 'gc-key'",
@@ -57,7 +63,7 @@ simulation_test!(
             .await
             .expect("third checkpoint should succeed");
 
-        assert_commits(
+        wait_for_commits(
             &session,
             &[&interval_one_first, &interval_one_second],
             false,
@@ -127,6 +133,7 @@ simulation_test!(
         })
         .await
         .expect("branch should be created from the recoverable auto-commit");
+        advance_to_next_gc(&main, 1).await;
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('main-after-branch', 'main')",
             &[],
@@ -160,6 +167,82 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    checkpoint_gc_aggregates_recovery_intervals_across_branches,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        main.create_branch(CreateBranchOptions {
+            id: Some("gc-other-branch".to_string()),
+            name: "GC other branch".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("other branch should be created");
+        let other = sim.wrap_session(
+            engine
+                .open_session("gc-other-branch")
+                .await
+                .expect("other branch session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('gc-main', 'main')",
+            &[],
+        )
+        .await
+        .expect("main interval write should succeed");
+        let main_auto_commit = branch_head(&engine, sim.main_branch_id()).await;
+        main.create_checkpoint()
+            .await
+            .expect("main checkpoint should retain its interval");
+        main.create_checkpoint()
+            .await
+            .expect("main recovery root should rotate");
+
+        other
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('gc-other', 'other')",
+                &[],
+            )
+            .await
+            .expect("other interval write should succeed");
+        let other_auto_commit = branch_head(&engine, "gc-other-branch").await;
+        other
+            .create_checkpoint()
+            .await
+            .expect("other checkpoint should retain its interval");
+        other
+            .create_checkpoint()
+            .await
+            .expect("other recovery root should rotate");
+
+        assert_commits(&main, &[&main_auto_commit, &other_auto_commit], true).await;
+        for _ in 4..CHECKPOINT_GC_INTERVAL {
+            main.create_checkpoint()
+                .await
+                .expect("global GC padding checkpoint should succeed");
+        }
+        wait_for_commits(&main, &[&main_auto_commit, &other_auto_commit], false).await;
+    }
+);
+
+async fn advance_to_next_gc(session: &support::simulation_test::engine::SimSession, sequence: u64) {
+    for _ in (sequence + 1)..CHECKPOINT_GC_INTERVAL {
+        session
+            .create_checkpoint()
+            .await
+            .expect("padding checkpoint should succeed");
+    }
+}
+
 async fn branch_head(engine: &lix_engine::Engine, branch_id: &str) -> String {
     engine
         .load_branch_head_commit_id(branch_id)
@@ -186,5 +269,42 @@ async fn assert_commits(
             expected_present,
             "unexpected reachability for commit {commit_id}"
         );
+    }
+}
+
+/// Checkpoint GC is deliberately asynchronous: the checkpoint/root
+/// publication is the foreground guarantee, while collection may complete
+/// after the API returns. Bound the wait so this test verifies eventual
+/// collection without introducing timing-sensitive assertions.
+async fn wait_for_commits(
+    session: &support::simulation_test::engine::SimSession,
+    commit_ids: &[&str],
+    expected_present: bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut matches = true;
+        for commit_id in commit_ids {
+            let result = session
+                .execute(
+                    &format!("SELECT id FROM lix_commit WHERE id = '{commit_id}'"),
+                    &[],
+                )
+                .await
+                .expect("commit existence query should succeed");
+            let present = !result.is_empty();
+            if present != expected_present {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return;
+        }
+        if Instant::now() >= deadline {
+            assert_commits(session, commit_ids, expected_present).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

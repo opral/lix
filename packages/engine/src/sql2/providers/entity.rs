@@ -1702,6 +1702,7 @@ mod tests {
             "lix_active_account",
             "lix_binary_blob_ref",
             "lix_change",
+            "lix_checkpoint_marker",
             "lix_directory_descriptor",
             "lix_file_descriptor",
         ] {

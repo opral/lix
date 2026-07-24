@@ -108,6 +108,13 @@ pub(crate) fn stage_commit_root(
     Ok(())
 }
 
+pub(crate) fn stage_delete_commit_root(writes: &mut StorageWriteSet, commit_id: CommitId) {
+    writes.delete(
+        TRACKED_STATE_COMMIT_ROOT_SPACE,
+        key(commit_root_key(commit_id)),
+    );
+}
+
 pub(crate) async fn read_chunk(
     store: &(impl StorageAdapterRead + ?Sized),
     hash: &[u8; TRACKED_STATE_HASH_BYTES],
@@ -325,6 +332,7 @@ mod tests {
     use crate::changelog::{
         CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId,
     };
+    use crate::gc::{CHECKPOINT_GC_STATE_SPACE, CHECKPOINT_RECOVERY_REF_SPACE};
     use crate::json_store::store::JSON_SPACE;
     use crate::live_state::LIVE_STATE_INDEX_ROW_SPACE;
     use crate::tracked_state::types::{
@@ -351,6 +359,8 @@ mod tests {
             CHANGE_SPACE,
             COMMIT_CHANGE_REF_CHUNK_SPACE,
             COMMIT_CHANGE_ID_SPACE,
+            CHECKPOINT_RECOVERY_REF_SPACE,
+            CHECKPOINT_GC_STATE_SPACE,
         ];
         let mut seen = BTreeMap::new();
         for space in spaces {

@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::branch::BranchRefReader;
-use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head};
+use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, latest_checkpoint_for_branch};
 use crate::commit_graph::CommitGraphReader;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
@@ -103,21 +103,23 @@ where
                     let mut tracked = TrackedStateContext::new().reader(store);
                     let mut rows = Vec::new();
                     for head in heads {
-                        let checkpoint =
-                            checkpoint_history_from_head(graph.as_mut(), &head.commit_id)
-                                .await
-                                .map_err(lix_error_to_datafusion_error)?
-                                .into_iter()
-                                .next()
-                                .ok_or_else(|| {
-                                    DataFusionError::Execution(format!(
-                                        "branch '{}' has no checkpoint baseline",
-                                        head.branch_id
-                                    ))
-                                })?;
+                        let checkpoint_commit_id = latest_checkpoint_for_branch(
+                            graph.as_mut(),
+                            &mut tracked,
+                            &head.commit_id,
+                            &head.branch_id,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "branch '{}' has no checkpoint baseline",
+                                head.branch_id
+                            ))
+                        })?;
                         let diff = tracked
                             .diff_commits(
-                                &checkpoint.commit_id.to_string(),
+                                &checkpoint_commit_id.to_string(),
                                 &head.commit_id.to_string(),
                                 &TrackedStateDiffRequest::default(),
                             )
@@ -154,7 +156,7 @@ where
     }
 }
 
-fn working_change_schema(by_branch: bool) -> SchemaRef {
+pub(super) fn working_change_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),

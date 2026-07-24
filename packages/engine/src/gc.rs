@@ -5,35 +5,78 @@
 //! recovered commit alive. The checkpoint transaction stages the rotation in
 //! the same storage write set that publishes the compacted checkpoint.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::binary_cas::{BinaryCasContext, BinaryCasGcSweep, BlobHash};
 use crate::changelog::{
-    ChangeRecordProjection, ChangelogContext, ChangelogReader, ChangelogWriter, CommitId, GcPlan,
-    GcRoot, materialize_change_payloads,
+    ChangeRecordProjection, ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot,
+    materialize_change_payloads,
 };
 use crate::live_state::LiveStateIndexContext;
 use crate::storage_adapter::{
-    ScanPlan, StorageAdapterRead, StorageKey, StoragePrefix, StorageProjectedValue,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
+    StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
-pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v1";
+pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v3";
 pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0008_0001),
     CHECKPOINT_RECOVERY_REF_NAMESPACE,
 );
+pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
+pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
 
-const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
+const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointRecoveryRef {
     pub(crate) branch_id: String,
     pub(crate) recovered_head_commit_id: CommitId,
     pub(crate) checkpoint_commit_id: CommitId,
+    pub(crate) interval_has_commits: bool,
+}
+
+/// Repository-global maintenance debt.
+///
+/// Checkpoint publication and recovery remain branch-local, but collection is
+/// repository-wide. One singleton prevents redundant full sweeps when several
+/// branches checkpoint concurrently or become due at the same time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CheckpointGcState {
+    pub(crate) checkpoint_sequence: u64,
+    pub(crate) last_gc_sequence: u64,
+    pub(crate) collectible_interval_count: u64,
+}
+
+impl CheckpointGcState {
+    pub(crate) fn add_collectible_interval(&mut self, interval_has_commits: bool) {
+        if !interval_has_commits {
+            return;
+        }
+        self.collectible_interval_count = self.collectible_interval_count.saturating_add(1);
+    }
+
+    pub(crate) fn has_collectible_debt(self) -> bool {
+        self.collectible_interval_count > 0
+    }
+
+    pub(crate) fn mark_collected(&mut self) {
+        self.last_gc_sequence = self.checkpoint_sequence;
+        self.collectible_interval_count = 0;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointPublication {
+    pub(crate) recovery_ref: CheckpointRecoveryRef,
+    pub(crate) gc_state: CheckpointGcState,
 }
 
 #[derive(musli::Encode)]
@@ -49,6 +92,16 @@ struct StoredCheckpointRecoveryRef {
     branch_id: String,
     recovered_head_commit_id: CommitId,
     checkpoint_commit_id: CommitId,
+    interval_has_commits: bool,
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCheckpointGcState {
+    format_version: u32,
+    checkpoint_sequence: u64,
+    last_gc_sequence: u64,
+    collectible_interval_count: u64,
 }
 
 /// Stages one branch's recovery-root rotation.
@@ -74,11 +127,36 @@ pub(crate) fn stage_recovery_ref_rotation(
             branch_id: recovery.branch_id.clone(),
             recovered_head_commit_id: recovery.recovered_head_commit_id,
             checkpoint_commit_id: recovery.checkpoint_commit_id,
+            interval_has_commits: recovery.interval_has_commits,
         },
     )?;
     writes.put(
         CHECKPOINT_RECOVERY_REF_SPACE,
         StorageKey(Bytes::from(key)),
+        StorageValue {
+            bytes: Bytes::from(value),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn stage_checkpoint_gc_state(
+    writes: &mut StorageWriteSet,
+    state: &CheckpointGcState,
+) -> Result<(), LixError> {
+    validate_checkpoint_gc_state(*state)?;
+    let value = storage_codec::encode(
+        "checkpoint GC state",
+        &StoredCheckpointGcState {
+            format_version: CHECKPOINT_GC_STATE_FORMAT_VERSION,
+            checkpoint_sequence: state.checkpoint_sequence,
+            last_gc_sequence: state.last_gc_sequence,
+            collectible_interval_count: state.collectible_interval_count,
+        },
+    )?;
+    writes.put(
+        CHECKPOINT_GC_STATE_SPACE,
+        StorageKey(Bytes::from_static(CHECKPOINT_GC_STATE_KEY)),
         StorageValue {
             bytes: Bytes::from(value),
         },
@@ -142,6 +220,7 @@ pub(crate) async fn load_recovery_refs(
                     branch_id: stored.branch_id,
                     recovered_head_commit_id: stored.recovered_head_commit_id,
                     checkpoint_commit_id: stored.checkpoint_commit_id,
+                    interval_has_commits: stored.interval_has_commits,
                 },
             );
         }
@@ -152,6 +231,81 @@ pub(crate) async fn load_recovery_refs(
     Ok(refs.into_values().collect())
 }
 
+pub(crate) async fn load_recovery_ref(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+) -> Result<Option<CheckpointRecoveryRef>, LixError> {
+    let key = recovery_ref_key(branch_id)?;
+    let result = PointReadPlan::new(
+        CHECKPOINT_RECOVERY_REF_SPACE,
+        &[StorageKey(Bytes::from(key))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    let Some(StorageProjectedValue::FullValue(bytes)) = result.value.into_iter().next().flatten()
+    else {
+        return Ok(None);
+    };
+    let stored: StoredCheckpointRecoveryRef =
+        storage_codec::decode("checkpoint recovery ref", &bytes)?;
+    validate_stored_recovery_ref(&stored, branch_id)?;
+    Ok(Some(CheckpointRecoveryRef {
+        branch_id: stored.branch_id,
+        recovered_head_commit_id: stored.recovered_head_commit_id,
+        checkpoint_commit_id: stored.checkpoint_commit_id,
+        interval_has_commits: stored.interval_has_commits,
+    }))
+}
+
+pub(crate) async fn load_checkpoint_gc_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<CheckpointGcState, LixError> {
+    let result = PointReadPlan::new(
+        CHECKPOINT_GC_STATE_SPACE,
+        &[StorageKey(Bytes::from_static(CHECKPOINT_GC_STATE_KEY))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    let Some(StorageProjectedValue::FullValue(bytes)) = result.value.into_iter().next().flatten()
+    else {
+        return Ok(CheckpointGcState::default());
+    };
+    let stored: StoredCheckpointGcState = storage_codec::decode("checkpoint GC state", &bytes)?;
+    if stored.format_version != CHECKPOINT_GC_STATE_FORMAT_VERSION {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "checkpoint GC state has unsupported format version {}",
+                stored.format_version
+            ),
+        ));
+    }
+    let state = CheckpointGcState {
+        checkpoint_sequence: stored.checkpoint_sequence,
+        last_gc_sequence: stored.last_gc_sequence,
+        collectible_interval_count: stored.collectible_interval_count,
+    };
+    validate_checkpoint_gc_state(state)?;
+    Ok(state)
+}
+
+fn validate_checkpoint_gc_state(state: CheckpointGcState) -> Result<(), LixError> {
+    let checkpoint_age = state
+        .checkpoint_sequence
+        .checked_sub(state.last_gc_sequence);
+    if state.checkpoint_sequence == 0
+        || checkpoint_age.is_none()
+        || (checkpoint_age == Some(0) && state.has_collectible_debt())
+        || checkpoint_age.is_some_and(|age| state.collectible_interval_count > age)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "checkpoint GC state has inconsistent sequence or debt counters",
+        ));
+    }
+    Ok(())
+}
+
 fn recovery_ref_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     storage_codec::encode(
         "checkpoint recovery ref key",
@@ -159,24 +313,57 @@ fn recovery_ref_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     )
 }
 
+fn validate_stored_recovery_ref(
+    stored: &StoredCheckpointRecoveryRef,
+    expected_branch_id: &str,
+) -> Result<(), LixError> {
+    if stored.format_version != CHECKPOINT_RECOVERY_REF_FORMAT_VERSION {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "checkpoint recovery ref for branch '{}' has unsupported format version {}",
+                stored.branch_id, stored.format_version
+            ),
+        ));
+    }
+    if stored.branch_id != expected_branch_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "checkpoint recovery ref key does not match branch '{}'",
+                stored.branch_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcSweep {
     pub(crate) tracked_commit_roots: Vec<CommitId>,
-    pub(crate) tracked_tree_chunks: Vec<[u8; 32]>,
-    pub(crate) binary_cas: BinaryCasGcSweep,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RepositoryGcPlan {
     pub(crate) changelog: GcPlan,
     pub(crate) sweep: RepositoryGcSweep,
+    pub(crate) profile: RepositoryGcProfile,
 }
 
-/// Plans and stages a complete repository sweep against one pinned read.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RepositoryGcProfile {
+    pub(crate) root_discovery_us: u64,
+    pub(crate) changelog_us: u64,
+    pub(crate) tracked_root_stage_us: u64,
+    pub(crate) total_us: u64,
+}
+
+/// Plans and stages logical repository GC against one pinned read.
 ///
 /// The caller must serialize this operation with repository writes and commit
 /// `writes` atomically. Planning and mutation are deliberately separated from
 /// storage commit so checkpoint/session code can retain lifecycle control.
+/// Content-addressed tree/CAS orphan repair is intentionally an offline path.
 pub(crate) async fn stage_repository_gc<S>(
     store: S,
     writes: &mut StorageWriteSet,
@@ -184,17 +371,19 @@ pub(crate) async fn stage_repository_gc<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    let total_started = Instant::now();
+    let phase_started = Instant::now();
     let flat_rows = LiveStateIndexContext::new()
         .reader(store.clone())
         .scan_all_index_rows()
         .await?;
-    let standalone_change_ids = flat_rows
+    let branch_ref_change_ids = flat_rows
         .iter()
-        .map(|row| row.change_id)
-        .collect::<BTreeSet<_>>();
+        .filter(|row| row.schema_key == "lix_branch_ref")
+        .map(|row| row.change_id);
     let flat_payloads = materialize_change_payloads(
         &store,
-        standalone_change_ids.iter().copied(),
+        branch_ref_change_ids,
         ChangeRecordProjection::from_columns(&["snapshot_content".to_string()]),
         "garbage-collection flat live-state root",
     )
@@ -227,149 +416,48 @@ where
         roots.push(GcRoot::BranchHead(commit_id));
     }
     for recovery in load_recovery_refs(&store).await? {
-        roots.push(GcRoot::RecoveryHead {
-            branch_id: recovery.branch_id,
-            commit_id: recovery.recovered_head_commit_id,
-        });
+        roots.push(GcRoot::BranchHead(recovery.recovered_head_commit_id));
     }
+    let root_discovery_us = elapsed_micros(phase_started);
 
+    let phase_started = Instant::now();
     let mut changelog_store = store.clone();
     let changelog_plan = ChangelogContext::new()
-        .reader(changelog_store.clone())
-        .plan_gc(&roots)
+        .writer(&mut changelog_store, writes)
+        .collect_garbage(&roots)
         .await?;
-    let live_commits = changelog_plan
-        .live
-        .commits
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let changelog_us = elapsed_micros(phase_started);
+    // Changelog reachability is the logical correctness boundary. A
+    // tracked root has the same commit id, so dead root metadata can be
+    // deleted directly without inventorying every retained root.
+    let sweep_tracked_commit_roots = changelog_plan.sweep.commits.clone();
 
-    let all_tracked_roots = crate::tracked_state::scan_commit_roots(&store).await?;
-    let roots_by_commit = all_tracked_roots
-        .iter()
-        .map(|root| (root.commit_id, root))
-        .collect::<BTreeMap<_, _>>();
-    let mut live_tracked_root_ids = Vec::with_capacity(live_commits.len());
-    for commit_id in &live_commits {
-        let root = roots_by_commit.get(commit_id).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("live commit '{commit_id}' has no tracked-state root"),
-            )
-        })?;
-        live_tracked_root_ids.push(root.root_id.clone());
-    }
-    let sweep_tracked_commit_roots = all_tracked_roots
-        .iter()
-        .filter(|root| !live_commits.contains(&root.commit_id))
-        .map(|root| root.commit_id)
-        .collect::<Vec<_>>();
-    let live_tree_chunks = crate::tracked_state::TrackedStateContext::new()
-        .reachable_tree_chunk_hashes(&store, live_tracked_root_ids)
-        .await?;
-    let sweep_tracked_tree_chunks = crate::tracked_state::scan_tree_chunk_hashes(&store)
-        .await?
-        .into_iter()
-        .filter(|hash| !live_tree_chunks.contains(hash))
-        .collect::<Vec<_>>();
-
-    let live_change_payloads = materialize_change_payloads(
-        &store,
-        changelog_plan.live.changes.iter().copied(),
-        ChangeRecordProjection::from_columns(&["snapshot_content".to_string()]),
-        "garbage-collection live change",
-    )
-    .await?;
-    let live_blob_hashes = collect_live_blob_hashes(&live_change_payloads)?;
-    let binary_cas = BinaryCasContext::new();
-    let binary_cas_sweep = binary_cas.plan_gc(&store, &live_blob_hashes).await?;
-
-    {
-        let mut writer = ChangelogContext::new().writer(&mut changelog_store, writes);
-        let staged_plan = writer.collect_garbage(&roots).await?;
-        if staged_plan != changelog_plan {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "garbage-collection plan changed while staging its sweep",
-            ));
-        }
-    }
+    // Checkpoint GC is deliberately logical-only. Removing a dead changelog
+    // commit also invalidates its derived tracked-state root metadata; the
+    // immutable tree/CAS payloads are reclaimed by a future offline storage
+    // maintenance path, never by an interactive checkpoint flow.
+    let phase_started = Instant::now();
     for commit_id in &sweep_tracked_commit_roots {
         crate::tracked_state::stage_delete_commit_root(writes, *commit_id);
     }
-    for hash in &sweep_tracked_tree_chunks {
-        crate::tracked_state::stage_delete_tree_chunk(writes, *hash);
-    }
-    binary_cas.stage_gc_sweep(writes, &binary_cas_sweep);
+    let tracked_root_stage_us = elapsed_micros(phase_started);
 
     Ok(RepositoryGcPlan {
         changelog: changelog_plan,
         sweep: RepositoryGcSweep {
             tracked_commit_roots: sweep_tracked_commit_roots,
-            tracked_tree_chunks: sweep_tracked_tree_chunks,
-            binary_cas: binary_cas_sweep,
+        },
+        profile: RepositoryGcProfile {
+            root_discovery_us,
+            changelog_us,
+            tracked_root_stage_us,
+            total_us: elapsed_micros(total_started),
         },
     })
 }
 
-fn collect_live_blob_hashes(
-    payloads: &std::collections::HashMap<
-        crate::changelog::ChangeId,
-        crate::changelog::MaterializedChangePayload,
-    >,
-) -> Result<BTreeSet<BlobHash>, LixError> {
-    let mut hashes = BTreeSet::new();
-    for payload in payloads.values() {
-        let Some(identity) = payload.identity.as_ref() else {
-            continue;
-        };
-        let Some(snapshot_content) = payload.snapshot_content.as_deref() else {
-            continue;
-        };
-        if identity.schema_key == "lix_binary_blob_ref" {
-            let snapshot =
-                serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("invalid live lix_binary_blob_ref snapshot: {error}"),
-                    )
-                })?;
-            hashes.insert(BlobHash::from_hex(required_snapshot_text(
-                &snapshot,
-                "blob_hash",
-                "lix_binary_blob_ref",
-            )?)?);
-            continue;
-        }
-        if identity.schema_key == "lix_key_value"
-            && identity.entity_pk.as_single_string()? == crate::plugin::PLUGIN_REGISTRY_KEY
-        {
-            let snapshot =
-                serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("invalid live plugin registry snapshot: {error}"),
-                    )
-                })?;
-            if let Some(plugins) = snapshot
-                .get("value")
-                .and_then(|value| value.get("plugins"))
-                .and_then(serde_json::Value::as_array)
-            {
-                for plugin in plugins {
-                    for field in ["archive_blob_hash", "wasm_blob_hash"] {
-                        hashes.insert(BlobHash::from_hex(required_snapshot_text(
-                            plugin,
-                            field,
-                            "plugin registry entry",
-                        )?)?);
-                    }
-                }
-            }
-        }
-    }
-    Ok(hashes)
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn parse_snapshot(
@@ -413,7 +501,10 @@ mod tests {
     use crate::changelog::CommitId;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
-    use super::{CheckpointRecoveryRef, load_recovery_refs, stage_recovery_ref_rotation};
+    use super::{
+        CheckpointGcState, CheckpointRecoveryRef, load_checkpoint_gc_state, load_recovery_ref,
+        load_recovery_refs, stage_checkpoint_gc_state, stage_recovery_ref_rotation,
+    };
 
     #[tokio::test]
     async fn recovery_ref_rotation_replaces_only_the_target_branch() {
@@ -430,7 +521,8 @@ mod tests {
             .await
             .expect("initial recovery refs should commit");
 
-        let second_main = recovery("main", "main-old-2", "main-checkpoint-2");
+        let mut second_main = recovery("main", "main-old-2", "main-checkpoint-2");
+        second_main.interval_has_commits = false;
         let mut writes = storage.new_write_set();
         stage_recovery_ref_rotation(&mut writes, &second_main)
             .expect("second main recovery ref should stage");
@@ -447,7 +539,41 @@ mod tests {
             load_recovery_refs(&read)
                 .await
                 .expect("recovery refs should load"),
-            vec![second_main, first_other]
+            vec![second_main.clone(), first_other]
+        );
+        assert_eq!(
+            load_recovery_ref(&read, "main")
+                .await
+                .expect("main recovery ref should load"),
+            Some(second_main)
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_gc_state_round_trips() {
+        let storage = StorageAdapter::new(Memory::new());
+        let expected = CheckpointGcState {
+            checkpoint_sequence: 129,
+            last_gc_sequence: 64,
+            collectible_interval_count: 65,
+        };
+        let mut writes = storage.new_write_set();
+        stage_checkpoint_gc_state(&mut writes, &expected)
+            .expect("checkpoint GC state should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("checkpoint GC state should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("GC-state read should open");
+        assert_eq!(
+            load_checkpoint_gc_state(&read)
+                .await
+                .expect("checkpoint GC state should load"),
+            expected
         );
     }
 
@@ -456,6 +582,7 @@ mod tests {
             branch_id: branch_id.to_string(),
             recovered_head_commit_id: CommitId::for_test_label(recovered_head),
             checkpoint_commit_id: CommitId::for_test_label(checkpoint),
+            interval_has_commits: true,
         }
     }
 }

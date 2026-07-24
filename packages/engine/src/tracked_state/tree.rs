@@ -7,7 +7,7 @@
 )]
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     future::Future,
     num::NonZeroUsize,
     ops::Range,
@@ -99,27 +99,6 @@ impl TrackedStateTree {
         commit_id: &str,
     ) -> Result<Option<TrackedStateRootId>, LixError> {
         storage::load_root(store, commit_id).await
-    }
-
-    pub(crate) async fn reachable_chunk_hashes(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        roots: impl IntoIterator<Item = TrackedStateRootId>,
-    ) -> Result<BTreeSet<[u8; TRACKED_STATE_HASH_BYTES]>, LixError> {
-        let mut reachable = BTreeSet::new();
-        let mut pending = roots
-            .into_iter()
-            .map(|root| *root.as_bytes())
-            .collect::<Vec<_>>();
-        while let Some(hash) = pending.pop() {
-            if !reachable.insert(hash) {
-                continue;
-            }
-            if let DecodedNode::Internal(internal) = self.load_node(store, &hash).await? {
-                pending.extend(internal.children().iter().map(|child| child.child_hash));
-            }
-        }
-        Ok(reachable)
     }
 
     #[cfg(test)]

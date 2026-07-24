@@ -1,11 +1,10 @@
 use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Blob, CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
-    CreateCheckpointReceipt, ExecuteOptions, ExecuteResult, ExecutionDisposition, LixError, Memory,
-    MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
-    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition, LixError, Memory,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ObserveEvents, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 

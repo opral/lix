@@ -20,7 +20,7 @@ use crate::entity_pk::EntityPk;
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
-use crate::gc::CheckpointRecoveryRef;
+use crate::gc::CheckpointPublication;
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
@@ -50,7 +50,7 @@ pub(crate) struct TransactionWriteBuffer {
     insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>>,
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
     first_commit_parent_override_by_branch: Mutex<BTreeMap<String, CommitId>>,
-    checkpoint_recovery_refs: Mutex<Vec<CheckpointRecoveryRef>>,
+    checkpoint_publications: Mutex<Vec<CheckpointPublication>>,
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
 }
@@ -66,7 +66,7 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) insert_identities: BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     pub(crate) first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
-    pub(crate) checkpoint_recovery_refs: Vec<CheckpointRecoveryRef>,
+    pub(crate) checkpoint_publications: Vec<CheckpointPublication>,
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
 }
@@ -304,7 +304,7 @@ impl TransactionWriteBuffer {
             insert_identities: Mutex::new(BTreeMap::new()),
             commit_change_refs_by_branch: Mutex::new(BTreeMap::new()),
             first_commit_parent_override_by_branch: Mutex::new(BTreeMap::new()),
-            checkpoint_recovery_refs: Mutex::new(Vec::new()),
+            checkpoint_publications: Mutex::new(Vec::new()),
             extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
@@ -358,11 +358,11 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged first commit parent overrides lock",
             )
         })?;
-        let mut checkpoint_recovery_refs_guard =
-            self.checkpoint_recovery_refs.lock().map_err(|_| {
+        let mut checkpoint_publications_guard =
+            self.checkpoint_publications.lock().map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "failed to acquire transaction staged checkpoint recovery refs lock",
+                    "failed to acquire transaction staged checkpoint publications lock",
                 )
             })?;
         let result = Ok(PreparedWriteSet {
@@ -375,7 +375,7 @@ impl TransactionWriteBuffer {
             first_commit_parent_override_by_branch: std::mem::take(
                 &mut *first_parent_overrides_guard,
             ),
-            checkpoint_recovery_refs: std::mem::take(&mut *checkpoint_recovery_refs_guard),
+            checkpoint_publications: std::mem::take(&mut *checkpoint_publications_guard),
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         });
@@ -383,19 +383,19 @@ impl TransactionWriteBuffer {
         result
     }
 
-    pub(crate) fn add_checkpoint_recovery_ref(
+    pub(crate) fn add_checkpoint_publication(
         &self,
-        recovery: CheckpointRecoveryRef,
+        publication: CheckpointPublication,
     ) -> Result<(), LixError> {
-        self.checkpoint_recovery_refs
+        self.checkpoint_publications
             .lock()
             .map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "failed to acquire transaction staged checkpoint recovery refs lock",
+                    "failed to acquire transaction staged checkpoint publications lock",
                 )
             })?
-            .push(recovery);
+            .push(publication);
         Ok(())
     }
 

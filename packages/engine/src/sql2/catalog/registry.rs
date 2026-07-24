@@ -247,17 +247,21 @@ impl PublicCatalog {
         self.insert(surface(
             "lix_checkpoint",
             PublicSurfaceKind::Checkpoint,
-            public_columns(["commit_id", "created_at", "lixcol_depth"]),
+            public_columns([
+                ("commit_id", false),
+                ("created_at", false),
+                ("lixcol_depth", false),
+            ]),
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
             "lix_checkpoint_by_branch",
             PublicSurfaceKind::CheckpointByBranch,
             public_columns([
-                "commit_id",
-                "created_at",
-                "lixcol_branch_id",
-                "lixcol_depth",
+                ("commit_id", false),
+                ("created_at", false),
+                ("lixcol_branch_id", false),
+                ("lixcol_depth", false),
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
@@ -265,12 +269,12 @@ impl PublicCatalog {
             "lix_working_change",
             PublicSurfaceKind::WorkingChange,
             public_columns([
-                "entity_pk",
-                "schema_key",
-                "file_id",
-                "change_kind",
-                "before_change_id",
-                "after_change_id",
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("change_kind", false),
+                ("before_change_id", true),
+                ("after_change_id", true),
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
@@ -278,20 +282,14 @@ impl PublicCatalog {
             "lix_working_change_by_branch",
             PublicSurfaceKind::WorkingChangeByBranch,
             public_columns([
-                "entity_pk",
-                "schema_key",
-                "file_id",
-                "change_kind",
-                "before_change_id",
-                "after_change_id",
-                "lixcol_branch_id",
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("change_kind", false),
+                ("before_change_id", true),
+                ("after_change_id", true),
+                ("lixcol_branch_id", false),
             ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
-            "lix_state_history",
-            PublicSurfaceKind::History,
-            state_history_columns(),
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
