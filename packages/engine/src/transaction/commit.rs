@@ -48,8 +48,9 @@ pub(crate) async fn commit_prepared_writes(
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
-    for recovery in &prepared_writes.checkpoint_recovery_refs {
-        crate::gc::stage_recovery_ref_rotation(&mut writes, recovery)?;
+    for publication in &prepared_writes.checkpoint_publications {
+        crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
+        crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
     }
     let mut json_writer = JsonStoreContext::new().writer();
 
@@ -1097,7 +1098,7 @@ mod tests {
                     change_refs(["change-1"]),
                 )]),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_recovery_refs: Vec::new(),
+                checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1303,7 +1304,7 @@ mod tests {
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::new(),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_recovery_refs: Vec::new(),
+                checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1384,7 +1385,7 @@ mod tests {
                 state_rows: vec![untracked_global_row("change-untracked")],
                 commit_change_refs_by_branch: BTreeMap::new(),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_recovery_refs: Vec::new(),
+                checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1415,7 +1416,7 @@ mod tests {
                     change_refs(["change-tracked"]),
                 )]),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_recovery_refs: Vec::new(),
+                checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1496,7 +1497,7 @@ mod tests {
                         ),
                     )]),
                     first_commit_parent_override_by_branch: BTreeMap::new(),
-                    checkpoint_recovery_refs: Vec::new(),
+                    checkpoint_publications: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
                     file_data_writes: Vec::new(),
                 },
@@ -1528,7 +1529,7 @@ mod tests {
                     )],
                     commit_change_refs_by_branch: BTreeMap::new(),
                     first_commit_parent_override_by_branch: BTreeMap::new(),
-                    checkpoint_recovery_refs: Vec::new(),
+                    checkpoint_publications: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
                     file_data_writes: Vec::new(),
                 },
@@ -1576,7 +1577,7 @@ mod tests {
                     change_refs(["change-tracked"]),
                 )]),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_recovery_refs: Vec::new(),
+                checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1706,7 +1707,7 @@ mod tests {
                     change_refs(["change-branch-a"]),
                 )]),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_recovery_refs: Vec::new(),
+                checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },

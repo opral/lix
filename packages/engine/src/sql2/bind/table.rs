@@ -247,6 +247,8 @@ mod tests {
             "lix_change_author",
             "lix_change_author_by_branch",
             "lix_change_author_history",
+            "lix_checkpoint",
+            "lix_checkpoint_by_branch",
             "lix_commit",
             "lix_commit_by_branch",
             "lix_commit_edge",
@@ -269,6 +271,8 @@ mod tests {
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
+            "lix_working_change",
+            "lix_working_change_by_branch",
         ];
 
         assert_eq!(actual, expected);
@@ -284,6 +288,10 @@ mod tests {
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
+            "lix_checkpoint",
+            "lix_checkpoint_by_branch",
+            "lix_working_change",
+            "lix_working_change_by_branch",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),
@@ -294,6 +302,7 @@ mod tests {
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",
+            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",

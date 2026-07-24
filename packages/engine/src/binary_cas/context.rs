@@ -2,11 +2,9 @@ use async_trait::async_trait;
 
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
-use crate::binary_cas::{
-    BinaryCasGcSweep, BlobBytesBatch, BlobHash, BlobPayload, BlobWriteReceipt,
-};
+use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobPayload, BlobWriteReceipt};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
@@ -50,19 +48,6 @@ impl BinaryCasContext {
         S: StorageAdapterRead + ?Sized,
     {
         ExistingChunkAwareBinaryCasWriter::new(store, writes, self.chunking)
-    }
-
-    pub(crate) async fn plan_gc(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        live_blobs: &BTreeSet<BlobHash>,
-    ) -> Result<BinaryCasGcSweep, LixError> {
-        crate::binary_cas::kv::plan_gc(store, live_blobs).await
-    }
-
-    #[expect(clippy::unused_self)]
-    pub(crate) fn stage_gc_sweep(&self, writes: &mut StorageWriteSet, sweep: &BinaryCasGcSweep) {
-        crate::binary_cas::kv::stage_gc_sweep(writes, sweep);
     }
 }
 

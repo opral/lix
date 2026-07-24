@@ -315,6 +315,7 @@ simulation_test!(
             "lix_branch_descriptor",
             "lix_branch_ref",
             "lix_change",
+            "lix_checkpoint_marker",
             "lix_change_author",
             "lix_commit",
             "lix_commit_edge",
@@ -351,6 +352,10 @@ simulation_test!(
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
+            "lix_checkpoint",
+            "lix_checkpoint_by_branch",
+            "lix_working_change",
+            "lix_working_change_by_branch",
         ] {
             assert!(
                 public_table_names.contains(surface_name),
@@ -361,6 +366,7 @@ simulation_test!(
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",
+            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",

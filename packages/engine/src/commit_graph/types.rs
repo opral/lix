@@ -31,6 +31,14 @@ pub(crate) struct CommitGraphCommit {
     pub(crate) parent_commit_ids: Vec<CommitId>,
 }
 
+/// Lightweight commit metadata for graph walks that do not inspect members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitGraphCommitRecord {
+    pub(crate) commit_id: CommitId,
+    pub(crate) parent_commit_ids: Vec<CommitId>,
+    pub(crate) created_at: LixTimestamp,
+}
+
 /// Commit reachable from a requested graph head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReachableCommitGraphCommit {
@@ -79,6 +87,20 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         &mut self,
         commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommit>, LixError>;
+
+    async fn load_commit_record(
+        &mut self,
+        commit_id: &CommitId,
+    ) -> Result<Option<CommitGraphCommitRecord>, LixError> {
+        Ok(self
+            .load_commit(commit_id)
+            .await?
+            .map(|commit| CommitGraphCommitRecord {
+                commit_id: commit.commit_id,
+                parent_commit_ids: commit.parent_commit_ids,
+                created_at: commit.canonical_change.created_at,
+            }))
+    }
 
     async fn reachable_commits(
         &mut self,
