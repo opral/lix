@@ -1,7 +1,7 @@
 use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError, MutationIdentity,
     RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, VerifiedRequestBlob,
-    WasmComponentV2Factory, WasmLimits, WasmRuntime,
+    WasmComponentV2Factory, WasmLimits, WasmRuntime, WasmTransitionCounters,
 };
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
@@ -909,6 +909,137 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     );
 
     lix.close().await.expect("workspace should close");
+}
+
+#[derive(Debug)]
+struct ColdMaterializedOpenSample {
+    elapsed: Duration,
+    counters: WasmTransitionCounters,
+}
+
+#[tokio::test]
+#[ignore = "large cold-open materialized-base benchmark"]
+async fn v2_cold_open_materialized_csv_and_json_benchmark() {
+    const SAMPLES: usize = 5;
+
+    let storage = lix_sdk::Memory::new();
+    let seed = open_lix(OpenLixOptions::new(storage.clone()))
+        .await
+        .expect("benchmark workspace should open");
+    install_plugin(&seed, "plugin_csv_v2", &build_csv_v2_plugin_archive())
+        .await
+        .expect("CSV v2 plugin should install");
+    install_plugin(
+        &seed,
+        "plugin_json_incremental_v2",
+        &build_json_v2_plugin_archive(),
+    )
+    .await
+    .expect("JSON v2 plugin should install");
+
+    let csv = csv_ten_mib_fixture();
+    let (json_flat, _, _) = json_ten_mib_flat_fixture();
+    let mut json_nested = Vec::with_capacity(json_flat.len() + 10);
+    json_nested.extend_from_slice(br#"{"outer":"#);
+    json_nested.extend_from_slice(&json_flat);
+    json_nested.push(b'}');
+
+    for (path, bytes) in [
+        ("/cold-materialized.csv", csv.as_slice()),
+        ("/cold-materialized-flat.json", json_flat.as_slice()),
+        ("/cold-materialized-nested.json", json_nested.as_slice()),
+    ] {
+        write_file(&seed, path, bytes.to_vec())
+            .await
+            .unwrap_or_else(|error| panic!("seed import for {path} should succeed: {error:?}"));
+    }
+    seed.close().await.expect("seed workspace should close");
+
+    for (label, path, expected) in [
+        ("csv-220k-rows", "/cold-materialized.csv", csv.as_slice()),
+        (
+            "json-flat-39870-properties",
+            "/cold-materialized-flat.json",
+            json_flat.as_slice(),
+        ),
+        (
+            "json-nested-39870-properties",
+            "/cold-materialized-nested.json",
+            json_nested.as_slice(),
+        ),
+    ] {
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let lix = open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("cold benchmark workspace should reopen");
+            lix.reset_plugin_v2_transition_counters();
+            let started = Instant::now();
+            let actual = read_file(&lix, path)
+                .await
+                .unwrap_or_else(|error| panic!("cold read for {path} should succeed: {error:?}"))
+                .unwrap_or_else(|| panic!("cold read for {path} should return materialized bytes"));
+            let elapsed = started.elapsed();
+            assert_eq!(actual, expected, "cold read must remain byte-exact");
+            samples.push(ColdMaterializedOpenSample {
+                elapsed,
+                counters: lix.plugin_v2_transition_counters(),
+            });
+            lix.close()
+                .await
+                .expect("cold benchmark workspace should close");
+        }
+        report_cold_materialized_open(label, expected.len(), &samples);
+    }
+}
+
+fn report_cold_materialized_open(
+    label: &str,
+    expected_bytes: usize,
+    samples: &[ColdMaterializedOpenSample],
+) {
+    let mut elapsed_ms = samples
+        .iter()
+        .map(|sample| sample.elapsed.as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
+    elapsed_ms.sort_by(f64::total_cmp);
+    let p50_ms = elapsed_ms[elapsed_ms.len() / 2];
+    let p95_index = ((elapsed_ms.len() * 95).div_ceil(100)).saturating_sub(1);
+    let p95_ms = elapsed_ms[p95_index];
+
+    for sample in samples {
+        let counters = sample.counters;
+        assert_eq!(
+            counters.full_renderer_invocations, 1,
+            "{label} must exercise a true cold render"
+        );
+        assert!(
+            counters.full_state_semantic_rows_materialized > 0,
+            "{label} must hydrate semantic entities for a cold actor"
+        );
+        assert!(
+            counters.component_boundary_bytes >= expected_bytes as u64,
+            "{label} must account for its full cold-open boundary work"
+        );
+    }
+
+    let representative = samples[elapsed_ms.len() / 2].counters;
+    eprintln!(
+        "v2_cold_materialized_open label={label} bytes={expected_bytes} samples={} \
+         p50_ms={p50_ms:.3} p95_ms={p95_ms:.3} source_read_calls={} source_bytes_read={} \
+         packet_pages={} packet_records={} attachment_reads={} attachment_bytes_read={} \
+         boundary_bytes={} guest_high_water_bytes={} full_renderer_invocations={}",
+        samples.len(),
+        representative.source_read_calls,
+        representative.source_bytes_read,
+        representative.packet_pages,
+        representative.packet_records,
+        representative.attachment_reads,
+        representative.attachment_bytes_read,
+        representative.component_boundary_bytes,
+        representative.guest_linear_memory_high_water_bytes,
+        representative.full_renderer_invocations,
+    );
 }
 
 #[tokio::test]
@@ -2168,6 +2299,24 @@ fn build_json_v2_plugin_archive() -> Vec<u8> {
 const JSON_TEN_MIB_BYTES: usize = 10 * 1024 * 1024;
 const JSON_TEN_MIB_PROPERTY_COUNT: usize = 39_870;
 const JSON_V2_GUEST_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+
+fn csv_ten_mib_fixture() -> Vec<u8> {
+    const LONG_ROW_COUNT: usize = 120_000;
+    const SHORT_ROW_COUNT: usize = 100_000;
+    const LONG_ROW: &[u8] = b"000000000000000,1111111111,2222222222,3333333333\n";
+    const SHORT_ROW: &[u8] = b"00000000000000,1111111111,2222222222,3333333333\n";
+
+    let expected_len = LONG_ROW_COUNT * LONG_ROW.len() + SHORT_ROW_COUNT * SHORT_ROW.len();
+    let mut bytes = Vec::with_capacity(expected_len);
+    for _ in 0..LONG_ROW_COUNT {
+        bytes.extend_from_slice(LONG_ROW);
+    }
+    for _ in 0..SHORT_ROW_COUNT {
+        bytes.extend_from_slice(SHORT_ROW);
+    }
+    assert_eq!(bytes.len(), 10_680_000);
+    bytes
+}
 
 fn json_ten_mib_flat_fixture() -> (Vec<u8>, usize, String) {
     const BASE_MEMBER_BYTES: usize = 44;
