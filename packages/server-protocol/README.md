@@ -64,3 +64,26 @@ mapping, and multiplexed observations. Host-specific routes such as
 authentication, health checks, and compare-and-swap filesystem mutations stay
 outside it. Session identifiers are opaque capabilities: hosts should not log
 or persist them.
+
+## Binary file upsert
+
+Clients that explicitly want file **upsert** semantics can check for
+`capabilities.binaryFileUpsert === true` in the handshake response and send a
+protected request to:
+
+```text
+POST /lix/v1/file/upsert?path=<percent-encoded-absolute-file-path>
+Lix-Session-Id: <session-id>
+Content-Type: application/octet-stream
+```
+
+The body is the raw file bytes, including an empty body for a present empty
+file. The endpoint creates a missing file or replaces an existing file's data,
+uses the normal transactional filesystem write path, and returns the standard
+`ExecuteResponse` envelope with `rowsAffected: 1`. It has the same configured
+request-body ceiling as JSON protocol requests.
+
+This is intentionally a structured file-transfer operation, not a transparent
+replacement for arbitrary SQL `UPDATE`: callers choose its upsert behavior
+explicitly. The path must be a percent-encoded absolute Lix file path (for
+example, `%2Fassets%2Freport.pdf`).

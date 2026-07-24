@@ -1,7 +1,7 @@
 use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
+    Blob, CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
     ExecuteOptions, ExecuteResult, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
     SwitchBranchOptions, SwitchBranchReceipt, Value,
@@ -192,6 +192,21 @@ where
     ) -> Result<ExecuteResult, LixError> {
         self.session
             .execute_with_options(sql, params, options)
+            .await
+    }
+
+    /// Upserts one file's bytes by full logical path without parsing SQL.
+    ///
+    /// This structured path is intended for file transfer clients. It uses the
+    /// engine's filesystem fast-write path and retains normal plugin and
+    /// transaction behavior.
+    pub async fn upsert_file_data(
+        &self,
+        path: impl Into<String>,
+        data: impl Into<Blob>,
+    ) -> Result<u64, LixError> {
+        self.session
+            .upsert_file_data(path.into(), data.into())
             .await
     }
 

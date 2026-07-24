@@ -3,6 +3,7 @@
 
 use axum::{
     Extension, Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
     middleware::{self, Next},
@@ -585,6 +586,7 @@ where
         let protected = Router::new()
             .route("/lix/v1/execute", post(execute::<S>))
             .route("/lix/v1/execute-batch", post(execute_batch::<S>))
+            .route("/lix/v1/file/upsert", post(upsert_file_data::<S>))
             .route("/lix/v1/branch/create", post(create_branch::<S>))
             .route("/lix/v1/branch/switch", post(switch_branch::<S>))
             .route("/lix/v1/observe", post(observe::<S>))
@@ -973,6 +975,7 @@ where
             session_id: lease.session_id.clone(),
             capabilities: ProtocolCapabilities {
                 request_blob_splice: true,
+                binary_file_upsert: true,
             },
         }),
     ))
@@ -1063,6 +1066,28 @@ where
             .map(ExecuteResponse::try_from)
             .collect::<Result<Vec<_>, _>>()?,
     ))
+}
+
+/// Upserts one file from an octet-stream body.
+///
+/// This intentionally covers only the dominant file-transfer shape. It keeps
+/// the normal execute response envelope, but avoids JSON base64 expansion and
+/// decoding for the file payload itself.
+async fn upsert_file_data<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+    Query(request): Query<BinaryFileUpdateRequest>,
+    body: Bytes,
+) -> Result<Json<ExecuteResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = required_non_empty(request.path, "path")?;
+    let result = lease
+        .run(move |lix| async move { lix.upsert_file_data(path, body).await })
+        .await?;
+    Ok(Json(ExecuteResponse::try_from(
+        ExecuteResult::from_rows_affected(result),
+    )?))
 }
 
 async fn create_branch<S>(
@@ -1701,6 +1726,7 @@ struct HandshakeResponse {
 #[serde(rename_all = "camelCase")]
 struct ProtocolCapabilities {
     request_blob_splice: bool,
+    binary_file_upsert: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1713,6 +1739,11 @@ struct ExecuteRequest {
     options: ExecuteOptionsRequest,
     #[serde(default)]
     cache_blobs: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinaryFileUpdateRequest {
+    path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2384,6 +2415,7 @@ mod tests {
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(first["capabilities"]["requestBlobSplice"], true);
+        assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
         assert!(
             session_id
@@ -2440,6 +2472,181 @@ mod tests {
         .await;
         assert_eq!(gone.status(), StatusCode::GONE);
         assert_eq!(error_code(gone).await, "LIX_ERROR_PROTOCOL_SESSION_GONE");
+    }
+
+    #[tokio::test]
+    async fn binary_file_upsert_accepts_raw_bytes_and_preserves_execute_response_shape() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "params": [
+                    { "kind": "text", "value": "/payload.bin" },
+                    { "kind": "blob", "base64": "b2xk" }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let payload = vec![0, 1, 2, 3, 255];
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(payload.clone()))
+                    .expect("binary file upsert request"),
+            )
+            .await
+            .expect("binary file upsert response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["rowsAffected"], 1);
+        assert_eq!(response["columns"], json!([]));
+        assert_eq!(response["rows"], json!([]));
+
+        let selected = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/payload.bin" }]
+            })),
+        )
+        .await;
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(selected).await["rows"][0][0],
+            wire_blob_json(&payload)
+        );
+
+        // An empty body is a real empty file, not an absent request payload.
+        // The filesystem fast path tombstones a prior blob reference when
+        // appropriate and leaves the file itself visible.
+        let emptied = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::empty())
+                    .expect("empty binary file upsert request"),
+            )
+            .await
+            .expect("empty binary file upsert response");
+        assert_eq!(emptied.status(), StatusCode::OK);
+        assert_eq!(response_json(emptied).await["rowsAffected"], 1);
+
+        let empty_selected = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/payload.bin" }]
+            })),
+        )
+        .await;
+        assert_eq!(empty_selected.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(empty_selected).await["rows"][0][0],
+            wire_blob_json(&[])
+        );
+
+        let created_payload = vec![4, 5, 6];
+        let created = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fcreated.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(created_payload.clone()))
+                    .expect("binary file create request"),
+            )
+            .await
+            .expect("binary file create response");
+        assert_eq!(created.status(), StatusCode::OK);
+        assert_eq!(response_json(created).await["rowsAffected"], 1);
+
+        let created_selected = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "params": [{ "kind": "text", "value": "/created.bin" }]
+            })),
+        )
+        .await;
+        assert_eq!(created_selected.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(created_selected).await["rows"][0][0],
+            wire_blob_json(&created_payload)
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_file_upsert_requires_a_live_session_and_valid_path() {
+        let app = app().await;
+        let missing_session = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![1_u8]))
+                    .expect("missing session request"),
+            )
+            .await
+            .expect("missing session response");
+        assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_code(missing_session).await,
+            "LIX_ERROR_PROTOCOL_SESSION_REQUIRED"
+        );
+
+        let (session_id, _) = new_session(&app.router).await;
+        let invalid_path = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=relative.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![1_u8]))
+                    .expect("invalid path request"),
+            )
+            .await
+            .expect("invalid path response");
+        assert_eq!(invalid_path.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_code(invalid_path).await,
+            "LIX_ERROR_PATH_MISSING_LEADING_SLASH"
+        );
     }
 
     #[tokio::test]
@@ -3097,6 +3304,32 @@ mod tests {
             })),
         )
         .await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn configured_body_limit_rejects_oversized_binary_file_upsert() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_request_body_bytes: 1_024,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Foversized.bin")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![0_u8; 2_048]))
+                    .expect("oversized binary file upsert request"),
+            )
+            .await
+            .expect("oversized binary file upsert response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
