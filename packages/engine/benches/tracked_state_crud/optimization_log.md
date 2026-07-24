@@ -2179,3 +2179,36 @@ places 59.3% of whole-process samples under transaction commit, split between
 prepared-write validation (27.4%) and commit construction/persistence (26.6%);
 SQL parsing is 7.6%. This is a real single-transaction path, not twenty version
 commits hidden in the harness.
+
+## 2026-07-24 — Route bound writes by primary key
+
+A 1 kHz Samply profile of the 10k public-SQL point-update benchmark showed
+`scan_entity_candidates` requesting every live row for the entity schema and
+branch. `overlay_scan_rows` then materialized the full surface before the bound
+predicate discarded 9,999 rows. This explains both the gap over the 1.470 ms
+tracked-transaction control and the approximately linear growth from 1k to 10k.
+
+Bound entity UPDATE and DELETE now extract exact string primary keys from safe
+predicate shapes and pass them to `LiveStateScanRequest::filter.entity_pks`.
+Equality, `IN`, complete `OR` branches, guaranteed `AND` conjuncts, parameters,
+and composite primary keys are supported. Partial disjunctions, non-string
+identity columns, nested identity paths, and other uncertain shapes retain the
+existing full scan. Contradictory identity predicates route to an empty scan.
+Candidate rows still pass through the original predicate evaluator, so this is
+candidate pruning rather than a semantic shortcut.
+
+Criterion point estimates:
+
+| Operation | Main 1k | Routed 1k | Change | Main 10k | Routed 10k | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| update one by PK | 7.812 ms | 1.349 ms | -82.7% | 71.596 ms | 4.008 ms | -94.4% |
+| delete one by PK | 7.982 ms | 1.299 ms | -83.7% | 65.166 ms | 4.654 ms | -92.9% |
+
+The routed 10k profile reduced inclusive samples in
+`scan_entity_candidates`/`overlay_scan_rows` from about 17% to 0.75% of the
+whole profiled process, which includes fixture construction. Transaction commit
+is now the dominant remaining path at about 58.9%. Against standalone SQLite,
+the 10k point-operation gaps fall from 1358.0x to 76.0x for UPDATE and from
+1316.5x to 94.0x for DELETE. The remaining fixed cost is primarily tracked
+commit construction and persistence rather than surface-size-dependent SQL
+candidate selection.
