@@ -392,6 +392,20 @@ pub struct ExecuteOptions {
     pub origin_key: Option<String>,
 }
 
+/// Whether abandoning an in-flight SQL execution can discard its work.
+///
+/// This is derived from Lix's parsed and bound statement route, rather than
+/// from SQL-text matching. A [`Self::CancellableRead`] has no durable side
+/// effects. [`Self::Durable`] covers writes and read-shaped statements that
+/// invoke a runtime function whose state is persisted after evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDisposition {
+    /// A pure read that a transport may cancel when its caller disconnects.
+    CancellableRead,
+    /// An operation whose completion must outlive a cancelled transport.
+    Durable,
+}
+
 /// One SQL statement to execute as part of an atomic batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecuteBatchStatement {
@@ -450,6 +464,43 @@ impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Classifies one SQL execution for a caller that owns its transport
+    /// lifecycle.
+    ///
+    /// The classification is intentionally based on the parsed statement and
+    /// Lix's bound route. It does not use SQL-text heuristics, and callers
+    /// must still execute the statement to receive the normal validation and
+    /// query-planning errors.
+    pub fn execution_disposition(&self, sql: &str) -> Result<ExecutionDisposition, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        execution_disposition(&statement)
+    }
+
+    /// Classifies an atomic SQL batch for a caller that owns its transport
+    /// lifecycle.
+    ///
+    /// A batch is cancellable only when every parsed and bound statement is a
+    /// pure read. Any durable statement makes the whole batch durable so its
+    /// atomic transaction can complete after a transport disconnects.
+    pub fn execute_batch_disposition(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<ExecutionDisposition, LixError> {
+        for (statement_index, statement) in statements.iter().enumerate() {
+            let parsed = self
+                .sql_planning_cache
+                .parse_statement(&statement.sql)
+                .map_err(|error| with_batch_statement_index(error, statement_index))?;
+            if execution_disposition(&parsed)
+                .map_err(|error| with_batch_statement_index(error, statement_index))?
+                == ExecutionDisposition::Durable
+            {
+                return Ok(ExecutionDisposition::Durable);
+            }
+        }
+        Ok(ExecutionDisposition::CancellableRead)
+    }
+
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
@@ -2163,6 +2214,20 @@ fn point_identity_value_is_text(
     }
 }
 
+fn execution_disposition(
+    statement: &datafusion::sql::parser::Statement,
+) -> Result<ExecutionDisposition, LixError> {
+    match sql2::bind_statement_route(statement)? {
+        sql2::BoundStatementRoute::Write => Ok(ExecutionDisposition::Durable),
+        sql2::BoundStatementRoute::Read
+            if sql2::statement_has_durable_runtime_function(statement) =>
+        {
+            Ok(ExecutionDisposition::Durable)
+        }
+        sql2::BoundStatementRoute::Read => Ok(ExecutionDisposition::CancellableRead),
+    }
+}
+
 fn classify_execute_batch(
     statements: &[ExecuteBatchStatement],
     planning_cache: &sql2::SqlPlanningCache<crate::catalog::CatalogFingerprint>,
@@ -2177,11 +2242,9 @@ fn classify_execute_batch(
         let parsed_statement = planning_cache
             .parse_statement(&statement.sql)
             .map_err(|error| with_batch_statement_index(error, statement_index))?;
-        let route = sql2::bind_statement_route(&parsed_statement)
+        let disposition = execution_disposition(&parsed_statement)
             .map_err(|error| with_batch_statement_index(error, statement_index))?;
-        if route == sql2::BoundStatementRoute::Write
-            || sql2::statement_has_durable_runtime_function(&parsed_statement)
-        {
+        if disposition == ExecutionDisposition::Durable {
             is_read_only = false;
         }
         parsed.push(parsed_statement);
@@ -2530,6 +2593,48 @@ mod tests {
             classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")], &cache).unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn execution_disposition_uses_the_parsed_bound_statement_route() {
+        let session = open_session().await;
+
+        assert_eq!(
+            session.execution_disposition("SELECT 1").unwrap(),
+            ExecutionDisposition::CancellableRead
+        );
+        assert_eq!(
+            session
+                .execution_disposition("SELECT lix_uuid_v7()")
+                .unwrap(),
+            ExecutionDisposition::Durable
+        );
+        assert_eq!(
+            session
+                .execution_disposition(
+                    "INSERT INTO lix_file (path, data) VALUES ('/disposition.txt', 'data')",
+                )
+                .unwrap(),
+            ExecutionDisposition::Durable
+        );
+        assert_eq!(
+            session
+                .execute_batch_disposition(&[
+                    batch_statement("SELECT 1"),
+                    batch_statement("SELECT * FROM lix_file"),
+                ])
+                .unwrap(),
+            ExecutionDisposition::CancellableRead
+        );
+        assert_eq!(
+            session
+                .execute_batch_disposition(&[
+                    batch_statement("SELECT 1"),
+                    batch_statement("SELECT lix_timestamp()"),
+                ])
+                .unwrap(),
+            ExecutionDisposition::Durable
+        );
     }
 
     #[test]

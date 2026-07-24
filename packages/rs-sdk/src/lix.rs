@@ -2,9 +2,9 @@ use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, Engine, EngineOptions, ExecuteBatchStatement,
-    ExecuteOptions, ExecuteResult, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
-    SwitchBranchOptions, SwitchBranchReceipt, Value,
+    ExecuteOptions, ExecuteResult, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
+    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -195,6 +195,16 @@ where
             .await
     }
 
+    /// Classifies one SQL execution for a caller that owns its transport
+    /// lifecycle.
+    ///
+    /// The result comes from Lix's parsed and bound statement route. It is
+    /// safe for a transport to abandon [`ExecutionDisposition::CancellableRead`]
+    /// work; [`ExecutionDisposition::Durable`] work must be allowed to finish.
+    pub fn execution_disposition(&self, sql: &str) -> Result<ExecutionDisposition, LixError> {
+        self.session.execution_disposition(sql)
+    }
+
     /// Upserts one file's bytes by full logical path without parsing SQL.
     ///
     /// This structured path is intended for file transfer clients. It uses the
@@ -241,6 +251,15 @@ where
         self.session
             .execute_batch_with_options(statements, options)
             .await
+    }
+
+    /// Classifies an atomic SQL batch for a caller that owns its transport
+    /// lifecycle.
+    pub fn execute_batch_disposition(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<ExecutionDisposition, LixError> {
+        self.session.execute_batch_disposition(statements)
     }
 
     pub fn observe(
