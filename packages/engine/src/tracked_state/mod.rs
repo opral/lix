@@ -10,6 +10,7 @@ mod storage;
 mod tree;
 mod types;
 
+pub(crate) use codec::encode_key_ref;
 pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader};
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
@@ -24,11 +25,11 @@ pub(crate) use storage::load_root;
 pub(crate) use storage::stage_delete_commit_root;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE};
-pub(crate) use types::TrackedStateKey;
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateReadColumns,
-    TrackedStateScanRequest,
+    TrackedStateRootMutationRef, TrackedStateScanRequest,
 };
+pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 #[cfg(feature = "storage-benches")]
 pub mod bench {
     pub use super::bench_support::*;

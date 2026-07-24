@@ -48,6 +48,18 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
+/// One ordered tracked-root mutation with its insert-collision contract.
+///
+/// Bulk commit assembly keeps this zero-copy form until it has compared the
+/// mutation with the parent leaf. That lets the common full-batch path retain
+/// only one incoming key/value at a time instead of a second `Vec` plus a
+/// cloned absence-guard set.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedStateRootMutationRef<'a> {
+    pub(crate) delta: TrackedStateDeltaRef<'a>,
+    pub(crate) require_absence: bool,
+}
+
 /// Value stored in tracked-state commit-root trees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateIndexValue {

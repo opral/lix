@@ -302,17 +302,64 @@ impl StorageWriteSet {
     }
 
     pub async fn lower_into<W>(
-        self,
+        mut self,
         write: &mut W,
     ) -> Result<StorageWriteSetStats, StorageWriteSetError>
     where
         W: StorageWrite,
     {
-        self.validate()?;
-        self.lower_validated_into(write).await
+        self.validate_and_sort()?;
+        self.lower_sorted_into(write).await
     }
 
-    async fn lower_validated_into<W>(
+    /// Validates the owned write set while putting each storage batch in its
+    /// final key order.
+    ///
+    /// The old lowering path first copied every key into a transaction-wide
+    /// hash map solely to find duplicates, then sorted the original vectors
+    /// before sending them to storage. A write group already has exactly one
+    /// storage space, so sorting its owned puts/deletes lets us detect every
+    /// duplicate by adjacent/merge comparison without cloning the keys or
+    /// allocating a second full-workload hash table.
+    fn validate_and_sort(&mut self) -> Result<(), StorageWriteSetError> {
+        for group in &self.groups {
+            if let Some(incoming) = group.conflicting_declarations.first() {
+                return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
+                    id: group.space.id,
+                    existing_name: group.space.name,
+                    incoming_name: incoming.name,
+                });
+            }
+        }
+
+        for group in &mut self.groups {
+            let puts_sorted = group
+                .puts
+                .is_sorted_by(|left, right| left.key.0 <= right.key.0);
+            let deletes_sorted = group.deletes.is_sorted();
+            #[cfg(feature = "storage-benches")]
+            if order_stats_enabled() && !group.puts.is_empty() {
+                eprintln!(
+                    "write-set-order space={} puts={} puts_sorted={puts_sorted} deletes={} deletes_sorted={deletes_sorted}",
+                    group.space.name,
+                    group.puts.len(),
+                    group.deletes.len(),
+                );
+            }
+            if !puts_sorted {
+                group
+                    .puts
+                    .sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
+            }
+            if !deletes_sorted {
+                group.deletes.sort_unstable();
+            }
+            validate_sorted_group(group)?;
+        }
+        Ok(())
+    }
+
+    async fn lower_sorted_into<W>(
         self,
         write: &mut W,
     ) -> Result<StorageWriteSetStats, StorageWriteSetError>
@@ -323,7 +370,7 @@ impl StorageWriteSet {
             groups, mut stats, ..
         } = self;
 
-        for mut group in groups {
+        for group in groups {
             #[cfg(feature = "storage-benches")]
             if std::env::var_os("LIX_WRITE_SET_SPACE_STATS").is_some() {
                 let key_bytes = group
@@ -345,34 +392,6 @@ impl StorageWriteSet {
                     key_bytes,
                     value_bytes,
                 );
-            }
-            // Lower each space batch in ascending key order. Hash-keyed
-            // spaces such as json_store produce effectively random insertion
-            // order; sorted batches let B-tree storage implementations write with cursor
-            // locality instead of a fresh seek per key. Most other spaces
-            // already produce key order (BTreeMap
-            // iteration, time-ordered ids), so the common case is a
-            // read-only scan.
-            let puts_sorted = group
-                .puts
-                .is_sorted_by(|left, right| left.key.0 <= right.key.0);
-            let deletes_sorted = group.deletes.is_sorted();
-            #[cfg(feature = "storage-benches")]
-            if order_stats_enabled() && !group.puts.is_empty() {
-                eprintln!(
-                    "write-set-order space={} puts={} puts_sorted={puts_sorted} deletes={} deletes_sorted={deletes_sorted}",
-                    group.space.name,
-                    group.puts.len(),
-                    group.deletes.len(),
-                );
-            }
-            if !puts_sorted {
-                group
-                    .puts
-                    .sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
-            }
-            if !deletes_sorted {
-                group.deletes.sort_unstable();
             }
             if !group.puts.is_empty() {
                 stats.put_batches += 1;
@@ -408,12 +427,11 @@ impl StorageWriteSet {
     where
         StorageImpl: Storage,
     {
-        self.validate()?;
         let mut write = storage
             .begin_write(opts)
             .await
             .map_err(StorageWriteSetError::Storage)?;
-        let stats = match self.lower_validated_into(&mut write).await {
+        let stats = match self.lower_into(&mut write).await {
             Ok(stats) => stats,
             Err(error) => {
                 let _ = write.rollback().await;
@@ -446,6 +464,45 @@ impl StorageWriteSet {
         }
         group
     }
+}
+
+fn validate_sorted_group(group: &StorageWriteGroup) -> Result<(), StorageWriteSetError> {
+    if let Some(duplicate) = group
+        .puts
+        .windows(2)
+        .find_map(|pair| (pair[0].key == pair[1].key).then(|| pair[0].key.clone()))
+    {
+        return Err(StorageWriteSetError::DuplicateMutation {
+            space: group.space,
+            key: duplicate,
+        });
+    }
+    if let Some(duplicate) = group
+        .deletes
+        .windows(2)
+        .find_map(|pair| (pair[0] == pair[1]).then(|| pair[0].clone()))
+    {
+        return Err(StorageWriteSetError::DuplicateMutation {
+            space: group.space,
+            key: duplicate,
+        });
+    }
+
+    let mut put_index = 0usize;
+    let mut delete_index = 0usize;
+    while put_index < group.puts.len() && delete_index < group.deletes.len() {
+        match group.puts[put_index].key.cmp(&group.deletes[delete_index]) {
+            std::cmp::Ordering::Less => put_index += 1,
+            std::cmp::Ordering::Greater => delete_index += 1,
+            std::cmp::Ordering::Equal => {
+                return Err(StorageWriteSetError::DuplicateMutation {
+                    space: group.space,
+                    key: group.puts[put_index].key.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for StorageWriteSet {

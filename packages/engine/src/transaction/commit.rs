@@ -8,8 +8,8 @@ use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader};
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
-    CommitId, CommitRecord,
+    ChangeId, ChangeRecord, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitId,
+    CommitRecord, TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -21,7 +21,10 @@ use crate::live_state::{
     LiveStateIndexScanRequest, branch_empty_precondition, row_absent_precondition,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef, TrackedStateKey};
+use crate::tracked_state::{
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateKey, TrackedStateKeyRef,
+    TrackedStateRootMutationRef, encode_key_ref,
+};
 use crate::transaction::staging::{
     PreparedInsertIdentity, PreparedStateRowIdentity, PreparedWriteSet,
 };
@@ -254,7 +257,7 @@ fn index_prepared_rows(rows: &[PreparedStateRow]) -> Result<PreparedRowIndex, Li
 
 #[derive(Clone, Debug)]
 struct StagedChangelogCommit {
-    change_ids: Vec<ChangeId>,
+    change_count: usize,
     selected_change_refs: Vec<StagedCommitChangeRef>,
 }
 
@@ -271,12 +274,12 @@ async fn stage_changelog_commits(
     let changes = state_rows
         .iter()
         .filter(|row| !(row.untracked && row.snapshot.is_none()))
-        .map(change_record_from_state_row)
+        .map(transaction_change_record_from_state_row)
         .chain(
             branch_ref_rows
                 .iter()
                 .filter(|row| row.change.snapshot.is_some())
-                .map(|row| Ok(row.change.clone())),
+                .map(|row| Ok(TransactionChangeRecordRef::from(&row.change))),
         )
         .collect::<Result<Vec<_>, _>>()?;
     let mut commit_change_refs = Vec::with_capacity(commit_rows.len());
@@ -287,8 +290,6 @@ async fn stage_changelog_commits(
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut refs = Vec::with_capacity(state_row_indices.len());
-        let mut change_ids =
-            Vec::with_capacity(state_row_indices.len() + commit_row.selected_change_refs.len());
         for &row_index in state_row_indices {
             let row = &state_rows[row_index];
             let change_id = row.change_id.as_ref().ok_or_else(|| {
@@ -298,11 +299,9 @@ async fn stage_changelog_commits(
                 )
             })?;
             refs.push(*change_id);
-            change_ids.push(*change_id);
         }
         for change_ref in &commit_row.selected_change_refs {
             refs.push(change_ref.change_id);
-            change_ids.push(change_ref.change_id);
         }
         commits.push(CommitRecord {
             format_version: 1,
@@ -312,6 +311,7 @@ async fn stage_changelog_commits(
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
         });
+        let change_count = refs.len();
         commit_change_refs.push(CommitChangeRefSet {
             commit_id: commit_row.commit_id,
             entries: refs,
@@ -319,13 +319,13 @@ async fn stage_changelog_commits(
         staged.insert(
             commit_row.commit_id,
             StagedChangelogCommit {
-                change_ids,
+                change_count,
                 selected_change_refs: commit_row.selected_change_refs.clone(),
             },
         );
     }
 
-    let append = ChangelogAppend {
+    let append = TransactionChangelogAppend {
         commits,
         changes,
         commit_change_refs,
@@ -339,33 +339,31 @@ async fn stage_changelog_commits(
     Ok(staged)
 }
 
-fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, LixError> {
+fn transaction_change_record_from_state_row(
+    row: &PreparedStateRow,
+) -> Result<TransactionChangeRecordRef<'_>, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "staged row is missing change_id before changelog change construction",
         ));
     };
-    Ok(ChangeRecord {
+    Ok(TransactionChangeRecordRef {
         format_version: 2,
         change_id: *change_id,
-        entity_pk: row.entity_pk.clone(),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot: row
-            .snapshot
-            .as_ref()
-            .map_or(crate::json_store::JsonSlot::None, |snapshot| {
-                snapshot.slot()
-            }),
-        metadata: row
-            .metadata
-            .as_ref()
-            .map_or(crate::json_store::JsonSlot::None, |metadata| {
-                metadata.slot()
-            }),
+        entity_pk: &row.entity_pk,
+        schema_key: &row.schema_key,
+        file_id: row.file_id.as_deref(),
+        snapshot: row.snapshot.as_ref().map_or(
+            crate::json_store::JsonSlotRef::None,
+            crate::transaction::types::StageJson::slot_ref,
+        ),
+        metadata: row.metadata.as_ref().map_or(
+            crate::json_store::JsonSlotRef::None,
+            crate::transaction::types::StageJson::slot_ref,
+        ),
         created_at: row.updated_at,
-        origin_key: row.origin_key.clone(),
+        origin_key: row.origin_key.as_deref(),
     })
 }
 
@@ -782,16 +780,52 @@ async fn stage_tracked_roots(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        if state_row_indices.len() > staged.change_ids.len() {
+        if state_row_indices.len() > staged.change_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
                     "commit '{}' has {} tracked rows but only {} changelog changes",
                     root.commit_id,
                     state_row_indices.len(),
-                    staged.change_ids.len()
+                    staged.change_count
                 ),
             ));
+        }
+        // Normal entity batches are already in canonical primary-key order.
+        // When they cover a substantial fraction of a parent root, stream the
+        // parent/changes directly into canonical chunks instead of point
+        // reading every key and materializing two more full-workload vectors.
+        if !state_row_indices.is_empty()
+            && staged.selected_change_refs.is_empty()
+            && tracked_state_rows_are_strictly_sorted(state_rows, state_row_indices)
+        {
+            let commit_id_text = root.commit_id.to_string();
+            let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
+            let first_row = &state_rows[state_row_indices[0]];
+            let first_mutation_key = encode_key_ref(TrackedStateKeyRef {
+                schema_key: &first_row.schema_key,
+                file_id: first_row.file_id.as_deref(),
+                entity_pk: &first_row.entity_pk,
+            });
+            if tracked_writer
+                .try_stage_bulk_parent_root_from_ordered_mutations(
+                    &commit_id_text,
+                    parent_commit_id_text.as_deref(),
+                    state_row_indices.len(),
+                    &first_mutation_key,
+                    state_row_indices.iter().map(|&row_index| {
+                        let row = &state_rows[row_index];
+                        Ok(TrackedStateRootMutationRef {
+                            delta: tracked_delta_from_state_row(row)?,
+                            require_absence: tracked_row_requires_absence(row, insert_identities),
+                        })
+                    }),
+                )
+                .await?
+                .is_some()
+            {
+                continue;
+            }
         }
         let deltas = state_row_indices
             .iter()
@@ -882,6 +916,35 @@ async fn stage_tracked_roots(
         ));
     }
     Ok(())
+}
+
+fn tracked_state_rows_are_strictly_sorted(
+    state_rows: &[PreparedStateRow],
+    row_indices: &[RowIndex],
+) -> bool {
+    row_indices.windows(2).all(|pair| {
+        let left = &state_rows[pair[0]];
+        let right = &state_rows[pair[1]];
+        left.schema_key
+            .cmp(&right.schema_key)
+            .then_with(|| left.file_id.cmp(&right.file_id))
+            .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+            .is_lt()
+    })
+}
+
+fn tracked_row_requires_absence(
+    row: &PreparedStateRow,
+    insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
+) -> bool {
+    if insert_identities.is_empty() {
+        return false;
+    }
+    row.snapshot.is_some()
+        && !row.untracked
+        && insert_identities
+            .get(&PreparedStateRowIdentity::from(row))
+            .is_some_and(|insert| !insert.untracked())
 }
 
 fn tracked_roots_parent_first(

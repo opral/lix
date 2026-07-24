@@ -1,6 +1,7 @@
 use super::types::{
     ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRefChunk,
     CommitChangeRefChunkWire, CommitChangeRefChunkWireRef, CommitId, CommitRecord,
+    TransactionChangeRecordRef,
 };
 use crate::common::LixError;
 use crate::entity_pk::EntityPk;
@@ -11,20 +12,36 @@ pub(crate) fn encode_commit_record(record: &CommitRecord) -> Result<Vec<u8>, Lix
 }
 
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
+    encode_change_record_ref(&ChangeRecordRef {
+        format_version: record.format_version,
+        schema_key: &record.schema_key,
+        entity_pk: &record.entity_pk.parts,
+        file_id: record.file_id.as_deref(),
+        snapshot: record.snapshot.as_ref_slot(),
+        metadata: record.metadata.as_ref_slot(),
+        created_at: record.created_at,
+        origin_key: record.origin_key.as_deref(),
+    })
+}
+
+pub(crate) fn encode_transaction_change_record(
+    record: &TransactionChangeRecordRef<'_>,
+) -> Result<Vec<u8>, LixError> {
+    encode_change_record_ref(&ChangeRecordRef {
+        format_version: record.format_version,
+        schema_key: record.schema_key,
+        entity_pk: &record.entity_pk.parts,
+        file_id: record.file_id,
+        snapshot: record.snapshot,
+        metadata: record.metadata,
+        created_at: record.created_at,
+        origin_key: record.origin_key,
+    })
+}
+
+fn encode_change_record_ref(record: &ChangeRecordRef<'_>) -> Result<Vec<u8>, LixError> {
     // change_id is the storage key; the value intentionally omits it.
-    storage_codec::encode(
-        "change record",
-        &ChangeRecordRef {
-            format_version: record.format_version,
-            schema_key: &record.schema_key,
-            entity_pk: &record.entity_pk.parts,
-            file_id: record.file_id.as_deref(),
-            snapshot: record.snapshot.as_ref_slot(),
-            metadata: record.metadata.as_ref_slot(),
-            created_at: record.created_at,
-            origin_key: record.origin_key.as_deref(),
-        },
-    )
+    storage_codec::encode("change record", record)
 }
 
 pub(crate) fn decode_change_record(
@@ -193,6 +210,20 @@ mod tests {
         let decoded =
             decode_change_record(&encoded, record.change_id).expect("record should decode");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn transaction_change_record_encoding_matches_owned_record() {
+        let record = ChangeRecord {
+            snapshot: JsonSlot::from_json("{\"name\":\"libf\\u00f6\\u4e2d\"}"),
+            metadata: JsonSlot::from_json("{\"k\":1}"),
+            ..full_record()
+        };
+        assert_eq!(
+            encode_transaction_change_record(&TransactionChangeRecordRef::from(&record))
+                .expect("borrowed record should encode"),
+            encode_change_record(&record).expect("owned record should encode"),
+        );
     }
 
     #[test]
