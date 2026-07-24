@@ -3,6 +3,7 @@ import type { LixSnapshotStorage } from "./types.js";
 
 class MemorySnapshotStorage implements LixSnapshotStorage {
 	readonly snapshots = new Map<string, Uint8Array>();
+	saveCalls = 0;
 
 	async load(namespace: string): Promise<Uint8Array | undefined> {
 		const snapshot = this.snapshots.get(namespace);
@@ -10,9 +11,33 @@ class MemorySnapshotStorage implements LixSnapshotStorage {
 	}
 
 	async save(namespace: string, snapshot: Uint8Array): Promise<void> {
+		this.saveCalls += 1;
 		this.snapshots.set(namespace, snapshot.slice());
 	}
 }
+
+test("persistent worker binding saves after createCheckpoint", async () => {
+	const { openPersistentLixWorkerBinding } =
+		await import("../dist/worker/client.js");
+	const storage = new MemorySnapshotStorage();
+	const binding = await openPersistentLixWorkerBinding({
+		storage,
+		namespace: "checkpoint-persistence",
+	});
+	try {
+		await binding.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')",
+			[],
+		);
+		const before = storage.saveCalls;
+
+		await binding.createCheckpoint();
+
+		expect(storage.saveCalls).toBe(before + 1);
+	} finally {
+		await binding.close();
+	}
+});
 
 test("persistent worker binding restores an exact Rust snapshot", async () => {
 	const { openPersistentLixWorkerBinding } =

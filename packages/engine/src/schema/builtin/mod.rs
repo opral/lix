@@ -18,6 +18,7 @@ const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const LIX_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const LIX_CHECKPOINT_MARKER_SCHEMA_KEY: &str = "lix_checkpoint_marker";
 
 const LIX_REGISTERED_SCHEMA_JSON: &str = include_str!("lix_registered_schema.json");
 const LIX_KEY_VALUE_SCHEMA_JSON: &str = include_str!("lix_key_value.json");
@@ -34,6 +35,7 @@ const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
 const LIX_FILE_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_file_descriptor.json");
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_directory_descriptor.json");
 const LIX_BINARY_BLOB_REF_SCHEMA_JSON: &str = include_str!("lix_binary_blob_ref.json");
+const LIX_CHECKPOINT_MARKER_SCHEMA_JSON: &str = include_str!("lix_checkpoint_marker.json");
 
 static LIX_REGISTERED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_KEY_VALUE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -50,6 +52,7 @@ static LIX_COMMIT_EDGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_FILE_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_DIRECTORY_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_BINARY_BLOB_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_CHECKPOINT_MARKER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 
 const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_REGISTERED_SCHEMA_KEY,
@@ -67,6 +70,7 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
     LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
     LIX_BINARY_BLOB_REF_SCHEMA_KEY,
+    LIX_CHECKPOINT_MARKER_SCHEMA_KEY,
 ];
 
 pub(super) fn is_seed_schema_key(schema_key: &str) -> bool {
@@ -146,6 +150,12 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
         }
         LIX_BINARY_BLOB_REF_SCHEMA_KEY => Some(LIX_BINARY_BLOB_REF_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_binary_blob_ref.json", LIX_BINARY_BLOB_REF_SCHEMA_JSON)
+        })),
+        LIX_CHECKPOINT_MARKER_SCHEMA_KEY => Some(LIX_CHECKPOINT_MARKER_SCHEMA.get_or_init(|| {
+            parse_builtin_schema(
+                "lix_checkpoint_marker.json",
+                LIX_CHECKPOINT_MARKER_SCHEMA_JSON,
+            )
         })),
         _ => None,
     }

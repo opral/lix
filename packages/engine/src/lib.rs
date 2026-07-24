@@ -20,6 +20,7 @@ pub(crate) mod catalog;
 pub(crate) mod cel;
 #[allow(unused_imports)]
 pub mod changelog;
+pub(crate) mod checkpoint;
 pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod compression;
@@ -28,6 +29,7 @@ pub mod engine;
 pub(crate) mod entity_pk;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
+pub(crate) mod gc;
 pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod live_state;
@@ -74,10 +76,10 @@ pub use session::{
     ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue,
 };
 pub use session::{
-    CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
-    MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
-    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::conformance::{

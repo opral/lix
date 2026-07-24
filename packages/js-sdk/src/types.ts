@@ -139,6 +139,10 @@ export type CreateBranchReceipt = {
 	commitId: string;
 };
 
+export type CreateCheckpointReceipt = {
+	commitId: string;
+};
+
 export type SwitchBranchOptions = {
 	branchId: string;
 };

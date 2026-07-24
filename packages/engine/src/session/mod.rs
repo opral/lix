@@ -10,14 +10,17 @@
 //! the storage commit point-of-no-return. After that point, close waits for
 //! commit completion. Crash persistence is provider-defined.
 
+mod checkpoint;
 mod context;
 mod create_branch;
 mod execute;
+mod gc;
 mod merge;
 pub(crate) mod observe;
 mod switch_branch;
 mod transaction;
 
+pub use checkpoint::CreateCheckpointReceipt;
 pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};

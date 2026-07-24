@@ -200,6 +200,41 @@ pub(super) async fn scan_values(
     Ok(rows)
 }
 
+pub(super) async fn scan_all_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<Vec<(FlatIdentity, FlatValue)>, LixError> {
+    let plan = ScanPlan::prefix(
+        LIVE_STATE_INDEX_ROW_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut rows = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            rows.push((
+                decode_key(entry.key.0.as_ref())?,
+                decode_projected_value(entry.value)?,
+            ));
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
 /// Returns concrete flat identities when every filter dimension resolves to
 /// exact keys. This lets multi-row validation use one batched point read
 /// instead of one prefix scan per entity.
